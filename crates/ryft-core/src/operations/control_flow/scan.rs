@@ -733,11 +733,11 @@ where
         }
         if length.bounds().extent() == Some(0) && (!carried_inputs.is_empty() || has_empty_root) {
             // Keep the inferred dimension identities even when their bounds pin zero. Dynamic zeros consume the
-            // corresponding runtime geometry, so this shortcut preserves the public region signature.
+            // corresponding runtime extents, so this shortcut preserves the public region signature.
             let output_types = self.infer_output_types(&input_types, &[source_body.interface()])?;
             let boundary_values =
                 inputs.iter().map(|input| context.boundary_value(input)).collect::<Result<Vec<_>, _>>()?;
-            let has_output_geometry = output_types[carry_count..].iter().all(|output_type| {
+            let has_output_extents = output_types[carry_count..].iter().all(|output_type| {
                 let ArrayIrType::Array(output_type) = output_type else { return false };
                 output_type.shape().dimensions().iter().filter_map(Dimension::variable).all(|variable| {
                     boundary_values.iter().any(|value| match value.r#type().as_ref() {
@@ -749,9 +749,9 @@ where
                     })
                 })
             });
-            // A preserved reference can be the only carrier of a dynamic slice extent. Keep the scan boundary in
-            // that case: its body owns the geometry, and no iteration or reference read executes for zero trips.
-            if has_output_geometry {
+            // A preserved reference can be the only carrier of a dynamic slice extent. Keep the scan boundary in that
+            // case: its body owns the extent, and no iteration or reference read executes for zero trips.
+            if has_output_extents {
                 let mut outputs = carry_inputs.to_vec();
                 // A zero-trip scan still validates the relationships between its inputs that their types cannot prove
                 // (refer to `ScanType::unchecked_identity_relationships`). Retain that validation as a zero-trip scan
@@ -829,7 +829,7 @@ where
                             }) {
                                 return context.boundary_value(input);
                             }
-                            // An array also carries its runtime axis geometry. Reify that dimension when the boundary
+                            // An array also carries its runtime axis extents. Reify that dimension when the boundary
                             // has no separate dimension leaf rather than dropping a valid symbolic output shape.
                             for input in inputs {
                                 let value = context.boundary_value(input)?;
@@ -852,7 +852,7 @@ where
                             }
                             Err(ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "zero-trip `{SCAN_OPERATION_NAME}` output `{output_type}` has no input geometry \
+                                    "zero-trip `{SCAN_OPERATION_NAME}` output `{output_type}` has no input extent \
                                      for dimension `{variable}`",
                                 ),
                             })
@@ -1097,7 +1097,7 @@ where
         // still rejects inputs that type inference rejects (e.g., a stacked input whose scan axis is sharded over an
         // explicit mesh axis, or a dimension carry whose extent lies outside its declared bounds). Live reference
         // handles may refine their declared referents eagerly, so they keep their declared types here.
-        // `refine_output_types` below validates their concrete geometry against the other inputs.
+        // `refine_output_types` below validates their concrete shapes against the other inputs.
         let mut validation_types = input_types.clone();
         for (validation_type, expected_type) in validation_types.iter_mut().zip(&expected_input_types) {
             if validation_type.is_reference() && expected_type.is_reference() {
@@ -1252,9 +1252,9 @@ where
             }
         }
         T::validate_scan_input_type_signature(&body_input_types, carry_count, &self.length, &input_types)?;
-        match T::validate_scan_runtime_geometry(&self.length, carry_count, &input_types) {
+        match T::validate_scan_runtime_extents(&self.length, carry_count, &input_types) {
             Ok(()) => self.infer_output_types(&input_types, &[body.interface()])?,
-            // Known values can have geometry that their types cannot prove (e.g., a symbolic runtime length next to
+            // Known values can have extents that their types cannot prove (e.g., a symbolic runtime length next to
             // concrete stacks), which only executing the scan validates. Retain the original scan so specialization
             // cannot erase that validation by forwarding every output.
             Err(_) => return context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], inputs),
@@ -1550,7 +1550,7 @@ where
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         // Structural body batching receives mapped axes without per-item ragged extent carriers, so reject those
-        // inputs before body transformation or parent binding can lose their logical geometry.
+        // inputs before body transformation or parent binding can lose their logical extents.
         ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
         let body = driver.region(0)?;
         let body_input_types = body.input_types();
@@ -1762,6 +1762,8 @@ where
 // reuse the partition reconstruction of partial evaluation, which stacks varying residuals and hoists invariant ones.
 impl<T, C> DifferentiableOperation<C> for ScanOperation<T>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
     T: DifferentiableType + ScanType + TemporalResidualType,
     C: Context<Type = T> + Zero<C::Value>,
     C::Operation:
@@ -1808,7 +1810,7 @@ where
             }
         }
         T::validate_scan_input_type_signature(&body_input_types, carry_count, &length, &input_types)?;
-        let preserve_known_scan = match T::validate_scan_runtime_geometry(&length, carry_count, &input_types) {
+        let preserve_known_scan = match T::validate_scan_runtime_extents(&length, carry_count, &input_types) {
             Ok(()) => {
                 self.infer_output_types(&input_types, &[body.interface()])?;
                 false
@@ -2034,6 +2036,7 @@ where
 // returned as a value.
 impl<V, O> TransposableOperation<V, O> for ScanOperation<ArrayType>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType>
         + ResidualZeroProvider<ArrayType, Operation = O>
@@ -2061,10 +2064,10 @@ where
 // Reference carries and stacks accumulate through the enclosing context's cotangent references, which are resolved
 // (and allocated on first use when their state cotangent is live) before the primal rule threads them positionally
 // through the reversed scan. Ordinary carry cotangents drive earlier iterations and scanned cotangents have element
-// geometry inside the body, so they are all returned as values before the accumulators apply demand or gradient
-// buffers.
+// shapes inside the body, so they are all returned as values before the accumulators apply demand or gradient buffers.
 impl<V, O> TransposableOperation<V, O> for ScanOperation<ArrayIrType>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
@@ -2112,7 +2115,7 @@ pub trait ScanType: Type<Identity = DimensionVariable> {
     ///   - `body_input_types`: Declared body inputs, including the intrinsic scalar `i64` index.
     ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
     ///   - `carry_count`: Number of matching carry positions on both boundaries.
-    ///   - `length`: Declared trip-count geometry, validated independently of a runtime value.
+    ///   - `length`: Declared trip count, validated independently of a runtime value.
     ///
     /// # Errors
     ///
@@ -2126,7 +2129,7 @@ pub trait ScanType: Type<Identity = DimensionVariable> {
 
     /// Validates the operation inputs against the declared iteration inputs, including the type and identity of a
     /// trailing runtime length. This checks ordinary type refinement independently of whether the runtime length and
-    /// the stacked axes are provably equal; use [`Self::validate_scan_runtime_geometry`] for that additional contract.
+    /// the stacked axes are provably equal; use [`Self::validate_scan_runtime_extents`] for that additional contract.
     /// Callers must first validate the body signature. Eager callers may replace a reference input with its declared
     /// reference type after checking that the actual referent refines it, as eager handles preserve runtime ownership.
     ///
@@ -2161,7 +2164,7 @@ pub trait ScanType: Type<Identity = DimensionVariable> {
     /// # Errors
     ///
     /// Returns an error when runtime length and stacked leading dimensions are not provably equal.
-    fn validate_scan_runtime_geometry(
+    fn validate_scan_runtime_extents(
         length: &Dimension,
         carry_count: usize,
         input_types: &[Self],
@@ -2170,7 +2173,7 @@ pub trait ScanType: Type<Identity = DimensionVariable> {
     /// Returns the groups of operation input positions whose declared types share an identity (e.g., two `f32[n]`
     /// carries, a `dimension<n>` carry and a `ref<f32[n]>` carry, or two `dimension<n>` carries) that the actual input
     /// types `input_types` do not provably agree on, apart from the trailing runtime length, which
-    /// [`Self::validate_scan_runtime_geometry`] covers. The scan boundary requires every group to agree at runtime.
+    /// [`Self::validate_scan_runtime_extents`] covers. The scan boundary requires every group to agree at runtime.
     ///
     /// Agreement is proven when every member carries the identity at the same static extent, which type inference
     /// compares wherever the members end up. Members that carry it at the same symbolic identity are consistent by
@@ -2362,7 +2365,7 @@ impl ScanType for ArrayType {
         Ok(())
     }
 
-    fn validate_scan_runtime_geometry(
+    fn validate_scan_runtime_extents(
         _length: &Dimension,
         _carry_count: usize,
         _input_types: &[Self],
@@ -2505,7 +2508,7 @@ impl ScanType for ArrayIrType {
         Ok(())
     }
 
-    fn validate_scan_runtime_geometry(
+    fn validate_scan_runtime_extents(
         length: &Dimension,
         carry_count: usize,
         input_types: &[Self],
@@ -3000,6 +3003,7 @@ fn split_scan_by_knownness<V, O, C, PartitionRegion>(
     mut partition_region: PartitionRegion,
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: ScanType + TemporalResidualType>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
     O: Operation<Type = V::Type> + From<ScanOperation<V::Type>> + TemporalResidualOperation<V::Type>,
@@ -3168,13 +3172,13 @@ where
 ///
 /// # Parameters
 ///
-///   - `scan`: Source scan, whose geometry and lowering attributes both derived scans retain.
+///   - `scan`: Source scan, whose length, direction, and lowering attributes both derived scans retain.
 ///   - `body_input_types`: Full iteration input signature, including the intrinsic index.
 ///   - `body_output_count`: Number of original iteration outputs before adding residual storage.
 ///   - `inputs`: Source operation values in the binding destinations' shared representation.
 ///   - `input_known`: Knownness of the original body inputs, including the known intrinsic index.
 ///   - `carry_known`: Converged knownness of the initial and next carry values.
-///   - `preserve_known_scan`: Retains the known scan and its full input boundary when runtime geometry requires eager
+///   - `preserve_known_scan`: Retains the known scan and its full input boundary when runtime extents require eager
 ///     value validation before any computed invariant work is hoisted.
 ///   - `relationships`: Groups of positions of `inputs` whose agreement only a scan boundary validates.
 ///   - `partition`: Known and residual body programs with their compact boundary descriptors.
@@ -4148,7 +4152,7 @@ where
 /// Partition-aware transposition rule for a [`ScanOperation`] in a tangent program. The per-iteration residuals of a
 /// linearized scan are ordinary *scanned inputs* (known residual stacks) and its loop-invariant residuals are known
 /// carries that the body passes through unchanged, so the rule reads them from the pullback and threads them back
-/// through a transposed scan with the same loop geometry.
+/// through a transposed scan with the same length.
 ///
 /// The scan's instruction inputs correspond to the body's inputs after its intrinsic index as `[carries...,
 /// scanned_inputs...]`. The reversed loop regenerates the index. Each instruction input is independently linear (a
@@ -4219,6 +4223,7 @@ fn transpose_primal_scan<T, V, O, D: TranspositionDriver<V, O>>(
     cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
 where
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
     T: DifferentiableType + ScanType,
     V: Value<Type = T>,
     O: Operation<Type = T> + ResidualZeroProvider<T, Operation = O> + From<ScanOperation<T>>,
@@ -4381,10 +4386,10 @@ where
     // becomes a real input of the reversed scan, unless it is a stacked output whose per-iteration zero the reversed
     // body constructs itself. Its type alone cannot construct it when it references runtime identities, but the
     // boundary collectively names every such quantity, so the zero is assembled from the peers one identity at a time.
-    // Carry cotangents keep the per-iteration geometry that live peer carries and known carries also carry, while a
-    // dead stacked cotangent's scan-length-prefixed geometry is split across the boundary: the length identity rides
-    // the runtime length input (a first-class dimension) and any known residual stack, while its inner extents ride the
-    // carries and per-iteration peers. Live cotangent references also supply their referents' geometry when every
+    // Carry cotangents keep the per-iteration shapes that live peer carries and known carries also carry, while a dead
+    // stacked cotangent's scan-length-prefixed shape is split across the boundary: the length identity rides the
+    // runtime length input (a first-class dimension) and any known residual stack, while its inner extents ride the
+    // carries and per-iteration peers. Live cotangent references also supply their referents' extents when every
     // ordinary output cotangent is zero and only reference state keeps the reverse live.
     let dimension_sources = || {
         outputs
@@ -8017,7 +8022,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_recovers_zero_output_geometry_from_an_array_carry() {
+    fn test_scan_reference_discharge_recovers_zero_output_shape_from_an_array_carry() {
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let values_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into()]));
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
@@ -8069,7 +8074,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_recovers_zero_output_geometry_from_a_reference_carry() {
+    fn test_scan_reference_discharge_recovers_zero_output_shape_from_a_reference_carry() {
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let empty_type = ArrayType::new(DataType::F32, Shape::new(vec![0.into(), rows.clone().into()]));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -8119,8 +8124,8 @@ mod tests {
     // Replacing the body's dynamic selection with a slice input preserves the identities of subsequent allocations, so
     // discharge targets collected from the original program still select the intended internal allocation.
     #[test]
-    fn test_scan_reference_discharge_preserves_zero_output_geometry_in_a_preserved_reference() {
-        // Partial discharge must retain a zero-trip body boundary when its only dynamic geometry remains in a handle.
+    fn test_scan_reference_discharge_preserves_zero_output_shape_in_a_preserved_reference() {
+        // Partial discharge must retain a zero-trip body boundary when its only dynamic extent remains in a handle.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let values_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.into()]));
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
@@ -10415,7 +10420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_retains_value_geometry_of_known_dimension_carries() {
+    fn test_scan_partial_evaluation_retains_value_extents_of_known_dimension_carries() {
         // A known dimension carry of extent 2 contradicts the `f32[3]` carry, because the body declares both carries
         // with the identity `n`. Partial evaluation must not eliminate the known carry before that check: whether it
         // rejects the scan itself or retains it in the residual program, executing the result must fail, exactly as
@@ -11899,7 +11904,7 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        // An unknown stack keeps the effectful scan residual, and its known carry gives the body precise geometry.
+        // An unknown stack keeps the effectful scan residual, and its known carry gives the body precise shapes.
         let live = ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap());
         let evaluation = program
             .partially_evaluate(&[
@@ -12132,7 +12137,6 @@ mod tests {
             },
         );
     }
-
     #[test]
     fn test_scan_batching_composite_rejects_ragged_inputs_before_transforming_body() {
         // Structural composite batching receives mapped axes without ragged carriers. Rejection must precede both
@@ -12156,7 +12160,6 @@ mod tests {
             },
         );
     }
-
     #[test]
     fn test_scan_batching_validates_direct_body_and_input_contracts() {
         // A direct rule invocation must not repair the body's index or index past an excessive carry count, and
@@ -12667,7 +12670,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_validates_concrete_eager_runtime_geometry() {
+    fn test_scan_batching_composite_validates_concrete_eager_runtime_extents() {
         // An eager runtime length and the packed eager arrays it describes have exact types, so valid direct binding
         // executes and unequal lengths are rejected before they can truncate or over-read the packed stack.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
@@ -13358,7 +13361,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_composite_validates_runtime_geometry_before_forwarding_carries() {
+    fn test_scan_differentiation_composite_validates_runtime_extents_before_forwarding_carries() {
         let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -13375,8 +13378,8 @@ mod tests {
         };
 
         // The runtime length's extent agrees with the concrete stack. The unused stack has a structural-zero tangent,
-        // so only the known scan validates its original geometry before returning the unchanged carry; the tangent
-        // body needs no stack coefficient.
+        // so only the known scan validates its original extents before returning the unchanged carry; the tangent body
+        // needs no stack coefficient.
         let (outputs, pushforward) = differentiate_at(primals(3))
             .linearize(|inputs: Vec<TestIrTracer>| {
                 let context = inputs[0].context();
@@ -13415,7 +13418,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_retains_value_geometry_of_known_dimension_carries() {
+    fn test_scan_differentiation_retains_value_extents_of_known_dimension_carries() {
         // A dimension carry of extent 2 contradicts the `f32[3]` carry, because the body declares both carries with
         // the identity `n`. Separate-context linearization must reject it rather than forward the pass-through
         // carries without running the known scan that checks it, whether or not the scan iterates.
@@ -13445,7 +13448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_retains_value_geometry_of_related_dimension_carries() {
+    fn test_scan_differentiation_retains_value_extents_of_related_dimension_carries() {
         // Two carries that the body declares as `dimension<n>` must agree, and so must a `dimension<n>` carry and the
         // referent of a `ref<f32[n]>` carry. Both relationships hold only for the concrete values. Direct execution
         // and replay reject these primals, and so must separate-context linearization, whether or not the scan
@@ -14536,7 +14539,7 @@ mod tests {
     #[test]
     fn test_scan_differentiation_preserves_manual_variation_of_residual_stacks() {
         // The carry changes on every iteration. Linearization stores its prior values in a stack that must keep
-        // the carry's manual variation, and reverse mode slices those varying coefficients with matching geometry.
+        // the carry's manual variation, and reverse mode slices those varying coefficients with matching shapes.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let scalar_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
@@ -16825,7 +16828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transposition_uses_reference_geometry_for_dead_dynamic_outputs() {
+    fn test_scan_transposition_uses_reference_extents_for_dead_dynamic_outputs() {
         // The stacked snapshots are dead, while the reference's state cotangent remains live. Its referent is the only
         // source of the dynamic extent needed to seed those snapshots with zeros in the reversed scan.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());

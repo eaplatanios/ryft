@@ -24,13 +24,12 @@
 //! The reduced axes are removed from the output shape, and the remaining axes keep their order, as for StableHLO's
 //! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, products, extrema, and Boolean reductions start from
 //! their combiner identity (e.g., `0` for sums and `1` for products), so an empty axis produces that identity. Bounded
-//! ragged-axis reductions support sums, products, and logarithmic sums of exponentials; padding is replaced by zero,
-//! one, or negative infinity (with a zero imaginary component for complex inputs), respectively. Other kinds reject
-//! ragged reduced axes, except that index reductions replace padding by the lowest value of the input data type for
-//! [`ArgMax`] and by the highest one for [`ArgMin`], which a live element always beats or ties with a lower index.
-//! Narrow floating-point sums, products, means, and logarithmic sums of exponentials compute in `f32` before converting
-//! the output back to the input data type. Empty floating-point and complex means compute NaNs before output
-//! conversion.
+//! ragged-axis reductions replace padding with the combiner identity. Logarithmic sums of exponentials use negative
+//! infinity, with a zero imaginary component for complex inputs. Means reject ragged reduced axes because their divisor
+//! would count padding. Index reductions replace padding by the lowest value of the input data type for [`ArgMax`] and
+//! by the highest one for [`ArgMin`], which a live element always beats or ties with a lower index. Narrow
+//! floating-point sums, products, means, and logarithmic sums of exponentials compute in `f32` before converting the
+//! output back to the input data type. Empty floating-point and complex means compute NaNs before output conversion.
 //!
 //! Floating-point and complex sums and means are linear: their transposes broadcast the cotangent over the reduced
 //! axes, dividing it by the number of reduced elements for means. Extrema route the tangent through selected elements,
@@ -73,7 +72,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, ProjectedContext};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
@@ -107,8 +106,9 @@ use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
-    TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
+    TypeError, Typed, Value, ValueDomainDispatch,
 };
+use crate::tracing::TracingContext;
 
 /// Name of [`ReduceOperation`]. The reduction's [`ReductionKind`] is rendered as its `kind` attribute.
 pub const REDUCE_OPERATION_NAME: &str = "reduce";
@@ -928,9 +928,7 @@ impl_differentiable_operation! {
 
 impl<C> MemberDifferentiableOperation<C> for ReduceOperation
 where
-    C: Context<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C: ContextProjection<ArrayType, Type = ArrayIrType>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
@@ -947,6 +945,8 @@ where
                            + From<CompareOperation<ArrayType>>
                            + From<ParallelVaryOperation>,
         > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1468,7 +1468,7 @@ impl ArrayType {
             reduce_mask[*axis] = true;
         }
 
-        // Validate axes before the element domain so malformed geometry retains diagnostic precedence.
+        // Validate axes before the element domain so malformed axes retain diagnostic precedence.
         kind.validate_data_type(REDUCE_OPERATION_NAME, self.data_type())?;
         if !axes.is_empty() {
             kind.validate_unreduced_axes(REDUCE_OPERATION_NAME, self)?;
@@ -2376,10 +2376,11 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, differentiate_at};
@@ -2712,10 +2713,9 @@ mod tests {
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );
-        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), variable.clone(), vec![0])])
-            .unwrap();
+        let input =
+            ragged_array_batch(packed.into_projected().unwrap(), extents.into_projected().unwrap(), &variable, 1)
+                .unwrap();
 
         // The per-item reduced axis 0 is the packed axis 1 that carries the ragged extents.
         let (outputs, evidence) = ReduceOperation::new(vec![0], ReductionKind::Product)
@@ -2764,15 +2764,13 @@ mod tests {
         // Static array batching cannot neutralize ragged padding, and says so rather than summing the padding's
         // exponentials into the live output.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(
-                1,
-                Array::vector(vec![1i32, 3]).unwrap(),
-                variable.clone(),
-                vec![0],
-            )])
-            .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![0.0f32; 6]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             ReduceOperation::new(vec![0], ReductionKind::LogSumExp).batch(
                 &BatchingContext::new(EagerContext::<Array>::new(), 2),
@@ -2799,10 +2797,9 @@ mod tests {
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );
-        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), variable.clone(), vec![0])])
-            .unwrap();
+        let input =
+            ragged_array_batch(packed.into_projected().unwrap(), extents.into_projected().unwrap(), &variable, 1)
+                .unwrap();
 
         // The per-item reduced axis 0 is the packed axis 1 that carries the ragged extents.
         let (outputs, evidence) = ReduceOperation::new(vec![0], ReductionKind::LogSumExp)
@@ -2855,17 +2852,8 @@ mod tests {
             ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let ragged = |values: Array| {
-            ArrayBatch::new(values, BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(vec![1i32, 2]).unwrap(),
-                    length.clone(),
-                    vec![0],
-                )])
-                .unwrap()
-        };
+        let ragged =
+            |values: Array| ragged_array_batch(values, Array::vector(vec![1i32, 2]).unwrap(), &length, 1).unwrap();
         for (kind, input, expected) in [
             (
                 ReductionKind::Max,
@@ -4558,12 +4546,12 @@ mod tests {
             ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let input = ArrayBatch::new(
+        let input = ragged_array_batch(
             Array::matrix(2, 3, vec![f32::NEG_INFINITY, 100.0, 100.0, -3.0, -1.0, 100.0]).unwrap(),
-            BatchAxis::new(0),
+            Array::vector(vec![1i32, 2]).unwrap(),
+            &length,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 2]).unwrap(), length.clone(), vec![0])])
         .unwrap();
         assert_eq!(
             ArgMaxOperation::new(0, DataType::I32)
@@ -4770,12 +4758,12 @@ mod tests {
             ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let input = ArrayBatch::new(
+        let input = ragged_array_batch(
             Array::matrix(2, 3, vec![f32::INFINITY, -100.0, -100.0, 3.0, 1.0, -100.0]).unwrap(),
-            BatchAxis::new(0),
+            Array::vector(vec![1i32, 2]).unwrap(),
+            &length,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 2]).unwrap(), length.clone(), vec![0])])
         .unwrap();
         assert_eq!(
             ArgMinOperation::new(0, DataType::I32)

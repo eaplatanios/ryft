@@ -172,12 +172,12 @@ use thiserror::Error;
 use crate::arrays::sharding::meshes::render_mesh_axis_name;
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType,
-    Dimension, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, Shape, Sharding,
-    ShardingDimension, ShardingError,
+    Dimension, DimensionType, DimensionValue, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension,
+    ShardingError,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BoundaryLayout,
+    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
@@ -459,32 +459,6 @@ pub enum ShardMapError {
         "batching a `shard_map` over mapped inputs requires a static batch extent, but it has type `{extent_type}`"
     )]
     DynamicBatchExtentNotSupported { extent_type: DimensionType },
-
-    /// Error returned when batching a `shard_map` over a bounded ragged carrier (i.e., one whose packed value carries
-    /// the per-item extents of a dynamic dimension) at one of its boundary positions. Structural batching transports
-    /// such extents through sealed program boundaries as ordinary integer slots, but the body would have to receive
-    /// the ragged dimension as a dynamic dimension of its local boundary type, and shard-map boundary types are static
-    /// (refer to the `# Static Boundaries` section of the documentation of [`ShardMapOperation`]). Valid programs do
-    /// not reach this error through public construction, because a value whose per-item type names a ragged
-    /// dimension cannot be passed to a static boundary in the first place.
-    #[error(
-        "batching a `shard_map` cannot pass the per-item extents of bounded ragged dimension `{dimension}` of \
-         {value_kind} #{value_index} through its boundary, whose types are static"
-    )]
-    RaggedBoundaryValueNotSupported { value_kind: &'static str, value_index: usize, dimension: DimensionVariable },
-
-    /// Error returned when batching a `shard_map` over a bounded ragged input whose ragged dimension its input
-    /// sharding partitions along an active manual axis. Every device would receive a shard of the packed capacity of
-    /// that dimension, whose per-device extents differ from the global per-item extents, and `shard_map` defines no
-    /// conversion from the global extents to the local extents of its shards. This restriction is independent of the
-    /// static boundary types that [`ShardMapError::RaggedBoundaryValueNotSupported`] describes, so it is reported
-    /// first.
-    #[error(
-        "batching a `shard_map` cannot partition bounded ragged dimension `{dimension}` of input #{input_index} \
-         along manual axis `{axis_name}`, because the local extents of its shards are not derived from its global \
-         per-item extents"
-    )]
-    PartitionedRaggedDimensionNotSupported { input_index: usize, dimension: DimensionVariable, axis_name: String },
 
     /// Error returned when batching a `shard_map` over mapped inputs places the batch axis on a mesh axis that an input
     /// or output sharding of the `shard_map` names (as JAX rejects a `spmd_axis_name` that its `in_specs` or
@@ -1336,8 +1310,7 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// effect (refer to the batching errors of [`ShardMapError`]). A forwarded reference output keeps the batch axis of the
 /// reference input that it forwards, and an unbatched reference input is shared by every batch item, so writing a
 /// batched value into it is rejected. A dynamic batch extent is rejected whenever a boundary position is mapped or the
-/// body uses the extent, and so is a bounded ragged input, because boundary types are static (refer to the `# Static
-/// Boundaries` section below).
+/// body uses the extent, because boundary types are static (refer to the `# Static Boundaries` section below).
 ///
 /// Interpretation over the [`Array`] values of the reference backend (i.e., in a domain whose values are
 /// [`ArrayIrValue<Array>`]) emulates the devices in lockstep: every global input is split into the shard of each device
@@ -2070,7 +2043,7 @@ where
         // final state is typed by the input it replaces (the allocation's current state) rather than by the declared
         // global referent, because the declared boundary type may omit sharding metadata that the allocation carries
         // and the discharged state must match the allocation's referent type exactly.
-        let discharged_inputs = inputs
+        let boundary_inputs = inputs
             .iter()
             .zip(&allocations)
             .map(|(input, allocation)| match allocation {
@@ -2091,7 +2064,7 @@ where
             .map(|&index| self.shard_map.out_shardings()[index].clone())
             .collect::<Vec<_>>();
         for &index in &mutated_inputs {
-            output_types.push(discharged_inputs[index].r#type().into_owned());
+            output_types.push(boundary_inputs[index].r#type().into_owned());
             out_shardings.push(self.shard_map.in_shardings()[index].clone());
         }
         let shard_map = ShardMap::from_shardings(
@@ -2101,7 +2074,7 @@ where
             self.shard_map.manual_axes().to_vec(),
         );
         let operation = ShardMapOperation::from_boundary(shard_map, input_types, output_types);
-        let mut outputs = context.parent().bind(operation, vec![program], &discharged_inputs)?;
+        let mut outputs = context.parent().bind(operation, vec![program], &boundary_inputs)?;
         check_count!("output", outputs, value_output_indices.len() + mutated_inputs.len(), ProgramError);
         let final_states = outputs.split_off(value_output_indices.len());
         for (index, final_state) in mutated_inputs.iter().zip(final_states) {
@@ -2336,17 +2309,13 @@ where
 // and is rejected with `ShardMapError::DynamicBatchExtentNotSupported` otherwise. That rejection is deliberate rather
 // than a gap: padding the batch to a static bound would run the body on padding items, which effectful bodies and
 // bodies that write through references would observe, and JAX also supports only static batch sizes here (its
-// `_shard_map_batch` computes them with integer arithmetic). The body is batched over the input layout of the shared
-// boundary transport (refer to `ArrayIrBoundaryLayout`), whose level-extent slot the rule replaces by a constant of
-// the same static type inside the body (or drops when the body does not use it), so that no dimension crosses the
-// boundary, and the batched body keeps exactly the payload slots of its output layout as outputs, which removes the
-// level extent that structurally batched programs forward. Bounded ragged inputs are rejected even though the shared
-// transport carries their per-item extents as ordinary integer slots: their per-item boundary types name the ragged
-// dimension, which a static boundary cannot declare (`ShardMapError::RaggedBoundaryValueNotSupported`), and a ragged
-// dimension that the input sharding partitions along an active manual axis would additionally need local per-item
-// extents for every shard, which `shard_map` does not define (`ShardMapError::PartitionedRaggedDimensionNotSupported`).
-// Valid programs do not reach either rejection through public construction, because a value whose per-item type names
-// a ragged dimension cannot be passed to a static boundary in the first place.
+// `_shard_map_batch` computes them with integer arithmetic). The structurally batched body receives the extent as a
+// leading dimension input (refer to `ArrayIrBatchingPolicy`), which the rule replaces by a constant of the same static
+// type inside the body (or drops when the body does not use it), so that no dimension crosses the boundary. Ragged
+// inputs are rejected because their per-item extents would be lost at the boundary. Supporting them needs ragged-aware
+// structural program batching that threads the per-item lengths through the boundary as inputs, which `scan`,
+// `condition`, and kernels need as well and which should therefore be shared among them rather than built for this rule
+// alone.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation
 where
     C: Context<
@@ -2361,44 +2330,6 @@ where
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         check_count!("input", inputs, self.input_types.len(), ProgramError);
-
-        // Structural batching transports the per-item extents of bounded ragged carriers through sealed program
-        // boundaries, but this boundary cannot receive them (refer to the rationale above), so each one is rejected
-        // with the limitation that it hits before any batching work starts: a ragged dimension that the input sharding
-        // partitions along an active manual axis has no local per-item extents, and every other one would need a
-        // dynamic local boundary type.
-        let to_batching_error = |error: ShardMapError| BatchingError::from(ProgramError::from(error));
-        for (input_index, input) in inputs.iter().enumerate() {
-            for ragged_axis in input.ragged_axes() {
-                // A ragged carrier is mapped, and the per-item position of its ragged axis skips the batch axis.
-                let position = match input.batch_axis_position() {
-                    Some(batch_position) if batch_position < ragged_axis.axis() => ragged_axis.axis() - 1,
-                    _ => ragged_axis.axis(),
-                };
-                if let Some(ShardingDimension::Sharded(axis_names)) =
-                    self.shard_map.in_shardings()[input_index].dimensions().get(position)
-                    && let Some(axis_name) =
-                        axis_names.iter().find(|axis_name| self.shard_map.manual_axes().contains(axis_name))
-                {
-                    return Err(to_batching_error(ShardMapError::PartitionedRaggedDimensionNotSupported {
-                        input_index,
-                        dimension: ragged_axis.dimension().clone(),
-                        axis_name: axis_name.clone(),
-                    }));
-                }
-            }
-        }
-        if let Some((input_index, ragged_axis)) = inputs
-            .iter()
-            .enumerate()
-            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
-        {
-            return Err(to_batching_error(ShardMapError::RaggedBoundaryValueNotSupported {
-                value_kind: "input",
-                value_index: input_index,
-                dimension: ragged_axis.dimension().clone(),
-            }));
-        }
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
 
         // A call whose inputs are all unbatched computes the same values for every batch item when no collective in its
@@ -2408,6 +2339,9 @@ where
             let outputs = context.parent().bind(self.clone(), vec![driver.region(0)?.to_program()], &input_values)?;
             return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>().into());
         }
+        // Ragged batching needs ragged-aware structural program batching shared with `scan`, `condition`, and kernels,
+        // and dynamic extents are rejected deliberately (refer to the rationale above).
+        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
         let extent_type = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.clone();
         let static_extent = || {
             extent_type.extent().ok_or_else(|| {
@@ -2420,16 +2354,13 @@ where
             static_extent()?;
         }
 
-        // Batch the local body over the input layout, whose slots are the level extent followed by the packed payload
-        // of every input (the checks above leave no extent slot). Inside the body, the level extent is replaced by a
-        // constant of its own static type, so that the batched body keeps the boundary of the source body, and a body
-        // that does not use it (e.g., one whose values are all unbatched) drops it instead, so that it needs no static
-        // extent. The body keeps exactly the payload slots of its output layout as outputs, which drops the level
-        // extent that the batched program forwards. Inside the body, the batch dimension keeps only the `Explicit` axes
-        // of its placement, because a placement on a manual axis would make the batched body values vary along it
-        // (refer to the rationale above).
+        // Batch the local body at the mapped input axes, and replace its leading extent input and output by a constant
+        // of the extent's own static type, so that the batched body keeps the boundary of the source body. A body that
+        // does not use the extent (e.g., one whose values are all unbatched) drops it instead, so that it needs no
+        // static extent. Inside the body, the batch dimension keeps only the `Explicit` axes of its placement, because
+        // a placement on a manual axis would make the batched body values vary along it (refer to the rationale above).
         let body = driver.region(0)?;
-        let (input_layout, input_slots) = driver.pack_boundary(context, inputs)?;
+        let input_axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
         let body_context = match context.axis_sharding() {
             ShardingDimension::Sharded(axis_names) => {
                 let mesh = self.shard_map.mesh();
@@ -2447,48 +2378,34 @@ where
             }
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => context.clone(),
         };
-        let (batched_body, input_layout, output_layout, evidence) = driver
-            .batch_program(&body_context, body, &input_layout, ProgramBatchingOutputAxesPolicy::Natural)?
+        let (batched_body, output_axes) = driver
+            .batch_program(&body_context, body, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
-
-        // Output extents would equally need a dynamic boundary type, which the static output types of a body never
-        // produce, so this only guards the boundary against bodies that were assembled without validation.
-        for carrier in 0..output_layout.carrier_count() {
-            if let Some(slot) = output_layout.extent_slots(carrier).first() {
-                return Err(to_batching_error(ShardMapError::RaggedBoundaryValueNotSupported {
-                    value_kind: "output",
-                    value_index: carrier,
-                    dimension: output_layout.extent_identity(*slot).unwrap().clone(),
-                }));
-            }
-        }
-        let output_axes = output_layout.batch_axes();
-        let output_slots = output_layout.payload_slots();
-        let output_ids = output_slots.iter().map(|slot| batched_body.output_ids()[*slot]).collect::<Vec<_>>();
-        let (live_body, live_inputs) = batched_body.filtered(batched_body.input_ids(), &output_ids, &[])?;
-        let payload_slots = input_layout.payload_slots();
+        check_count!("output", batched_body.output_ids(), output_axes.len() + 1, ProgramError);
+        let (live_body, live_inputs) =
+            batched_body.filtered(batched_body.input_ids(), &batched_body.output_ids()[1..], &[])?;
         let batched_body = {
             let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-            let mut slot_atoms = vec![None; input_layout.slot_count()];
-            if let Some(slot) = input_layout.level_extent()
-                && live_inputs.contains(&slot)
-            {
+            let body_extent = if live_inputs.contains(&0) {
                 let extent = DimensionValue::new(extent_type.clone(), static_extent()?).map_err(ProgramError::from)?;
-                slot_atoms[slot] =
-                    Some(builder.add_instruction(ConstantOperation::new(extent), Vec::new(), Vec::new(), None)?[0]);
-            }
-            let input_types = batched_body.input_types();
-            for slot in &payload_slots {
-                slot_atoms[*slot] = Some(builder.add_input(input_types[*slot].clone()));
-            }
-
-            // Every live input slot is either the live level extent or a payload slot, since no extent slot exists.
-            let live_body_inputs = live_inputs.iter().map(|slot| slot_atoms[*slot].unwrap()).collect::<Vec<_>>();
+                Some(builder.add_instruction(ConstantOperation::new(extent), Vec::new(), Vec::new(), None)?[0])
+            } else {
+                None
+            };
+            let body_inputs = batched_body.input_types()[1..]
+                .iter()
+                .cloned()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let live_body_inputs = live_inputs
+                .iter()
+                .map(|&index| if index == 0 { body_extent.unwrap() } else { body_inputs[index - 1] })
+                .collect::<Vec<_>>();
             let body_outputs = builder.splice_program(&live_body, live_body_inputs.as_slice())?;
             builder
                 .build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
-                    vec![Placeholder; payload_slots.len()],
+                    vec![Placeholder; body_inputs.len()],
                     vec![Placeholder; output_axes.len()],
                 )?
                 .simplified()?
@@ -2535,6 +2452,7 @@ where
                     });
                 }
             };
+            let to_batching_error = |error: ShardMapError| BatchingError::from(ProgramError::from(error));
             let (placement, manual_axes) =
                 self.shard_map.batched_placement(placement_axes, driver.region(0)?).map_err(to_batching_error)?;
             let batch_dimension = Dimension::Static(static_extent()?);
@@ -2594,15 +2512,14 @@ where
         let operation = ShardMapOperation::from_boundary(shard_map, input_types, output_types)
             .with_output_forwarding(self.output_forwarding.clone())
             .map_err(ProgramError::from)?;
-        let boundary_values = payload_slots.iter().map(|slot| input_slots[*slot].clone()).collect::<Vec<_>>();
-        let outputs = context.parent().bind(operation, vec![batched_body], &boundary_values)?;
+        let outputs = context.parent().bind(operation, vec![batched_body], &input_values)?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        let outputs = outputs
+        Ok(outputs
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| ArrayIrBatch::new(output, axis))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(BatchedOutputs::new(outputs, evidence))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -5243,10 +5160,10 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex,
         ArraySliceAxis, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Memory, MeshAxis,
-        RaggedAxis, TiledLayout,
+        TiledLayout,
     };
     use crate::axes::AxisError;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingLevelExtent, BatchingTracer, batch};
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingLevelExtent, batch};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationRule, Linearization, NothingSavable, differentiate_at, rematerialize};
@@ -10838,8 +10755,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_batching_rejects_ragged_inputs() {
-        // The per-item extents of a bounded ragged batch would have to reach the body as a dynamic dimension of its
-        // local boundary type, but shard-map boundary types are static, so the input is rejected before batching.
+        // A bounded ragged batch would lose its per-item extents at the static boundary, so it is rejected.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
         let operation = ShardMapOperation::from_boundary(
             ShardMap::from_shardings(
@@ -10862,94 +10778,11 @@ mod tests {
             TestEagerContext::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let expected =
-            ShardMapError::RaggedBoundaryValueNotSupported { value_kind: "input", value_index: 0, dimension: length };
         assert!(matches!(
             operation.batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`shard_map` does not support bounded ragged dimension `length` on input 0",
         ));
-        assert_eq!(
-            expected.to_string(),
-            "batching a `shard_map` cannot pass the per-item extents of bounded ragged dimension `length` of input #0 \
-             through its boundary, whose types are static",
-        );
-    }
-
-    #[test]
-    fn test_shard_map_batching_rejects_partitioned_ragged_inputs() {
-        // A ragged dimension that the input sharding partitions along an active manual axis would need local per-item
-        // extents for every shard, which is reported ahead of the static boundary, wherever the batch axis lies.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let operation = ShardMapOperation::from_boundary(
-            ShardMap::from_shardings(
-                manual_mesh(),
-                vec![sharded_along_x()],
-                vec![sharded_along_x()],
-                vec!["x".to_string()],
-            ),
-            vec![f32_vector_type(4)],
-            vec![f32_vector_type(4)],
-        );
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            TestEagerContext::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let extents = ArrayIrValue::Array(Array::vector(vec![3i32, 1]).unwrap());
-        let values = vec![1.0f32, 2.0, 3.0, 0.0, 4.0, 0.0, 0.0, 0.0];
-        for (input, batch_axis, ragged_axis) in
-            [(Array::matrix(2, 4, values.clone()).unwrap(), 0, 1), (Array::matrix(4, 2, values).unwrap(), 1, 0)]
-        {
-            let input = ArrayIrBatch::new(ArrayIrValue::Array(input), BatchAxis::new(batch_axis))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(ragged_axis, extents.clone(), length.clone(), vec![batch_axis])])
-                .unwrap();
-            let expected = ShardMapError::PartitionedRaggedDimensionNotSupported {
-                input_index: 0,
-                dimension: length.clone(),
-                axis_name: "x".to_string(),
-            };
-            assert!(matches!(
-                operation.batch(&context, &EmptyRegionDriver, &[input]),
-                Err(BatchingError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-            ));
-            assert_eq!(
-                expected.to_string(),
-                "batching a `shard_map` cannot partition bounded ragged dimension `length` of input #0 along manual \
-                 axis `x`, because the local extents of its shards are not derived from its global per-item extents",
-            );
-        }
-    }
-
-    #[test]
-    fn test_shard_map_batching_of_ragged_invocations_rejects_dynamic_boundary_types() {
-        // Valid programs do not reach the ragged rejections of the batching rule: the per-item type of a ragged batch
-        // names its ragged dimension, so invoking `shard_map` on it already fails boundary construction.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let mesh = manual_mesh();
-        let replicated = Sharding::replicated(mesh.clone(), 1);
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            TestEagerContext::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![2.0f32, 1.0, 0.0, 3.0, 0.0, 0.0]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![2i32, 1]).unwrap()),
-            &length,
-            1,
-        )
-        .unwrap();
-        let input = ValueProjection::<ArrayType>::into_projected(BatchingTracer::new(context, input)).unwrap();
-        let result = shard_map(
-            |x: ShardMapTracer<BatchingContext<TestEagerContext, ArrayIrBatchingPolicy>>| x.clone() + x,
-            input,
-            mesh,
-            replicated.clone(),
-            replicated,
-        );
-        assert_eq!(
-            result.map(|_| ()),
-            Err(ShardMapError::DynamicShapeNotSupported { value_kind: "input", value_index: 0, dimension: 0 }),
-        );
     }
 
     #[test]

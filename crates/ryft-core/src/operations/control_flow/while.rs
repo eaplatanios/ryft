@@ -14,7 +14,7 @@ use crate::batching::{
     BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
 use crate::captures::CaptureReference;
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer, ResidualZeroProvider,
@@ -836,6 +836,10 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Structural loop replay has no carrier for per-item extents, so bounded ragged state is rejected before either
+        // region is batched.
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
+
         // The rule requests all nested-computation work through its region access (region 0 is the condition and
         // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
         let state_count = inputs.len();
@@ -1032,6 +1036,9 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // Structural loop replay has no carrier for per-item extents, so bounded ragged state is rejected before either
+        // region is batched.
+        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
         let condition_region = driver.region(0)?;
         let body_region = driver.region(1)?;
         let state_count = inputs.len();
@@ -1245,6 +1252,8 @@ where
 // [`WhileResidualStackType`] and [`WhileResidualStackOperation`] describe.
 impl<C> DifferentiableOperation<C> for WhileOperation<C::Type>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
     C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>
@@ -1276,6 +1285,7 @@ where
 
 impl<V: Value, O> TransposableOperation<V, O> for WhileOperation<V::Type>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V::Type: WhileType,
     O: Operation<Type = V::Type>,
 {
@@ -1590,9 +1600,10 @@ fn split_while_by_closed_knownness<V, O, C, D>(
     driver: &D,
 ) -> Result<Option<Vec<PartialEvaluationValue<C::Value>>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value,
     V::Type: WhileType,
-    C: Context<Constant = V, Operation = O>,
+    C: Context<Type = V::Type, Constant = V, Operation = O>,
     O: Operation<Type = V::Type> + From<WhileOperation<V::Type>>,
     D: PartialEvaluationDriver<C>,
 {
@@ -2064,6 +2075,8 @@ fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, P: DifferentiationPoli
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -2122,6 +2135,8 @@ fn jvp_while_bounded<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>
     bound: usize,
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + WhileResidualStackOperation<C::Type>
@@ -2347,8 +2362,8 @@ where
         .flatten()
         .map(|&state_index| tangent_inputs[state_index].primal().clone())
         .collect::<Vec<_>>();
-    // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits, because
-    // the tangent type derivation preserves geometry exactly.
+    // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits, because the
+    // tangent type derivation preserves shapes exactly.
     for (input, &active) in tangent_inputs.iter().zip(&element_has_tangent) {
         if active {
             tangent_scan_inputs.push(C::Operation::materialize_zero_from_residual_sources(
@@ -2459,6 +2474,8 @@ fn jvp_while_fused<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType + WhileType,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<WhileOperation<C::Type>>,
@@ -2505,7 +2522,7 @@ where
 
     // Stage the fused loop over the instruction input primals followed by the materialized tangents of the live
     // differential state elements — the fused body takes each of those tangents as a real program input, so their
-    // structural zeros are materialized against their own primal, which supplies the runtime geometry a
+    // structural zeros are materialized against their own primal, which supplies the runtime extents a
     // reference-bearing tangent type omits — and zip the output halves back into `DifferentiationDual`s in the original
     // state order, restoring structural zeros for the omitted zero-space state elements.
     let fused_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
@@ -2586,6 +2603,8 @@ fn jvp_while_eagerly<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, ProgramError>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType + WhileType,
     C::Value: Concretizable<bool>,
@@ -2694,6 +2713,7 @@ fn vary_while_index_or_mask<V, O>(
     target: &ArrayType,
 ) -> Result<Tracer<TracingContext<V, O>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: WhileResidualStackType>,
     O: WhileResidualStackOperation<V::Type>,
 {
@@ -2755,6 +2775,7 @@ fn build_bounded_while_programs<V, O>(
     bound: usize,
 ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, Vec<V::Type>), ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: WhileResidualStackType>,
     O: WhileResidualStackOperation<V::Type>,
 {
@@ -2974,6 +2995,7 @@ fn masked_while_programs<V, O>(
     body: &Program<V, O, Vec<V>, Vec<V>>,
 ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: WhileResidualStackType>,
     O: WhileResidualStackOperation<V::Type>,
 {
@@ -3258,6 +3280,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::arrays::batching::testing::ragged_batch;
     use crate::arrays::{
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,
@@ -3274,6 +3297,7 @@ mod tests {
     use crate::operations::arithmetic::{
         AddOperation, DivOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, SubOperation,
     };
+    use crate::operations::assertions::GuardOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
@@ -3294,9 +3318,9 @@ mod tests {
     use crate::parameters::Parameter;
     use crate::partial::{PartialTracer, ResidualInputSource};
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
-        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary,
-        ValueDirectDispatch,
+        BindingRegionDriver, EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, InstructionId, Provenance,
+        ProvenanceScope, ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType,
+        RegionDataFlowRegionBoundary, ValueDirectDispatch,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
@@ -6429,6 +6453,12 @@ mod tests {
             }
         }
     }
+    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for TestOperation {
+        type Operation = Self;
+        fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
 
     impl<C: Domain<Type = ArrayType, Value = TestValue>> InterpretableOperation<C> for TestOperation
     where
@@ -8884,6 +8914,30 @@ mod tests {
         let expected =
             vec![TestIrValue::Dimension(axis_extent), TestIrValue::Array(Array::vector(vec![8.0f32, 80.0]).unwrap())];
         assert_eq!(discharged.into_parts().0.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_composite_while_batching_rejects_ragged_inputs_before_transforming_regions() {
+        // Structural loop batching sees only the mapped axis, so bounded ragged state is rejected before either region
+        // is batched. An empty driver also proves that the rejection precedes any region transformation.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestIrValue, TestIrOperation>::new(),
+            TestIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ragged_batch(
+            array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+            array(Array::vector(vec![1i64, 2]).unwrap()),
+            &length,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            WhileOperation::new().batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "`while` does not support bounded ragged dimension `length` on input 0".to_string(),
+            },
+        );
     }
 
     #[test]

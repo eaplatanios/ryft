@@ -13,7 +13,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy, batch_projected_operation,
 };
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
@@ -79,10 +79,10 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// of inactive branches still execute and can fail, but gradient propagation into their inputs is stopped before branch
 /// evaluation so inactive non-finite derivatives do not contaminate the selected derivative. The selected branch must
 /// still have a defined derivative. With a replicated predicate, structural branch batching does not carry bounded
-/// ragged geometry across its branch boundaries, so bounded ragged inputs are rejected before either branch is batched.
+/// ragged extents across its branch boundaries, so bounded ragged inputs are rejected before either branch is batched.
 /// Composite staging with a mapped predicate also rejects branch-local type identities. Replaying both branches into
 /// one parent trace loses their separate definition scopes, and freshening those definitions alone would leave any
-/// dependent array geometry needing a runtime join. Dimension identities established by branch inputs remain supported.
+/// dependent array shapes needing a runtime join. Dimension identities established by branch inputs remain supported.
 ///
 /// Forward-mode differentiation requires matching reference-output tangent slots in both branches. A reference
 /// forwarded from an active input in only one branch is rejected, because synthesizing a tangent reference for its
@@ -138,9 +138,9 @@ impl<T: ConditionType> ConditionOperation<T> {
     /// `region_interfaces`, and returns its output types. Both branches must declare the same input types, the
     /// predicate must be a scalar Boolean, and every value input must refine its declared branch input type. Reference
     /// inputs must equal their declared types, except that a live reference handle may refine its declared referent:
-    /// its concrete geometry then participates in refinement, while the declared type remains its allocation contract.
-    /// The declared branch outputs must agree after applying the facts that the inputs establish (e.g., `f64[extent]`
-    /// and `f64[3]` agree for an `f64[3]` input), and every output must satisfy the predicate's manual variation
+    /// its concrete shape then participates in refinement, while the declared type remains its allocation contract. The
+    /// declared branch outputs must agree after applying the facts that the inputs establish (e.g., `f64[extent]` and
+    /// `f64[3]` agree for an `f64[3]` input), and every output must satisfy the predicate's manual variation
     /// requirements (refer to [`ConditionType::validate_condition_output`]).
     ///
     /// # Parameters
@@ -168,7 +168,7 @@ impl<T: ConditionType> ConditionOperation<T> {
         for (index, (declared, actual)) in branch_input_types.iter().zip(&input_types[1..]).enumerate() {
             if declared.is_reference() && actual.is_reference() && is_live_input(index) {
                 // Reference outputs retain their declared types. Keep their input identities in scope even when a live
-                // handle's concrete referent supplies static geometry to output refinement.
+                // handle's concrete referent supplies static extents to output refinement.
                 identity_input_types[index + 1] = declared.clone();
             } else if let Some(relation) = region_input_mismatch(declared, actual) {
                 return Err(TypeError::invalid(format!(
@@ -198,12 +198,12 @@ impl<T: ConditionType> ConditionOperation<T> {
 
     /// Returns whether replaying both branches at the actual branch input types `input_types[1..]` preserves the
     /// validity of this application, i.e., whether the two refined branch signatures agree and satisfy the predicate's
-    /// manual variation requirements. Replay can refine geometry, but cannot repair mismatched metadata or supply a
+    /// manual variation requirements. Replay can refine shapes, but cannot repair mismatched metadata or supply a
     /// missing variation contract, so specialization is requested only when it cannot change which applications are
     /// accepted. Branch input types are compared after refinement because `region_interfaces` may be partially
     /// reconciled (i.e., one branch already specialized and its peer not yet), and reference outputs are refined too,
-    /// so that specializing the first branch does not prevent specializing its peer. The original branches are
-    /// required to declare the same input types separately (refer to [`Operation::validate_region_interfaces`]).
+    /// so that specializing the first branch does not prevent specializing its peer. The original branches are required
+    /// to declare the same input types separately (refer to [`Operation::validate_region_interfaces`]).
     fn admits_specialization(input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> bool {
         let refined_signatures = region_interfaces
             .iter()
@@ -462,7 +462,7 @@ where
         // inputs as one complete signature against its declared input types before any of its work executes. That
         // check accepts the concrete referents of live reference handles as refinements of symbolic allocation types,
         // and requires shared dimension identities to agree across arrays and reference referents. Compare the outputs
-        // after applying those same input facts so eager binding and program construction accept the same geometry.
+        // after applying those same input facts so eager binding and program construction accept the same shapes.
         let [true_branch, false_branch] = self.branches(driver, inputs.len())?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validated_output_types(&input_types, &[true_branch.interface(), false_branch.interface()], |_| true)?;
@@ -475,8 +475,12 @@ where
 //
 // With a [`Known`](PartialValue::Known) predicate that the known-side context can [`resolve`](Context::resolve) to a
 // [`Constant`](crate::ValueResolution::Constant) payload whose value can be concretized as a Boolean, it selects the
-// taken branch and inlines it via [`PartialEvaluationContext::inline_program`], so the condition disappears from the
-// residual program; the inlined branch is fed the remaining inputs. A known predicate that is *not* concretizable —
+// taken branch and always inlines it over the remaining inputs, so the condition disappears from the residual program.
+// Inlining enters the branch through the shared guarded region entry, which stages a guard for every relationship
+// between its inputs that their actual types leave unproven (e.g., a computed `dimension<2>` next to an unknown
+// `f32[n]`, both entering at `n`). The guard stays in the residual program when one of its members is unknown and keeps
+// later ordered known effects of the inlined body behind that check, so the residual program accepts and rejects the
+// same inputs that the branch entry would. A known predicate that is *not* concretizable —
 // under a staging known-side context, a genuine [`Tracer`] into the outer program — cannot select a branch at
 // partial-evaluation time; the condition is instead split by `split_condition_by_knownness` into a *known* condition
 // bound in the enclosing known-side context (so known branch work stays behind the conditional instead of being staged
@@ -513,10 +517,10 @@ where
             .and_then(|predicate| context.parent().resolve(predicate).into_constant())
             .and_then(|predicate| predicate.concretize().ok())
             .map(|predicate| if predicate { 0 } else { 1 });
-        // Inlining a selected branch enters it like eager interpretation, which accepts live reference handles whose
-        // referents refine its symbolic allocation types. Otherwise, known eager references retain the declared
-        // allocation boundary while their actual referents establish geometry, and unknown and symbolic known
-        // references still require the exact primitive reference types.
+        // Inlining a selected branch through its guarded entry enters it like eager interpretation, which accepts live
+        // reference handles whose referents refine its symbolic allocation types. Otherwise, known eager references
+        // retain the declared allocation boundary while their actual referents establish extents, and unknown and
+        // symbolic known references still require the exact primitive reference types.
         self.validated_output_types(&input_types, &region_interfaces, |index| {
             selected_branch.is_some() || (context.parent().is_eager() && inputs[index + 1].is_known())
         })?;
@@ -524,33 +528,6 @@ where
         // region 1 the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
         // Input 0 is the predicate; inputs 1.. feed both branches.
         if let Some(index) = selected_branch {
-            let branch = driver.region(index)?;
-            let declared_types = branch.input_types();
-            let refinements = <C::Type as Type>::Refinements::new(declared_types.iter(), &input_types[1..])?;
-            // Inlining the selected branch removes its entry, which validates the relationships between the identities
-            // that its inputs share. A computed unknown value already has a residual type, so when the actual input
-            // types leave a relationship that such a value takes part in unproven (e.g., a locally known `f32[3]` next
-            // to an unknown `f32[n]`), the branch entry is its only check, and the selected condition is retained.
-            // Relationships that the actual types prove (e.g., a known and an unknown `f32[n]`) survive inlining.
-            let unproven = refinements.identities_needing_runtime_checks();
-            let retained = declared_types.iter().zip(&inputs[1..]).any(|(declared, input)| {
-                input.is_unknown() && declared.identities().any(|(_, identity)| unproven.contains(identity))
-            });
-            if retained {
-                let mut retained_inputs = inputs.to_vec();
-                if context.parent().is_eager() {
-                    for (declared, input) in declared_types.iter().zip(&mut retained_inputs[1..]) {
-                        if input.is_known() && declared.is_reference() && *input.r#type() != *declared {
-                            *input = context.preserve_reference_input(input, declared)?;
-                        }
-                    }
-                }
-                return context.fold_or_residualize(
-                    O::from(*self),
-                    driver.regions().map(|region| region.to_program()).collect(),
-                    &retained_inputs,
-                );
-            }
             return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
         }
         if inputs[0].is_known() {
@@ -758,7 +735,8 @@ where
 // staged replay rejects branch-local type identities whose definition scopes would be lost when the branches flatten.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
 where
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
                            + From<ConditionOperation<ArrayIrType>>
@@ -766,7 +744,6 @@ where
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: DimensionSize
         + Assert
         + DynamicBroadcast
@@ -896,7 +873,7 @@ where
         }
         // Replaying branches into one trace does not relocate their internal identities. Definitions would collide
         // across the two branches or a repeated invocation, and merely freshening them would leave dependent arrays
-        // with unrelated geometry at selection. Input-established identities retain their existing authority.
+        // with unrelated shapes at selection. Input-established identities retain their existing authority.
         if !context.parent().is_eager() {
             for (branch_name, region) in [("true", true_region), ("false", false_region)] {
                 if let Some(identity) = region.type_identity_signature().internal_identities().first() {
@@ -1014,10 +991,10 @@ where
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
 
-        // Region replay validates ragged geometry at every branch instruction, and selection preserves compatible
-        // output carriers. An input dimension absent from all selected outputs was therefore consumed inside the
-        // branches or belonged to an unused input. Attest to that consumption at the enclosing condition boundary,
-        // where the instruction-local evidence of the branch reductions is no longer available.
+        // Region replay validates ragged extents at every branch instruction, and selection preserves compatible output
+        // carriers. An input dimension absent from all selected outputs was therefore consumed inside the branches or
+        // belonged to an unused input. Attest to that consumption at the enclosing condition boundary, where the
+        // instruction-local evidence of the branch reductions is no longer available.
         let mut consumed_dimensions = Vec::new();
         for dimension in inputs.iter().flat_map(ArrayIrBatch::ragged_axes).map(|axis| axis.dimension()) {
             let preserved = outputs.iter().any(|output| {
@@ -1048,7 +1025,7 @@ where
 //
 // Separate linearization partitions each branch through the differentiation driver and joins their residual boundaries.
 // The primal condition produces the selected branch's residuals and placeholders for the peer's slots; the tangent
-// condition consumes only its selected branch's residuals. Zeroable placeholders use live input geometry, and
+// condition consumes only its selected branch's residuals. Zeroable placeholders use live input extents, and
 // non-zeroable placeholders forward a known input of the identical type. Partial evaluation uses the same
 // reconstruction helper, retaining the original condition when it cannot construct a safe placeholder.
 //
@@ -1056,6 +1033,8 @@ where
 // conditional selects the same branch for both halves because they share the same primal predicate edge.
 impl<C> DifferentiableOperation<C> for ConditionOperation<C::Type>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type: ConditionType + DifferentiableType> + Zero<C::Value>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<ConditionOperation<C::Type>>,
 {
@@ -1203,7 +1182,7 @@ where
                     // known input of the identical type instead. The placeholder is a dead output of the untaken
                     // branch, so any value of that type preserves the semantics; when no such input exists, the shared
                     // residual boundary cannot be constructed. Zeroable edges instead use the residual-zero protocol,
-                    // which reads their live geometry from the known inputs.
+                    // which reads their live extents from the known inputs.
                     if edge_type.validate_zero().is_err() {
                         return Ok(known_inputs
                             .iter()
@@ -1287,6 +1266,7 @@ where
 // returned as a value.
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<ArrayType>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType>
         + ResidualZeroProvider<ArrayType, Operation = O>
@@ -1320,6 +1300,7 @@ where
 // on first use when their state cotangent is live) before the shared rule passes them into both transposed branches.
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<ArrayIrType>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
@@ -1681,6 +1662,7 @@ fn split_condition_by_knownness<V: Value, O, C, D: PartialEvaluationDriver<C>>(
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V::Type: ConditionType,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
     O: Operation<Type = V::Type>
@@ -1909,7 +1891,7 @@ where
 
     // Build each known branch over the shared `[known outputs..., true edges..., false edges...]` output signature,
     // filling the peer branch's edge slots with placeholders. The caller decides how to construct them: partial
-    // evaluation accepts only identity-free typed zeros, while differentiation can obtain runtime geometry from the
+    // evaluation accepts only identity-free typed zeros, while differentiation can obtain runtime extents from the
     // known branch inputs or forward a known input of the identical type. Both branches are built before binding either
     // condition so an unsupported placeholder can retain the original conditional without staging any work in the
     // caller's context.
@@ -2200,9 +2182,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if the boundary counts disagree, the predicate has no known value, a branch cannot be transposed,
-/// a structural zero cannot be reconstructed from the available runtime geometry, or the transposed condition cannot
-/// be bound in `context`. Callers must supply a validated condition boundary with matching branch signatures.
+/// Returns an error if the boundary counts disagree, the predicate has no known value, a branch cannot be transposed, a
+/// structural zero cannot be reconstructed from the available runtime extents, or the transposed condition cannot be
+/// bound in `context`. Callers must supply a validated condition boundary with matching branch signatures.
 pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
     context: &mut TracingContext<V, O>,
     driver: &D,
@@ -2213,6 +2195,7 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
 where
     V: Value<Type: ConditionType + DifferentiableType>,
     O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O> + From<ConditionOperation<V::Type>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     // A condition with no live output cotangents and no live reference input is a zero linear map, so every input
     // cotangent is zero. A live reference input keeps the rule live, because its accumulated state cotangent flows
@@ -2315,7 +2298,7 @@ where
         }
         // A dead output's structural-zero cotangent still becomes a real input of the transposed condition. Its type
         // alone cannot construct it when it references runtime identities. Live peer cotangents and known residuals
-        // supply their geometry first. A live reference-state cotangent can keep the condition live even when every
+        // supply their extents first. A live reference-state cotangent can keep the condition live even when every
         // ordinary output cotangent is zero, so its referent is also an available source of runtime extents.
         transposed_inputs.push(O::materialize_zero_from_residual_sources(
             context,
@@ -2371,6 +2354,7 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_batch;
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
@@ -2397,6 +2381,7 @@ mod tests {
     use crate::operations::custom_functions::operations::CustomFunctionTransposeOperation;
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::DimensionAddOperation;
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
     use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
@@ -2404,11 +2389,12 @@ mod tests {
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::{Parameter, Placeholder};
-    use crate::partial::{PartialEvaluation, PartialEvaluationInput, PartialTracer, ReferencePlacement};
+    use crate::partial::{
+        PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialTracer, ReferencePlacement,
+    };
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation,
-        ReferenceAnalysisError, ReferenceDischargeResult, ReferenceSource, ReferenceType, ReferenceView, RegionDriver,
-        RegionRef, TypeError,
+        EffectClasses, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation, ReferenceAnalysisError,
+        ReferenceDischargeResult, ReferenceSource, ReferenceType, ReferenceView, RegionDriver, RegionRef, TypeError,
     };
     use crate::tracing::{DomainTracingContext, NestedTracingContext, Trace, Tracer, TracingContext};
 
@@ -5243,7 +5229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_interpretation_validates_runtime_reference_geometry() {
+    fn test_condition_interpretation_validates_runtime_reference_extents() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -6051,7 +6037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_partial_evaluation_refines_known_eager_reference_geometry() {
+    fn test_condition_partial_evaluation_refines_known_eager_reference_shape() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(vector_type));
@@ -6207,7 +6193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_partial_evaluation_specializes_residual_known_eager_reference_geometry() {
+    fn test_condition_partial_evaluation_specializes_residual_known_eager_reference_shape() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
             DataType::F32,
@@ -6343,9 +6329,10 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_partial_evaluation_retains_selected_branch_entry_relationships() {
-        // A known predicate selects the branch, which inlining would enter without its entry checks. Both branch inputs
-        // share `n`, and the branch reads only the unknown second input.
+    fn test_condition_partial_evaluation_inlines_selected_branch_with_entry_relationships() {
+        // A known predicate selects the branch, which is inlined through its guarded entry: a relationship the input
+        // types prove needs no guard, and an unproven one stays as a residual guard. Both branch inputs share `n`, and
+        // the branch reads only the unknown second input.
         let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)])).into();
         let branch = {
@@ -6437,16 +6424,16 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_partial_evaluation_retains_selected_branch_for_computed_extents() {
+    fn test_condition_partial_evaluation_inlines_selected_branch_for_computed_extents() {
         // The extent `1 + 1` is computed inside the program, so no root entry establishes it, and the array that the
-        // branch reads is a computed unknown whose residual type stays symbolic. Only the entry of the retained
-        // selected branch checks that the array's runtime extent is 2.
+        // branch reads is a computed unknown whose residual type stays symbolic. The guarded entry of the inlined
+        // selected branch checks that the array's runtime extent is 2 and narrows the array before the branch uses it.
         let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let dimension_type = DimensionType::from(n.clone());
         let vector_type: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)])).into();
         let branch = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            builder.add_input(dimension_type.into());
+            builder.add_input(dimension_type.clone().into());
             let input = builder.add_input(vector_type.clone());
             let output = builder
                 .add_instruction(
@@ -6493,27 +6480,17 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(vector_type)]).unwrap();
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(vector_type.clone())]).unwrap();
+        let guard = r#"guard [boundary="partial evaluation", types=[dimension<n ∈ [1, 8)>, f32[n]]]"#;
         assert_eq!(
             evaluation.program.to_string(),
-            indoc! {"
+            formatdoc! {"
                 lambda %0:f32[n] .
-                let %1:bool[] = const true
-                    %2:dimension<2> = const 2
-                    %3:f32[n] = add %0 %0
-                    %4:f32[2] = condition %1 %2 %3 [
-                        true={
-                            lambda %0:dimension<n ∈ [1, 8)>, %1:f32[n] .
-                            let %2:f32[n] = mul %1 %1
-                            in (%2)
-                        },
-                        false={
-                            lambda %0:dimension<n ∈ [1, 8)>, %1:f32[n] .
-                            let %2:f32[n] = mul %1 %1
-                            in (%2)
-                        },
-                    ]
-                in (%4)"},
+                let %1:dimension<2> = const 2
+                    %2:f32[n] = add %0 %0
+                    %3:dimension<2>, %4:f32[2] = {guard} %1 %2
+                    %5:f32[2] = mul %4 %4
+                in (%5)"},
         );
         let context = EagerContext::<TestValue, TestOperation>::new();
         assert_eq!(
@@ -6527,6 +6504,401 @@ mod tests {
         })));
         assert_eq!(program.interpret(vec![array(Array::vector(vec![1f32; 3]).unwrap())]), mismatch);
         assert_eq!(evaluation.interpret(&context, &[array(Array::vector(vec![1f32; 3]).unwrap())]), mismatch);
+
+        // When the selected branch writes the array through a reference whose type keeps `n`, the guarded entry checks
+        // the computed extent against both and retains `n` instead of narrowing the array, and the residual program
+        // rejects a mismatching array before the inlined write, exactly like the source program.
+        let ArrayIrType::Array(array_type) = &vector_type else { unreachable!() };
+        let reference_type: ArrayIrType = ReferenceType::new(array_type.clone()).into();
+        let branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            builder.add_input(dimension_type.into());
+            let input = builder.add_input(vector_type.clone());
+            let reference = builder.add_input(reference_type.clone());
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, input], None)
+                .unwrap();
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+        }
+        .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(vector_type.clone());
+        let reference = builder.add_input(reference_type.clone());
+        let doubled = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![input, input],
+                None,
+            )
+            .unwrap()[0];
+        let one = builder.add_constant(TestValue::Dimension(DimensionValue::new(one_type.clone(), 1).unwrap()));
+        let extent = builder
+            .add_instruction(
+                DimensionAddOperation::new(&one_type, &one_type).unwrap(),
+                Vec::new(),
+                vec![one, one],
+                None,
+            )
+            .unwrap()[0];
+        let predicate = builder.add_constant(array(Array::scalar(true).unwrap()));
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch);
+        builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrType>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, extent, doubled, reference],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(vector_type), PartialValue::Unknown(reference_type)])
+            .unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {r#"
+                lambda %0:f32[n], %1:ref<f32[n]> .
+                let %2:dimension<2> = const 2
+                    %3:f32[n] = add %0 %0
+                    %4:dimension<n ∈ [1, 8)>, %5:f32[n] = guard [
+                        boundary="partial evaluation",
+                        types=[dimension<n ∈ [1, 8)>, f32[n], ref<f32[n]>],
+                        retained=[n],
+                    ] %2 %3 %1
+                    () = reference_write %1 %5
+                in ()"#},
+        );
+        let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let inputs = vec![array(Array::vector(vec![4f32; 2]).unwrap()), TestValue::Reference(reference.clone())];
+        assert_eq!(evaluation.interpret(&context, &inputs), Ok(Vec::new()));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![8f32; 2]).unwrap()));
+        let reference = ArrayReference::new(Array::vector(vec![1f32; 3]).unwrap());
+        let inputs = vec![array(Array::vector(vec![4f32; 3]).unwrap()), TestValue::Reference(reference.clone())];
+        assert_eq!(program.interpret(inputs.clone()), mismatch);
+        assert_eq!(evaluation.interpret(&context, &inputs), mismatch);
+        assert_eq!(reference.read(), Ok(Array::vector(vec![1f32; 3]).unwrap()));
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_inlines_selected_branch_with_known_inputs() {
+        // The branch squares an array, writes the square through a reference, and returns it. All three of its inputs
+        // share the symbolic `extent` identity.
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.dimension().clone()]));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(vector_type.clone()));
+        let branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            builder.add_input(extent.clone().into());
+            let input = builder.add_input(vector_type.into());
+            let reference = builder.add_input(reference_type);
+            let output = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(MulOperation::new())),
+                    Vec::new(),
+                    vec![input, input],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, output], None)
+                .unwrap();
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+        }
+        .unwrap();
+
+        // Under an eager parent, the exact types of the known inputs prove every entry relationship, so the selected
+        // branch is inlined without a guard and folds entirely on the known side: its write through the known
+        // reference executes during partial evaluation, and the residual program keeps no `condition`, `guard`, or
+        // reference instruction.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Execute);
+        let reference = ArrayReference::new(Array::vector(vec![0f32; 2]).unwrap());
+        let inputs = [
+            context.lift(array(Array::scalar(true).unwrap())).unwrap(),
+            context.lift(dimension(&extent, 2)).unwrap(),
+            context.lift(array(Array::vector(vec![2f32, 3.0]).unwrap())).unwrap(),
+            context.lift(TestValue::Reference(reference.clone())).unwrap(),
+        ];
+        let outputs = context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs).unwrap();
+        let output = outputs[0].value().unwrap().clone();
+        drop((inputs, outputs));
+        let evaluation = context.into_evaluation(vec![output]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda  .
+                in ()"},
+        );
+        assert_eq!(
+            evaluation.outputs(),
+            [PartialEvaluationOutput::Known(array(Array::vector(vec![4f32, 9.0]).unwrap()))],
+        );
+        assert_eq!(reference.read(), Ok(Array::vector(vec![4f32, 9.0]).unwrap()));
+
+        // Known inputs that violate the shared `extent` relationship are rejected during partial evaluation, before
+        // the selected write executes, instead of being deferred to a residual entry guard.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Execute);
+        let reference = ArrayReference::new(Array::vector(vec![0f32; 2]).unwrap());
+        let inputs = [
+            context.lift(array(Array::scalar(true).unwrap())).unwrap(),
+            context.lift(dimension(&extent, 2)).unwrap(),
+            context.lift(array(Array::vector(vec![2f32, 3.0, 4.0]).unwrap())).unwrap(),
+            context.lift(TestValue::Reference(reference.clone())).unwrap(),
+        ];
+        assert_eq!(
+            context.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs).map(|_| ()),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "extent".to_string(),
+                expected: 2,
+                actual: 3,
+            }))),
+        );
+        assert_eq!(reference.read(), Ok(Array::vector(vec![0f32; 2]).unwrap()));
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_shares_known_references_with_inlined_branches() {
+        // A known live reference that enters an inlined selected branch reaches the residual program once, at its exact
+        // type, whether the handle is also used by a later instruction, by a second condition, or by an earlier
+        // instruction. The guarded entry of each inlined branch checks the unknown array against the reference before
+        // its write, and the predicate folds away.
+        let dimension = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
+        let reference_type = ReferenceType::new(array_type.clone());
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        branch.add_input(dimension.clone().into());
+        let array = branch.add_input(array_type.clone().into());
+        let reference = branch.add_input(reference_type.clone().into());
+        branch
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, array], None)
+            .unwrap();
+        let branch = branch
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+            .unwrap();
+
+        // The source program runs the condition over all four inputs and then reads the reference.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = builder.add_input(dimension.clone().into());
+        let array = builder.add_input(array_type.clone().into());
+        let reference = builder.add_input(reference_type.into());
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch.clone());
+        builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, extent, array, reference],
+                None,
+            )
+            .unwrap();
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![read], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+
+        // Bind the same instructions directly with a known predicate, extent, and reference, and an unknown array.
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let predicate = TestValue::Array(Array::scalar(true).unwrap());
+        let extent = TestValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
+        let direct = PartialEvaluationContext::new(context.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let known_reference =
+            PartialTracer::new(direct.clone(), direct.known_value(TestValue::Reference(reference.clone())));
+        let inputs = vec![
+            PartialTracer::new(direct.clone(), direct.known_value(predicate.clone())),
+            PartialTracer::new(direct.clone(), direct.known_value(extent.clone())),
+            PartialTracer::new(direct.clone(), direct.unknown_input(array_type.clone().into(), 0)),
+            known_reference.clone(),
+        ];
+        assert_eq!(
+            direct.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+            Ok(Vec::new()),
+        );
+        let read = direct.bind(ReferenceReadOperation::new(), Vec::new(), &[known_reference]).unwrap();
+        let output = read[0].value().unwrap().clone();
+        drop((inputs, read));
+        let evaluation = direct.into_evaluation(vec![output]).unwrap();
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[extent], %1:ref<f32[2]> .
+                let %2:dimension<2> = const 2
+                    %3:dimension<2>, %4:f32[2] = guard [
+                        boundary="partial evaluation",
+                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                    ] %2 %0 %1
+                    () = reference_write %1 %4
+                    %5:f32[2] = reference_read %1
+                in (%5)"#},
+        );
+
+        // The residual program rejects a mismatching array before writing and otherwise writes and reads the handle
+        // exactly like the source program does with an equal handle.
+        let mismatching = TestValue::Array(Array::vector(vec![4f32; 3]).unwrap());
+        let source_reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let mismatch = Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "extent".to_string(),
+            expected: 2,
+            actual: 3,
+        })));
+        assert_eq!(
+            program.interpret(vec![
+                predicate.clone(),
+                extent.clone(),
+                mismatching.clone(),
+                TestValue::Reference(source_reference.clone()),
+            ]),
+            mismatch,
+        );
+        assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&mismatching)), mismatch);
+        assert_eq!(reference.read(), source_reference.read());
+        assert_eq!(reference.read().unwrap(), Array::vector(vec![1f32; 2]).unwrap());
+        let matching = TestValue::Array(Array::vector(vec![4f32; 2]).unwrap());
+        assert_eq!(
+            evaluation.interpret(&context, std::slice::from_ref(&matching)),
+            program.interpret(vec![predicate, extent, matching, TestValue::Reference(source_reference.clone())]),
+        );
+        assert_eq!(reference.read(), source_reference.read());
+        assert_eq!(reference.read().unwrap(), Array::vector(vec![4f32; 2]).unwrap());
+
+        // A known live reference that enters two inlined selected branches reaches the residual program once, at its
+        // exact type, and the residual program behaves like eagerly binding both conditions.
+        let condition_inputs = |direct: &PartialEvaluationContext<_>, unknown: &PartialTracer<_>, reference| {
+            vec![
+                PartialTracer::new(direct.clone(), direct.known_value(TestValue::Array(Array::scalar(true).unwrap()))),
+                PartialTracer::new(
+                    direct.clone(),
+                    direct.known_value(TestValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap())),
+                ),
+                unknown.clone(),
+                reference,
+            ]
+        };
+        let eager_inputs = |array: &Array, reference: &ArrayReference<Array>| {
+            vec![
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap()),
+                TestValue::Array(array.clone()),
+                TestValue::Reference(reference.clone()),
+            ]
+        };
+        let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let direct = PartialEvaluationContext::new(context.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let unknown = PartialTracer::new(direct.clone(), direct.unknown_input(array_type.clone().into(), 0));
+        let known_reference =
+            PartialTracer::new(direct.clone(), direct.known_value(TestValue::Reference(reference.clone())));
+        for reference in [known_reference.clone(), known_reference] {
+            let inputs = condition_inputs(&direct, &unknown, reference);
+            let outputs = direct.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs);
+            assert_eq!(outputs, Ok(Vec::new()));
+        }
+        drop(unknown);
+        let evaluation = direct.into_evaluation(Vec::new()).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[extent], %1:ref<f32[2]> .
+                let %2:dimension<2> = const 2
+                    %3:dimension<2>, %4:f32[2] = guard [
+                        boundary="partial evaluation",
+                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                    ] %2 %0 %1
+                    %5:dimension<2> = const 2
+                    () = reference_write %1 %4
+                    %6:dimension<2>, %7:f32[2] = guard [
+                        boundary="partial evaluation",
+                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                    ] %5 %0 %1
+                    () = reference_write %1 %7
+                in ()"#},
+        );
+        let mismatching = Array::vector(vec![4f32; 3]).unwrap();
+        let source_reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        assert_eq!(
+            context.bind(
+                ConditionOperation::new(),
+                vec![branch.clone(), branch.clone()],
+                &eager_inputs(&mismatching, &source_reference),
+            ),
+            mismatch,
+        );
+        assert_eq!(evaluation.interpret(&context, &[TestValue::Array(mismatching)]), mismatch);
+        assert_eq!(reference.read(), source_reference.read());
+        let matching = Array::vector(vec![4f32; 2]).unwrap();
+        for _ in 0..2 {
+            let outputs = context.bind(
+                ConditionOperation::new(),
+                vec![branch.clone(), branch.clone()],
+                &eager_inputs(&matching, &source_reference),
+            );
+            assert_eq!(outputs, Ok(Vec::new()));
+        }
+        assert_eq!(evaluation.interpret(&context, &[TestValue::Array(matching.clone())]), Ok(Vec::new()));
+        assert_eq!(reference.read(), source_reference.read());
+        assert_eq!(reference.read().unwrap(), Array::vector(vec![4f32; 2]).unwrap());
+
+        // An earlier use that materializes the handle at its exact type shares that residual input with the inlined
+        // selected branch, instead of giving the residual program two aliasing reference inputs.
+        let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let direct = PartialEvaluationContext::new(context.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let unknown = PartialTracer::new(direct.clone(), direct.unknown_input(array_type.into(), 0));
+        let known_reference =
+            PartialTracer::new(direct.clone(), direct.known_value(TestValue::Reference(reference.clone())));
+        let read = direct.bind(ReferenceReadOperation::new(), Vec::new(), &[known_reference.clone()]).unwrap();
+        let inputs = condition_inputs(&direct, &unknown, known_reference);
+        assert_eq!(
+            direct.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+            Ok(Vec::new()),
+        );
+        let output = read[0].value().unwrap().clone();
+        drop((inputs, read, unknown));
+        let evaluation = direct.into_evaluation(vec![output]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[extent], %1:ref<f32[2]> .
+                let %2:f32[2] = reference_read %1
+                    %3:dimension<2> = const 2
+                    %4:dimension<2>, %5:f32[2] = guard [
+                        boundary="partial evaluation",
+                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                    ] %3 %0 %1
+                    () = reference_write %1 %5
+                in (%2)"#},
+        );
+        let mismatching = Array::vector(vec![4f32; 3]).unwrap();
+        let source_reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let source_read =
+            context.bind(ReferenceReadOperation::new(), Vec::new(), &[TestValue::Reference(source_reference.clone())]);
+        assert_eq!(
+            context.bind(
+                ConditionOperation::new(),
+                vec![branch.clone(), branch.clone()],
+                &eager_inputs(&mismatching, &source_reference),
+            ),
+            mismatch,
+        );
+        assert_eq!(evaluation.interpret(&context, &[TestValue::Array(mismatching)]), mismatch);
+        assert_eq!(reference.read(), source_reference.read());
+        let matching = Array::vector(vec![4f32; 2]).unwrap();
+        assert_eq!(
+            context.bind(
+                ConditionOperation::new(),
+                vec![branch.clone(), branch],
+                &eager_inputs(&matching, &source_reference),
+            ),
+            Ok(Vec::new()),
+        );
+        assert_eq!(evaluation.interpret(&context, &[TestValue::Array(matching)]), source_read);
+        assert_eq!(reference.read(), source_reference.read());
     }
 
     #[test]
@@ -7370,7 +7742,7 @@ mod tests {
     #[test]
     fn test_composite_condition_partial_evaluation_specializes_residual_branches() {
         // Concrete predicates inline the selected branch; unknown predicates retain the condition and specialize both
-        // residual branches to the concrete input geometry. Both paths preserve the refined output and its values.
+        // residual branches to the concrete input shapes. Both paths preserve the refined output and its values.
         let program = refined_vector_condition_program();
         let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         assert_eq!(program.output_types(), vec![vector_type.clone()]);
@@ -7825,8 +8197,8 @@ mod tests {
 
     #[test]
     fn test_composite_condition_batching_rejects_ragged_inputs_under_replicated_predicate() {
-        // Composite carriers store the same per-item geometry outside the packed array type, so their structural
-        // branch batching must reject it before a branch can observe the finite storage bound as a logical extent.
+        // Composite carriers store the same per-item extents outside the packed array type, so their structural
+        // branch batching must reject them before a branch can observe the finite storage bound as a logical extent.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<TestValue, TestOperation>::new(),
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -7849,6 +8221,83 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_condition_batching_selects_fresh_ragged_extents_under_mapped_predicate()
+    -> Result<(), ProgramError> {
+        // Under a batch-varying predicate both branches run, so they must be pure. Branches that broadcast to a mapped
+        // dimension input produce fresh ragged outputs of that input's extents, and each item selects its own branch's
+        // payload. Branches that compute their own lengths with `dimension_from_scalar` check those lengths against the
+        // dimension's bounds, which is an effect, so they are rejected rather than run for every item.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+        type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
+        let broadcast_branch = |use_second: bool| -> Result<_, ProgramError> {
+            let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+                |(first, second, extent): (Branch, Branch, Branch)| {
+                    if use_second { second } else { first }.dynamic_broadcast_to(&[extent])
+                },
+                (
+                    ArrayIrType::from(ArrayType::scalar(DataType::F64)),
+                    ArrayIrType::from(ArrayType::scalar(DataType::F64)),
+                    ArrayIrType::from(DimensionType::from(length.clone())),
+                ),
+            )?;
+            Ok(program.into_flat_program())
+        };
+        let regions = vec![broadcast_branch(false)?, broadcast_branch(true)?];
+        let driver = CountingBatchingDriver::new(&regions);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestValue, TestOperation>::new(),
+            TestValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let predicate = ArrayIrBatch::new(array(Array::vector(vec![true, false])?), BatchAxis::new(0))?;
+        let extents = array(Array::vector(vec![1i64, 3])?);
+        let inputs = [
+            predicate.clone(),
+            ArrayIrBatch::new(array(Array::vector(vec![5.0f64, 6.0])?), BatchAxis::new(0))?,
+            ArrayIrBatch::new(array(Array::vector(vec![7.0f64, 8.0])?), BatchAxis::new(0))?,
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(length.clone()))?,
+        ];
+        let (outputs, _) = ConditionOperation::new().batch(&context, &driver, &inputs)?.into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].value(), &array(Array::matrix(2, 3, vec![5.0f64, 5.0, 5.0, 8.0, 8.0, 8.0])?));
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
+        assert_eq!(outputs[0].ragged_axes()[0].extents(), &extents);
+
+        let computed_branch = |use_second: bool| -> Result<_, ProgramError> {
+            let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+                |(value, first, second): (Branch, Branch, Branch)| {
+                    let extent = if use_second { second } else { first }.to_dimension(length.clone())?;
+                    let broadcast = value.dynamic_broadcast_to(std::slice::from_ref(&extent))?;
+                    Ok((extent, broadcast))
+                },
+                (
+                    ArrayIrType::from(ArrayType::scalar(DataType::F64)),
+                    ArrayIrType::from(ArrayType::scalar(DataType::I64)),
+                    ArrayIrType::from(ArrayType::scalar(DataType::I64)),
+                ),
+            )?;
+            Ok(program.into_flat_program())
+        };
+        let regions = vec![computed_branch(false)?, computed_branch(true)?];
+        let driver = CountingBatchingDriver::new(&regions);
+        let inputs = [
+            predicate,
+            ArrayIrBatch::new(array(Array::vector(vec![5.0f64, 7.0])?), BatchAxis::new(0))?,
+            ArrayIrBatch::new(array(Array::vector(vec![1i64, 3])?), BatchAxis::new(0))?,
+            ArrayIrBatch::new(array(Array::vector(vec![2i64, 0])?), BatchAxis::new(0))?,
+        ];
+        assert_eq!(
+            ConditionOperation::new().batch(&context, &driver, &inputs).unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "cannot batch a `condition` with a batch-varying predicate and effectful branches because \
+                          observable effects cannot be selected per batch item"
+                    .to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_composite_condition_batching_forwards_ragged_inputs_under_mapped_predicate() {
         // The mapped-predicate path replays each branch with complete carriers, rather than structurally batching
         // its boundary. Selection must retain the shared per-item extents alongside the packed forwarded values.
@@ -7857,12 +8306,12 @@ mod tests {
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayIrBatch::new(
+        let input = ragged_batch(
             array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            BatchAxis::new(0),
+            array(Array::vector(vec![1i64, 2]).unwrap()),
+            &dimension,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, array(Array::vector(vec![1i64, 2]).unwrap()), dimension, vec![0])])
         .unwrap();
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let forwarded = builder.add_input(input.unbatched_type());
@@ -7895,12 +8344,12 @@ mod tests {
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayIrBatch::new(
+        let input = ragged_batch(
             array(Array::matrix(2, 3, vec![1.0f64, 900.0, 800.0, 4.0, 5.0, 700.0]).unwrap()),
-            BatchAxis::new(0),
+            array(Array::vector(vec![1i64, 2]).unwrap()),
+            &dimension,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, array(Array::vector(vec![1i64, 2]).unwrap()), dimension, vec![0])])
         .unwrap();
         let branch = |kind| {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -9483,11 +9932,11 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_condition_linearization_preserves_dynamic_residual_geometry() {
+    fn test_composite_condition_linearization_preserves_dynamic_residual_extents() {
         let (program, extent_type, _) = dynamic_extent_condition_program();
 
         // Separate primal and tangent contexts require the untaken branch's residual slots to retain the same live
-        // extent. Only the selected branch consumes its residuals, so geometry-aware zero placeholders are sufficient.
+        // extent. Only the selected branch consumes its residuals, so extent-aware zero placeholders are sufficient.
         let linearization = program.linearize().unwrap();
         assert_eq!(
             linearization.primal().to_string(),
@@ -10967,7 +11416,7 @@ mod tests {
 
         // A known symbolic predicate cannot select a branch during partial evaluation. Because the dynamic output
         // edge refers to the extent identity, the condition remains whole instead of fabricating an opposite-branch
-        // placeholder with arbitrary geometry.
+        // placeholder with arbitrary extents.
         let outer = TracingContext::<TestValue, TestOperation>::new();
         let symbolic_predicate = outer.input(ArrayType::scalar(DataType::Boolean).into());
         let evaluation = program
@@ -11016,7 +11465,7 @@ mod tests {
             .unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(output_type.clone()));
 
-        // Reusable linearization follows the same ordinary region rule and closes over the dynamic result geometry;
+        // Reusable linearization follows the same ordinary region rule and closes over the dynamic result shape;
         // applying its null linear map therefore reconstructs the shaped tangent without a type-only zero.
         let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
         let extent = context.input(extent_type.clone().into());
@@ -11619,7 +12068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_transposition_uses_reference_geometry_for_dead_dynamic_outputs() {
+    fn test_condition_transposition_uses_reference_extents_for_dead_dynamic_outputs() {
         // The condition's snapshot output is dead, but its reference state cotangent is live. The reference supplies
         // the only runtime extent available when materializing the dead snapshot's zero seed.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());

@@ -226,8 +226,8 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
             }
         }
 
-        // Broadcast geometry and placement over descriptors without pending reductions, retagging the condition with
-        // a branch data type so that it does not take part in promotion, and then restore the shared branch reduction
+        // Broadcast shapes and placement over descriptors without pending reductions, retagging the condition with a
+        // branch data type so that it does not take part in promotion, and then restore the shared branch reduction
         // state on the output. These descriptors only drive inference and no runtime value is retagged.
         let condition = condition.without_reduction_axes().with_data_type(on_true.data_type());
         let mut output_type = self.infer_elementwise_broadcast_type(&[
@@ -308,7 +308,7 @@ impl_differentiable_operation! {
                 for branch in [on_true, on_false] {
                     // Align live tangents to the output type before selection. Missing tangents use that same type,
                     // which also lets an integer branch contribute zero when promotion gives the output a tangent
-                    // space. Dynamic output geometry comes from the primal exemplar rather than a nullary zero.
+                    // space. Dynamic output shapes come from the primal exemplar rather than a nullary zero.
                     let tangent = match branch.tangent() {
                         MaybeZero::Value(tangent) => tangent.align_tangent(&tangent_type, &exemplar)?,
                         MaybeZero::Zero(_) if tangent_type.identities().next().is_some() => {
@@ -404,7 +404,7 @@ impl_differentiable_operation! {
 impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_: SelectOperation<ArrayIrType>) -> Self {
-        // A `select` reads its complete output geometry, including every runtime extent, from its inputs, and so the
+        // A `select` reads its complete output shape, including every runtime extent, from its inputs, and so the
         // homogeneous array member already expresses the dynamic case and the composite family needs no mixed encoding
         // for it. This conversion lets composite-typed values stage `select` through the shared `Select` blanket
         // implementation. Projecting the member rejects first-class dimension and reference inputs.
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_select_differentiation_dynamic() {
-        // Exercise both positions of a missing tangent with symbolic geometry, including runtime empty arrays.
+        // Exercise both positions of a missing tangent with symbolic shapes, including runtime empty arrays.
         for (live_true_branch, true_data_type) in
             [(true, DataType::F64), (false, DataType::F64), (false, DataType::I32)]
         {
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[test]
     fn test_select_transposition_dynamic() {
-        // Dynamic zeros read the cotangent's geometry, and the scalar branch sums its selected contributions.
+        // Dynamic zeros read the cotangent's shape, and the scalar branch sums its selected contributions.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
         let shape = Shape::new(vec![Dimension::Dynamic(size)]);

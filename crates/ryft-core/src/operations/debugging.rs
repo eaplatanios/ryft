@@ -316,7 +316,7 @@ mod tests {
         Array, ArrayOperation, DataType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension,
     };
-    use crate::batching::{BatchAxis, BoundaryLayout, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
@@ -447,11 +447,10 @@ mod tests {
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let (batched, _, output_layout, _) = program
+        let (batched, output_axes) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
-        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -473,10 +472,10 @@ mod tests {
             .unwrap();
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let batched = program
+        let (batched, _) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_program();
+            .into_parts();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -560,7 +559,7 @@ mod tests {
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
         )
         .unwrap();
-        let batched = program
+        let (batched, _) = program
             .to_flat_program()
             .batched_with_threaded_extent(
                 DimensionValue::constant(3).unwrap().r#type().into_owned(),
@@ -569,7 +568,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_program();
+            .into_parts();
         let global_sharding = "{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}";
         let global_type = format!("f32[3, 4][sharding={global_sharding}]");
         let local_type =
