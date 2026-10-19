@@ -1755,7 +1755,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
 
         let mut outputs = vec![false; instruction.outputs().len()];
         outputs[output_index] = true;
-        let roots = self.demands(instruction, &outputs, boundary)?;
+        let roots = self.demands(program.entry(), instruction, &outputs, boundary)?;
         let mut pending = roots
             .iter()
             .rev()
@@ -1822,7 +1822,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
                                 output_count: instruction.outputs().len(),
                                 regions: &regions,
                             };
-                            dependencies.extend(self.demands(instruction, &used_outputs, boundary)?);
+                            dependencies.extend(self.demands(region, instruction, &used_outputs, boundary)?);
                         }
                     }
 
@@ -1853,6 +1853,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
     ///
     /// # Parameters
     ///
+    ///   - `region`: Region of the program that contains `instruction`.
     ///   - `instruction`: Region-carrying instruction of the program.
     ///   - `used_outputs`: Outputs of `instruction` that are used, marked in the order of its outputs.
     ///   - `boundary`: Boundary of `instruction` and its attached regions, as constructed from
@@ -1863,12 +1864,16 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
     /// Returns the errors of the region data flow and region liveness queries.
     fn demands(
         &mut self,
+        region: RegionId,
         instruction: &Instruction<O>,
         used_outputs: &[bool],
         boundary: RegionDataFlowBoundary<'_>,
     ) -> Result<Vec<(RegionId, Vec<bool>)>, ProgramError> {
         let operation = instruction.operation();
-        let mut regions = AttachedRegionLiveness::new(&mut self.analysis, instruction.regions());
+        let atoms = self.program.region_ref(region)?.atoms();
+        let input_types = instruction.inputs().iter().map(|input| atoms[input.index()].r#type().into_owned()).collect();
+        let mut regions =
+            AttachedRegionLiveness::new(&mut self.analysis, operation, input_types, instruction.regions());
         let demands =
             operation.region_data_flow().execution_demands(operation, used_outputs, boundary, &mut regions)?;
         Ok(instruction

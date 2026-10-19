@@ -133,10 +133,14 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType};
+    use ryft_macros::Operation;
+
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType,
+    };
     use crate::captures::CaptureReference;
     use crate::contexts::StagingContext;
-    use crate::operations::{ConditionOperation, ReferenceReadOperation, ReferenceWriteOperation};
+    use crate::operations::{ConditionOperation, GuardOperation, ReferenceReadOperation, ReferenceWriteOperation};
     use crate::parameters::Placeholder;
     use crate::partial::contexts::{PartialEvaluationContext, ReferencePlacement};
     use crate::partial::values::PartialEvaluationValue;
@@ -146,6 +150,15 @@ mod tests {
     pub(super) type TestValue = ArrayIrValue<Array>;
     pub(super) type TestOperation = ArrayIrOperation<Array>;
     pub(super) type TestCapture = CaptureReference<ArrayIrType>;
+
+    /// Reference access family for capture-backed staging and partial-evaluation tests.
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(type(ArrayIrType), constant(TestCapture))]
+    pub(super) enum TestCaptureOperation {
+        Read(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
+        Write(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
+        Guard(GuardOperation<ArrayIrType>),
+    }
 
     /// Builds a nested residual read followed by a write to an independently supplied reference.
     pub(super) fn reference_ordering_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {

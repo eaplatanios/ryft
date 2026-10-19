@@ -697,7 +697,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Display for PartitionedProgram<V, O
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Partitions this borrowed [`Region`](crate::Region) based on per-input known-ness without first detaching its
     /// source computation. Refer to the documentation of [`Program::partition`] for more information.
     #[inline]
@@ -1011,7 +1014,10 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
+impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Partitions this [`Program`] based on the provided per-input known-ness into a known-side program and a
     /// residual program joined by residual edges, packaged as a [`PartitionedProgram`]. This function invokes
     /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context) with a **fresh** [`TracingContext`]
@@ -1085,7 +1091,9 @@ mod tests {
     use crate::partial::residuals::{
         NoStorage, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualRejection,
     };
-    use crate::partial::tests::{TestCapture, TestOperation, TestValue, reference_ordering_program};
+    use crate::partial::tests::{
+        TestCapture, TestCaptureOperation, TestOperation, TestValue, reference_ordering_program,
+    };
     use crate::partial::values::PartialEvaluationOutput;
     use crate::programs::{
         EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, ProgramBuilder, ProgramError,
@@ -1347,10 +1355,7 @@ mod tests {
         );
 
         // Inline reference constants are not input feeders, on either side of the partition.
-        let mut builder = ProgramBuilder::<
-            TestCapture,
-            ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-        >::new();
+        let mut builder = ProgramBuilder::<TestCapture, TestCaptureOperation>::new();
         let value = builder.add_input(scalar_type);
         let captured = builder.add_constant(CaptureReference::new(0, reference_type));
         builder
@@ -2060,10 +2065,7 @@ mod tests {
 
     #[test]
     fn test_region_partition_with_configuration_repeated_residual_preserves_reference_constant_order() {
-        let mut builder = ProgramBuilder::<
-            TestCapture,
-            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-        >::new();
+        let mut builder = ProgramBuilder::<TestCapture, TestCaptureOperation>::new();
         let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let captured =
             builder.add_constant(CaptureReference::new(0, ReferenceType::new(ArrayType::scalar(DataType::F32)).into()));
