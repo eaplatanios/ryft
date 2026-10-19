@@ -1079,6 +1079,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayType, DataType,
+        DimensionBounds, DimensionType, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::differentiation::NothingSavable;
@@ -2320,6 +2321,35 @@ mod tests {
 
         // The provided known-ness must cover every program input.
         assert!(matches!(program.partition(&[true]), Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 })));
+    }
+
+    #[test]
+    fn test_program_partition_drops_unconsumed_known_reference_inputs() {
+        // A known symbolic `ref<f32[n]>` next to an unknown `f32[n]` that the body returns is never consumed.
+        // The residual program drops it, and the known program keeps the reference as its own input.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(ReferenceType::new(array_type.clone()).into());
+        let array = builder.add_input(array_type.into());
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap();
+        assert_eq!(partition.residual_inputs(), &[ResidualInputSource::UnknownInput(1)]);
+        assert_eq!(partition.known_reference_inputs().count(), 0);
+        assert_eq!(
+            partition.known_program().to_string(),
+            indoc! {"
+                lambda %0:ref<f32[n]> .
+                in ()"},
+        );
+        assert_eq!(
+            partition.residual_program().to_string(),
+            indoc! {"
+                lambda %0:f32[n] .
+                in (%0)"},
+        );
     }
 
     #[test]

@@ -1217,7 +1217,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// values that only that invocation supplies. The residual entry checks such a relationship, but only when the
     /// residual program runs, after any effect of the body that partial evaluation folds into the known side. When the
     /// body has effects, the guard therefore checks such relationships too, so that it defers those effects behind the
-    /// check. Its two callers choose the flag as follows:
+    /// check. Its two callers, and [`prepare_root_inputs`](Self::prepare_root_inputs), which prepares a root entry
+    /// through the same contract, choose the flag as follows:
     ///
     ///   - Attached-region inlining from an operation's partial-evaluation rule (i.e., through
     ///     [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)) passes `false`:
@@ -1225,6 +1226,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     it, so the identities that they share with known inputs need no additional check.
     ///   - [`inline_program`](Self::inline_program) passes `true`: it replays a program at the root of the residual
     ///     program, whose unknown inputs are the residual program's own inputs, supplied by a separate invocation.
+    ///   - [`prepare_root_inputs`](Self::prepare_root_inputs) passes `true`: it prepares the replay of a program's own
+    ///     entry at the root of partial evaluation, whose unknown inputs are the residual program's inputs.
     ///
     /// # Errors
     ///
@@ -1919,10 +1922,10 @@ mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::{
-        AddOperation, DimensionAddOperation, DimensionSizeOperation, DimensionSubOperation, LinearCallOperation,
-        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RematerializeOperation, SubOperation,
-        WhileOperation, Zero, ZeroOperation,
+        AddOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation, DimensionSubOperation,
+        LinearCallOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
+        RematerializeOperation, SubOperation, WhileOperation, Zero, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::evaluations::PartialEvaluation;
@@ -3165,6 +3168,106 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_inline_program_replays_repeated_and_forced_renamed_dimensions() {
+        // Each replay rebuilds its constant and defines a fresh arithmetic result. Both copies share one actual `q`,
+        // but their result identities must remain distinct and their zeros must use the corresponding definition.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, q] = ["n", "q"].map(|name| DimensionType::new(name, bounds));
+        let one_type = DimensionType::from(Dimension::Static(1));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let dimension = builder.add_input(n.clone().into());
+        let one = builder.add_constant(TestValue::Dimension(DimensionValue::constant(1).unwrap()));
+        let result = builder
+            .add_instruction(DimensionAddOperation::new(&n, &one_type).unwrap(), Vec::new(), vec![dimension, one], None)
+            .unwrap()[0];
+        let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
+            panic!("expected a dimension result");
+        };
+        let zero = builder
+            .add_instruction(
+                TestOperation::Zero(ZeroOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![result_type.simplified_dimension()]),
+                ))),
+                Vec::new(),
+                vec![result],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![result, zero], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let parent = EagerContext::<TestValue, TestOperation>::new();
+        let context = PartialEvaluationContext::new(parent.clone());
+        let input = context.unknown_input(q.clone().into(), 0);
+        let first = context.inline_program(&program, vec![input.clone()]).unwrap();
+        let second = context.inline_program(&program, vec![input]).unwrap();
+        let evaluation = context.into_evaluation(first.into_iter().chain(second).collect()).unwrap();
+        let types = evaluation.program().output_types();
+        assert_ne!(types[0], types[2]);
+        let (ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)) = (&types[0], &types[2]) else {
+            panic!("expected two dimension results");
+        };
+        assert_eq!(types[1], ArrayType::new(DataType::F32, Shape::new(vec![first.simplified_dimension()])).into());
+        assert_eq!(types[3], ArrayType::new(DataType::F32, Shape::new(vec![second.simplified_dimension()])).into());
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+            lambda %0:dimension<q ∈ [1, 8)> .
+            let %1:dimension<1> = const 1
+                %2:dimension<n + 1 ∈ [2, 9)> = dimension_add %0 %1
+                %3:f32[n + 1] = zero [type=f32[n + 1]] %2
+                %4:dimension<1> = const 1
+                %5:dimension<n + 1 ∈ [2, 9)> = dimension_add %0 %4
+                %6:f32[n + 1] = zero [type=f32[n + 1]] %5
+            in (%2, %3, %5, %6)"},
+        );
+        let result = TestValue::Dimension(DimensionValue::constant(3).unwrap());
+        let zero = TestValue::Array(Array::vector(vec![0f32; 3]).unwrap());
+        assert_eq!(
+            evaluation.interpret(&parent, &[TestValue::Dimension(DimensionValue::constant(2).unwrap())]),
+            Ok(vec![result.clone(), zero.clone(), result, zero]),
+        );
+
+        // Explicit deferral uses the renamed arithmetic payload even with a known symbolic parent tracer.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let context = PartialEvaluationContext::new(outer.clone());
+        let known = context.known_value(outer.input(q.into()));
+        let region = program.entry_region_ref();
+        let deferred = HashSet::from([InstructionId::new(region.id(), 0)]);
+        let outputs = context.inline_region(region, vec![known], &deferred, None, None).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+            lambda %0:dimension<q ∈ [1, 8)> .
+            let %1:dimension<1> = const 1
+                %2:dimension<n + 1 ∈ [2, 9)> = dimension_add %0 %1
+                %3:f32[n + 1] = zero [type=f32[n + 1]] %2
+            in (%2, %3)"},
+        );
+        assert!(matches!(
+            evaluation.outputs(),
+            [PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)],
+        ));
+        let outputs = evaluation.interpret(&outer, &[]).unwrap();
+        let atoms = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+        let replayed = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(atoms, vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            replayed.interpret(vec![TestValue::Dimension(DimensionValue::constant(3).unwrap())]),
+            Ok(vec![
+                TestValue::Dimension(DimensionValue::constant(4).unwrap()),
+                TestValue::Array(Array::vector(vec![0f32; 4]).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
     fn test_partial_evaluation_context_inline_region_observation() {
         let program = reference_ordering_program();
         let region = program.entry_region_ref();
@@ -3227,6 +3330,150 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         ),);
         assert!(observations.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_region_replays_renamed_regions_on_shared_reference_fallback() {
+        // Passing the same source root twice keeps the conditional whole even with a known predicate. That fallback
+        // must receive the renamed attached regions, not the source branch's `zero<n>` beside a `dimension<q>` input.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, q] = ["n", "q"].map(|name| DimensionType::new(name, bounds));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type: ArrayIrType = ReferenceType::new(scalar_type).into();
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let dimension = branch.add_input(n.clone().into());
+        let reference = branch.add_input(reference_type.clone());
+        branch.add_input(reference_type.clone());
+        let read = branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let zero = branch
+            .add_instruction(
+                TestOperation::Zero(ZeroOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![n.simplified_dimension()]),
+                ))),
+                Vec::new(),
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let branch = branch
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![zero, read], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let branch = builder.import_program(branch);
+        let dimension = builder.add_input(n.into());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let reference = builder.add_input(reference_type);
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![branch, branch],
+                vec![predicate, dimension, reference, reference],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let parent = EagerContext::<TestValue, TestOperation>::new();
+        let context = PartialEvaluationContext::new(parent.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let dimension = context.unknown_input(q.into(), 0);
+        let predicate = context.known_value(TestValue::Array(Array::scalar(true).unwrap()));
+        let reference = ArrayReference::new(Array::scalar(7f32).unwrap());
+        let reference = context.known_value(TestValue::Reference(reference));
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let outputs = context
+            .inline_region(region, vec![dimension, predicate, reference], &HashSet::new(), None, Some(&analysis))
+            .unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:dimension<q ∈ [1, 8)>, %1:bool[], %2:ref<f32[]> .
+                let %3:f32[q], %4:f32[] = condition %1 %0 %2 %2 [
+                    true={
+                        lambda %0:dimension<q ∈ [1, 8)>, %1:ref<f32[]>, %2:ref<f32[]> .
+                        let %3:f32[] = reference_read %1
+                            %4:f32[q] = zero [type=f32[q]] %0
+                        in (%4, %3)
+                    },
+                    false={
+                        lambda %0:dimension<q ∈ [1, 8)>, %1:ref<f32[]>, %2:ref<f32[]> .
+                        let %3:f32[] = reference_read %1
+                            %4:f32[q] = zero [type=f32[q]] %0
+                        in (%4, %3)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+        assert_eq!(
+            evaluation.interpret(&parent, &[TestValue::Dimension(DimensionValue::constant(3).unwrap())]),
+            Ok(vec![
+                TestValue::Array(Array::vector(vec![0f32; 3]).unwrap()),
+                TestValue::Array(Array::scalar(7f32).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_region_retains_incoming_guard_barriers() {
+        // An unknown `ref<f32[n]>` next to a known exact `f32[3]` requires an entry guard, which defers the known print
+        // of the body. Reference-aware replay of the guarded region must retain that incoming barrier too: its source
+        // analysis starts after the guard, and must not clear the barrier merely because no source instruction has
+        // deferred yet.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let reference_type: ArrayIrType = ReferenceType::new(array_type.clone()).into();
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(reference_type.clone());
+        builder.add_input(array_type.into());
+        let scalar = builder.add_input(scalar_type.clone());
+        builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(PrintOperation::<ArrayType>::new("known"))),
+                Vec::new(),
+                vec![scalar],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+            .unwrap();
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let scalar = outer.input(scalar_type);
+        let context = PartialEvaluationContext::new(outer.clone());
+        let reference = context.unknown_input(reference_type, 0);
+        let array = context.known_value(outer.constant(TestValue::Array(Array::vector(vec![1f32; 3]).unwrap())));
+        let scalar = context.known_value(scalar);
+        let region = program.entry_region_ref();
+        let inputs = context.guard_region_inputs(region, vec![reference, array, scalar], true).unwrap();
+        let analysis = region.reference_analysis(0).unwrap();
+        let outputs = context.inline_region(region, inputs, &HashSet::new(), None, Some(&analysis)).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:ref<f32[n]>, %1:f32[3], %2:f32[] .
+                let %3:f32[n] = guard [boundary="partial evaluation", types=[ref<f32[n]>, f32[n]], retained=[n]] %0 %1
+                    %4:f32[] = print [label=known] %2
+                in ()"#},
+        );
+        let parent = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        assert_eq!(
+            parent.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[3] = const [1.0, 1.0, 1.0]
+                in ()"},
+        );
     }
 
     #[test]
