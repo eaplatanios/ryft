@@ -5,7 +5,9 @@ use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, ValueResolution};
+use crate::interpretation::ReplayTypeIdentities;
 use crate::macros::check_count;
+use crate::operations::GuardOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::evaluations::PartialEvaluation;
 use crate::partial::operations::{PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver};
@@ -18,9 +20,10 @@ use crate::partial::values::{
 use crate::programs::operations::OperationFoldReplacement;
 use crate::programs::{
     AtomId, BindingRegionDriver, EffectClasses, FlatProgram, InstructionId, Operation, OperationPayloadProjection,
-    Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState,
-    ReferenceAnalysis, ReferenceIdentity, RegionRef, RegionReplayMappings, RegionRole, ReplayRegionDriver, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueDomainDispatch, ValueProjection,
+    OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
+    ProvenanceState, ReferenceAnalysis, ReferenceIdentity, RegionRef, RegionReplayMappings, RegionRole,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -447,16 +450,19 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// evaluation rules use this after computing a value in [`parent`](Self::parent).
     ///
     /// A constant value that defines a type identity is embedded as a residual-program constant when consumed by
-    /// residual work, preserving its role as the identity's producer. Symbolic known values remain residual inputs
-    /// because their known-side producer stays live.
+    /// residual work, preserving its role as the identity's producer. So is a constant value that its type determines
+    /// completely (refer to [`Value::singleton`]), such as a static first-class dimension, which a residual program
+    /// can therefore embed without threading it as an input. Symbolic known values remain residual inputs because
+    /// their known-side producer stays live.
     ///
     /// # Parameters
     ///
     ///   - `value`: Value belonging to this context's known-side parent. Its context membership is not checked.
     pub fn known_value(&self, value: C::Value) -> PartialEvaluationValue<C::Value> {
-        let defines_identity =
-            value.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
-        if defines_identity && self.parent.resolve(&value).is_constant() {
+        let r#type = value.r#type();
+        let defines_identity = r#type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
+        let determined_by_type = C::Value::singleton(r#type.as_ref()).is_some();
+        if (defines_identity || determined_by_type) && self.parent.resolve(&value).is_constant() {
             PartialEvaluationValue::known_constant(value)
         } else {
             PartialEvaluationValue::known(value)
@@ -697,70 +703,8 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
         // and a genuine error rides `?` out through the `collect` into `residualize`.
-        let input_atoms = inputs
-            .iter()
-            .map(|input| -> Result<AtomId, ProgramError> {
-                // A residual variable is already a residual atom, and an already-materialized known value's shared
-                // slot carries the residual atom assigned on first materialization. Every other known value differs
-                // only in whether it materializes as an inline constant.
-                let constant = match input.materialization() {
-                    PartialValueMaterialization::Undecided => false,
-                    PartialValueMaterialization::Input { residual_atom: None } => false,
-                    PartialValueMaterialization::Input { residual_atom: Some(atom) } => return Ok(atom),
-                    PartialValueMaterialization::Constant { residual_atom: None } => true,
-                    PartialValueMaterialization::Constant { residual_atom: Some(atom) } => return Ok(atom),
-                    PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
-                };
-
-                let known = input.as_known().ok_or_else(|| {
-                    ProgramError::MalformedProgram(
-                        "residual materialization marked an unknown value as a known residual".to_string(),
-                    )
-                })?;
-
-                let atom = if constant {
-                    let constant = self.parent.resolve(known).into_constant().ok_or_else(|| {
-                        ProgramError::MalformedProgram(
-                            "residual materialization required a constant payload for a known value that is \
-                             not resolvable to a constant in the active known-side context"
-                                .to_string(),
-                        )
-                    })?;
-                    let reference_identity =
-                        known.r#type().is_reference().then(|| self.parent.reference_identity(known)).transpose()?;
-                    let atom = self.builder.borrow_mut().add_constant(constant);
-                    if let Some(key) = reference_identity {
-                        self.constant_reference_identities.borrow_mut().insert(atom, key);
-                    }
-                    atom
-                } else {
-                    // Only input feeders deduplicate across distinct values naming the same known-side staged atom.
-                    let staged_atom = match self.parent.resolve(known) {
-                        ValueResolution::Staged(atom) => Some(atom),
-                        _ => None,
-                    };
-                    let existing = staged_atom.and_then(|staged| self.staged_feeders.borrow().get(&staged).copied());
-                    if let Some(atom) = existing {
-                        atom
-                    } else {
-                        let atom = self.builder.borrow_mut().add_input(known.r#type().into_owned());
-                        self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
-                        if let Some(staged_atom) = staged_atom {
-                            self.staged_feeders.borrow_mut().insert(staged_atom, atom);
-                        }
-                        atom
-                    }
-                };
-
-                // Record the assignment in the value's shared slot so that every clone of this value reuses the same
-                // residual atom instead of materializing the value again.
-                input.materialization.set(match constant {
-                    true => PartialValueMaterialization::Constant { residual_atom: Some(atom) },
-                    false => PartialValueMaterialization::Input { residual_atom: Some(atom) },
-                });
-                Ok(atom)
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let input_atoms =
+            inputs.iter().map(|input| self.materialize_input(input)).collect::<Result<Vec<_>, ProgramError>>()?;
 
         // Propagate the materialized inputs' refinements through attached regions, just as replay into a trace does.
         // Release the builder borrow before specialization replays any body into its own fresh trace. Keep the original
@@ -789,6 +733,16 @@ impl<C: Context> PartialEvaluationContext<C> {
             )?
             .unwrap_or(regions)
         };
+
+        // Specialization replays the regions, which may introduce ordered work that their original effects did not
+        // declare (e.g., an entry guard for a relationship that the specialized inputs leave unproven). Later ordered
+        // operations must not move ahead of it either.
+        let specialized_effects_are_ordered = regions.iter().enumerate().any(|(index, region)| {
+            operation.region_role(index) == Some(RegionRole::Computation) && region.effects().classes().is_ordered()
+        });
+        if specialized_effects_are_ordered {
+            self.defer_ordered_effects.set(true);
+        }
 
         // Residualized regions splice into the residual builder's arena directly (i.e., owned move), in region order.
         let region_ids = {
@@ -823,11 +777,25 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// so that an operation can rewrite itself into transformed work. For example, a known-predicate `condition` can
     /// inline its selected branch.
     ///
+    /// Inlining removes the program's entry, so the identity relationships of its input types that the types of
+    /// `inputs` leave unproven are first checked by entry guards, staged before anything that the body stages, exactly
+    /// as when an operation's partial evaluation rule inlines an attached region. Unlike such a region, the program is
+    /// replayed at the root of the residual program: its unknown inputs are the residual program's own inputs, which a
+    /// separate invocation supplies, so a relationship between a known input and an unknown input can only be checked
+    /// when the residual program runs. When the program has effects, its entry guard therefore also checks those
+    /// relationships, so that the effects, which could otherwise fold into the known side, wait for that check.
+    ///
     /// # Parameters
     ///
     ///   - `program`: [`Program`] whose entry [`Region`](crate::Region) is replayed through this
     ///     [`PartialEvaluationContext`].
     ///   - `inputs`: Partially evaluated values bound to `program`'s input [`Atom`](crate::Atom)s in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the types of `inputs` do not refine the input types of `program`, when its entry needs a
+    /// guard that this context's operation family cannot provide (refer to [`OperationProvider`]), or when replaying
+    /// one of its instructions fails.
     #[inline]
     pub fn inline_program(
         &self,
@@ -838,12 +806,22 @@ impl<C: Context> PartialEvaluationContext<C> {
         C::Operation:
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
-        self.inline_region(program.entry_region_ref(), inputs, &HashSet::new(), None, None)
+        let region = program.entry_region_ref();
+        let inputs = self.guard_region_inputs(region, inputs, true)?;
+        self.inline_region(region, inputs, &HashSet::new(), None, None)
     }
 
     /// Replays a borrowed [`Region`](crate::Region) without materializing it as a standalone source [`Program`].
     /// Input binding and output ordering follow [`inline_program`](Self::inline_program). Each call tracks its own
     /// source instruction indices, including recursive calls into shared regions.
+    ///
+    /// The caller must have prepared `inputs` for the region's entry through
+    /// [`guard_region_inputs`](Self::guard_region_inputs) or [`prepare_region_inputs`](Self::prepare_region_inputs),
+    /// which check the supplied signature against the entry and guard every relationship that it leaves unproven, so
+    /// replay performs no entry check of its own. The prepared types can still differ from the declared ones (e.g.,
+    /// they can rename array axes or carry the exact facts that the entry proves), so replay relates them to the
+    /// region's declarations through scoped facts (refer to [`TypeRefinements::from_local_declarations`]), which
+    /// treat the declared identities as local to the region instead of as names that the prepared types may share.
     ///
     /// # Parameters
     ///
@@ -868,16 +846,75 @@ impl<C: Context> PartialEvaluationContext<C> {
         C::Operation:
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
+        check_count!("input", inputs, region.input_ids().len(), ProgramError);
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+
+        // Residual replay stages even when the known-side parent is eager.
+        let refinements = <C::Type as Type>::Refinements::from_local_declarations(region.input_types(), &input_types)?;
+        let type_identities = ReplayTypeIdentities::new(region, &input_types, refinements, true)?;
         let deferred_effect_ordering = RefCell::new(EffectOrdering::default());
         let instruction_index = Cell::new(0);
         let region_mappings = RegionReplayMappings::new();
-        region.interpret_with(
+        region.interpret_with::<_, ProgramError, _, _>(
             inputs,
-            |_, constant| Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant.clone())?)),
+            |_, constant| {
+                Ok(PartialEvaluationValue::known_constant(
+                    self.parent.lift(type_identities.rename_constant(constant)?)?,
+                ))
+            },
             |instruction, inputs| {
-                // Evaluate inside the source instruction's recorded origin so that residualized instructions record
-                // where they came from.
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                // Preparation and the consuming rule belong to the same source instruction. Count any emitted
+                // check before dispatch so an otherwise known result still records its deferred assertion.
+                let residual_instruction_count =
+                    residual_instructions.map(|_| self.builder.borrow().instructions().len());
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                let prepared = if let Some((guard, members)) =
+                    type_identities.instruction_guard(region, instruction, &input_types)?
+                {
+                    let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+                    let outputs = self.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                        self.fold_or_residualize(
+                            C::Operation::provide(
+                                guard,
+                                &members.iter().map(|&index| &input_types[index]).collect::<Vec<_>>(),
+                            )?,
+                            Vec::new(),
+                            &guarded,
+                        )
+                    })?;
+                    check_count!(
+                        "output",
+                        outputs,
+                        members.iter().filter(|&&index| !input_types[index].is_reference()).count(),
+                        ProgramError,
+                    );
+
+                    // Replace only unknown operands and operands whose type the guard changes. A known operand with
+                    // an unchanged type keeps its knownness, so that the consuming instruction can still fold, while
+                    // its check survives as an ordered residual effect. This differs from `RegionInterpreter::step`,
+                    // which substitutes every non-reference member.
+                    let mut prepared = inputs.to_vec();
+                    let mut outputs = outputs.into_iter();
+                    for index in members {
+                        if !input_types[index].is_reference() {
+                            let output = outputs.next().unwrap();
+                            if inputs[index].is_unknown() || output.r#type().as_ref() != inputs[index].r#type().as_ref()
+                            {
+                                prepared[index] = output;
+                            }
+                        }
+                    }
+                    Some(prepared)
+                } else {
+                    None
+                };
+
+                let inputs = prepared.as_deref().unwrap_or(inputs);
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                let renaming = type_identities.instruction_renaming(region, instruction, &input_types)?;
+                let operation = instruction.operation().rename_type_identities(&renaming)?;
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?
+                    .with_type_identity_renaming(&renaming)?;
                 let index = instruction_index.get();
                 instruction_index.set(index + 1);
                 let driver = RecursivePartialEvaluationDriver {
@@ -885,22 +922,23 @@ impl<C: Context> PartialEvaluationContext<C> {
                     repeated_residual: reference_analysis.is_some(),
                 };
 
-                // Count emitted instructions only when recording observations. Output knownness alone cannot detect
-                // residual effects with no outputs, or an operation that emits effects and returns known outputs.
-                let residual_instruction_count =
-                    residual_instructions.map(|_| self.builder.borrow().instructions().len());
-
+                // Evaluate inside the source instruction's recorded origin so that residualized instructions,
+                // like the instruction guard above, record where they came from.
                 let outputs = self.invoke_with_provenance_origin(instruction.provenance().clone(), || {
                     driver.partially_evaluate_instruction(
                         self,
                         region,
                         index,
+                        &operation,
                         inputs,
                         deferred_instructions,
                         &deferred_effect_ordering,
                         reference_analysis,
                     )
                 })?;
+
+                let output_types = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+                type_identities.record_outputs(region, instruction, &output_types, Some(&input_types))?;
 
                 // Record the source instruction if it produces unknown outputs or emits residual work. Checking
                 // builder growth also catches effects with no outputs and rules that emit effects but return known
@@ -1095,6 +1133,444 @@ impl<C: Context> PartialEvaluationContext<C> {
             )?
             .into_simplified()?;
         Ok(PartialEvaluation { program, inputs, outputs: evaluation_outputs })
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Materializes a known live reference at a validated declared allocation boundary, whose runtime referent is
+    /// still validated on region entry. The residual program treats distinct reference inputs as independent roots,
+    /// so a handle that it already receives is reused when its residual input has the declared type. A residual input
+    /// of another type (e.g., the exact type of an earlier use) cannot be widened to the declared allocation contract
+    /// inside the residual program, and a second input for the same handle would alias it, so that case is rejected.
+    /// Otherwise, the residual input is recorded in the shared materialization slot of `input`, so that every later
+    /// materialization of that value (e.g., by an instruction that uses the handle after the retained region) reuses
+    /// it instead of adding a second, aliasing input at the handle's exact type. The returned value shares that slot.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input`: Known eager reference value whose actual referent refines the declared allocation type.
+    ///   - `declared`: Reference input contract of the retained region.
+    pub(crate) fn preserve_reference_input(
+        &self,
+        input: &PartialEvaluationValue<C::Value>,
+        declared: &C::Type,
+    ) -> Result<PartialEvaluationValue<C::Value>, ProgramError> {
+        let known = input
+            .as_known()
+            .ok_or_else(|| ProgramError::MalformedProgram("reference entry witness must be known".to_string()))?;
+        if !self.parent.is_eager() || !declared.is_reference() || !known.r#type().is_reference() {
+            return Err(ProgramError::MalformedProgram(
+                "reference entry witness must have a known eager reference type".to_string(),
+            ));
+        }
+        <C::Type as Type>::Refinements::new([declared], [known.r#type()])?;
+        if let Some(identity) = self.parent.reference_identity(known)? {
+            let builder = self.builder.borrow();
+            for (input_index, existing) in self.inputs.borrow().iter().enumerate() {
+                let PartialEvaluationInput::Known(existing) = existing else {
+                    continue;
+                };
+                if !existing.r#type().is_reference() || self.parent.reference_identity(existing)? != Some(identity) {
+                    continue;
+                }
+                let atom = builder.input_ids()[input_index];
+                let existing_type = builder.atoms()[atom.index()].r#type();
+                if *existing_type != *declared {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "a known reference that the residual program already receives as `{existing_type}` cannot \
+                             also enter a retained region at its declared type `{declared}`",
+                        ),
+                    });
+                }
+                input.materialization.set(PartialValueMaterialization::Input { residual_atom: Some(atom) });
+                return Ok(input.clone());
+            }
+        }
+        let atom = self.builder.borrow_mut().add_input(declared.clone());
+        self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
+        input.materialization.set(PartialValueMaterialization::Input { residual_atom: Some(atom) });
+        Ok(input.clone())
+    }
+
+    /// Seeds a fresh residual boundary from the complete source entry, preserving exact facts and shared symbolic
+    /// identities supplied by known members even when replay never consumes those members.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Source boundary whose input contracts constrain the complete invocation.
+    ///   - `inputs`: Known values and actual unknown types in source input order.
+    pub(super) fn prepare_region_inputs(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: &[PartialValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Replaying the body removes this boundary's entry check, and the body is specialized at the exact facts that
+        // the entry proves about the actual inputs (e.g., an unknown `f32[n]` next to a known `f32[2]`, both entering
+        // `f32[n]`, is replayed as `f32[2]`). Known inputs are narrowed first, by the relationships among them alone
+        // (refer to `Self::narrow_known_inputs`). Residual entries keep the supplied unknown types, so that the
+        // residual program accepts every value that the source program accepts: an entry guard, staged before anything
+        // that the body stages so that no known-side effect folds before it, checks the entry's remaining relationships
+        // and returns the narrowed values that seed the body. A guard with an unknown input stays in the residual
+        // program together with its known witnesses, and its ordered effect defers later ordered known effects. A
+        // reference cannot be cast, so it keeps its supplied type and the guard only checks it. Related values use
+        // compatible protected representatives, with reference geometry taking precedence over known representations
+        // (refer to `Self::pinned_identities` and `GuardOperation::retaining`). A narrowing without a guard (i.e., by
+        // an actual identity whose own bounds admit a single extent, which needs no check) narrows the residual entry
+        // type instead. An operation family without a guard cannot preserve an unproven relationship at all, so such
+        // an entry is rejected (refer to `Self::guard_region_inputs`).
+        let seed = self.prepare_entry_inputs(
+            region,
+            inputs
+                .iter()
+                .map(|input| input.as_known().map(|value| PartialEvaluationValue::known_input(value.clone())))
+                .collect(),
+            inputs.iter().map(|input| input.r#type().into_owned()).collect(),
+            true,
+        )?;
+
+        // A symbolic known value can constrain an unknown's runtime geometry without providing an exact extent.
+        // Keep such values as ordinary residual inputs, including transitive links through multi-identity members.
+        let mut identities = seed
+            .iter()
+            .filter(|input| input.is_unknown())
+            .flat_map(|input| input.r#type().identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut retained = vec![false; seed.len()];
+        loop {
+            let mut changed = false;
+            for (index, input) in seed.iter().enumerate() {
+                if input.is_known() && !retained[index] {
+                    let r#type = input.r#type();
+                    if r#type.identities().any(|(_, identity)| identities.contains(identity)) {
+                        self.materialize_input(input)?;
+                        identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+                        retained[index] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Ok(seed)
+    }
+
+    /// Replaces the entry of `region` for the values in `inputs`, which are bound to its inputs in input order, so that
+    /// the caller can replay the region's body in its place (e.g., when inlining it). This is the one entry contract of
+    /// every consumer that removes a region's entry: when the types of `inputs` leave identity relationships of the
+    /// entry unproven (refer to [`GuardOperation::for_entry`]), entry guards are staged before anything that the
+    /// body stages, so that no known-side effect folds before them. The relationships among known inputs alone are
+    /// checked first, by a guard that folds into the known side and whose narrowed outputs replace the known inputs
+    /// (refer to [`Self::narrow_known_inputs`]). The remaining relationships are checked by a guard whose narrowed
+    /// outputs replace unknown inputs and known inputs whose required representation changes. Reference identities
+    /// take precedence over known representations (refer to [`Self::pinned_identities`]). An unknown input can connect
+    /// otherwise independent known classes, so changing a known representation can require the residual check even
+    /// without references. A guard with an unknown input stays in the residual program together with its known
+    /// witnesses, and its ordered effect defers later ordered known effects.
+    ///
+    /// When `separate_invocation` is set, the unknown inputs are inputs of a residual program that is invoked
+    /// separately from the known side, so that an identity which a known input and an unknown input share relates
+    /// values that only that invocation supplies. The residual entry checks such a relationship, but only when the
+    /// residual program runs, after any effect of the body that partial evaluation folds into the known side. When the
+    /// body has effects, the guard therefore checks such relationships too, so that it defers those effects behind the
+    /// check. Its two callers choose the flag as follows:
+    ///
+    ///   - Attached-region inlining from an operation's partial-evaluation rule (i.e., through
+    ///     [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)) passes `false`:
+    ///     the region is inlined within one evaluation, whose unknown values were already checked where they entered
+    ///     it, so the identities that they share with known inputs need no additional check.
+    ///   - [`inline_program`](Self::inline_program) passes `true`: it replays a program at the root of the residual
+    ///     program, whose unknown inputs are the residual program's own inputs, supplied by a separate invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inputs do not refine the entry, or when the entry needs a guard but this context's
+    /// operation family cannot provide one (refer to [`OperationProvider`]): removing the entry would then
+    /// drop the check of its unproven relationships.
+    pub(super) fn guard_region_inputs(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<PartialEvaluationValue<C::Value>>,
+        separate_invocation: bool,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
+        self.prepare_entry_inputs(region, inputs.into_iter().map(Some).collect(), input_types, separate_invocation)
+    }
+
+    /// Gives `input` a residual atom using its existing materialization policy, preserving shared assignments and
+    /// deduplicating known-side staged feeders. Entry witnesses use the same protocol as consumed residual inputs.
+    fn materialize_input(&self, input: &PartialEvaluationValue<C::Value>) -> Result<AtomId, ProgramError> {
+        // A residual variable is already a residual atom, and an already-materialized known value's shared
+        // slot carries the residual atom assigned on first materialization. Every other known value differs
+        // only in whether it materializes as an inline constant.
+        let constant = match input.materialization() {
+            PartialValueMaterialization::Undecided => false,
+            PartialValueMaterialization::Input { residual_atom: None } => false,
+            PartialValueMaterialization::Input { residual_atom: Some(atom) } => return Ok(atom),
+            PartialValueMaterialization::Constant { residual_atom: None } => true,
+            PartialValueMaterialization::Constant { residual_atom: Some(atom) } => return Ok(atom),
+            PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
+        };
+
+        let known = input.as_known().ok_or_else(|| {
+            ProgramError::MalformedProgram(
+                "residual materialization marked an unknown value as a known residual".to_string(),
+            )
+        })?;
+
+        let atom = if constant {
+            let constant = self.parent.resolve(known).into_constant().ok_or_else(|| {
+                ProgramError::MalformedProgram(
+                    "residual materialization required a constant payload for a known value that is \
+                     not resolvable to a constant in the active known-side context"
+                        .to_string(),
+                )
+            })?;
+            let reference_identity =
+                known.r#type().is_reference().then(|| self.parent.reference_identity(known)).transpose()?;
+            let atom = self.builder.borrow_mut().add_constant(constant);
+            if let Some(key) = reference_identity {
+                self.constant_reference_identities.borrow_mut().insert(atom, key);
+            }
+            atom
+        } else {
+            // Only input feeders deduplicate across distinct values naming the same known-side staged atom.
+            let staged_atom = match self.parent.resolve(known) {
+                ValueResolution::Staged(atom) => Some(atom),
+                _ => None,
+            };
+            let existing = staged_atom.and_then(|staged| self.staged_feeders.borrow().get(&staged).copied());
+            if let Some(atom) = existing {
+                atom
+            } else {
+                let atom = self.builder.borrow_mut().add_input(known.r#type().into_owned());
+                self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
+                if let Some(staged_atom) = staged_atom {
+                    self.staged_feeders.borrow_mut().insert(staged_atom, atom);
+                }
+                atom
+            }
+        };
+
+        // Record the assignment in the value's shared slot so that every clone of this value reuses the same
+        // residual atom instead of materializing the value again.
+        input.materialization.set(match constant {
+            true => PartialValueMaterialization::Constant { residual_atom: Some(atom) },
+            false => PartialValueMaterialization::Input { residual_atom: Some(atom) },
+        });
+        Ok(atom)
+    }
+
+    /// Prepares one complete entry before replay. Existing values keep their shared materialization state; `None`
+    /// marks an unallocated root unknown whose supplied type belongs to the residual header. Both entry guards (i.e.,
+    /// the one over the known inputs that [`Self::narrow_known_inputs`] plans and the one over the complete entry that
+    /// [`Self::plan_entry_guard`] plans) are requested from the operation family before anything is folded,
+    /// residualized, or allocated, so that a rejection leaves this context unchanged.
+    fn prepare_entry_inputs(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        mut inputs: Vec<Option<PartialEvaluationValue<C::Value>>>,
+        mut input_types: Vec<C::Type>,
+        separate_invocation: bool,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        check_count!("input", inputs, region.input_ids().len(), ProgramError);
+        check_count!("input", input_types, inputs.len(), ProgramError);
+        let declared = region.input_types();
+        let known = inputs
+            .iter()
+            .map(|input| input.as_ref().is_some_and(PartialEvaluationValue::is_known))
+            .collect::<Vec<_>>();
+        let known_guard = Self::narrow_known_inputs(&declared, &known, &input_types)?;
+        if let Some((_, _, outputs)) = &known_guard {
+            // Request the complete entry's guard before the known guard folds or residualizes, so that a family that
+            // rejects either guard leaves this context unchanged. The known guard's outputs carry the types that its
+            // operation infers, which stand in for the narrowed known inputs in this request. The applied guard is
+            // planned again below from the actual narrowed values, because a known guard that remains residual turns
+            // the members whose types it changes into unknown values.
+            let mut narrowed_types = input_types.clone();
+            for (index, r#type) in outputs {
+                narrowed_types[*index] = r#type.clone();
+            }
+            Self::plan_entry_guard(region, &declared, &inputs, &mut narrowed_types, separate_invocation)?;
+        }
+        if let Some((guard, members, outputs)) = known_guard {
+            let guarded = members.iter().map(|&index| inputs[index].clone().unwrap()).collect::<Vec<_>>();
+            let narrowed = self.fold_or_residualize(guard, Vec::new(), &guarded)?;
+            check_count!("output", narrowed, outputs.len(), ProgramError);
+            for ((index, _), output) in outputs.into_iter().zip(narrowed) {
+                if inputs[index].as_ref().unwrap().r#type() != output.r#type() {
+                    input_types[index] = output.r#type().into_owned();
+                    inputs[index] = Some(output);
+                }
+            }
+        }
+        let (members, guard) =
+            Self::plan_entry_guard(region, &declared, &inputs, &mut input_types, separate_invocation)?;
+        let mut inputs = inputs
+            .into_iter()
+            .zip(input_types)
+            .enumerate()
+            .map(|(index, (input, r#type))| input.unwrap_or_else(|| self.unknown_input(r#type, index)))
+            .collect::<Vec<_>>();
+        let Some(guard) = guard else {
+            return Ok(inputs);
+        };
+        let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+        let output_members =
+            members.iter().copied().filter(|&index| !declared[index].is_reference()).collect::<Vec<_>>();
+        let outputs = self.fold_or_residualize(guard, Vec::new(), &guarded)?;
+        check_count!("output", outputs, output_members.len(), ProgramError);
+        for (index, output) in output_members.into_iter().zip(outputs) {
+            if inputs[index].is_unknown() || inputs[index].r#type() != output.r#type() {
+                inputs[index] = output;
+            }
+        }
+        Ok(inputs)
+    }
+
+    /// Plans the narrowing of the known members of an entry declared as `declared` by the relationships among the known
+    /// inputs alone, where `known` marks those members and `input_types` holds the types of all inputs, in input order.
+    /// Known values keep their types in the body that partial evaluation replays, so a known symbolic value that such a
+    /// relationship fixes (e.g., a known `f32[n, m]` next to a known `dimension<2>` entering
+    /// `[f32[n, m], dimension<m>]`) would otherwise disagree with the values that the body computes from the exact one
+    /// (e.g., a `zero[m]` of type `f32[2]`). An entry guard over the known members checks those relationships before
+    /// anything that the body stages. Its outputs replace only members whose type changes, so a deferred guard does not
+    /// make unchanged known values residual. The guard retains the identities of known references, which cannot be
+    /// cast. Relationships that involve unknown inputs are left to [`Self::guard_region_inputs`].
+    ///
+    /// Returns [`None`] when the known types prove every such relationship. Otherwise, returns the guard operation that
+    /// this context's operation family provides, the positions of its members among the inputs, and the position and
+    /// inferred type of each of its outputs (i.e., of each non-reference member), in input order. Staging or
+    /// residualizing the guard produces outputs of exactly those types, while an eager known side supplies exact types,
+    /// which leave no relationship among known inputs unproven. Planning mutates no state, so that the caller can
+    /// request every entry guard before applying any of them.
+    #[allow(clippy::type_complexity)]
+    fn narrow_known_inputs(
+        declared: &[C::Type],
+        known: &[bool],
+        input_types: &[C::Type],
+    ) -> Result<Option<(C::Operation, Vec<usize>, Vec<(usize, C::Type)>)>, ProgramError> {
+        let indices = (0..known.len()).filter(|&index| known[index]).collect::<Vec<_>>();
+        let known_declared = indices.iter().map(|&index| declared[index].clone()).collect::<Vec<_>>();
+        let known_types = indices.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
+        let Some((guard, members)) = GuardOperation::for_entry("partial_evaluation", &known_declared, &known_types)?
+        else {
+            return Ok(None);
+        };
+        let member_types = members.iter().map(|&member| known_types[member].clone()).collect::<Vec<_>>();
+        let pinned_identities = Self::pinned_identities(member_types.iter().map(|r#type| (false, r#type)));
+        let guard = guard.retaining(&member_types, &pinned_identities)?;
+        let guard = C::Operation::provide(guard, &member_types.iter().collect::<Vec<_>>())?;
+        let output_types = guard.infer_output_types(&member_types, &[])?;
+        let output_indices = members
+            .iter()
+            .filter(|&&member| !known_declared[member].is_reference())
+            .map(|&member| indices[member])
+            .collect::<Vec<_>>();
+        check_count!("output", output_types, output_indices.len(), ProgramError);
+        let members = members.into_iter().map(|member| indices[member]).collect();
+        Ok(Some((guard, members, output_indices.into_iter().zip(output_types).collect())))
+    }
+
+    /// Plans the guard over the complete entry of `region`, which is declared as `declared`, for `inputs` whose known
+    /// members have already been narrowed (with [`None`] marking unallocated root unknowns) and their `input_types`, in
+    /// input order. Returns the positions of the guarded members, in increasing order, together with the guard
+    /// operation that this context's operation family provides for them, or [`None`] when no relationship needs a
+    /// check. Unallocated root unknowns outside the guard are narrowed in `input_types` only by their actual identities'
+    /// own singleton bounds. Refer to [`Self::guard_region_inputs`] for the role of `separate_invocation`.
+    ///
+    /// The guard re-checks the known members of every class that an unknown input joins, even though the guard that
+    /// [`Self::narrow_known_inputs`] plans has already established their relationships among themselves. Dropping
+    /// such members is not safe in general: a known member can be the only one that ties a formal identity to the
+    /// class (e.g., two known `f32[b]` entering `f32[n]` and `f32[m]`, next to unknowns entering both), and reference
+    /// precedence can change the representation of every known member of the class, which only guard outputs carry.
+    fn plan_entry_guard(
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        declared: &[C::Type],
+        inputs: &[Option<PartialEvaluationValue<C::Value>>],
+        input_types: &mut [C::Type],
+        separate_invocation: bool,
+    ) -> Result<(Vec<usize>, Option<C::Operation>), ProgramError> {
+        let mut members = GuardOperation::for_entry("partial_evaluation", declared, input_types)?
+            .map(|(_, members)| members)
+            .unwrap_or_default();
+        let pinned = Self::pinned_identities(
+            inputs
+                .iter()
+                .zip(input_types.iter())
+                .map(|(input, r#type)| (input.as_ref().is_some_and(PartialEvaluationValue::is_known), r#type)),
+        );
+        if inputs.iter().any(Option::is_none) {
+            // Outside guarded members, only an actual identity's own singleton bounds can narrow an unknown.
+            // Guarded representations always stay inside the body, so checked unknown headers remain unchanged.
+            let refinements = <C::Type as Type>::Refinements::new(declared.iter(), input_types.iter())?;
+            for (index, (input_type, input)) in input_types.iter_mut().zip(inputs).enumerate() {
+                if input.is_none() && !input_type.is_reference() && !members.contains(&index) {
+                    *input_type = refinements.refine_actual(input_type, &pinned)?;
+                }
+            }
+        }
+        if separate_invocation && !region.effects().classes().is_empty() {
+            let identities_of = |known: bool| {
+                inputs
+                    .iter()
+                    .zip(input_types.iter())
+                    .filter(|(input, _)| input.as_ref().is_some_and(PartialEvaluationValue::is_known) == known)
+                    .flat_map(|(_, r#type)| {
+                        r#type.identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (known_identities, unknown_identities) = (identities_of(true), identities_of(false));
+            for (index, r#type) in input_types.iter().enumerate() {
+                if r#type
+                    .identities()
+                    .any(|(_, identity)| known_identities.contains(identity) && unknown_identities.contains(identity))
+                    && !members.contains(&index)
+                {
+                    members.push(index);
+                }
+            }
+            members.sort_unstable();
+        }
+        if members.is_empty() {
+            return Ok((members, None));
+        }
+        let member_types = members.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
+        let guard =
+            GuardOperation::new("partial_evaluation", members.iter().map(|&index| declared[index].clone()).collect())
+                .retaining(&member_types, &pinned)?;
+        let guard = C::Operation::provide(guard, &member_types.iter().collect::<Vec<_>>())?;
+        Ok((members, Some(guard)))
+    }
+
+    /// Returns candidate symbolic representatives in priority order: immutable reference identities, then identities
+    /// still carried by known inputs after known-side narrowing. A known representation can change behind a residual
+    /// entry check, while reference handles always keep their referent types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Whether each input is known, paired with its type, in input order.
+    fn pinned_identities<'o>(inputs: impl IntoIterator<Item = (bool, &'o C::Type)>) -> Vec<<C::Type as Type>::Identity>
+    where
+        C::Type: 'o,
+    {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let mut identities = Vec::new();
+        for (_, r#type) in inputs
+            .iter()
+            .filter(|(_, r#type)| r#type.is_reference())
+            .chain(inputs.iter().filter(|(known, r#type)| *known && !r#type.is_reference()))
+        {
+            for (_, identity) in r#type.identities() {
+                if !identities.contains(identity) {
+                    identities.push(identity.clone());
+                }
+            }
+        }
+        identities
     }
 }
 
@@ -1479,18 +1955,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
+        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::{
-        AddOperation, DimensionSubOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
-        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation, RematerializeOperation, SubOperation, WhileOperation, Zero,
+        AddOperation, DimensionAddOperation, DimensionSizeOperation, DimensionSubOperation, LinearCallOperation,
+        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RematerializeOperation, SubOperation,
+        WhileOperation, Zero, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::evaluations::PartialEvaluation;
@@ -1498,7 +1975,8 @@ mod tests {
         NoStorage, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualRejection,
     };
     use crate::partial::tests::{
-        TestCapture, TestOperation, TestValue, reference_ordering_program, replay_reference_ordering_program,
+        TestCapture, TestCaptureOperation, TestOperation, TestValue, reference_ordering_program,
+        replay_reference_ordering_program,
     };
     use crate::partial::values::{
         PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
@@ -1852,6 +2330,46 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_known_value() {
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let vector = TestValue::Array(Array::vector(vec![1f32, 2.0]).unwrap());
+
+        // A value that its type does not determine keeps an undecided materialization, so residual work that consumes
+        // it receives it as a residual input.
+        assert_eq!(context.known_value(vector.clone()).materialization(), PartialValueMaterialization::Undecided);
+
+        // An eager fold produces a static first-class dimension, which its type determines completely. Residual work
+        // that consumes it therefore embeds it as a constant instead of receiving it as a residual input.
+        let size = DimensionSizeOperation::new(&vector_type, 0).unwrap();
+        let extent = context.parent().bind(size, Vec::new(), &[vector]).unwrap().remove(0);
+        let extent = context.known_value(extent);
+        assert_eq!(extent.materialization(), PartialValueMaterialization::Constant { residual_atom: None });
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let unknown = context.unknown_input(n.clone().into(), 0);
+        let sum = DimensionAddOperation::new(&DimensionType::from(Dimension::Static(2)), &n).unwrap();
+        let outputs = context.residualize(sum, Vec::new(), &[extent, unknown]).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.inputs(), &[PartialEvaluationInput::Unknown(0)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:dimension<n ∈ [1, 8)> .
+                let %1:dimension<2> = const 2
+                    %2:dimension<2 + n ∈ [3, 10)> = dimension_add %1 %0
+                in (%2)"},
+        );
+
+        // A symbolic value of a staging parent stays undecided, because its known-side producer stays live.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let staging = PartialEvaluationContext::new(outer.clone());
+        assert_eq!(
+            staging.known_value(outer.input(n.into())).materialization(),
+            PartialValueMaterialization::Undecided,
+        );
+    }
+
+    #[test]
     fn test_partial_evaluation_context_fold_or_residualize() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs
@@ -1909,6 +2427,14 @@ mod tests {
 
             fn effects(&self) -> Cow<'_, Effects> {
                 Cow::Borrowed(&self.effects)
+            }
+        }
+
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for UnavailableOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -2339,6 +2865,14 @@ mod tests {
         #[derive(Clone)]
         struct PreparationFailureOperation;
 
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for PreparationFailureOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
+            }
+        }
+
         impl Operation for PreparationFailureOperation {
             type Type = ArrayType;
 
@@ -2543,6 +3077,136 @@ mod tests {
             evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0).unwrap()]),
             Ok(vec![Array::scalar(11.0).unwrap()])
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_program_guards_the_entry() {
+        // Inlining `[f32[n], f32[n]] -> first` with a known `f32[2]` and an unknown `f32[n]` removes the program's
+        // entry, so the inlined residual checks `n` exactly like the source program and accepts only extent 2.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()])).into();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = builder.add_input(vector_type.clone());
+        builder.add_input(vector_type.clone());
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let vector = |extent| TestValue::Array(Array::vector(vec![1f32; extent]).unwrap());
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let outputs = context
+            .inline_program(
+                &program,
+                vec![PartialEvaluationValue::known(vector(2)), context.unknown_input(vector_type, 1)],
+            )
+            .unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[n], %1:f32[2] .
+                let %2:f32[2], %3:f32[2] = guard [boundary="partial_evaluation", types=[f32[n], f32[n]]] %1 %0
+                in ()"#},
+        );
+        let eager = EagerContext::<TestValue, TestOperation>::new();
+        assert_eq!(evaluation.interpret(&eager, &[vector(2)]), Ok(vec![vector(2)]));
+        assert_eq!(evaluation.interpret(&eager, &[vector(3)]), program.interpret(vec![vector(2), vector(3)]));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_program_preserves_exact_definitions_with_retained_references() {
+        // A singleton actual matrix joins two formal identities. The reference retains its wider identity, but that
+        // name cannot replace the narrower formal axis: preparation must keep a source-admissible representation.
+        let narrow = DimensionType::new("narrow", DimensionBounds::new(1, Some(4)).unwrap());
+        let wide = DimensionType::new("wide", DimensionBounds::new(1, Some(8)).unwrap());
+        let exact = DimensionType::new("exact", DimensionBounds::new(3, Some(4)).unwrap());
+        let vector =
+            |dimension: &DimensionType| ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
+        let reference_type: ArrayIrType = ReferenceType::new(vector(&wide)).into();
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![narrow.dimension().clone(), wide.dimension().clone()]));
+        let actual_matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![exact.dimension().clone(), exact.dimension().clone()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(reference_type.clone());
+        let dimension = builder.add_input(narrow.clone().into());
+        builder.add_input(matrix_type.into());
+        let output =
+            builder.add_instruction(ZeroOperation::new(vector(&narrow)), vec![], vec![dimension], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference =
+            |extent| ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; extent]).unwrap()));
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let matrix = ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap());
+        let expected = program.interpret(vec![reference(3), dimension.clone(), matrix.clone()]).unwrap();
+        let context =
+            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let inputs = vec![
+            context.unknown_input(reference_type, 0),
+            PartialEvaluationValue::known(dimension.clone()),
+            context.unknown_input(actual_matrix_type.into(), 2),
+        ];
+        let outputs = context.inline_program(&program, inputs).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:ref<f32[wide]>, %1:f32[exact, exact] .
+                let %2:f32[3, wide] = guard [
+                    boundary="partial_evaluation",
+                    types=[ref<f32[wide]>, f32[narrow, wide]],
+                    retained=[wide],
+                ] %0 %1
+                in ()"#},
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[reference(3), matrix.clone()]), Ok(expected));
+        let direct_error = program.interpret(vec![reference(4), dimension, matrix.clone()]);
+        assert_eq!(
+            direct_error,
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "wide".to_owned(),
+                expected: 4,
+                actual: 3,
+            }))),
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[reference(4), matrix]), direct_error);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_program_rejects_unguardable_entries() {
+        // An operation family without an entry guard cannot preserve an unproven entry relationship, so inlining a
+        // program with a mixed signature is rejected instead of dropping its entry check.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let first = builder.add_input(vector_type.clone());
+        builder.add_input(vector_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        assert_eq!(
+            context
+                .inline_program(
+                    &program,
+                    vec![
+                        PartialEvaluationValue::known(Array::vector(vec![1f32; 2]).unwrap()),
+                        context.unknown_input(vector_type, 1),
+                    ],
+                )
+                .map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "the input types of `partial_evaluation` leave identity relationships unproven, but the \
+                          operation family cannot represent the guard required to preserve these input checks"
+                    .to_string(),
+            }),
+        );
+        assert!(context.builder.borrow().instructions().is_empty());
     }
 
     #[test]
@@ -2881,6 +3545,304 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_preserve_reference_input() {
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let declared: ArrayIrType =
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![extent.dimension().clone()]))).into();
+        let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Stage);
+
+        // A handle that the residual program does not receive yet becomes a new residual input of the declared type,
+        // which the shared materialization slot of the supplied value records.
+        let first = context.known_value(TestValue::Reference(reference.clone()));
+        let prepared = context.preserve_reference_input(&first, &declared).unwrap();
+        let input = PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(0)) };
+        assert_eq!(first.materialization(), input);
+        assert!(Rc::ptr_eq(&prepared.materialization, &first.materialization));
+
+        // A distinct value of the same handle reuses that residual input, and so does a later use of that value.
+        let second = context.known_value(TestValue::Reference(reference.clone()));
+        let reused = context.preserve_reference_input(&second, &declared).unwrap();
+        assert_eq!(second.materialization(), input);
+        assert!(Rc::ptr_eq(&reused.materialization, &second.materialization));
+        let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
+        let outputs = context.residualize(read.clone(), Vec::new(), &[second]).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.inputs(), &[PartialEvaluationInput::Known(TestValue::Reference(reference.clone()))]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:ref<f32[extent]> .
+                let %1:f32[extent] = reference_read %0
+                in (%1)"},
+        );
+
+        // A handle that the residual program already receives at another type (e.g., the exact type of an earlier
+        // use) cannot also enter at the declared type without a second, aliasing input.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Stage);
+        let known = context.known_value(TestValue::Reference(reference.clone()));
+        context.residualize(read, Vec::new(), std::slice::from_ref(&known)).unwrap();
+        assert_eq!(
+            context.preserve_reference_input(&known, &declared).map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "a known reference that the residual program already receives as `ref<f32[2]>` cannot also \
+                          enter a retained region at its declared type `ref<f32[extent]>`"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(context.inputs.borrow().len(), 1);
+
+        // Only known references of an eager known side can enter at their declared types.
+        let unknown = context.unknown_input(declared.clone(), 0);
+        assert_eq!(
+            context.preserve_reference_input(&unknown, &declared).map(|_| ()),
+            Err(ProgramError::MalformedProgram("reference entry witness must be known".to_string())),
+        );
+        let array = context.known_value(TestValue::Array(Array::vector(vec![1f32; 2]).unwrap()));
+        assert_eq!(
+            context.preserve_reference_input(&array, &declared).map(|_| ()),
+            Err(ProgramError::MalformedProgram(
+                "reference entry witness must have a known eager reference type".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_prepare_region_inputs_rejects_unguardable_entries() {
+        // An operation family without an entry guard cannot preserve an unproven entry relationship, so preparing a
+        // mixed signature is rejected instead of dropping its entry check.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let first = builder.add_input(vector_type.clone());
+        builder.add_input(vector_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        assert_eq!(
+            context
+                .prepare_region_inputs(
+                    program.entry_region_ref(),
+                    &[PartialValue::Known(Array::vector(vec![1f32; 2]).unwrap()), PartialValue::Unknown(vector_type)],
+                )
+                .map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "the input types of `partial_evaluation` leave identity relationships unproven, but the \
+                          operation family cannot represent the guard required to preserve these input checks"
+                    .to_string(),
+            }),
+        );
+
+        // Family validation must precede residual-header allocation, leaving a rejected preparation reusable.
+        assert!(context.builder.borrow().input_ids().is_empty());
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(context.inputs.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_guard_region_inputs_preserves_known_inputs_behind_deferred_guards() {
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, a, b] = ["n", "a", "b"].map(|name| DimensionType::new(name, bounds));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = builder.add_input(n.clone().into());
+        builder.add_input(n.clone().into());
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // With effect folding disabled, the guard over the known `dimension<a>` and `dimension<b>` stays residual. Its
+        // output replaces only the member whose type it changes, so the first input stays known.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let first = outer.input(a.clone().into());
+        let second = outer.input(b.clone().into());
+        let context = PartialEvaluationContext::new(outer).with_allow_effect_folding(false);
+        let first = context.known_value(first);
+        let second = context.known_value(second);
+        let outputs =
+            context.guard_region_inputs(program.entry_region_ref(), vec![first.clone(), second], true).unwrap();
+        assert_eq!(outputs[0].as_known(), first.as_known());
+        assert!(outputs[1].is_unknown());
+        assert_eq!(outputs[1].r#type(), first.r#type());
+        assert!(context.defer_ordered_effects());
+        let evaluation = context.into_evaluation(vec![outputs[0].clone()]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)> .
+                let %2:dimension<a ∈ [1, 8)>, %3:dimension<a ∈ [1, 8)> = guard [
+                    boundary="partial_evaluation",
+                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    retained=[a],
+                ] %0 %1
+                in ()"#},
+        );
+
+        // A deferral caused by an earlier residual check must preserve the same knownness as disabled folding.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let first = outer.input(a.clone().into());
+        let second = outer.input(b.clone().into());
+        let context = PartialEvaluationContext::new(outer);
+        let first = context.known_value(first);
+        let second = context.known_value(second);
+        let unknown = context.unknown_input(a.clone().into(), 0);
+        context
+            .fold_or_residualize(
+                GuardOperation::new("earlier", vec![n.clone().into(), n.clone().into()])
+                    .with_retained(vec![a.to_variable()]),
+                Vec::new(),
+                &[unknown, second.clone()],
+            )
+            .unwrap();
+        let outputs =
+            context.guard_region_inputs(program.entry_region_ref(), vec![first.clone(), second], true).unwrap();
+        assert_eq!(outputs[0].as_known(), first.as_known());
+        assert!(outputs[1].is_unknown());
+        assert_eq!(outputs[1].r#type(), first.r#type());
+        assert!(context.defer_ordered_effects());
+        let evaluation = context.into_evaluation(vec![outputs[0].clone()]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)>, %2:dimension<a ∈ [1, 8)> .
+                let %3:dimension<a ∈ [1, 8)>, %4:dimension<a ∈ [1, 8)> = guard [
+                    boundary="earlier",
+                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    retained=[a],
+                ] %0 %1
+                    %5:dimension<a ∈ [1, 8)>, %6:dimension<a ∈ [1, 8)> = guard [
+                        boundary="partial_evaluation",
+                        types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                        retained=[a],
+                    ] %2 %1
+                in ()"#},
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_guard_region_inputs_rechecks_known_members_of_unknown_classes() {
+        // A known `dimension<b>` and a known `dimension<c>` next to an unknown `dimension<a>` enter
+        // `[dimension<n>, dimension<n>, dimension<n>]`. The guard over the known pair establishes their relationship,
+        // and the guard over the complete entry checks the unknown input against that class. The latter re-checks both
+        // known members, because dropping known members of a class is not safe in general (refer to
+        // `PartialEvaluationContext::plan_entry_guard`).
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, a, b, c] = ["n", "a", "b", "c"].map(|name| DimensionType::new(name, bounds));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(n.clone().into());
+        builder.add_input(n.clone().into());
+        let output = builder.add_input(n.into());
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        // Disabling effect folding keeps the guard over the known pair in the residual program, next to the entry
+        // guard.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let first = outer.input(b.into());
+        let second = outer.input(c.into());
+        let context = PartialEvaluationContext::new(outer).with_allow_effect_folding(false);
+        let inputs = vec![context.known_value(first), context.known_value(second), context.unknown_input(a.into(), 2)];
+        let outputs = context.guard_region_inputs(program.entry_region_ref(), inputs, false).unwrap();
+        let evaluation = context.into_evaluation(vec![outputs[2].clone()]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)>, %2:dimension<c ∈ [1, 8)> .
+                let %3:dimension<b ∈ [1, 8)>, %4:dimension<b ∈ [1, 8)> = guard [
+                    boundary="partial_evaluation",
+                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    retained=[b],
+                ] %1 %2
+                    %5:dimension<b ∈ [1, 8)>, %6:dimension<b ∈ [1, 8)>, %7:dimension<b ∈ [1, 8)> = guard [
+                        boundary="partial_evaluation",
+                        types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                        retained=[b],
+                    ] %1 %4 %0
+                in (%7)"#},
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_guard_region_inputs_requests_every_guard_before_mutating_state() {
+        /// Operation family that represents guards with at most two members, so that it accepts the guard over the
+        /// known inputs below and rejects the guard over the complete entry.
+        #[derive(Clone, Debug)]
+        struct PairGuardOperation(GuardOperation<ArrayIrType>);
+
+        impl Operation for PairGuardOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayIrType],
+                region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                self.0.infer_output_types(input_types, region_interfaces)
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                self.0.effects()
+            }
+        }
+
+        impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for PairGuardOperation {
+            type Operation = Self;
+
+            fn provide(
+                request: GuardOperation<ArrayIrType>,
+                _input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                if request.declared_types().len() > 2 {
+                    return Err(request.unsupported_family_error());
+                }
+                Ok(Self(request))
+            }
+        }
+
+        // The known `dimension<b>` and `dimension<c>` need a guard of their own, which a staging parent would fold
+        // into its program, and the unknown `dimension<a>` needs a guard over the complete entry, which the family
+        // rejects. Both are requested before the first one folds, so the rejection leaves both programs unchanged.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, a, b, c] = ["n", "a", "b", "c"].map(|name| DimensionType::new(name, bounds));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, PairGuardOperation>::new();
+        let output = builder.add_input(n.clone().into());
+        builder.add_input(n.clone().into());
+        builder.add_input(n.into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let outer = TracingContext::<ArrayIrValue<Array>, PairGuardOperation>::new();
+        let context = PartialEvaluationContext::new(outer.clone());
+        let inputs = vec![
+            PartialEvaluationValue::known(outer.input(b.into())),
+            PartialEvaluationValue::known(outer.input(c.into())),
+            context.unknown_input(a.into(), 2),
+        ];
+        assert_eq!(
+            context.guard_region_inputs(program.entry_region_ref(), inputs, false).map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "the input types of `partial_evaluation` leave identity relationships unproven, but the \
+                          operation family cannot represent the guard required to preserve these input checks"
+                    .to_string(),
+            }),
+        );
+        assert!(outer.builder().borrow().instructions().is_empty());
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert_eq!(context.inputs.borrow().len(), 1);
+    }
+
+    #[test]
     fn test_partial_evaluation_context_lift() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         let lifted = context.lift(Array::scalar(2.0).unwrap()).unwrap();
@@ -3105,10 +4067,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_reference_identity_for_captured_accesses() {
-        let outer = TracingContext::<
-            TestCapture,
-            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-        >::new();
+        let outer = TracingContext::<TestCapture, TestCaptureOperation>::new();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         let capture = outer.constant(CaptureReference::new(0, reference_type.clone()));
         let expected = outer.reference_identity(&capture).unwrap();
@@ -3156,10 +4115,7 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_reference_identity_for_unresolved_inherited_capture() {
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let outer = TracingContext::<
-            TestCapture,
-            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-        >::new();
+        let outer = TracingContext::<TestCapture, TestCaptureOperation>::new();
         let context = PartialEvaluationContext::new(outer.clone());
 
         // Inherited constants enter the residual builder without being materialized through the parent context.
