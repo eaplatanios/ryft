@@ -5,7 +5,7 @@ use ryft_macros::Parameterized;
 use crate::arrays::ArrayType;
 use crate::axes::NamedAxes;
 use crate::batching::{BatchableType, RecursiveBatchingPolicy};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{CotangentBatchingPolicy, DifferentiableType};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::attention::{
@@ -22,7 +22,7 @@ use crate::operations::custom_functions::operations::CustomFunctionOperation;
 use crate::operations::custom_functions::rules::CustomRuleRegistration;
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError, Typed, Value};
-use crate::tracing::{DomainTracer, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
 /// Residuals retained by the fused attention reverse rule.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
@@ -93,6 +93,7 @@ fn bind_attention_backward<D: Domain<Type = ArrayType>>(
 where
     D::Operation: From<DotProductAttentionBackwardOperation>
         + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     let signature = inputs.signature();
     let context = inputs.query.domain();
@@ -150,7 +151,10 @@ type AttentionBackward<D> = Box<
 /// boundary, which lets the transitions' transposes accumulate invariant-input contributions exactly once. Its forward
 /// and backward rules are retained: an ordinary call traces only the attention primal, and the rules are traced on the
 /// first reverse-mode request of each specialization and cached for as long as the function lives.
-pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>> {
+pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>>
+where
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+{
     /// Custom function that stages the attention training call.
     function: CustomFunction<
         AttentionInputs<DomainTracer<D>>,
@@ -165,6 +169,7 @@ impl<D: Domain<Type = ArrayType>> DifferentiableDotProductAttention<D>
 where
     D::Constant: 'static,
     D::Operation: 'static,
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     /// Aligns the inputs' manual variation and stages the attention training call.
     pub fn call<C, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
@@ -212,6 +217,7 @@ where
         + From<DotProductAttentionBackwardOperation>
         + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
     DomainTracer<D>: DotProductAttention,
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     let primal: AttentionPrimal<D> = Box::new(move |inputs| {
         let (output, _) = DomainTracer::<D>::dot_product_attention(inputs, configuration.with_residual(false))?;

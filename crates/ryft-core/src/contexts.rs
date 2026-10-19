@@ -204,13 +204,17 @@ impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
 /// # Guard Provision
 ///
 /// Every context's operation family provides [`GuardOperation`] requests. Contextual replay (refer to
-/// [`Program::interpret_in_context`]) checks the type relationships of a region boundary before specializing its body
-/// and, under a symbolic context, must bind that check as an instruction of the family, so it constructs the check
+/// [`Program::interpret_in_context`]) checks the type relationships of a region boundary or instruction before
+/// specializing the replayed body to them and, when the types leave a relationship unproven, constructs a guard
 /// through [`OperationProvider`] and binds it like any other operation. Stating the requirement here, rather than at
-/// every replay caller, lets `C: Context` alone imply it. Families whose enum carries a guard variant receive the
-/// provider from the blanket `From` implementation; a family that cannot represent a guard implements a rejecting
-/// provider, which an eager context never invokes because concrete values establish their relationships at the
-/// boundary.
+/// every replay caller, lets `C: Context` alone imply it. Families whose enum stores a guard variant receive the
+/// provider from the blanket `From` implementation, while `#[derive(Operation)]` and
+/// [`impl_guardless_operation!`](crate::impl_guardless_operation) generate a rejecting provider for families that store
+/// no guard, so such a family needs no hand-written provider. An eager context over exact values never invokes a
+/// provider, because concrete values establish their relationships at the boundary and replay constructs no guard for
+/// them (refer to [`needs_guards`](Self::needs_guards)). A guard that replay does construct is enforced by the
+/// family's rule under a transform, by interpretation in an eager context, or by staging, according to the contract in
+/// [the `GuardOperation` documentation](GuardOperation#enforcement).
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait Context:
     Clone + Domain<Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>>
@@ -259,13 +263,15 @@ pub trait Context:
     fn is_eager(&self) -> bool;
 
     /// Returns whether replaying a [`Region`](crate::Region) over inputs of types `input_types` in this [`Context`]
-    /// must stage guards for type relationships that the types do not prove. A staging context always does, because
-    /// the body it stages is specialized to relationships that remain unproven until runtime. An eager context does
-    /// only when an input type is not fully static: concrete values carry exact types, so a type that still names an
-    /// identity marks a transform carrier riding over an eager parent (e.g., a bounded ragged batch or a mapped
-    /// dimension) whose per-item extents live outside the type and which a boundary refinement check alone cannot
-    /// validate. Only the guard's transform rule reaches those per-item checks. Exact static types keep guard planning
-    /// off the eager hot path.
+    /// must construct guards for type relationships that the types do not prove. Binding such a guard enforces it,
+    /// which, depending on the context, may interpret, transform, stage, or reject it. Refer to
+    /// [`GuardOperation`'s enforcement contract](GuardOperation#enforcement) for more information. A context that is
+    /// not eager always needs guards, because the body it stages is specialized to relationships that remain unproven
+    /// until runtime. An eager context needs them only when an input type is not fully static: concrete values carry
+    /// exact types, so a type that still names an identity marks a transform carrier riding over an eager parent (e.g.,
+    /// a bounded ragged batch or a mapped dimension) whose per-item extents live outside the type and which a boundary
+    /// refinement check alone cannot validate. Only the guard's transform rule reaches those per-item checks, and it
+    /// rejects carriers that it cannot relate. Exact static types keep guard planning off the eager hot path.
     #[inline]
     fn needs_guards(&self, input_types: &[Self::Type]) -> bool {
         !self.is_eager() || input_types.iter().any(|r#type| r#type.identities().next().is_some())
@@ -1042,6 +1048,7 @@ mod tests {
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::differentiation::DifferentiationTracer;
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, DimensionAddOperation, NegOperation, OneOperation,
         WhileOperation, ZeroOperation,
@@ -1516,13 +1523,7 @@ mod tests {
             }
         }
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for StagingRegionOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(StagingRegionOperation);
 
         #[derive(Clone)]
         struct IdentityInstantiatingRegionOperation {
@@ -1584,13 +1585,7 @@ mod tests {
             }
         }
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for IdentityInstantiatingRegionOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(IdentityInstantiatingRegionOperation);
 
         let region = {
             let mut builder = ProgramBuilder::<Array, StagingRegionOperation>::new();
@@ -1801,16 +1796,7 @@ mod tests {
             }
         }
 
-        impl OperationProvider<DimensionType, GuardOperation<DimensionType>> for NarrowingOperation {
-            type Operation = Self;
-
-            fn provide(
-                request: GuardOperation<DimensionType>,
-                _input_types: &[&DimensionType],
-            ) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(NarrowingOperation);
 
         /// Stages one narrowed body through the chosen driver and checks its result, inference count, and closure.
         fn check_narrowed_body<D: BindingRegionDriver<DimensionValue, NarrowingOperation>>(

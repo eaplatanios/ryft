@@ -4546,8 +4546,9 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
-        Add, AddOperation, ConditionOperation, GuardOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        Add, AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
         ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
@@ -4557,7 +4558,7 @@ mod tests {
     use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::{Instruction, InstructionId};
-    use crate::programs::operations::{Operation, OperationFormatter, OperationProjection, OperationProvider};
+    use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
     use crate::programs::programs::ProgramRenderingMode;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::analysis::ReferenceAnalysisError;
@@ -5220,13 +5221,7 @@ mod tests {
         }
     }
 
-    impl OperationProvider<ListIrType, GuardOperation<ListIrType>> for ListOperation {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<ListIrType>, _input_types: &[&ListIrType]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(ListOperation);
 
     /// Region-policy stand-in that permits exactly one non-consuming reference access mode.
     #[derive(Copy, Clone, Debug)]
@@ -9423,16 +9418,7 @@ mod tests {
             type Projected = ArrayOperation<Array>;
         }
 
-        impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for CallingOperation {
-            type Operation = Self;
-
-            fn provide(
-                request: GuardOperation<ArrayIrType>,
-                _input_types: &[&ArrayIrType],
-            ) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(CallingOperation);
 
         impl From<ArrayOperation<Array>> for CallingOperation {
             fn from(operation: ArrayOperation<Array>) -> Self {

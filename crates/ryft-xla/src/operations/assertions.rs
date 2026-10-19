@@ -1197,8 +1197,7 @@ fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i
 /// token into the ordered-I/O chain, so every later ordered I/O effect (including those inside the region whose input
 /// it checks) is ordered after its check and after every earlier assertion on that chain, exactly as the input
 /// validation that it replaces precedes the region. That includes a guard that emits no check of its own because its
-/// packed declarations are proven, such as the guard through which batching orders values after per-item ragged
-/// checks (refer to the ragged batching of [`GuardOperation`]). Ordinary assertions keep their independent chain.
+/// declarations are proven. Ordinary assertions keep their independent chain.
 ///
 /// # Parameters
 ///
@@ -1876,74 +1875,75 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_ragged_guard_orders_later_io_after_per_item_checks() {
-        use ryft_core::{
-            BatchAxis, DimensionFromScalar, DynamicBroadcast, Print, Reduce, ReductionKind, StagingContext,
-            TracingContext, Value, batch,
-        };
+    fn test_lower_guard_orders_later_io_after_preceding_assertions() {
+        use ryft_core::{AssertOperation, DimensionFromScalarOperation, PrintOperation};
 
-        use crate::experimental::ops::XlaOperation;
-
-        // Batching a guard over a bounded ragged carrier stages its per-item check as a standalone assertion ahead of
-        // guards whose packed declarations are already proven. Those guards still join the assertion chain into the
-        // ordered-I/O chain, so a later print of an input that does not consume the guard's outputs cannot run before
-        // the per-item validation.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged: ArrayIrType =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into();
-        let row_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
+        // A guard whose declarations are proven emits no check of its own, but it still joins the assertions that
+        // precede it into the ordered-I/O chain, so a later print of a value that does not consume the guard's output
+        // cannot run before those assertions.
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let array_type = ArrayType::new_static(DataType::F64, [3]);
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
         let mut builder = CompositeXlaProgramBuilder::new();
-        let carrier = builder.add_input(ragged.clone());
-        let row = builder.add_input(row_type);
-        let guarded = builder
-            .add_instruction(GuardOperation::new("region", vec![ragged; 2]), Vec::new(), vec![carrier, row], None)
-            .unwrap()
-            .to_vec();
-        let guarded = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(guarded, vec![Placeholder; 2], vec![Placeholder; 2])
+        let left = builder.add_input(scalar_type.clone().into());
+        let right = builder.add_input(scalar_type.clone().into());
+        let value = builder.add_input(array_type.clone().into());
+        let row = builder.add_input(array_type.clone().into());
+        let left_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(left_variable.into()), Vec::new(), vec![left], None)
+            .unwrap()[0];
+        let right_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(right_variable.into()), Vec::new(), vec![right], None)
+            .unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                Vec::new(),
+                vec![left_dimension, right_dimension],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`left_dimension` <= `right_dimension`"),
+                Vec::new(),
+                vec![predicate],
+                None,
+            )
             .unwrap();
-        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
-        let values = trace.input(ArrayType::new_static(DataType::F64, [2]).into());
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let rows = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
-        let (summed, printed) = batch(
-            |(value, extent, row)| {
-                let carrier = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
-                let outputs = guarded.interpret_in_context(&carrier.domain(), vec![carrier, row.clone()])?;
-                Ok((outputs[0].reduce(&[0], ReductionKind::Sum)?, row.print("row")?))
-            },
-            (values, extents, rows),
-            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
-            (BatchAxis::new(0), BatchAxis::new(0)),
-            None,
-        )
-        .unwrap();
-        let program = trace.builder().borrow().clone();
-        let program = program
+        let guarded = builder
+            .add_instruction(
+                GuardOperation::new("region", vec![ArrayIrType::from(array_type.clone())]),
+                Vec::new(),
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("row"), Vec::new(), vec![row], None)
+            .unwrap()[0];
+        let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![summed.atom_id().unwrap(), printed.atom_id().unwrap()],
-                vec![Placeholder; 3],
+                vec![guarded, printed],
+                vec![Placeholder; 4],
                 vec![Placeholder; 2],
             )
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
             &[],
-            &[
-                ArrayType::new_static(DataType::F64, [2]),
-                ArrayType::new_static(DataType::I32, [2]),
-                ArrayType::new_static(DataType::F64, [2, 3]),
-            ],
-            &[ArrayType::new_static(DataType::F64, [2]), ArrayType::new_static(DataType::F64, [2, 3])],
+            &[scalar_type.clone(), scalar_type, array_type.clone(), array_type.clone()],
+            &[array_type.clone(), array_type],
             "main",
             None,
             None,
         )
         .unwrap();
-        // The per-item check is the last assertion; the print's token derives from its output token through the
-        // guards' chain joins.
+        // The guard emits no assertion, so the explicit requirement is the last one. The print's token derives from
+        // its output token through the guard's chain join.
         let assertion = module.lines().filter(|line| line.contains("@ryft.assert")).last().unwrap();
-        assert!(assertion.contains("requires every batch item's dimension `length` to have extent 3"), "{module}");
+        assert!(assertion.contains("`left_dimension` <= `right_dimension`"), "{module}");
         let assertion_token = assertion.trim().split_once(" = ").unwrap().0.to_owned();
         let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
         let mut token = print
@@ -1961,8 +1961,8 @@ mod tests {
             let definition = module
                 .lines()
                 .find(|line| line.trim().starts_with(&format!("{token} = stablehlo.after_all")))
-                .unwrap_or_else(|| panic!("print token `{token}` does not derive from the per-item check:\n{module}"));
-            // Follow the first operand of the join that is not the ordered-I/O chain's own token.
+                .unwrap_or_else(|| panic!("print token `{token}` does not derive from the assertion:\n{module}"));
+            // Follow the last operand of the join, which is the assertion token rather than the ordered-I/O chain's.
             let operands = definition.split_once("after_all").unwrap().1.split_once(':').unwrap().0;
             token = operands.split(',').map(str::trim).filter(|operand| !operand.is_empty()).last().unwrap().to_owned();
         }
@@ -2125,267 +2125,6 @@ mod tests {
             let error = execute_mixed_program(&client, &jvp, &inputs, &[2, 6, 2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
         }
-    }
-
-    #[test]
-    fn test_execute_ragged_guard_jvp() {
-        use ryft_core::{
-            BatchAxis, DimensionFromScalar, DynamicBroadcast, Reduce, ReductionKind, StagingContext, TracingContext,
-            Value, batch,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::XlaOperation;
-        use crate::tests::execution_client;
-
-        // The guard relates a bounded ragged carrier and a dense `f64[3]` row under one declared identity. Batching
-        // its JVP over per-item extents stages a per-item check that every carrier has extent 3 ahead of the guarded
-        // primal and tangent outputs, whose masked sums then see each item's three live elements.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged: ArrayIrType =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into();
-        let row_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let carrier = builder.add_input(ragged.clone());
-        let row = builder.add_input(row_type);
-        let guarded = builder
-            .add_instruction(
-                GuardOperation::new("region", vec![ragged.clone(); 2]),
-                Vec::new(),
-                vec![carrier, row],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let guarded = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(guarded, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let guarded_jvp = guarded.jvp().unwrap();
-        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
-        let values = trace.input(ArrayType::new_static(DataType::F64, [2]).into());
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let rows = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
-        let (primal, tangent) = batch(
-            |(value, extent, row)| {
-                let carrier = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
-                let inputs = vec![carrier.clone(), row.clone(), carrier.clone(), row];
-                // The outputs are the guarded carrier and row followed by their tangents, all typed `f64[length]`.
-                let outputs = guarded_jvp.interpret_in_context(&carrier.domain(), inputs)?;
-                Ok((outputs[0].reduce(&[0], ReductionKind::Sum)?, outputs[2].reduce(&[0], ReductionKind::Sum)?))
-            },
-            (values, extents, rows),
-            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
-            (BatchAxis::new(0), BatchAxis::new(0)),
-            None,
-        )
-        .unwrap();
-        let program = trace.builder().borrow().clone();
-        let program = program
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![primal.atom_id().unwrap(), tangent.atom_id().unwrap()],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let inputs = |extents: Vec<i32>| {
-            [
-                MixedValue::Array(vec![2.0, 3.0], vec![2]),
-                MixedValue::Integers(extents, vec![2]),
-                MixedValue::Array(vec![1.0; 6], vec![2, 3]),
-            ]
-        };
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs(vec![3, 3]), &[]),
-            Ok(vec![MixedValue::Array(vec![6.0, 9.0], vec![2]), MixedValue::Array(vec![6.0, 9.0], vec![2])]),
-        );
-        let error = execute_mixed_program(&client, &program, &inputs(vec![1, 3]), &[]).unwrap_err().to_string();
-        assert!(error.contains("requires every batch item's dimension `length` to have extent 3"), "{error}");
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_singleton_extent_storage() {
-        use indoc::indoc;
-        use ryft_core::{
-            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, CastOperation,
-            DimensionConstant, EmptyRegionDriver, RaggedAxis, StagingContext, TracingContext,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::XlaOperation;
-        use crate::tests::execution_client;
-
-        // A witnessed identity must retain compact metadata, and a later refinement must check that metadata over
-        // the actual two-item coordinate domain. Both paths operate on the same singleton extent input.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
-        let values = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [1]).into());
-        let context =
-            BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), trace.dimension_constant(2).unwrap());
-        let source = ArrayIrBatch::new(values, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
-            .unwrap();
-        let logical = source.unbatched_type();
-        let retained = CastOperation::checked(logical.clone(), vec![logical.clone(); 2])
-            .batch(&context, &EmptyRegionDriver, &[source.clone(), source])
-            .unwrap()
-            .into_parts()
-            .0
-            .remove(0);
-        let retained_extents = retained.ragged_axes()[0].extents().clone();
-        let narrowed = CastOperation::checked(ArrayType::new_static(DataType::F64, [2]).into(), vec![logical])
-            .batch(&context, &EmptyRegionDriver, &[retained])
-            .unwrap()
-            .into_parts()
-            .0
-            .remove(0);
-        let program = trace.builder().borrow().clone();
-        let program = program
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![narrowed.value().atom_id().unwrap(), retained_extents.atom_id().unwrap()],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f64[2, 3], %1:i32[1] .
-                let %2:dimension<2> = constant [value=2]
-                    %3:f64[2, 3] = cast [type=f64[2, 3], inputs=[f64[2, 3], f64[2, 3]]] %0 %0
-                    %4:i32[1] = cast [type=i32[1], inputs=[i32[1], f64[2, 3]]] %1 %3
-                    %5:dimension<2> = constant [value=2]
-                    %6:i64[] = dimension_to_scalar %5
-                    %7:i64[1] = convert_element_type [data_type=i64] %4
-                    %8:bool[1] = compare [direction=Equal] %7 %6
-                    %9:dimension<2> = constant [value=2]
-                    %10:bool[2] = broadcast [output_axes=[0]] %8 %9
-                    %11:bool[] = reduce [kind=all, axes=[0]] %10
-                    () = assert [
-                        message="`cast` requires every batch item's dimension `length` to have extent 2",
-                        labels=[],
-                    ] %11
-                    %12:f64[2, 2] = slice [start_indices=[0, 0], limits=[2, 2]] %3
-                    %13:f64[2, 2], %14:i32[1] = guard [boundary="cast", types=[f64[2, 2], i32[1]]] %12 %4
-                in (%13, %4)
-            "#}
-            .trim_end(),
-        );
-        let client = execution_client();
-        let values = MixedValue::Array(vec![1.0, 2.0, 99.0, 3.0, 4.0, 99.0], vec![2, 3]);
-        assert_eq!(
-            execute_mixed_program(&client, &program, &[values.clone(), MixedValue::Integers(vec![2], vec![1])], &[]),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]), MixedValue::Integers(vec![2], vec![1])]),
-        );
-        let error = execute_mixed_program(&client, &program, &[values, MixedValue::Integers(vec![3], vec![1])], &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("requires every batch item's dimension `length` to have extent 2"), "{error}");
-    }
-
-    #[test]
-    fn test_execute_ragged_symbolic_singleton_extent_consumers() {
-        use indoc::indoc;
-        use ryft_core::{
-            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer, DimensionSize,
-            DimensionToScalar, ParallelReduce, RaggedAxis, ReductionKind, TracingContext, Value,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::XlaOperation;
-        use crate::tests::execution_client;
-
-        // Metadata storage has one entry, while both consumers operate over the runtime participant domain.
-        let participants = DimensionVariable::new("participants", DimensionBounds::new(0, Some(3)).unwrap());
-        let unit = DimensionVariable::new("unit", DimensionBounds::new(1, Some(2)).unwrap());
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let (_, program) =
-            TracingContext::<XlaConstant, XlaOperation>::trace(
-                |(extent, packed, extents)| {
-                    let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(extent.domain(), extent)
-                        .with_axis_name("items".to_string());
-                    let source = ArrayIrBatch::new(packed, BatchAxis::new(0))?
-                        .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])?;
-                    let source = BatchingTracer::new(context, source);
-                    let size_sum =
-                        source.dimension_size(0)?.to_scalar()?.parallel_reduce(ReductionKind::Sum, "items")?;
-                    let reduced = source.parallel_reduce(ReductionKind::Sum, "items")?.into_batch();
-                    let reduced_extent = reduced.ragged_axes()[0].extents().clone();
-                    Ok((size_sum.into_batch().into_value(), reduced.into_value(), reduced_extent))
-                },
-                (
-                    ArrayIrType::Dimension(DimensionType::from(participants.clone())),
-                    ArrayIrType::Array(ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![participants.into(), Dimension::Static(3)]),
-                    )),
-                    ArrayIrType::Array(ArrayType::new(DataType::I32, Shape::new(vec![unit.into()]))),
-                ),
-            )
-            .unwrap();
-        let program = program.into_flat_program();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<participants ∈ [0, 3)>, %1:f64[participants, 3], %2:i32[unit] .
-                let %3:dimension<1> = dimension_size [axis=0] %2
-                    %4:i32[1] = broadcast [output_axes=[0]] %2 %3
-                    %5:dimension<participants ∈ [0, 3)> = dimension_size [axis=0] %1
-                    %6:i32[participants] = broadcast [output_axes=[0]] %4 %5
-                    %7:i64[participants] = convert_element_type [data_type=i64] %6
-                    %8:i64[] = reduce [kind=sum, axes=[0]] %7
-                    %9:dimension<participants ∈ [0, 3)> = dimension_size [axis=0] %1
-                    %10:dimension<3> = constant [value=3]
-                    %11:i32[3] = iota [type=i32[3], dimension=0]
-                    %12:i32[participants, 3] = broadcast [output_axes=[1]] %11 %9 %10
-                    %13:dimension<1> = dimension_size [axis=0] %2
-                    %14:i32[1] = broadcast [output_axes=[0]] %2 %13
-                    %15:i32[participants, 3] = broadcast [output_axes=[0]] %14 %9 %10
-                    %16:bool[participants, 3] = compare [direction=LessThan] %12 %15
-                    %17:f64[participants, 3] = zero_like %1
-                    %18:f64[participants, 3] = select %16 %1 %17
-                    %19:f64[3] = reduce [kind=sum, axes=[0]] %18
-                    %20:dimension<participants ∈ [0, 3)> = dimension_size [axis=0] %18
-                    %21:dimension<1> = dimension_size [axis=0] %2
-                    %22:i32[1] = broadcast [output_axes=[0]] %2 %21
-                    %23:i32[participants] = broadcast [output_axes=[0]] %22 %20
-                    %24:i32[] = reduce [kind=max, axes=[0]] %23
-                    %25:i32[] = constant [value=0]
-                    %26:i32[] = max %24 %25
-                in (%8, %19, %26)"
-            },
-        );
-
-        let client = execution_client();
-        let values = MixedValue::Array(vec![1., 2., 99., 3., 4., 99.], vec![2, 3]);
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &program,
-                &[MixedValue::Dimension(0), values.clone(), MixedValue::Integers(vec![2], vec![1])],
-                &[0, 1],
-            ),
-            Ok(vec![
-                MixedValue::Dimension(0),
-                MixedValue::Array(vec![0., 0., 0.], vec![3]),
-                MixedValue::Integers(vec![0], vec![]),
-            ]),
-        );
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &program,
-                &[MixedValue::Dimension(2), values, MixedValue::Integers(vec![2], vec![1])],
-                &[2, 1],
-            ),
-            Ok(vec![
-                MixedValue::Dimension(4),
-                MixedValue::Array(vec![4., 6., 0.], vec![3]),
-                MixedValue::Integers(vec![2], vec![]),
-            ]),
-        );
     }
 
     /// Builds an eager dimension value whose diagnostic variable name matches the FFI-reported operand name.

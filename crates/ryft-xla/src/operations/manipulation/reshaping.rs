@@ -287,10 +287,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, BatchAxis, BatchableOperation, BatchingContext,
-        ConstantOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
-        DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass, EffectClasses,
-        EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, Operation, Placeholder,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, BatchAxis, BatchableOperation, BatchedProgram,
+        BatchingContext, ConstantOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation,
+        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass,
+        EffectClasses, EmptyRegionDriver, LogicalMesh, MeshAxis, MeshAxisType, Operation, Placeholder,
         ProgramBatchingOutputAxesPolicy, ProgramError, Reshape, Shape, Sharding, ShardingDimension, StagingContext,
         TracedShardMap, TracingContext, TransposeOperation, Typed, trace_shard_map,
     };
@@ -997,7 +997,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_program_and_output_axes();
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let jvp = batched.jvp().unwrap();
         let values = (1..=18).map(f64::from).collect::<Vec<_>>();

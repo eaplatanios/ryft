@@ -1,0 +1,21 @@
+error[E0119]: conflicting implementations of trait `OperationProvider<ArrayType, GuardOperation<ArrayType>>` for type `ConvertedGuardOperation`
+ --> tests/operations/error_conflicting_guard_provider.rs:5:24
+  |
+5 | #[derive(Clone, Debug, ryft::Operation)]
+  |                        ^^^^^^^^^^^^^^^
+  |
+  = note: conflicting implementation in crate `ryft_core`:
+          - impl<T, O> OperationProvider<T, GuardOperation<T>> for O
+            where <O as ryft::Operation>::Type == T, T: ryft::Type, O: ryft::Operation, O: From<GuardOperation<T>>;
+  = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `OperationProvider<ArrayType, GuardOperation<ArrayType>>` for type `AliasedGuardOperation`
+  --> tests/operations/error_conflicting_guard_provider.rs:22:24
+   |
+22 | #[derive(Clone, Debug, ryft::Operation)]
+   |                        ^^^^^^^^^^^^^^^
+   |
+   = note: conflicting implementation in crate `ryft_core`:
+           - impl<T, O> OperationProvider<T, GuardOperation<T>> for O
+             where <O as ryft::Operation>::Type == T, T: ryft::Type, O: ryft::Operation, O: From<GuardOperation<T>>;
+   = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)

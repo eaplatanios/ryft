@@ -3591,20 +3591,19 @@ pub(crate) mod tests {
         DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::{
-        BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-        ProgramBatchingOutputAxesPolicy,
+        BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+        BatchingPolicy, ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::differentiation::reverse::{CotangentDestinationKind, ReverseModeDifferentiate};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::impl_non_transposable_operation;
+    use crate::macros::{impl_guardless_operation, impl_non_transposable_operation};
     use crate::operations::{
-        AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, GuardOperation,
-        LinearCallOperation, Mul, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient,
-        StopGradientOperation, ZeroOperation,
+        AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, LinearCallOperation, Mul,
+        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient, StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -5043,7 +5042,7 @@ pub(crate) mod tests {
         let (batched, output_axes) = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_program_and_output_axes();
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let reverse = batched
             .entry_region_ref()
@@ -5627,13 +5626,7 @@ pub(crate) mod tests {
             }
         }
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for ObservedOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(ObservedOperation);
 
         impl ResidualZeroProvider<ArrayType> for ObservedOperation {}
 
@@ -5699,7 +5692,7 @@ pub(crate) mod tests {
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )
                 .unwrap()
-                .into_program_and_output_axes();
+                .into_parts();
             let xs = Array::matrix(2, 3, rows.to_vec()).unwrap();
             let context = EagerContext::<Value, ArrayIrOperation<Array>>::new();
             let (_, pullback) = differentiate_at(Value::Array(xs))

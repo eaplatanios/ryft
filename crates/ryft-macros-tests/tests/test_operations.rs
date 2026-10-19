@@ -458,15 +458,32 @@ impl ErasedOperation {
 /// Stand-in for the typed guard request used by partial-evaluation dispatch.
 struct GuardOperation<T: Type>(PhantomData<T>);
 
+impl<T: Type> GuardOperation<T> {
+    /// Stand-in for `ryft_core::GuardOperation::unsupported_family_error`, which the rejecting guard provider that the
+    /// derive generates for a family without a native guard variant returns.
+    fn unsupported_family_error(&self) -> ProgramError {
+        ProgramError
+    }
+}
+
 /// Stand-in for the associated operation contract emitted by the derive. These fixtures test generated bounds;
-/// operation construction is covered separately using the real provider in `mixed_members`.
+/// operation construction is covered separately using the real provider in `mixed_members` and `guard_provision`.
 trait OperationProvider<T: Type, Request = ()> {
     /// Operation selected for the request and type universe.
     type Operation: Operation<Type = T>;
+
+    /// Stand-in for `ryft_core::OperationProvider::provide`, which the derive implements for guard requests.
+    fn provide(request: Request, input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
 }
 
-impl<T: Type, O: Operation<Type = T>, Request> OperationProvider<T, Request> for O {
+// Every family provides zero requests because these fixtures test generated bounds rather than operation selection.
+// Guard requests are instead provided by the rejecting provider that the derive generates for each fixture family.
+impl<T: Type, O: Operation<Type = T>> OperationProvider<T, ZeroOperation<T>> for O {
     type Operation = Self;
+
+    fn provide(_request: ZeroOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+        Err(ProgramError)
+    }
 }
 
 /// Validates projected original region interfaces using the same contract as `ryft_core`'s derive support helper.
@@ -1826,21 +1843,6 @@ enum DefaultPathLinearOperation<V: ryft::Value<Type = ryft::ArrayType>> {
     Constant(ryft::ConstantOperation<V>),
 }
 
-impl<V: ryft::Value<Type = ryft::ArrayType>>
-    ryft::OperationProvider<ryft::ArrayType, ryft::GuardOperation<ryft::ArrayType>> for DefaultPathLinearOperation<V>
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ryft::GuardOperation<ryft::ArrayType>,
-        _input_types: &[&ryft::ArrayType],
-    ) -> Result<Self, ryft::ProgramError> {
-        Err(ryft::ProgramError::UnsupportedOperation {
-            message: "guards are unsupported by this test family".to_owned(),
-        })
-    }
-}
-
 #[test]
 fn test_operation_default_crate_path_is_ryft() {
     let r#type = ryft::ArrayType::scalar(ryft::DataType::F64);
@@ -1904,6 +1906,108 @@ fn test_operation_generates_payload_identity() {
     assert_ne!(constant(-0.0), constant(0.0));
 }
 
+/// Guard-provision fixtures for the [`OperationProvider`](ryft::OperationProvider) of
+/// [`GuardOperation`](ryft::GuardOperation) requests that every [`Context`](ryft::Context) family carries. Unlike the
+/// rest of this file, this module builds on the real `ryft` vocabulary, because guard provision is only observable
+/// through contextual replay of a program whose symbolic input relationships remain unproven.
+mod guard_provision {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+    use ryft::arrays::Array;
+    use ryft::{
+        ArrayType, Context, DataType, Dimension, DimensionBounds, DimensionVariable, GuardOperation, Placeholder,
+        ProgramBuilder, ProgramError, Shape, StagingContext, TagOperation, TracingContext,
+    };
+
+    /// Derived family without a native guard variant, which therefore receives the generated rejecting provider.
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(type(ArrayType), constant(Array))]
+    enum GuardlessOperation {
+        Tag(TagOperation<ArrayType>),
+    }
+
+    /// Derived family with a native guard variant, which provides guards through the blanket supporting provider over
+    /// its generated `From<GuardOperation<ArrayType>>` conversion.
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(type(ArrayType), constant(Array))]
+    enum GuardedOperation {
+        Tag(TagOperation<ArrayType>),
+        Guard(GuardOperation<ArrayType>),
+    }
+
+    #[test]
+    fn test_operation_generates_rejecting_guard_provider() {
+        // Both inputs share the identity `n`, which relates their extents.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let mut builder = ProgramBuilder::<Array, GuardlessOperation>::new();
+        let first = builder.add_input(vector_type.clone());
+        builder.add_input(vector_type.clone());
+        let tag = GuardlessOperation::from(TagOperation::new("first"));
+        let output = builder.add_instruction(tag, Vec::new(), vec![first], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Eager interpretation establishes the input relationships from concrete values, so it needs no guard and the
+        // family is usable as an eager family without a hand-written provider.
+        let two = Array::vector(vec![1f32, 2f32]).unwrap();
+        assert_eq!(
+            program.interpret(vec![two.clone(), Array::vector(vec![3f32, 4f32]).unwrap()]),
+            Ok(vec![two.clone()]),
+        );
+
+        // Replaying at a lifted `f32[2]` and a symbolic `f32[n]` leaves `n = 2` unproven, so replay requests a guard
+        // that this family cannot represent and reports that instead of dropping the input check.
+        let context = TracingContext::<Array, GuardlessOperation>::new();
+        let inputs = vec![context.lift(two).unwrap(), context.input(vector_type)];
+        assert!(matches!(
+            program.interpret_in_context(&context, inputs),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the input types of `region` leave identity relationships unproven, but the operation \
+                               family cannot represent the guard required to preserve these input checks",
+        ));
+    }
+
+    #[test]
+    fn test_operation_skips_rejecting_guard_provider_for_native_guards() {
+        // Both inputs share the identity `n`, which relates their extents.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let mut builder = ProgramBuilder::<Array, GuardedOperation>::new();
+        let first = builder.add_input(vector_type.clone());
+        builder.add_input(vector_type.clone());
+        let tag = GuardedOperation::from(TagOperation::new("first"));
+        let output = builder.add_instruction(tag, Vec::new(), vec![first], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // The same replay stages the family's own guard ahead of the body, which then consumes the checked values.
+        let two = Array::vector(vec![1f32, 2f32]).unwrap();
+        let context = TracingContext::<Array, GuardedOperation>::new();
+        let inputs = vec![context.lift(two.clone()).unwrap(), context.input(vector_type)];
+        let outputs = program.interpret_in_context(&context, inputs).unwrap();
+        let output_atoms = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+        let traced = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(output_atoms, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            traced.to_string(),
+            indoc! {r#"
+                lambda %1:f32[n] .
+                let %0:f32[2] = const [1.0, 2.0]
+                    %2:f32[2], %3:f32[2] = guard [boundary="region", types=[f32[n], f32[n]]] %0 %1
+                    %4:f32[2] = tag [key=first] %2
+                in (%4)"#},
+        );
+        assert_eq!(traced.interpret(vec![two.clone()]), Ok(vec![two]));
+    }
+}
+
 /// Mixed-boundary fixtures for the declared-member machinery. Unlike the rest of this file, this module builds on the
 /// real `ryft` member vocabulary instead of stand-ins, because the mixed contracts the derive emits against
 /// ([`MemberOperation`](ryft::MemberOperation), the member zero constructor selected per output universe, and
@@ -1914,7 +2018,7 @@ mod structural_batching {
     use ryft::{
         ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, BatchableOperation, BatchingContext,
         DimensionAddOperation, DimensionOperation, DimensionType, DimensionValue, EagerContext, EmptyRegionDriver,
-        GuardOperation, OperationProvider, ProgramError, Typed,
+        Typed,
     };
 
     /// Operation family whose only member is the structural first-class-dimension family. That family has no batching
@@ -1925,14 +2029,6 @@ mod structural_batching {
     enum StructuralBatchingOperation {
         #[ryft(projected(DimensionType, structural))]
         Dimension(DimensionOperation<DimensionValue>),
-    }
-
-    impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for StructuralBatchingOperation {
-        type Operation = Self;
-
-        fn provide(_request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-        }
     }
 
     #[test]
@@ -2207,14 +2303,6 @@ mod mixed_members {
         Constant(ryft::ConstantOperation<V>),
     }
 
-    impl<V: Value<Type = ArrayType>> OperationProvider<ArrayType, GuardOperation<ArrayType>> for MixedMemberOperation<V> {
-        type Operation = Self;
-
-        fn provide(_request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-        }
-    }
-
     impl<V: Value<Type = ArrayType>> TransposableOperation<V, Self> for MixedMemberOperation<V> {
         fn transpose<D: TranspositionDriver<V, Self>>(
             &self,
@@ -2259,16 +2347,6 @@ mod mixed_members {
         /// Homogeneous first-class-dimension member family.
         #[ryft(projected(DimensionType, structural))]
         Dimension(DimensionOperation<DimensionValue>),
-    }
-
-    impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>>
-        for MixedProgramOperation<A>
-    {
-        type Operation = Self;
-
-        fn provide(_request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-        }
     }
 
     impl<A, C> MemberDifferentiableOperation<C> for MixedMemberOperation<A>
@@ -3833,6 +3911,7 @@ fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
+    test_cases.compile_fail("tests/operations/error_conflicting_guard_provider.rs");
     test_cases.compile_fail("tests/operations/error_conflicting_variant_classes.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");

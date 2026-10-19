@@ -49,7 +49,7 @@ use crate::operations::{
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, NoReferenceTransform, NoReferent, Operation, OperationProjection, OperationProvider, ProgramError,
+    MaybeZero, NoReferenceTransform, NoReferent, Operation, OperationProjection, ProgramError,
     ReferenceAccessDescriptor, ReferenceAccessOperation, Type, TypeError, TypeIdentityPosition, Typed, Value,
     ValueProjection,
 };
@@ -250,16 +250,6 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Div(DimensionDivOperation),
     Rem(DimensionRemOperation),
     Pow(DimensionPowOperation),
-}
-
-impl<V: Value<Type = DimensionType>> OperationProvider<DimensionType, GuardOperation<DimensionType>>
-    for DimensionOperation<V>
-{
-    type Operation = Self;
-
-    fn provide(request: GuardOperation<DimensionType>, _input_types: &[&DimensionType]) -> Result<Self, ProgramError> {
-        Err(request.unsupported_family_error())
-    }
 }
 
 /// Value-level capability bundle that groups every operation Ryft supports on first-class dimension values, so that
@@ -624,10 +614,9 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             },
             // A linear call stores no types, so it reaches the carrier that owns the extent-threaded region rule
             // unchanged.
-            ArrayOperation::LinearCall(operation) => Self::LinearCall(
-                LinearCallOperation::new(operation.residual_count())
-                    .with_auxiliary_output_count(operation.auxiliary_output_count()),
-            ),
+            ArrayOperation::LinearCall(operation) => {
+                Self::LinearCall(LinearCallOperation::new(operation.residual_count()))
+            }
             // Lifting a rematerialized call lifts its residual policy, which keeps the identity of the policy (refer to
             // `ResidualPolicyReference::lift`).
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.lift()),

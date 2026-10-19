@@ -1368,7 +1368,7 @@ mod tests {
         DimensionBounds, DimensionType, Memory, ShardingDimension,
     };
     use crate::axes::AxisError;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::operations::{
@@ -1710,7 +1710,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_program_and_output_axes();
+            .into_parts();
         assert_eq!(
             batched.to_string(),
             indoc! {"

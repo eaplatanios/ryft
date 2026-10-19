@@ -4156,7 +4156,7 @@ pub(crate) mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::LinearizationTracer;
     use crate::differentiation::{Differentiate, differentiate_at};
-    use crate::macros::{check_count, check_types};
+    use crate::macros::{check_count, check_types, impl_guardless_operation};
     use crate::operations::{
         AddOperation, CastOperation, ConditionOperation, Constant, GuardOperation, MulOperation, PrintOperation,
         ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
@@ -4345,13 +4345,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for TestLinearOperation {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(TestLinearOperation);
 
     impl From<AddOperation<ArrayType>> for TestLinearOperation {
         #[inline]
@@ -8901,13 +8895,7 @@ pub(crate) mod tests {
             }
         }
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for ScopedMemberOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(ScopedMemberOperation);
 
         impl From<AddOperation<ArrayType>> for ScopedMemberOperation {
             fn from(operation: AddOperation<ArrayType>) -> Self {
@@ -8940,16 +8928,7 @@ pub(crate) mod tests {
             }
         }
 
-        impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for ScopedProgramOperation {
-            type Operation = Self;
-
-            fn provide(
-                request: GuardOperation<ArrayIrType>,
-                _input_types: &[&ArrayIrType],
-            ) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(ScopedProgramOperation);
 
         impl From<ScopedMemberOperation> for ScopedProgramOperation {
             fn from(operation: ScopedMemberOperation) -> Self {
@@ -9100,16 +9079,7 @@ pub(crate) mod tests {
             }
         }
 
-        impl OperationProvider<ProjectedMemberType<2>, GuardOperation<ProjectedMemberType<2>>> for InterleavedMemberOperation {
-            type Operation = Self;
-
-            fn provide(
-                request: GuardOperation<ProjectedMemberType<2>>,
-                _input_types: &[&ProjectedMemberType<2>],
-            ) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(InterleavedMemberOperation);
 
         impl From<AddOperation<ProjectedMemberType<2>>> for InterleavedMemberOperation {
             fn from(_operation: AddOperation<ProjectedMemberType<2>>) -> Self {
@@ -9143,16 +9113,7 @@ pub(crate) mod tests {
             }
         }
 
-        impl OperationProvider<ProjectedProgramType, GuardOperation<ProjectedProgramType>> for InterleavedProgramOperation {
-            type Operation = Self;
-
-            fn provide(
-                request: GuardOperation<ProjectedProgramType>,
-                _input_types: &[&ProjectedProgramType],
-            ) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(InterleavedProgramOperation);
 
         impl From<InterleavedMemberOperation> for InterleavedProgramOperation {
             fn from(operation: InterleavedMemberOperation) -> Self {

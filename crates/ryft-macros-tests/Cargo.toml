@@ -16,4 +16,5 @@ ryft-core = { path = "../ryft-core" }
 trybuild.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
 pretty_assertions.workspace = true

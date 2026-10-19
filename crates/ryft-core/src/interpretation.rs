@@ -1419,6 +1419,7 @@ mod tests {
         DimensionVariable, Shape,
     };
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
         AddOperation, BroadcastOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation,
         NegOperation, ZeroOperation,
@@ -1847,13 +1848,6 @@ mod tests {
                 Ok(vec![input_type.clone()])
             }
         }
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for WrongShapeOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
 
         impl InterpretableOperation<EagerContext<Array, WrongShapeOperation>> for WrongShapeOperation {
             fn interpret<D: InterpretationDriver<EagerContext<Array, WrongShapeOperation>>>(
@@ -1865,6 +1859,8 @@ mod tests {
                 Ok(vec![Array::vector(vec![1.0, 2.0, 3.0]).unwrap()])
             }
         }
+
+        impl_guardless_operation!(WrongShapeOperation);
 
         let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
         let batch = DimensionVariable::new("batch", bounds);

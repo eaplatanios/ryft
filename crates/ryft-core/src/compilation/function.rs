@@ -1871,9 +1871,10 @@ mod tests {
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::{GuardOperation, ZeroOperation};
+    use crate::macros::impl_guardless_operation;
+    use crate::operations::ZeroOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, OperationProvider, RegionInterface, Type, TypeError};
+    use crate::programs::{EmptyRegionDriver, Operation, RegionInterface, Type, TypeError};
 
     use super::*;
 
@@ -1898,13 +1899,8 @@ mod tests {
             Ok(input_types.to_vec())
         }
     }
-    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for NegateOperation {
-        type Operation = Self;
 
-        fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(NegateOperation);
 
     #[derive(Clone)]
     struct TestLoweredProgram {

@@ -128,17 +128,15 @@ pub(crate) mod tests {
     use crate::arrays::{ArrayIrType, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::check_count;
-    use crate::operations::assertions::GuardOperation;
+    use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{Add, AddOperation};
     use crate::parameters::Parameter;
     use crate::programs::{
-        Effects, EmptyRegionDriver, NoReferenceTransform, Operation, OperationProvider, ProgramError,
-        ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-        ReferenceDischargeReference, ReferenceDischargeValue, ReferenceDischargeableOperation,
-        ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError, TypeIdentity,
-        TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueDirectDispatch,
-        discharge_reference_free_operation,
+        Effects, EmptyRegionDriver, NoReferenceTransform, Operation, ProgramError, ReferenceAccumulationPolicy,
+        ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
+        RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
+        ValueDirectDispatch, discharge_reference_free_operation,
     };
 
     use super::*;
@@ -638,13 +636,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl OperationProvider<TestType, GuardOperation<TestType>> for TestOperation {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<TestType>, _input_types: &[&TestType]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(TestOperation);
 
     macro_rules! impl_test_operation_from_reference_primitive {
         // Supplies the operation conversion required by each discharge rule's context bound.

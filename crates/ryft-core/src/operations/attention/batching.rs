@@ -1,4 +1,6 @@
+use crate::contexts::ContextProjection;
 use crate::operations::manipulation::broadcasting::DynamicBroadcast;
+use crate::programs::OperationProjection;
 
 use super::*;
 
@@ -69,6 +71,7 @@ fn attention_backward_batch_roles(
 /// attention instead folds `[v, B, T, N, H]` to `[v * B, T, N, H]`. Biases and masks are first materialized to
 /// `[v, B, N, T, S]`, which handles every broadcastable rank and preserves mapped bias and mask inputs. Results reverse
 /// the normalization, and a bias cotangent is reduced over precisely the axes broadcast by its logical bias input.
+/// Bounded ragged inputs are rejected because this normalization does not transport per-item extent metadata.
 fn batch_attention_static<C, O>(
     operation: &O,
     context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
@@ -82,6 +85,7 @@ where
         + InterpretableBatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
 {
     check_count!("input", input_roles, inputs.len(), ProgramError);
+    ArrayBatch::reject_ragged_inputs(operation, inputs)?;
     let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_count = operation.infer_output_types(input_types.as_slice(), &[])?.len();
@@ -106,10 +110,12 @@ where
     let query_type = inputs[0].unbatched_type();
     let query_rank = query_type.rank();
     let key_type = inputs[1].unbatched_type();
-    let batch_size = if query_rank == 4 { query_type.shape()[0].value().unwrap() } else { 1 };
-    let query_sequence_size = query_type.shape()[query_rank - 3].value().unwrap();
-    let head_count = query_type.shape()[query_rank - 2].value().unwrap();
-    let key_sequence_size = key_type.shape()[key_type.rank() - 3].value().unwrap();
+    let query_dimensions = static_dimensions(&query_type)?;
+    let key_dimensions = static_dimensions(&key_type)?;
+    let batch_size = if query_rank == 4 { query_dimensions[0] } else { 1 };
+    let query_sequence_size = query_dimensions[query_rank - 3];
+    let head_count = query_dimensions[query_rank - 2];
+    let key_sequence_size = key_dimensions[key_type.rank() - 3];
     let merged_inputs = aligned_inputs
         .iter()
         .zip(input_roles)
@@ -272,6 +278,7 @@ where
 /// This is the dynamic counterpart of [`batch_attention_static`]. It stages the same prefix normalization using mixed
 /// `broadcast` and `reshape` operations that take their result dimensions as ordinary staged inputs. Consequently a
 /// dynamic mapped extent, logical batch, or sequence length never becomes host metadata or a specialization key.
+/// Bounded ragged inputs are rejected before normalization, as in the static adapter.
 fn batch_attention_dynamic<C, O>(
     operation: &O,
     context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
@@ -280,7 +287,8 @@ fn batch_attention_dynamic<C, O>(
     output_roles: &[AttentionBatchOutput],
 ) -> Result<Vec<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>>, BatchingError>
 where
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Operation: From<ConstantOperation<DimensionValue>>
                            + From<DimensionMulOperation>
@@ -288,13 +296,13 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value:
         DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<O> + From<ReduceOperation>,
-    O: Operation<Type = ArrayType> + Clone,
+    O: Operation<Type = ArrayType>,
 {
     check_count!("input", input_roles, inputs.len(), ProgramError);
+    ArrayBatch::reject_ragged_inputs(operation, inputs)?;
     let outer_context = context.parent().parent();
     if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
         let values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -508,7 +516,8 @@ where
 impl<C> BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
     for DotProductAttentionOperation
 where
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Operation: From<ConstantOperation<DimensionValue>>
                            + From<DimensionMulOperation>
@@ -517,7 +526,6 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value:
         DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
@@ -546,7 +554,8 @@ where
 impl<C> BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
     for DotProductAttentionBackwardOperation
 where
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Operation: From<ConstantOperation<DimensionValue>>
                            + From<DimensionMulOperation>
@@ -555,7 +564,6 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value:
         DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:

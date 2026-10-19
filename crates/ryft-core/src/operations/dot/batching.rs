@@ -1,3 +1,7 @@
+use crate::operations::collectives::parallel_vary::{
+    ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
+};
+
 use super::*;
 
 // Alignment delegates mapped-axis materialization to `ArrayExtentBatchingPolicy::match_axis`, so a dynamic mapped
@@ -58,6 +62,23 @@ where
             (Some(_), None) => vec![inputs[0].clone(), P::match_axis(context, &inputs[1], Axis::from(0))?],
             (None, Some(_)) => vec![P::match_axis(context, &inputs[0], Axis::from(0))?, inputs[1].clone()],
         };
+        // Validate the logical dimensions before padding replaces them with equal-looking capacities. The lifted
+        // capability aligns manual variation before binding, so use the same alignment on this type-only view; the
+        // capability still stages the actual transitions, whose transposes must retain their reductions.
+        let logical_types = aligned_inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
+        let logical_types = vary_over_missing_manual_axes(
+            logical_types.clone(),
+            &logical_types,
+            &manual_variation_axes(&logical_types),
+            |mut input, axis, mesh| {
+                if input.sharding().is_none() {
+                    let rank = input.rank();
+                    input = input.with_sharding(Sharding::replicated(mesh.clone(), rank)).map_err(TypeError::from)?;
+                }
+                Ok(ParallelVaryOperation::new(axis.to_owned()).infer_output_types(&[input], &[])?.remove(0))
+            },
+        )?;
+        self.infer_output_types(&logical_types, &[])?;
         let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis_position()).collect();
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(self.dimensions(), aligned_axes[0], aligned_axes[1])
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
@@ -109,6 +130,39 @@ where
 
         let contracting_axes = [dimensions.lhs_contracting_dimensions(), dimensions.rhs_contracting_dimensions()];
         let batching_axes = [dimensions.lhs_batching_dimensions(), dimensions.rhs_batching_dimensions()];
+        // Equal dimension identities describe equal extents only at corresponding coordinates. Dot pairs its batch
+        // and contracting axes, while left and right free axes vary independently. Storage order does not matter,
+        // and a singleton extent array still ranges over the full domain of the data axis it indexes.
+        let paired_axes = batching_axes[0]
+            .iter()
+            .zip(batching_axes[1])
+            .chain(contracting_axes[0].iter().zip(contracting_axes[1]))
+            .collect::<Vec<_>>();
+        for (&left_axis, &right_axis) in contracting_axes[0].iter().zip(contracting_axes[1]) {
+            let left = aligned_inputs[0].ragged_axes().iter().find(|axis| axis.axis() == left_axis);
+            let right = aligned_inputs[1].ragged_axes().iter().find(|axis| axis.axis() == right_axis);
+            let compatible = match (left, right) {
+                (Some(left), Some(right)) => {
+                    left.extent_axes().len() == right.extent_axes().len()
+                        && left.extent_axes().iter().all(|left_coordinate| {
+                            paired_axes.iter().any(|(left_axis, right_axis)| {
+                                left_coordinate == *left_axis && right.extent_axes().contains(right_axis)
+                            })
+                        })
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !compatible {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{DOT_OPERATION_NAME}` requires matching extent coordinates for contracted ragged \
+                         dimension `{}`",
+                        left.or(right).unwrap().dimension(),
+                    ),
+                });
+            }
+        }
         let mut contracted_dimensions = Vec::new();
         let mut output_ragged_axes = Vec::new();
         let mut contraction_inputs = Vec::with_capacity(aligned_inputs.len());

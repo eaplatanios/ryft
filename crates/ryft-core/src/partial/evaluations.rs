@@ -291,8 +291,7 @@ mod tests {
     use crate::partial::tests::{TestOperation, TestValue};
     use crate::partial::values::{PartialEvaluationInput, PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        AtomId, Operation, OperationProvider, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType,
-        TypeError, Typed,
+        AtomId, Operation, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, TypeError, Typed,
     };
     use crate::tests::{
         TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
@@ -1500,14 +1499,6 @@ mod tests {
         enum ArrayAdditionOperation {
             Constant(ConstantOperation<Array>),
             Add(AddOperation<ArrayType>),
-        }
-
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for ArrayAdditionOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
         }
 
         /// Minimal projected family that supports entry checks without proof casts.

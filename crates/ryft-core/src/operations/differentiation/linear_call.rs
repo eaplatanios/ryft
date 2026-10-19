@@ -5,7 +5,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
@@ -147,7 +147,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///   - `forward`: Function that builds the forward map `v = Lᵣ(u)` from `(residuals, linear_inputs)`.
     ///   - `transpose`: Function that builds the transpose map `ū = Lᵣᵀ(v̄)` from `(residuals, output_cotangents)`.
     pub(crate) fn stage<
-        C: Context<Type = T, Operation: Clone + From<LinearCallOperation<T>>>,
+        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
         ForwardFn: FnOnce(
             &[Tracer<NestedTracingContext<C>>],
             &[Tracer<NestedTracingContext<C>>],
@@ -162,7 +162,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         linear_inputs: Vec<C::Value>,
         forward_fn: ForwardFn,
         transpose_fn: TransposeFn,
-    ) -> Result<Vec<C::Value>, ProgramError> {
+    ) -> Result<Vec<C::Value>, ProgramError>
+    where
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
+    {
         let residual_count = residuals.len();
         let forward_input_types =
             residuals.iter().chain(&linear_inputs).map(|value| value.r#type().into_owned()).collect();
@@ -473,7 +477,7 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 
 impl<
     T: DifferentiableType,
-    C: Context<Type = T, Operation: Clone + From<LinearCallOperation<T>>>,
+    C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
     P: CotangentBatchingPolicy<C>,
 > BatchableOperation<C, P> for LinearCallOperation<T>
 {
@@ -495,6 +499,9 @@ impl<
             Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
         > + Zero<C::Value>,
 > DifferentiableOperation<C> for LinearCallOperation<C::Type>
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -604,6 +611,8 @@ impl<
         + ResidualZeroProvider<V::Type, Operation = O>
         + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -799,10 +808,19 @@ pub(crate) mod tests {
     fn test_linear_call_operation_supports_a_third_composite_member() {
         // A third-member residual paired with a first-member linear value proves that the operation and its attached
         // regions use generic program storage without an array/dimension-specific projection.
+
+        /// Linear-call-only family over the three-member program type. It rejects guards, which eager replay never
+        /// requests.
+        #[derive(Clone, Debug, ryft_macros::Operation)]
+        #[ryft(type(ProjectedProgramType), constant(ProjectedProgramValue))]
+        enum ProjectedLinearCallOperation {
+            LinearCall(LinearCallOperation<ProjectedProgramType>),
+        }
+
         let linear_type = ProjectedProgramType::First(ProjectedMemberType);
         let residual_type = ProjectedProgramType::Third(ProjectedMemberType);
         let forward = {
-            let mut builder = ProgramBuilder::<ProjectedProgramValue, LinearCallOperation<ProjectedProgramType>>::new();
+            let mut builder = ProgramBuilder::<ProjectedProgramValue, ProjectedLinearCallOperation>::new();
             builder.add_input(residual_type.clone());
             let linear = builder.add_input(linear_type.clone());
             builder
@@ -814,7 +832,7 @@ pub(crate) mod tests {
                 .unwrap()
         };
         let transpose = {
-            let mut builder = ProgramBuilder::<ProjectedProgramValue, LinearCallOperation<ProjectedProgramType>>::new();
+            let mut builder = ProgramBuilder::<ProjectedProgramValue, ProjectedLinearCallOperation>::new();
             builder.add_input(residual_type.clone());
             let cotangent = builder.add_input(linear_type.clone());
             builder
@@ -825,7 +843,7 @@ pub(crate) mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<ProjectedProgramValue, LinearCallOperation<ProjectedProgramType>>::new();
+        let mut builder = ProgramBuilder::<ProjectedProgramValue, ProjectedLinearCallOperation>::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
         let residual = builder.add_input(residual_type);

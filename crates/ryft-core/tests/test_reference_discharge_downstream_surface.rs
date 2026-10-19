@@ -45,30 +45,30 @@ use ryft_core::{
     AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AtomId, BatchAxis, BatchAxisSpecification,
     BatchableOperation, BatchableReferenceTransform, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver,
     BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
-    BoundReferenceTransform, BoundaryLayout, BroadcastOperation, CompareOperation, ConstantOperation, Context,
-    ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentSeed,
-    DataType, DenseBoundaryLayout, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    BoundReferenceTransform, BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation,
+    Context, ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
+    CotangentSeed, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DivOperation, Domain,
-    EagerContext, EffectClass, EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, GuardOperation,
-    InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero,
-    MemberDifferentiableOperation, MemberTransposableOperation, MulOperation, NegOperation, NoIdentity,
-    NoReferenceTransform, OneLikeOperation, OneOperation, Operation, OperationFormatter, OperationProvider,
-    OutputRegionProvenance, ParallelVaryOperation, Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder,
-    PolicyBatchedProgram, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedContext,
-    RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceBoundary,
-    ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult,
-    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
-    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew,
-    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSource,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
+    EagerContext, EffectClass, EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance,
+    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation,
+    MemberTransposableOperation, MulOperation, NegOperation, NoIdentity, NoReferenceTransform, OneLikeOperation,
+    OneOperation, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance, ParallelVaryOperation,
+    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver,
+    ReduceOperation, Reference, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceBoundary, ReferenceBoundaryError,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSource, ReferenceSwap,
+    ReferenceSwapOperation, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
     ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot,
     ReshapeOperation, ReshardOperation, ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer,
     TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
     TypeError, Typed, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation,
-    batch, check_count, differentiate_at, discharge_reference_free_operation, infer_reference_view_type,
-    jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
+    batch, check_count, differentiate_at, discharge_reference_free_operation, impl_guardless_operation,
+    infer_reference_view_type, jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -930,16 +930,7 @@ where
     }
 }
 
-impl OperationProvider<RegisterIrType, GuardOperation<RegisterIrType>> for RegisterOperation {
-    type Operation = Self;
-
-    fn provide(
-        _request: GuardOperation<RegisterIrType>,
-        _input_types: &[&RegisterIrType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-    }
-}
+impl_guardless_operation!(RegisterOperation);
 
 /// Static half selector used to compare disjoint folded access paths.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1337,7 +1328,7 @@ impl<C: Context<Type = RegisterIrType>> BatchingPolicy<C> for RegisterBatching {
     type Batch = C::Value;
     type Extent = usize;
     type Evidence = ();
-    type Layout = DenseBoundaryLayout;
+    type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
 
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
         if !batch_axis.is_replicated() {
@@ -1366,6 +1357,21 @@ impl<C: Context<Type = RegisterIrType>> BatchingPolicy<C> for RegisterBatching {
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, RegisterIrType> {
         batch.r#type()
     }
+
+    fn adapt_batched_program<
+        CollapseFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            ryft_core::Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    >(
+        program: Self::BatchedProgram,
+        _required_output_axes: Option<&[BatchAxis]>,
+        _collapse_fn: CollapseFn,
+    ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
+        // Every carrier is replicated, so a batched program already carries the source boundary.
+        Ok(program)
+    }
 }
 
 // The register universe batches region-free operations only; recursion into nested programs is left unsupported.
@@ -1381,33 +1387,12 @@ impl<C: Context<Type = RegisterIrType>> RecursiveBatchingPolicy<C> for RegisterB
     fn batch_program_at_level(
         _level: &BatchingLevel<RegisterIrType>,
         _region: RegionRef<'_, C::Constant, C::Operation>,
-        _inputs: &DenseBoundaryLayout,
+        _input_axes: &[BatchAxis],
         _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<PolicyBatchedProgram<C, Self>, BatchingError> {
+    ) -> Result<Self::BatchedProgram, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
             message: "the register universe batches region-free operations only".to_string(),
         })
-    }
-
-    fn dense_boundary_layout(_level: &BatchingLevel<RegisterIrType>, input_axes: &[BatchAxis]) -> DenseBoundaryLayout {
-        DenseBoundaryLayout::new(input_axes.to_vec())
-    }
-
-    fn pack_boundary(
-        _context: &BatchingContext<C, Self>,
-        batches: &[Self::Batch],
-    ) -> Result<(DenseBoundaryLayout, Vec<C::Value>), BatchingError> {
-        // Every register carrier is its replicated value, so each carrier occupies exactly one slot.
-        Ok((DenseBoundaryLayout::new(vec![BatchAxis::replicated(); batches.len()]), batches.to_vec()))
-    }
-
-    fn unpack_boundary(layout: &DenseBoundaryLayout, slots: &[C::Value]) -> Result<Vec<Self::Batch>, BatchingError> {
-        layout
-            .payload_slots()
-            .into_iter()
-            .zip(layout.batch_axes())
-            .map(|(slot, batch_axis)| <Self as BatchingPolicy<C>>::batch(slots[slot].clone(), batch_axis))
-            .collect()
     }
 
     fn batch_region(
@@ -2439,13 +2424,6 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         Div(DivOperation<ArrayType>),
         Select(SelectOperation<ArrayType>),
     }
-    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for ValueOnlyArrayOperation {
-        type Operation = Self;
-
-        fn provide(_request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-        }
-    }
 
     impl OperationProvider<ArrayType, ParallelVaryOperation> for ValueOnlyArrayOperation {
         type Operation = Self;
@@ -2473,13 +2451,6 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         One(OneOperation<ArrayIrType>),
         #[ryft(projected(ArrayType))]
         Array(ValueOnlyArrayOperation),
-    }
-    impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for ValueOnlyOperation {
-        type Operation = Self;
-
-        fn provide(_request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-        }
     }
 
     impl ReferenceAccessOperation for ValueOnlyOperation {
@@ -2914,13 +2885,8 @@ mod custom_array_transforms {
         Read(ReferenceReadOperation<ArrayType, ArrayIrType, CustomTransform>),
         AddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, CustomTransform>),
     }
-    impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for CustomOperation {
-        type Operation = Self;
 
-        fn provide(_request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-        }
-    }
+    impl_guardless_operation!(CustomOperation);
 
     impl CustomOperation {
         /// Converts metadata only at the eager execution boundary; staged accesses retain the downstream transform

@@ -33,7 +33,9 @@ pub const DOT_PRODUCT_ATTENTION_OPERATION_NAME: &str = "dot_product_attention";
 /// Eager execution and portable lowering both evaluate [`dot_product_attention_ir_composition`]. The primitive itself
 /// is a backend-recognizable inference boundary and is intentionally not directly differentiable; use
 /// [`differentiable_dot_product_attention`] for reverse-mode differentiation. Its batching rule folds a mapped leading
-/// axis into the logical batch axis while retaining this boundary for fused lowering.
+/// axis into the logical batch axis while retaining this boundary for fused lowering. Bounded ragged carriers are
+/// unsupported because this normalization does not transport per-item extent metadata; explicit sequence-length
+/// inputs remain supported.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DotProductAttentionOperation {
     /// Value-independent attention semantics.
@@ -212,7 +214,8 @@ pub const DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME: &str = "dot_product_att
 /// head, reduces a broadcast bias cotangent to its original shape, and zeroes padded query rows. Portable evaluation is
 /// owned by [`dot_product_attention_backward_ir_composition`]; this operation remains only so a fused forward's
 /// transpose can select the matching backend backward ABI. Higher-order derivatives should differentiate the ordinary
-/// portable composition instead of differentiating this boundary.
+/// portable composition instead of differentiating this boundary. Batching rejects bounded ragged carriers for the
+/// same reason as [`DotProductAttentionOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DotProductAttentionBackwardOperation {
     /// Value-independent semantics of the differentiated forward operation.

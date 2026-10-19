@@ -91,7 +91,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{ArrayType, DimensionType, ShardingDimension};
 use crate::axes::{Axis, AxisError};
-use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -501,7 +501,10 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
         required_output_axes: Option<&[BatchAxis]>,
         widening_output_count: usize,
         collapse_fn: CollapseFn,
-    ) -> Result<Self, BatchingError> {
+    ) -> Result<Self, BatchingError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
         if let Some(required_output_axes) = required_output_axes {
             check_count!("output", output_axes, required_output_axes.len(), ProgramError);
         } else if widening_output_count == 0 {
@@ -868,7 +871,7 @@ where
 /// transforms, and a structural value could still vary per batch item. [`batch_replicated_projected_operation`]
 /// additionally checks the first promise at runtime, so an implementation that breaks it fails with a diagnostic rather
 /// than silently replicating a mapped value.
-pub trait ReplicatedBatchingPolicyProjection<C: Context + DomainProjection<T>, T: Type>: BatchingPolicy<C> {
+pub trait ReplicatedBatchingPolicyProjection<C: ContextProjection<T>, T: Type>: BatchingPolicy<C> {
     /// Converts one outer carrier into the bare member value that it replicates, rejecting a mapped carrier or one with
     /// metadata that the member value cannot represent.
     ///
@@ -2130,8 +2133,8 @@ pub fn batch<
 pub fn batch_projected_operation<
     T: Type,
     O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,
+    C: ContextProjection<T>,
     P: BatchingPolicyProjection<C, T>,
-    C: Context + DomainProjection<T>,
 >(
     context: &BatchingContext<C, P>,
     operation: &O,
@@ -2201,7 +2204,7 @@ pub fn batch_projected_operation<
 /// [`BatchingError::Program`].
 pub fn batch_replicated_projected_operation<
     T: Type,
-    C: Context + DomainProjection<T>,
+    C: ContextProjection<T>,
     P: ReplicatedBatchingPolicyProjection<C, T>,
 >(
     context: &BatchingContext<C, P>,
@@ -2237,6 +2240,38 @@ pub fn batch_replicated_projected_operation<
         .map(|output| P::replicated(<C::Value as ValueProjection<T>>::from_projected(output)))
         .collect::<Vec<_>>()
         .into())
+}
+
+/// Rejects the `inputs` of an operation named `operation_name` if any of them carries per-item extents that its
+/// packed value does not name (i.e., the extents of a bounded ragged axis or of a mapped dimension). Structural
+/// program batching passes only packed values and batch axes into a sealed region, so such a carrier cannot cross
+/// the region boundary, and a guard lifts declarations that cannot relate those extents. The check is stated over
+/// [`Type::identities`]: a carrier is rejected when its per-item type (i.e., its [`BatchingPolicy::unbatched_type`])
+/// names a dimension identity that the type of its packed value does not name.
+///
+/// # Errors
+///
+/// Returns [`BatchingError::UnsupportedOperation`] for the first such input, naming `operation_name`, the first such
+/// dimension identity, and the input's position.
+pub(crate) fn reject_ragged_carriers<C: Context, P: BatchingPolicy<C>>(
+    operation_name: &str,
+    inputs: &[P::Batch],
+) -> Result<(), BatchingError> {
+    for (index, input) in inputs.iter().enumerate() {
+        let packed_type = P::value(input).r#type();
+        let unbatched_type = P::unbatched_type(input);
+        if let Some((_, dimension)) = unbatched_type
+            .identities()
+            .find(|(_, identity)| packed_type.identities().all(|(_, packed)| packed != *identity))
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{operation_name}` does not support bounded ragged dimension `{dimension}` on input {index}",
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

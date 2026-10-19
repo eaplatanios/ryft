@@ -5,10 +5,9 @@ use std::sync::Arc;
 
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
-    Accuracy, Array, ArrayOperation, ArrayType, CastOperation, CastType, Context, DataType, EagerContext,
-    GuardOperation, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation, OperationProvider, ParallelVary,
-    Parameter, Placeholder, Program, ProgramBuilder, ProgramError, Region, Sin, SinOperation, Type, TypeError, Typed,
-    Value, ValueDirectDispatch,
+    Accuracy, Array, ArrayOperation, ArrayType, CastOperation, CastType, Context, DataType, EagerContext, LogicalMesh,
+    ManualVariationAlignment, NoIdentity, Operation, ParallelVary, Parameter, Placeholder, Program, ProgramBuilder,
+    ProgramError, Region, Sin, SinOperation, Type, TypeError, Typed, Value, ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.
@@ -124,14 +123,6 @@ impl Typed for DirectArray {
 #[ryft(crate = "ryft_core", type(ArrayType), constant(DirectArray))]
 enum DirectOperation {
     Sin(SinOperation<ArrayType>),
-}
-
-impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for DirectOperation {
-    type Operation = Self;
-
-    fn provide(_request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-    }
 }
 
 impl Value for DirectArray {

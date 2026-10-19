@@ -13,7 +13,7 @@ use super::*;
 /// Array-member projection used throughout the mixed attention composition.
 type ArrayProjection<V> = <V as ValueProjection<ArrayType>>::Projected;
 
-/// Private capability for constructing an iota with one mixed value's runtime geometry.
+/// Private capability for constructing an iota with one mixed value's runtime shape.
 pub trait AttentionIota: Value<Type = ArrayIrType> {
     /// Constructs an `i32` iota matching `target` and varying along `axis`.
     fn attention_iota(target: &Self, axis: usize) -> Result<Self, ProgramError>;
@@ -82,7 +82,7 @@ fn array_dimensions<V: Value<Type = ArrayIrType> + DimensionSize>(value: &V) -> 
     (0..r#type.rank()).map(|axis| value.dimension_size(axis)).collect()
 }
 
-/// Broadcasts one projected array to the exact runtime geometry of `target`.
+/// Broadcasts one projected array to the exact runtime shape of `target`.
 fn broadcast_like<V>(
     value: <V as ValueProjection<ArrayType>>::Projected,
     target: &V,
@@ -546,7 +546,7 @@ where
     in_range.select(&project_array::<V>(value)?, &project_array::<V>(zero)?)
 }
 
-/// Evaluates the portable attention backward pass in the mixed array IR using the same first-class geometry and mask
+/// Evaluates the portable attention backward pass in the mixed array IR using the same first-class dimensions and mask
 /// construction as [`dot_product_attention_ir_composition`].
 pub fn dot_product_attention_backward_ir_composition<V>(
     inputs: &AttentionInputs<V>,

@@ -998,62 +998,16 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
-    use ryft_core::{
-        ArrayIrBatchingPolicy, BatchAxis, BatchingTracer, Cast, ConvertElementType, DimensionBounds,
-        DimensionFromScalar, DimensionToScalar, DimensionType, DimensionVariable, DynamicBroadcast, GuardOperation,
-        Placeholder, Reduce, StagingContext, TracingContext, batch,
-    };
+    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Placeholder};
 
-    use crate::experimental::lowering::tests::{MixedValue, XlaProgramBuilder, dynamic_dimension};
+    use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
-        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
     };
     use crate::to_mlir_module_for_program;
 
     use super::*;
-
-    /// Per-item tracer of a batch staged in the composite XLA tracing context.
-    type RaggedBatchTracer = BatchingTracer<TracingContext<XlaConstant, XlaOperation>, ArrayIrBatchingPolicy>;
-
-    /// Batches `function` along axis 0 of `f64[2]` values, `i32[2]` extents, and `f64[2, 3]` dense rows, so that each
-    /// batch item observes its scalar value, its scalar `i32` extent, and its dense `f64[3]` row, and returns the
-    /// batched program over those three inputs with the batched per-item result as its single output. Tests that
-    /// batch casts over bounded ragged carriers build the carriers inside `function` by mapping the extent to a
-    /// dimension and broadcasting the value to it.
-    fn ragged_batch_program<F>(function: F) -> FlatXlaProgram
-    where
-        F: FnOnce((RaggedBatchTracer, RaggedBatchTracer, RaggedBatchTracer)) -> Result<RaggedBatchTracer, ProgramError>,
-    {
-        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
-        let values = trace.input(ArrayType::new_static(DataType::F64, [2]).into());
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let dense = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
-        let output = batch(
-            function,
-            (values, extents, dense),
-            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        let program = trace.builder().borrow().clone();
-        program.build(vec![output.atom_id().unwrap()], vec![Placeholder; 3], vec![Placeholder]).unwrap()
-    }
-
-    /// Inputs of a [`ragged_batch_program`]: values `[2.0, 3.0]`, the per-item `extents`, and all-ones dense rows.
-    fn ragged_batch_inputs(extents: [i32; 2]) -> [MixedValue; 3] {
-        [
-            MixedValue::Array(vec![2.0, 3.0], vec![2]),
-            MixedValue::Integers(extents.to_vec(), vec![2]),
-            MixedValue::Array(vec![1.0; 6], vec![2, 3]),
-        ]
-    }
-
-    /// Bounded ragged `f64` vector type whose extent is `variable`.
-    fn ragged_vector(variable: &DimensionVariable) -> ArrayIrType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable.clone())])).into()
-    }
 
     /// Compiles `module` with one SPMD partition per CPU device, executes it once with one `f64` input buffer of
     /// `dimensions` per device holding that device's entry of `shards`, and returns every device's single `f64` output
@@ -2786,7 +2740,9 @@ mod tests {
 
     #[test]
     fn test_lower_guarded_cast() {
-        use ryft_core::{BatchAxis, Layout, ProgramBatchingOutputAxesPolicy, Shape, ShardingDimension, TiledLayout};
+        use ryft_core::{
+            BatchAxis, BatchedProgram, Layout, ProgramBatchingOutputAxesPolicy, Shape, ShardingDimension, TiledLayout,
+        };
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::tests::execution_client;
@@ -2862,7 +2818,8 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_program();
+            .into_parts()
+            .0;
         let inputs = [MixedValue::Dimension(2), MixedValue::Array(vec![1f64; 48], vec![3, 4, 4])];
         assert_eq!(
             execute_mixed_program(&client, &batched, &inputs, &[2, 2, 2]),
@@ -3147,298 +3104,5 @@ mod tests {
         assert_eq!(execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]), Ok(Vec::new()));
         let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_witnessed_identity() {
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Two ragged carriers of one batch share their per-item extents, so the witnessed identity cast stages no
-        // check and the masked sum of the identity's output sees only each item's live elements.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let program = ragged_batch_program(|(value, extent, _)| {
-            let dimension = extent.to_dimension(length.clone())?;
-            let first = value.dynamic_broadcast_to(&[dimension.clone()])?;
-            let second = value.dynamic_broadcast_to(&[dimension])?;
-            first.cast(ragged_vector(&length), &[second])?.reduce(&[0], ReductionKind::Sum)
-        });
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &ragged_batch_inputs([1, 3]), &[]),
-            Ok(vec![MixedValue::Array(vec![2.0, 9.0], vec![2])]),
-        );
-        assert_eq!(
-            execute_mixed_program(&client, &program, &ragged_batch_inputs([0, 2]), &[]),
-            Ok(vec![MixedValue::Array(vec![0.0, 6.0], vec![2])]),
-        );
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_narrowing_to_static() {
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Narrowing a ragged carrier to the static extent 3 stages a per-item extent check, and the sliced storage
-        // and the checked extents pass through a guard whose dependency barrier carries the assertion token, so the
-        // result cannot be computed before the check and the executable fails when any item's extent differs from 3.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let program = ragged_batch_program(|(value, extent, _)| {
-            let dimension = extent.to_dimension(length.clone())?;
-            let carrier = value.dynamic_broadcast_to(&[dimension])?;
-            carrier
-                .cast(ArrayType::new_static(DataType::F64, [3]).into(), &[])?
-                .reduce(&[0], ReductionKind::Sum)
-        });
-        let input_types = program
-            .input_types()
-            .iter()
-            .map(|r#type| match r#type {
-                ArrayIrType::Array(r#type) => r#type.clone(),
-                r#type => panic!("expected an array input but got {type}"),
-            })
-            .collect::<Vec<_>>();
-        let output_types = vec![ArrayType::new_static(DataType::F64, [2])];
-        let module = to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None);
-        assert_eq!(
-            module.unwrap(),
-            indoc! {"
-            module {
-              func.func @main(%arg0: tensor<2xf64>, %arg1: tensor<2xi32>, %arg2: tensor<2x3xf64>) -> tensor<2xf64> {
-                %c = stablehlo.constant dense<0> : tensor<i64>
-                %c_0 = stablehlo.constant dense<0> : tensor<i64>
-                %0 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i64>) -> tensor<2xi64>
-                %1 = stablehlo.after_all  : !stablehlo.token
-                %2 = stablehlo.after_all  : !stablehlo.token
-                %3:5 = stablehlo.while(%iterArg = %c, %iterArg_3 = %arg1, %iterArg_4 = %0, %iterArg_5 = %1, \
-                %iterArg_6 = %2) : tensor<i64>, tensor<2xi32>, tensor<2xi64>, !stablehlo.token, !stablehlo.token
-                cond {
-                  %c_7 = stablehlo.constant dense<2> : tensor<i64>
-                  %12 = stablehlo.compare LT, %iterArg, %c_7, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                  stablehlo.return %12 : tensor<i1>
-                } do {
-                  %12 = stablehlo.dynamic_slice %iterArg_3, %iterArg, sizes = [1] : (tensor<2xi32>, \
-                tensor<i64>) -> tensor<1xi32>
-                  %13 = stablehlo.reshape %12 : (tensor<1xi32>) -> tensor<i32>
-                  %14 = stablehlo.convert %13 : (tensor<i32>) -> tensor<i64>
-                  %c_7 = stablehlo.constant dense<0> : tensor<i64>
-                  %15 = stablehlo.compare GE, %14, %c_7, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                  %c_8 = stablehlo.constant dense<4> : tensor<i64>
-                  %16 = stablehlo.compare LT, %14, %c_8, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                  %17 = stablehlo.and %15, %16 : tensor<i1>
-                  %18 = stablehlo.custom_call @ryft.assert(%17, %14, %iterArg_5) {api_version = 4 : i32, \
-                backend_config = {actor = \"dimension_from_scalar\", detail = \"[0, 4)\", kind = \"bounds\", \
-                left = \"length\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> \
-                !stablehlo.token
-                  %19 = stablehlo.reshape %14 : (tensor<i64>) -> tensor<1xi64>
-                  %20 = stablehlo.dynamic_update_slice %iterArg_4, %19, %iterArg : (tensor<2xi64>, \
-                tensor<1xi64>, tensor<i64>) -> tensor<2xi64>
-                  %c_9 = stablehlo.constant dense<1> : tensor<i64>
-                  %21 = stablehlo.add %iterArg, %c_9 : tensor<i64>
-                  stablehlo.return %21, %iterArg_3, %20, %18, %iterArg_6 : tensor<i64>, tensor<2xi32>, \
-                tensor<2xi64>, !stablehlo.token, !stablehlo.token
-                }
-                %4 = stablehlo.broadcast_in_dim %arg0, dims = [0] : (tensor<2xf64>) -> tensor<2x3xf64>
-                %c_1 = stablehlo.constant dense<3> : tensor<i64>
-                %5 = stablehlo.broadcast_in_dim %c_1, dims = [] : (tensor<i64>) -> tensor<2xi64>
-                %6 = stablehlo.compare EQ, %3#2, %5, SIGNED : (tensor<2xi64>, tensor<2xi64>) -> tensor<2xi1>
-                %c_2 = stablehlo.constant dense<true> : tensor<i1>
-                %7 = stablehlo.reduce(%6 init: %c_2) applies stablehlo.and across dimensions = [0] : \
-                (tensor<2xi1>, tensor<i1>) -> tensor<i1>
-                %8 = stablehlo.custom_call @ryft.assert(%7, %3#3) {api_version = 4 : i32, backend_config = \
-                {actor = \"assert\", kind = \"generic\", label_count = \"0\", message = \"`cast` requires \
-                every batch item's dimension `length` to have extent 3\"}, has_side_effect = true} : \
-                (tensor<i1>, !stablehlo.token) -> !stablehlo.token
-                %9 = stablehlo.after_all %3#4, %8 : !stablehlo.token
-                %10:3 = stablehlo.optimization_barrier %4, %3#2, %8 : tensor<2x3xf64>, tensor<2xi64>, !stablehlo.token
-                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                %11 = stablehlo.reduce(%10#0 init: %cst) applies stablehlo.add across dimensions = [1] : \
-                (tensor<2x3xf64>, tensor<f64>) -> tensor<2xf64>
-                return %11 : tensor<2xf64>
-              }
-            }
-            "},
-        );
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &ragged_batch_inputs([3, 3]), &[]),
-            Ok(vec![MixedValue::Array(vec![6.0, 9.0], vec![2])]),
-        );
-        let error = execute_mixed_program(&client, &program, &ragged_batch_inputs([1, 3]), &[]).unwrap_err();
-        let error = error.to_string();
-        assert!(error.contains("`cast` requires every batch item's dimension `length` to have extent 3"), "{error}");
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_narrowing_live_coordinates() {
-        use ryft_core::{ArrayIrBatch, BatchingContext, DimensionConstant, RaggedAxis};
-
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Inner extent entries outside the outer ragged prefix are padding. The compiled check must ignore those
-        // entries, while the checked result and subsequent masked reduction still depend on every live comparison.
-        let outer = DimensionVariable::new("outer", DimensionBounds::new(0, Some(4)).unwrap());
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
-        let value = trace.input(ArrayType::new_static(DataType::F64, [2, 3, 3]).into());
-        let outer_extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let inner_extents = trace.input(ArrayType::new_static(DataType::I32, [2, 3]).into());
-        let context = BatchingContext::new(trace.clone(), trace.dimension_constant(2).unwrap());
-        let source = BatchingTracer::new(
-            context,
-            ArrayIrBatch::new(value, BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![
-                    RaggedAxis::new(2, inner_extents, length, vec![0, 1]),
-                    RaggedAxis::new(1, outer_extents, outer.clone(), vec![0]),
-                ])
-                .unwrap(),
-        );
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(outer), Dimension::Static(2)]));
-        let output = source.cast(target.into(), &[]).unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap();
-        let program: FlatXlaProgram = trace
-            .builder()
-            .borrow()
-            .clone()
-            .build(vec![output.into_batch().into_value().atom_id().unwrap()], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-        let client = execution_client();
-        let mut inputs = [
-            MixedValue::Array(vec![1.0; 18], vec![2, 3, 3]),
-            MixedValue::Integers(vec![1, 2], vec![2]),
-            MixedValue::Integers(vec![2, 0, 1, 2, 2, 3], vec![2, 3]),
-        ];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[]),
-            Ok(vec![MixedValue::Array(vec![2.0, 4.0], vec![2])]),
-        );
-        inputs[2] = MixedValue::Integers(vec![2, 3, 2, 2, 2, 1], vec![2, 3]);
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[]),
-            Ok(vec![MixedValue::Array(vec![2.0, 4.0], vec![2])]),
-        );
-        inputs[2] = MixedValue::Integers(vec![2, 3, 2, 2, 1, 1], vec![2, 3]);
-        let error = execute_mixed_program(&client, &program, &inputs, &[]).unwrap_err().to_string();
-        assert!(error.contains("`cast` requires every batch item's dimension `length` to have extent 2"), "{error}");
-
-        // With no live outer coordinates, even the preceding inner mismatch is vacuous.
-        inputs[1] = MixedValue::Integers(vec![0, 0], vec![2]);
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[]),
-            Ok(vec![MixedValue::Array(vec![0.0, 0.0], vec![2])]),
-        );
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_mapped_dimension_to_static() {
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Casting the mapped first-class dimension itself to the static extent 3 stages the same per-item check,
-        // and the cast dimension reads back as that static extent for every item.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let program = ragged_batch_program(|(_, extent, _)| {
-            let dimension = extent.to_dimension(length.clone())?;
-            let dimension = dimension.cast(ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3))), &[])?;
-            // Dimensions read back as `i64` scalars, which the mixed executable ABI carries only as `i32` arrays.
-            dimension.to_scalar()?.convert_element_type(DataType::I32)
-        });
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &ragged_batch_inputs([3, 3]), &[]),
-            Ok(vec![MixedValue::Integers(vec![3, 3], vec![2])]),
-        );
-        let error = execute_mixed_program(&client, &program, &ragged_batch_inputs([1, 3]), &[]).unwrap_err();
-        let error = error.to_string();
-        assert!(error.contains("`cast` requires every batch item's dimension `length` to have extent 3"), "{error}");
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_identity_change_with_padding() {
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Renaming the carrier's extent to a wider-bounded identity checks that both witnesses agree per item and
-        // pads the packed axis from the source bound 3 to the target bound 5, which must not disturb the masked sum.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let other = DimensionVariable::new("other", DimensionBounds::new(0, Some(6)).unwrap());
-        let program = ragged_batch_program(|(value, extent, _)| {
-            let carrier = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
-            let witness = value.dynamic_broadcast_to(&[extent.to_dimension(other.clone())?])?;
-            carrier.cast(ragged_vector(&other), &[witness])?.reduce(&[0], ReductionKind::Sum)
-        });
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &ragged_batch_inputs([1, 3]), &[]),
-            Ok(vec![MixedValue::Array(vec![2.0, 9.0], vec![2])]),
-        );
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_widening_dense_through_ragged_witness() {
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Widening each item's dense `f64[3]` row to the ragged identity checks that the witness's extent is 3 for
-        // every item, and the widened output then carries the per-item extents of the witness.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let program = ragged_batch_program(|(value, extent, dense)| {
-            let witness = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
-            dense.cast(ragged_vector(&length), &[witness])?.reduce(&[0], ReductionKind::Sum)
-        });
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &ragged_batch_inputs([3, 3]), &[]),
-            Ok(vec![MixedValue::Array(vec![3.0, 3.0], vec![2])]),
-        );
-        let error = execute_mixed_program(&client, &program, &ragged_batch_inputs([1, 3]), &[]).unwrap_err();
-        let error = error.to_string();
-        assert!(error.contains("`cast` requires every batch item's dimension `length` to have extent 3"), "{error}");
-    }
-
-    #[test]
-    fn test_execute_ragged_cast_empty_batch() {
-        use crate::experimental::lowering::tests::execute_mixed_program;
-        use crate::tests::execution_client;
-
-        // Batching along a bounded dynamic `items` axis keeps the per-item check and the masked sum valid for a batch
-        // whose runtime size is zero: the check reduces over no items and passes, and the output is an empty vector
-        // whose runtime extent follows the logical outputs. A populated batch still checks every item.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let items = dynamic_dimension("items", Some(3));
-        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
-        let values = trace.input(ArrayType::new(DataType::F64, Shape::new(vec![items.clone()])).into());
-        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![items])).into());
-        let output = batch(
-            |(value, extent)| {
-                let carrier = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
-                carrier
-                    .cast(ArrayType::new_static(DataType::F64, [3]).into(), &[])?
-                    .reduce(&[0], ReductionKind::Sum)
-            },
-            (values, extents),
-            (BatchAxis::new(0), BatchAxis::new(0)),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        let program = trace.builder().borrow().clone();
-        let program: FlatXlaProgram =
-            program.build(vec![output.atom_id().unwrap()], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-        let client = execution_client();
-        let empty = [MixedValue::Array(vec![0.0; 2], vec![2]), MixedValue::Integers(vec![0; 2], vec![2])];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &empty, &[0, 0]),
-            Ok(vec![MixedValue::Array(vec![], vec![0]), MixedValue::Dimension(0)]),
-        );
-        let full = [MixedValue::Array(vec![2.0, 3.0], vec![2]), MixedValue::Integers(vec![3, 3], vec![2])];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &full, &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![6.0, 9.0], vec![2]), MixedValue::Dimension(2)]),
-        );
-        let short = [MixedValue::Array(vec![2.0, 3.0], vec![2]), MixedValue::Integers(vec![1, 3], vec![2])];
-        let error = execute_mixed_program(&client, &program, &short, &[2, 2]).unwrap_err().to_string();
-        assert!(error.contains("`cast` requires every batch item's dimension `length` to have extent 3"), "{error}");
     }
 }

@@ -1306,6 +1306,7 @@ mod tests {
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
         AddOperation, AxisIndex, ConditionOperation, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike,
         OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite,
@@ -1594,13 +1595,7 @@ mod tests {
             }
         }
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for NoOutputOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
+        impl_guardless_operation!(NoOutputOperation);
 
         let context = TracingContext::<Array, NoOutputOperation>::new();
         let builder = context.builder().clone();

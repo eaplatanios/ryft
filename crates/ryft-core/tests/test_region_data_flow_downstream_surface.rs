@@ -12,12 +12,12 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::{
     Array, ArrayType, CompareOperation, ComparisonDirection, Concretizable, ConstantOperation, Context, DataType,
-    Domain, DotDimensionNumbers, DotOperation, GuardOperation, InterpretableOperation, InterpretationDriver,
-    MulOperation, NoStorage, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder, ProgramError, RegionDataFlow,
-    RegionDataFlowBoundary, RegionDataFlowRegionBoundary, RegionDataFlowRule, RegionDataFlowSource,
-    RegionDataFlowSources, RegionInterface, RegionLiveness, RegionSlot, ResidualCandidate, ResidualDecision,
-    ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection, TagOperation, TypeError,
+    Domain, DotDimensionNumbers, DotOperation, InterpretableOperation, InterpretationDriver, MulOperation, NoStorage,
+    Operation, OperationFormatter, OutputRegionProvenance, PartiallyEvaluatableOperation, Placeholder, Program,
+    ProgramBuilder, ProgramError, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary,
+    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionSlot,
+    ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference,
+    ResidualRejection, TagOperation, TypeError,
 };
 
 /// Small downstream operation family whose recurrent carrier has no scan or while variant.
@@ -30,14 +30,6 @@ enum DownstreamOperation {
     Compare(CompareOperation<ArrayType>),
     Mul(MulOperation<ArrayType>),
     Recurrent(RecurrentOperation),
-}
-
-impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for DownstreamOperation {
-    type Operation = Self;
-
-    fn provide(_request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
-    }
 }
 
 /// Two-step recurrence whose second result reaches its dot producer only through an earlier iteration.

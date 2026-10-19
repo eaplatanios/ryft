@@ -5595,7 +5595,6 @@ mod tests {
         check_array_types = [@no_unreduced],
     );
 
-    impl_guardless_operation!(<T> TestUnaryOperation<T> where T: Type);
     impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
     impl_reference_dischargeable_operation!(@reference_free TestUnaryOperation<ArrayType>);
@@ -5610,6 +5609,8 @@ mod tests {
             })
         }
     }
+
+    impl_guardless_operation!(<T> TestUnaryOperation<T> where T: Type);
 
     impl From<ZeroOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
         fn from(_operation: ZeroOperation<ArrayType>) -> Self {
@@ -5658,7 +5659,6 @@ mod tests {
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
-    impl_guardless_operation!(<T> TestBinaryOperation<T> where T: Type);
     impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);
     impl_reference_dischargeable_operation!(@local_reference <T> TestBinaryOperation<T> where T: Type);
 
@@ -5672,6 +5672,8 @@ mod tests {
             })
         }
     }
+
+    impl_guardless_operation!(<T> TestBinaryOperation<T> where T: Type);
 
     impl From<ZeroOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
         fn from(_operation: ZeroOperation<ArrayType>) -> Self {
@@ -5835,8 +5837,6 @@ mod tests {
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
-    impl_guardless_operation!(<T> TestDifferentiableOperation<T> where T: Type);
-
     impl_differentiable_operation! {
         TestDifferentiableOperation<ArrayType>,
         jvp<C>
@@ -5864,6 +5864,8 @@ mod tests {
         },
     }
 
+    impl_guardless_operation!(<T> TestDifferentiableOperation<T> where T: Type);
+
     const TEST_REVERSED_SUB_OPERATION_NAME: &str = "test_reversed_sub";
     const TEST_NEGATED_ADD_OPERATION_NAME: &str = "test_negated_add";
 
@@ -5880,13 +5882,13 @@ mod tests {
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
-    impl_guardless_operation!(<T> TestReversedSubOperation<T> where T: Type);
-
     impl_differentiable_elementwise_operation! {
         @linear
         TestReversedSubOperation,
         rule = [@negative, @positive]
     }
+
+    impl_guardless_operation!(<T> TestReversedSubOperation<T> where T: Type);
 
     define_elementwise_operation!(
         @binary
@@ -5901,13 +5903,13 @@ mod tests {
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
-    impl_guardless_operation!(<T> TestNegatedAddOperation<T> where T: Type);
-
     impl_differentiable_elementwise_operation! {
         @linear
         TestNegatedAddOperation,
         rule = [@negative, @negative]
     }
+
+    impl_guardless_operation!(<T> TestNegatedAddOperation<T> where T: Type);
 
     /// Unary operator used to test [`impl_tracer_operator!`].
     trait TestUnaryOperator {

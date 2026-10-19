@@ -29,16 +29,16 @@ pub use arrays::{
     ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform, ArrayReferenceTransformIndex,
     ArrayReferenceTransformPath, ArrayReferenceViewError, ArraySliceAxis, ArrayType, ArrayTypeRefinements, AsArrayType,
     AsDimensionType, Broadcastable, BroadcastingError, Complex, DataType, DataTypeError, Device, DeviceId, DeviceMesh,
-    Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionOperations, DimensionSource,
-    DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, ExactShape,
-    ExactShapeDimension, FloatingPointArrayElement, Layout, LayoutError, LinearResiduals, LogicalMesh,
-    MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, NumericArrayElement, ProcessIndex,
-    RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity, RealArrayElement, RealFloatingPointArrayElement,
-    Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization, StaticArrayExtentBatchingPolicy,
-    StaticShape, StridedLayout, ThreadedExtentBatchedProgram, Tile, TileDimension, TiledLayout, bf16, decode_elements,
-    decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
-    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1,
-    u2, u4,
+    Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionOperations, DimensionRefinements,
+    DimensionSource, DimensionType, DimensionTypeRefinements, DimensionValue, DimensionVariable,
+    DynamicArrayExtentBatchingPolicy, ExactShape, ExactShapeDimension, FloatingPointArrayElement, Layout, LayoutError,
+    LinearResiduals, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, NumericArrayElement,
+    ProcessIndex, RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity, RealArrayElement,
+    RealFloatingPointArrayElement, Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization,
+    StaticArrayExtentBatchingPolicy, StaticShape, StridedLayout, ThreadedExtentBatchedProgram, Tile, TileDimension,
+    TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn,
+    f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1,
+    i2, i4, materialize_array_tangent, u1, u2, u4,
 };
 pub use axes::{Axes, Axis, AxisError, NamedAxes, NamedAxis};
 pub use batching::{
@@ -61,7 +61,8 @@ pub use compilation::{
     jit, jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
 };
 pub use contexts::{
-    Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext, ValueResolution,
+    Context, ContextProjection, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext,
+    ValueResolution,
 };
 pub use differentiation::{
     BinaryElementwiseJvpInputs, BroadcastDerivativeAlignment, CotangentAccumulator, CotangentBatchingPolicy,
@@ -96,45 +97,46 @@ pub use operations::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME,
     ASSERT_OPERATION_NAME, ATAN2_OPERATION_NAME, AXIS_INDEX_OPERATION_NAME, Abs, AbsOperation, Accuracy, Add,
     AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, ArithmeticDimensionOperation,
-    ArithmeticOperations, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue, Atan2,
-    Atan2Operation, AxisIndex, AxisIndexOperation, BROADCAST_OPERATION_NAME, BasicIndex, BatchingRuleConsistencyError,
-    BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME,
-    COMPLEX_OPERATION_NAME, CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONJUGATE_OPERATION_NAME,
-    CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME,
-    COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_CALL_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
-    CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, Capability, CategoricalSamplingMode, Ceil, CeilOperation, Clamp,
-    ClampOperation, CollectiveMode, CollectiveOperations, CollectiveOptions, Compare, CompareOperation,
-    ComparisonDirection, ComparisonType, ComplexOperation, ComplexOperations, Concatenate, ConcatenateOperation,
-    Condition, ConditionOperation, ConditionType, Conjugate, ConjugateOperation, Constant, ConstantOperation,
-    ConstantOperations, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, ConvertElementType,
-    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeKind, CumulativeOperation, CustomCall,
-    CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching, CustomCallInputOutputAlias, CustomCallOperation,
-    CustomCallPrimal, CustomCallRaggedContract, CustomCallRaggedInputBinding, CustomCallRaggedOutputBinding,
-    CustomFunction, CustomFunctionBatching, CustomFunctionJvp, CustomFunctionJvpRule, CustomFunctionOperation,
-    CustomFunctionTransposeOperation, CustomFunctionVjp, CustomRuleDefinition, CustomRuleReference,
-    CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer, DIMENSION_ADD_OPERATION_NAME,
-    DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME,
-    DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME,
-    DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME,
-    DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME,
-    DIV_OPERATION_NAME, DOT_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-    DefaultBatching, DefaultJvp, DefaultVjp, DimensionAddOperation, DimensionConstant, DimensionDivOperation,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
-    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
-    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers,
-    DotOperation, DotOperations, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicFill,
-    DynamicGather, DynamicIota, DynamicManipulationOperations, DynamicOne, DynamicPad, DynamicReshape,
-    DynamicReshapeOperation, DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds,
+    ArithmeticOperations, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
+    AssertionValue, Atan2, Atan2Operation, AxisIndex, AxisIndexOperation, BROADCAST_OPERATION_NAME, BasicIndex,
+    BatchingRuleConsistencyError, BlockQuantize, Broadcast, BroadcastOperation, CAST_OPERATION_NAME,
+    CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME, COMPLEX_OPERATION_NAME,
+    CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONJUGATE_OPERATION_NAME, CONSTANT_OPERATION_NAME,
+    CONSTRAIN_SHARDING_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_CALL_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
+    CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, Capability, Cast, CastOperation, CastType, CategoricalSamplingMode, Ceil,
+    CeilOperation, Clamp, ClampOperation, CollectiveMode, CollectiveOperations, CollectiveOptions, Compare,
+    CompareOperation, ComparisonDirection, ComparisonType, ComplexOperation, ComplexOperations, Concatenate,
+    ConcatenateOperation, Condition, ConditionOperation, ConditionType, Conjugate, ConjugateOperation, Constant,
+    ConstantOperation, ConstantOperations, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
+    ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeKind,
+    CumulativeOperation, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
+    CustomCallInputOutputAlias, CustomCallOperation, CustomCallPrimal, CustomCallRaggedContract,
+    CustomCallRaggedInputBinding, CustomCallRaggedOutputBinding, CustomFunction, CustomFunctionBatching,
+    CustomFunctionJvp, CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation,
+    CustomFunctionVjp, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource,
+    CustomRuleSpecializer, CustomRuleTracer, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE,
+    DIMENSION_DIV_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME,
+    DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME,
+    DIMENSION_REM_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME,
+    DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME, DIV_OPERATION_NAME, DOT_OPERATION_NAME,
+    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DefaultBatching, DefaultJvp, DefaultVjp,
+    DimensionAddOperation, DimensionConstant, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation,
+    DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
+    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
+    DivOperation, Dot, DotDimensionNumbers, DotOperation, DotOperations, DynamicBroadcast, DynamicBroadcastOperation,
+    DynamicConcatenate, DynamicFill, DynamicGather, DynamicIota, DynamicManipulationOperations, DynamicOne, DynamicPad,
+    DynamicReshape, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds,
     DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, DynamicZero,
     ERF_OPERATION_NAME, EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp, ExpOperation,
     ExponentialOperations, ExtremaOperations, FLOOR_OPERATION_NAME, Fill, Floor, FloorOperation, GATHER_OPERATION_NAME,
-    Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IMAGINARY_OPERATION_NAME,
-    IOTA_OPERATION_NAME, Imaginary, ImaginaryOperation, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed,
-    Indexing, Iota, IotaOperation, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME, LN_1P_OPERATION_NAME,
-    LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LiftedCustomRules, LinearCallOperation,
-    Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, LogicalOperations, Logistic,
-    LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManipulationOperations,
+    GUARD_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, GuardOperation,
+    IMAGINARY_OPERATION_NAME, IOTA_OPERATION_NAME, Imaginary, ImaginaryOperation, IndexInteger, IndexMask,
+    IndexSelector, IndexSlice, Indexed, Indexing, Iota, IotaOperation, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME,
+    LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LiftedCustomRules,
+    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, LogicalOperations,
+    Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManipulationOperations,
     ManualVariationAlignment, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME,
     NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME,
     OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, PAD_OPERATION_NAME,
@@ -216,13 +218,15 @@ pub use programs::{
     RegionDataFlowBoundary, RegionDataFlowRegionBoundary, RegionDataFlowRule, RegionDataFlowSource,
     RegionDataFlowSources, RegionDriver, RegionId, RegionInterface, RegionKey, RegionLiveness, RegionRef,
     RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform,
-    TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch,
-    ValueDispatch, ValueDomainDispatch, ValueId, ValueProjection, batch_reference_transforms,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
-    infer_reference_view_type, rewrite_reference_access_transforms, validate_projected_operation_region_interfaces,
-    validate_reference_boundary, validated_reference_access_descriptors,
+    TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind,
+    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
+    ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch, ValueDispatch, ValueDomainDispatch, ValueId,
+    ValueProjection, batch_reference_transforms, discharge_local_reference_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation, fold_projected_operation,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types, infer_reference_view_type,
+    rewrite_reference_access_transforms, type_identities_needing_runtime_checks,
+    validate_projected_operation_region_interfaces, validate_reference_boundary,
+    validated_reference_access_descriptors,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -255,14 +259,15 @@ pub(crate) mod tests {
         TranspositionContext, TranspositionDriver,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::check_count;
+    use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{
         AddOperation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
         ConstantOperation, ConvertElementTypeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation,
-        DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation,
-        PadOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation,
-        ReshapeOperation, ReshardOperation, SelectOperation, SliceOperation, StopGradientOperation, SubOperation,
-        TransposeOperation, UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
+        DivOperation, ExpOperation, GuardOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation,
+        OneOperation, PadOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation,
+        ReferenceWriteOperation, ReshapeOperation, ReshardOperation, SelectOperation, SliceOperation,
+        StopGradientOperation, SubOperation, TransposeOperation, UpdateSliceOperation, ZeroLikeOperation,
+        ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -712,6 +717,8 @@ pub(crate) mod tests {
         V: Value<Type = ProjectedMemberType<MEMBER>>,
         O: Operation<Type = ProjectedMemberType<MEMBER>> + From<AddOperation<ProjectedMemberType<MEMBER>>>,
     > TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
+    where
+        O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
@@ -730,6 +737,8 @@ pub(crate) mod tests {
             Ok(())
         }
     }
+
+    impl_guardless_operation!(<const MEMBER: u8> ProjectedMemberOperation<MEMBER>);
 
     /// Test-only composite operation family embedding all three member families.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -841,12 +850,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
-    /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,
-    /// splicing, and rebuild paths) in isolation. Production region-carrying operations (e.g., the control-flow family)
-    /// impose their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture
-    /// declares arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures
-    /// whose failures cannot be masked by control-flow inference.
+    impl_guardless_operation!(ProjectedProgramOperation);
+
+    /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`] machinery (i.e.,
+    /// construction, interning and sharing, interface derivation, validation, effects propagation, rendering, splicing,
+    /// and rebuild paths) in isolation. Production region-carrying operations (e.g., the control-flow family) impose
+    /// their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture declares
+    /// arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures whose
+    /// failures cannot be masked by control-flow inference.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub enum TestRegionOperation {
         /// Region-free binary addition stand-in used inside region bodies.
@@ -939,6 +950,8 @@ pub(crate) mod tests {
         }
     }
 
+    impl_guardless_operation!(TestRegionOperation);
+
     /// Region-free test [`Operation`] family isolating ordered-state effect handling (i.e., simplification liveness
     /// and ordering) from reference-operation semantics.
     #[derive(Clone, Debug, PartialEq)]
@@ -977,6 +990,8 @@ pub(crate) mod tests {
             }))
         }
     }
+
+    impl_guardless_operation!(TestOrderedStateOperation);
 
     impl InterpretableOperation<EagerContext<Array, Self>> for TestOrderedStateOperation {
         fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(

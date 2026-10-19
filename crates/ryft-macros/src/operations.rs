@@ -10,6 +10,8 @@ use crate::helpers::hygiene::const_block;
 use crate::helpers::receivers::replace_self_type;
 use crate::helpers::symbols::Symbol;
 
+// TODO(eaplatanios): Review this module.
+
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
 const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
@@ -818,11 +820,11 @@ impl OperationEnum {
     }
 
     /// Generates the `Operation` derive output: the [`Operation`] dispatcher, the [`InterpretableOperation`]
-    /// dispatcher, the
-    /// [`PartiallyEvaluatableOperation`] dispatcher, the [`Display`] implementation, and the `From` and borrowed
-    /// `TryFrom` payload conversions. Refer to the documentation of the [`Operation`] trait for information on the
-    /// shape of the generated code and on how the interpretation value types are inferred from the enum's
-    /// `Value<Type = T>` generic parameters.
+    /// dispatcher, the [`PartiallyEvaluatableOperation`] dispatcher, the [`Display`] implementation, the `From` and
+    /// borrowed `TryFrom` payload conversions, and, for a family that stores no guard, the rejecting guard provider
+    /// (refer to [`OperationEnum::generate_guard_provider_impl`]). Refer to the documentation of the [`Operation`]
+    /// trait for information on the shape of the generated code and on how the interpretation value types are inferred
+    /// from the enum's `Value<Type = T>` generic parameters.
     fn generate_operation(&self) -> TokenStream {
         let variants = &self.variants;
         let ryft = &self.ryft_crate;
@@ -838,6 +840,7 @@ impl OperationEnum {
             .iter()
             .filter(|variant| !variant.is_generic_extension)
             .map(|variant| self.generate_conversion_impl(variant));
+        let guard_provider = self.generate_guard_provider_impl();
 
         const_block(quote! {
             #operation
@@ -860,6 +863,8 @@ impl OperationEnum {
             }
 
             #(#conversion_impls)*
+
+            #guard_provider
         })
     }
 
@@ -2146,6 +2151,45 @@ impl OperationEnum {
         }
     }
 
+    /// Generates the [`OperationProvider`](ryft_core::OperationProvider) implementation that rejects every
+    /// [`GuardOperation`](ryft_core::GuardOperation) request of the enum's primary type with
+    /// [`GuardOperation::unsupported_family_error`](ryft_core::GuardOperation::unsupported_family_error), or returns
+    /// [`None`] when a variant stores a native guard (refer to [`OperationVariant::is_native_guard`]). Every
+    /// [`Context`](ryft_core::Context) requires its operation family to provide guard requests, so a family that stores
+    /// no guard needs this provider to be used as a context's family at all. A family that stores a native guard
+    /// instead converts it through the generated `From<GuardOperation<T>>` implementation, which `ryft-core`'s blanket
+    /// supporting provider turns into an accepting provider. The two implementations never overlap: the blanket
+    /// requires `Enum: From<GuardOperation<T>>`, which only the deriving crate can implement for its own enum, so the
+    /// compiler proves that it does not hold whenever no such conversion exists. A family that both stores no native
+    /// guard and hand-writes that conversion therefore fails to compile with a conflicting-implementations error
+    /// (E0119) instead of silently rejecting guards it could represent.
+    fn generate_guard_provider_impl(&self) -> Option<TokenStream> {
+        if self.variants.iter().any(OperationVariant::is_native_guard) {
+            return None;
+        }
+        let ryft = &self.ryft_crate;
+        let primary_type = &self.operation_type;
+        let enum_type = &self.self_type;
+        let (impl_generics, _, where_clause) = self.operation_generics.split_for_impl();
+        Some(quote! {
+            #[automatically_derived]
+            impl #impl_generics #ryft::OperationProvider<#primary_type, #ryft::GuardOperation<#primary_type>>
+                for #enum_type
+            #where_clause
+            {
+                type Operation = Self;
+
+                #[inline]
+                fn provide(
+                    request: #ryft::GuardOperation<#primary_type>,
+                    _input_types: &[&#primary_type],
+                ) -> ::std::result::Result<Self, #ryft::ProgramError> {
+                    ::std::result::Result::Err(request.unsupported_family_error())
+                }
+            }
+        })
+    }
+
     /// Generates the canonical [`OperationProjection`] implementation for one declared projected member variant, in
     /// either role. Composite-native and mixed variants do not define homogeneous operation-family projections.
     fn generate_operation_projection_impl(&self, variant: &OperationVariant) -> Option<TokenStream> {
@@ -2424,6 +2468,22 @@ impl OperationVariant {
     /// Receiver expression to use when delegating to the wrapped operation.
     fn receiver(&self) -> TokenStream {
         if self.is_boxed { quote!(&**operation) } else { quote!(operation) }
+    }
+
+    /// Returns whether this variant stores a native guard of the enclosing family: a composite-native payload, stored
+    /// directly or boxed, whose type is a path whose last segment is `GuardOperation`. Detection is syntactic, by that
+    /// path segment, because a procedural macro cannot resolve types. Projected and mixed members do not count, since
+    /// their guards belong to the member universe rather than to the enum's primary type, and neither does a bare
+    /// generic extension payload. A payload naming the guard through a type alias is therefore not detected, and the
+    /// generated rejecting provider then conflicts with the blanket provider that the variant's `From` conversion
+    /// enables (E0119), which is a compile error rather than a silent rejection.
+    fn is_native_guard(&self) -> bool {
+        matches!(self.class, OperationVariantClass::CompositeNative)
+            && matches!(
+                &self.payload_type,
+                syn::Type::Path(type_path) if type_path.qself.is_none()
+                    && type_path.path.segments.last().is_some_and(|segment| segment.ident == "GuardOperation"),
+            )
     }
 }
 
@@ -2806,6 +2866,15 @@ mod tests {
         let mut parser = OperationParser::new();
         parser.extract_attributes(&input);
         parser
+    }
+
+    /// Parses a derive input and normalizes it into an [`OperationEnum`].
+    fn normalize_operation_enum(tokens: TokenStream) -> OperationEnum {
+        let mut input = syn::parse2(tokens).expect("failed to parse derive input");
+        replace_self_type(&mut input);
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        parser.normalize_input(&input).expect("failed to normalize operation enum")
     }
 
     #[test]
@@ -3712,6 +3781,103 @@ mod tests {
         assert!(generated.contains("ryft::DifferentiationDual::new_with_zero_tangent(primal)"));
         assert!(generated.contains("TableType:ryft::DifferentiableType"));
         assert!(!generated.contains("ryft::ZeroOperation<DimensionType>"));
+    }
+
+    #[test]
+    fn test_operation_generate_guard_provider_impl() {
+        // A family without a native guard variant rejects guard requests of its primary type under the bounds of its
+        // generated `Operation` implementation.
+        let operation = normalize_operation_enum(quote! {
+            enum GuardlessOperation<V: Value<Type = ArrayType>> {
+                Constant(ConstantOperation<V>),
+                Add(AddOperation<ArrayType>),
+            }
+        });
+        let generated: syn::ItemImpl = syn::parse2(operation.generate_guard_provider_impl().unwrap()).unwrap();
+        let expected: syn::ItemImpl = syn::parse_quote! {
+            #[automatically_derived]
+            impl<V: Value<Type = ArrayType>> ryft::OperationProvider<ArrayType, ryft::GuardOperation<ArrayType>>
+                for GuardlessOperation<V>
+            where
+                ConstantOperation<V>: ryft::Operation<Type = ArrayType>,
+                AddOperation<ArrayType>: ryft::Operation<Type = ArrayType>
+            {
+                type Operation = Self;
+
+                #[inline]
+                fn provide(
+                    request: ryft::GuardOperation<ArrayType>,
+                    _input_types: &[&ArrayType],
+                ) -> ::std::result::Result<Self, ryft::ProgramError> {
+                    ::std::result::Result::Err(request.unsupported_family_error())
+                }
+            }
+        };
+        assert_eq!(generated.to_token_stream().to_string(), expected.to_token_stream().to_string());
+    }
+
+    #[test]
+    fn test_operation_generate_guard_provider_impl_native_guard() {
+        // A native guard variant converts through its generated `From` implementation, which enables the blanket
+        // supporting provider, so the derive must not generate a conflicting rejecting provider.
+        let operation = normalize_operation_enum(quote! {
+            enum GuardedOperation<V: Value<Type = ArrayType>> {
+                Constant(ConstantOperation<V>),
+                Guard(ryft::GuardOperation<ArrayType>),
+            }
+        });
+        assert!(operation.generate_guard_provider_impl().is_none());
+    }
+
+    #[test]
+    fn test_operation_generate_guard_provider_impl_boxed_native_guard() {
+        let operation = normalize_operation_enum(quote! {
+            enum BoxedGuardOperation<V: Value<Type = ArrayType>> {
+                Constant(ConstantOperation<V>),
+                Guard(Box<GuardOperation<ArrayType>>),
+            }
+        });
+        assert!(operation.generate_guard_provider_impl().is_none());
+    }
+
+    #[test]
+    fn test_operation_generate_guard_provider_impl_projected_member_guard() {
+        // A projected member guard belongs to the member universe, so the family still rejects guards of its own
+        // primary type.
+        let operation = normalize_operation_enum(quote! {
+            #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>))]
+            enum ProjectedGuardOperation {
+                #[ryft(projected(ArrayType))]
+                Guard(GuardOperation<ArrayType>),
+            }
+        });
+        let generated: syn::ItemImpl = syn::parse2(operation.generate_guard_provider_impl().unwrap()).unwrap();
+        let expected: syn::ItemImpl = syn::parse_quote! {
+            #[automatically_derived]
+            impl ryft::OperationProvider<ArrayIrType, ryft::GuardOperation<ArrayIrType>> for ProjectedGuardOperation
+            where
+                GuardOperation<ArrayType>: ryft::Operation<Type = ArrayType>,
+                ArrayType: ryft::Type<
+                    Identity = <ArrayIrType as ryft::Type>::Identity,
+                >,
+                ArrayIrType: ::std::convert::From<ArrayType>,
+                for<'__member_type> &'__member_type ArrayType: ::std::convert::TryFrom<
+                    &'__member_type ArrayIrType,
+                    Error = ryft::TypeError,
+                >
+            {
+                type Operation = Self;
+
+                #[inline]
+                fn provide(
+                    request: ryft::GuardOperation<ArrayIrType>,
+                    _input_types: &[&ArrayIrType],
+                ) -> ::std::result::Result<Self, ryft::ProgramError> {
+                    ::std::result::Result::Err(request.unsupported_family_error())
+                }
+            }
+        };
+        assert_eq!(generated.to_token_stream().to_string(), expected.to_token_stream().to_string());
     }
 
     /// Returns the derive input of the payload projection test. It covers a projected member declared before the

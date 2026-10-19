@@ -21,8 +21,9 @@ use crate::kernels::memory::{
     AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation, WaitOperation,
 };
 use crate::kernels::validation::KernelReferenceOperation;
+use crate::macros::impl_guardless_operation;
 use crate::operations::{
-    ConditionOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, GuardOperation,
+    ConditionOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
 };
@@ -31,9 +32,9 @@ use crate::partial::{
 };
 use crate::programs::{
     Effects, ErasedOperation, InputRegionProvenance, Operation, OperationBoundaryPruning, OperationPayloadProjection,
-    OperationProjection, OperationProvider, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming,
+    OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
+    TypeIdentityRenaming,
 };
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
@@ -703,15 +704,9 @@ where
     }
 }
 
-impl<Extension: Operation<Type = ArrayIrType>> OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>>
-    for KernelOperation<Extension>
-{
-    type Operation = Self;
-
-    fn provide(request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Err(request.unsupported_family_error())
-    }
-}
+impl_guardless_operation!(
+    <Extension> KernelOperation<Extension> where Extension: Operation<Type = ArrayIrType>
+);
 
 impl<Extension: Operation<Type = ArrayIrType>> From<MaskedLoadOperation> for KernelOperation<Extension> {
     fn from(operation: MaskedLoadOperation) -> Self {

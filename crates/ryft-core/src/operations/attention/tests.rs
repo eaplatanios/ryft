@@ -4,14 +4,43 @@ use approx::assert_abs_diff_eq;
 use indoc::indoc;
 use pretty_assertions::assert_eq;
 
-use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionVariable};
-use crate::batching::batch;
-use crate::contexts::StagingContext;
+use crate::arrays::{
+    Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, RaggedAxis,
+};
+use crate::batching::{BatchingTracer, batch};
+use crate::contexts::{EagerContext, StagingContext};
 use crate::parameters::Placeholder;
+use crate::programs::EmptyRegionDriver;
 use crate::tests::hash_of;
 use crate::tracing::TracingContext;
 
 use super::*;
+
+/// Builds valid forward tensors and backward residuals with sequence lengths varying over the outer coordinate.
+fn ragged_attention_batches(batch_axis: BatchAxis) -> Vec<ArrayBatch<Array>> {
+    let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+    let extents = Array::vector(vec![1i64, 2]).unwrap();
+    let tensor = ArrayBatch::new(
+        Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 1, 1]), &[1f32; 4]).unwrap(),
+        batch_axis,
+    )
+    .unwrap()
+    .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), length.clone(), vec![0])])
+    .unwrap();
+    let statistic = ArrayBatch::new(
+        Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 1]), &[1f32; 4]).unwrap(),
+        batch_axis,
+    )
+    .unwrap()
+    .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
+    .unwrap();
+    let inputs = vec![tensor.clone(), tensor.clone(), tensor.clone(), tensor.clone(), statistic, tensor];
+    let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
+    DotProductAttentionBackwardOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default())
+        .infer_output_types(&input_types, &[])
+        .unwrap();
+    inputs
+}
 
 #[test]
 fn test_attention_configuration() {
@@ -447,6 +476,95 @@ fn test_dot_product_attention_batching() {
     assert_eq!(outputs[0].value().to_f64s(), vec![3.0, 10.0]);
     assert_eq!(outputs[1].batch_axis(), BatchAxis::new(0));
     assert_eq!(outputs[1].unbatched_type().shape(), &static_shape(&[1, 1]));
+}
+
+#[test]
+fn test_dot_product_attention_batching_rejects_ragged_static() {
+    let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+    let forward = DotProductAttentionOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default());
+    let backward =
+        DotProductAttentionBackwardOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default());
+    let inputs = ragged_attention_batches(BatchAxis::new(0));
+    let tracers = inputs[..3]
+        .iter()
+        .map(|input| BatchingTracer::new(context.clone(), input.clone()))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        context.bind(forward, Vec::new(), &tracers).map_err(BatchingError::from),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention` does not support bounded ragged dimension `length` on input 0",
+    ));
+    assert!(matches!(
+        backward.batch(&context, &EmptyRegionDriver, &inputs),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention_backward` does not support bounded ragged dimension \
+                           `length` on input 0",
+    ));
+    let inputs = ragged_attention_batches(BatchAxis::replicated());
+    assert!(matches!(
+        forward.batch(&context, &EmptyRegionDriver, &inputs[..3]),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention` does not support bounded ragged dimension `length` on input 0",
+    ));
+    assert!(matches!(
+        backward.batch(&context, &EmptyRegionDriver, &inputs),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention_backward` does not support bounded ragged dimension \
+                           `length` on input 0",
+    ));
+}
+
+#[test]
+fn test_dot_product_attention_batching_rejects_ragged_dynamic() {
+    let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+        ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+        ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+    );
+    let forward = DotProductAttentionOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default());
+    let backward =
+        DotProductAttentionBackwardOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default());
+    let inputs = ragged_attention_batches(BatchAxis::new(0));
+    assert!(matches!(
+        forward.batch(&context, &EmptyRegionDriver, &inputs[..3]),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention` does not support bounded ragged dimension `length` on input 0",
+    ));
+    assert!(matches!(
+        backward.batch(&context, &EmptyRegionDriver, &inputs),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention_backward` does not support bounded ragged dimension \
+                           `length` on input 0",
+    ));
+    let inputs = ragged_attention_batches(BatchAxis::replicated());
+    assert!(matches!(
+        forward.batch(&context, &EmptyRegionDriver, &inputs[..3]),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention` does not support bounded ragged dimension `length` on input 0",
+    ));
+    assert!(matches!(
+        backward.batch(&context, &EmptyRegionDriver, &inputs),
+        Err(BatchingError::UnsupportedOperation { message })
+            if message == "`dot_product_attention_backward` does not support bounded ragged dimension \
+                           `length` on input 0",
+    ));
+}
+
+#[test]
+fn test_dot_product_attention_batching_static_requires_static_sequence() {
+    let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+    let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(3)).unwrap());
+    let input = ArrayBatch::new(
+        trace.input(ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.into(), 1.into(), 1.into()]))),
+        BatchAxis::new(0),
+    )
+    .unwrap();
+    let operation =
+        DotProductAttentionOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default());
+    assert!(matches!(
+        operation.batch(&BatchingContext::new(trace, 2), &EmptyRegionDriver, &[input.clone(), input.clone(), input]),
+        Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message, .. })))
+            if message == "`dot_product_attention` batching requires statically shaped inputs",
+    ));
 }
 
 #[test]

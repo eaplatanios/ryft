@@ -1920,7 +1920,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::check_count;
+    use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{
         AddOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation, DimensionSubOperation,
         LinearCallOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation,
@@ -2388,14 +2388,6 @@ mod tests {
             }
         }
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for UnavailableOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
-
         impl InterpretableOperation<EagerContext<Array, Self>> for UnavailableOperation {
             fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(
                 &self,
@@ -2406,6 +2398,8 @@ mod tests {
                 Err(self.error.clone())
             }
         }
+
+        impl_guardless_operation!(UnavailableOperation);
 
         let unsupported = ProgramError::UnsupportedOperation { message: "kernel is unavailable".to_string() };
         let operation = UnavailableOperation { error: unsupported.clone(), effects: Effects::empty().clone() };
@@ -2823,14 +2817,6 @@ mod tests {
         #[derive(Clone)]
         struct PreparationFailureOperation;
 
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for PreparationFailureOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
-        }
-
         impl Operation for PreparationFailureOperation {
             type Type = ArrayType;
 
@@ -2859,6 +2845,8 @@ mod tests {
                 Ok(input_types.to_vec())
             }
         }
+
+        impl_guardless_operation!(PreparationFailureOperation);
 
         // Ordinary output validation accepts this application, but must not conceal a failed preparation request.
         let state_type = ArrayType::scalar(DataType::F32);
