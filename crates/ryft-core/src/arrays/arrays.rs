@@ -41,7 +41,7 @@ use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, T
 ///
 /// A production [`Array`] always carries a fully static [`ArrayType`]. Every constructor that sizes or addresses a
 /// payload funnels through [`ArrayAddressing::new`], which rejects any type with a [`Dimension::Dynamic`] axis, so a
-/// dynamically shaped array value cannot be built. Reference kernels may therefore assume static geometry and read
+/// dynamically shaped array value cannot be built. Reference kernels may therefore assume static shapes and read
 /// extents directly off the stored type instead of resolving first-class dimension extent. [`Program`](crate::Program)s
 /// that genuinely need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where each
 /// dynamic axis is carried by an explicit dimension input.

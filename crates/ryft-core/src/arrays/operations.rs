@@ -7,7 +7,7 @@ use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::contexts::{Context, ProjectedContext};
+use crate::contexts::{ContextProjection, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
@@ -20,21 +20,21 @@ use crate::operations::attention::{
 };
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
-    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CeilOperation, ClampOperation,
-    CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations, ConcatenateOperation,
-    ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations, ConstrainShardingOperation,
-    ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomCall, CustomCallOperation,
-    CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation, DimensionDivOperation,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
-    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
-    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, DotOperation,
-    DotOperations, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
+    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
+    ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations,
+    ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations,
+    ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomCall,
+    CustomCallOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
+    DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
+    DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
+    DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
+    DotOperation, DotOperations, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
     DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation,
-    ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, ImaginaryOperation, IotaOperation,
-    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
-    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
-    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
+    ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation,
+    IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
+    LogicalOperations, LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation,
+    NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
     ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
@@ -49,7 +49,7 @@ use crate::operations::{
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, NoReferenceTransform, NoReferent, Operation, OperationProjection, ProgramError,
+    MaybeZero, NoReferenceTransform, NoReferent, Operation, OperationProjection, OperationProvider, ProgramError,
     ReferenceAccessDescriptor, ReferenceAccessOperation, Type, TypeError, TypeIdentityPosition, Typed, Value,
     ValueProjection,
 };
@@ -148,6 +148,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
     Print(PrintOperation<ArrayType>),
     Assert(AssertOperation<ArrayType>),
+    Guard(GuardOperation<ArrayType>),
+    Cast(CastOperation<ArrayType>),
     CustomCall(CustomCallOperation),
     CustomFunction(CustomFunctionOperation<V, ArrayOperation<V>>),
     CustomFunctionTranspose(CustomFunctionTransposeOperation<V, ArrayOperation<V>>),
@@ -248,6 +250,16 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Div(DimensionDivOperation),
     Rem(DimensionRemOperation),
     Pow(DimensionPowOperation),
+}
+
+impl<V: Value<Type = DimensionType>> OperationProvider<DimensionType, GuardOperation<DimensionType>>
+    for DimensionOperation<V>
+{
+    type Operation = Self;
+
+    fn provide(request: GuardOperation<DimensionType>, _input_types: &[&DimensionType]) -> Result<Self, ProgramError> {
+        Err(request.unsupported_family_error())
+    }
 }
 
 /// Value-level capability bundle that groups every operation Ryft supports on first-class dimension values, so that
@@ -465,6 +477,14 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Asserts a Boolean array predicate with optional array or dimension diagnostics.
     Assert(AssertOperation<ArrayIrType>),
 
+    /// Checks at runtime the identity relationships of an entry that the actual input types do not prove, and returns
+    /// its inputs narrowed by the facts that those relationships prove.
+    Guard(GuardOperation<ArrayIrType>),
+
+    /// Returns its first input at a compatible array or first-class dimension type, using further inputs as
+    /// shape and proof witnesses.
+    Cast(CastOperation<ArrayIrType>),
+
     /// Mixed foreign-kernel call whose trailing dimension inputs define its dynamic output axes.
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
@@ -604,9 +624,10 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             },
             // A linear call stores no types, so it reaches the carrier that owns the extent-threaded region rule
             // unchanged.
-            ArrayOperation::LinearCall(operation) => {
-                Self::LinearCall(LinearCallOperation::new(operation.residual_count()))
-            }
+            ArrayOperation::LinearCall(operation) => Self::LinearCall(
+                LinearCallOperation::new(operation.residual_count())
+                    .with_auxiliary_output_count(operation.auxiliary_output_count()),
+            ),
             // Lifting a rematerialized call lifts its residual policy, which keeps the identity of the policy (refer to
             // `ResidualPolicyReference::lift`).
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.lift()),
@@ -646,7 +667,8 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> 
 impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
 where
     A: Value<Type = ArrayType>,
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Constant: ValueProjection<ArrayType, Projected = A>,
             Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
@@ -660,7 +682,6 @@ where
                            + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
                            + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         > + Zero<C::Value>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
     ScatterOperation: MemberDifferentiableOperation<C>,
 {
@@ -693,7 +714,8 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
         rule: DifferentiationRule,
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
     where
-        C: Context<
+        C: ContextProjection<
+                ArrayType,
                 Type = ArrayIrType,
                 Constant: ValueProjection<ArrayType, Projected = A>,
                 Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
@@ -707,7 +729,6 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
                                + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
                                + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
             > + Zero<C::Value>,
-        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
         ScatterOperation: MemberDifferentiableOperation<C>,
     {
@@ -720,19 +741,19 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
             Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
             operation => {
-                // When the result geometry of an implicitly broadcasting elementwise operation carries a runtime
-                // extent, its inputs are first replicated into that geometry, so that the projected member rule
-                // differentiates inputs that already have the result shape. The member-family alignment (i.e.,
+                // When the result shape of an implicitly broadcasting elementwise operation carries a runtime extent,
+                // its inputs are first replicated into that shape, so that the projected member rule differentiates
+                // inputs that already have the result shape. The member-family alignment (i.e.,
                 // `ElementwiseDerivativeAlignment`) cannot replicate into a runtime extent itself, because its
-                // `BroadcastOperation` carries the complete output geometry as payload metadata and program replay
-                // never refines a payload type. Such an extent is therefore only reachable through an input edge, which
-                // this arm supplies: it reads each runtime extent off the input that owns that axis as a first-class
+                // `BroadcastOperation` carries the complete output shape as payload metadata and program replay never
+                // refines a payload type. Such an extent is therefore only reachable through an input edge, which this
+                // arm supplies: it reads each runtime extent off the input that owns that axis as a first-class
                 // dimension value and replicates with a `DynamicBroadcastOperation`. Linearization then keeps one
                 // scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
                 // aligned input. The replication yields `None`, and the inputs are differentiated as they are, when the
                 // operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent
-                // space (so no input is ever aligned), its result geometry is fully static, or every input already has
-                // the result shape.
+                // space (so no input is ever aligned), its result shape is fully static, or every input already has the
+                // result shape.
                 let replicated = 'replicated: {
                     // The variants whose type inference broadcasts several inputs into one result, and whose
                     // differentiation rules therefore align narrower inputs (both live tangents and primal
@@ -897,6 +918,7 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
 
 impl<A, V, O> MemberTransposableOperation<V, O> for ArrayOperation<A>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     A: Value<Type = ArrayType>,
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
@@ -922,7 +944,13 @@ where
             Self::DynamicSlice(operation) => {
                 operation.transpose_in_parent(context, driver, inputs, outputs, accumulators)
             }
-            operation => transpose_projected_operation(context, operation, inputs, outputs, accumulators),
+            operation => transpose_projected_operation::<ArrayType, ArrayOperation<A>, V, O>(
+                context,
+                operation,
+                inputs,
+                outputs,
+                accumulators,
+            ),
         }
     }
 }
@@ -976,7 +1004,7 @@ mod tests {
         ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
         Typed, Value, ValueProjection,
     };
-    use crate::tests::hash_of;
+    use crate::tests::{TestArrayOperation, hash_of};
     use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
@@ -1090,14 +1118,19 @@ mod tests {
         assert_ne!(add, DimensionOperation::Mul(DimensionMulOperation::new(&left_type, &right_type).unwrap()));
         assert_ne!(add, DimensionOperation::Add(DimensionAddOperation::new(&right_type, &left_type).unwrap()));
 
-        // Constant payloads follow the dimension literal identity.
-        let dimension = DimensionValue::constant(3).unwrap();
-        let constant = DimensionOperation::<DimensionValue>::Constant(ConstantOperation::new(dimension.clone()));
-        let same_constant = DimensionOperation::<DimensionValue>::Constant(ConstantOperation::new(dimension));
+        // Constant payloads follow the dimension literal identity, which is the literal's extent.
+        let constant = DimensionOperation::<DimensionValue>::Constant(ConstantOperation::new(
+            DimensionValue::constant(3).unwrap(),
+        ));
+        let same_constant = DimensionOperation::<DimensionValue>::Constant(ConstantOperation::new(
+            DimensionValue::constant(3).unwrap(),
+        ));
         assert_eq!(constant, same_constant);
         assert_eq!(hash_of(&constant), hash_of(&same_constant));
-        let fresh_dimension = DimensionValue::constant(3).unwrap();
-        assert_ne!(constant, DimensionOperation::Constant(ConstantOperation::new(fresh_dimension)));
+        assert_ne!(
+            constant,
+            DimensionOperation::Constant(ConstantOperation::new(DimensionValue::constant(4).unwrap()))
+        );
     }
 
     #[test]
@@ -1157,8 +1190,8 @@ mod tests {
         );
 
         // Drift gate: an instruction output may only *reference* a dimension identity that one of its own inputs
-        // carries. A rule that recovered geometry from stored metadata instead of an input edge would produce a
-        // output type naming an identity that reaches the instruction through no rendered edge.
+        // carries. A rule that recovered extents from stored metadata instead of an input edge would produce a output
+        // type naming an identity that reaches the instruction through no rendered edge.
         let atoms = program.atoms();
         for instruction in program.instructions() {
             let mut input_identities = Vec::new();
@@ -1277,7 +1310,7 @@ mod tests {
         let first_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let second_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar], None)
+            .add_instruction(DimensionFromScalarOperation::new(total.into()), Vec::new(), vec![extent_scalar], None)
             .unwrap()[0];
         let first = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![first_value, extent], None)
@@ -1348,7 +1381,12 @@ mod tests {
         let value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent_scalar], None)
+            .add_instruction(
+                DimensionFromScalarOperation::new(rows.clone().into()),
+                Vec::new(),
+                vec![extent_scalar],
+                None,
+            )
             .unwrap()[0];
         let lower = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let upper = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(8).unwrap()));
@@ -1530,8 +1568,7 @@ mod tests {
     #[test]
     fn test_composite_pushforward_materializes_a_dynamic_zero_space_output_tangent() {
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let key_type =
-            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![extent_type.dimension().clone()]));
         let context = TracingContext::<TestValue, TestOperation>::new();
         let extent = context.input(extent_type.into());
         let key = context.input(key_type.clone().into());
@@ -1732,13 +1769,13 @@ mod tests {
 
         let renamed_left = DimensionVariable::new("renamed_left", bounds);
         let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(left_type.variable().clone(), renamed_left.clone()).unwrap();
+        renaming.insert(left_type.variable().unwrap().clone(), renamed_left.clone()).unwrap();
         let ArrayIrOperation::Dimension(DimensionOperation::Add(add)) =
             dimension_operation.rename_type_identities(&renaming).unwrap()
         else {
             panic!("expected a renamed dimension addition operation");
         };
-        assert_eq!(add.left_type().variable(), &renamed_left);
+        assert_eq!(add.left_type().variable(), Some(&renamed_left));
         assert_eq!(add.right_type(), &right_type);
 
         // A genuinely mixed operation is represented directly by the outer family rather than either homogeneous
@@ -1776,7 +1813,7 @@ mod tests {
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(output_extent.variable().clone()), Dimension::Static(3)]),
+                    Shape::new(vec![output_extent.dimension().clone(), Dimension::Static(3)]),
                 )
                 .into()
             ]),
@@ -1985,16 +2022,16 @@ mod tests {
             vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap())],
         );
 
-        let rows = DimensionValue::constant(2).unwrap();
-        let columns = DimensionValue::constant(3).unwrap();
+        // Dynamic constructors accept exact eager extents for their symbolic axes.
+        let rows_type = DimensionType::new("rows", DimensionBounds::non_negative(Some(9)).unwrap());
+        let columns_type = DimensionType::new("columns", DimensionBounds::non_negative(Some(9)).unwrap());
+        let rows = DimensionValue::new(rows_type.clone(), 2).unwrap();
+        let columns = DimensionValue::new(columns_type.clone(), 3).unwrap();
         let zero = context
             .bind(
                 ZeroOperation::new(ArrayType::new(
                     DataType::F32,
-                    Shape::new(vec![
-                        Dimension::Dynamic(rows.r#type().variable().clone()),
-                        Dimension::Dynamic(columns.r#type().variable().clone()),
-                    ]),
+                    Shape::new(vec![rows_type.dimension().clone(), columns_type.dimension().clone()]),
                 )),
                 Vec::new(),
                 &[ArrayIrValue::Dimension(rows), ArrayIrValue::Dimension(columns)],
@@ -2002,13 +2039,10 @@ mod tests {
             .unwrap();
         assert_eq!(zero, vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())]);
 
-        let extent = DimensionValue::constant(3).unwrap();
+        let extent = DimensionValue::new(columns_type.clone(), 3).unwrap();
         let one = context
             .bind(
-                OneOperation::new(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(extent.r#type().variable().clone())]),
-                )),
+                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![columns_type.dimension().clone()]))),
                 Vec::new(),
                 &[ArrayIrValue::Dimension(extent)],
             )
@@ -2043,13 +2077,13 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 
-        let rows = DimensionValue::constant(2).unwrap();
+        let rows = DimensionValue::new(rows_type.clone(), 2).unwrap();
         let dynamic_iota = context
             .bind(
                 IotaOperation::new(
                     ArrayType::new(
                         DataType::I32,
-                        Shape::new(vec![Dimension::Dynamic(rows.r#type().variable().clone()), Dimension::Static(3)]),
+                        Shape::new(vec![rows_type.dimension().clone(), Dimension::Static(3)]),
                     ),
                     0,
                 )
@@ -2080,7 +2114,7 @@ mod tests {
             operation = ArrayIrOperation::from(IotaOperation::new(
                 ArrayType::new(
                     DataType::I32,
-                    Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                    Shape::new(vec![extent_type.dimension().clone()]),
                 ),
                 0,
             )
@@ -2240,14 +2274,14 @@ mod tests {
         );
 
         let zero_context = TestContext::new();
-        let rows_value = DimensionValue::constant(2).unwrap();
-        let columns_value = DimensionValue::constant(3).unwrap();
+        // Dynamic constructors staged with exact constant extents for their symbolic axes have static outputs.
+        let rows_type = DimensionType::new("rows", DimensionBounds::non_negative(Some(9)).unwrap());
+        let columns_type = DimensionType::new("columns", DimensionBounds::non_negative(Some(9)).unwrap());
+        let rows_value = DimensionValue::new(rows_type.clone(), 2).unwrap();
+        let columns_value = DimensionValue::new(columns_type.clone(), 3).unwrap();
         let zero_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![
-                Dimension::Dynamic(rows_value.r#type().variable().clone()),
-                Dimension::Dynamic(columns_value.r#type().variable().clone()),
-            ]),
+            Shape::new(vec![rows_type.dimension().clone(), columns_type.dimension().clone()]),
         );
         let rows = zero_context.constant(ArrayIrValue::Dimension(rows_value));
         let columns = zero_context.constant(ArrayIrValue::Dimension(columns_value));
@@ -2278,22 +2312,19 @@ mod tests {
                 lambda  .
                 let %0:dimension<2> = const 2
                     %1:dimension<3> = const 3
-                    %2:f32[2, 3] = zero [type=f32[2, 3]] %0 %1
+                    %2:f32[2, 3] = zero [type=f32[rows, columns]] %0 %1
                 in (%2)
             "}
             .trim_end(),
         );
 
         let one_context = TestContext::new();
-        let extent_value = DimensionValue::constant(3).unwrap();
+        let extent_value = DimensionValue::new(columns_type.clone(), 3).unwrap();
         let extent = one_context.constant(ArrayIrValue::Dimension(extent_value.clone()));
         let extent_atom = extent.atom_id().unwrap();
         let one_output = one_context
             .bind(
-                OneOperation::new(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
-                )),
+                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![columns_type.dimension().clone()]))),
                 Vec::new(),
                 &[extent],
             )
@@ -2321,23 +2352,20 @@ mod tests {
             indoc! {"
                 lambda  .
                 let %0:dimension<3> = const 3
-                    %1:f32[3] = one [type=f32[3]] %0
+                    %1:f32[3] = one [type=f32[columns]] %0
                 in (%1)
             "}
             .trim_end(),
         );
 
         let iota_context = TestContext::new();
-        let extent_value = DimensionValue::constant(3).unwrap();
+        let extent_value = DimensionValue::new(columns_type.clone(), 3).unwrap();
         let extent = iota_context.constant(ArrayIrValue::Dimension(extent_value.clone()));
         let extent_atom = extent.atom_id().unwrap();
         let output = iota_context
             .bind(
                 IotaOperation::new(
-                    ArrayType::new(
-                        DataType::I32,
-                        Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
-                    ),
+                    ArrayType::new(DataType::I32, Shape::new(vec![columns_type.dimension().clone()])),
                     0,
                 )
                 .unwrap(),
@@ -2368,7 +2396,7 @@ mod tests {
             indoc! {"
                 lambda  .
                 let %0:dimension<3> = const 3
-                    %1:i32[3] = iota [type=i32[3], dimension=0] %0
+                    %1:i32[3] = iota [type=i32[columns], dimension=0] %0
                 in (%1)
             "}
             .trim_end(),
@@ -3254,16 +3282,18 @@ mod tests {
         );
 
         // Known dimension arithmetic folds during partial evaluation while the two shape operations retain their
-        // explicit extent inputs in the residual program.
+        // explicit extent inputs in the residual program. The residual entry keeps the supplied array type, and an
+        // entry guard checks it against the known extent before the shape operations consume its narrowed copy.
         let evaluation = program
             .partially_evaluate(&[
                 PartialValue::Unknown(input_type.clone().into()),
                 PartialValue::Known(extent_value.clone()),
             ])
             .unwrap();
-        assert_eq!(evaluation.program().instructions().len(), 2);
-        assert!(matches!(evaluation.program().instructions()[0].operation(), ArrayIrOperation::Reshape(_),));
-        assert!(matches!(evaluation.program().instructions()[1].operation(), ArrayIrOperation::Broadcast(_),));
+        assert_eq!(evaluation.program().instructions().len(), 3);
+        assert!(matches!(evaluation.program().instructions()[0].operation(), ArrayIrOperation::Guard(_),));
+        assert!(matches!(evaluation.program().instructions()[1].operation(), ArrayIrOperation::Reshape(_),));
+        assert!(matches!(evaluation.program().instructions()[2].operation(), ArrayIrOperation::Broadcast(_),));
         assert_eq!(
             evaluation.interpret(
                 &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
@@ -3513,12 +3543,15 @@ mod tests {
         /// Updates a reference from an ordinary array without producing a value.
         ReferenceAndArrayToUnit,
 
-        /// Consumes first-class dimensions as geometry (or reads an array's geometry as a dimension) without ever
+        /// Consumes first-class dimensions as extents (or reads an array's extent as a dimension) without ever
         /// converting a value from one member kind into the other.
-        GeometryMixed,
+        DimensionMixed,
 
         /// Checks a Boolean array condition with optional scalar array or dimension observations and no outputs.
         AssertionToUnit,
+
+        /// Returns each input at another type of the same member kind, never converting between member kinds.
+        KindPreserving,
 
         /// Forwards composite regions whose bodies may carry every admitted member kind.
         RegionForwarding,
@@ -3533,14 +3566,16 @@ mod tests {
     /// array-to-reference and reference-to-array crossings use their explicitly classified reference operations.
     fn member_kind_signature(operation: &ArrayIrOperation<Array>) -> MemberKindSignature {
         match operation {
-            ArrayIrOperation::Zero(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::One(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::Iota(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Zero(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::One(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::Iota(_) => MemberKindSignature::DimensionMixed,
             ArrayIrOperation::Array(_) => MemberKindSignature::ArrayToArray,
             ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::Assert(_) => MemberKindSignature::AssertionToUnit,
-            ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Guard(_) => MemberKindSignature::KindPreserving,
+            ArrayIrOperation::Cast(_) => MemberKindSignature::KindPreserving,
+            ArrayIrOperation::DimensionSize(_) => MemberKindSignature::DimensionMixed,
             ArrayIrOperation::ReferenceNew(_) => MemberKindSignature::ArrayToReference,
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
@@ -3551,16 +3586,16 @@ mod tests {
             ArrayIrOperation::ReferenceFreeze(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
-            ArrayIrOperation::Reshape(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::Broadcast(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::Concatenate(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::CustomCall(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::Pad(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::DynamicSlice(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::ParallelAllGather(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::ParallelAllToAll(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Reshape(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::Broadcast(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::Concatenate(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::CustomCall(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::Pad(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::DynamicSlice(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::ParallelAllGather(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::DimensionMixed,
+            ArrayIrOperation::ParallelAllToAll(_) => MemberKindSignature::DimensionMixed,
             ArrayIrOperation::ParallelRaggedAllToAll(_) => MemberKindSignature::ArrayToArray,
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
@@ -3596,14 +3631,14 @@ mod tests {
         // signature. Exactly two variants may turn a dimension value into array data (the explicit
         // `dimension_to_scalar` gateway and the deliberately composite-level dimension comparison) and exactly one may
         // turn array data into a dimension value (the checked `dimension_from_scalar` gateway). Everything else either
-        // stays inside one homogeneous member family, treats dimensions as geometry, observes them in an assertion,
-        // or forwards regions.
+        // stays inside one homogeneous member family, treats dimensions as extents, observes them in an assertion,
+        // returns each input at another type of the same member kind, or forwards regions.
         let expected: Vec<(ArrayIrOperation<Array>, MemberKindSignature)> = vec![
-            (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
-            (ArrayIrOperation::One(OneOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
+            (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::DimensionMixed),
+            (ArrayIrOperation::One(OneOperation::new(dynamic_type.clone())), MemberKindSignature::DimensionMixed),
             (
                 ArrayIrOperation::Iota(IotaOperation::new(dynamic_integer_type, 0).unwrap()),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())), MemberKindSignature::ArrayToArray),
             (
@@ -3621,8 +3656,19 @@ mod tests {
                 MemberKindSignature::AssertionToUnit,
             ),
             (
+                ArrayIrOperation::Guard(GuardOperation::new("region", vec![dynamic_type.clone().into()])),
+                MemberKindSignature::KindPreserving,
+            ),
+            (
+                ArrayIrOperation::Cast(CastOperation::unchecked(
+                    dynamic_type.clone().into(),
+                    vec![dynamic_type.clone().into()],
+                )),
+                MemberKindSignature::KindPreserving,
+            ),
+            (
                 ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (ArrayIrOperation::ReferenceNew(ReferenceNewOperation::new()), MemberKindSignature::ArrayToReference),
             (ArrayIrOperation::ReferenceRead(ReferenceReadOperation::new()), MemberKindSignature::ReferenceToArray),
@@ -3644,15 +3690,15 @@ mod tests {
             ),
             (ArrayIrOperation::ReferenceFreeze(ReferenceFreezeOperation::new()), MemberKindSignature::ReferenceToArray),
             (
-                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone())),
+                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone().into())),
                 MemberKindSignature::ArrayToDimensionGateway,
             ),
             (
                 ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
                 MemberKindSignature::DimensionToArrayGateway,
             ),
-            (ArrayIrOperation::Reshape(DynamicReshapeOperation::new()), MemberKindSignature::GeometryMixed),
-            (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::GeometryMixed),
+            (ArrayIrOperation::Reshape(DynamicReshapeOperation::new()), MemberKindSignature::DimensionMixed),
+            (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::DimensionMixed),
             (
                 ArrayIrOperation::Concatenate(
                     ConcatenateOperation::<ArrayIrType>::new(
@@ -3665,28 +3711,28 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::CustomCall(
                     CustomCallOperation::new("ryft.test.identity", vec![scalar_type.clone()]).into(),
                 ),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::Pad(PadOperation::new(vec![0], vec![0], vec![0]).unwrap()),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::DynamicSlice(DynamicSliceOperation::<ArrayIrType>::from_rank(1)),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
                     RandomAlgorithm::ThreeFry,
                     dynamic_type.clone(),
                 )),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::ParallelAllGather(ParallelAllGatherOperation::new(
@@ -3696,7 +3742,7 @@ mod tests {
                     CollectiveOptions::new(CollectiveMode::Untiled),
                     ParallelAllGatherOutputVariance::Varying,
                 )),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::ParallelSumScatter(ParallelSumScatterOperation::new(
@@ -3705,7 +3751,7 @@ mod tests {
                     0,
                     CollectiveOptions::new(CollectiveMode::Untiled),
                 )),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::ParallelAllToAll(ParallelAllToAllOperation::new(
@@ -3715,7 +3761,7 @@ mod tests {
                     0,
                     CollectiveOptions::new(CollectiveMode::Untiled),
                 )),
-                MemberKindSignature::GeometryMixed,
+                MemberKindSignature::DimensionMixed,
             ),
             (
                 ArrayIrOperation::ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation::new("x".to_string(), 2)),
@@ -3795,7 +3841,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 40);
+        assert_eq!(expected.len(), 42);
         assert_eq!(
             expected
                 .iter()
@@ -3813,6 +3859,10 @@ mod tests {
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::AssertionToUnit).count(),
             1,
+        );
+        assert_eq!(
+            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::KindPreserving).count(),
+            2,
         );
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ArrayToReference).count(),

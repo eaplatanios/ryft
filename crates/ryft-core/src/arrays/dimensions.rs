@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use ryft_macros::Parameter;
 
 use crate::arrays::operations::DimensionOperation;
-use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
+use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::{
@@ -13,45 +13,49 @@ use crate::programs::{
     ValueDirectDispatch,
 };
 
-/// Checked host representation of a first-class runtime [`Dimension`](crate::Dimension) value. Its eager domain
-/// performs checked host integer arithmetic without allocating an array or dispatching to a device backend. Fallible
-/// capabilities such as [`Add::add`](crate::Add::add) form the canonical arithmetic API. [`std::ops::Add`],
-/// [`std::ops::Sub`], [`std::ops::Mul`], [`std::ops::Div`], and [`std::ops::Rem`] implementations
-/// provide panicking operator sugar for both owned and borrowed values.
+/// Checked host representation of a first-class runtime [`Dimension`] value. Its eager domain performs checked host
+/// integer arithmetic without allocating an array or dispatching to a device backend. Fallible capabilities such as
+/// [`Add::add`](crate::Add::add) form the canonical arithmetic API. [`std::ops::Add`], [`std::ops::Sub`],
+/// [`std::ops::Mul`], [`std::ops::Div`], and [`std::ops::Rem`] implementations provide panicking operator
+/// sugar for both owned and borrowed values.
+///
+/// Like every eager value, a [`DimensionValue`] is typed by its exact type: the static [`DimensionType`] of its extent
+/// (rendered as, e.g., `dimension<3>`), just as an eager array is typed by its static shape. A static type has no
+/// identity, so two values are equal exactly when their types are (i.e., when their extents are, like the host integers
+/// that they represent). Symbolic dimension types, whose bounds admit a range of extents, describe staged values
+/// instead. A Just-In-Time (JIT) compilation boundary that should reuse one compiled program across extents declares
+/// the symbolic types at which to stage its inputs explicitly. Refer to the documentation of
+/// [`CompiledFunctionDispatcher::with_staged_input_types`](crate::CompiledFunctionDispatcher::with_staged_input_types)
+/// for more information on that.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionValue {
-    /// [`DimensionType`] defining this [`DimensionValue`]'s [`DimensionVariable`](crate::DimensionVariable)
-    /// and [`DimensionBounds`].
-    r#type: DimensionType,
-
     /// Concrete non-negative extent of this [`DimensionValue`].
     extent: usize,
 }
 
 impl DimensionValue {
-    /// Creates a new [`DimensionValue`] after validating the provided [`DimensionType`] and `extent`.
+    /// Creates a new [`DimensionValue`] with the provided `extent` after validating it against the bounds of the
+    /// provided [`DimensionType`] (e.g., the declared type of the program input that the value is meant for). The
+    /// value's own type is the static type of `extent` regardless of `r#type`.
     pub fn new(r#type: DimensionType, extent: usize) -> Result<Self, DimensionError> {
-        if extent > MAX_DIMENSION_EXTENT {
-            return Err(DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: MAX_DIMENSION_EXTENT });
-        }
-
         let bounds = r#type.bounds();
         if !bounds.contains(extent) {
             return Err(DimensionError::BindingOutOfBounds {
-                variable: r#type.variable().to_string(),
+                variable: r#type.simplified_dimension().to_string(),
                 value: extent,
                 bounds,
             });
         }
-
-        Ok(Self { r#type, extent })
+        Self::constant(extent)
     }
 
-    /// Creates a new [`DimensionValue`] literal with a fresh [`DimensionType`] that admits only `extent`.
+    /// Creates a new [`DimensionValue`] with the provided `extent`.
     #[inline]
     pub fn constant(extent: usize) -> Result<Self, DimensionError> {
-        let bounds = DimensionBounds::new(extent, extent.checked_add(1))?;
-        Self::new(DimensionType::new(extent.to_string(), bounds), extent)
+        if extent > MAX_DIMENSION_EXTENT {
+            return Err(DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: MAX_DIMENSION_EXTENT });
+        }
+        Ok(Self { extent })
     }
 
     /// Returns the concrete non-negative extent of this [`DimensionValue`].
@@ -73,7 +77,7 @@ impl Typed for DimensionValue {
 
     #[inline]
     fn r#type(&self) -> Cow<'_, DimensionType> {
-        Cow::Borrowed(&self.r#type)
+        Cow::Owned(DimensionType::from(Dimension::Static(self.extent)))
     }
 }
 
@@ -89,20 +93,23 @@ impl Value for DimensionValue {
     #[inline]
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+        _renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        Self::new(self.r#type.rename_identities(renaming)?, self.extent).map_err(Into::into)
+        // A static type has no identities to rename.
+        Ok(self.clone())
     }
 
     #[inline]
     fn singleton(r#type: &DimensionType) -> Option<Self> {
         // Bounds are not checked against the backend width when they are constructed, so a singleton interval above
         // `MAX_DIMENSION_EXTENT` admits one extent that no value can represent; it has no singleton value.
-        r#type.extent().and_then(|extent| Self::new(r#type.clone(), extent).ok())
+        r#type.extent().and_then(|extent| Self::constant(extent).ok())
     }
 }
 
 impl LiteralIdentity for DimensionValue {
+    // A static type has no identity, so the extent identifies a dimension literal completely.
+
     #[inline]
     fn literal_eq(&self, other: &Self) -> bool {
         self == other
@@ -126,6 +133,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
+    use crate::arrays::types::dimensions::DimensionBounds;
     use crate::operations::{Add, Assert, Compare, Div, Rem, Sub};
 
     use crate::tests::literal_hash_of;
@@ -136,7 +144,13 @@ mod tests {
     fn test_dimension_value() {
         let batch_type = DimensionType::new("batch", DimensionBounds::new(1, Some(65)).unwrap());
         let batch = DimensionValue::new(batch_type.clone(), 32).unwrap();
-        assert_eq!(batch.r#type().as_ref(), &batch_type);
+
+        // The value's type is the static type of its extent, which has no identity, so every value of that extent has
+        // the same type regardless of the type that it was validated against.
+        assert_eq!(batch.r#type().into_owned(), DimensionType::from(Dimension::Static(32)));
+        assert_eq!(batch.r#type().variable(), None);
+        assert_eq!(batch.r#type().to_string(), "dimension<32>");
+        assert_eq!(batch.r#type(), DimensionValue::constant(32).unwrap().r#type());
         assert_eq!(batch.extent(), 32);
         assert_eq!(batch.to_string(), "32");
         assert_eq!(batch.concretize(), Ok(32));
@@ -171,38 +185,40 @@ mod tests {
         let left = DimensionValue::new(left_type.clone(), 7).unwrap();
         let right = DimensionValue::new(right_type.clone(), 3).unwrap();
         let sum = left.add(&right).unwrap();
-        assert_eq!(sum.r#type().bounds(), DimensionBounds::new(0, Some(19)).unwrap());
+        assert_eq!(sum.r#type().extent(), Some(10));
         assert_eq!(sum.extent(), 10);
 
-        // Concrete backend capability implementations retain input-specific diagnostics for invalid observed extents
-        // admitted by otherwise valid input bounds.
+        // Concrete capability errors report operand roles and actual extents, independently of the static types.
         let error = DimensionValue::new(left_type.clone(), 1).unwrap().sub(&right).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation {
-                message: "left >= right; observed left=1, right=3".to_string(),
+                message: "`dimension_sub` requires left >= right; got left=1, right=3".to_string(),
             }),
         );
         let zero = DimensionValue::new(right_type.clone(), 0).unwrap();
         let error = left.div(&zero).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
+            Some(&DimensionError::RequirementViolation {
+                message: "`dimension_div` requires right > 0; got left=7, right=0".to_string(),
+            }),
         );
         let error = left.rem(&zero).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
+            Some(&DimensionError::RequirementViolation {
+                message: "`dimension_rem` requires right > 0; got left=7, right=0".to_string(),
+            }),
         );
     }
 
     #[test]
     fn test_dimension_value_singleton() {
-        // A singleton interval determines its value, which keeps the type's identity rather than a literal's name.
+        // A singleton interval determines its value, whose type is static like that of every dimension value.
         let singleton_type = DimensionType::new("batch", DimensionBounds::new(4, Some(5)).unwrap());
         let singleton = DimensionValue::singleton(&singleton_type).unwrap();
-        assert_eq!(singleton.r#type().as_ref(), &singleton_type);
-        assert_eq!(singleton.extent(), 4);
+        assert_eq!(singleton, DimensionValue::constant(4).unwrap());
         assert_eq!(DimensionValue::singleton(&DimensionValue::constant(0).unwrap().r#type()).unwrap().extent(), 0);
 
         // Wider bounds admit several extents and so determine no value.
@@ -221,10 +237,11 @@ mod tests {
 
     #[test]
     fn test_literal_identity_dimension_value() {
-        // Dimension literals are identical exactly when their values are, including their dimension identity.
+        // Dimension literals have static types without identities, so they are identical exactly
+        // when their extents are.
         let dimension = DimensionValue::constant(3).unwrap();
-        assert!(dimension.literal_eq(&dimension.clone()));
-        assert_eq!(literal_hash_of(&dimension), literal_hash_of(&dimension.clone()));
-        assert!(!dimension.literal_eq(&DimensionValue::constant(3).unwrap()));
+        assert!(dimension.literal_eq(&DimensionValue::constant(3).unwrap()));
+        assert_eq!(literal_hash_of(&dimension), literal_hash_of(&DimensionValue::constant(3).unwrap()));
+        assert!(!dimension.literal_eq(&DimensionValue::constant(4).unwrap()));
     }
 }

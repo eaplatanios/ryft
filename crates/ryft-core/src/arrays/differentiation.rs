@@ -13,7 +13,7 @@ use crate::differentiation::{
     CotangentBatchingPolicy, DifferentiationDual, DifferentiationError, ResidualZeroProvider,
 };
 use crate::operations::{
-    ConstantOperation, DimensionSizeOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
+    ConstantOperation, DimensionSizeOperation, GuardOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
     ReferenceReadOperation, Zero, ZeroOperation,
 };
 use crate::programs::{
@@ -441,7 +441,14 @@ impl<
     C: Context<
             Type = ArrayIrType,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
+            Operation: OperationProjection<
+                ArrayType,
+                Projected: OperationProvider<
+                    ArrayType,
+                    GuardOperation<ArrayType>,
+                    Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
+                > + From<ReduceOperation>,
+            >,
         >,
 > CotangentBatchingPolicy<C> for ArrayIrBatchingPolicy
 {
@@ -472,11 +479,11 @@ fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
 }
 
 /// Materializes one array input's forward-mode tangent as a concrete projected array value, reading whatever runtime
-/// geometry the tangent type omits from the input's primal. A mixed array rule that has to hand a concrete tangent to
-/// a staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
+/// extents the tangent type omits from the input's primal. A mixed array rule that has to hand a concrete tangent to a
+/// staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
 /// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary
-/// [`ZeroOperation`] is unconstructible for it). The primal names every one of those extents, because the tangent type
-/// derivation preserves geometry exactly and rewrites only element representation, layout, and sharding.
+/// [`ZeroOperation`] is unconstructible for it). The primal names every one of those extents, because the tangent
+/// type derivation preserves shapes exactly and rewrites only element representation, layout, and sharding.
 ///
 /// The zero is therefore staged through the *mixed* parent family's residual protocol rather than the projected array
 /// view, and the result is projected back. That is deliberate: the mixed family owns the dynamic zero constructor that
@@ -489,7 +496,7 @@ fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
 /// # Parameters
 ///
 ///   - `context`: Projected array view of the active mixed [`Context`], whose parent stages the zero.
-///   - `input`: Forward-mode dual whose tangent is materialized and whose primal supplies its runtime geometry.
+///   - `input`: Forward-mode dual whose tangent is materialized and whose primal supplies its runtime extents.
 pub fn materialize_array_tangent<
     C: Context<
             Type = ArrayIrType,

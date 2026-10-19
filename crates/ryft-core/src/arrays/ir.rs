@@ -18,11 +18,12 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
 };
 
+// TODO(eaplatanios): Do we have a problem here with the sizes of the variants?
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
-/// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the concrete array
-/// representation selected by the owning backend. Dimensions use the common [`DimensionValue`] which is a checked
-/// host representation, so that eager dimension arithmetic remains host integer work and does not allocate arrays
-/// or dispatch to device backends.
+/// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the array value representation,
+/// which can be a backend array or a context-carrying value such as a tracer. Dimensions use the common
+/// [`DimensionValue`], a checked host representation, so eager dimension arithmetic remains host integer
+/// work and does not allocate arrays or dispatch to device backends.
 ///
 /// This type lets arrays, checked host-side dimensions, and array references share one storage universe, while
 /// [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume only the member
@@ -120,7 +121,7 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
 
     #[inline]
     fn singleton(r#type: &ArrayIrType) -> Option<Self> {
-        // Only the dimension member has singleton types. Array types describe geometry rather than contents,
+        // Only the dimension member has singleton types. Array types describe shapes rather than contents,
         // and a reference type never determines the allocation that it names.
         match r#type {
             ArrayIrType::Dimension(r#type) => DimensionValue::singleton(r#type).map(Self::Dimension),
