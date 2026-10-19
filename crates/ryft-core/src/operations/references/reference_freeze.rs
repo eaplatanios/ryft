@@ -9,7 +9,7 @@ use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
@@ -201,8 +201,9 @@ impl<
         + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>,
 > TransposableOperation<V, O> for ReferenceFreezeOperation<T, U>
 where
-    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate<<O as ReferenceAccessOperation>::Transform>,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    TracingContext<V, O>: StagingContext<Type = U, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

@@ -480,14 +480,17 @@ where
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
 
-        for output_dimension in output_dimensions {
-            output_dimension.validate_replicated_dimension()?;
-        }
+        // Output dimensions are shared shape metadata (a mapped dimension with a static per-item type enters as that
+        // static dimension).
+        let output_dimension_values = output_dimensions
+            .iter()
+            .map(|output_dimension| output_dimension.replicated_dimension_value(context.parent()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Every batch item of a replicated state computes the same function of the same state, so generating the
         // bits once and replicating both outputs is exact.
         if state.batch_axis().is_replicated() {
-            let inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+            let inputs = std::iter::once(state.value().clone()).chain(output_dimension_values).collect::<Vec<_>>();
             let mut outputs = context.parent().bind(self.clone(), Vec::new(), &inputs)?;
             check_count!("output", outputs, 2, ProgramError);
             let bits = outputs.remove(1);
@@ -520,10 +523,7 @@ where
         let extent_type = context.axis_extent().r#type();
         let length = <&DimensionType>::try_from(extent_type.as_ref())?.simplified_dimension();
         let scan = ScanOperation::<C::Type>::new(output_dimensions.len(), length.clone());
-        let mut scan_inputs = output_dimensions
-            .iter()
-            .map(|output_dimension| output_dimension.value().clone())
-            .collect::<Vec<_>>();
+        let mut scan_inputs = output_dimension_values.into_iter().collect::<Vec<_>>();
         scan_inputs.push(state.into_value());
         if length.variable().is_some() {
             scan_inputs.push(context.axis_extent().clone());
@@ -1246,11 +1246,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, StridedLayout,
+        ArrayIrBoundaryLayout, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, Layout, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, Sharding, StridedLayout,
     };
     use crate::axes::NamedAxis;
-    use crate::batching::{BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy};
+    use crate::batching::{BatchingTracer, BoundaryLayout, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -1914,10 +1914,11 @@ mod tests {
 
         // A mapped state stages one carry-free scan over the per-item states, so the batched program size is
         // independent of the batch size.
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -1948,7 +1949,7 @@ mod tests {
         assert_eq!(outputs[1].elements::<u32>(), Ok(expected_bits));
 
         // A replicated state keeps the unbatched program.
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -1957,6 +1958,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::replicated(), BatchAxis::replicated()]);
         assert_eq!(batched.to_string(), program.to_string());
     }
@@ -2033,11 +2035,14 @@ mod tests {
         let nested = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<Context>>::batch_program(
             &nested_context,
             program.entry_region_ref(),
-            &[BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()],
+            &ArrayIrBoundaryLayout::dense(
+                true,
+                &[BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()],
+            ),
             ProgramBatchingOutputAxesPolicy::Natural,
         )?;
         assert_eq!(nested.output_axes(), &[BatchAxis::new(1), BatchAxis::new(1)]);
-        let (nested, _) = nested.into_parts();
+        let nested = nested.into_program();
         assert_eq!(
             nested
                 .instructions()

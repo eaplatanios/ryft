@@ -129,14 +129,16 @@ pub(crate) mod tests {
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
+    use crate::operations::assertions::GuardOperation;
     use crate::operations::{Add, AddOperation};
     use crate::parameters::Parameter;
     use crate::programs::{
-        Effects, EmptyRegionDriver, NoReferenceTransform, Operation, ProgramError, ReferenceAccumulationPolicy,
-        ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
-        RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
-        ValueDirectDispatch, discharge_reference_free_operation,
+        Effects, EmptyRegionDriver, NoReferenceTransform, Operation, OperationProvider, ProgramError,
+        ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+        ReferenceDischargeReference, ReferenceDischargeValue, ReferenceDischargeableOperation,
+        ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError, TypeIdentity,
+        TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueDirectDispatch,
+        discharge_reference_free_operation,
     };
 
     use super::*;
@@ -633,6 +635,14 @@ pub(crate) mod tests {
                     message: format!("`{}` must be discharged before interpretation", self.name()),
                 }),
             }
+        }
+    }
+
+    impl OperationProvider<TestType, GuardOperation<TestType>> for TestOperation {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<TestType>, _input_types: &[&TestType]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
         }
     }
 

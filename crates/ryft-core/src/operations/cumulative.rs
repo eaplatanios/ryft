@@ -67,7 +67,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
@@ -363,6 +363,11 @@ impl_differentiable_operation! {
             + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
             + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>
             + OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>,
+        TracingContext<C::Constant, C::Operation>: StagingContext<
+            Type = ArrayType,
+            Constant = C::Constant,
+            Operation = C::Operation,
+        >,
     {
         |operation, context, driver, inputs| {
             // A cumulative sum is linear in its input, so its tangent is the same prefix sum of the input tangent.
@@ -739,7 +744,7 @@ impl ArrayType {
     /// same discipline that the ragged batching rule already uses. That extension is deliberately not implemented here
     /// as it would silently change the operation's cost model, and so it belongs to an explicit dynamic-scan surface.
     fn cumulative(&self, axis: usize, kind: CumulativeKind) -> Result<Self, TypeError> {
-        // The element data type is validated before the scan geometry, and the diagnostic names the kind, because the
+        // The element data type is validated before the scanned axis, and the diagnostic names the kind, because the
         // supported data types differ across kinds (e.g., summation accepts the structural zero while extrema do not).
         let data_type = self.data_type();
         let requirement: Option<Cow<'static, str>> = match kind {
@@ -2607,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_cumulative_rejects_invalid_geometry() {
+    fn test_array_type_cumulative_rejects_invalid_shape() {
         let input = ArrayType::new_static(DataType::F64, [2, 3]);
         assert_eq!(
             input.cumulative(2, CumulativeKind::Sum),
@@ -2713,7 +2718,7 @@ mod tests {
             assert_eq!(input.cumulative(1, CumulativeKind::LogSumExp), Ok(input.clone()));
         }
 
-        // The element data type is validated before the scan geometry.
+        // The element data type is validated before the scanned axis.
         assert_eq!(
             ArrayType::new_static(DataType::Boolean, [3]).cumulative(1, CumulativeKind::Sum),
             Err(TypeError::invalid("`cumulative` with kind `sum` requires numeric inputs but got `bool`")),

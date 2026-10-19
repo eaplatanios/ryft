@@ -53,7 +53,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation, batch_projected_operation,
 };
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     DifferentiationPolicy, MemberDifferentiableOperation,
@@ -61,6 +61,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
+
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
@@ -1259,7 +1260,7 @@ impl CustomCallOperation {
     /// Returns the layout required by an aliased input at its unchanged or batch-prefixed logical shape. The declared
     /// output shape may be dynamic in the mixed universe, where trailing extent inputs refine it to the input's shape
     /// (e.g., an `f32[2]` input aliased to a declared `f32[rows]` output), so any shape that refines the declared one
-    /// is laid out. An incompatible shape is left to alias validation, rather than changing geometry to satisfy an
+    /// is laid out. An incompatible shape is left to alias validation, rather than changing the shape to satisfy an
     /// alias.
     fn alias_input_layout(
         &self,
@@ -2321,7 +2322,7 @@ where
             | CustomCallBatching::Vectorized => {
                 self.validate_single_call_ragged_bindings(|index| inputs[index].batch_axis().is_replicated())?;
                 // Mapped axes always move to physical axis 0. Replicated inputs either gain the full mapped extent,
-                // gain a singleton axis for the kernel to broadcast internally, or keep their original geometry.
+                // gain a singleton axis for the kernel to broadcast internally, or keep their original shape.
                 let aligned = inputs
                     .iter()
                     .map(|input| {
@@ -2500,9 +2501,9 @@ where
 // [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
 // batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
 // dimension is itself dynamic.
-impl<C: Context<Type = ArrayIrType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
+    for CustomCallOperation
 where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: PartialEq
         + DimensionSize
         + DynamicBroadcast
@@ -2549,9 +2550,12 @@ where
             )?;
             Vec::new()
         };
-        for extent in extents {
-            extent.validate_replicated_dimension()?;
-        }
+        // Extents are shared shape metadata (a mapped dimension with a static per-item type enters as that static
+        // dimension).
+        let extent_values = extents
+            .iter()
+            .map(|extent| extent.replicated_dimension_value(context.parent()))
+            .collect::<Result<Vec<_>, _>>()?;
         let batch_dimension =
             <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
         if extents.is_empty() && batch_dimension.value().is_some() {
@@ -2560,7 +2564,7 @@ where
 
         let Some((index, mapped)) = arrays.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
         else {
-            let values = inputs.iter().map(ArrayIrBatch::value).cloned().collect::<Vec<_>>();
+            let values = arrays.iter().map(ArrayIrBatch::value).cloned().chain(extent_values).collect::<Vec<_>>();
             let outputs = context.parent().bind(self.clone(), Vec::new(), values.as_slice())?;
             return self.array_ir_outputs::<C>(outputs, BatchAxis::replicated(), inputs, &[]);
         };
@@ -2616,7 +2620,7 @@ where
                         continue;
                     };
                     if input_type.layout() != Some(&layout) {
-                        // Resolve dimensions from the slice itself so a relayout preserves dynamic geometry exactly.
+                        // Resolve dimensions from the slice itself so a relayout preserves dynamic extents exactly.
                         let mut broadcast_inputs = vec![input];
                         for axis in 0..input_type.rank() {
                             let dimension = DimensionSizeOperation::new(&input_type, axis)?;
@@ -2645,7 +2649,7 @@ where
                 if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
                     scan = scan.with_unroll(unroll)?;
                 }
-                let mut packed = extents.iter().map(|extent| extent.value().clone()).collect::<Vec<_>>();
+                let mut packed = extent_values;
                 packed.extend(
                     carry_indices.iter().chain(stacked_indices.iter()).map(|&index| aligned[index].value().clone()),
                 );
@@ -2714,14 +2718,14 @@ where
                 // Regroup the trailing extents: each output's inserted batch axis is its new leading dynamic axis,
                 // followed by that output's originally declared extents in axis order.
                 let mut values = aligned.iter().map(|batch| batch.value().clone()).collect::<Vec<_>>();
-                let mut declared_extents = extents.iter();
+                let mut declared_extents = extent_values.into_iter();
                 for output_type in &self.output_types {
                     if batch_dimension.variable().is_some() {
                         values.push(context.axis_extent().clone());
                     }
                     for dimension in output_type.shape().dimensions() {
                         if matches!(dimension, Dimension::Dynamic(_)) {
-                            values.push(declared_extents.next().unwrap().value().clone());
+                            values.push(declared_extents.next().unwrap());
                         }
                     }
                 }
@@ -2838,6 +2842,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue,
         ArrayOperation, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
@@ -2845,7 +2850,7 @@ mod tests {
         Tile, TileDimension,
     };
     use crate::batching::{
-        BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingError, BatchingTracer,
+        BatchAxis, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, BoundaryLayout,
         ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::StagingContext;
@@ -4627,7 +4632,7 @@ mod tests {
 
         // A call whose inputs are all replicated is bound unchanged and reports replicated outputs, because the
         // region-free foreign kernel cannot observe the transform's axis.
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(
                 2,
                 ShardingDimension::Replicated,
@@ -4636,6 +4641,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::replicated()]);
         assert_eq!(
             batched.to_string(),
@@ -4818,10 +4824,13 @@ mod tests {
     fn test_custom_call_batching_undeclared_ragged_inputs() {
         // Calls without a ragged contract reject ragged inputs before binding anything, whatever their behavior.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), length, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
         let operation =
             CustomCallOperation::new("ryft.test.side_effect", vec![ArrayType::new_static(DataType::F32, [2])])
                 .with_batching(CustomCallBatching::BroadcastAll)
@@ -4877,7 +4886,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -4886,6 +4895,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(
@@ -4968,11 +4978,12 @@ mod tests {
             ArrayType::new_static(DataType::F32, [2]),
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .to_flat_program()
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
         assert_eq!(
@@ -5011,10 +5022,10 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(4, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5030,10 +5041,10 @@ mod tests {
             "}
             .trim_end(),
         );
-        let (batched, _) = program
+        let batched = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5086,10 +5097,10 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(4, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5179,10 +5190,11 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -5246,7 +5258,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_array_ir_sequential_aliased_layouts() -> Result<(), ProgramError> {
-        // The mixed body resolves the slice's dimensions so that the relayout preserves dynamic geometry exactly.
+        // The mixed body resolves the slice's dimensions so that the relayout preserves dynamic extents exactly.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = trace.input(DimensionType::from(batch.clone()).into());
@@ -5357,7 +5369,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [2, 3])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -5365,7 +5377,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5433,7 +5445,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -5442,6 +5454,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -5511,10 +5524,10 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(
             batched.to_string(),
@@ -5542,10 +5555,11 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -5665,7 +5679,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [2, 3])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -5673,7 +5687,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -5799,14 +5813,15 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (inner, _) = program
+        let inner = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
-        let (outer, output_axes) = inner
+            .into_program();
+        let (outer, _, output_layout, _) = inner
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             outer.to_string(),
@@ -5833,7 +5848,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -5842,6 +5857,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -5917,7 +5933,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [2, 3])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -5925,7 +5941,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -6007,14 +6023,15 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (inner, _) = program
+        let inner = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
-        let (outer, output_axes) = inner
+            .into_program();
+        let (outer, _, output_layout, _) = inner
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             outer.to_string(),
@@ -6029,7 +6046,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_vectorized() {
-        // Mapped inputs move to batch axis 0 and replicated inputs keep their original geometry.
+        // Mapped inputs move to batch axis 0 and replicated inputs keep their original shape.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation =
@@ -6041,7 +6058,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -6050,6 +6067,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -6106,7 +6124,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_vectorized_input_layouts() {
-        // Replicated inputs keep their geometry, so only the declared layouts of mapped inputs shift.
+        // Replicated inputs keep their shape, so only the declared layouts of mapped inputs shift.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
@@ -6120,7 +6138,7 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [2, 3])],
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -6128,7 +6146,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -6199,14 +6217,15 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2])],
         )
         .unwrap();
-        let (inner, _) = program
+        let inner = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
-        let (outer, output_axes) = inner
+            .into_program();
+        let (outer, _, output_layout, _) = inner
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             outer.to_string(),
@@ -6227,12 +6246,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
-        let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            length.clone(),
-            vec![0],
-        )])?;
+        let data = ragged_array_batch(packed, extents.clone(), &length, 1)?;
         let extent_input = ArrayBatch::new(extents.clone(), BatchAxis::new(0))?;
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::Sequential { unroll: None })
@@ -6286,12 +6300,7 @@ mod tests {
         let extents =
             trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch_size)])).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
-        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            length.clone(),
-            vec![0],
-        )])?;
+        let data = ragged_batch(packed, extents.clone(), &length, 1)?;
         let extent_input = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::Sequential { unroll: None })
@@ -6335,12 +6344,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
-        let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            length.clone(),
-            vec![0],
-        )])?;
+        let data = ragged_array_batch(packed, extents.clone(), &length, 1)?;
         let extent_input = ArrayBatch::new(extents.clone(), BatchAxis::new(0))?;
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::BroadcastAll)
@@ -6381,12 +6385,7 @@ mod tests {
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
         let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
-        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            length.clone(),
-            vec![0],
-        )])?;
+        let data = ragged_batch(packed, extents.clone(), &length, 1)?;
         let extent_input = ArrayIrBatch::new(extents.clone(), BatchAxis::new(0))?;
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::BroadcastAll)
@@ -6542,7 +6541,7 @@ mod tests {
             vec![packed_type.clone(), ArrayType::scalar(DataType::I32)],
         )
         .unwrap();
-        let (inner, _) = program
+        let inner = program
             .batched(
                 3,
                 ShardingDimension::Replicated,
@@ -6550,8 +6549,8 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
-        let (outer, output_axes) = inner
+            .into_program();
+        let (outer, _, output_layout, _) = inner
             .batched(
                 2,
                 ShardingDimension::Replicated,
@@ -6560,6 +6559,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             outer.to_string(),
@@ -6587,12 +6587,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
-        let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            input_length.clone(),
-            vec![0],
-        )])?;
+        let data = ragged_array_batch(packed, extents.clone(), &input_length, 1)?;
         let extent_input = ArrayBatch::new(extents, BatchAxis::new(0))?;
         let operation = CustomCallOperation::new(
             "ryft.test.fresh_ragged",
@@ -6870,10 +6865,7 @@ mod tests {
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let other_extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
-        let data = ArrayBatch::new(packed, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])
-            .unwrap();
+        let data = ragged_array_batch(packed, extents, &length, 1).unwrap();
         let extent_input = ArrayBatch::new(other_extents, BatchAxis::new(0)).unwrap();
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::BroadcastAll)
@@ -6894,10 +6886,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
-        let data = ArrayBatch::new(packed, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), length.clone(), vec![0])])
-            .unwrap();
+        let data = ragged_array_batch(packed, extents.clone(), &length, 1).unwrap();
         let extent_input = ArrayBatch::new(extents, BatchAxis::new(0)).unwrap();
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::BroadcastAll)

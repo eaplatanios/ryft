@@ -1388,7 +1388,7 @@ mod tests {
             type Type = ArrayType;
             type Value = DispatchArray;
             type Constant = Array;
-            type Operation = TransposeOperation;
+            type Operation = ArrayOperation<Array>;
         }
 
         impl Context for InvalidOutputContext {

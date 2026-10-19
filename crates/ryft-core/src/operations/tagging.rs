@@ -244,7 +244,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, ShardingDimension,
     };
-    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy};
+    use crate::batching::{BatchAxis, BoundaryLayout, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -346,10 +346,11 @@ mod tests {
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),

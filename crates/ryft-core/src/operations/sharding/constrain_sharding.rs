@@ -426,10 +426,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        RaggedAxis, Shape,
+        Shape,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -732,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_constrain_sharding_batching_ragged() {
-        // The constraint preserves the packed geometry, so a bounded ragged axis on the input carries
+        // The constraint preserves the packed shape, so a bounded ragged axis on the input carries
         // over to the output.
         let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
@@ -740,10 +741,7 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
-        let input = ArrayBatch::new(array.clone(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(array.clone(), extents, &variable, 1).unwrap();
         let ragged_axes = input.ragged_axes().to_vec();
         let (outputs, _) = ConstrainShardingOperation::new(constraint.clone())
             .batch(&context, &EmptyRegionDriver, &[input])

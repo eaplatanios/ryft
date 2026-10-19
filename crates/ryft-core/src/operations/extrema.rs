@@ -481,7 +481,7 @@ impl_differentiable_operation! {
             }
 
             // Compare the primals in the differential representation of the output, like every other elementwise
-            // derivative, so that the selection masks and the tangents share one aligned geometry.
+            // derivative, so that the selection masks and the tangents share one aligned shape.
             let primal = context.primal_to_tangent(output_primal.clone())?;
             let lower_primal = context.primal_to_tangent(lower.primal().clone())?.align_tangent(&target, &primal)?;
             let input_primal = context.primal_to_tangent(input.primal().clone())?.align_tangent(&target, &primal)?;

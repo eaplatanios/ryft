@@ -941,9 +941,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Sharding, StridedLayout, i4,
+        LogicalMesh, MeshAxis, MeshAxisType, Sharding, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::contexts::EagerContext;
@@ -1446,11 +1447,13 @@ mod tests {
     fn test_sort_batching_ragged() {
         // Sorting would move padding into valid data, so bounded ragged batches are rejected.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input =
-            ArrayBatch::new(Array::matrix(2, 3, vec![2.0, 1.0, 0.0, 3.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![2i32, 1]).unwrap(), length, vec![0])])
-                .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![2.0, 1.0, 0.0, 3.0, 0.0, 0.0]).unwrap(),
+            Array::vector(vec![2i32, 1]).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         assert!(matches!(
             SortOperation::new(0, SortDirection::Ascending).batch(&context, &EmptyRegionDriver, &[input]),

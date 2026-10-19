@@ -52,6 +52,7 @@ use crate::macros::{
     impl_non_transposable_operation, impl_reference_dischargeable_operation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::manipulation::conversions::ElementType;
 use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::{
@@ -300,8 +301,9 @@ impl<
     }
 }
 
-impl<C: Context<Type = ArrayIrType, Operation: From<CompareOperation<ArrayIrType>>>>
-    BatchableOperation<C, ArrayIrBatchingPolicy> for CompareOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for CompareOperation<ArrayIrType>
+where
+    C::Operation: From<CompareOperation<ArrayIrType>> + From<ConstantOperation<DimensionValue>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -309,16 +311,15 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CompareOperation<ArrayIrType
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        // Dimension inputs describe one shared array shape and must therefore remain replicated;
-        // their Boolean array output is replicated ordinary data.
+        // Dimension inputs describe one shared array shape and must therefore remain replicated (a mapped dimension
+        // with a static per-item type enters as that static dimension); their Boolean array output is replicated
+        // ordinary data.
         check_count!("input", inputs, 2, ProgramError);
-        let left = &inputs[0];
-        let right = &inputs[1];
-        left.validate_replicated_dimension()?;
-        right.validate_replicated_dimension()?;
+        let left = inputs[0].replicated_dimension_value(context.parent())?;
+        let right = inputs[1].replicated_dimension_value(context.parent())?;
         Ok(context
             .parent()
-            .bind(*self, Vec::new(), &[left.value().clone(), right.value().clone()])?
+            .bind(*self, Vec::new(), &[left, right])?
             .into_iter()
             .map(ArrayIrBatch::replicated)
             .collect::<Vec<_>>()

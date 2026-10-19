@@ -316,17 +316,18 @@ mod tests {
         Array, ArrayOperation, DataType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension,
     };
-    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::batching::{BatchAxis, BoundaryLayout, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
     };
+    use crate::operations::assertions::GuardOperation;
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, Typed};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, OperationProvider, ProgramBuilder, Typed};
     use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -446,10 +447,11 @@ mod tests {
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let (batched, output_axes) = program
+        let (batched, _, output_layout, _) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
+        let output_axes = output_layout.batch_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -471,10 +473,10 @@ mod tests {
             .unwrap();
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let (batched, _) = program
+        let batched = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
+            .into_program();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -558,7 +560,7 @@ mod tests {
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
         )
         .unwrap();
-        let (batched, _) = program
+        let batched = program
             .to_flat_program()
             .batched_with_threaded_extent(
                 DimensionValue::constant(3).unwrap().r#type().into_owned(),
@@ -567,7 +569,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
+            .into_program();
         let global_sharding = "{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}";
         let global_type = format!("f32[3, 4][sharding={global_sharding}]");
         let local_type =
@@ -784,10 +786,25 @@ mod tests {
 
         impl Value for EagerDomainValue {
             type Dispatch = ValueDomainDispatch;
-            type Domain = EagerContext<Self, PrintOperation<ArrayType>>;
+            type Domain = EagerContext<Self, EagerDomainOperation>;
 
             fn domain(&self) -> Self::Domain {
                 EagerContext::new()
+            }
+        }
+
+        /// Print-only operation family of that eager domain. It rejects guards, which eager replay never requests.
+        #[derive(Clone, Debug, ryft_macros::Operation)]
+        #[ryft(type(ArrayType), constant(EagerDomainValue))]
+        enum EagerDomainOperation {
+            Print(PrintOperation<ArrayType>),
+        }
+
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for EagerDomainOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 

@@ -7,6 +7,8 @@ use crate::programs::ValueDomainDispatch;
 
 use super::*;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`ScaledDotOperation`].
 pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 
@@ -23,7 +25,8 @@ pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 /// [`Self::preferred_element_type`]. That definition is implemented once by [`scaled_dot_composition`] and is also the
 /// decomposition of the XLA `xla.scaled_dot` composite. Like the corresponding JAX primitive, scaled dot is not
 /// differentiable. Batching inserts one leading batch pair and shifts the existing dimension numbers, without a rank
-/// ceiling.
+/// ceiling. Bounded ragged carriers are unsupported because the batching rule neither masks contracting padding nor
+/// preserves free-axis extent metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScaledDotOperation {
     /// Contracting and batching dimension specification.
@@ -241,7 +244,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScaledDo
 
 // Batching rule for [`ScaledDotOperation`]. Every input is aligned to one leading mapped axis. The rule then shifts
 // every existing dimension number past that new axis and records axis zero as an additional batching dimension on both
-// element inputs. Repeating the transform applies the same lift again, so batching has no rank ceiling.
+// element inputs. Repeating the transform applies the same lift again, so batching has no rank ceiling. Bounded
+// ragged inputs are rejected because this rule neither masks contracting padding nor preserves free-axis extents.
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ScaledDotOperation
 where
@@ -256,6 +260,7 @@ where
         if inputs.len() != self.input_count() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_count(), actual: inputs.len() }.into());
         }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         }
@@ -447,7 +452,8 @@ where
         + Dot
         + Mul
         + Reshape,
-    <ArrayIrValue<V> as Value>::Domain: Context<Type = ArrayIrType> + DimensionConstant,
+    <ArrayIrValue<V> as Value>::Domain:
+        Context<Type = ArrayIrType, Operation = crate::arrays::ArrayIrOperation<V>> + DimensionConstant,
 {
     let lhs = ArrayIrValue::from(lhs.clone());
     let rhs = ArrayIrValue::from(rhs.clone());
@@ -581,11 +587,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
-        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
-    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
+    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::assertions::AssertionError;
     use crate::operations::dot::DotDimensionNumbers;
@@ -913,5 +920,55 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![4.0, 4.0]);
+    }
+
+    #[test]
+    fn test_scaled_dot_batching_rejects_ragged_inputs() {
+        // Contraction must not include the nonzero padding after each example's logical length.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let left = ragged_array_batch(
+            Array::from_elements(
+                ArrayType::new_static(DataType::F32, [2, 1, 3]),
+                &[1f32, 100.0, 100.0, 1.0, 1.0, 100.0],
+            )
+            .unwrap(),
+            Array::vector(vec![1i64, 2]).unwrap(),
+            &length,
+            2,
+        )
+        .unwrap();
+        let right = ragged_array_batch(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3, 1]), &[1f32; 6]).unwrap(),
+            Array::vector(vec![1i64, 2]).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
+        let operation = ScaledDotOperation::new(DotDimensionNumbers::matmul(), DataType::F32, false, false);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let inputs =
+            [BatchingTracer::new(context.clone(), left.clone()), BatchingTracer::new(context.clone(), right.clone())];
+        assert!(matches!(
+            context.bind(operation, Vec::new(), &inputs).map_err(BatchingError::from),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`scaled_dot` does not support bounded ragged dimension `length` on input 0",
+        ));
+
+        // An outer coordinate remains meaningful even when the current mapped level is replicated.
+        let left = ArrayBatch::replicated(left.value().clone()).with_ragged_axes(left.ragged_axes().to_vec()).unwrap();
+        let right = ArrayBatch::replicated(right.value().clone())
+            .with_ragged_axes(right.ragged_axes().to_vec())
+            .unwrap();
+        let operation = ScaledDotOperation::new(
+            DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]),
+            DataType::F32,
+            false,
+            false,
+        );
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &[left, right]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`scaled_dot` does not support bounded ragged dimension `length` on input 0",
+        ));
     }
 }

@@ -10,7 +10,7 @@ use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayTyp
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
@@ -323,8 +323,9 @@ impl<
         + ReferenceReadTransposition<U>,
 > TransposableOperation<V, O> for ReferenceReadOperation<T, U, Transform>
 where
-    ReferenceReadOperation<T, U, Transform>: Operation<Type = U>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate<Transform>,
+    ReferenceReadOperation<T, U, Transform>: Operation<Type = U>,
+    TracingContext<V, O>: StagingContext<Type = U, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -409,6 +410,7 @@ pub trait ReferenceReadTransposition<T: Type>: Operation<Type = T> + Sized {
     ) -> Result<(), ProgramError>
     where
         Tracer<TracingContext<V, Self>>: ReferenceAddUpdate<Transform>,
+        TracingContext<V, Self>: StagingContext<Type = T, Constant = V, Operation = Self>,
     {
         reference.add_update_through(cotangent, transforms, bindings)
     }
@@ -431,6 +433,7 @@ impl<
     ) -> Result<(), ProgramError>
     where
         Tracer<TracingContext<V, Self>>: ReferenceAddUpdate<Transform>,
+        TracingContext<V, Self>: StagingContext<Type = ArrayIrType, Constant = V, Operation = Self>,
     {
         // Composite array IR families sum the cotangent of a read whose view varies over manual axes beyond its root
         // over those axes before accumulating it (refer to the documentation of `ReferenceReadTransposition`).

@@ -47,7 +47,8 @@ pub use arithmetic::{
     SqrtOperation, Sub, SubOperation,
 };
 pub use assertions::{
-    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
+    ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
+    AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveMode, CollectiveOperations, CollectiveOptions,
@@ -126,20 +127,21 @@ pub use logical::{
     Or, OrOperation, XOR_OPERATION_NAME, Xor, XorOperation,
 };
 pub use manipulation::{
-    BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME,
-    CONVERT_ELEMENT_TYPE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType,
-    ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicManipulationOperations, DynamicPad,
-    DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,
-    DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME,
-    Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
-    IndexSlice, Indexed, Indexing, ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation,
-    REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision,
-    ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME,
-    SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-    ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME,
-    TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
-    UpdateSlice, UpdateSliceOperation,
+    BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CAST_OPERATION_NAME,
+    CONCATENATE_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate,
+    ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME,
+    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate,
+    DynamicGather, DynamicManipulationOperations, DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
+    DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode,
+    GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing,
+    ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
+    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
+    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
+    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
+    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
+    UpdateSliceOperation,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use random::{
@@ -334,7 +336,7 @@ pub trait ElementwiseOperation: Operation<Type = ArrayType> {
         Ok(vec![self.infer_elementwise_broadcast_type(input_types)?])
     }
 
-    /// Broadcasts input geometry and placement after validating matching manual variation. Operations with specialized
+    /// Broadcasts input shapes and placement after validating matching manual variation. Operations with specialized
     /// reduction-state rules may normalize those states before calling this function and restore their output state.
     fn infer_elementwise_broadcast_type(&self, input_types: &[ArrayType]) -> Result<ArrayType, TypeError> {
         ArrayType::check_matching_manual_variation(self.name(), &input_types.iter().collect::<Vec<_>>())?;
