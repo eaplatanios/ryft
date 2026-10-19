@@ -159,19 +159,130 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, DimensionBounds, DimensionType, ParallelAllToAllOperation, ParallelPermuteOperation,
-        Shape, ShardMap, Sharding,
+        Array, ArrayIrBatch, ArrayOperation, BatchAxis, BatchingContext, BatchingTracer, DimensionBounds,
+        DimensionConstant, DimensionType, DimensionVariable, OneLike, ParallelAllToAllOperation,
+        ParallelPermuteOperation, ParallelReduce, Placeholder, RaggedAxis, Reduce, ReductionKind, Shape, ShardMap,
+        Sharding, StagingContext, TracingContext,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
-    use crate::experimental::lowering::tests::{test_manual_mesh, test_vector_type};
+    use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program, test_manual_mesh, test_vector_type};
     use crate::experimental::lowering::types::lower_array_ir_type;
-    use crate::experimental::ops::XlaOperation;
+    use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
+    use crate::tests::execution_client;
     use crate::{LowerableOperation, MemberLowerableOperation, XlaLowerer};
 
     use super::*;
+
+    #[test]
+    fn test_execute_parallel_reduce_ragged_coordinate_padding() {
+        let row = DimensionVariable::new("row", DimensionBounds::new(0, Some(3)).unwrap());
+        let column = DimensionVariable::new("column", DimensionBounds::new(0, Some(4)).unwrap());
+        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
+        let value = trace.input(ArrayType::new_static(DataType::F64, [2, 2, 3]).into());
+        let rows = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
+        let columns = trace.input(ArrayType::new_static(DataType::I32, [2, 2]).into());
+        let context = BatchingContext::new(trace.clone(), trace.dimension_constant(2).unwrap())
+            .with_axis_name("items".to_string());
+        let input = BatchingTracer::new(
+            context,
+            ArrayIrBatch::new(value, BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![
+                    RaggedAxis::new(1, rows, row, vec![0]),
+                    RaggedAxis::new(2, columns, column, vec![0, 1]),
+                ])
+                .unwrap(),
+        );
+        let output = input
+            .parallel_reduce(ReductionKind::Sum, "items")
+            .unwrap()
+            .one_like()
+            .unwrap()
+            .reduce(&[0, 1], ReductionKind::Sum)
+            .unwrap();
+        let program: FlatXlaProgram = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build(vec![output.into_batch().into_value().atom_id().unwrap()], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 2, 3], %1:i32[2], %2:i32[2, 2] .
+                let %3:dimension<2> = constant [value=2]
+                    %4:dimension<2> = constant [value=2]
+                    %5:dimension<2> = constant [value=2]
+                    %6:dimension<3> = constant [value=3]
+                    %7:i32[2] = iota [type=i32[2], dimension=0]
+                    %8:i32[2, 2, 3] = broadcast [output_axes=[1]] %7 %4 %5 %6
+                    %9:i32[2, 2, 3] = broadcast [output_axes=[0]] %1 %4 %5 %6
+                    %10:bool[2, 2, 3] = compare [direction=LessThan] %8 %9
+                    %11:i32[3] = iota [type=i32[3], dimension=0]
+                    %12:i32[2, 2, 3] = broadcast [output_axes=[2]] %11 %4 %5 %6
+                    %13:i32[2, 2, 3] = broadcast [output_axes=[0, 1]] %2 %4 %5 %6
+                    %14:bool[2, 2, 3] = compare [direction=LessThan] %12 %13
+                    %15:bool[2, 2, 3] = and %10 %14
+                    %16:f64[2, 2, 3] = zero_like %0
+                    %17:f64[2, 2, 3] = select %15 %0 %16
+                    %18:f64[2, 3] = reduce [kind=sum, axes=[0]] %17
+                    %19:i32[] = reduce [kind=max, axes=[0]] %1
+                    %20:dimension<2> = constant [value=2]
+                    %21:dimension<2> = constant [value=2]
+                    %22:i32[2] = iota [type=i32[2], dimension=0]
+                    %23:i32[2, 2] = broadcast [output_axes=[1]] %22 %20 %21
+                    %24:i32[2, 2] = broadcast [output_axes=[0]] %1 %20 %21
+                    %25:bool[2, 2] = compare [direction=LessThan] %23 %24
+                    %26:i32[2, 2] = zero_like %2
+                    %27:i32[2, 2] = select %25 %2 %26
+                    %28:i32[2] = reduce [kind=max, axes=[0]] %27
+                    %29:i32[] = constant [value=0]
+                    %30:i32[2] = max %28 %29
+                    %31:f64[2, 3] = one_like %18
+                    %32:dimension<2> = constant [value=2]
+                    %33:dimension<3> = constant [value=3]
+                    %34:i32[2] = iota [type=i32[2], dimension=0]
+                    %35:i32[2, 3] = broadcast [output_axes=[0]] %34 %32 %33
+                    %36:i32[2, 3] = broadcast [output_axes=[]] %19 %32 %33
+                    %37:bool[2, 3] = compare [direction=LessThan] %35 %36
+                    %38:i32[3] = iota [type=i32[3], dimension=0]
+                    %39:i32[2, 3] = broadcast [output_axes=[1]] %38 %32 %33
+                    %40:i32[2, 3] = broadcast [output_axes=[0]] %30 %32 %33
+                    %41:bool[2, 3] = compare [direction=LessThan] %39 %40
+                    %42:bool[2, 3] = and %37 %41
+                    %43:f64[2, 3] = zero_like %31
+                    %44:f64[2, 3] = select %42 %31 %43
+                    %45:f64[] = reduce [kind=sum, axes=[0, 1]] %44
+                in (%45)"},
+        );
+
+        // Only live coordinate entries can define the result's extents. Count its live elements after replacing
+        // its data with ones, so a zero-valued padded result cannot hide an incorrectly enlarged extent.
+        let client = execution_client();
+        let mut inputs = [
+            MixedValue::Array(vec![1.0; 12], vec![2, 2, 3]),
+            MixedValue::Integers(vec![1, 2], vec![2]),
+            MixedValue::Integers(vec![1, 0, 1, 1], vec![2, 2]),
+        ];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[]),
+            Ok(vec![MixedValue::Array(vec![2.0], vec![])]),
+        );
+        inputs[2] = MixedValue::Integers(vec![1, 3, 1, 1], vec![2, 2]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[]),
+            Ok(vec![MixedValue::Array(vec![2.0], vec![])]),
+        );
+        inputs[1] = MixedValue::Integers(vec![0, 0], vec![2]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[]),
+            Ok(vec![MixedValue::Array(vec![0.0], vec![])]),
+        );
+    }
 
     #[test]
     fn test_manual_collective_lowering_revalidates_raw_bindings() {

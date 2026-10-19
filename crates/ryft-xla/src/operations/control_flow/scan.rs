@@ -2286,4 +2286,97 @@ mod tests {
             "},
         );
     }
+
+    #[test]
+    fn test_batched_ragged_scan_executes_with_sliced_and_stacked_extents_on_cpu() {
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer, Context, RaggedAxis,
+            ReduceOperation, ReductionKind, TracingContext, Value,
+        };
+
+        // The ragged carry crosses every iteration with its per-item extents. The per-item extents of the stacked `z`
+        // vary along the scan axis (with the batch coordinate first), so the batched scan slices them together with
+        // `z` and stacks them together with `z + z`. The carry accumulates the sums of the slices over each item's own
+        // lengths, ignoring the padding.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let total = builder.add_input(ArrayType::scalar(DataType::F64).into());
+            let z = builder.add_input(ragged_type.into());
+            let sum = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                    Vec::new(),
+                    vec![z],
+                    None,
+                )
+                .unwrap()[0];
+            let next_total =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![total, sum], None).unwrap()[0];
+            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![z, z], None).unwrap()[0];
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![next_total, doubled],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+        }
+        .unwrap();
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |(extent, total, z, extents)| {
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(extent.domain(), extent);
+                let inputs = [
+                    ArrayIrBatch::replicated(total),
+                    ArrayIrBatch::new(z, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
+                        2,
+                        extents,
+                        length.clone(),
+                        vec![0, 1],
+                    )])?,
+                ]
+                .map(|input| BatchingTracer::new(context.clone(), input));
+                let mut outputs = context
+                    .bind(XlaOperation::Scan(ScanOperation::new(1, 3)), vec![body], &inputs)?
+                    .into_iter()
+                    .map(BatchingTracer::into_batch)
+                    .collect::<Vec<_>>();
+                let doubled = outputs.pop().unwrap();
+                let extents = doubled.ragged_axes()[0].extents().clone();
+                Ok((outputs.pop().unwrap().into_value(), extents, doubled.into_value()))
+            },
+            (
+                ArrayIrType::from(DimensionType::from(Dimension::Static(2))),
+                ArrayIrType::from(ArrayType::scalar(DataType::F64)),
+                ArrayIrType::from(ArrayType::new_static(DataType::F64, [2, 3, 3])),
+                ArrayIrType::from(ArrayType::new_static(DataType::I32, [2, 3])),
+            ),
+        )
+        .unwrap();
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program.into_flat_program(),
+                &[
+                    MixedValue::Dimension(2),
+                    MixedValue::Array(vec![0.0], vec![]),
+                    MixedValue::Array((1..=18).map(f64::from).collect(), vec![2, 3, 3]),
+                    MixedValue::Integers(vec![2, 3, 0, 1, 0, 3], vec![2, 3]),
+                ],
+                &[],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![18.0, 61.0], vec![2]),
+                MixedValue::Integers(vec![2, 1, 3, 0, 0, 3], vec![3, 2]),
+                MixedValue::Array(
+                    vec![
+                        2.0, 4.0, 6.0, 20.0, 22.0, 24.0, 8.0, 10.0, 12.0, 26.0, 28.0, 30.0, 14.0, 16.0, 18.0, 32.0,
+                        34.0, 36.0,
+                    ],
+                    vec![3, 2, 3],
+                ),
+            ]),
+        );
+    }
 }

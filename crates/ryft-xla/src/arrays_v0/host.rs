@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use ryft_core::{ArrayType, Typed};
-use ryft_pjrt::Event;
+use ryft_pjrt::{Event, ExecutionFence};
 
 use crate::arrays::ArrayTypeExtension;
 use crate::{Error as XlaError, ToPjrt, XlaArray};
@@ -61,6 +61,9 @@ pub(crate) struct DenseArrayHostCopy {
 
     /// In-flight copies, one per global shard.
     shards: Vec<PendingDenseShardHostCopy>,
+
+    /// Producer completion, including when no payload copy is needed to observe an execution error.
+    completion: Option<ExecutionFence>,
 }
 
 impl DenseArrayHostCopy {
@@ -71,6 +74,9 @@ impl DenseArrayHostCopy {
 
     /// Finishes this copy and reports whether a global merge buffer was allocated.
     pub(crate) fn finish_with_measurements(self) -> Result<(Vec<u8>, bool), ArrayError> {
+        if let Some(completion) = &self.completion {
+            completion.block_until_ready()?;
+        }
         if self.shards.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -133,12 +139,25 @@ impl DenseArrayHostCopy {
 /// Starts copies for every addressable shard of `array` without awaiting them. Errors when any global shard is not
 /// addressable from the current process.
 pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<DenseArrayHostCopy, ArrayError> {
-    if array.data_type().is_zero() {
+    let completion = array.execution_fence().cloned();
+    // Empty arrays have no payload either. Avoid asking PJRT for a zero-byte dynamic copy, whose size-query
+    // fallback can expose the bound allocation and its trailer instead of the empty logical value.
+    if array.data_type().is_zero() || array.shape().as_slice().contains(&0) {
         return Ok(DenseArrayHostCopy {
             global_shape: array.shape(),
             element_type: array.data_type(),
             total_byte_count: 0,
             shards: Vec::new(),
+            completion: Some(match completion {
+                Some(completion) => completion,
+                None => ExecutionFence::new(
+                    array
+                        .addressable_shards()
+                        .filter_map(|shard| shard.buffer())
+                        .map(|buffer| buffer.ready())
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            }),
         });
     }
 
@@ -157,7 +176,8 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
                 .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
             let shard_shape = shard.shape();
             Ok(PendingDenseShardHostCopy {
-                event: buffer.copy_to_host(None)?,
+                // The merge consumes row-major bytes even when the device buffer has another physical layout.
+                event: buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?,
                 shard_index,
                 device_id: device.id(),
                 expected_byte_count: ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?,
@@ -165,7 +185,7 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Resul
             })
         })
         .collect::<Result<Vec<_>, ArrayError>>()?;
-    Ok(DenseArrayHostCopy { global_shape, element_type, total_byte_count, shards })
+    Ok(DenseArrayHostCopy { global_shape, element_type, total_byte_count, shards, completion })
 }
 
 /// Copies every addressable shard of `array` to host and merges them into one dense row-major byte buffer. Errors when

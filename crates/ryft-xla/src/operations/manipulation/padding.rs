@@ -231,7 +231,7 @@ pub(crate) fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c
     Ok(vec![result])
 }
 
-/// Checks padding geometry using actual extents and wide host arithmetic before native dimension narrowing.
+/// Checks padding against actual extents using wide host arithmetic before native dimension narrowing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
     operation: &PadOperation<ArrayIrType>,

@@ -1789,8 +1789,8 @@ impl OperationEnum {
                             },
                         },
                         // A structural mixed payload is constant with respect to its parent-universe inputs, but its
-                        // zero tangent still needs the runtime geometry those inputs carry. Stage the primal and the
-                        // member zero over the same inputs so the geometry stays available to both. Each output's zero
+                        // zero tangent still needs the runtime extents those inputs carry. Stage the primal and the
+                        // member zero over the same inputs so the extents stay available to both. Each output's zero
                         // tangent is staged in the computational member universe that output belongs to, and an output
                         // outside every such universe (e.g., a structural member output) has a zero differential space
                         // and needs no instruction.
@@ -1908,7 +1908,7 @@ impl OperationEnum {
     /// driver, whose concrete implementation establishes the corresponding `Program::transpose_with_respect_to`
     /// bounds. Computational projected members use `MemberTransposableOperation::transpose_in_parent`, preserving
     /// access to accumulator buffers that the member's own value family may not represent. Mixed members keep their
-    /// geometry-aware projection adapter, and structural projected members contribute no cotangents.
+    /// shape-aware projection adapter, and structural projected members contribute no cotangents.
     fn generate_transposable_operation(&self) -> TokenStream {
         let variants = &self.variants;
         let ryft = &self.ryft_crate;
@@ -1964,6 +1964,14 @@ impl OperationEnum {
                     });
                     where_clause.predicates.push(syn::parse_quote! {
                         #operation_self_type: #ryft::OperationProjection<#member_type>
+                    });
+                    where_clause.predicates.push(syn::parse_quote! {
+                        <#operation_self_type as #ryft::OperationProjection<#member_type>>::Projected:
+                            #ryft::OperationProvider<
+                                #member_type,
+                                #ryft::GuardOperation<#member_type>,
+                                Operation = <#operation_self_type as #ryft::OperationProjection<#member_type>>::Projected,
+                            >
                     });
                     where_clause.predicates.push(syn::parse_quote! {
                         <#operation_self_type as #ryft::OperationProjection<#member_type>>::Projected:

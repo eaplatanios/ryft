@@ -455,6 +455,9 @@ impl ErasedOperation {
     }
 }
 
+/// Stand-in for the typed guard request used by partial-evaluation dispatch.
+struct GuardOperation<T: Type>(PhantomData<T>);
+
 /// Stand-in for the associated operation contract emitted by the derive. These fixtures test generated bounds;
 /// operation construction is covered separately using the real provider in `mixed_members`.
 trait OperationProvider<T: Type, Request = ()> {
@@ -1823,6 +1826,21 @@ enum DefaultPathLinearOperation<V: ryft::Value<Type = ryft::ArrayType>> {
     Constant(ryft::ConstantOperation<V>),
 }
 
+impl<V: ryft::Value<Type = ryft::ArrayType>>
+    ryft::OperationProvider<ryft::ArrayType, ryft::GuardOperation<ryft::ArrayType>> for DefaultPathLinearOperation<V>
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ryft::GuardOperation<ryft::ArrayType>,
+        _input_types: &[&ryft::ArrayType],
+    ) -> Result<Self, ryft::ProgramError> {
+        Err(ryft::ProgramError::UnsupportedOperation {
+            message: "guards are unsupported by this test family".to_owned(),
+        })
+    }
+}
+
 #[test]
 fn test_operation_default_crate_path_is_ryft() {
     let r#type = ryft::ArrayType::scalar(ryft::DataType::F64);
@@ -1896,7 +1914,7 @@ mod structural_batching {
     use ryft::{
         ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, BatchableOperation, BatchingContext,
         DimensionAddOperation, DimensionOperation, DimensionType, DimensionValue, EagerContext, EmptyRegionDriver,
-        Typed,
+        GuardOperation, OperationProvider, ProgramError, Typed,
     };
 
     /// Operation family whose only member is the structural first-class-dimension family. That family has no batching
@@ -1907,6 +1925,14 @@ mod structural_batching {
     enum StructuralBatchingOperation {
         #[ryft(projected(DimensionType, structural))]
         Dimension(DimensionOperation<DimensionValue>),
+    }
+
+    impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for StructuralBatchingOperation {
+        type Operation = Self;
+
+        fn provide(_request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
+        }
     }
 
     #[test]
@@ -1940,7 +1966,7 @@ mod mixed_members {
         AddOperation, ArrayIrType, ArrayIrValue, ArrayType, Context, CotangentAccumulator, DataType,
         DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
         DifferentiationDual, DifferentiationPolicy, Dimension, DimensionBounds, DimensionOperation, DimensionType,
-        DimensionValue, DimensionVariable, EmptyRegionDriver, MaybeZero, MemberDifferentiableOperation,
+        DimensionValue, DimensionVariable, EmptyRegionDriver, GuardOperation, MaybeZero, MemberDifferentiableOperation,
         MemberInterpretableOperation, MemberOperation, MemberTransposableOperation, Operation, OperationProvider,
         PartialValue, ProgramError, RegionInterface, Shape, StagingContext, Tracer, TracingContext,
         TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed,
@@ -1991,7 +2017,7 @@ mod mixed_members {
             _region_interfaces: &[RegionInterface<ArrayIrType>],
         ) -> Result<Vec<ArrayIrType>, TypeError> {
             // The parent boundary is `(array, dimension, array, dimension) -> array`, so the payload's own homogeneous
-            // rule sees the two array inputs and the dimension inputs only select the result geometry.
+            // rule sees the two array inputs and the dimension inputs only select the result shape.
             let arrays = input_types
                 .iter()
                 .filter_map(|r#type| <&ArrayType>::try_from(r#type).ok())
@@ -2029,7 +2055,7 @@ mod mixed_members {
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
             let context = context.primal();
-            // A linear payload pushes its tangents through the same mixed instruction, keeping the geometry inputs as
+            // A linear payload pushes its tangents through the same mixed instruction, keeping the dimension inputs as
             // primals.
             let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             let primal = context.bind(self.clone(), Vec::new(), primals.as_slice())?.remove(0);
@@ -2048,6 +2074,8 @@ mod mixed_members {
 
     impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>>>
         TransposableOperation<V, O> for InterleavedOperation
+    where
+        O: OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
@@ -2142,6 +2170,8 @@ mod mixed_members {
 
     impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O>
         for MixedUniverseConstructorOperation
+    where
+        O: OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
@@ -2175,6 +2205,14 @@ mod mixed_members {
 
         /// Member constant, which is what ties this family to its flowing value type.
         Constant(ryft::ConstantOperation<V>),
+    }
+
+    impl<V: Value<Type = ArrayType>> OperationProvider<ArrayType, GuardOperation<ArrayType>> for MixedMemberOperation<V> {
+        type Operation = Self;
+
+        fn provide(_request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
+        }
     }
 
     impl<V: Value<Type = ArrayType>> TransposableOperation<V, Self> for MixedMemberOperation<V> {
@@ -2221,6 +2259,16 @@ mod mixed_members {
         /// Homogeneous first-class-dimension member family.
         #[ryft(projected(DimensionType, structural))]
         Dimension(DimensionOperation<DimensionValue>),
+    }
+
+    impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>>
+        for MixedProgramOperation<A>
+    {
+        type Operation = Self;
+
+        fn provide(_request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
+        }
     }
 
     impl<A, C> MemberDifferentiableOperation<C> for MixedMemberOperation<A>
@@ -2298,7 +2346,7 @@ mod mixed_members {
 
     /// Returns the fixture's array member type together with the first-class dimension member type its mixed
     /// instructions consume and produce. The array type is static because reconstructing a mixed instruction from type
-    /// metadata alone requires that its geometry not live in runtime identity references.
+    /// metadata alone requires that its shape not live in runtime identity references.
     fn fixture_types() -> (ArrayType, DimensionType) {
         let dimension_type = DimensionType::new("items", DimensionBounds::new(1, Some(8)).unwrap());
         (ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])), dimension_type)

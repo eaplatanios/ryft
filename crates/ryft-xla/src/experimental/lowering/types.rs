@@ -1,15 +1,16 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AtomId, CaptureReference, ComparisonDirection, DataType, Dimension, DimensionValue,
+    ArrayIrType, ArrayType, AtomId, CaptureReference, ComparisonDirection, DataType, Dimension, DimensionValue, Layout,
     ProgramError, Shape, Type as RyftType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
-    Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef, Type, TypeRef,
+    Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef,
+    IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef, Type, TypeRef,
     Value as MlirValue, ValueRef,
 };
 
+use crate::ToPjrt;
 use crate::experimental::lowering::{LoweringError, MlirLowerableValue};
 use crate::experimental::ops::{XlaArrayConstant, XlaConstant};
 use crate::operations::comparisons::lower_compare_to_mlir;
@@ -489,6 +490,36 @@ pub(crate) fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     lower_u64_constant_splat(value, &output_type, output_tensor_type, block, context, location)
 }
 
+/// Encodes an executable boundary's requested layout using PJRT's `mhlo.layout_mode` convention. Internal
+/// `LayoutConstraint` calls alone do not constrain the parameter or result ABI.
+pub(crate) fn lower_boundary_layout<'c, 't>(
+    array_type: &ArrayType,
+    kind: &str,
+    context: &'c MlirContext<'t>,
+) -> Result<Option<AttributeRef<'c, 't>>, LoweringError> {
+    let Some(layout) = array_type.layout() else {
+        return Ok(None);
+    };
+    let Layout::Tiled(tiled) = layout else {
+        return Err(LoweringError::UnsupportedOp { op: format!("strided {kind} layout `{layout}`") });
+    };
+    // The pinned XLA SliceToDynamic emitter assumes row-major source/result layouts. Requesting a different
+    // dynamic result layout can abort compilation rather than return an error.
+    if kind == "output"
+        && array_type.static_shape().is_none()
+        && !tiled.minor_to_major().iter().copied().eq((0..array_type.rank()).rev())
+    {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("non-row-major bounded-dynamic output layout `{layout}`"),
+        });
+    }
+    Ok(Some(
+        context
+            .string_attribute(tiled.to_pjrt().map_err(ProgramError::custom)?.to_string().as_str())
+            .as_ref(),
+    ))
+}
+
 /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
 pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
     array_type: &ArrayType,
@@ -888,6 +919,18 @@ mod tests {
             reshape_dimension_i32(value),
             Err(LoweringError::ReshapeDimensionOutOfRange { value, bit_width: 32 }),
         );
+    }
+
+    #[test]
+    fn test_lower_boundary_layout() {
+        use ryft_core::TiledLayout;
+
+        let context = MlirContext::new();
+        let plain = ArrayType::new_static(DataType::F32, [2, 3]);
+        assert!(lower_boundary_layout(&plain, "input", &context).unwrap().is_none());
+        let column_major = plain.with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let attribute = lower_boundary_layout(&column_major, "output", &context).unwrap().unwrap();
+        assert_eq!(attribute.to_string(), "\"{0,1}\"");
     }
 
     #[test]

@@ -32,13 +32,13 @@ pub(crate) mod select;
 /// StableHLO lowering of `while`.
 pub(crate) mod r#while;
 
-/// Lowers the entry guard of a region entered with `values` of the `actual_types`, before any conversion to the
-/// region's declared input types. Region entry lowering retypes each input independently, so a relationship between
+/// Lowers the input relationship guard of a region invoked with `values` of the `actual_types`, before any conversion
+/// to the region's declared input types. Lowering retypes each region input independently, so a relationship between
 /// inputs that their actual types leave unproven (e.g., a `dimension<n>` input that must equal the extent of an exact
-/// `f32[3]` input entering `f32[n]`) is checked by an [`GuardOperation`] before the region runs, exactly as eager
-/// region entry validation would reject it. Static extents are checked as constants and dynamic ones are read from the
-/// values, so the guard needs no conversion and can precede every path that the region entry takes (including paths
-/// that never run the region). Entries whose actual types prove every relationship emit nothing.
+/// `f32[3]` input entering `f32[n]`) is checked by a [`GuardOperation`] before the region runs, exactly as eager
+/// validation of region inputs would reject it. Static extents are checked as constants and dynamic ones are read from
+/// the values, so the guard needs no conversion and can precede every path that invokes the region (including paths
+/// that never run the region). Inputs whose actual types prove every relationship need no guard.
 ///
 /// # Parameters
 ///
@@ -77,13 +77,13 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 
 /// Returns the [`EffectClasses`] whose tokens lowering `program` threads: its source effect classes, plus
 /// [`EffectClass::OrderedAssertion`] when lowering synthesizes an assertion anywhere in it, at any depth. Lowering
-/// synthesizes the entry guard of a nested `condition`, `while`, or `scan` whose inputs leave relationships of its
-/// region entry unproven (refer to [`lower_region_guard`]), and the validation of the extent operands that a
-/// dynamic array constructor (`zero`, `one`, or `iota`), a random bit generator, or a custom call consumes for output
-/// axes that type inference refined to static extents (refer to `validates_output_extents`). A region that contains
-/// such an assertion must thread its tokens out (refer to `token_threaded_effects`) even when its source program is
-/// pure, so that later assertions and I/O follow it: an entry guard joins its assertion token into the ordered I/O
-/// chain, and every assertion advances the ordered-assertion chain.
+/// synthesizes the input relationship guard of a nested `condition`, `while`, or `scan` whose inputs leave
+/// relationships of its region inputs unproven (refer to [`lower_region_guard`]), and the validation of the extent
+/// operands that a dynamic array constructor (`zero`, `one`, or `iota`), a random bit generator, or a custom call
+/// consumes for output axes that type inference refined to static extents (refer to `validates_output_extents`). A
+/// region that contains such an assertion must thread its tokens out (refer to `token_threaded_effects`) even when its
+/// source program is pure, so that later assertions and I/O follow it: a region input guard joins its assertion token
+/// into the ordered I/O chain, and every assertion advances the ordered-assertion chain.
 pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &XlaProgram<ProgramInput, ProgramOutput, O>,
 ) -> Result<EffectClasses, LoweringError>
@@ -162,13 +162,14 @@ where
 /// Converts the lowered value of one control-flow input to the lowered type of the region input that it feeds, which
 /// the input type refines (refer to the `while`, `scan`, and `condition` type inference rules in `ryft-core`), or more
 /// generally to a type whose dynamic axes take either a static extent of the input or the runtime size of a dynamic
-/// axis of the input (e.g., the outputs of an entry guard or a `cast`). Regions receive every input at its declared
-/// type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type, so those
-/// inputs are returned unchanged. A static extent that refines a bounded dynamic dimension, and a dynamic dimension
-/// whose physical bound differs from the declared one, lower to different tensor types. Such an input is exposed as its
-/// full physical buffer, padded up (or sliced down) to the physical bound of the declared type along every such axis,
-/// and then given the runtime size of every dynamic dimension of the declared type with `stablehlo.set_dimension_size`:
-/// the static extent for a refined axis, and the input's own runtime size for an axis that stays dynamic.
+/// axis of the input (e.g., the outputs of a region input guard or a `cast`). Regions receive every input at its
+/// declared type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type, so
+/// those inputs are returned unchanged. A static extent that refines a bounded dynamic dimension, and a dynamic
+/// dimension whose physical bound differs from the declared one, lower to different tensor types. Such an input is
+/// exposed as its full physical buffer, padded up (or sliced down) to the physical bound of the declared type along
+/// every such axis, and then given the runtime size of every dynamic dimension of the declared type with
+/// `stablehlo.set_dimension_size`: the static extent for a refined axis, and the input's own runtime size for an axis
+/// that stays dynamic.
 pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
@@ -344,9 +345,9 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
 ///
 /// `entry_effect_tokens` are the enclosing scope's active per-class tokens, referenced inside the region through
 /// StableHLO's implicit region capture (the same mechanism that feeds `input_values` into `stablehlo.if` branches).
-/// Ordinary results are converted to `output_types` before the region returns one trailing token for each class
-/// in `threaded_effects`, in canonical effect order. A branch that is pure for one of those classes returns that
-/// class's entry token unchanged.
+/// Ordinary results are converted to `output_types` before the region returns one trailing token for each class in
+/// `threaded_effects`, in canonical effect order. A branch that is pure for one of those classes returns that class's
+/// incoming token unchanged.
 pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatXlaProgram<O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -377,7 +378,7 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
             &mut region_effect_tokens,
         )?;
         // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
-        // common refined geometry even when their declared dynamic and static result types differ.
+        // common refined shapes even when their declared dynamic and static result types differ.
         outputs = lower_refined_region_outputs(
             outputs,
             &program.output_types(),

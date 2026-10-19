@@ -10,12 +10,12 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::types::{
-    lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
+    lower_explicit_shape, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, physical_bound_type,
     reshape_dimension_i64,
 };
 use crate::operations::constants::{
-    dynamic_constructor_types, lower_constructor_layout, refine_dynamic_constructor_result,
+    dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
@@ -108,6 +108,13 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
     let input = input_values[0];
+    // A static result can refine exact symbolic input axes. Expose their proved physical sizes so that XLA does not
+    // retain a dynamic unit axis that would prevent a subsequent singleton expansion.
+    let input = if output_type.static_shape().is_some() {
+        lower_physical_storage(input, &input_types[0], block, context, location)?
+    } else {
+        input
+    };
     let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
         if output_type.layout().is_some() {
             return Err(LoweringError::UnsupportedOp {
@@ -168,7 +175,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             operation.output_axes(),
             location,
         )?)?;
-        let result = lower_constructor_layout(broadcast.result(0).unwrap().as_ref(), &physical_type, block, location)?;
+        let result = lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), &physical_type, block, location)?;
         let mut sources = vec![(input, 0); output_type.rank()];
         for (input_axis, output_axis) in operation.output_axes().iter().enumerate() {
             sources[*output_axis] = (input, input_axis);
@@ -181,7 +188,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             operation.output_axes(),
             location,
         )?)?;
-        lower_constructor_layout(broadcast.result(0).unwrap().as_ref(), output_type, block, location)?
+        lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), output_type, block, location)?
     };
     if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
         lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), bound_manual_axes, block, location)
@@ -214,15 +221,18 @@ impl LowerableOperation for DynamicBroadcastOperation {
         };
         let output_type = <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
         let result = if output_type.static_shape().is_some() {
+            // Exact symbolic axes have no inactive storage, and must lose their dynamic bit before a static result
+            // is consumed as singleton broadcast storage by a later operation.
+            let input = lower_physical_storage(*input, input_type, block, context, location)?;
             let output_tensor_type = lower_tensor_type(output_type, context, location)?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
-                *input,
+                input,
                 output_tensor_type,
                 self.output_axes(),
                 location,
             )?)?;
             let result = broadcast.result(0).unwrap().as_ref();
-            lower_constructor_layout(result, output_type, block, location)?
+            lower_layout_constraint(result, output_type, block, location)?
         } else if physical_bound_type(input_type).is_ok() && physical_bound_type(output_type).is_ok() {
             // Finite bounded inputs can be materialized at their physical shape, broadcast statically, and then
             // refined from the explicit result extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
@@ -610,15 +620,13 @@ mod tests {
                 builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
             assert_eq!(
                 to_mlir_module_for_plain_program(&program, "main"),
-                Err(LoweringError::UnsupportedOp {
-                    op: format!("dynamic constructor with {kind} output layout `{layout}`"),
-                }),
+                Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") }),
             );
         }
     }
 
     #[test]
-    fn test_lower_dynamic_broadcast_executes_dynamic_geometry() {
+    fn test_lower_dynamic_broadcast_executes_dynamic_shape() {
         let shape = Shape::new(vec![dynamic_dimension("size", Some(5))]);
         let integer_type = ArrayType::new(DataType::I64, shape.clone());
         let complex_type = ArrayType::new(DataType::C64, shape.clone());
@@ -779,6 +787,78 @@ mod tests {
                         .collect::<Vec<_>>(),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_broadcast_exact_symbolic_extent_refinement_executes_on_cpu() {
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+
+        // Both broadcast forms can normalize proved symbolic extents to static storage. The unit axis must then
+        // expand as a static singleton, while the exact nonunit axis preserves its distinct element values.
+        let client = execution_client();
+        for explicit_extents in [false, true] {
+            let unit = DimensionVariable::new("unit", DimensionBounds::new(1, Some(2)).unwrap());
+            let fixed = DimensionVariable::new("fixed", DimensionBounds::new(2, Some(3)).unwrap());
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![unit.into(), fixed.into()]));
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(input_type.into());
+            let normalized = if explicit_extents {
+                let one = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(1).unwrap()));
+                let two = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(2).unwrap()));
+                builder
+                    .add_instruction(
+                        DynamicBroadcastOperation::new(vec![0, 1]),
+                        Vec::new(),
+                        vec![input, one, two],
+                        None,
+                    )
+                    .unwrap()[0]
+            } else {
+                builder
+                    .add_instruction(
+                        BroadcastOperation::new(ArrayType::new_static(DataType::F64, [1, 2]), vec![0, 1]),
+                        Vec::new(),
+                        vec![input],
+                        None,
+                    )
+                    .unwrap()[0]
+            };
+            let expanded = builder
+                .add_instruction(
+                    BroadcastOperation::new(ArrayType::new_static(DataType::F64, [3, 2]), vec![0, 1]),
+                    Vec::new(),
+                    vec![normalized],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![expanded], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                program.to_string(),
+                if explicit_extents {
+                    indoc! {"
+                        lambda %0:f64[unit, fixed] .
+                        let %1:dimension<1> = const 1
+                            %2:dimension<2> = const 2
+                            %3:f64[1, 2] = broadcast [output_axes=[0, 1]] %0 %1 %2
+                            %4:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[0, 1]] %3
+                        in (%4)"
+                    }
+                } else {
+                    indoc! {"
+                        lambda %0:f64[unit, fixed] .
+                        let %1:f64[1, 2] = broadcast [output_type=f64[1, 2], output_axes=[0, 1]] %0
+                            %2:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[0, 1]] %1
+                        in (%2)"
+                    }
+                },
+            );
+            assert_eq!(
+                execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2., 3.], vec![1, 2])], &[1, 2],),
+                Ok(vec![MixedValue::Array(vec![2., 3., 2., 3., 2., 3.], vec![3, 2])]),
+            );
         }
     }
 
@@ -1005,11 +1085,30 @@ mod tests {
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), columns.into()])).with_layout(layout);
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![
+                    ArrayType::scalar(DataType::F32),
+                    ArrayType::scalar(DataType::I64),
+                    ArrayType::scalar(DataType::I64)
+                ],
+                &output_type,
+                "main",
+                None,
+                None,
+            ),
+            Err(LoweringError::UnsupportedOp {
+                op: "non-row-major bounded-dynamic output layout `tiled{0,1}`".to_string(),
+            }),
+        );
+        // An unspecified executable result layout still permits the internal constraint.
         let module = to_mlir_module_for_program(
             &program,
             &[],
             &vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64)],
-            &output_type,
+            &output_type.with_layout(None),
             "main",
             None,
             None,
@@ -1055,9 +1154,7 @@ mod tests {
                     None,
                     None,
                 ),
-                Err(LoweringError::UnsupportedOp {
-                    op: format!("dynamic constructor with {kind} output layout `{layout}`"),
-                }),
+                Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") }),
             );
         }
     }

@@ -60,7 +60,7 @@ impl LowerableOperation for ConstantOperation<Array> {
     }
 }
 
-/// Lowers a zero or one with its exemplar's runtime geometry.
+/// Lowers a zero or one with its exemplar's runtime shape.
 pub(crate) fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
@@ -120,8 +120,8 @@ pub(crate) fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Constrains a statically allocated constructor result before attaching its runtime dimensions.
-pub(crate) fn lower_constructor_layout<'b, 'c: 'b, 't: 'c>(
+/// Constrains the layout of a statically shaped physical buffer before attaching its runtime dimensions.
+pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
@@ -131,23 +131,17 @@ pub(crate) fn lower_constructor_layout<'b, 'c: 'b, 't: 'c>(
         return Ok(value);
     };
     let Layout::Tiled(tiled) = layout else {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!("dynamic constructor with strided output layout `{layout}`"),
-        });
+        return Err(LoweringError::UnsupportedOp { op: format!("strided output layout `{layout}`") });
     };
     if !tiled.tiles().is_empty() {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!("dynamic constructor with tiled output layout `{layout}`"),
-        });
+        return Err(LoweringError::UnsupportedOp { op: format!("tiled output layout `{layout}`") });
     }
     let axes = tiled.minor_to_major();
     if axes.len() != r#type.rank()
         || axes.iter().any(|axis| *axis >= r#type.rank())
         || axes.iter().collect::<std::collections::HashSet<_>>().len() != r#type.rank()
     {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!("dynamic constructor with invalid output layout `{layout}` for type `{type}`"),
-        });
+        return Err(LoweringError::UnsupportedOp { op: format!("invalid output layout `{layout}` for type `{type}`") });
     }
     // XLA recognizes this custom call as a physical layout constraint. Apply it to the allocation's static shape:
     // runtime extents are attached afterward, so the call needs no separate dynamic result-shape arguments.
@@ -218,7 +212,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    result = lower_constructor_layout(result, &refined_type, block, location)?;
+    result = lower_layout_constraint(result, &refined_type, block, location)?;
     let i32_scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
         .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
@@ -891,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_like_constant_dynamic_geometry() {
+    fn test_lower_like_constant_dynamic_shape() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(5))]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
@@ -955,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_like_constant_dynamic_geometry_requires_supported_bound() {
+    fn test_lower_like_constant_dynamic_shape_requires_supported_bound() {
         for (operation, name) in [
             (ArrayOperation::ZeroLike(ZeroLikeOperation::new()), "zero_like"),
             (ArrayOperation::OneLike(OneLikeOperation::new()), "one_like"),
@@ -996,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_like_constant_executes_dynamic_geometry() {
+    fn test_lower_like_constant_executes_dynamic_shape() {
         let input_type = ArrayType::new(DataType::C64, Shape::new(vec![dynamic_dimension("size", Some(5))]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], Vec::new())));
         let mut builder = XlaProgramBuilder::new();

@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lower_transpose_executes_dynamic_geometry() {
+    fn test_lower_transpose_executes_dynamic_shape() {
         let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), Dimension::Static(2)]);
         let mut builder = XlaProgramBuilder::new();
         let integer_input = builder.add_input(ArrayType::new(DataType::I64, shape.clone()));

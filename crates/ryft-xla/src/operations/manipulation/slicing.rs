@@ -1017,7 +1017,7 @@ mod tests {
             "#},
         );
 
-        // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
+        // The strided slice pullback pads the cotangent with a zero scalar using the inverse padding
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
         let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(

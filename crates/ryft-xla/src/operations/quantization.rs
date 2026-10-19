@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_materializes_absent_scaled_dot_scales() {
         // The public optional-scale API still lowers to JAX's exact four-operand composite. Contracting dummy-scale
-        // axes have size one, noncontracting axes retain the corresponding element geometry, and the decomposition
+        // axes have size one, noncontracting axes retain the corresponding element extents, and the decomposition
         // ignores the identity operands rather than imposing block-ratio requirements on an absent scale.
         let element_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));

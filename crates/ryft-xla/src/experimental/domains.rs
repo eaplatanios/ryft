@@ -14,14 +14,14 @@ use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, BatchingError,
-    BindingRegionDriver, CallRequest, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
-    CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
-    DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize,
-    DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass,
-    EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh, LoweringRequest, Memory,
-    MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
-    Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
+    BindingRegionDriver, CallRequest, Cast, CastType, Compare, CompilationCacheDomain, CompilationContext,
+    CompilationDomain, CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId,
+    DeviceMesh, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation,
+    DimensionSize, DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext,
+    EffectClass, EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh,
+    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
+    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
     ReferenceReplacementPreparation, ReferenceSource, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape,
     Sharding, ShardingDimension, SortDirection, SpecializationCache, SpecializationCacheEntry,
     SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
@@ -1332,8 +1332,8 @@ impl<'c> XlaDomain<'c> {
     /// loops are needed.
     ///
     /// Work that involves no device computation never reaches the compile cache. Reference operations act on host-side
-    /// handles (refer to [`Self::eager_reference_bind`]), while dimension operations, dimension comparisons, and the
-    /// conversions between dimensions and scalars are decided on the host, and only their array results are uploaded
+    /// handles (refer to [`Self::eager_reference_bind`]), while dimension operations, dimension casts and comparisons,
+    /// and conversions between dimensions and scalars are decided on the host. Only their array results are uploaded
     /// (refer to [`Self::eager_scalar`]). Reference operands of any other operation, and reference state carried by
     /// attached regions, are rejected because XLA eager execution lowers each operation.
     fn eager_bind<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
@@ -1447,6 +1447,27 @@ impl<'c> XlaDomain<'c> {
                 XlaValue::Dimension(_) | XlaValue::Reference(_) => None,
             })
             .collect::<Vec<_>>();
+
+        if let XlaOperation::Cast(operation) = &operation
+            && matches!(operation.output_type(), ArrayIrType::Dimension(_))
+        {
+            // Context::bind rejects attached regions. Validate the original declaration before observing every
+            // array witness producer: the host dimension has no buffer that could retain those dependencies. Eager
+            // values have exact types, so interpreted inference proves the relationship or rejects it; it never
+            // leaves a check to a backend.
+            let values = inputs.iter().cloned().map(XlaValue::into_array_ir_value).collect::<Vec<_>>();
+            operation.infer_interpreted_output_type(
+                &values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(),
+                &[],
+            )?;
+            self.validate_eager_placement(&array_inputs)?;
+            for input in &array_inputs {
+                input
+                    .block_until_ready()
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            }
+            return Ok(vec![XlaValue::from_array_ir_value(values[0].clone(), self)]);
+        }
 
         // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
         // and its inputs directly to a compiled program, so a repeated application skips tracing, lowering, and
@@ -3323,7 +3344,50 @@ impl XlaExecutionPlan {
         mesh: &DeviceMesh,
     ) -> Result<Self, XlaDomainError> {
         let physical_input_logical_indices = signature.project_inputs(&(0..input_types.len()).collect::<Vec<_>>());
-        let physical_input_types = signature.physical_input_types(input_types);
+        let mut physical_input_types = signature.physical_input_types(input_types);
+        let compiled_executable = executable.executable()?;
+        let input_layouts =
+            if physical_input_types.is_empty() { Vec::new() } else { compiled_executable.input_layouts()? };
+        let physical_output_types = signature.physical_output_types(output_types);
+        let output_layouts = if physical_output_types.iter().any(|array_type| array_type.layout().is_some()) {
+            compiled_executable.output_layouts()?
+        } else {
+            Vec::new()
+        };
+        // Low-level compile options can override MLIR layout attributes. Validate the compiled ABI before trusting
+        // declared layouts, including when rebuilding a plan for a persistent executable. Unspecified layouts impose
+        // no constraint, and tokens are excluded from these physical array type lists.
+        for (kind, types, layouts) in [
+            ("input", physical_input_types.as_slice(), input_layouts.as_slice()),
+            ("output", physical_output_types.as_slice(), output_layouts.as_slice()),
+        ] {
+            for (index, array_type) in types.iter().enumerate() {
+                if let Some(expected) = array_type.layout() {
+                    let layout = layouts.get(index).ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+                        reason: format!("executable {kind} {index} has no physical layout"),
+                    })?;
+                    let actual = Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?)
+                        .map_err(Error::from)?;
+                    if &actual != expected {
+                        return Err(XlaDomainError::InvalidCompilationOptions {
+                            reason: format!(
+                                "executable {kind} {index} uses layout `{actual}` but its type declares `{expected}`",
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        // These types describe the physical executable signature, including layouts chosen for unconstrained
+        // logical inputs. Keep the logical declarations unchanged so they still admit other representations.
+        for (index, array_type) in physical_input_types.iter_mut().enumerate() {
+            let layout = input_layouts.get(index).ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+                reason: format!("executable input {index} has no physical layout"),
+            })?;
+            let layout =
+                Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?).map_err(Error::from)?;
+            *array_type = array_type.clone().with_layout(layout);
+        }
         let logical_donation_flags =
             std::iter::repeat_n(false, capture_count).chain(donation_flags.iter().copied()).collect::<Vec<_>>();
         let mut default_donation_flags = signature.project_inputs(logical_donation_flags.as_slice());
@@ -3612,7 +3676,8 @@ impl<'c> XlaDomain<'c> {
     /// The backend may execute inline or return pending arrays and a completion fence. This function adds no wait
     /// solely because public outputs are empty. Bounded-dynamic boundaries can introduce additional waits:
     /// below-bound inputs perform device-to-host copies and bound-shaped uploads before launch, and each dynamic
-    /// output reads its hidden extent scalar before constructing the logical output type.
+    /// output reads its hidden extent scalar before constructing the logical output type. Erased zero-space inputs
+    /// await producer completion before launch because they have no physical buffer to carry that dependency.
     pub(crate) fn execute_compiled_async(
         &self,
         program: &XlaCompiledProgram<'c>,
@@ -3708,6 +3773,14 @@ impl<'c> XlaDomain<'c> {
             (input_refinements, Some(actual_input_types))
         };
 
+        // Erased zero-space inputs have no buffers through which PJRT could order consumer work after their
+        // producers. Observe completion before dropping those inputs, including before any consumer effects run.
+        for (input, physical_index) in inputs.iter().zip(program.signature.input_mapping()) {
+            if physical_index.is_none() {
+                input.block_until_ready()?;
+            }
+        }
+
         // Without hidden extent scalars, physical inputs are a projection of the logical inputs (which is the identity
         // for most programs); bounded-dynamic inputs are padded to their physical bounds instead.
         let inputs = if program.signature.input_dimensions().is_empty() {
@@ -3735,7 +3808,46 @@ impl<'c> XlaDomain<'c> {
         } else {
             inputs
         };
-        let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
+        let mut inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
+        // A logical input without a layout constraint admits any physical representation. Match the compiled
+        // signature before handing buffers to PJRT, which otherwise reads their storage in its expected order.
+        // Known layouts convert on device through the existing capability. Unknown layouts require observing the
+        // shard buffers; only a mismatch takes the dense host fallback, which also handles differently laid-out shards.
+        for (input, physical_type) in inputs.iter_mut().zip(&plan.physical_input_types) {
+            if input.data_type().is_zero() {
+                continue;
+            }
+            let expected = physical_type.layout().expect("the execution plan records every physical input layout");
+            if let Some(actual) = input.layout() {
+                if actual != expected {
+                    // A representation adapter owns its small compilation signature, so do not inherit a caller's
+                    // low-level parameter/result shape overrides. Keep the same session, mesh and effect scope.
+                    let conversion_domain = self.with_compilation_options(CompilationOptions::default());
+                    let source = input.clone().associate(&conversion_domain)?;
+                    *input = source.cast(source.r#type().into_owned().with_layout(expected.clone()), &[])?;
+                }
+            } else {
+                let expected_buffer_layout = expected.to_pjrt().map_err(Error::from)?;
+                let mut needs_conversion = false;
+                for shard in input.addressable_shards() {
+                    if let Some(buffer) = shard.buffer()
+                        && buffer.specification()?.layout != expected_buffer_layout
+                    {
+                        needs_conversion = true;
+                        break;
+                    }
+                }
+                if needs_conversion {
+                    let bytes = materialize_dense_array_bytes(input)?;
+                    *input = XlaArray::from_host_buffer(
+                        self,
+                        input.r#type().into_owned().with_layout(expected.clone()),
+                        input.mesh().clone(),
+                        bytes,
+                    )?;
+                }
+            }
+        }
         let donation_flags = if donation_overrides.is_empty() {
             plan.default_donation_flags.clone()
         } else {
@@ -6811,17 +6923,18 @@ mod tests {
         AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
         Assert, AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation,
-        BatchingContext, CalleeRegionDriver, CaptureReference, CollectiveOptions, CompareOperation,
-        ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
-        ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation, CustomFunctionJvpRule,
-        CustomFunctionOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation,
-        DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
-        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
-        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
-        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        BatchingContext, CalleeRegionDriver, CaptureReference, Cast, CastOperation, CollectiveOptions,
+        CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
+        CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
+        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
+        CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation,
+        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
+        DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
+        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy,
+        DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
+        DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
+        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
         OneOperation, ParallelAllGatherOperation, ParallelAllGatherOutputVariance, ParallelAllToAllOperation,
         ParallelPermuteOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation, Program,
         ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind,
@@ -7381,8 +7494,8 @@ mod tests {
             .add_instruction(DimensionFromScalarOperation::new(attention_batch.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
 
-        // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share it,
-        // while the static right operand fixes one output column and the static block geometry fixes `k = 16`.
+        // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share it, while
+        // the static right operand fixes one output column and the static block shape fixes `k = 16`.
         let scaled_lhs = builder
             .add_instruction(OneOperation::new(scaled_lhs_type), Vec::new(), vec![dimension], None)
             .unwrap()[0];
@@ -10650,7 +10763,7 @@ mod tests {
         let width = ValueProjection::<DimensionType>::into_projected(columns.clone()).unwrap();
         let width = width.add(&one).unwrap().div(&two).unwrap().into_value();
         // The inner slice receives a genuinely runtime-shaped array. Its pullback must allocate that exact shape,
-        // before the outer prefix slice embeds it back into the original static input geometry.
+        // before the outer prefix slice embeds it back into the original static input shape.
         let prefix = input
             .dynamic_slice_with_dimensions(&[zero.clone(), zero.clone()], &[rows, columns], &[1, 1])
             .unwrap();
@@ -10944,6 +11057,51 @@ mod tests {
             .r#await()
             .unwrap();
         assert_eq!(values_from_bytes::<f32>(value_bytes.as_slice()), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_prepare_compiled_execution_preserves_erased_input_producer_completion() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        // Exercise both the ordinary input projection and the branch that materializes bounded inputs. The failed
+        // producer belongs to an erased zero-space input, so no physical input buffer can carry its failure.
+        for value_type in
+            [ArrayType::new_static(DataType::F32, [2]), ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))]
+        {
+            let mut builder = XlaProgramBuilder::new();
+            let zero_input = builder.add_input(zero_type.clone().into());
+            let value_input = builder.add_input(value_type.into());
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![zero_input, value_input],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap();
+            let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            assert_eq!(lowered.signature.input_mapping(), &[None, Some(0)]);
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let (event, promise) = client.event(()).unwrap();
+            promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
+            let zero = XlaArray::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), [])
+                .unwrap()
+                .with_execution_fence(ExecutionFence::new(vec![event]));
+            let value = XlaArray::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F32, [2]),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0]),
+            )
+            .unwrap();
+            assert!(matches!(
+                domain.execute_compiled_async(&compiled, vec![zero, value]),
+                Err(XlaDomainError::Xla(Error::PjrtError(ryft_pjrt::Error::InvalidArgument { message, .. })))
+                    if message == "erased producer failed",
+            ));
+        }
     }
 
     #[test]
@@ -11423,6 +11581,284 @@ mod tests {
             "invalid compilation options: bounded-dynamic multi-device programs currently require fully replicated \
              shardings because Shardy rejects dynamic tensors",
         );
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect the actual buffer, independently of the declared array type.
+    fn test_xla_lowering_preserves_cast_layouts() {
+        use ryft_core::{Cast, CastOperation};
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let values = vec![1f64, 2., 3., 4., 5., 6.];
+        let input =
+            XlaArray::from_host_buffer(&domain, actual_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let target = input.r#type().into_owned().with_layout(layout.clone());
+        let consumer = crate::jit::compile::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            input.r#type().into_owned(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        for output in [input.cast(target.clone(), &[]).unwrap(), input.cast_unchecked(target, &[]).unwrap()] {
+            assert_eq!(
+                output.addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                Ok(layout.to_pjrt().unwrap())
+            );
+            // The next executable must consume the actual column-major buffer and return dense logical values.
+            let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
+            assert_eq!(read_f64s(&client, &consumed), values);
+            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&output).unwrap()), values);
+            let destination_mesh = domain_mesh(&client, "destination", 1);
+            let moved = output
+                .to_placement(
+                    &domain,
+                    crate::arrays_v0::DevicePutTarget::Placement {
+                        sharding: Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
+                        mesh: destination_mesh,
+                    },
+                )
+                .unwrap();
+            assert_eq!(moved.layout(), Some(&layout));
+            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&moved).unwrap()), values);
+            // A raw buffer may have a known physical layout even when its logical type leaves that field open.
+            let opaque = XlaArray::from_addressable_buffers(
+                &domain,
+                output.r#type().into_owned().with_layout(None),
+                mesh.clone(),
+                vec![
+                    output
+                        .addressable_shards()
+                        .next()
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .copy_to_device(client.addressable_devices().unwrap().remove(0))
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            let doubled = domain.interpret(&consumer.executable_function(), opaque).unwrap();
+            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            let doubled = domain.interpret(&consumer.executable_function(), output).unwrap();
+            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+        }
+
+        // A tuple mixes an erased zero, a constrained result and an unconstrained result. The dynamic case also
+        // appends hidden extent results. Check the actual buffers rather than trusting their reconstructed types.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
+        let zero = XlaArray::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), []).unwrap();
+        for source_type in [actual_type, ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]))] {
+            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+                let mut builder = XlaProgramBuilder::new();
+                let source = builder.add_input(source_type.clone().into());
+                let zero_input = builder.add_input(zero_type.clone().into());
+                let output = builder
+                    .add_instruction(
+                        constructor(
+                            input.r#type().into_owned().with_layout(layout.clone()).into(),
+                            vec![source_type.clone().into()],
+                        ),
+                        vec![],
+                        vec![source],
+                        None,
+                    )
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                        vec![zero_input, output, source],
+                        vec![Placeholder; 2],
+                        vec![Placeholder; 3],
+                    )
+                    .unwrap();
+                let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+                assert_eq!(lowered.signature.input_mapping(), &[Some(0), None]);
+                assert_eq!(lowered.signature.output_mapping(), &[None, Some(0), Some(1)]);
+                let compiled = domain.compile_xla_program(&lowered).unwrap();
+                let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), zero.clone()]).unwrap();
+                assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
+                assert_eq!(outputs[1].layout(), Some(&layout));
+                assert_eq!(
+                    outputs[1].addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                    Ok(layout.to_pjrt().unwrap())
+                );
+                assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[1]).unwrap()), values);
+                assert_eq!(read_f64s(&client, &outputs[2]), values);
+                assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Verify actual result storage alongside the hidden extent and effect-token ABI.
+    fn test_xla_lowering_preserves_dynamic_row_major_layout_with_ordered_io() {
+        use ryft_core::CastOperation;
+
+        use crate::operations::debugging::with_captured_prints;
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(source_type.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(
+                    source_type.clone().with_layout(layout.clone()).into(),
+                    vec![source_type.into()],
+                ),
+                vec![],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("layout"), vec![], vec![scalar], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.signature.ordered_io_output_index(), Some(2));
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        for rows in [2, 0] {
+            let values = (1..=rows * 3).map(|value| value as f64).collect::<Vec<_>>();
+            let input = XlaArray::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F64, [rows, 3]),
+                mesh.clone(),
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            let scalar = XlaArray::from_host_buffer(
+                &domain,
+                ArrayType::scalar(DataType::F64),
+                mesh.clone(),
+                values_to_bytes(&[1f64]),
+            )
+            .unwrap();
+            let (outputs, prints) =
+                with_captured_prints(|| domain.execute_xla_program(&compiled, vec![input, scalar]).unwrap());
+            assert_eq!(outputs[0].shape().as_slice(), &[rows, 3]);
+            assert_eq!(
+                outputs[0].addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                Ok(layout.to_pjrt().unwrap()),
+            );
+            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
+            assert_eq!(prints.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_xla_execution_plan_rejects_compilation_options_with_conflicting_layouts() {
+        use ryft_core::CastOperation;
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::unchecked(
+                    input_type.clone().with_layout(layout.clone()).into(),
+                    vec![input_type.into()],
+                ),
+                vec![],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let row_major = BufferSpecification::new(BufferType::F64, [2, 3]).proto().unwrap();
+        // Explicit argument layouts bypass the MLIR layout attributes in PJRT. A conflicting result override must
+        // fail before its buffers can be wrapped in types that claim another layout.
+        lowered.compilation_options.argument_layouts = vec![row_major.clone()];
+        lowered.compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(row_major);
+        let Err(error) = domain.compile_xla_program(&lowered) else {
+            panic!("conflicting executable layout unexpectedly accepted");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid compilation options: executable output 0 uses layout `tiled{1,0}` but its type declares \
+             `tiled{0,1}`",
+        );
+        let column_major = BufferSpecification::with_layout(BufferType::F64, [2, 3], layout.to_pjrt().unwrap())
+            .proto()
+            .unwrap();
+        lowered.compilation_options.executable_build_options.as_mut().unwrap().result_shape =
+            Some(column_major.clone());
+        domain.compile_xla_program(&lowered).unwrap();
+        lowered.compilation_options.argument_layouts = vec![column_major];
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let values = vec![1f64, 2., 3., 4., 5., 6.];
+        let input = XlaArray::from_host_buffer(
+            &domain,
+            ArrayType::new_static(DataType::F64, [2, 3]),
+            mesh,
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input]).unwrap();
+        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
+        let configured = domain.with_compilation_options(lowered.compilation_options.clone());
+        let input = XlaArray::from_host_buffer(
+            &configured,
+            ArrayType::new_static(DataType::F64, [2, 3])
+                .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]))),
+            compiled.mesh().clone(),
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input]).unwrap();
+        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect per-device storage in addition to the global type.
+    fn test_xla_lowering_preserves_cast_layouts_on_multiple_cpu_devices() {
+        use ryft_core::Cast;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new_static(DataType::F64, [4, 3])
+            .with_sharding(
+                Sharding::new(
+                    mesh.logical_mesh().clone(),
+                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let values = (1..=12).map(|value| value as f64).collect::<Vec<_>>();
+        let input =
+            XlaArray::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let target = input_type.with_layout(layout.clone());
+        let output = input.cast(target, &[]).unwrap();
+        for shard in output.addressable_shards() {
+            assert_eq!(shard.shape().as_slice(), &[2, 3]);
+            assert_eq!(shard.buffer().unwrap().layout(), Ok(layout.to_pjrt().unwrap()));
+        }
+        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&output).unwrap()), values);
     }
 
     #[test]
@@ -13504,6 +13940,131 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn test_eager_bind_executes_dimension_cast() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let selected = domain.fork_effect_scope();
+        let value = XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone()));
+        let output_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
+        for checked in [true, false] {
+            let output = if checked {
+                value.cast(output_type.clone(), &[])
+            } else {
+                value.cast_unchecked(output_type.clone(), &[])
+            }
+            .unwrap();
+            assert_eq!(output, value);
+            assert!(Arc::ptr_eq(output.xla_domain().session(), domain.session()));
+            assert!(Arc::ptr_eq(&output.xla_domain().effect_scope, &domain.effect_scope));
+
+            let operation = if checked {
+                CastOperation::checked(output_type.clone(), vec![output_type.clone()])
+            } else {
+                CastOperation::unchecked(output_type.clone(), vec![output_type.clone()])
+            };
+            let outputs = selected.bind(operation, Vec::new(), &[value.clone()]).unwrap();
+            assert_eq!(outputs, vec![value.clone()]);
+            assert!(Arc::ptr_eq(&outputs[0].xla_domain().effect_scope, &selected.effect_scope));
+        }
+        assert_eq!(domain.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_eager_bind_dimension_cast_validates_declared_relationships() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let value = XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone()));
+        let output_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let declared_types = vec![
+            DimensionType::from(extent.clone()).into(),
+            ArrayType::new(DataType::F32, Shape::new(vec![extent.into()])).into(),
+        ];
+        let valid = XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]));
+        let invalid = XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation = constructor(output_type.clone(), declared_types.clone());
+            assert_eq!(
+                domain.bind(operation.clone(), Vec::new(), &[value.clone(), valid.clone()]),
+                Ok(vec![value.clone()]),
+            );
+            assert_eq!(
+                domain.bind(operation.clone(), Vec::new(), &[value.clone(), invalid.clone()]),
+                Err(ProgramError::Type(TypeError::custom(ryft_core::DimensionError::InputDimensionMismatch {
+                    dimension: "extent".to_owned(),
+                    expected: 2,
+                    actual: 3,
+                }))),
+            );
+            assert_eq!(
+                domain.bind(operation, Vec::new(), &[value.clone()]),
+                Err(TypeError::invalid("expected 2 inputs but got 1").into()),
+            );
+            let mismatch = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3)));
+            assert_eq!(
+                domain.bind(constructor(mismatch, vec![output_type.clone()]), Vec::new(), &[value.clone()]),
+                Err(TypeError::invalid("`cast` cannot convert type `dimension<2>` to unrelated type `dimension<3>`")
+                    .into()),
+            );
+        }
+        let region = XlaProgramBuilder::new()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            domain.bind(CastOperation::checked(output_type.clone(), vec![output_type]), vec![region], &[value],),
+            Err(ProgramError::MalformedProgram(
+                "operation `cast` declares no region slots but 1 regions were attached".to_owned(),
+            )),
+        );
+        assert_eq!(domain.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_eager_bind_dimension_cast_preserves_witness_errors() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let value = XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone()));
+        let output_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
+        for data_type in [DataType::F32, DataType::Zero] {
+            let (event, promise) = client.event(()).unwrap();
+            promise.set(Some(ryft_pjrt::Error::invalid_argument("cast witness failed"))).unwrap();
+            let bytes = if data_type.is_zero() { Vec::new() } else { values_to_bytes::<f32>(&[1.0, 2.0]) };
+            let witness = XlaValue::Array(
+                XlaArray::from_host_buffer(&domain, ArrayType::new_static(data_type, [2]), mesh.clone(), bytes)
+                    .unwrap()
+                    .with_execution_fence(ExecutionFence::new(vec![event])),
+            );
+            for checked in [true, false] {
+                let wrapped = ArrayIrValue::<XlaArray<'_>>::Dimension(DimensionValue::constant(2).unwrap());
+                let XlaValue::Array(array) = &witness else { unreachable!() };
+                let witnesses = [ArrayIrValue::Array(array.clone())];
+                let result = if checked {
+                    wrapped.cast(output_type.clone(), &witnesses)
+                } else {
+                    wrapped.cast_unchecked(output_type.clone(), &witnesses)
+                };
+                assert_eq!(
+                    result,
+                    Err(ProgramError::Concretization {
+                        message: "host dimension `cast` cannot retain an array witness producer; bind the cast \
+                                  through a composite context"
+                            .to_owned(),
+                    })
+                );
+                let result = if checked {
+                    value.cast(output_type.clone(), &[witness.clone()])
+                } else {
+                    value.cast_unchecked(output_type.clone(), &[witness.clone()])
+                };
+                assert_eq!(result, Err(ProgramError::InvalidArgument { message: "cast witness failed".to_owned() }),);
+            }
+        }
+        assert_eq!(domain.cache_size(), 0);
     }
 
     #[test]
@@ -15981,11 +16542,30 @@ mod tests {
         // An input that belongs to a session over a different client is rejected by client identity.
         let input = f32_vector(&foreign_domain, &foreign_mesh, &[1.0, 2.0]);
         assert!(matches!(
-            domain.bind(NegOperation::new(), Vec::new(), &[input]),
+            domain.bind(NegOperation::new(), Vec::new(), &[input.clone()]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is owned by a \
                     different PJRT client than this domain's client",
         ));
+        // Dimension-result casts execute on the host but still require array witnesses from the selected client.
+        let dimension_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
+        let dimension =
+            XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.parent().clone()));
+        assert_eq!(
+            domain.parent().bind(
+                CastOperation::checked(
+                    dimension_type.clone(),
+                    vec![dimension_type, input.r#type().into_owned().into()],
+                ),
+                Vec::new(),
+                &[dimension, XlaValue::Array(input)],
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: "received incompatible devices for eager xla execution: input #0 is owned by a different \
+                          PJRT client than this domain's client"
+                    .to_owned(),
+            }),
+        );
     }
 
     #[test]

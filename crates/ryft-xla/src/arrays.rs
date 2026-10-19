@@ -5,8 +5,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Memory, Parameter, Parameterized, ProjectedContext,
-    Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, ValueDomainDispatch, check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, LayoutError, Memory, Parameter, Parameterized,
+    ProjectedContext, Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, ValueDomainDispatch,
+    check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -346,6 +347,7 @@ impl<'o> XlaArray<'o> {
         // Derive the global shard layout and transfer only the shards owned by this process. Remote shards remain
         // represented by metadata when `Self::from_addressable_buffers` materializes the final array.
         let data_type = r#type.data_type();
+        let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose().map_err(Error::from)?;
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
@@ -393,7 +395,7 @@ impl<'o> XlaArray<'o> {
                     shard_dimensions.as_slice(),
                     None,
                     memory,
-                    None,
+                    device_layout.clone(),
                 )?);
             } else {
                 // Compute row-major strides in units of elements so that each shard slice can be translated
@@ -468,7 +470,7 @@ impl<'o> XlaArray<'o> {
                     shard_dimensions.as_slice(),
                     byte_strides.as_deref(),
                     memory,
-                    None,
+                    device_layout.clone(),
                 )?);
             }
         }
@@ -585,6 +587,12 @@ impl<'o> XlaArray<'o> {
     #[inline]
     pub fn xla_domain(&self) -> &XlaDomain<'o> {
         &self.domain
+    }
+
+    /// Returns the whole-execution completion shared by this array's producer, when it has one.
+    #[inline]
+    pub(crate) fn execution_fence(&self) -> Option<&ExecutionFence> {
+        self.execution_fence.as_ref()
     }
 
     /// Returns the [`DataType`] of the elements stored in this [`XlaArray`].
@@ -807,6 +815,18 @@ impl<'o> XlaArray<'o> {
                 expected: r#type.memory(),
                 actual: buffer_memory.kind()?.to_string(),
             });
+        }
+
+        if let Some(expected) = r#type.layout() {
+            let actual = Layout::from_pjrt(buffer.specification()?.layout)?;
+            if &actual != expected {
+                return Err(LayoutError::InvalidLayout {
+                    message: format!(
+                        "buffer on device {device_id} uses layout `{actual}` but its type declares `{expected}`",
+                    ),
+                }
+                .into());
+            }
         }
 
         // Validate the concrete buffer type against the physical representation of the logical shard type.
@@ -1560,6 +1580,82 @@ mod tests {
                 actual,
             },
         );
+    }
+
+    #[test]
+    #[allow(deprecated)] // PJRT currently exposes actual buffer layout only through this query.
+    fn test_array_from_host_buffer_layout() {
+        let client = crate::tests::execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&device).unwrap()],
+        )
+        .unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let array = XlaArray::from_host_buffer(
+            &domain,
+            ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone()),
+            mesh.clone(),
+            values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
+        assert_eq!(array.layout(), Some(&layout));
+        assert_eq!(
+            array.addressable_shards().next().unwrap().buffer().unwrap().layout(),
+            Ok(layout.to_pjrt().unwrap())
+        );
+        assert_eq!(
+            values_from_bytes::<f64>(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap().as_slice()),
+            vec![1., 2., 3., 4., 5., 6.],
+        );
+        let wrong_buffer = client
+            .buffer(
+                values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]).as_slice(),
+                BufferType::F64,
+                [2, 3],
+                None,
+                device.clone(),
+                None,
+            )
+            .unwrap();
+        let error = XlaArray::from_addressable_buffers(
+            &domain,
+            ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout),
+            mesh,
+            vec![wrong_buffer],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid layout: buffer on device {} uses layout `tiled{{1,0}}` but its type declares `tiled{{0,1}}`",
+                device.id().unwrap(),
+            )
+        );
+    }
+
+    #[test]
+    fn test_empty_array_host_materialization_preserves_producer_errors() {
+        let client = crate::tests::execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&device).unwrap()],
+        )
+        .unwrap();
+        for data_type in [DataType::F32, DataType::Zero] {
+            let (event, promise) = client.event(()).unwrap();
+            promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
+            let array = XlaArray::from_host_buffer(&domain, ArrayType::new_static(data_type, [0]), mesh.clone(), [])
+                .unwrap()
+                .with_execution_fence(ExecutionFence::new(vec![event]));
+            let copy = crate::arrays_v0::host::begin_materialize_dense_array_bytes(&array).unwrap();
+            assert_eq!(copy.shard_copy_count(), 0);
+            assert_eq!(copy.finish().unwrap_err().to_string(), "empty producer failed");
+        }
     }
 
     #[test]

@@ -1334,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_lower_mlir_module_for_program_emits_fmha_scale_bias_softmax_on_cuda() {
-        // A broadcastable user bias is expanded to the physical score geometry before entering the ScaleBias ABI.
+        // A broadcastable user bias is expanded to the physical score shape before entering the ScaleBias ABI.
         let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
             DataType::BF16,
             2,
@@ -1658,7 +1658,7 @@ mod tests {
                 .unwrap();
         }
 
-        // The analytical backward uses the same first-class geometry and mask construction.
+        // The analytical backward uses the same first-class dimensions and mask construction.
         let (program, input_types, output_types) =
             build_backward(2, false, attention_backward_operation(AttentionConfiguration::new().with_scale(0.125)));
         lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None).unwrap();

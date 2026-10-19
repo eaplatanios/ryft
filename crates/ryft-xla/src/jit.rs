@@ -945,6 +945,8 @@ impl<'c> XlaDomain<'c> {
     }
 
     /// Enqueues an XLA runtime program and retains whole-execution completion, including for zero-output calls.
+    /// Erased zero-space inputs await producer completion before submission because no physical input buffer can
+    /// carry their dependency. Bounded-dynamic input preparation and output reconstruction can also wait for transfers.
     pub fn interpret_async<In, Out>(
         &self,
         executable: &ExecutableXlaFunction<'c, In, Out>,

@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use ryft_core::{
-    Array, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, ConstrainShardingOperation, CustomCallOperation,
-    DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation,
-    EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction, LogicalMesh, Memory,
-    OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError, Provenance,
-    RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape, ShardMap,
-    ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed, Value,
+    Array, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, CastOperation, ConstrainShardingOperation,
+    CustomCallOperation, DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation,
+    DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
+    LogicalMesh, Memory, OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError,
+    Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
+    ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed, Value,
     ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
@@ -25,13 +25,14 @@ use crate::experimental::lowering::compositions::{
 use crate::experimental::lowering::regions::{lower_nested_program_inline, lower_program_outputs_with_inputs};
 use crate::experimental::lowering::signature::XlaExecutableSignature;
 use crate::experimental::lowering::types::{
-    lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64, lower_tensor_type,
-    lower_unplaced_constant_output,
+    lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
+    lower_tensor_type, lower_unplaced_constant_output,
 };
 use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
+use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 use crate::{RaggedDotLoweringStrategy, ToMlir};
@@ -197,8 +198,8 @@ impl LoweredXlaModule {
 ///
 /// Ordered assertions and ordered I/O intentionally use independent chains. This preserves program order within
 /// each observable class without introducing an ordering relationship between unrelated classes. Unordered I/O has
-/// no token slot. Entry guards are the one exception: they replace an entry validation that precedes everything the
-/// entry guards, so their lowering joins the assertion chain into the ordered-I/O chain (refer to
+/// no token slot. Region input guards are the exception: input validation must precede every operation in the
+/// invoked region, so their lowering joins the assertion chain into the ordered-I/O chain (refer to
 /// `operations::assertions::lower_guard`).
 #[derive(Copy, Clone, Default)]
 pub(crate) struct EffectTokens<'b, 'c: 'b, 't: 'c> {
@@ -1466,6 +1467,8 @@ where
             shardings.push(token_sharding);
         }
     }
+    // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary,
+    // whose types already omit static zeros and include hidden extent scalars; tokens have no array type.
     // Placement belongs to physical array slots, including captures, but never to the appended effect token.
     // Default device placement needs no attribute; host identities still need attributes even without transfers.
     let function_arguments = physical_argument_tensor_types
@@ -1489,10 +1492,15 @@ where
                     context.integer_attribute(context.signless_integer_type(64), *output_index as i64).as_ref(),
                 );
             }
+            if let Some(array_type) = physical_argument_types.get(index)
+                && let Some(layout) = lower_boundary_layout(array_type, "input", &context)?
+            {
+                attributes.insert("mhlo.layout_mode".into(), layout);
+            }
             let attributes = (!attributes.is_empty()).then_some(attributes);
-            TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+            Ok::<_, LoweringError>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let function_results = physical_output_tensor_types
         .iter()
         .enumerate()
@@ -1507,10 +1515,15 @@ where
                     context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
                 );
             }
+            if let Some(array_type) = physical_output_types.get(index)
+                && let Some(layout) = lower_boundary_layout(array_type, "output", &context)?
+            {
+                attributes.insert("mhlo.layout_mode".into(), layout);
+            }
             let attributes = (!attributes.is_empty()).then_some(attributes);
-            TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+            Ok::<_, LoweringError>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     module.body()?.append_operation({
         let function_block = context.block(
@@ -1982,6 +1995,17 @@ where
                     let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
                     let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
                     broadcast_changes_explicit_sharding(input_type, output_type, output_axes)
+                } else if operation.projected_payload::<CastOperation<ArrayIrType>>().is_some()
+                    || operation.projected_payload::<CastOperation<ArrayType>>().is_some()
+                {
+                    // Casts of first-class dimensions carry no placement, and array casts constrain placement only
+                    // when the explicit placement changes.
+                    let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
+                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                    match (<&ArrayType>::try_from(input_type.as_ref()), <&ArrayType>::try_from(output_type.as_ref())) {
+                        (Ok(input_type), Ok(output_type)) => cast_changes_explicit_placement(input_type, output_type),
+                        _ => false,
+                    }
                 } else {
                     operation
                         .projected_payload::<DynamicReshapeOperation>()

@@ -94,7 +94,11 @@ impl<'o> XlaArray<'o> {
         let global_dimensions = global_shape.as_slice();
         if self.data_type().is_zero() {
             let r#type = self.r#type().into_owned().with_sharding(target_sharding)?;
-            return Ok(Self::from_zero_space(engine, r#type, target_mesh)?);
+            let mut output = Self::from_zero_space(engine, r#type, target_mesh)?;
+            if let Some(fence) = self.execution_fence() {
+                output = output.with_execution_fence(fence.clone());
+            }
+            return Ok(output);
         }
 
         // Tier 1: exact-shard fast path. Doesn't materialize anything new on host.
@@ -106,7 +110,7 @@ impl<'o> XlaArray<'o> {
             &target_sharding,
         )? {
             let shape = Shape::new(global_dimensions.iter().copied().map(Dimension::Static).collect());
-            let array_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding)?;
+            let array_type = self.r#type().into_owned().with_shape(shape).with_sharding(target_sharding)?;
             return Ok(Self::from_addressable_buffers(engine, array_type, target_mesh, addressable_buffers)?);
         }
 

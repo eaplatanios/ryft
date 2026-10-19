@@ -18,7 +18,7 @@ use ryft_mlir::{
 };
 
 use crate::experimental::lowering::regions::lower_program_outputs_with_inputs;
-use crate::experimental::lowering::types::lower_tensor_type;
+use crate::experimental::lowering::types::{lower_boundary_layout, lower_tensor_type};
 use crate::experimental::lowering::{
     CollectiveLoweringState, EffectTokens, contains_unresolved_references, contains_unresolved_state,
     current_or_new_token, normalize_function_name, remove_unused_constants, serialize_lowered_module,
@@ -32,7 +32,8 @@ use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, ToMlir,
 /// Lowers a [`TracedShardMap`] traced for [`XlaDomain`] (e.g., by [`ryft_core::trace_shard_map`]) to a textual
 /// StableHLO/Shardy MLIR module whose single function runs the traced body as one `sdy.manual_computation` over the
 /// boundary of the traced shard map. The function arguments and results carry the input and output shardings of the
-/// boundary as `sdy.sharding` attributes. The traced body is lowered as is, since tracing already simplified it.
+/// boundary as `sdy.sharding` attributes and preserve requested physical layouts through `mhlo.layout_mode`. The
+/// traced body is lowered as is, since tracing already simplified it.
 ///
 /// # Parameters
 ///
@@ -200,22 +201,30 @@ fn lower_shard_map_module(
 
     // The global boundary types of a traced shard map carry no memory kind (refer to `ShardMap::global_input_type` and
     // to the global output type derivation of `ShardMapOperation::from_program`), so the function signature carries
-    // only the boundary shardings.
+    // the boundary shardings and any requested physical layouts.
     let function_arguments = global_input_tensor_types
         .iter()
+        .zip(&global_input_types)
         .zip(shard_map.in_shardings().iter())
-        .map(|(tensor_type, sharding)| {
+        .map(|((tensor_type, array_type), sharding)| {
             let sharding = sharding.to_mlir(location)?;
-            let attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
+            let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
+            if let Some(layout) = lower_boundary_layout(array_type, "input", &context)? {
+                attributes.insert("mhlo.layout_mode".into(), layout);
+            }
             Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
     let function_results = global_output_tensor_types
         .iter()
+        .zip(&global_output_types)
         .zip(shard_map.out_shardings().iter())
-        .map(|(tensor_type, sharding)| {
+        .map(|((tensor_type, array_type), sharding)| {
             let sharding = sharding.to_mlir(location)?;
-            let attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
+            let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
+            if let Some(layout) = lower_boundary_layout(array_type, "output", &context)? {
+                attributes.insert("mhlo.layout_mode".into(), layout);
+            }
             Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
@@ -775,6 +784,89 @@ mod tests {
             let second = lines.iter().position(|line| line == &format!("second: {device}.0")).unwrap();
             assert!(first < second);
         }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect physical result storage independently of the lowered IR.
+    fn test_to_mlir_module_preserves_cast_layouts() {
+        use ryft_core::{Cast, Layout, TiledLayout, Typed};
+        use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
+
+        use crate::ToPjrt;
+        use crate::tests::execution_client;
+
+        let mesh = test_manual_mesh("x", 1);
+        let sharding = Sharding::replicated(mesh.clone(), 2);
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(layout.clone());
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |input| {
+                let input = input.cast(input.r#type().into_owned().with_layout(None), &[]).unwrap();
+                input.cast(input.r#type().into_owned().with_layout(layout.clone()), &[]).unwrap()
+            },
+            input_type,
+            mesh,
+            sharding.clone(),
+            sharding,
+        )
+        .unwrap();
+        let module = to_mlir_module(&traced, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=1]>
+                  func.func @main(%arg0: tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\", \
+                      sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={\"x\"}>}) \
+                      -> (tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\", \
+                      sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}, {}], replicated={\"x\"}>] \
+                        out_shardings=[<@mesh, [{}, {}], replicated={\"x\"}>] \
+                        manual_axes={\"x\"} (%arg1: tensor<2x3xf32>) {
+                      %1 = stablehlo.custom_call @LayoutConstraint(%arg1) {\
+                          operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
+                          result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                      sdy.return %1 : tensor<2x3xf32>
+                    } : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    return %0 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+        let client = execution_client();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(1))
+            .unwrap();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let values = vec![1f32, 2., 3., 4., 5., 6.];
+        let buffer = client
+            .buffer(
+                values_to_bytes(&values).as_slice(),
+                BufferType::F32,
+                [2, 3],
+                None,
+                device,
+                Some(layout.to_pjrt().unwrap()),
+            )
+            .unwrap();
+        let inputs = vec![ExecutionInput { buffer: Arc::new(buffer), donatable: false }];
+        let outputs = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                vec![],
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let output = &outputs[0].outputs[0];
+        assert_eq!(output.layout(), Ok(layout.to_pjrt().unwrap()));
+        let bytes = output.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(2))).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(&bytes), values);
     }
 
     #[test]

@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, BatchAxis,
-    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    CalleeRegionDriver, CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinationKind,
-    CotangentDestinations, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, InputRegionProvenance,
-    InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, BatchableOperation,
+    BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BoundaryLayout, CalleeRegionDriver,
+    CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinationKind, CotangentDestinations,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Dimension, InputRegionProvenance, InterpretableOperation,
+    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter, OperationProvider,
+    OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
     RematerializationOptimizationBarrier, ShardMapOperation, StagingContext, Tracer, TracingContext,
@@ -475,17 +475,6 @@ impl CompiledCallOperation<XlaConstant> for XlaOperation {
     }
 }
 
-/// Bridges canonical internal physical positions to the public batching declaration.
-fn batch_axis_from_position(axis: Option<usize>) -> BatchAxis {
-    BatchAxis::from_optional_position(axis)
-}
-
-/// Recovers a canonical physical position returned by the core program batching pass.
-fn batch_axis_position(axis: &BatchAxis) -> Option<usize> {
-    axis.axis()
-        .map(|axis| usize::try_from(axis.value()).expect("program batching returns canonical nonnegative axes"))
-}
-
 fn ensure_call_input_types<T: Type>(
     operation_name: &'static str,
     expected_types: &[T],
@@ -729,12 +718,21 @@ where
     }
 }
 
-// Batching rule for [`JitCallOperation`]: the callee region is rebatched over the mapped input axes (via
-// [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the
-// batched callee re-attached. An eager
-// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
-// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
-// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
+// Batching rule for [`JitCallOperation`]: the callee region is rebatched over the boundary layout of the input carriers
+// (via [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the batched
+// callee re-attached. An eager client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the
+// batched call immediately, a staging parent stages it into the enclosing trace, and a differentiation parent
+// dispatches it through its own `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize`
+// closures.
+//
+// The callee boundary is flat, so it carries complete carriers: the level extent and the per-item extents of bounded
+// ragged carriers cross it as additional inputs, a mapped dimension crosses it as its packed extent array, and the
+// outputs are rebuilt from the output layout together with the extents that the callee forwards or produces, while the
+// callee consumed every input extent identity that no output carries (the rule's evidence). Layouts built from live
+// carriers place every auxiliary slot ahead of the payload slots, so the auxiliary slots extend the call's leading
+// lifted-capture prefix, ahead of the original captures: like captures, they are never pruned, and like residuals, they
+// never receive tangents, because extents are discrete. The batched callee also forwards the level extent as its
+// leading output, which no output carrier reads, so the reconstruction ignores it.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
 where
     C: Context<Type = ArrayIrType>,
@@ -746,8 +744,8 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
-        if axes.iter().all(BatchAxis::is_replicated) {
+        // A replicated carrier owns no per-item extents, so a completely replicated call binds its original callee.
+        if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
             return Ok(context
                 .parent()
                 .bind(
@@ -760,22 +758,14 @@ where
                 .collect::<Vec<_>>()
                 .into());
         }
-        // The canonical composite transform threads one leading dimension through the callee. Treat it as an
-        // additional explicit capture and remove only its bookkeeping output; the original capture order remains.
-        let (callee, axes) = driver
-            .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
+        let (input_layout, input_slots) = driver.pack_boundary(context, inputs)?;
+        let (callee, input_layout, output_layout, evidence) = driver
+            .batch_program(context, driver.region(0)?, &input_layout, ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
-        let mut values = vec![context.axis_extent().clone()];
-        values.extend(inputs.iter().map(|input| input.value().clone()));
-        let mut outputs = context.parent().bind(Self::new(self.capture_count() + 1), vec![callee], &values)?;
-        check_count!("output", outputs, axes.len() + 1, ProgramError);
-        outputs.remove(0);
-        Ok(outputs
-            .into_iter()
-            .zip(axes)
-            .map(|(value, axis)| ArrayIrBatch::new(value, axis))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+        let operation = Self::new(self.capture_count() + input_layout.auxiliary_slots().len());
+        let outputs = context.parent().bind(operation, vec![callee], &input_slots)?;
+        check_count!("output", outputs, output_layout.slot_count(), ProgramError);
+        Ok(BatchedOutputs::new(driver.unpack_boundary(&output_layout, outputs.as_slice())?, evidence))
     }
 }
 
@@ -790,9 +780,10 @@ where
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy>, BatchingError> {
-        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        // Rebatch the callee region over the mapped input axes when any input carries the batch axis; an
-        // all-replicated call binds its original callee unchanged.
+        // Rebatch the callee region over the boundary layout of the input carriers when any input carries the batch
+        // axis, exactly like the composite rule (whose documentation describes the boundary), except that a homogeneous
+        // level has no first-class extent, so only the per-item extents of ragged carriers precede the payloads and
+        // extend the lifted-capture prefix. An all-replicated call binds its original callee unchanged.
         //
         // Unlike the forward-mode and transpose rules below, this rebatching is deliberately not served from the
         // callee region's retained transform cache: the batched program depends on live `BatchingContext` state (the
@@ -803,39 +794,24 @@ where
         // joins the region transform cache behind a gate measurement, through a batching-policy hook returning
         // `Option<key>` where `None` keeps a policy uncached, so soundness stays opt-in per policy. See
         // `.tasks/plan_general_transform_caching_analysis.md`.
-        let (batched_callee, output_axes) = match ArrayBatch::common_batch_size(inputs)? {
-            Some(_) => {
-                let input_batch_axes = inputs
-                    .iter()
-                    .map(|input| batch_axis_from_position(input.batch_axis_position()))
-                    .collect::<Vec<_>>();
-                let (batched_callee, output_axes) = driver
-                    .batch_program(
-                        context,
-                        driver.region(0)?,
-                        input_batch_axes.as_slice(),
-                        ProgramBatchingOutputAxesPolicy::Natural,
-                    )?
-                    .into_parts();
-                let output_axes = output_axes.iter().map(batch_axis_position).collect::<Vec<_>>();
-                (batched_callee.into_simplified()?, output_axes)
-            }
-            None => {
-                let callee = driver.region(0)?;
-                let output_axes = vec![None; callee.output_types().len()];
-                (callee.to_program(), output_axes)
-            }
-        };
-        let outputs =
-            context
-                .parent()
-                .bind(*self, CalleeRegionDriver::new(&[Arc::new(batched_callee)]), &physical_inputs)?;
-        Ok(outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output, batch_axis_from_position(axis)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+        if ArrayBatch::common_batch_size(inputs)?.is_none() {
+            let callee = driver.region(0)?.to_program();
+            let inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+            let outputs = context.parent().bind(*self, CalleeRegionDriver::new(&[Arc::new(callee)]), &inputs)?;
+            return Ok(outputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>().into());
+        }
+        let (input_layout, input_slots) = driver.pack_boundary(context, inputs)?;
+        let (callee, input_layout, output_layout, evidence) = driver
+            .batch_program(context, driver.region(0)?, &input_layout, ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
+        let operation = Self::new(self.capture_count() + input_layout.auxiliary_slots().len());
+        let outputs = context.parent().bind(
+            operation,
+            CalleeRegionDriver::new(&[Arc::new(callee.into_simplified()?)]),
+            &input_slots,
+        )?;
+        check_count!("output", outputs, output_layout.slot_count(), ProgramError);
+        Ok(BatchedOutputs::new(driver.unpack_boundary(&output_layout, outputs.as_slice())?, evidence))
     }
 }
 
@@ -2081,6 +2057,187 @@ mod tests {
         let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
         assert_eq!(body.input_types().len(), 2);
         assert_eq!(body.output_ids()[0], body.input_ids()[0]);
+    }
+
+    #[test]
+    fn test_jit_call_operation_batch_transports_ragged_and_mapped_dimension_inputs() {
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver,
+            RaggedAxis, RecursiveBatchingDriver, ReduceOperation, ReductionKind,
+        };
+
+        // The callee boundary is flat, so the per-item extents of the ragged input cross it as an additional leading
+        // capture and the mapped dimension as its packed extent array. The callee sums the ragged input under its
+        // per-item extents, and the outputs are rebuilt from the output layout, including the extents that the callee
+        // forwards, so no extent identity is consumed.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let dimension_type = DimensionType::from(Dimension::Dynamic(length.clone()));
+        let ragged_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let dimension = builder.add_input(dimension_type.clone().into());
+        let values = builder.add_input(ragged_type.into());
+        let sum = builder
+            .add_instruction(
+                XlaOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                Vec::new(),
+                vec![values],
+                None,
+            )
+            .unwrap()[0];
+        let callee = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sum, values, dimension],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let callees = [Arc::new(callee)];
+        let regions = CalleeRegionDriver::new(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |(lengths, values, extents): (
+                Tracer<TracingContext<XlaConstant, XlaOperation>>,
+                Tracer<TracingContext<XlaConstant, XlaOperation>>,
+                Tracer<TracingContext<XlaConstant, XlaOperation>>,
+            )| {
+                let parent = values.context();
+                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(2).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                let inputs = [
+                    ArrayIrBatch::mapped_dimension(lengths, BatchAxis::new(0), dimension_type.clone())?,
+                    ArrayIrBatch::new(values, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
+                        1,
+                        extents,
+                        length.clone(),
+                        vec![0],
+                    )])?,
+                ];
+                let (mut outputs, evidence) =
+                    JitCallOperation::<ArrayIrType>::new(0).batch(&context, &driver, &inputs)?.into_parts();
+                assert_eq!(evidence, Vec::<DimensionVariable>::new());
+                assert_eq!(outputs.len(), 3);
+                assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+                assert_eq!(outputs[0].ragged_axes(), &[]);
+                assert_eq!(outputs[1].ragged_axes().len(), 1);
+                assert_eq!(outputs[1].ragged_axes()[0].dimension(), &length);
+                assert_eq!(outputs[2].mapped_dimension_type(), Some(&dimension_type));
+                let lengths = outputs.pop().unwrap().into_value();
+                let values = outputs.pop().unwrap();
+                let extents = values.ragged_axes()[0].extents().clone();
+                Ok::<_, ProgramError>(vec![outputs.pop().unwrap().into_value(), values.into_value(), extents, lengths])
+            },
+            (
+                ArrayIrType::Array(ArrayType::new_static(DataType::I64, [2])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 4])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::I64, [2])),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i64[2], %1:f32[2, 4], %2:i64[2] .
+                let %3:dimension<2> = const 2
+                    %4:dimension<2>, %5:i64[2], %6:f32[2], %7:f32[2, 4], %8:i64[2] = jit_call [capture_count=2] \
+                        %3 %2 %0 %1 [
+                        callee={
+                            lambda %0:dimension<2>, %1:i64[2], %2:i64[2], %3:f32[2, 4] .
+                            let %4:i64[4] = iota [type=i64[4], dimension=0]
+                                %5:dimension<2> = constant [value=2]
+                                %6:dimension<4> = constant [value=4]
+                                %7:i64[2, 4] = broadcast [output_axes=[1]] %4 %5 %6
+                                %8:i64[2, 4] = broadcast [output_axes=[0]] %1 %5 %6
+                                %9:bool[2, 4] = compare [direction=LessThan] %7 %8
+                                %10:f32[2, 4] = zero_like %3
+                                %11:f32[2, 4] = select %9 %3 %10
+                                %12:f32[2] = reduce [kind=sum, axes=[1]] %11
+                            in (%0, %1, %12, %3, %2)
+                        },
+                    ]
+                in (%6, %7, %5, %8)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_batched_ragged_jit_call_executes_with_masked_extents_on_cpu() {
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer, RaggedAxis,
+            ReduceOperation, ReductionKind,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // The callee sums its ragged input and doubles it. Batching passes the per-item extents into the callee, so
+        // each item sums only its own elements despite the large padding values, and the doubled output keeps the
+        // extents that the callee forwards (its padding is doubled as well, since padding is unspecified).
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let callee = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let values = builder.add_input(ragged_type.into());
+            let sum = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                    Vec::new(),
+                    vec![values],
+                    None,
+                )
+                .unwrap()[0];
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![values, values], None).unwrap()[0];
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sum, doubled],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+        }
+        .unwrap();
+        let (_, program) =
+            TracingContext::<XlaConstant, XlaOperation>::trace(
+                |(extent, extents, values)| {
+                    let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(extent.domain(), extent);
+                    let input = ArrayIrBatch::new(values, BatchAxis::new(0))?
+                        .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])?;
+                    let mut outputs = context
+                        .bind(
+                            XlaOperation::JitCall(JitCallOperation::new(0)),
+                            vec![callee],
+                            &[BatchingTracer::new(context.clone(), input)],
+                        )?
+                        .into_iter()
+                        .map(BatchingTracer::into_batch)
+                        .collect::<Vec<_>>();
+                    let doubled = outputs.pop().unwrap();
+                    let extents = doubled.ragged_axes()[0].extents().clone();
+                    Ok::<_, ProgramError>((outputs.pop().unwrap().into_value(), extents, doubled.into_value()))
+                },
+                (
+                    ArrayIrType::from(DimensionType::from(Dimension::Static(2))),
+                    ArrayIrType::from(ArrayType::new_static(DataType::I32, [2])),
+                    ArrayIrType::from(ArrayType::new_static(DataType::F64, [2, 3])),
+                ),
+            )
+            .unwrap();
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program.into_flat_program(),
+                &[
+                    MixedValue::Dimension(2),
+                    MixedValue::Integers(vec![2, 1], vec![2]),
+                    MixedValue::Array(vec![1.0, 2.0, 900.0, 3.0, 800.0, 700.0], vec![2, 3]),
+                ],
+                &[],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![3.0, 3.0], vec![2]),
+                MixedValue::Integers(vec![2, 1], vec![2]),
+                MixedValue::Array(vec![2.0, 4.0, 1800.0, 6.0, 1600.0, 1400.0], vec![2, 3]),
+            ]),
+        );
     }
 
     #[test]

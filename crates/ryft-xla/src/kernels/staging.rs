@@ -14,8 +14,8 @@ use ryft_core::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation, Context,
     CotangentAccumulator, CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OutputRegionProvenance,
+    DifferentiationPolicy, Domain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
+    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationProvider, OutputRegionProvenance,
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
@@ -505,8 +505,9 @@ impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for XlaKernelOpe
     }
 }
 
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
-    for XlaKernelOperation
+impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O> for XlaKernelOperation
+where
+    O: OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

@@ -157,8 +157,8 @@ fn train<A, C, ReadValues>(
     mut read_values: ReadValues,
 ) -> ExampleResult<Training>
 where
-    A: ArrayOperations<Type: DifferentiableType + ReferenceMemberType>,
-    C: Context<Type = A::Type, Value = A> + TrainingDomain<A>,
+    A: ArrayOperations<Type = C::Type>,
+    C: Context<Value = A> + TrainingDomain<A>,
     LinearizationTracer<C>: ArrayOperations,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {
@@ -250,8 +250,8 @@ fn run_core<A, C, ReadValues>(
     read_values: ReadValues,
 ) -> ExampleResult<Training>
 where
-    A: ArrayOperations<Type: DifferentiableType + ReferenceMemberType>,
-    C: Context<Type = A::Type, Value = A> + TrainingDomain<A>,
+    A: ArrayOperations<Type = C::Type>,
+    C: Context<Value = A> + TrainingDomain<A>,
     LinearizationTracer<C>: ArrayOperations,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {

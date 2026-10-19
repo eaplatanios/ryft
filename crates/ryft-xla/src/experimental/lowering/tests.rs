@@ -3,7 +3,7 @@ use std::sync::Arc;
 use indoc::indoc;
 use pretty_assertions::assert_eq;
 use ryft_core::{
-    AddOperation, AtomId, CaptureReference, ConditionOperation, Context, Cos, Differentiate, Dimension,
+    AddOperation, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos, Differentiate, Dimension,
     DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext,
     EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, Placeholder, Program, ProgramBuilder,
     ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, Sin, TracedShardMap,
@@ -87,13 +87,17 @@ pub(crate) fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>
     DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
 }
 
-/// One physical value of the mixed executable ABI used by the reshape execution tests: `f64` array storage with
-/// its physical dimensions on input and the row-major elements inside its logical dimensions on output, or one
-/// `i64` dimension, which on output also carries the hidden runtime extents that follow the logical outputs.
+/// One physical value of the mixed executable ABI used by the reshape execution tests: `f64` or `i32` array
+/// storage with its physical dimensions on input and the row-major elements inside its logical dimensions on
+/// output, or one `i64` dimension, which on output also carries the hidden runtime extents that follow the logical
+/// outputs.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MixedValue {
     /// `f64` storage of one array together with its dimensions.
     Array(Vec<f64>, Vec<u64>),
+
+    /// `i32` storage of one array together with its dimensions (e.g., the per-item extents of a ragged batch).
+    Integers(Vec<i32>, Vec<u64>),
 
     /// One `i64` first-class dimension or hidden runtime extent.
     Dimension(i64),
@@ -128,6 +132,14 @@ pub(crate) fn execute_mixed_program(
             MixedValue::Array(values, dimensions) => client.buffer(
                 values_to_bytes(values).as_slice(),
                 BufferType::F64,
+                dimensions.as_slice(),
+                None,
+                device.clone(),
+                None,
+            )?,
+            MixedValue::Integers(values, dimensions) => client.buffer(
+                values_to_bytes(values).as_slice(),
+                BufferType::I32,
                 dimensions.as_slice(),
                 None,
                 device.clone(),
@@ -174,8 +186,11 @@ pub(crate) fn execute_mixed_program(
         .iter()
         .enumerate()
         .map(|(index, output)| {
-            let bytes = output.copy_to_host(None)?.r#await()?;
-            if output_types.get(index).is_none_or(|output_type| output_type.data_type() != DataType::F64) {
+            let bytes = output
+                .copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(output.dimensions()?.len())))?
+                .r#await()?;
+            let data_type = output_types.get(index).map(|output_type| output_type.data_type());
+            if data_type.is_none_or(|data_type| data_type != DataType::F64 && data_type != DataType::I32) {
                 // Dimension outputs and the trailing hidden runtime extents are `i64` scalars.
                 return Ok(MixedValue::Dimension(values_from_bytes::<i64>(bytes.as_slice())[0]));
             }
@@ -183,6 +198,10 @@ pub(crate) fn execute_mixed_program(
             // result may still carry its backing allocation and trailing size metadata, which are ignored.
             let logical = output.unpadded_dimensions()?.to_vec();
             let element_count = logical.iter().product::<u64>() as usize;
+            if data_type == Some(DataType::I32) {
+                let elements = values_from_bytes::<i32>(&bytes[..element_count * size_of::<i32>()]);
+                return Ok(MixedValue::Integers(elements, logical));
+            }
             let elements = values_from_bytes::<f64>(&bytes[..element_count * size_of::<f64>()]);
             Ok(MixedValue::Array(elements, logical))
         })
@@ -258,6 +277,42 @@ fn test_collect_nested_sharding_mesh() {
         ),
         Err(LoweringError::IncompatibleNestedMeshes)
     ));
+
+    // Cast placement can be the module's only mesh use, including when its result is internal.
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+    let input_type = test_vector_type(4);
+    let output_type = input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+    for operation in [
+        CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.clone().into()]).into(),
+        XlaOperation::Array(ArrayOperation::Cast(CastOperation::checked(output_type, vec![input_type.clone()]))),
+    ] {
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        builder.add_instruction(operation, vec![], vec![input], None).unwrap();
+        let program = builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
+        assert_eq!(collect_nested_sharding_mesh(&program, None).unwrap(), Some(mesh.clone()));
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone()],
+                &Vec::<ArrayType>::new(),
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                    return
+                  }
+                }
+            "#},
+        );
+    }
 }
 
 #[test]
@@ -599,6 +654,43 @@ fn test_entry_alias_attribute_executes_in_place_on_cpu() {
     assert_eq!(output_pointer, input_pointer);
     let output = output.copy_to_host(None).unwrap().r#await().unwrap();
     assert_eq!(values_from_bytes::<f32>(output.as_slice()), vec![2.0, 4.0, 6.0, 8.0]);
+}
+
+#[test]
+fn test_to_mlir_module_for_program_preserves_boundary_layouts() {
+    use ryft_core::{Layout, TiledLayout};
+
+    let array_type =
+        ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+    let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
+    let mut builder = CompositeXlaProgramBuilder::new();
+    let input = builder.add_input(array_type.clone().into());
+    let zero = builder.add_input(zero_type.clone().into());
+    let program = builder
+        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero, input], vec![Placeholder; 2], vec![Placeholder; 2])
+        .unwrap();
+    assert_eq!(
+        to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone(), zero_type.clone()],
+            &vec![zero_type, array_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap(),
+        indoc! {"
+            module {
+              func.func @main(%arg0: tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) \
+                  -> (tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) {
+                %c = stablehlo.constant dense<false> : tensor<i1>
+                %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<2x3xi1>
+                return %arg0 : tensor<2x3xf32>
+              }
+            }
+        "},
+    );
 }
 
 #[test]

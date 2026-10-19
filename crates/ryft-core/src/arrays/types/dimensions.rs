@@ -348,7 +348,7 @@ impl TypeIdentity for DimensionVariable {
 /// declared bounds, which are computable before execution like every other dimension type. Its producing instruction
 /// makes that variable an internal identity, so it neither appears in nor needs an input-boundary [`TypeRefinements`]
 /// entry. Execution reads the scalar and checks the observed extent against the declared bounds before the value may
-/// control array geometry. Backend representations are more permissive. For example, a StableHLO
+/// control array shapes. Backend representations are more permissive. For example, a StableHLO
 /// [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary runtime integer tensor
 /// with no provenance requirement, so lowering does not need this machinery. The restriction is a frontend type-system
 /// choice: an _unchecked_ data-derived extent would make output types depend on unbounded runtime values, and

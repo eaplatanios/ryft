@@ -400,7 +400,6 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
     options: &Options,
     schedule: &KernelSchedule,
 ) -> Result<validation::Plan, Error> {
-    let plan = validation::Plan::new(kernel, target, options, schedule)?;
     memory::validate_async_copies(
         kernel
             .definition()
@@ -412,6 +411,23 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
     )?;
     for (instruction_id, instruction) in kernel.definition().body().entry_region_ref().instructions_in_closure() {
         let supported = match instruction.operation() {
+            KernelOperation::Portable(ArrayIrOperation::Guard(_))
+            | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Guard(_))) => {
+                return Err(Error::Unsupported {
+                    operation: "guard",
+                    reason: "runtime type checks require native failure propagation".to_owned(),
+                });
+            }
+            // This rejects every cast, including the unchecked identity and layout casts that transforms stage through
+            // `CastOperation::bind_unchecked` (e.g., when a tangent is rebound at its primal's type), so transformed
+            // kernel bodies that acquire one are unsupported until the native lowering handles casts.
+            KernelOperation::Portable(ArrayIrOperation::Cast(_))
+            | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Cast(_))) => {
+                return Err(Error::Unsupported {
+                    operation: "cast",
+                    reason: "casts are not supported by the baseline scalar lowering".to_owned(),
+                });
+            }
             KernelOperation::Portable(ArrayIrOperation::Assert(_))
             | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(_))) => {
                 return Err(Error::Unsupported {
@@ -527,7 +543,7 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
             });
         }
     }
-    Ok(plan)
+    validation::Plan::new(kernel, target, options, schedule)
 }
 
 /// Constructs the checked source module and its physical argument mapping.
@@ -1774,6 +1790,60 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_casts_and_guard_checks() {
+        use ryft_core::{CastOperation, GuardOperation};
+
+        for (checked, native) in
+            [(Some(true), false), (Some(false), false), (Some(true), true), (Some(false), true), (None, false)]
+        {
+            let operation = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap()],
+            )
+            .unwrap();
+            let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+                let value = references[0].read()?;
+                let r#type = value.r#type().into_owned();
+                let operation = if let Some(checked) = checked {
+                    if native {
+                        let ryft_core::ArrayIrType::Array(r#type) = r#type else { unreachable!() };
+                        let operation = if checked {
+                            CastOperation::checked(r#type.clone(), vec![r#type; 2])
+                        } else {
+                            CastOperation::unchecked(r#type.clone(), vec![r#type; 2])
+                        };
+                        ArrayIrOperation::Array(ArrayOperation::Cast(operation))
+                    } else {
+                        let operation = if checked {
+                            CastOperation::checked(r#type.clone(), vec![r#type; 2])
+                        } else {
+                            CastOperation::unchecked(r#type.clone(), vec![r#type; 2])
+                        };
+                        ArrayIrOperation::Cast(operation)
+                    }
+                } else {
+                    ArrayIrOperation::Guard(GuardOperation::new("kernel", vec![r#type.clone(); 2]))
+                };
+                value.context().bind(operation, vec![], &[value.clone(), value.clone()])?;
+                Ok(())
+            })
+            .unwrap();
+            let verified = VerifiedKernel::new(&definition, 1).unwrap();
+            let error =
+                validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
+                    .err()
+                    .unwrap();
+            assert!(
+                matches!(&error, Error::Unsupported { operation, reason }
+                if *operation == if checked.is_some() { "cast" } else { "guard" }
+                    && reason == if checked.is_some() { "casts are not supported by the baseline scalar lowering" }
+                        else { "runtime type checks require native failure propagation" }),
+                "checked={checked:?}, native={native}: {error:?}",
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_rejects_partial_async_copy_transforms() {
         // Admission rejects a partial source or destination selection before any native module is constructed.
         // `test_module_async_copy_reference_transforms` covers the admitted full identity slices.
@@ -2104,10 +2174,9 @@ mod tests {
                 let context = references[0].context();
                 let source = references[0].read()?;
                 let dimension = context.bind(
-                    ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(
-                        "extent",
-                        DimensionBounds::new(2, Some(5)).unwrap(),
-                    ))),
+                    ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(
+                        DimensionVariable::new("extent", DimensionBounds::new(2, Some(5)).unwrap()).into(),
+                    )),
                     vec![],
                     &[source],
                 )?;

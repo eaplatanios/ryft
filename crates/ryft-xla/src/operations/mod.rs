@@ -9,7 +9,7 @@ use ryft_mlir::{
 
 use crate::LoweringError;
 use crate::experimental::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
-use crate::operations::constants::lower_constructor_layout;
+use crate::operations::constants::lower_layout_constraint;
 
 /// StableHLO lowering of arithmetic operations.
 pub(crate) mod arithmetic;
@@ -185,7 +185,7 @@ where
                 &[],
                 location,
             )?)?;
-            let result = lower_constructor_layout(
+            let result = lower_layout_constraint(
                 broadcast.result(0).unwrap().as_ref(),
                 &physical_type,
                 &mut block.as_ref(),

@@ -23,7 +23,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::operations::manipulation::conversions::lower_cast;
+use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -1190,16 +1190,15 @@ fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i
     Ok(i64::from_ne_bytes(scalar_bytes(buffer, memory)?))
 }
 
-/// Lowers the runtime check of an [`GuardOperation`] over `values`, whose actual types are `actual_types`, against
-/// the guard's `declared_types`. Every occurrence of a declared dimension identity (an array axis or a first-class
-/// dimension member) is observed as an `i64` extent, which is static when its actual type fixes it and read at runtime
-/// otherwise, and an assertion requires each occurrence to equal the first. Pairs that are both static were already
-/// checked when the guard was typed and emit nothing.
+/// Lowers the runtime check of a [`GuardOperation`] over `values`, whose actual types are `actual_types`, against
+/// the guard's `declared_types` (refer to [`lower_type_relationship_checks`]).
 ///
-/// Ordered assertions and ordered I/O normally use independent token chains. An entry guard instead joins its
-/// assertion token into the ordered-I/O chain, so every later ordered I/O effect (including those inside the region
-/// whose entry it guards) is ordered after the check, exactly as the entry validation that it replaces precedes the
-/// region. Ordinary assertions keep their independent chain.
+/// Ordered assertions and ordered I/O normally use independent token chains. A guard instead joins the assertion
+/// token into the ordered-I/O chain, so every later ordered I/O effect (including those inside the region whose input
+/// it checks) is ordered after its check and after every earlier assertion on that chain, exactly as the input
+/// validation that it replaces precedes the region. That includes a guard that emits no check of its own because its
+/// packed declarations are proven, such as the guard through which batching orders values after per-item ragged
+/// checks (refer to the ragged batching of [`GuardOperation`]). Ordinary assertions keep their independent chain.
 ///
 /// # Parameters
 ///
@@ -1217,76 +1216,28 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
-    check_count!("input", values, declared_types.len(), ProgramError);
-    check_count!("input", actual_types, declared_types.len(), ProgramError);
-    // Each occurrence is either a static extent or a lowered runtime `i64` extent.
-    let mut occurrences = Vec::<(DimensionVariable, Result<usize, ValueRef<'b, 'c, 't>>)>::new();
-    for ((declared, &value), actual) in declared_types.iter().zip(values).zip(actual_types) {
-        match (declared, actual) {
-            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if declared.rank() == actual.rank() => {
-                for (axis, (declared, actual)) in
-                    declared.shape().dimensions().iter().zip(actual.shape().dimensions()).enumerate()
-                {
-                    let Dimension::Dynamic(variable) = declared else { continue };
-                    let extent = match actual {
-                        Dimension::Static(extent) => Ok(*extent),
-                        Dimension::Dynamic(_) => {
-                            Err(lower_runtime_dimension_size_i64(value, axis, block, context, location)?)
-                        }
-                    };
-                    occurrences.push((variable.clone(), extent));
-                }
-            }
-            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
-                let Some(variable) = declared.variable() else { continue };
-                occurrences.push((variable.clone(), actual.extent().ok_or(value)));
-            }
-            (declared, actual) => {
-                return Err(LoweringError::UnsupportedOp {
-                    op: format!(
-                        "`{GUARD_OPERATION_NAME}` of `{boundary}` cannot check actual type `{actual}` against \
-                         declared type `{declared}`",
-                    ),
-                });
-            }
-        }
-    }
-
-    let mut guarded = false;
-    for (index, (variable, extent)) in occurrences.iter().enumerate() {
-        let Some((_, first)) = occurrences[..index].iter().find(|(previous, _)| previous == variable) else {
-            continue;
-        };
-        if first.is_ok() && extent.is_ok() {
-            continue;
-        }
-        let mut lower_extent = |extent: &Result<usize, ValueRef<'b, 'c, 't>>| match extent {
-            Ok(extent) => Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0)),
-            Err(value) => Ok::<_, LoweringError>(*value),
-        };
-        let expected = lower_extent(first)?;
-        let actual = lower_extent(extent)?;
-        let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, actual, expected, block, location)?;
-        lower_assert_to_custom_call(
-            GUARD_OPERATION_NAME,
-            &format!("input dimension `{variable}` must have one extent at the entry of `{boundary}`"),
-            &["expected".to_string(), "actual".to_string()],
-            None,
-            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64)],
-            &[predicate, expected, actual],
-            effect_tokens,
-            block,
-            context,
-            location,
-        )?;
-        guarded = true;
-    }
+    let guarded = lower_type_relationship_checks(
+        GUARD_OPERATION_NAME,
+        &format!("at the entry of `{boundary}`"),
+        declared_types,
+        values,
+        actual_types,
+        effect_tokens,
+        block,
+        context,
+        location,
+    )?;
 
     // Later ordered I/O of both ordered I/O classes, which share one token slot, follows the check: the assertion token
     // joins the I/O chain, which every scope that threads the assertion token also threads (refer to
-    // `token_threaded_effects`). Unordered effects have no token and are not ordered after the check.
-    if guarded {
-        let assertion = current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?;
+    // `token_threaded_effects`). A guard that emits no check still joins the assertions that precede it, since its
+    // ordered effect follows them. Unordered effects have no token and are not ordered after the check.
+    let assertion = if guarded {
+        Some(current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?)
+    } else {
+        effect_tokens.get(EffectClass::OrderedAssertion)
+    };
+    if let Some(assertion) = assertion {
         let joined = match effect_tokens.get(EffectClass::OrderedIo) {
             Some(io) => block
                 .append_operation(stable_hlo::after_all(&[io, assertion], location)?)?
@@ -1298,6 +1249,162 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
         effect_tokens.set(EffectClass::OrderedIo, joined);
     }
     Ok(())
+}
+
+/// Lowers runtime assertions that `values`, whose actual types are `actual_types`, satisfy the relationships that
+/// `declared_types` express, and returns whether it emitted any. Every occurrence of a declared dimension identity (an
+/// array axis or a first-class dimension member) is observed as an `i64` extent, which is static when its actual type
+/// fixes it and read at runtime otherwise, and an assertion requires each occurrence to equal the first. A declared
+/// static extent whose actual dimension is symbolic is asserted to be that extent. Pairs that are both static were
+/// already checked when the instruction was typed and emit nothing. Actual dimensions with proven equal extents
+/// share one observation even across different values. The assertions advance only the ordered-assertion chain.
+///
+/// # Parameters
+///
+///   - `actor`: Name of the operation that owns the assertions, reported in their diagnostics.
+///   - `site`: Description of where the relationships must hold, appended to the diagnostics (e.g., ``in `cast` ``).
+///   - `declared_types`: Declared types that express the relationships.
+///   - `values`: Lowered values whose runtime extents must satisfy them.
+///   - `actual_types`: Actual types of `values`.
+pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
+    actor: &str,
+    site: &str,
+    declared_types: &[ArrayIrType],
+    values: &[ValueRef<'b, 'c, 't>],
+    actual_types: &[ArrayIrType],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<bool, LoweringError> {
+    check_count!("input", values, declared_types.len(), ProgramError);
+    check_count!("input", actual_types, declared_types.len(), ProgramError);
+    let mut checked = false;
+    let mut lower_check = |expected: ValueRef<'b, 'c, 't>,
+                           actual: ValueRef<'b, 'c, 't>,
+                           message: String,
+                           effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+                           block: &mut BlockRef<'b, 'c, 't>|
+     -> Result<(), LoweringError> {
+        let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, actual, expected, block, location)?;
+        lower_assert_to_custom_call(
+            actor,
+            &message,
+            &["expected".to_string(), "actual".to_string()],
+            None,
+            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64)],
+            &[predicate, expected, actual],
+            effect_tokens,
+            block,
+            context,
+            location,
+        )?;
+        checked = true;
+        Ok(())
+    };
+
+    // Keep a runtime extent's original input and optional array axis until a real comparison needs it. Source/output
+    // declarations can observe the same axis twice, or different values can carry the same actual identity. Retain
+    // those actual dimensions so proven equalities require neither a query nor a host callback.
+    let mut occurrences =
+        Vec::<(&DimensionVariable, &Dimension, Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>)>::new();
+    let mut static_checks = Vec::<(usize, &Dimension, (ValueRef<'b, 'c, 't>, Option<usize>))>::new();
+    for ((declared, &value), actual) in declared_types.iter().zip(values).zip(actual_types) {
+        match (declared, actual) {
+            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if declared.rank() == actual.rank() => {
+                for (axis, (declared, actual)) in
+                    declared.shape().dimensions().iter().zip(actual.shape().dimensions()).enumerate()
+                {
+                    let extent = actual.bounds().extent().ok_or((value, Some(axis)));
+                    match (declared, extent) {
+                        (Dimension::Dynamic(variable), extent) => occurrences.push((variable, actual, extent)),
+                        (Dimension::Static(_), Ok(_)) => {}
+                        (Dimension::Static(expected), Err((value, Some(axis)))) => {
+                            if static_checks.iter().any(|(extent, dimension, observed)| {
+                                extent == expected
+                                    && (*observed == (value, Some(axis)) || dimension.has_equal_extents(actual))
+                            }) {
+                                continue;
+                            }
+                            static_checks.push((*expected, actual, (value, Some(axis))));
+                            let runtime = lower_runtime_dimension_size_i64(value, axis, block, context, location)?;
+                            let expected = lower_static_index_constants(&[*expected], block, context, location)?[0];
+                            let message = format!("input dimension `{actual}` must have the declared extent {site}");
+                            lower_check(expected, runtime, message, effect_tokens, block)?;
+                        }
+                        (Dimension::Static(_), Err((_, None))) => unreachable!(),
+                    }
+                }
+            }
+            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
+                match (declared.variable(), declared.extent(), actual.extent()) {
+                    (Some(variable), _, extent) => {
+                        occurrences.push((variable, actual.dimension(), extent.ok_or((value, None))));
+                    }
+                    (None, Some(expected), None) => {
+                        if static_checks.iter().any(|(extent, dimension, observed)| {
+                            *extent == expected
+                                && (*observed == (value, None) || dimension.has_equal_extents(actual.dimension()))
+                        }) {
+                            continue;
+                        }
+                        static_checks.push((expected, actual.dimension(), (value, None)));
+                        let expected = lower_static_index_constants(&[expected], block, context, location)?[0];
+                        let message = format!("input dimension `{actual}` must have the declared extent {site}");
+                        lower_check(expected, value, message, effect_tokens, block)?;
+                    }
+                    (None, _, _) => {}
+                }
+            }
+            (declared, actual) => {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "`{actor}` cannot check actual type `{actual}` against declared type `{declared}` {site}"
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut comparisons = Vec::<(usize, usize)>::new();
+    let equivalent = |left: usize, right: usize| {
+        occurrences[left].2 == occurrences[right].2 || occurrences[left].1.has_equal_extents(occurrences[right].1)
+    };
+    for (index, (variable, dimension, extent)) in occurrences.iter().enumerate() {
+        let Some(first_index) = occurrences[..index].iter().position(|(previous, _, _)| previous == variable) else {
+            continue;
+        };
+        let first = &occurrences[first_index].2;
+        if (first.is_ok() && extent.is_ok())
+            || static_checks.iter().any(|(expected, actual, observed)| {
+                (first.as_ref().is_ok_and(|extent| extent == expected)
+                    && (*extent == Err(*observed) || dimension.has_equal_extents(actual)))
+                    || (extent.as_ref().is_ok_and(|extent| extent == expected)
+                        && (*first == Err(*observed) || occurrences[first_index].1.has_equal_extents(actual)))
+            })
+            || occurrences[..index].iter().any(|(previous, actual, observed)| {
+                previous == variable && (observed == extent || dimension.has_equal_extents(actual))
+            })
+            || comparisons.iter().any(|&(left, right)| {
+                (equivalent(left, first_index) && equivalent(right, index))
+                    || (equivalent(right, first_index) && equivalent(left, index))
+            })
+        {
+            continue;
+        }
+        let lower_extent = |extent: &Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>,
+                            block: &mut BlockRef<'b, 'c, 't>| match extent {
+            Ok(extent) => Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0)),
+            Err((value, None)) => Ok::<_, LoweringError>(*value),
+            Err((value, Some(axis))) => lower_runtime_dimension_size_i64(*value, *axis, block, context, location),
+        };
+        let expected = lower_extent(first, block)?;
+        let actual = lower_extent(extent, block)?;
+        let message = format!("input dimension `{variable}` must have one extent {site}");
+        lower_check(expected, actual, message, effect_tokens, block)?;
+        comparisons.push((first_index, index));
+    }
+    Ok(checked)
 }
 
 impl LowerableOperation for GuardOperation<ArrayType> {
@@ -1352,10 +1459,10 @@ pub(crate) fn lower_dependency_barrier<'b, 'c: 'b, 't: 'c>(
     Ok((0..values.len()).map(|index| barrier.result(index).unwrap().as_ref()).collect())
 }
 
-/// Lowers an [`GuardOperation`] instruction: emits its check with [`lower_guard`], makes every output
-/// depend on the check, and converts each input to its output type with [`lower_cast`]. The conversions only
+/// Lowers a [`GuardOperation`] instruction: emits its check with [`lower_guard`], makes every output
+/// depend on the check, and converts each input's shape with [`lower_cast_shape`]. The conversions only
 /// re-describe values that the check has related, including outputs that narrow some axes and give others a
-/// [retained](GuardOperation::retained) identity.
+/// [retained](GuardOperation::retained) identity. Guards preserve their inputs' layout and sharding.
 fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     boundary: &str,
     declared_types: &[ArrayIrType],
@@ -1386,7 +1493,7 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         .zip(input_types)
         .zip(output_types)
         .map(|((&value, input_type), output_type)| {
-            lower_cast(value, input_type, output_type, &mut lowerer.block, lowerer.context, lowerer.location)
+            lower_cast_shape(value, input_type, output_type, &mut lowerer.block, lowerer.context, lowerer.location)
         })
         .collect()
 }
@@ -1769,6 +1876,99 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_ragged_guard_orders_later_io_after_per_item_checks() {
+        use ryft_core::{
+            BatchAxis, DimensionFromScalar, DynamicBroadcast, Print, Reduce, ReductionKind, StagingContext,
+            TracingContext, Value, batch,
+        };
+
+        use crate::experimental::ops::XlaOperation;
+
+        // Batching a guard over a bounded ragged carrier stages its per-item check as a standalone assertion ahead of
+        // guards whose packed declarations are already proven. Those guards still join the assertion chain into the
+        // ordered-I/O chain, so a later print of an input that does not consume the guard's outputs cannot run before
+        // the per-item validation.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged: ArrayIrType =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into();
+        let row_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let carrier = builder.add_input(ragged.clone());
+        let row = builder.add_input(row_type);
+        let guarded = builder
+            .add_instruction(GuardOperation::new("region", vec![ragged; 2]), Vec::new(), vec![carrier, row], None)
+            .unwrap()
+            .to_vec();
+        let guarded = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(guarded, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
+        let values = trace.input(ArrayType::new_static(DataType::F64, [2]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
+        let rows = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
+        let (summed, printed) = batch(
+            |(value, extent, row)| {
+                let carrier = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
+                let outputs = guarded.interpret_in_context(&carrier.domain(), vec![carrier, row.clone()])?;
+                Ok((outputs[0].reduce(&[0], ReductionKind::Sum)?, row.print("row")?))
+            },
+            (values, extents, rows),
+            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        let program = trace.builder().borrow().clone();
+        let program = program
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![summed.atom_id().unwrap(), printed.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[
+                ArrayType::new_static(DataType::F64, [2]),
+                ArrayType::new_static(DataType::I32, [2]),
+                ArrayType::new_static(DataType::F64, [2, 3]),
+            ],
+            &[ArrayType::new_static(DataType::F64, [2]), ArrayType::new_static(DataType::F64, [2, 3])],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        // The per-item check is the last assertion; the print's token derives from its output token through the
+        // guards' chain joins.
+        let assertion = module.lines().filter(|line| line.contains("@ryft.assert")).last().unwrap();
+        assert!(assertion.contains("requires every batch item's dimension `length` to have extent 3"), "{module}");
+        let assertion_token = assertion.trim().split_once(" = ").unwrap().0.to_owned();
+        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
+        let mut token = print
+            .split_once("@ryft.print(")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0
+            .rsplit_once(", ")
+            .unwrap()
+            .1
+            .to_owned();
+        while token != assertion_token {
+            let definition = module
+                .lines()
+                .find(|line| line.trim().starts_with(&format!("{token} = stablehlo.after_all")))
+                .unwrap_or_else(|| panic!("print token `{token}` does not derive from the per-item check:\n{module}"));
+            // Follow the first operand of the join that is not the ordered-I/O chain's own token.
+            let operands = definition.split_once("after_all").unwrap().1.split_once(':').unwrap().0;
+            token = operands.split(',').map(str::trim).filter(|operand| !operand.is_empty()).last().unwrap().to_owned();
+        }
+    }
+
+    #[test]
     fn test_lower_guard_orders_bounded_conversions_after_the_check() {
         use ryft_core::{
             AddOperation, ArrayReferenceDischarge, PartialValue, ReferenceReadOperation, ReferenceType, TracingContext,
@@ -1857,8 +2057,8 @@ mod tests {
             let error = execute_mixed_program(&client, program, &inputs, &[2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
 
-            // The tangent cast has its own data input. Its primal proof witnesses and the assertion token must be
-            // real dependencies even though neither is numerically used by the representation conversion.
+            // The tangent cast has its own data input. The converted primal proof must remain a dependency even
+            // though it is not numerically used; that proof already depends on the assertion token.
             let jvp = program.jvp().unwrap();
             let tangent_module = to_mlir_module_for_program(
                 &jvp,
@@ -1888,7 +2088,28 @@ mod tests {
                     line.contains(&format!("stablehlo.optimization_barrier {}, {},", entry_value(3), entry_value(1),))
                 })
                 .unwrap();
-            assert!(barrier.contains(token), "{tangent_module}");
+            let primal_barrier = tangent_module
+                .lines()
+                .find(|line| line.contains("stablehlo.optimization_barrier") && line.contains(token))
+                .unwrap();
+            let primal_values = primal_barrier.trim().split_once(':').unwrap().0;
+            let extent = tangent_module
+                .lines()
+                .find(|line| line.contains(&format!("stablehlo.get_dimension_size {primal_values}#1")))
+                .unwrap()
+                .trim()
+                .split_once(" = ")
+                .unwrap()
+                .0;
+            let proof = tangent_module
+                .lines()
+                .find(|line| line.contains("stablehlo.set_dimension_size") && line.contains(&format!(", {extent},")))
+                .unwrap()
+                .trim()
+                .split_once(" = ")
+                .unwrap()
+                .0;
+            assert!(barrier.contains(&format!(", {proof} :")), "{tangent_module}");
             let values = barrier.trim().split_once(':').unwrap().0;
             assert!(tangent_module.contains(&format!("stablehlo.get_dimension_size {values}#0")), "{tangent_module}");
             let inputs = [inputs[0].clone(), inputs[1].clone(), inputs[0].clone(), inputs[1].clone()];
@@ -1904,6 +2125,267 @@ mod tests {
             let error = execute_mixed_program(&client, &jvp, &inputs, &[2, 6, 2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
         }
+    }
+
+    #[test]
+    fn test_execute_ragged_guard_jvp() {
+        use ryft_core::{
+            BatchAxis, DimensionFromScalar, DynamicBroadcast, Reduce, ReductionKind, StagingContext, TracingContext,
+            Value, batch,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::experimental::ops::XlaOperation;
+        use crate::tests::execution_client;
+
+        // The guard relates a bounded ragged carrier and a dense `f64[3]` row under one declared identity. Batching
+        // its JVP over per-item extents stages a per-item check that every carrier has extent 3 ahead of the guarded
+        // primal and tangent outputs, whose masked sums then see each item's three live elements.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged: ArrayIrType =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into();
+        let row_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let carrier = builder.add_input(ragged.clone());
+        let row = builder.add_input(row_type);
+        let guarded = builder
+            .add_instruction(
+                GuardOperation::new("region", vec![ragged.clone(); 2]),
+                Vec::new(),
+                vec![carrier, row],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let guarded = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(guarded, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let guarded_jvp = guarded.jvp().unwrap();
+        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
+        let values = trace.input(ArrayType::new_static(DataType::F64, [2]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
+        let rows = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
+        let (primal, tangent) = batch(
+            |(value, extent, row)| {
+                let carrier = value.dynamic_broadcast_to(&[extent.to_dimension(length.clone())?])?;
+                let inputs = vec![carrier.clone(), row.clone(), carrier.clone(), row];
+                // The outputs are the guarded carrier and row followed by their tangents, all typed `f64[length]`.
+                let outputs = guarded_jvp.interpret_in_context(&carrier.domain(), inputs)?;
+                Ok((outputs[0].reduce(&[0], ReductionKind::Sum)?, outputs[2].reduce(&[0], ReductionKind::Sum)?))
+            },
+            (values, extents, rows),
+            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        let program = trace.builder().borrow().clone();
+        let program = program
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![primal.atom_id().unwrap(), tangent.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let inputs = |extents: Vec<i32>| {
+            [
+                MixedValue::Array(vec![2.0, 3.0], vec![2]),
+                MixedValue::Integers(extents, vec![2]),
+                MixedValue::Array(vec![1.0; 6], vec![2, 3]),
+            ]
+        };
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs(vec![3, 3]), &[]),
+            Ok(vec![MixedValue::Array(vec![6.0, 9.0], vec![2]), MixedValue::Array(vec![6.0, 9.0], vec![2])]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs(vec![1, 3]), &[]).unwrap_err().to_string();
+        assert!(error.contains("requires every batch item's dimension `length` to have extent 3"), "{error}");
+    }
+
+    #[test]
+    fn test_execute_ragged_cast_singleton_extent_storage() {
+        use indoc::indoc;
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, CastOperation,
+            DimensionConstant, EmptyRegionDriver, RaggedAxis, StagingContext, TracingContext,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::experimental::ops::XlaOperation;
+        use crate::tests::execution_client;
+
+        // A witnessed identity must retain compact metadata, and a later refinement must check that metadata over
+        // the actual two-item coordinate domain. Both paths operate on the same singleton extent input.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let trace = TracingContext::<XlaConstant, XlaOperation>::new();
+        let values = trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [1]).into());
+        let context =
+            BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), trace.dimension_constant(2).unwrap());
+        let source = ArrayIrBatch::new(values, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
+            .unwrap();
+        let logical = source.unbatched_type();
+        let retained = CastOperation::checked(logical.clone(), vec![logical.clone(); 2])
+            .batch(&context, &EmptyRegionDriver, &[source.clone(), source])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        let retained_extents = retained.ragged_axes()[0].extents().clone();
+        let narrowed = CastOperation::checked(ArrayType::new_static(DataType::F64, [2]).into(), vec![logical])
+            .batch(&context, &EmptyRegionDriver, &[retained])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        let program = trace.builder().borrow().clone();
+        let program = program
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![narrowed.value().atom_id().unwrap(), retained_extents.atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f64[2, 3], %1:i32[1] .
+                let %2:dimension<2> = constant [value=2]
+                    %3:f64[2, 3] = cast [type=f64[2, 3], inputs=[f64[2, 3], f64[2, 3]]] %0 %0
+                    %4:i32[1] = cast [type=i32[1], inputs=[i32[1], f64[2, 3]]] %1 %3
+                    %5:dimension<2> = constant [value=2]
+                    %6:i64[] = dimension_to_scalar %5
+                    %7:i64[1] = convert_element_type [data_type=i64] %4
+                    %8:bool[1] = compare [direction=Equal] %7 %6
+                    %9:dimension<2> = constant [value=2]
+                    %10:bool[2] = broadcast [output_axes=[0]] %8 %9
+                    %11:bool[] = reduce [kind=all, axes=[0]] %10
+                    () = assert [
+                        message="`cast` requires every batch item's dimension `length` to have extent 2",
+                        labels=[],
+                    ] %11
+                    %12:f64[2, 2] = slice [start_indices=[0, 0], limits=[2, 2]] %3
+                    %13:f64[2, 2], %14:i32[1] = guard [boundary="cast", types=[f64[2, 2], i32[1]]] %12 %4
+                in (%13, %4)
+            "#}
+            .trim_end(),
+        );
+        let client = execution_client();
+        let values = MixedValue::Array(vec![1.0, 2.0, 99.0, 3.0, 4.0, 99.0], vec![2, 3]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[values.clone(), MixedValue::Integers(vec![2], vec![1])], &[]),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]), MixedValue::Integers(vec![2], vec![1])]),
+        );
+        let error = execute_mixed_program(&client, &program, &[values, MixedValue::Integers(vec![3], vec![1])], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires every batch item's dimension `length` to have extent 2"), "{error}");
+    }
+
+    #[test]
+    fn test_execute_ragged_symbolic_singleton_extent_consumers() {
+        use indoc::indoc;
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer, DimensionSize,
+            DimensionToScalar, ParallelReduce, RaggedAxis, ReductionKind, TracingContext, Value,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::experimental::ops::XlaOperation;
+        use crate::tests::execution_client;
+
+        // Metadata storage has one entry, while both consumers operate over the runtime participant domain.
+        let participants = DimensionVariable::new("participants", DimensionBounds::new(0, Some(3)).unwrap());
+        let unit = DimensionVariable::new("unit", DimensionBounds::new(1, Some(2)).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let (_, program) =
+            TracingContext::<XlaConstant, XlaOperation>::trace(
+                |(extent, packed, extents)| {
+                    let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(extent.domain(), extent)
+                        .with_axis_name("items".to_string());
+                    let source = ArrayIrBatch::new(packed, BatchAxis::new(0))?
+                        .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])?;
+                    let source = BatchingTracer::new(context, source);
+                    let size_sum =
+                        source.dimension_size(0)?.to_scalar()?.parallel_reduce(ReductionKind::Sum, "items")?;
+                    let reduced = source.parallel_reduce(ReductionKind::Sum, "items")?.into_batch();
+                    let reduced_extent = reduced.ragged_axes()[0].extents().clone();
+                    Ok((size_sum.into_batch().into_value(), reduced.into_value(), reduced_extent))
+                },
+                (
+                    ArrayIrType::Dimension(DimensionType::from(participants.clone())),
+                    ArrayIrType::Array(ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![participants.into(), Dimension::Static(3)]),
+                    )),
+                    ArrayIrType::Array(ArrayType::new(DataType::I32, Shape::new(vec![unit.into()]))),
+                ),
+            )
+            .unwrap();
+        let program = program.into_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<participants ∈ [0, 3)>, %1:f64[participants, 3], %2:i32[unit] .
+                let %3:dimension<1> = dimension_size [axis=0] %2
+                    %4:i32[1] = broadcast [output_axes=[0]] %2 %3
+                    %5:dimension<participants ∈ [0, 3)> = dimension_size [axis=0] %1
+                    %6:i32[participants] = broadcast [output_axes=[0]] %4 %5
+                    %7:i64[participants] = convert_element_type [data_type=i64] %6
+                    %8:i64[] = reduce [kind=sum, axes=[0]] %7
+                    %9:dimension<participants ∈ [0, 3)> = dimension_size [axis=0] %1
+                    %10:dimension<3> = constant [value=3]
+                    %11:i32[3] = iota [type=i32[3], dimension=0]
+                    %12:i32[participants, 3] = broadcast [output_axes=[1]] %11 %9 %10
+                    %13:dimension<1> = dimension_size [axis=0] %2
+                    %14:i32[1] = broadcast [output_axes=[0]] %2 %13
+                    %15:i32[participants, 3] = broadcast [output_axes=[0]] %14 %9 %10
+                    %16:bool[participants, 3] = compare [direction=LessThan] %12 %15
+                    %17:f64[participants, 3] = zero_like %1
+                    %18:f64[participants, 3] = select %16 %1 %17
+                    %19:f64[3] = reduce [kind=sum, axes=[0]] %18
+                    %20:dimension<participants ∈ [0, 3)> = dimension_size [axis=0] %18
+                    %21:dimension<1> = dimension_size [axis=0] %2
+                    %22:i32[1] = broadcast [output_axes=[0]] %2 %21
+                    %23:i32[participants] = broadcast [output_axes=[0]] %22 %20
+                    %24:i32[] = reduce [kind=max, axes=[0]] %23
+                    %25:i32[] = constant [value=0]
+                    %26:i32[] = max %24 %25
+                in (%8, %19, %26)"
+            },
+        );
+
+        let client = execution_client();
+        let values = MixedValue::Array(vec![1., 2., 99., 3., 4., 99.], vec![2, 3]);
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Dimension(0), values.clone(), MixedValue::Integers(vec![2], vec![1])],
+                &[0, 1],
+            ),
+            Ok(vec![
+                MixedValue::Dimension(0),
+                MixedValue::Array(vec![0., 0., 0.], vec![3]),
+                MixedValue::Integers(vec![0], vec![]),
+            ]),
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Dimension(2), values, MixedValue::Integers(vec![2], vec![1])],
+                &[2, 1],
+            ),
+            Ok(vec![
+                MixedValue::Dimension(4),
+                MixedValue::Array(vec![4., 6., 0.], vec![3]),
+                MixedValue::Integers(vec![2], vec![]),
+            ]),
+        );
     }
 
     /// Builds an eager dimension value whose diagnostic variable name matches the FFI-reported operand name.

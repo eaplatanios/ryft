@@ -7,7 +7,7 @@ use ryft_core::{
     Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout, Typed,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
+use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, ExecutionFence, Program, load_cpu_plugin};
 
 use crate::tests::{logical_mesh_2x2, values_from_bytes, values_to_bytes};
 use crate::{Error, FromPjrt, ToMlir, XlaArray, XlaSession};
@@ -938,6 +938,58 @@ fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
     assert_eq!(resharded.r#type().memory(), Memory::Host { pinned: true });
     assert_eq!(resharded.addressable_shards().count(), mesh.devices().len());
     assert!(resharded.addressable_shards().all(|shard| shard.buffer().is_none()));
+}
+
+#[test]
+fn test_zero_space_reshard_preserves_producer_completion() {
+    let client = crate::tests::execution_client();
+    let engine = XlaSession::new(&client).domain();
+    let device = client.addressable_devices().unwrap().remove(0);
+    let source_mesh = DeviceMesh::new(
+        LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+        vec![Device::from_pjrt(&device).unwrap()],
+    )
+    .unwrap();
+    let target_mesh = DeviceMesh::new(
+        LogicalMesh::new(vec![MeshAxis::new("target", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+        source_mesh.devices().to_vec(),
+    )
+    .unwrap();
+    let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
+    let target = DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding.clone() };
+
+    for fails in [false, true] {
+        let (event, promise) = client.event(()).unwrap();
+        let source =
+            XlaArray::from_host_buffer(&engine, ArrayType::new_static(DataType::Zero, [2]), source_mesh.clone(), [])
+                .unwrap()
+                .with_execution_fence(ExecutionFence::new(vec![event]));
+        let outputs = [
+            source.to_placement(&engine, target.clone()).unwrap(),
+            source.clone().into_placement(&engine, target.clone()).unwrap(),
+            compiled_reshard::reshard(&source, &engine, &target_mesh, &target_sharding).unwrap(),
+        ];
+        // A representation-only move must neither wait for nor discard the producer's completion. Complete the event
+        // before asserting so even a failing regression releases its pending native callbacks.
+        let pending = outputs
+            .iter()
+            .map(|output| matches!(output.execution_fence().map(ExecutionFence::is_ready), Some(Ok(false))))
+            .collect::<Vec<_>>();
+        promise.set(fails.then(|| PjrtError::invalid_argument("zero producer failed"))).unwrap();
+        assert_eq!(pending, vec![true; 3]);
+        for output in outputs {
+            let result = output.block_until_ready();
+            if fails {
+                assert!(matches!(
+                    result,
+                    Err(Error::PjrtError(PjrtError::InvalidArgument { message, .. }))
+                        if message == "zero producer failed",
+                ));
+            } else {
+                assert_eq!(result.map_err(|error| error.to_string()), Ok(()));
+            }
+        }
+    }
 }
 
 #[test]

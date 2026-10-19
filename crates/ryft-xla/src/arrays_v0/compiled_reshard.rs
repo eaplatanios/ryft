@@ -68,7 +68,11 @@ pub(crate) fn reshard_with_donation<'o>(
 ) -> Result<XlaArray<'o>, ArrayError> {
     if source.data_type().is_zero() {
         let r#type = source.r#type().into_owned().with_sharding(dst_sharding.clone())?;
-        return Ok(XlaArray::from_zero_space(engine, r#type, dst_mesh.clone())?);
+        let mut output = XlaArray::from_zero_space(engine, r#type, dst_mesh.clone())?;
+        if let Some(fence) = source.execution_fence() {
+            output = output.with_execution_fence(fence.clone());
+        }
+        return Ok(output);
     }
     // `Manual` axes are managed explicitly by the user (e.g. inside `shard_map`) and cannot be
     // planned by the SPMD partitioner from the top level. `Auto` and `Explicit` axes both go

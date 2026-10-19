@@ -393,7 +393,13 @@ mod tests {
 
     fn read_f32s(array: &XlaArray<'_>) -> Vec<f32> {
         let shard = array.addressable_shards().next().unwrap();
-        let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+        let bytes = shard
+            .buffer()
+            .unwrap()
+            .copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard.shape().rank())))
+            .unwrap()
+            .r#await()
+            .unwrap();
         values_from_bytes::<f32>(bytes.as_slice())
     }
 

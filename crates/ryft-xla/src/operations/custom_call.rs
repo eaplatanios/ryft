@@ -593,18 +593,31 @@ mod tests {
 
         assert_eq!(
             module,
-            indoc! {r#"
+            indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                  func.func @main(%arg0: tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}, %arg1: tensor<2x3xf32>) \
+                        -> tensor<2x3xf32> {
                     %0 = stablehlo.after_all  : !stablehlo.token
-                    %1:3 = stablehlo.custom_call @ryft.test.scaled_add(%arg0, %arg1, %0) {api_version = 4 : i32, backend_config = {count = 4 : i64, flag = true, label = "x", scale = 2.000000e+00 : f64}, has_side_effect = true, operand_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [1], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0, 1]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<2x3xf32>, tensor<2x3xf32>, !stablehlo.token) -> (tensor<2x3xf32>, tensor<2x3xf32>, !stablehlo.token)
-                    %2 = stablehlo.custom_call @ryft.print(%arg1, %1#2) {api_version = 4 : i32, backend_config = {label = "between"}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> !stablehlo.token
-                    %3:2 = stablehlo.custom_call @ryft.test.record(%arg1, %2) {api_version = 4 : i32, backend_config = {}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> (tensor<2x3xf32>, !stablehlo.token)
-                    %4 = stablehlo.custom_call @ryft.test.add_one(%3#0) {api_version = 4 : i32, backend_config = {}} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    %1:3 = stablehlo.custom_call @ryft.test.scaled_add(%arg0, %arg1, %0) {api_version = 4 : i32, \
+                        backend_config = {count = 4 : i64, flag = true, label = \"x\", scale = 2.000000e+00 : \
+                        f64}, has_side_effect = true, operand_layouts = [dense<[0, 1]> : tensor<2xindex>, \
+                        dense<[1, 0]> : tensor<2xindex>, dense<> : tensor<0xindex>], output_operand_aliases = \
+                        [#stablehlo.output_operand_alias<output_tuple_indices = [1], operand_index = 0, \
+                        operand_tuple_indices = []>], result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0, \
+                        1]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<2x3xf32>, tensor<2x3xf32>, \
+                        !stablehlo.token) -> (tensor<2x3xf32>, tensor<2x3xf32>, !stablehlo.token)
+                    %2 = stablehlo.custom_call @ryft.print(%arg1, %1#2) {api_version = 4 : i32, backend_config = \
+                        {label = \"between\"}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> \
+                        !stablehlo.token
+                    %3:2 = stablehlo.custom_call @ryft.test.record(%arg1, %2) {api_version = 4 : i32, \
+                        backend_config = {}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> \
+                        (tensor<2x3xf32>, !stablehlo.token)
+                    %4 = stablehlo.custom_call @ryft.test.add_one(%3#0) {api_version = 4 : i32, backend_config = \
+                        {}} : (tensor<2x3xf32>) -> tensor<2x3xf32>
                     return %4 : tensor<2x3xf32>
                   }
                 }
-            "#},
+            "},
         );
 
         // Byte-strided descriptors cannot be represented by StableHLO's permutation-only custom-call layouts.
@@ -634,9 +647,7 @@ mod tests {
                 None,
                 None,
             ),
-            Err(LoweringError::UnsupportedOp {
-                op: "custom_call with strided array layout `strided{12,4}`".to_string(),
-            }),
+            Err(LoweringError::UnsupportedOp { op: "strided input layout `strided{12,4}`".to_string() }),
         );
         let invalid_permutation_type =
             test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));

@@ -1,28 +1,28 @@
 error[E0277]: the trait bound `ArrayIrBatchingPolicy: ReplicatedBatchingPolicyProjection<EagerContext<ArrayIrValue<ryft::Array>, BadOperation>, ArrayType>` is not satisfied
-  --> tests/operations/error_structural_batching_without_replicated_projection.rs:14:24
+  --> tests/operations/error_structural_batching_without_replicated_projection.rs:25:24
    |
-14 |     assert_batchable::<BadOperation>();
+25 |     assert_batchable::<BadOperation>();
    |                        ^^^^^^^^^^^^ unsatisfied trait bound
    |
    = help: the trait `ReplicatedBatchingPolicyProjection<EagerContext<ArrayIrValue<ryft::Array>, BadOperation>, ArrayType>` is not implemented for `ArrayIrBatchingPolicy`
 help: the trait `ReplicatedBatchingPolicyProjection<C, DimensionType>` is implemented for `ArrayIrBatchingPolicy`
   --> $WORKSPACE/crates/ryft-core/src/arrays/batching.rs
    |
-   | / impl<C: Context<Type = ArrayIrType> + DomainProjection<DimensionType>>
-   | |     ReplicatedBatchingPolicyProjection<C, DimensionType> for ArrayIrBatchingPolicy
-   | |__________________________________________________________________________________^
+   | / impl<C: ContextProjection<DimensionType, Type = ArrayIrType>> ReplicatedBatchingPolicyProjection<C, DimensionType>
+   | |     for ArrayIrBatchingPolicy
+   | |_____________________________^
 note: required for `BadOperation` to implement `BatchableOperation<EagerContext<ArrayIrValue<ryft::Array>, BadOperation>, ArrayIrBatchingPolicy>`
-  --> tests/operations/error_structural_batching_without_replicated_projection.rs:6:6
+  --> tests/operations/error_structural_batching_without_replicated_projection.rs:9:6
    |
- 4 | #[derive(Clone, Debug, ryft::Operation)]
+ 7 | #[derive(Clone, Debug, ryft::Operation)]
    |                        --------------- type parameter would need to implement `BatchableOperation<EagerContext<ArrayIrValue<ryft::Array>, BadOperation>, ArrayIrBatchingPolicy>`
- 5 | #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(structural(ArrayType)), dispatch(batching))]
- 6 | enum BadOperation {
+ 8 | #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(structural(ArrayType)), dispatch(batching))]
+ 9 | enum BadOperation {
    |      ^^^^^^^^^^^^
    = help: consider manually implementing `BatchableOperation<EagerContext<ArrayIrValue<ryft::Array>, BadOperation>, ArrayIrBatchingPolicy>` to avoid undesired bounds caused by "imperfect derives"
    = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
 note: required by a bound in `assert_batchable`
-  --> tests/operations/error_structural_batching_without_replicated_projection.rs:11:24
+  --> tests/operations/error_structural_batching_without_replicated_projection.rs:22:24
    |
-11 | fn assert_batchable<O: BatchableOperation<EagerContext<ArrayIrValue<Array>, BadOperation>, ArrayIrBatchingPolicy>>() {}
+22 | fn assert_batchable<O: BatchableOperation<EagerContext<ArrayIrValue<Array>, BadOperation>, ArrayIrBatchingPolicy>>() {}
    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `assert_batchable`

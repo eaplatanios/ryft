@@ -10,7 +10,7 @@ use crate::experimental::lowering::types::{
     lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_signed_one_bit_to_mlir, lower_tensor_type,
     physical_bound_type,
 };
-use crate::operations::constants::lower_constructor_layout;
+use crate::operations::constants::lower_layout_constraint;
 use crate::operations::normalize_elementwise_operand;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
@@ -99,7 +99,7 @@ where
                 &output_axes,
                 location,
             )?)?;
-            let result = lower_constructor_layout(
+            let result = lower_layout_constraint(
                 broadcast.result(0).unwrap().as_ref(),
                 &physical_type,
                 &mut block.as_ref(),

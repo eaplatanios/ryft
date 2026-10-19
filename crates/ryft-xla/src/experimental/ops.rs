@@ -424,7 +424,6 @@ where
 
     /// Runtime check of the identity relationships of an entry that the actual input types do not prove, which
     /// returns its inputs narrowed by the facts that those relationships prove.
-    #[ryft(guard)]
     Guard(GuardOperation<ArrayIrType>),
 
     /// Conversion of a value to a compatible array or first-class dimension type.
@@ -1676,10 +1675,10 @@ pub(crate) mod tests {
             context.input(ArrayIrType::Dimension(DimensionType::from(columns))),
         ];
 
-        // No single source has the zero's type, so the geometry is assembled per declared residual: the statically
-        // shaped candidate names neither identity and is skipped without staging anything, the dynamic array supplies
-        // the row extent through a `dimension_size` read, and the first-class dimension supplies the column extent as
-        // itself. The shared array-IR implementation emits XLA operations directly for the selected sources.
+        // No single source has the zero's type, so its shape is assembled per declared residual: the statically shaped
+        // candidate names neither identity and is skipped without staging anything, the dynamic array supplies the row
+        // extent through a `dimension_size` read, and the first-class dimension supplies the column extent as itself.
+        // The shared array-IR implementation emits XLA operations directly for the selected sources.
         let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(zero_type.clone())),
