@@ -312,6 +312,8 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
+    use ryft_macros::Operation;
+
     use crate::arrays::{
         Array, ArrayOperation, DataType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension,
@@ -323,11 +325,10 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
     };
-    use crate::operations::assertions::GuardOperation;
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, OperationProvider, ProgramBuilder, Typed};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, Typed};
     use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -792,19 +793,15 @@ mod tests {
             }
         }
 
-        /// Print-only operation family of that eager domain. It rejects guards, which eager replay never requests.
-        #[derive(Clone, Debug, ryft_macros::Operation)]
+        /// Print-only family used to verify that capability dispatch through [`EagerContext`] interprets the print
+        /// without re-entering the value's [`Print`] capability. [`Context`] requires its operation family to provide
+        /// [`GuardOperation`](crate::GuardOperation) requests even when execution needs no guard. The derive supplies
+        /// a rejecting provider so this minimal family can serve as the value's domain without a guard variant.
+        /// This test binds print directly over concrete arrays and never requests a guard.
+        #[derive(Clone, Debug, Operation)]
         #[ryft(type(ArrayType), constant(EagerDomainValue))]
         enum EagerDomainOperation {
             Print(PrintOperation<ArrayType>),
-        }
-
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for EagerDomainOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
         }
 
         // The `Print` capability of a domain-dispatched value binds a `PrintOperation` through its eager domain, which

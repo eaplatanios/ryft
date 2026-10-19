@@ -2098,7 +2098,6 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::operations::assertions::GuardOperation;
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
@@ -3350,14 +3349,6 @@ mod tests {
         #[ryft(type(ArrayType), constant(ArrayType))]
         enum AbstractGatherOperation {
             Gather(GatherOperation<ArrayType>),
-        }
-
-        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for AbstractGatherOperation {
-            type Operation = Self;
-
-            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-                Err(request.unsupported_family_error())
-            }
         }
 
         impl OperationProvider<ArrayType, ParallelVaryOperation> for AbstractGatherOperation {

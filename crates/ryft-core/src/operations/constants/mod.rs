@@ -9,8 +9,8 @@
 //!     one first-class dimension value per dynamic axis of the requested type, so shapes that are only known at run
 //!     time can still be constructed inside the mixed [`ArrayIrValue`](crate::ArrayIrValue) family.
 //!   - Literals and exemplars like [`Constant`] which embeds an existing value, [`DimensionConstant`] which embeds a
-//!     dimension extent, and [`ZeroLike`] and [`OneLike`] which take their geometry from a value they are called on,
-//!     which is why they are value capabilities and need no dynamic variant.
+//!     dimension extent, and [`ZeroLike`] and [`OneLike`] which take their shape from a value they are called on, which
+//!     is why they are value capabilities and need no dynamic variant.
 //!
 //! # Examples
 //!
@@ -226,7 +226,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 /// [`DimensionVariable`](crate::DimensionVariable) named by the corresponding output axis. Static axes remain ordinary
 /// stored type metadata and consume no inputs. This is deliberately narrower than the mixed reshape/broadcast
 /// contract, which derives *every* output axis from an input (including exact constants): a constructor's static axes
-/// have no input geometry to relate to, so passing them as inputs would only grow the interpreted representation. A
+/// have no input extents to relate to, so passing them as inputs would only grow the interpreted representation. A
 /// stored type with no dynamic axes is valid with no inputs, although canonical operation-family lifts prefer the
 /// equivalent homogeneous nullary constructor inside the array member family. Dynamic axes retain their declared
 /// identities when the inputs define exactly those identities. An input with an exact type (i.e., one whose bounds

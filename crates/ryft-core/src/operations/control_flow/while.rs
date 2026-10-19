@@ -3294,10 +3294,10 @@ mod tests {
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::kernels::{KernelOperation, NoKernelExtension};
+    use crate::macros::impl_guardless_operation;
     use crate::operations::arithmetic::{
         AddOperation, DivOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, SubOperation,
     };
-    use crate::operations::assertions::GuardOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
@@ -6453,12 +6453,7 @@ mod tests {
             }
         }
     }
-    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for TestOperation {
-        type Operation = Self;
-        fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(TestOperation);
 
     impl<C: Domain<Type = ArrayType, Value = TestValue>> InterpretableOperation<C> for TestOperation
     where

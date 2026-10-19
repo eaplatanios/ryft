@@ -5,7 +5,7 @@ use crate::arrays::{
     ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
@@ -22,7 +22,7 @@ use crate::programs::{
     Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface, Type,
     TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::Tracer;
 
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &str = "zero";
@@ -34,8 +34,8 @@ pub const ZERO_OPERATION_NAME: &str = "zero";
 /// This operation also serves as an [`OperationProvider`] request: it carries the requested output type while the
 /// provider receives no input types. Composite operation families select the appropriate member operation from this
 /// type; homogeneous families use their ordinary `From<ZeroOperation<T>>` conversion.
-/// This constructs zeros whose geometry is fully described by their type. Differentiation's separate
-/// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol handles zeros that require runtime geometry from
+/// This constructs zeros whose shape is fully described by their type. Differentiation's separate
+/// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol handles zeros that require runtime extents from
 /// residual values, such as disconnected cotangents with dynamic axes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ZeroOperation<T: Type> {
@@ -226,8 +226,7 @@ where
     }
 }
 
-impl<C: Context + DomainProjection<T>, T: Type> Zero<<C::Value as ValueProjection<T>>::Projected>
-    for ProjectedContext<C, T>
+impl<C: ContextProjection<T>, T: Type> Zero<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
 where
     C::Operation: OperationProjection<T, Projected: From<ZeroOperation<T>>>,
 {
@@ -254,9 +253,8 @@ where
 
 impl<C: Context> Zero<PartialTracer<C>> for PartialEvaluationContext<C>
 where
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
+    C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
+    Self: Context<Type = C::Type, Value = PartialTracer<C>, Operation = C::Operation>,
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
@@ -527,7 +525,7 @@ mod tests {
             assert_eq!(context.zero(&ArrayType::scalar(r#type)), Ok(expected));
         }
 
-        // Rank-positive arrays and the zero-space data type preserve the requested geometry.
+        // Rank-positive arrays and the zero-space data type preserve the requested shape.
         let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let expected = Array::from_elements(output_type.clone(), &[0.0f32; 6]).unwrap();
         assert_eq!(context.zero(&output_type), Ok(expected.clone()));

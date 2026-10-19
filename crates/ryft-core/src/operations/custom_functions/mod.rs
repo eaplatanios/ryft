@@ -86,7 +86,7 @@ pub(crate) mod tests {
 
     /// Builds one flat program that binds the custom function `operation` with `regions` to inputs of `input_types`
     /// and returns all of its outputs.
-    pub(crate) fn custom_function_call_program<V: Value, O: Clone + Operation<Type = V::Type>>(
+    pub(crate) fn custom_function_call_program<V: Value, O: Operation<Type = V::Type>>(
         operation: impl Into<O>,
         regions: Vec<Program<V, O, Vec<V>, Vec<V>>>,
         input_types: Vec<V::Type>,

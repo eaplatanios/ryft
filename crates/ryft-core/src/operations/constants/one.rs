@@ -5,7 +5,7 @@ use crate::arrays::{
     ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
@@ -22,7 +22,7 @@ use crate::programs::{
     Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface, Type,
     TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::Tracer;
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &str = "one";
@@ -213,8 +213,7 @@ where
     }
 }
 
-impl<C: Context + DomainProjection<T>, T: Type> One<<C::Value as ValueProjection<T>>::Projected>
-    for ProjectedContext<C, T>
+impl<C: ContextProjection<T>, T: Type> One<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
 where
     C::Operation: OperationProjection<T, Projected: From<OneOperation<T>>>,
 {
@@ -241,9 +240,8 @@ where
 
 impl<C: Context> One<PartialTracer<C>> for PartialEvaluationContext<C>
 where
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
+    C::Operation: OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
+    Self: Context<Type = C::Type, Value = PartialTracer<C>, Operation = C::Operation>,
 {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
@@ -480,7 +478,7 @@ mod tests {
             assert_eq!(context.one(&ArrayType::scalar(r#type)), Ok(expected));
         }
 
-        // Rank-positive arrays preserve the requested geometry.
+        // Rank-positive arrays preserve the requested shape.
         let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let expected = Array::from_elements(output_type.clone(), &[1.0f32; 6]).unwrap();
         assert_eq!(context.one(&output_type), Ok(expected.clone()));

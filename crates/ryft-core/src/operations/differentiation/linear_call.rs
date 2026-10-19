@@ -735,6 +735,8 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_macros::Operation;
+
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
         DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
@@ -809,9 +811,12 @@ pub(crate) mod tests {
         // A third-member residual paired with a first-member linear value proves that the operation and its attached
         // regions use generic program storage without an array/dimension-specific projection.
 
-        /// Linear-call-only family over the three-member program type. It rejects guards, which eager replay never
-        /// requests.
-        #[derive(Clone, Debug, ryft_macros::Operation)]
+        /// Linear-call-only family over the three-member program type. [`Context`] requires its operation family to
+        /// provide [`GuardOperation`](crate::GuardOperation) requests even when replay needs no guard. The derive
+        /// supplies a rejecting provider, keeping that implementation on this test family instead of adding it to
+        /// the production [`LinearCallOperation`]. This test's identity-free input types prove all boundary
+        /// relationships, so eager replay never requests a guard.
+        #[derive(Clone, Debug, Operation)]
         #[ryft(type(ProjectedProgramType), constant(ProjectedProgramValue))]
         enum ProjectedLinearCallOperation {
             LinearCall(LinearCallOperation<ProjectedProgramType>),

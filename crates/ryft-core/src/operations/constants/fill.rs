@@ -171,9 +171,9 @@ where
 /// [`DynamicBroadcast::dynamic_broadcast_to`](crate::DynamicBroadcast::dynamic_broadcast_to) directly.
 /// To fill the shape of an exemplar, obtain each output dimension using
 /// [`DimensionSize::dimension_size`](crate::DimensionSize::dimension_size) and pass those values to the broadcast.
-/// This uses the exemplar's runtime geometry, including empty dimensions, without reading its element contents.
-/// Conversion and placement overrides can be applied to the projected array value before broadcasting; no separate
-/// value-fill operation is required.
+/// This uses the exemplar's runtime shape, including empty dimensions, without reading its element contents. Conversion
+/// and placement overrides can be applied to the projected array value before broadcasting; no separate value-fill
+/// operation is required.
 ///
 /// # Example
 ///
@@ -262,7 +262,7 @@ where
             let output_types = operation.infer_output_types(&input_types, &[])?;
             let output_type = <&ArrayType>::try_from(&output_types[0])?;
 
-            // Singleton bounds can make all storage geometry known even with explicit dimension inputs.
+            // Singleton bounds can make every storage extent known even with explicit dimension inputs.
             if output_type.static_shape().is_some() {
                 ArrayAddressing::new(output_type.clone())?;
             }
@@ -760,7 +760,8 @@ mod tests {
             .unwrap();
         assert_eq!(program.interpret(vec![extent.clone()]), Ok(vec![expected]));
 
-        // A zero lower bound cannot establish whether rows alias. Runtime geometry must reject overlapping rows.
+        // A zero lower bound cannot establish whether rows alias. The runtime extents must be checked to reject
+        // overlapping rows.
         let invalid_type = r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dimension = context.input(dimension_type.clone().into());

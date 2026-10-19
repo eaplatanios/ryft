@@ -7,21 +7,22 @@ use crate::arrays::{
     DimensionValue,
 };
 use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-    RecursiveBatchingPolicy,
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, BatchingTracer,
 };
-use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
+use crate::macros::{
+    check_count, impl_guardless_operation, impl_non_differentiable_operation, impl_nullary_transposable_operation,
+};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     LiteralIdentity, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::Tracer;
 
 /// Canonical operation name for [`ConstantOperation`].
 pub const CONSTANT_OPERATION_NAME: &str = "constant";
@@ -176,6 +177,8 @@ impl<
 impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
 impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
 
+impl_guardless_operation!(<V> ConstantOperation<V> where V: Value);
+
 impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ArrayIrOperation<A> {
     // Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
     // can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
@@ -209,7 +212,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Constant<V, V> for EagerContext<V, 
     }
 }
 
-impl<C: Context + DomainProjection<T>, T: Type>
+impl<C: ContextProjection<T>, T: Type>
     Constant<<C::Value as ValueProjection<T>>::Projected, <C::Constant as ValueProjection<T>>::Projected>
     for ProjectedContext<C, T>
 {
@@ -231,8 +234,7 @@ impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
 
 impl<C: Context> Constant<PartialTracer<C>, C::Constant> for PartialEvaluationContext<C>
 where
-    C::Operation:
-        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    Self: Context<Value = PartialTracer<C>, Constant = C::Constant>,
 {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
@@ -240,8 +242,9 @@ where
     }
 }
 
-impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>>
-    Constant<BatchingTracer<C, P>, C::Constant> for BatchingContext<C, P>
+impl<C: Context, P: BatchingPolicy<C>> Constant<BatchingTracer<C, P>, C::Constant> for BatchingContext<C, P>
+where
+    Self: Context<Value = BatchingTracer<C, P>, Constant = C::Constant>,
 {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<BatchingTracer<C, P>, ProgramError> {

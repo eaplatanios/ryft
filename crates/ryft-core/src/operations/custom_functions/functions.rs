@@ -20,7 +20,7 @@ use crate::batching::{
     Batch, BatchAxis, BatchAxisSpecification, BatchableType, BatchingError, BatchingLevel, BatchingLevelExtent,
     BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy, RecursiveBatchingPolicy, batch,
 };
-use crate::contexts::{Context, EagerContext};
+use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
     ResidualZeroProvider, TransposableOperation, TranspositionContext,
@@ -147,6 +147,7 @@ pub struct WithAccumulatingVjp<Residual, Tracer, Transposition, Forward, Backwar
 /// structured interface of the call, at the types of each specialization and replaying the traced program.
 pub trait CustomFunctionJvp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -171,6 +172,7 @@ where
 
 impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CustomFunctionJvp<V, O, Input, Output> for DefaultJvp
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -190,6 +192,7 @@ where
 impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>, Input, Output> CustomFunctionJvp<V, O, Input, Output>
     for JvpFromPrimal
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -208,8 +211,9 @@ where
 
 impl<V, O, Input, Output, Jvp> CustomFunctionJvp<V, O, Input, Output> for WithJvp<Jvp>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
-    O: 'static + Clone + Operation<Type = V::Type>,
+    O: 'static + Operation<Type = V::Type>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -252,8 +256,9 @@ where
 impl<V, O, Input, Output, Jvp> CustomFunctionJvp<V, O, Input, Output>
     for WithSymbolicZeroJvp<CustomRuleTracer<V, O>, Jvp>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
-    O: 'static + Clone + Operation<Type = V::Type>,
+    O: 'static + Operation<Type = V::Type>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
     Input::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
@@ -307,6 +312,7 @@ where
 /// dimension variables) always have the same structure; the forward rule is rejected otherwise.
 pub trait CustomFunctionVjp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -324,6 +330,7 @@ where
 
 impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CustomFunctionVjp<V, O, Input, Output> for DefaultVjp
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -343,6 +350,7 @@ where
 impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
     for WithVjp<Residual, Forward, Backward>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
     O: 'static
         + TransposableOperation<V, O>
@@ -429,6 +437,7 @@ where
 impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
     for WithSymbolicZeroVjp<Residual, CustomRuleTracer<V, O>, Forward, Backward>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
     O: 'static
         + TransposableOperation<V, O>
@@ -521,6 +530,7 @@ where
 impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
     for WithAccumulatingVjp<Residual, CustomRuleTracer<V, O>, TranspositionContext<V, O>, Forward, Backward>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
     O: 'static
         + TransposableOperation<V, O>
@@ -654,6 +664,7 @@ pub struct WithAxisDependentBatching<Tracer, Rule> {
 /// call registers for the operation family `(V, O)`.
 pub trait CustomFunctionBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -677,6 +688,7 @@ where
 impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CustomFunctionBatching<V, O, Input, Output>
     for DefaultBatching
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
@@ -695,6 +707,7 @@ where
 impl<V, O, Input, Output, Rule> CustomFunctionBatching<V, O, Input, Output>
     for WithBatching<CustomRuleTracer<V, O>, Rule>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
     O: 'static
         + Operation<Type = V::Type>
@@ -738,6 +751,7 @@ where
 impl<V, O, Input, Output, Rule> CustomFunctionBatching<V, O, Input, Output>
     for WithAxisDependentBatching<CustomRuleTracer<V, O>, Rule>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static
         + Value<
             Type: DifferentiableType + BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>> + Eq + Hash,
@@ -808,6 +822,7 @@ fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
 + Send
 + Sync
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value,
     O: 'static + Operation<Type = V::Type>,
     Input: 'static
@@ -972,6 +987,7 @@ fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
 + Send
 + Sync
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
     O: 'static + Operation<Type = V::Type>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
@@ -1030,6 +1046,7 @@ fn trace_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<(Residual::ParameterStructure, Vec<V::Type>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -1120,6 +1137,7 @@ fn trace_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
     named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
@@ -1185,6 +1203,7 @@ fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, B
     named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
@@ -1255,8 +1274,9 @@ fn trace_custom_jvp_rule<V, O, Input, Output, Jvp>(
     named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
-    O: Clone + Operation<Type = V::Type>,
+    O: Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -1308,8 +1328,9 @@ fn trace_symbolic_zero_custom_jvp_rule<V, O, Input, Output, Jvp>(
     named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
-    O: Clone + Operation<Type = V::Type>,
+    O: Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Input::Family:
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
@@ -1375,7 +1396,7 @@ where
 ///
 /// Returns a [`TypeError`] when the rule consumes or returns a placeholder tangent, and propagates program projection
 /// errors otherwise.
-fn without_non_differentiated_tangent_inputs<V: Value, O: Clone + Operation<Type = V::Type>>(
+fn without_non_differentiated_tangent_inputs<V: Value, O: Operation<Type = V::Type>>(
     name: &str,
     program: Program<V, O, Vec<V>, Vec<V>>,
     input_count: usize,
@@ -2000,6 +2021,8 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         C::Constant: 'static,
         C::Operation: 'static + From<CustomFunctionOperation<C::Constant, C::Operation>>,
         <C::Type as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
@@ -3189,7 +3212,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:dimension<n ∈ [2, 5)>, %2:dimension<n * n ∈ [4, 17)>, %3:dimension<n * n ∈ [4, 17)> .
-                let %4:zero[], %5:f64[n * n] = custom_function_transpose [name=\"custom_function\", leading_input_count=4, seed_geometry_count=1] %1 %1 %2 %3 %0
+                let %4:zero[], %5:f64[n * n] = custom_function_transpose [name=\"custom_function\", leading_input_count=4, seed_extent_count=1] %1 %1 %2 %3 %0
                 in (%5)
             "}
             .trim_end(),

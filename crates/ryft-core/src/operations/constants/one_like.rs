@@ -90,8 +90,8 @@ impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
 impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_: OneLikeOperation<ArrayIrType>) -> Self {
-        // The exemplar supplies the complete output geometry, including runtime extents, so the homogeneous member
-        // already represents dynamic arrays. Projecting that member also rejects dimension and reference inputs.
+        // The exemplar supplies the complete output shape, including runtime extents, so the homogeneous member already
+        // represents dynamic arrays. Projecting that member also rejects dimension and reference inputs.
         Self::Array(ArrayOperation::OneLike(OneLikeOperation::new()))
     }
 }

@@ -33,7 +33,7 @@ use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
     DiagonalBatchingPolicy, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
 };
-use crate::contexts::Context;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
     DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TranspositionContext,
@@ -80,12 +80,14 @@ trait CustomJvpRule<V, O>: Send + Sync {
         tangents: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomJvpRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[CustomRuleTracer<V, O>],
@@ -114,12 +116,14 @@ trait CustomSymbolicZeroJvpRule<V, O>: Send + Sync {
         tangents: &[MaybeZero<CustomRuleTracer<V, O>>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomSymbolicZeroJvpRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
@@ -146,12 +150,14 @@ trait CustomVjpForwardRule<V, O>: Send + Sync {
         primals: &[CustomRuleTracer<V, O>],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpForwardRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
         ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
@@ -180,12 +186,14 @@ pub(super) trait CustomVjpBackwardRule<V, O>: Send + Sync {
         seeds: &[CustomRuleTracer<V, O>],
     ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpBackwardRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(&[CustomRuleTracer<V, O>], &[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
         + Send
         + Sync,
@@ -211,12 +219,14 @@ pub(super) trait CustomSymbolicZeroVjpBackwardRule<V, O>: Send + Sync {
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
     ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomSymbolicZeroVjpBackwardRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
@@ -250,12 +260,14 @@ pub(super) trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomVjpAccumulatingBackwardRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &mut TranspositionContext<V, O>,
             &[PartialValue<CustomRuleTracer<V, O>>],
@@ -290,12 +302,14 @@ trait CustomBatchingRule<V: Typed, O>: Send + Sync {
         input_axes: &[BatchAxis],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, F> CustomBatchingRule<V, O> for F
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     F: Fn(
             &BatchingLevel<V::Type>,
             &[CustomRuleTracer<V, O>],
@@ -329,6 +343,7 @@ trait CustomRuleAxisDependence<V, O>: Send + Sync {
         removed_axis: usize,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 
@@ -339,6 +354,7 @@ trait CustomRuleAxisDependence<V, O>: Send + Sync {
         right: &CustomRuleTracer<V, O>,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>;
 }
@@ -349,6 +365,7 @@ struct PolicyAxisDependence<V, O>(PhantomData<fn() -> (V, O)>);
 
 impl<V, O> CustomRuleAxisDependence<V, O> for PolicyAxisDependence<V, O>
 where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
     O: Operation<Type = V::Type> + From<AddOperation<V::Type>>,
 {
@@ -624,11 +641,11 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleBackwardSpecializationKey<T> {
     /// Unbatched types of the known leading inputs (i.e., the non-differentiated inputs, the residuals, and the seed
-    /// geometry), excluding boundary inputs.
+    /// extents), excluding boundary inputs.
     pub(super) leading_input_types: Vec<T>,
 
-    /// Number of trailing leading inputs that carry seed geometry (refer to [`CustomFunctionTransposeOperation`]).
-    pub(super) seed_geometry_count: usize,
+    /// Number of trailing leading inputs that carry seed extents (refer to [`CustomFunctionTransposeOperation`]).
+    pub(super) seed_extent_count: usize,
 
     /// Unbatched tangent types of the differentiated inputs.
     pub(super) input_tangent_types: Vec<T>,
@@ -867,6 +884,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// outputs followed by one tangent per output.
     pub fn with_jvp<R>(mut self, rule: R) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: 'static + Operation<Type = V::Type>,
         R: 'static
@@ -888,6 +906,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// of the rule.
     pub fn with_symbolic_zero_jvp<R>(mut self, rule: R) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: 'static + Operation<Type = V::Type>,
         R: 'static
@@ -920,6 +939,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// destination that input's cotangent has.
     pub fn with_vjp<F, B>(mut self, forward: F, backward: B) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static
             + TransposableOperation<V, O>
@@ -969,6 +989,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// rule receives each structural-zero seed as a [`MaybeZero::Zero`] rather than as a materialized zero.
     pub fn with_symbolic_zero_vjp<F, B>(mut self, forward: F, backward: B) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static
             + TransposableOperation<V, O>
@@ -1023,6 +1044,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// cotangent.
     pub fn with_accumulating_vjp<F, B>(mut self, forward: F, backward: B) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
         O: 'static
             + TransposableOperation<V, O>
@@ -1075,6 +1097,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// recorded level. Without this, batched calls still execute their primal but reject differentiation.
     pub fn with_batching(mut self) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + BatchableType>,
         O: 'static + Operation<Type = V::Type>,
         <V::Type as BatchableType>::Policy:
@@ -1148,6 +1171,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// of traced programs, which is why it requires the family's differentiation bounds.
     pub fn with_batching_rule<R>(mut self, rule: R) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType>,
         O: 'static
             + Operation<Type = V::Type>
@@ -1183,6 +1207,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// items, which is why it is not the default (refer to [`CustomRuleSpecializer::derived`]).
     pub fn with_axis_dependent_batching_rule<R>(self, rule: R) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static
             + Value<Type: DifferentiableType + BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
         O: 'static
@@ -1214,6 +1239,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// discharged call whose traced rule programs contain reference state rejects differentiation.
     pub fn with_reference_discharge<P>(mut self) -> Self
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static
             + Value<Type: ReferenceDischargeableType<Policy = P> + From<P::Referent> + From<ReferenceType<P::Referent>>>,
         O: 'static + Operation<Type = V::Type> + ReferenceDischargeableOperation<TracingContext<V, O>, P>,
@@ -1253,6 +1279,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         program: Program<V, O, Vec<V>, Vec<V>>,
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
         O: Operation<Type = V::Type>,
     {
@@ -1639,6 +1666,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         key: CustomRuleSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>;
 
@@ -1649,6 +1677,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         key: CustomRuleSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>;
 
@@ -1660,6 +1689,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         key: CustomRuleBackwardSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + From<CustomFunctionTransposeOperation<V, O>>;
 
@@ -1671,6 +1701,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         key: CustomRuleBatchingRuleKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>;
 
@@ -1763,6 +1794,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>,
     {
@@ -1903,6 +1935,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>,
     {
@@ -2000,6 +2033,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleBackwardSpecializationKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type> + From<CustomFunctionTransposeOperation<V, O>>,
     {
@@ -2025,7 +2059,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 let source_carrier = CustomFunctionTransposeOperation::direct(
                     self.clone(),
                     leading_input_count,
-                    key.seed_geometry_count,
+                    key.seed_extent_count,
                     key.input_tangent_types.clone(),
                     key.output_tangent_types.clone(),
                     key.discharged,
@@ -2095,6 +2129,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         key: CustomRuleBatchingRuleKey<V::Type>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError>
     where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>,
     {
@@ -2440,6 +2475,7 @@ where
 impl<Vm, Om, Vc, Oc> CustomRuleSpecializer<Vc, Oc> for LiftedCustomRules<Vm, Om>
 where
     Vm: Value<Type: DifferentiableType + Eq + Hash>,
+    TracingContext<Vm, Om>: StagingContext<Type = Vm::Type, Constant = Vm, Operation = Om>,
     Om: Operation<Type = Vm::Type>
         + From<CustomFunctionTransposeOperation<Vm, Om>>
         + ResidualZeroProvider<Vm::Type, Operation = Om>,
@@ -2524,7 +2560,7 @@ where
             .collect::<Result<Vec<_>, DifferentiationError>>()?;
         let specialization = member.backward_specialization(CustomRuleBackwardSpecializationKey {
             leading_input_types: self.project_types(&key.leading_input_types)?,
-            seed_geometry_count: key.seed_geometry_count,
+            seed_extent_count: key.seed_extent_count,
             input_tangent_types: self.project_types(&key.input_tangent_types)?,
             output_tangent_types: self.project_types(&key.output_tangent_types)?,
             seed_types,
@@ -2590,7 +2626,10 @@ where
     }
 }
 
-impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDerivation<V, O> {
+impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDerivation<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Returns the batched program of a derived call for `key` (refer to [`CustomRuleDerivation`] for its two modes),
     /// which consumes the level's boundary inputs followed by the derived call's batched inputs (i.e., its primal
     /// inputs, including the boundary inputs of earlier levels, followed by its active tangents) and returns its
@@ -3144,7 +3183,10 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
     }
 }
 
-impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDefinition<V, O> {
+impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDefinition<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Batches `program` at the provided level with the retained batcher, rejecting the request when this definition
     /// has no batching support.
     fn batched_specialization(
@@ -3202,7 +3244,10 @@ fn conform_rule_output_types<V: Value, O: Operation<Type = V::Type>>(
     rule: &str,
     program: Program<V, O, Vec<V>, Vec<V>>,
     expected: &[V::Type],
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     let input_types = program.input_types();
     let output_types = program.output_types();
     let actual = output_types.get(..expected.len()).unwrap_or(&output_types);

@@ -3,9 +3,9 @@ use std::fmt::Display;
 use crate::arrays::{ArrayType, DataType};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    BatchingPolicy, ProgramBatchingOutputAxesPolicy, reject_ragged_carriers,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
@@ -505,6 +505,11 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
         // unchanged, and the body is specialized to the packed input types, so that type views that agree only for
         // dense batches (e.g., ragged inputs packed at their declared bounds) reconcile with the exact interface that
         // inference requires.
+
+        // The batched body receives only the packed values and their batch axes, so carriers with per-item extents
+        // are rejected before the body is batched.
+        reject_ragged_carriers::<C, P>(self.name(), inputs)?;
+
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
         if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
@@ -555,6 +560,8 @@ impl<
 > DifferentiableOperation<C> for RematerializeOperation<C::Type>
 where
     for<'t> &'t ArrayType: TryFrom<&'t C::Type>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -659,6 +666,8 @@ impl<
             Operation = O,
         >,
 > TransposableOperation<V, O> for RematerializeOperation<V::Type>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -765,10 +774,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_batch;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        DimensionBounds, DimensionType, DimensionValue, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension,
+        Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+        ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::captures::{CaptureReference, ClosedProgram};
@@ -801,8 +811,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicy;
     use crate::programs::{
-        EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType, RegionDriver,
-        RegionRef,
+        EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource,
+        ReferenceType, RegionDriver, RegionRef,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -1902,6 +1912,32 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 3);
         assert_eq!(counter.read(), Ok(Array::vector(vec![11.0f32, 22.0, 33.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_rematerialize_batching_rejects_ragged_inputs() {
+        // Structural body batching sees only the packed values and their batch axes, so a bounded ragged input is
+        // rejected before the body is batched. An empty driver also proves that the rejection precedes any body
+        // transformation.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestIrValue, TestIrOperation>::new(),
+            TestIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ragged_batch(
+            TestIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+            TestIrValue::Array(Array::vector(vec![1i64, 2]).unwrap()),
+            &length,
+            1,
+        )
+        .unwrap();
+        let operation = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable));
+        assert_eq!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "`rematerialize` does not support bounded ragged dimension `length` on input 0".to_string(),
+            },
+        );
     }
 
     #[test]

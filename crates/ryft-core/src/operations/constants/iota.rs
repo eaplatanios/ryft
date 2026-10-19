@@ -5,7 +5,7 @@ use crate::arrays::{
     ArrayOperation, ArrayType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
@@ -22,7 +22,7 @@ use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::Tracer;
 
 /// Canonical operation name for [`IotaOperation`].
 pub const IOTA_OPERATION_NAME: &str = "iota";
@@ -248,7 +248,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
     }
 }
 
-impl<C: Context + DomainProjection<ArrayType>> Iota<<C::Value as ValueProjection<ArrayType>>::Projected>
+impl<C: ContextProjection<ArrayType>> Iota<<C::Value as ValueProjection<ArrayType>>::Projected>
     for ProjectedContext<C, ArrayType>
 where
     C::Operation: OperationProjection<ArrayType, Projected: From<IotaOperation<ArrayType>>>,
@@ -276,9 +276,8 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<IotaOperation<ArrayType
 
 impl<C: Context<Type = ArrayType>> Iota<PartialTracer<C>> for PartialEvaluationContext<C>
 where
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<IotaOperation<ArrayType>>,
+    C::Operation: From<IotaOperation<ArrayType>>,
+    Self: Context<Type = C::Type, Value = PartialTracer<C>, Operation = C::Operation>,
 {
     #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<PartialTracer<C>, ProgramError> {
@@ -563,7 +562,7 @@ mod tests {
         let empty_type = ArrayType::new_static(DataType::I32, [usize::MAX, usize::MAX, 0]);
         assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]).map_err(Into::into));
 
-        // Nonempty oversized geometry is rejected before allocating storage, in both debug and release builds.
+        // Nonempty oversized shapes are rejected before allocating storage, in both debug and release builds.
         let oversized_type = ArrayType::new_static(DataType::I32, [1, usize::MAX, 2]);
         assert_eq!(
             context.iota(&oversized_type, 0),
