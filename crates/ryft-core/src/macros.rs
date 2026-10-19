@@ -1444,6 +1444,87 @@ macro_rules! define_elementwise_capability {
     };
 }
 
+/// Implements the [`OperationProvider`](crate::OperationProvider) trait for [`GuardOperation`](crate::GuardOperation)
+/// requests of a handwritten operation family that stores no guard. Every [`Context`](crate::Context) requires its
+/// operation family to provide guard requests, and the generated provider rejects each one with
+/// [`GuardOperation::unsupported_family_error`](crate::GuardOperation::unsupported_family_error), so that the family
+/// can be used as a context's family while replays that need a runtime input check fail with an explicit error instead
+/// of dropping the check. `#[derive(Operation)]` generates the same provider for a derived family without a native
+/// guard variant, so derived families never use this macro. The provider is coherent with the blanket provider for
+/// families with a `From<GuardOperation<T>>` conversion only while the family has no such conversion. The optional
+/// leading generic list declares operation-specific type or `const` parameters, and an optional `where` clause can
+/// provide any bounds needed to make the operation type well-formed.
+///
+/// # Examples
+///
+/// A handwritten payload that serves as a whole family (e.g., the default constant-only family of an eager context)
+/// provides the rejecting guard provider in one line, with the same optional generic list and `where` clause as
+/// the other `impl_*_operation!` macros:
+///
+/// ```rust,ignore
+/// impl_guardless_operation!(<V> ConstantOperation<V> where V: Value);
+/// impl_guardless_operation!(<Extension> KernelOperation<Extension> where Extension: Operation<Type = ArrayIrType>);
+/// impl_guardless_operation!(<const MEMBER: u8> ProjectedMemberOperation<MEMBER>);
+/// impl_guardless_operation!(TestRegionOperation);
+/// ```
+///
+/// Replaying a program whose boundary needs a runtime check then fails explicitly rather than skipping the check:
+///
+/// ```rust,ignore
+/// let error = program.interpret_in_context(&tracing_context, &[symbolic_input]).unwrap_err();
+/// assert!(error.to_string().contains("the operation family cannot represent the guard"));
+/// ```
+///
+/// # Parameters
+///
+///   - `$generic`: Optional operation-specific type or `const` parameters used by `$operation`.
+///   - `$operation`: The operation family type for which the implementation is generated.
+///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
+#[macro_export]
+macro_rules! impl_guardless_operation {
+    // This branch accepts an operation with `const` parameters and optional well-formedness bounds.
+    (<$(const $generic:ident: $generic_type:ty),+> $operation:ty $(where $($bounds:tt)+)?) => {
+        $crate::impl_guardless_operation!(
+            @impl [$(const $generic: $generic_type),+] ($operation) { $($($bounds)+)? }
+        );
+    };
+
+    // This branch accepts a generic operation with additional well-formedness bounds.
+    (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_guardless_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
+    };
+
+    // This branch accepts a generic operation whose `Operation` implementation supplies all required bounds.
+    (<$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_guardless_operation!(@impl [$($generic),+] ($operation) {});
+    };
+
+    // This branch accepts the common non-generic operation form.
+    ($operation:ty $(,)?) => {
+        $crate::impl_guardless_operation!(@impl [] ($operation) {});
+    };
+
+    // This internal helper emits the rejecting provider shared by every public invocation form.
+    (@impl [$($generic:tt)*] ($operation:ty) { $($bounds:tt)* }) => {
+        impl<__T: $crate::Type, $($generic)*> $crate::OperationProvider<__T, $crate::GuardOperation<__T>> for $operation
+        where
+            // Stated before the caller's bounds, which need not end with a comma.
+            $operation: $crate::Operation<Type = __T>,
+            $($bounds)*
+        {
+            type Operation = Self;
+
+            #[inline]
+            fn provide(
+                request: $crate::GuardOperation<__T>,
+                _input_types: &[&__T],
+            ) -> ::std::result::Result<Self, $crate::ProgramError> {
+                ::std::result::Result::Err(request.unsupported_family_error())
+            }
+        }
+    };
+}
+
 /// Implements [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) by delegating to one of
 /// two shared rules, selected explicitly at the call site:
 ///
@@ -5455,9 +5536,9 @@ pub use crate::{
     check_types, define_arithmetic_dimension_capability, define_dimension_arithmetic_operation,
     define_elementwise_capability, define_elementwise_operation, dispatch_on_array_element_type,
     impl_array_elementwise_operation, impl_differentiable_elementwise_operation, impl_differentiable_operation,
-    impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
-    impl_nullary_transposable_operation, impl_parameterwise_operator, impl_reference_dischargeable_operation,
-    impl_tracer_operator,
+    impl_guardless_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_nullary_batchable_operation, impl_nullary_transposable_operation, impl_parameterwise_operator,
+    impl_reference_dischargeable_operation, impl_tracer_operator,
 };
 
 #[cfg(test)]
@@ -5506,24 +5587,18 @@ mod tests {
     define_elementwise_operation!(
         @unary
         /// Unary operation used to test [`define_elementwise_operation!`].
-        TestUnaryOperation, TEST_UNARY_OPERATION_NAME,
-        Neg, neg,
+        TestUnaryOperation,
+        TEST_UNARY_OPERATION_NAME,
+        Neg,
+        neg,
         check_data_types = [@numeric @real],
         check_array_types = [@no_unreduced],
     );
 
+    impl_guardless_operation!(<T> TestUnaryOperation<T> where T: Type);
+    impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
+    impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
     impl_reference_dischargeable_operation!(@reference_free TestUnaryOperation<ArrayType>);
-
-    define_elementwise_operation!(
-        @binary
-        /// Binary operation used to test [`define_elementwise_operation!`].
-        TestBinaryOperation, TEST_BINARY_OPERATION_NAME,
-        Add, add,
-        check_data_types = [@numeric, @real],
-        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
-    );
-
-    impl_reference_dischargeable_operation!(@local_reference <T> TestBinaryOperation<T> where T: Type);
 
     impl OperationProvider<ArrayType, ParallelVaryOperation> for TestUnaryOperation<ArrayType> {
         type Operation = Self;
@@ -5536,6 +5611,57 @@ mod tests {
         }
     }
 
+    impl From<ZeroOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<TransposeOperation> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: TransposeOperation) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<BroadcastOperation> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: BroadcastOperation) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<NegOperation<DataType>> for TestUnaryOperation<DataType> {
+        fn from(_operation: NegOperation<DataType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<NegOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: NegOperation<ArrayType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<TestUnaryOperation<ArrayType>> for ArrayOperation<Array> {
+        fn from(_operation: TestUnaryOperation<ArrayType>) -> Self {
+            Self::Neg(NegOperation::new())
+        }
+    }
+
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation used to test [`define_elementwise_operation!`].
+        TestBinaryOperation,
+        TEST_BINARY_OPERATION_NAME,
+        Add,
+        add,
+        check_data_types = [@numeric, @real],
+        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    );
+
+    impl_guardless_operation!(<T> TestBinaryOperation<T> where T: Type);
+    impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);
+    impl_reference_dischargeable_operation!(@local_reference <T> TestBinaryOperation<T> where T: Type);
+
     impl OperationProvider<ArrayType, ParallelVaryOperation> for TestBinaryOperation<ArrayType> {
         type Operation = Self;
 
@@ -5547,14 +5673,52 @@ mod tests {
         }
     }
 
+    impl From<ZeroOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<TransposeOperation> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: TransposeOperation) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<BroadcastOperation> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: BroadcastOperation) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<AddOperation<DataType>> for TestBinaryOperation<DataType> {
+        fn from(_operation: AddOperation<DataType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<AddOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: AddOperation<ArrayType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<TestBinaryOperation<ArrayType>> for ArrayOperation<Array> {
+        fn from(_operation: TestBinaryOperation<ArrayType>) -> Self {
+            Self::Add(AddOperation::new())
+        }
+    }
+
     const TEST_MAGNITUDE_OPERATION_NAME: &str = "test_magnitude";
     const TEST_STRICT_ADD_OPERATION_NAME: &str = "test_strict_add";
 
     define_elementwise_operation!(
         @unary
         /// Unary operation used to test custom data-type inference.
-        TestMagnitudeOperation, TEST_MAGNITUDE_OPERATION_NAME,
-        Abs, abs,
+        TestMagnitudeOperation,
+        TEST_MAGNITUDE_OPERATION_NAME,
+        Abs,
+        abs,
         infer_data_types = |input_types: &[DataType]| {
             Ok(vec![match input_types[0] {
                 DataType::C64 => DataType::F32,
@@ -5567,8 +5731,10 @@ mod tests {
     define_elementwise_operation!(
         @binary
         /// Binary operation used to test custom array-type inference.
-        TestStrictAddOperation, TEST_STRICT_ADD_OPERATION_NAME,
-        Add, add,
+        TestStrictAddOperation,
+        TEST_STRICT_ADD_OPERATION_NAME,
+        Add,
+        add,
         infer_array_types = |input_types: &[ArrayType]| {
             if input_types[0] != input_types[1] {
                 return Err(TypeError::invalid("test strict-add inputs must have identical array types".to_string()));
@@ -5624,6 +5790,8 @@ mod tests {
         provider = TestBinaryOperation<DimensionType>,
     );
 
+    impl_guardless_operation!(TestArithmeticDimensionOperation);
+
     define_arithmetic_dimension_capability!(
         /// Dimension-arithmetic capability used to test [`define_arithmetic_dimension_capability!`].
         TestArithmeticDimension,
@@ -5636,8 +5804,10 @@ mod tests {
 
     define_dimension_arithmetic_operation!(
         /// Dimension operation testing inline capability generation.
-        TestGeneratedDimensionOperation, TEST_GENERATED_DIMENSION_OPERATION_NAME,
-        TestGeneratedDimension, test_generated_dimension,
+        TestGeneratedDimensionOperation,
+        TEST_GENERATED_DIMENSION_OPERATION_NAME,
+        TestGeneratedDimension,
+        test_generated_dimension,
         output_name = |left: &DimensionType, _right: &DimensionType| left.dimension().to_string(),
         infer_bounds = |left: &DimensionType, _right: &DimensionType| -> Result<_, DimensionError> {
             Ok((left.bounds(), false))
@@ -5650,16 +5820,22 @@ mod tests {
         },
     );
 
+    impl_guardless_operation!(TestGeneratedDimensionOperation);
+
     const TEST_DIFFERENTIABLE_OPERATION_NAME: &str = "test_differentiable";
 
     define_elementwise_operation!(
         @binary
         /// Binary operation used to test [`impl_differentiable_operation!`].
-        TestDifferentiableOperation, TEST_DIFFERENTIABLE_OPERATION_NAME,
-        Add, add,
+        TestDifferentiableOperation,
+        TEST_DIFFERENTIABLE_OPERATION_NAME,
+        Add,
+        add,
         check_data_types = [@numeric],
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
+
+    impl_guardless_operation!(<T> TestDifferentiableOperation<T> where T: Type);
 
     impl_differentiable_operation! {
         TestDifferentiableOperation<ArrayType>,
@@ -5696,22 +5872,15 @@ mod tests {
         /// Binary operation with a `[@negative, @positive]` differentiation rule used to test
         /// [`impl_differentiable_elementwise_operation!`]. Interpretation reuses [`Sub`] as a stand-in because only
         /// the generated differentiation and transposition rules are under test.
-        TestReversedSubOperation, TEST_REVERSED_SUB_OPERATION_NAME,
-        Sub, sub,
+        TestReversedSubOperation,
+        TEST_REVERSED_SUB_OPERATION_NAME,
+        Sub,
+        sub,
         check_data_types = [@numeric],
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
-    define_elementwise_operation!(
-        @binary
-        /// Binary operation with a `[@negative, @negative]` differentiation rule used to test
-        /// [`impl_differentiable_elementwise_operation!`]. Interpretation reuses [`Add`] as a stand-in because only
-        /// the generated differentiation and transposition rules are under test.
-        TestNegatedAddOperation, TEST_NEGATED_ADD_OPERATION_NAME,
-        Add, add,
-        check_data_types = [@numeric],
-        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
-    );
+    impl_guardless_operation!(<T> TestReversedSubOperation<T> where T: Type);
 
     impl_differentiable_elementwise_operation! {
         @linear
@@ -5719,163 +5888,25 @@ mod tests {
         rule = [@negative, @positive]
     }
 
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation with a `[@negative, @negative]` differentiation rule used to test
+        /// [`impl_differentiable_elementwise_operation!`]. Interpretation reuses [`Add`] as a stand-in because only
+        /// the generated differentiation and transposition rules are under test.
+        TestNegatedAddOperation,
+        TEST_NEGATED_ADD_OPERATION_NAME,
+        Add,
+        add,
+        check_data_types = [@numeric],
+        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    );
+
+    impl_guardless_operation!(<T> TestNegatedAddOperation<T> where T: Type);
+
     impl_differentiable_elementwise_operation! {
         @linear
         TestNegatedAddOperation,
         rule = [@negative, @negative]
-    }
-
-    impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
-    impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
-    impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);
-
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestUnaryOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestBinaryOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestDifferentiableOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestReversedSubOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestNegatedAddOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl OperationProvider<DimensionType, GuardOperation<DimensionType>> for TestArithmeticDimensionOperation {
-        type Operation = Self;
-
-        fn provide(
-            request: GuardOperation<DimensionType>,
-            _input_types: &[&DimensionType],
-        ) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl OperationProvider<DimensionType, GuardOperation<DimensionType>> for TestGeneratedDimensionOperation {
-        type Operation = Self;
-
-        fn provide(
-            request: GuardOperation<DimensionType>,
-            _input_types: &[&DimensionType],
-        ) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
-
-    impl From<ZeroOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<ZeroOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<TransposeOperation> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: TransposeOperation) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<BroadcastOperation> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: BroadcastOperation) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<NegOperation<DataType>> for TestUnaryOperation<DataType> {
-        fn from(_operation: NegOperation<DataType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<NegOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: NegOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<TransposeOperation> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: TransposeOperation) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<BroadcastOperation> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: BroadcastOperation) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<AddOperation<DataType>> for TestBinaryOperation<DataType> {
-        fn from(_operation: AddOperation<DataType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<AddOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: AddOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<TestUnaryOperation<ArrayType>> for ArrayOperation<Array> {
-        fn from(_operation: TestUnaryOperation<ArrayType>) -> Self {
-            Self::Neg(NegOperation::new())
-        }
-    }
-
-    impl From<TestBinaryOperation<ArrayType>> for ArrayOperation<Array> {
-        fn from(_operation: TestBinaryOperation<ArrayType>) -> Self {
-            Self::Add(AddOperation::new())
-        }
     }
 
     /// Unary operator used to test [`impl_tracer_operator!`].
@@ -6019,16 +6050,7 @@ mod tests {
     impl_nullary_transposable_operation!(<T> TestNullaryOperation<T> where T: Type);
     impl_nullary_batchable_operation!(@replicated <T> TestNullaryOperation<T> where T: Type);
 
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestNullaryOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(<T> TestNullaryOperation<T> where T: Type);
 
     /// Generic nullary operation used to instantiate generic macro forms.
     struct TestGenericNullaryOperation<T>(PhantomData<fn() -> T>);
@@ -6084,16 +6106,7 @@ mod tests {
     impl_nullary_transposable_operation!(<T> TestGenericNullaryOperation<T>);
     impl_nullary_batchable_operation!(@replicated <D> TestGenericNullaryOperation<D>);
 
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestGenericNullaryOperation<T>
-    where
-        Self: Operation<Type = T>,
-    {
-        type Operation = Self;
-
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(<T> TestGenericNullaryOperation<T> where T: Type);
 
     /// Generic nullary operation used to instantiate generic-plus-`where` macro forms.
     struct TestBoundedNullaryOperation<T>(PhantomData<fn() -> T>);
@@ -6149,12 +6162,7 @@ mod tests {
     impl_nullary_transposable_operation!(<O> TestBoundedNullaryOperation<O> where O: Clone);
     impl_nullary_batchable_operation!(@replicated <C> TestBoundedNullaryOperation<C> where C: Clone);
 
-    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestBoundedNullaryOperation<T> {
-        type Operation = Self;
-        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
-            Err(request.unsupported_family_error())
-        }
-    }
+    impl_guardless_operation!(<T> TestBoundedNullaryOperation<T> where T: Type);
 
     #[test]
     fn test_check_count() {
@@ -6674,6 +6682,27 @@ mod tests {
         assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_impl_guardless_operation() {
+        // Both the generic and the non-generic forms reject every guard request with the family-independent message.
+        let array_type = ArrayType::scalar(DataType::F64);
+        let guard = GuardOperation::new("region", vec![array_type.clone()]);
+        assert!(matches!(
+            TestUnaryOperation::<ArrayType>::provide(guard, &[&array_type]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the input types of `region` leave identity relationships unproven, but the operation \
+                               family cannot represent the guard required to preserve these input checks",
+        ));
+        let dimension_type = DimensionValue::constant(2).unwrap().r#type().into_owned();
+        let guard = GuardOperation::new("call", vec![dimension_type.clone()]);
+        assert!(matches!(
+            TestArithmeticDimensionOperation::provide(guard, &[&dimension_type]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the input types of `call` leave identity relationships unproven, but the operation \
+                               family cannot represent the guard required to preserve these input checks",
+        ));
     }
 
     #[test]
