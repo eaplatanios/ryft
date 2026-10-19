@@ -133,6 +133,9 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
     ///     analysis creates a clone with instruction-local ordering state; ordinary replay uses this context directly.
     ///   - `region`: Source region containing the instruction and its reference identities.
     ///   - `instruction_index`: Instruction index within the source region.
+    ///   - `operation`: Operation of the instruction with its type identities renamed for this replay (refer to
+    ///     [`ReplayTypeIdentities::instruction_renaming`]). The source instruction at `instruction_index` still drives
+    ///     the effect and reference analysis.
     ///   - `inputs`: Partially evaluated instruction inputs in source input order.
     ///   - `deferred_instructions`: Source instructions explicitly required to remain residual, including allocations
     ///     that must be created afresh for each residual call.
@@ -140,11 +143,13 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
     ///     when reference analysis is supplied; nested emission still enforces ordering within this instruction.
     ///   - `reference_analysis`: Canonical source-reference analysis for repeated residual calls. Omitting it retains
     ///     the active context's ordering rules without performing source-reference analysis.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn partially_evaluate_instruction<C: Context>(
         &self,
         context: &PartialEvaluationContext<C>,
         region: RegionRef<'_, C::Constant, C::Operation>,
         instruction_index: usize,
+        operation: &C::Operation,
         inputs: &[PartialEvaluationValue<C::Value>],
         deferred_instructions: &HashSet<InstructionId>,
         deferred_effect_ordering: &RefCell<EffectOrdering<ReferenceRoot>>,
@@ -189,7 +194,10 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
         };
 
         let instruction_context = effect_ordering.as_ref().map(|ordering| {
-            context.clone().with_defer_ordered_effects(deferred_effect_ordering.borrow().conflicts(ordering))
+            // An entry guard precedes this source-reference walk, so its global barrier survives local ordering.
+            context.clone().with_defer_ordered_effects(
+                context.defer_ordered_effects() || deferred_effect_ordering.borrow().conflicts(ordering),
+            )
         });
 
         let context = instruction_context.as_ref().unwrap_or(context);
@@ -197,12 +205,12 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
         let outputs = if must_defer || shared_reference_boundary {
             let programs = self.regions().map(RegionRef::to_program).collect();
             if must_defer {
-                context.residualize(instruction.operation().clone(), programs, inputs)
+                context.residualize(operation.clone(), programs, inputs)
             } else {
-                context.fold_or_residualize(instruction.operation().clone(), programs, inputs)
+                context.fold_or_residualize(operation.clone(), programs, inputs)
             }
         } else {
-            instruction.operation().partially_evaluate(context, self, inputs)
+            operation.partially_evaluate(context, self, inputs)
         }?;
 
         if let Some(ordering) = effect_ordering
@@ -241,6 +249,9 @@ where
         inputs: Vec<PartialEvaluationValue<C::Value>>,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let region = self.region(index)?;
+
+        // Both replays below take the place of the region's entry, so they follow the shared entry contract.
+        let inputs = context.guard_region_inputs(region, inputs, false)?;
 
         // Inlining during ordinary specialization shares the caller's residual builder and accumulated effect
         // ordering. It needs no separate allocation discovery or per-reference ordering analysis.
@@ -289,14 +300,7 @@ where
 
         // Retain actual known values and create residual inputs for unknowns. Their indices refer to the original
         // region inputs so the returned evaluation can reconstruct its residual arguments in the correct order.
-        let inputs = knowledge
-            .iter()
-            .enumerate()
-            .map(|(index, value)| match value {
-                PartialValue::Known(value) => PartialEvaluationValue::known_input(value.clone()),
-                PartialValue::Unknown(r#type) => nested.unknown_input(r#type.clone(), index),
-            })
-            .collect();
+        let inputs = nested.prepare_root_inputs(region, knowledge)?;
 
         // Apply the allocation decisions to replay of the original region, using its reference analysis to preserve
         // dependencies between accesses. The discovery pass already recorded which allocations need deferring, so
@@ -350,6 +354,10 @@ where
 /// operation decide how partial evaluation treats it. It can be implemented with an empty implementation block,
 /// deferring to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior
 /// can be customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
+///
+/// Inlining and region specialization preserve boundary checks by staging [`GuardOperation`](crate::GuardOperation)s
+/// through the guard provider that every [`Context`]'s operation family carries, so neither this trait nor
+/// [`partially_evaluate`](Self::partially_evaluate) states a separate guard-provider bound.
 ///
 /// # Type Parameters
 ///
@@ -423,16 +431,87 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrType, ArrayType, DataType};
+    use crate::arrays::{
+        Array, ArrayIrType, ArrayReference, ArrayType, DataType, DimensionBounds, DimensionError, DimensionType,
+        DimensionValue, Shape,
+    };
     use crate::contexts::EagerContext;
     use crate::operations::{ReferenceReadOperation, ReferenceWriteOperation};
     use crate::parameters::Placeholder;
     use crate::partial::contexts::PartialEvaluationContext;
     use crate::partial::tests::{TestOperation, TestValue};
     use crate::partial::values::PartialEvaluationOutput;
-    use crate::programs::{ProgramBuilder, ReferenceType};
+    use crate::programs::{ProgramBuilder, ReferenceType, TypeError};
 
     use super::*;
+
+    #[test]
+    fn test_recursive_partial_evaluation_driver_partially_evaluate_program_preserves_entry() {
+        let dimension = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
+        let reference_type = ReferenceType::new(array_type.clone());
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(dimension.into());
+        let array = builder.add_input(array_type.clone().into());
+        let reference = builder.add_input(reference_type.clone().into());
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, array], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+            .unwrap();
+        let regions = vec![program];
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let knowledge = [
+            PartialValue::Known(TestValue::Dimension(DimensionValue::constant(2).unwrap())),
+            PartialValue::Unknown(array_type.into()),
+            PartialValue::Unknown(reference_type.into()),
+        ];
+
+        // Both single and repeated residual evaluation check the known extent before the write. The array and the
+        // reference keep their supplied types, which share the identity `extent` (a reference cannot be cast, so the
+        // array is not narrowed either), so the residual entry relates them, and an entry guard relates them to the
+        // known extent. A matching array is written, and a mismatching array or reference is rejected before the write.
+        let check = |repeated_residual: bool| {
+            let driver = RecursivePartialEvaluationDriver { driver: &regions, repeated_residual };
+            let evaluation =
+                driver.partially_evaluate_program(&context, regions[0].entry_region_ref(), &knowledge).unwrap();
+            let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+            let inputs =
+                [TestValue::Array(Array::vector(vec![4f32; 2]).unwrap()), TestValue::Reference(reference.clone())];
+            assert_eq!(evaluation.interpret(context.parent(), &inputs), Ok(Vec::new()));
+            assert_eq!(reference.read().unwrap(), Array::vector(vec![4f32; 2]).unwrap());
+
+            let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
+            let inputs =
+                [TestValue::Array(Array::vector(vec![4f32; 3]).unwrap()), TestValue::Reference(reference.clone())];
+            assert_eq!(
+                evaluation.interpret(context.parent(), &inputs),
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "extent".to_string(),
+                    expected: 3,
+                    actual: 2,
+                }))),
+            );
+            assert_eq!(reference.read().unwrap(), Array::vector(vec![1f32; 2]).unwrap());
+
+            let reference = ArrayReference::new(Array::vector(vec![1f32; 3]).unwrap());
+            let inputs =
+                [TestValue::Array(Array::vector(vec![4f32; 3]).unwrap()), TestValue::Reference(reference.clone())];
+            assert_eq!(
+                evaluation.interpret(context.parent(), &inputs),
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "extent".to_string(),
+                    expected: 2,
+                    actual: 3,
+                }))),
+            );
+            assert_eq!(reference.read().unwrap(), Array::vector(vec![1f32; 3]).unwrap());
+        };
+
+        check(false);
+        check(true);
+    }
 
     #[test]
     fn test_recursive_partial_evaluation_driver_partition_program() {
