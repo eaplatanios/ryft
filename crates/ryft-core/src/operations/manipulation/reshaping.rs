@@ -14,7 +14,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment, TransposableOperation,
     transpose_projected_operation,
@@ -41,13 +41,13 @@ use crate::tracing::{Tracer, TracingContext};
 pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 
 /// [`Operation`] that reshapes its input array to a requested [`Shape`]. This is the member-family reshape primitive
-/// of the homogeneous array language: complete output geometry is carried by the output [`Shape`], so the operation
-/// has exactly one input and no explicit extent edges. The input shape is recoverable from the staged input types
-/// and is therefore not duplicated in the payload. It and [`BroadcastOperation`] form the homogeneous baseline that
+/// of the homogeneous array language: the complete output shape is carried by the output [`Shape`], so the operation
+/// has exactly one input and no explicit extent edges. The input shape is recoverable from the staged input types and
+/// is therefore not duplicated in the payload. It and [`BroadcastOperation`] form the homogeneous baseline that
 /// [`ProjectedContext`](crate::ProjectedContext) serves, which is why transform rules for mixed operations can delegate
-/// to them once input geometry is resolved. Refer to the documentation of [`Reshape`] for the underlying
-/// resolved-geometry contract. Programs that need first-class dynamic extents stage [`DynamicReshapeOperation`]
-/// instead, which takes one explicit first-class dimension input per output axis.
+/// to them once input shapes are resolved. Refer to the documentation of [`Reshape`] for the underlying resolved-shape
+/// contract. Programs that need first-class dynamic extents stage [`DynamicReshapeOperation`] instead, which takes one
+/// explicit first-class dimension input per output axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshapeOperation {
     /// Output [`Shape`] of this [`ReshapeOperation`].
@@ -820,7 +820,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> P
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicReshapeOperation
 where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<DynamicReshapeOperation>,
+    C::Operation: From<ConstantOperation<DimensionValue>> + From<DynamicReshapeOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -829,7 +829,7 @@ where
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         // Explicit output extents remain replicated shape values. A mapped input is canonicalized to a leading batch
-        // axis, and that axis is inserted into both the reshape geometry and the output sharding before the mixed
+        // axis, and that axis is inserted into both the target shape and the output sharding before the mixed
         // operation is replayed.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -889,16 +889,21 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayIrType>,
-        C::Operation: From<DimensionSizeOperation>
+        C::Operation: From<ConstantOperation<DimensionValue>>
+            + From<DimensionSizeOperation>
             + From<LinearCallOperation<ArrayIrType>>
             + From<DynamicReshapeOperation>
-            + From<ConstantOperation<DimensionValue>>
             + OperationProjection<ArrayType, Projected: From<BroadcastOperation>>,
+        TracingContext<C::Constant, C::Operation>: StagingContext<
+            Type = ArrayIrType,
+            Constant = C::Constant,
+            Operation = C::Operation,
+        >,
     {
         |operation, context, _driver, inputs| {
-            // The explicit output extents are ordinary non-differentiated shape values. Static input cotangent
-            // geometry replays the mixed reshape directly. Dynamic geometry retains the exact input shape so the
-            // linear transpose can reconstruct the inverse reshape from first-class dimension residuals.
+            // The explicit output extents are ordinary non-differentiated shape values. Static input cotangent shapes
+            // replay the mixed reshape directly. Dynamic shapes retain the exact input shape so the linear transpose
+            // can reconstruct the inverse reshape from first-class dimension residuals.
             let destinations = context;
             if inputs.is_empty() {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -923,9 +928,9 @@ impl_differentiable_operation! {
                     let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
                     let input_cotangent_type = input_type.cotangent()?;
 
-                    // Direct replay needs both the input geometry and the output geometry to be static, so that the
-                    // transpose can reshape back without runtime extents. Otherwise, the exact extents are retained
-                    // as linearization residuals; static extents become constants in the inverse shape.
+                    // Direct replay needs both the input shape and the output shape to be static, so that the transpose
+                    // can reshape back without runtime extents. Otherwise, the exact extents are retained as
+                    // linearization residuals; static extents become constants in the inverse shape.
                     let output_type = <&ArrayType>::try_from(output_primal.r#type().as_ref())?.clone();
                     if input_cotangent_type
                         .shape()
@@ -953,7 +958,7 @@ impl_differentiable_operation! {
                         let input_shape = residuals.retain_shape(tangent_context, array.primal())?;
 
                         // Both linear regions share one deterministic residual boundary. The forward region consumes
-                        // the retained output extents; the transpose region consumes the retained exact input geometry.
+                        // the retained output extents; the transpose region consumes the retained exact input shape.
                         let forward_operation = operation.clone();
                         let forward_output_extents = output_extent_residuals.clone();
                         let transpose_target_type = input_cotangent_type.clone();
@@ -1005,7 +1010,7 @@ impl_differentiable_operation! {
                                 check_count!("output", outputs, 1, ProgramError);
                                 let cotangent = outputs.remove(0);
 
-                                // The inverse geometry is exact, but reshape clears layouts and may need replicated
+                                // The inverse shape is exact, but reshape clears layouts and may need replicated
                                 // bridge sharding. Restore the original cotangent's complete storage metadata after
                                 // reconstructing the shape, just as the homogeneous rule's unalignment does.
                                 let cotangent =
@@ -1044,10 +1049,17 @@ impl_differentiable_operation! {
                         <O as OperationProjection<ArrayType>>::Projected,
                     >,
             >,
+        TracingContext<
+            <V as ValueProjection<ArrayType>>::Projected, <O as OperationProjection<ArrayType>>::Projected,
+        >: StagingContext<
+            Type = ArrayType,
+            Constant = <V as ValueProjection<ArrayType>>::Projected,
+            Operation = <O as OperationProjection<ArrayType>>::Projected,
+        >,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Static input geometry delegates to the homogeneous array pullback, while every explicit output
-            // extent receives a structural-zero cotangent. Dynamic input geometry requires linearization so
+            // Static input shapes delegate to the homogeneous array pullback, while every explicit output
+            // extent receives a structural-zero cotangent. Dynamic input shapes require linearization so
             // that `DifferentiableOperation::jvp` can retain its exact extents as residuals.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
@@ -1057,8 +1069,8 @@ impl_differentiable_operation! {
             };
             let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
 
-            // No inverse geometry is needed when there is no live contribution. In particular, dynamic input extents
-            // must not force residual capture for a structural-zero cotangent or a nondifferentiable input.
+            // No inverse shape is needed when there is no live contribution. In particular, dynamic input extents must
+            // not force residual capture for a structural-zero cotangent or a nondifferentiable input.
             if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
                 return Ok(());
             }
@@ -1067,7 +1079,7 @@ impl_differentiable_operation! {
             };
             let output_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
 
-            // The homogeneous pullback reshapes the cotangent back through static geometry only. A dynamic extent on
+            // The homogeneous pullback reshapes the cotangent back through static shapes only. A dynamic extent on
             // either side is available exactly as a linearization residual, so direct transposition is rejected.
             if input_cotangent_type
                 .shape()
@@ -1104,15 +1116,15 @@ impl_differentiable_operation! {
 
 /// Reshapes an array using one explicit first-class dimension value per output axis.
 ///
-/// This is the shape-polymorphic counterpart of [`Reshape`], which receives its complete output geometry as a
-/// [`Shape`]. Exact dimension types describe static axes, including those produced by arithmetic, while non-exact
-/// dimension types describe dynamic axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime shape
-/// arithmetic stays an ordinary graph computation instead of a type-level side condition; backend lowering chooses
-/// the appropriate static, bounded, or dynamic representation from the inferred result type.
+/// This is the shape-polymorphic counterpart of [`Reshape`], which receives its complete output shape as a [`Shape`].
+/// Exact dimension types describe static axes, including those produced by arithmetic, while non-exact dimension types
+/// describe dynamic axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime shape arithmetic stays an
+/// ordinary graph computation instead of a type-level side condition; backend lowering chooses the appropriate static,
+/// bounded, or dynamic representation from the inferred result type.
 ///
 /// The output extents must multiply to the input element count, including when either shape contains a zero axis. When
 /// the input types cannot prove this equality, the operation retains an ordered runtime assertion even if its result is
-/// unused. Each dynamic extent also retains its declared bounds. Backends may reject unbounded geometry or a reshape
+/// unused. Each dynamic extent also retains its declared bounds. Backends may reject unbounded extents or a reshape
 /// whose input and output physical capacities cannot be represented by their runtime reshape support; equal logical
 /// element counts alone do not guarantee that every bounded shape can be compiled.
 ///
@@ -1203,7 +1215,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     where
         Self: Value<Type: AsArrayType, Domain: DimensionConstant>,
     {
-        // Validate the requested geometry before staging any dimension constant, so that an invalid element count
+        // Validate the requested shape before staging any dimension constant, so that an invalid element count
         // leaves no dead dimension literals behind in a trace.
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -1238,7 +1250,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
         }
 
         if let Some(element_count) = input_type.element_count()? {
-            // Static geometry needs no runtime size arithmetic.
+            // A static shape needs no runtime size arithmetic.
             return self.dynamic_reshape_to_sizes(&[element_count]);
         }
 
@@ -1326,8 +1338,8 @@ impl<
         let operation = DynamicReshapeOperation::new().with_output_sharding(output_sharding);
         let output_type = infer_dynamic_reshape_output_type(input_type, output_shape, operation.output_sharding())?;
 
-        // A static identity reshape cannot observe its exact extent inputs, so it stages nothing. Dynamic geometry
-        // keeps the instruction because its inputs assert the runtime element-count relation.
+        // A static identity reshape cannot observe its exact extent inputs, so it stages nothing. A dynamic shape keeps
+        // the instruction because its inputs assert the runtime element-count relation.
         if input_type.static_shape().is_some() && &output_type == input_type {
             return Ok(self.clone());
         }
@@ -1690,10 +1702,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
         DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, RaggedAxis, Sharding, StridedLayout,
+        MeshAxisType, Sharding, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
@@ -1703,14 +1716,15 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::assertions::GuardOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
     use crate::operations::manipulation::transposition::TransposeOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
-        Typed, ValueDomainDispatch,
+        BindingRegionDriver, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
+        ProvenanceScope, Typed, ValueDomainDispatch,
     };
     use crate::tracing::Trace;
 
@@ -1760,7 +1774,10 @@ mod tests {
         type Operation = O;
     }
 
-    impl<V: Value, O: Debug + Operation<Type = V::Type>> Context for InvalidOutputContext<V, O> {
+    impl<V: Value, O: Debug + Operation<Type = V::Type>> Context for InvalidOutputContext<V, O>
+    where
+        O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+    {
         fn lift(&self, value: V) -> Result<Self::Value, ProgramError> {
             Ok(DispatchValue { value, output_count: self.0, operation: PhantomData })
         }
@@ -2117,8 +2134,8 @@ mod tests {
 
     #[test]
     fn test_reshape_batching_dynamic_singleton_axes() {
-        // Inserting a singleton axis around a dynamic per-item extent is a homogeneous reshape, so the mapped axis
-        // is threaded through it like any other static geometry and the dynamic identity survives in the output.
+        // Inserting a singleton axis around a dynamic per-item extent is a homogeneous reshape, so the mapped axis is
+        // threaded through it like any other static axis and the dynamic identity survives in the output.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let input = trace.input(
@@ -2183,10 +2200,7 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
-        let input = ArrayBatch::new(array, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(array, extents, &variable, 1).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
         let operation = ReshapeOperation::new(Shape::new(vec![Dimension::Static(3)]));
         assert_eq!(
@@ -2198,8 +2212,8 @@ mod tests {
             },
         );
 
-        // A first-class mapped extent cannot be embedded into the homogeneous operation's static result geometry.
-        // The diagnostic directs this case to the mixed operation, which carries that extent as an input.
+        // A first-class mapped extent cannot be embedded into the homogeneous operation's static result shape. The
+        // diagnostic directs this case to the mixed operation, which carries that extent as an input.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let extent = trace.input(DimensionType::from(items.clone()).into());
@@ -2462,10 +2476,10 @@ mod tests {
 
     #[test]
     fn test_reshape_reshape_invalid_output_count() {
-        // Exercise both missing and extra results without involving larger operation families.
+        // Exercise both missing and extra results. The context never runs the bound operation.
         let array = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[3_i32, 7]).unwrap();
         for output_count in [0, 2] {
-            let context = InvalidOutputContext::<Array, ReshapeOperation>(output_count, PhantomData);
+            let context = InvalidOutputContext::<Array, ArrayOperation<Array>>(output_count, PhantomData);
             let input = context.lift(array.clone()).unwrap();
             assert!(matches!(
                 input.reshape(Shape::new(vec![2.into(), 1.into()])),
@@ -2505,7 +2519,7 @@ mod tests {
             .trim_end(),
         );
 
-        // The rejected geometry is the same as at the type level, and nothing is staged for it.
+        // The rejected shape is the same as at the type level, and nothing is staged for it.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::F64, [6]).into());
         let input = <_ as ValueProjection<ArrayType>>::into_projected(input).unwrap();
@@ -3580,8 +3594,8 @@ mod tests {
             .unwrap();
         assert_eq!(program.output_types(), vec![source_array_type.into()]);
 
-        // Instantiating the boundary identities renames the identity throughout: the reshape has no stored geometry of
-        // its own, so its output type follows the renamed extent input.
+        // Instantiating the boundary identities renames the identity throughout: the reshape has no stored shape of its
+        // own, so its output type follows the renamed extent input.
         let target = DimensionVariable::new("target", bounds);
         let target_dimension_type = DimensionType::from(target.clone());
         let target_array_type =
@@ -3758,8 +3772,8 @@ mod tests {
         assert_ne!(replayed_types, program.output_types());
         assert_eq!(replayed_types[0].to_string(), "f64[2, source * 2]");
 
-        // Specialization replays this retained graph rather than retracing its construction closure. Both the
-        // dimension arithmetic and the reshape must acquire the concrete geometry at each independent call.
+        // Specialization replays this retained graph rather than retracing its construction closure. Both the dimension
+        // arithmetic and the reshape must acquire the concrete extents at each independent call.
         for size in [4, 5] {
             let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
             let specialized = program.clone().specialize(&[input_type.clone().into()]).unwrap();
@@ -3810,7 +3824,7 @@ mod tests {
         assert_eq!(outputs, vec![expected_output.clone()]);
         assert_eq!(evidence, Vec::<DimensionVariable>::new());
 
-        // A non-leading mapped axis is moved to the front before the per-item geometry is lifted.
+        // A non-leading mapped axis is moved to the front before the per-item shape is lifted.
         let transposed = ArrayIrBatch::new(
             ArrayIrValue::Array(
                 Array::matrix(6, 2, vec![0.0, 6.0, 1.0, 7.0, 2.0, 8.0, 3.0, 9.0, 4.0, 10.0, 5.0, 11.0]).unwrap(),
@@ -3861,10 +3875,7 @@ mod tests {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents =
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap());
-        let input = ArrayIrBatch::new(array, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
-            .unwrap();
+        let input = ragged_batch(array, extents, &variable, 1).unwrap();
         let three = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         assert_eq!(
             DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &[input, three]).unwrap_err(),
@@ -3878,7 +3889,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_reshape_batching_rejects_mapped_extent() {
-        // Output extents are replicated shape values; a mapped per-item dimension cannot describe one output geometry.
+        // Output extents are replicated shape values; a mapped per-item dimension cannot describe one output shape.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -4103,8 +4114,8 @@ mod tests {
             )
             .unwrap();
 
-        // Static geometry on both sides replays the mixed reshape directly on the tangent under the same constant
-        // extents, which are non-differentiated shape values.
+        // Static shapes on both sides replay the mixed reshape directly on the tangent under the same constant extents,
+        // which are non-differentiated shape values.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -4133,7 +4144,7 @@ mod tests {
     #[test]
     fn test_dynamic_reshape_differentiation_structural_zero_tangent() {
         // A direct rule call may carry a structural-zero array tangent. The rule must keep it structural at the output
-        // tangent type without staging a linear call or reading any extent, even for dynamic geometry on both sides.
+        // tangent type without staging a linear call or reading any extent, even for dynamic shapes on both sides.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(37)).unwrap());
         let input_type =
@@ -4463,10 +4474,10 @@ mod tests {
         let program = doubled_extent_reshape_program();
         let jvp = program.jvp().unwrap();
 
-        // The dual program derives the forward geometry once. The staged linear call receives the primal reshape's own
+        // The dual program derives the forward extents once. The staged linear call receives the primal reshape's own
         // dimension inputs as its leading residuals instead of restaging extent arithmetic for the tangent, so no
         // dimension acquires a second forward definition just because the program was differentiated. The additional
-        // geometry read is the transpose residual that the inverse reshape needs, not a duplicated derivation.
+        // dimension read is the transpose residual that the inverse reshape needs, not a duplicated derivation.
         assert_eq!(
             jvp.to_string(),
             indoc! {"
@@ -4751,7 +4762,7 @@ mod tests {
         );
 
         // The data-derived extent rides the ordinary residual path: it is a primal output, a tangent input, and a
-        // leading residual input of the linear call. Nothing about it is special-cased relative to the geometry-read
+        // leading residual input of the linear call. Nothing about it is special-cased relative to the dimension-read
         // `source` residual beside it, and no dimension acquires a tangent input of its own.
         assert_eq!(linearization.residual_count(), 2);
         assert_eq!(
@@ -4996,7 +5007,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_reshape_transposition() {
-        // Static geometry delegates to the homogeneous pullback, which reshapes the cotangent back, while the known
+        // A static shape delegates to the homogeneous pullback, which reshapes the cotangent back, while the known
         // extent inputs receive no cotangent.
         let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
@@ -5061,9 +5072,9 @@ mod tests {
 
     #[test]
     fn test_dynamic_reshape_transposition_rejects_a_dynamic_input_extent() {
-        // The direct rule reshapes the cotangent back through static geometry only, which cannot recover a runtime
-        // input extent. It therefore rejects dynamic input geometry by name; linearization is the supported route,
-        // because it retains that extent as an explicit residual.
+        // The direct rule reshapes the cotangent back through static shapes only, which cannot recover a runtime input
+        // extent. It therefore rejects dynamic input extents by name; linearization is the supported route, because it
+        // retains that extent as an explicit residual.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let input_type =
             ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows), 4.into()])));
@@ -5097,7 +5108,7 @@ mod tests {
     #[test]
     fn test_dynamic_reshape_transposition_rejects_a_dynamic_output_extent() {
         // A dynamic output extent is rejected for the same reason: the inverse reshape of the homogeneous pullback
-        // needs static geometry on both sides, and linearization retains the output extent as a residual instead.
+        // needs static shapes on both sides, and linearization retains the output extent as a residual instead.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let input_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [6]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -5222,11 +5233,11 @@ mod tests {
 
     #[test]
     fn test_dynamic_reshape_dynamic_reshape_invalid_output_count() {
-        // Exercise both missing and extra results without involving larger operation families.
+        // Exercise both missing and extra results. The context never runs the bound operation.
         let array = Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         for output_count in [0, 2] {
             let context =
-                InvalidOutputContext::<ArrayIrValue<Array>, DynamicReshapeOperation>(output_count, PhantomData);
+                InvalidOutputContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>(output_count, PhantomData);
             let input = context.lift(ArrayIrValue::Array(array.clone())).unwrap();
             let two = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
             let three = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())).unwrap();
@@ -5251,8 +5262,8 @@ mod tests {
                 if message == format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements"),
         ));
 
-        // The geometry is validated before any dimension constant is staged, so an invalid element count leaves no
-        // dead dimension literals behind in a trace.
+        // The shape is validated before any dimension constant is staged, so an invalid element count leaves no dead
+        // dimension literals behind in a trace.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::I32, [6]).into());
         assert!(matches!(

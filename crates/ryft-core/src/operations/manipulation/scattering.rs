@@ -13,7 +13,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
@@ -25,6 +25,7 @@ use crate::macros::{
 };
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul};
+
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::DimensionConstant;
@@ -583,7 +584,7 @@ impl ScatterOperation {
     /// context. `context` is used only for the nullary winner-ID construction.
     ///
     /// Structural-zero flags describe absent tangent contributions, not arrays whose numeric elements happen to be
-    /// zero. The caller materializes missing tangents using the appropriate static or retained runtime geometry.
+    /// zero. The caller materializes missing tangents using the appropriate static shape or retained runtime extents.
     ///
     /// # Parameters
     ///
@@ -822,8 +823,8 @@ impl ScatterOperation {
             let update_contribution = if updates_are_zero {
                 None
             } else {
-                // Mark the destinations without a dual gather as dynamic windows and possibly empty inserted axes
-                // can be scattered even when their geometry cannot be represented by a static gather window.
+                // Mark the destinations without a dual gather as dynamic windows and possibly empty inserted axes can
+                // be scattered even when their shape cannot be represented by a static gather window.
                 let input = input.convert_element_type(updates_tangent.r#type().data_type())?;
                 let touched = input.zero_like()?.scatter(
                     indices,
@@ -1217,9 +1218,9 @@ impl_differentiable_operation! {
             // (i.e., input 2) are the linear ones. Scatter-add accumulates into its input (i.e., `output = input +
             // scattered(updates)`, and so the input Jacobian is the identity), so the input cotangent is the output
             // cotangent unchanged. The update cotangent gathers the output cotangent at the scattered windows via the
-            // dual gather built by mirroring the scatter geometry. The transpose reads the known indices from the
-            // pullback boundary and stages an ordinary `GatherOperation`, so linearization retains the indices as
-            // regular Single Static Assignment (SSA) residuals. The indices receive a structural zero, and a zero
+            // dual gather built by mirroring the scatter's dimension numbers. The transpose reads the known indices
+            // from the pullback boundary and stages an ordinary `GatherOperation`, so linearization retains the indices
+            // as regular Single Static Assignment (SSA) residuals. The indices receive a structural zero, and a zero
             // output cotangent stays a structural zero. Unique-index overwrite erases the input cotangent at the
             // written windows. Multiply scatter also has a linear partition when only its base is unknown and both
             // indices and updates are retained constants.
@@ -1279,7 +1280,7 @@ impl_differentiable_operation! {
             }
 
             // The overwrite base cotangent needs zeros shaped like the updates. Static shapes can synthesize
-            // those directly. Dynamic shapes reuse the dual gather's runtime geometry. For example, overwriting
+            // those directly. Dynamic shapes reuse the dual gather's runtime extents. For example, overwriting
             // `base[target]` with `updates[size]` gathers a `size`-element cotangent, whose zero_like retains `size`.
             // Reuse that gather for the update cotangent when both contributions are requested.
             let dynamic_update_zeros = accumulators[0].is_needed()
@@ -1366,7 +1367,8 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> MemberDifferentiableOperation<C> for ScatterOperation
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType> + Zero<C::Value>> MemberDifferentiableOperation<C>
+    for ScatterOperation
 where
     C::Value: ValueProjection<
             ArrayType,
@@ -1384,7 +1386,6 @@ where
                            + Gather
                            + Scatter,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + OperationProjection<
             ArrayType,
@@ -1399,7 +1400,7 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Mixed input extents require missing tangents to be materialized from their primal runtime geometry.
+        // Mixed input extents require missing tangents to be materialized from their primals' runtime extents.
         // Coefficient construction remains shared with the homogeneous rule, with ordinary projected operations
         // retaining residuals.
         let destinations = context;
@@ -2341,10 +2342,11 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::batch;
@@ -4007,10 +4009,13 @@ mod tests {
 
         // Ragged input extents must never be replaced with packed storage extents while selecting windows.
         let variable = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let ragged = ArrayBatch::new(Array::matrix(2, 3, vec![1_f64, 2., 3., 4., 5., 6.]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
-            .unwrap();
+        let ragged = ragged_array_batch(
+            Array::matrix(2, 3, vec![1_f64, 2., 3., 4., 5., 6.]).unwrap(),
+            Array::vector(vec![1_i32, 3]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
         let updates = ArrayBatch::new(Array::matrix(2, 1, vec![1.0; 2]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[ragged, indices, updates]).unwrap_err(),
@@ -5644,9 +5649,9 @@ mod tests {
 
     #[test]
     fn test_scatter_differentiation_batched_dynamic_extent_nonlinear() {
-        // The nonlinear rules compose with the same batched geometry. The extremal rule reads each update's target
-        // back through the shared dual gather, which takes the zero batching window over the possibly-empty extent,
-        // while the product rule marks touched destinations through scatter and retains the multiplicative updates.
+        // The nonlinear rules compose with the same batched shapes. The extremal rule reads each update's target back
+        // through the shared dual gather, which takes the zero batching window over the possibly-empty extent, while
+        // the product rule marks touched destinations through scatter and retains the multiplicative updates.
         let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
         let items_type = DimensionType::from(items.clone());
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
@@ -5815,8 +5820,8 @@ mod tests {
             expected,
         );
 
-        // Multiplication's forward rule needs only scatter geometry, so it also supports the possibly empty
-        // inserted axis. The update pullback still has the pre-existing dual-gather restriction tested above.
+        // Multiplication's forward rule needs only the scatter's dimension numbers, so it also supports the possibly
+        // empty inserted axis. The update pullback still has the pre-existing dual-gather restriction tested above.
         let extent = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
         let linearization = constant_index_scatter_program(
             ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Mul)
@@ -6369,7 +6374,7 @@ mod tests {
             ])
         );
 
-        // Even when updates are retained constants, the base-only pullback still needs their runtime geometry.
+        // Even when updates are retained constants, the base-only pullback still needs their runtime extents.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         let mut residuals = linearization.primal().interpret(inputs).unwrap();
         let residuals = residuals.split_off(1);

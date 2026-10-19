@@ -15,7 +15,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
@@ -26,6 +26,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul};
+use crate::operations::assertions::GuardOperation;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -307,7 +308,7 @@ impl_differentiable_operation! {
             //     the input type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent,
             //     start_indices)`.
             //   - **Non-Unit Strides:** Read every `strides[d]`-th element, so the pullback pads the cotangent with a
-            //     zero scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
+            //     zero scalar using exactly the inverse padding: `edge_padding_low[d] = start_indices[d]`,
             //     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input
             //     extent (i.e., everything after the last element the forward slice covered). For example, slicing
             //     `[0..6)` with `start = 1` and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads
@@ -407,10 +408,8 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for SliceOperation
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberDifferentiableOperation<C> for SliceOperation
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<
@@ -421,6 +420,8 @@ where
                            + From<UpdateSliceOperation>
                            + From<ZeroOperation<ArrayType>>,
         >,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -512,8 +513,13 @@ where
             Projected: TransposableOperation<
                 <V as ValueProjection<ArrayType>>::Projected,
                 <O as OperationProjection<ArrayType>>::Projected,
+            > + OperationProvider<
+                ArrayType,
+                GuardOperation<ArrayType>,
+                Operation = <O as OperationProjection<ArrayType>>::Projected,
             > + From<SliceOperation>,
         >,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
@@ -550,7 +556,7 @@ where
             return Ok(());
         }
 
-        transpose_projected_operation(
+        transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected, V, O>(
             context,
             &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
             inputs,
@@ -1053,10 +1059,8 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for UpdateSliceOperation
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberDifferentiableOperation<C> for UpdateSliceOperation
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<
@@ -1066,6 +1070,8 @@ where
                            + From<UpdateSliceOperation>
                            + From<ZeroOperation<ArrayType>>,
         >,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1479,11 +1485,11 @@ impl DynamicSliceOperation<ArrayIrType> {
         Ok(true)
     }
 
-    /// Adds the slice cotangent to a zero with the original input geometry. Every update is a point, so no scatter
-    /// window dimension has to be static. `dimensions` supplies the cotangent extents, reusing retained size inputs
-    /// when available instead of staging new definitions of their dimension identities. Positive strides make the
-    /// logical coordinates unique. Physical padding and inactive updates remain the responsibility of the existing
-    /// bounded scatter lowering, rather than becoming extra logical updates here.
+    /// Adds the slice cotangent to a zero with the original input shape. Every update is a point, so no scatter window
+    /// dimension has to be static. `dimensions` supplies the cotangent extents, reusing retained size inputs when
+    /// available instead of staging new definitions of their dimension identities. Positive strides make the logical
+    /// coordinates unique. Physical padding and inactive updates remain the responsibility of the existing bounded
+    /// scatter lowering, rather than becoming extra logical updates here.
     fn apply_adjoint<
         V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
             + DimensionSize
@@ -1943,10 +1949,9 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for DynamicSliceOperation<ArrayType>
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberDifferentiableOperation<C>
+    for DynamicSliceOperation<ArrayType>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<
@@ -1956,6 +1961,8 @@ where
                            + From<DynamicUpdateSliceOperation>
                            + From<ZeroOperation<ArrayType>>,
         >,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2034,10 +2041,15 @@ where
             Projected: TransposableOperation<
                 <V as ValueProjection<ArrayType>>::Projected,
                 <O as OperationProjection<ArrayType>>::Projected,
+            > + OperationProvider<
+                ArrayType,
+                GuardOperation<ArrayType>,
+                Operation = <O as OperationProjection<ArrayType>>::Projected,
             > + From<DynamicSliceOperation>
                            + From<DynamicUpdateSliceOperation>
                            + From<AddOperation<ArrayType>>,
         >,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
@@ -2085,7 +2097,7 @@ where
             return Ok(());
         }
 
-        transpose_projected_operation(
+        transpose_projected_operation::<ArrayType, <O as OperationProjection<ArrayType>>::Projected, V, O>(
             context,
             &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
             inputs,
@@ -2314,12 +2326,11 @@ impl_differentiable_operation! {
         C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         C::Operation: From<DynamicSliceOperation<ArrayIrType>> + From<LinearCallOperation<ArrayIrType>>
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
-        Tracer<NestedTracingContext<C>>: Value<Type = ArrayIrType, Domain = NestedTracingContext<C>>
-            + DimensionSize + DimensionToScalar
+        Tracer<NestedTracingContext<C>>: DimensionSize + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
             + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
-        NestedTracingContext<C>: Context<
-                Type = ArrayIrType, Value = Tracer<NestedTracingContext<C>>, Operation = C::Operation,
+        NestedTracingContext<C>: StagingContext<
+                Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation,
             > + DimensionConstant + DynamicIota<Tracer<NestedTracingContext<C>>>
             + DynamicZero<Tracer<NestedTracingContext<C>>>,
     {
@@ -2335,7 +2346,7 @@ impl_differentiable_operation! {
                 return Ok(vec![DifferentiationDual::new(primal, zero)?]);
             };
 
-            // Static geometry needs no shape residuals as the ordinary transpose can recover the destination type.
+            // A static shape needs no shape residuals as the ordinary transpose can recover the destination type.
             // Keep this common case as one slice rather than introducing paired regions and coordinate arrays early.
             let input_type = tangent.r#type();
             if <&ArrayType>::try_from(input_type.as_ref())?.static_shape().is_some()
@@ -2349,7 +2360,7 @@ impl_differentiable_operation! {
                 return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
             }
 
-            // The result cannot reveal the original extent (e.g., slicing `[n]` to `[k]`). Retain that geometry once,
+            // The result cannot reveal the original extent (e.g., slicing `[n]` to `[k]`). Retain that extent once,
             // alongside discrete starts and sizes, so the transpose survives replay and specialization.
             let mut residuals = LinearResiduals::new();
             let bounds = residuals.retain_all(tangent_inputs[1..].iter().map(|input| input.primal().clone()));
@@ -2383,13 +2394,10 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType>,
-        Tracer<TracingContext<V, O>>: Value<Type = ArrayIrType, Domain = TracingContext<V, O>>
-            + DimensionSize + DimensionToScalar
+        Tracer<TracingContext<V, O>>: DimensionSize + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
             + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
-        TracingContext<V, O>: Context<
-                Type = ArrayIrType, Value = Tracer<TracingContext<V, O>>, Operation = O,
-            > + DimensionConstant + DynamicIota<Tracer<TracingContext<V, O>>>
+        TracingContext<V, O>: DimensionConstant + DynamicIota<Tracer<TracingContext<V, O>>>
             + DynamicZero<Tracer<TracingContext<V, O>>>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
@@ -3519,7 +3527,8 @@ impl_differentiable_operation! {
 }
 
 impl<
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -3534,6 +3543,9 @@ impl<
             >,
         >,
 > MemberDifferentiableOperation<C> for DynamicUpdateSliceOperation
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -3571,7 +3583,7 @@ impl<
 
         // The integer starts are the ordinary primal residuals shared by the forward update and its two transpose
         // branches. Input extents are retained only when a missing input tangent must be materialized inside the
-        // forward region. Otherwise, the output cotangent itself supplies the base geometry to the transpose.
+        // forward region. Otherwise, the output cotangent itself supplies the base shape to the transpose.
         let mut residuals = LinearResiduals::new();
         let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
         let input_is_live = !input.tangent().is_zero();
@@ -4258,8 +4270,8 @@ fn batch_by_item_expansion<
         let output_type = output_types.remove(0);
 
         // The callers are slicing operations: their output has the input's rank and element type within its extents.
-        // Reuse an empty mapped input and slice its geometry, avoiding a non-empty scalar-zero construction for
-        // formats such as `F8E8M0FNU` that cannot represent zero.
+        // Reuse an empty mapped input and slice it, avoiding a non-empty scalar-zero construction for formats such as
+        // `F8E8M0FNU` that cannot represent zero.
         let input = P::match_axis(context, &inputs[0], Axis::from(0))?;
         if input.unbatched_type() == output_type {
             return Ok(vec![input]);
@@ -4395,6 +4407,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayReferenceDischarge, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
@@ -4431,16 +4444,14 @@ mod tests {
     /// Returns a `[2, 4]` batch mapped at axis `0` whose data axis is declared bounded-ragged, which no slicing rule
     /// supports.
     fn ragged_batch() -> ArrayBatch<Array> {
-        let ragged_axis = RaggedAxis::new(
-            1,
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        ragged_array_batch(
+            Array::matrix(2, 4, vec![1.0; 8]).unwrap(),
             Array::vector(vec![1_i64, 3]).unwrap(),
-            DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap()),
-            vec![0],
-        );
-        ArrayBatch::new(Array::matrix(2, 4, vec![1.0; 8]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![ragged_axis])
-            .unwrap()
+            &length,
+            1,
+        )
+        .unwrap()
     }
 
     /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
@@ -8323,7 +8334,7 @@ mod tests {
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 3, actual: 5 }),
         );
 
-        // First-class starts and sizes must remain replicated because per-item slice geometry would be ragged.
+        // First-class starts and sizes must remain replicated because per-item slice extents would be ragged.
         let mapped_size =
             ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![1_i64, 2]).unwrap()), BatchAxis::new(0)).unwrap();
         assert!(matches!(
@@ -8383,8 +8394,8 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_array_ir_differentiation() {
-        // The slice geometry is discrete, but the array input remains linear: JVP applies the same runtime slice to the
-        // primal and tangent instead of treating the complete mixed operation as a constant.
+        // The slice starts and sizes are discrete, but the array input remains linear: JVP applies the same runtime
+        // slice to the primal and tangent instead of treating the complete mixed operation as a constant.
         let dimension = |extent| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)])).into());
@@ -8482,7 +8493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_slice_array_ir_transposition_runtime_geometry() {
+    fn test_dynamic_slice_array_ir_transposition_runtime_extents() {
         // Both source axes and both result axes vary, including zero extents. Point updates avoid imposing a
         // static window on either axis, and residual input dimensions restore the exact specialized source shape.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(6)).unwrap());
@@ -8539,7 +8550,7 @@ mod tests {
             )]),
         );
 
-        // Batch cotangent seeds while keeping the runtime geometry shared across mapped items.
+        // Batch cotangent seeds while keeping the runtime extents shared across mapped items.
         let mut batched_arguments = vec![ArrayIrValue::Array(
             Array::from_elements(
                 ArrayType::new_static(DataType::F64, [2, 2, 2]),
@@ -9430,7 +9441,7 @@ mod tests {
         let linearization = program.linearize().unwrap();
 
         // Both array tangents are live, so the only residual is the scalar start: the output cotangent itself supplies
-        // the base geometry to the transpose region, and the static update shape needs no retained extent.
+        // the base shape to the transpose region, and the static update shape needs no retained extent.
         assert_eq!(linearization.residual_count(), 1);
         assert_eq!(
             linearization.tangent().to_string(),
@@ -10275,8 +10286,8 @@ mod tests {
         );
 
         // An empty batch is synthesized from the operation's inferred per-item output type without interpreting a
-        // nonexistent item: an identity window returns the empty aligned input itself, and a smaller window slices
-        // that input's geometry instead of constructing a scalar zero (explicit layouts do not survive the alignment).
+        // nonexistent item: an identity window returns the empty aligned input itself, and a smaller window slices that
+        // input instead of constructing a scalar zero (explicit layouts do not survive the alignment).
         let indices = ArrayBatch::new(
             Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0]), &[]).unwrap(),
             BatchAxis::new(0),

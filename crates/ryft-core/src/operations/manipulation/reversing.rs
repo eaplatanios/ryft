@@ -120,7 +120,7 @@ impl<C: Context<Type = ArrayType, Value: Reverse>, P: ArrayExtentBatchingPolicy<
             .normalize(inputs[0].unbatched_type().rank())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
 
-        // Identity reversal preserves the packed value and all ragged geometry without reindexing storage.
+        // Identity reversal preserves the packed value and all ragged extents without reindexing storage.
         if axes.is_empty() {
             return Ok(vec![inputs[0].clone()].into());
         }
@@ -279,9 +279,9 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
-        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, RaggedAxis, Shape,
-        StridedLayout,
+        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -406,13 +406,15 @@ mod tests {
             ],
         );
 
-        // Only identity reversal can preserve ragged geometry without moving padded elements into valid data.
+        // Only identity reversal can preserve ragged extents without moving padded elements into valid data.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input =
-            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 0.0, 3.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![2_i32, 1]).unwrap(), length, vec![0])])
-                .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0, 2.0, 0.0, 3.0, 0.0, 0.0]).unwrap(),
+            Array::vector(vec![2_i32, 1]).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         assert!(matches!(
             ReverseOperation::new([0]).batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
