@@ -154,7 +154,7 @@ pub enum KernelInitializationError {
 /// begin empty. Masked windows preserve fixed logical tile types, with raw reads checked against actual valid lanes and
 /// output publication clipped to the full array. Unresolved selections never establish complete writes. Static
 /// separable tiling uses the canonical mapping program to check the maximal coordinate and proves coverage from its
-/// axis geometry. Other mappings use bounded enumeration through the same interpreter. Overlapping mutable windows
+/// per-axis extents. Other mappings use bounded enumeration through the same interpreter. Overlapping mutable windows
 /// require grid ordering or exclusively atomic accumulation. Atomic/non-atomic conflicts remain races; deterministic
 /// host traversal does not provide ordering absent from the grid contract.
 ///
@@ -550,7 +550,7 @@ impl Initialization<'_> {
         Ok(())
     }
 
-    /// Applies extension timing to canonical reference effects without redefining access geometry.
+    /// Applies extension timing to canonical reference effects without redefining access windows.
     fn extension<Extension: KernelExtension>(
         &mut self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,

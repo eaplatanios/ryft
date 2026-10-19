@@ -669,7 +669,7 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
     }
 
     /// Projects a tile's validity through the same canonical transforms as the accessed reference. This includes
-    /// indexed axes and nested slices; the mask shares geometry but owns independent immutable Boolean storage.
+    /// indexed axes and nested slices; the mask has the same shape but owns independent immutable Boolean storage.
     fn window_validity(&self, reference: &ArrayReference<Array>) -> Result<Option<Array>, ProgramError> {
         let Some(validity) = self.validity.get(&reference.id()) else {
             return Ok(None);

@@ -22,7 +22,7 @@ use crate::kernels::memory::{
 };
 use crate::kernels::validation::KernelReferenceOperation;
 use crate::operations::{
-    ConditionOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation,
+    ConditionOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, GuardOperation,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
 };
@@ -31,9 +31,9 @@ use crate::partial::{
 };
 use crate::programs::{
     Effects, ErasedOperation, InputRegionProvenance, Operation, OperationBoundaryPruning, OperationPayloadProjection,
-    OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
-    TypeIdentityRenaming,
+    OperationProjection, OperationProvider, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type,
+    TypeError, TypeIdentityRenaming,
 };
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
@@ -700,6 +700,16 @@ where
             // Unknown extension swaps retain their declared read-write effects until explicitly recognized.
             _ => None,
         }
+    }
+}
+
+impl<Extension: Operation<Type = ArrayIrType>> OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>>
+    for KernelOperation<Extension>
+{
+    type Operation = Self;
+
+    fn provide(request: GuardOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        Err(request.unsupported_family_error())
     }
 }
 

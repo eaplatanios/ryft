@@ -262,7 +262,7 @@ impl WireReferenceTransform {
         })
     }
 
-    /// Reconstructs a selection whose geometry and binding types are checked when the program is sealed.
+    /// Reconstructs a selection whose indices, extents, and binding types are checked when the program is sealed.
     fn decode(self) -> ArrayReferenceTransform {
         match self {
             Self::Index { axis, index } => {

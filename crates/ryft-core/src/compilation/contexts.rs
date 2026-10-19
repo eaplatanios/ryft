@@ -14,9 +14,10 @@ use crate::compilation::disk_cache::{CacheDigest, DiskCache};
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
 };
-use crate::contexts::Domain;
+use crate::contexts::{Domain, StagingContext};
 use crate::parameters::Parameterized;
 use crate::programs::{ProgramError, Type};
+use crate::tracing::DomainTracingContext;
 
 use super::function::{
     CallRequest, CompileRequest, CompiledFunction, ExecutableFunction, LoweredFunction, LoweringRequest,
@@ -77,8 +78,10 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         request: Request,
     ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
     where
+        Request: StageRequest<Self>,
         Self: Sized,
-        Request: StageRequest<Self>;
+        DomainTracingContext<Self, Self::Value>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>;
 
     /// Performs the complete backend-specific lowering transition.
     ///

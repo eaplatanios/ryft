@@ -191,28 +191,42 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
 
     /// Derives parameter batch axes from canonical packed input carriers and batches the definition. Write-only
     /// results acquire a leading batch axis; read-write results retain their input's axis. With entirely replicated
-    /// inputs the unchanged definition and replicated result axes are returned. Dynamic and ragged packed extents
-    /// require a separate proven mapping rule and are rejected before any kernel executes.
+    /// inputs the unchanged definition and replicated result axes are returned. Kernel batching adds a grid dimension
+    /// rather than a sealed program boundary, so it does not use the shared boundary transport of structurally batched
+    /// programs: a dynamic batch extent is rejected because the batch becomes a static grid dimension, and a bounded
+    /// ragged input is rejected because kernel parameters have static shapes and the batch grid dimension gives every
+    /// batch item the same block windows, so per-item extents would need per-item windows that mask their padding.
+    /// Both are rejected before any kernel executes. Valid programs do not reach the ragged rejection, because the
+    /// per-item type of a ragged input names its ragged dimension, which no static kernel signature does.
     pub fn batched_inputs<V: Value<Type = ArrayIrType>>(
         &self,
         inputs: &[ArrayIrBatch<V>],
         maximum_programs: usize,
     ) -> Result<(Self, Vec<Option<usize>>), KernelTransformError> {
         let unsupported = |message: &str| KernelTransformError::Unsupported { message: message.to_owned() };
+        for (index, input) in inputs.iter().enumerate() {
+            if let Some(ragged_axis) = input.ragged_axes().first() {
+                return Err(unsupported(&format!(
+                    "kernel batching cannot give the batch items of input {index} their own extents of bounded ragged \
+                     dimension `{}`, because kernel parameters have static shapes and the batch grid dimension gives \
+                     every batch item the same block windows, without masking per-item padding",
+                    ragged_axis.dimension(),
+                )));
+            }
+        }
         if inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>() != self.operation().input_types() {
             return Err(unsupported("batched input types differ from the kernel signature"));
         }
         let mut batch_size = None;
         for input in inputs {
-            if !input.ragged_axes().is_empty() {
-                return Err(unsupported("ragged kernel batching requires specialized block mappings"));
-            }
             if let Some(axis) = input.batch_axis_position() {
                 let r#type = input.value().r#type();
                 let ArrayIrType::Array(r#type) = r#type.as_ref() else {
                     return Err(unsupported("kernel batching accepts only ordinary array inputs"));
                 };
-                let shape = r#type.static_shape().ok_or_else(|| unsupported("kernel batch extents must be static"))?;
+                let shape = r#type.static_shape().ok_or_else(|| {
+                    unsupported("kernel batching requires a static batch extent, which becomes a static grid dimension")
+                })?;
                 let extent = shape.dimensions()[axis];
                 if batch_size.is_some_and(|previous| previous != extent) {
                     return Err(unsupported("kernel inputs have different batch extents"));
@@ -473,6 +487,89 @@ mod tests {
         let (unmapped, axes) = definition.batched_inputs(&[ArrayIrBatch::new(value, None).unwrap()], 1).unwrap();
         assert_eq!(axes, vec![None]);
         assert_eq!(unmapped.semantic_key().unwrap(), definition.semantic_key().unwrap());
+    }
+
+    #[test]
+    fn test_kernel_definition_batched_inputs_rejects_ragged_inputs() {
+        use crate::arrays::{DimensionVariable, RaggedAxis};
+
+        // Kernel parameters have static shapes and the batch grid dimension gives every batch item the same block
+        // windows, so the per-item extents of a ragged input are rejected before its types are compared.
+        let vector = ArrayType::new_static(DataType::I32, [4]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(vector.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(vector, KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace(call, |(references, _)| references[1].write(&references[0].read()?)).unwrap();
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let input = ArrayIrBatch::new(
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 4]), &[1i32, 2, 3, 0, 4, 0, 0, 0])
+                    .unwrap(),
+            ),
+            Some(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(
+            1,
+            ArrayIrValue::Array(Array::vector(vec![3i32, 1]).unwrap()),
+            length,
+            vec![0],
+        )])
+        .unwrap();
+        assert!(matches!(
+            definition.batched_inputs(&[input], 1),
+            Err(KernelTransformError::Unsupported { message })
+                if message == "kernel batching cannot give the batch items of input 0 their own extents of bounded \
+                               ragged dimension `length`, because kernel parameters have static shapes and the batch \
+                               grid dimension gives every batch item the same block windows, without masking per-item \
+                               padding",
+        ));
+    }
+
+    #[test]
+    fn test_kernel_definition_batched_inputs_rejects_dynamic_batch_extents() {
+        use crate::arrays::{DimensionVariable, Shape};
+        use crate::tracing::{Tracer, TracingContext};
+
+        // The batch becomes a static grid dimension of the batched kernel, so a dynamic batch extent is rejected.
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let vector = ArrayType::new_static(DataType::I32, [4]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(vector.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(vector, KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace(call, |(references, _)| references[1].write(&references[0].read()?)).unwrap();
+        let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(5)).unwrap());
+        TestContext::trace(
+            |(_, values): (Tracer<TestContext>, Tracer<TestContext>)| {
+                assert!(matches!(
+                    definition.batched_inputs(&[ArrayIrBatch::new(values.clone(), Some(0)).unwrap()], 1),
+                    Err(KernelTransformError::Unsupported { message })
+                        if message == "kernel batching requires a static batch extent, which becomes a static grid \
+                                       dimension",
+                ));
+                Ok(values)
+            },
+            (
+                ArrayIrType::Dimension(DimensionType::from(Dimension::Dynamic(items.clone()))),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::I32,
+                    Shape::new(vec![Dimension::Dynamic(items), Dimension::Static(4)]),
+                )),
+            ),
+        )
+        .unwrap();
     }
 
     #[test]

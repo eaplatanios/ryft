@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
-    Accuracy, Array, ArrayOperation, ArrayType, Context, DataType, EagerContext, LogicalMesh, ManualVariationAlignment,
-    Operation, ParallelVary, Parameter, Placeholder, Program, ProgramBuilder, ProgramError, Region, Sin, SinOperation,
-    Typed, Value, ValueDirectDispatch,
+    Accuracy, Array, ArrayOperation, ArrayType, CastOperation, CastType, Context, DataType, EagerContext,
+    GuardOperation, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation, OperationProvider, ParallelVary,
+    Parameter, Placeholder, Program, ProgramBuilder, ProgramError, Region, Sin, SinOperation, Type, TypeError, Typed,
+    Value, ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.
@@ -118,9 +119,24 @@ impl Typed for DirectArray {
     }
 }
 
+/// Downstream operation family of the [`DirectArray`] domain. It rejects guards, which eager replay never requests.
+#[derive(Clone, Debug, ryft_macros::Operation)]
+#[ryft(crate = "ryft_core", type(ArrayType), constant(DirectArray))]
+enum DirectOperation {
+    Sin(SinOperation<ArrayType>),
+}
+
+impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for DirectOperation {
+    type Operation = Self;
+
+    fn provide(_request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation { message: "guards are unsupported by this test family".to_owned() })
+    }
+}
+
 impl Value for DirectArray {
     type Dispatch = ValueDirectDispatch;
-    type Domain = EagerContext<Self, SinOperation<ArrayType>>;
+    type Domain = EagerContext<Self, DirectOperation>;
 
     fn domain(&self) -> Self::Domain {
         EagerContext::new()
@@ -169,4 +185,88 @@ fn test_direct_dispatch_value_implements_domain_binding_capabilities_directly() 
         ManualVariationAlignment::align_manual_variation(&[value.clone(), other.clone()]),
         Ok(vec![value, other]),
     );
+}
+
+#[test]
+fn test_cast_type_root_export() {
+    let input = ArrayType::scalar(DataType::F32);
+    let operation = CastOperation::checked(input.clone(), vec![input.clone()]);
+    assert_eq!(
+        ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&input)),
+        Ok((input.clone(), Some(input.clone()))),
+    );
+}
+
+#[test]
+fn test_external_cast_type_owns_inference() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static INFERENCES: AtomicUsize = AtomicUsize::new(0);
+
+    // This independent scalar family has no dimensions or identities and needs no array-specific bounds.
+    #[derive(Clone, Debug, PartialEq)]
+    struct ExternalCastType;
+
+    impl Display for ExternalCastType {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("external")
+        }
+    }
+
+    impl Parameter for ExternalCastType {}
+
+    impl Type for ExternalCastType {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    impl CastType for ExternalCastType {
+        fn infer_cast_output_type(
+            operation: &CastOperation<Self>,
+            input_types: &[Self],
+        ) -> Result<(Self, Option<Self>), TypeError> {
+            INFERENCES.fetch_add(1, Ordering::Relaxed);
+            // The primitive validates the family-independent declaration rules, including the input count through
+            // the default refinement implementation. All types in this family are equal, so an admitted signature
+            // proves the relationship, including all witness declarations.
+            operation.validate_declaration(input_types)?;
+            Ok((operation.output_type().clone(), Some(operation.output_type().clone())))
+        }
+    }
+
+    let operation = CastOperation::checked(ExternalCastType, vec![ExternalCastType, ExternalCastType]);
+    assert_eq!(operation.infer_output_types(&[ExternalCastType, ExternalCastType], &[]), Ok(vec![ExternalCastType]));
+    assert_eq!(INFERENCES.load(Ordering::Relaxed), 1);
+    // The primitive owns the arity diagnostic for every family through `validate_declaration`.
+    assert_eq!(
+        ExternalCastType::infer_cast_output_type(&operation, &[ExternalCastType]),
+        Err(TypeError::invalid("expected 2 inputs but got 1")),
+    );
+    // The primitive enforces its nonempty input structure before delegating to an independent type family.
+    assert_eq!(
+        CastOperation::checked(ExternalCastType, Vec::new()).infer_output_types(&[], &[]),
+        Err(TypeError::invalid("`cast` requires a declared first input type")),
+    );
+    assert_eq!(INFERENCES.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        ExternalCastType::infer_cast_output_type(&CastOperation::checked(ExternalCastType, Vec::new()), &[]),
+        Err(TypeError::invalid("`cast` requires a declared first input type")),
+    );
+    assert_eq!(INFERENCES.load(Ordering::Relaxed), 3);
 }

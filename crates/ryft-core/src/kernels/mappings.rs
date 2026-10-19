@@ -203,8 +203,8 @@ impl BlockMapping {
     /// axis whose coordinate is multiplied by the corresponding block extent, or `None` for a constant zero start.
     /// A unit block also admits the coordinate directly. Unknown expressions return `None` for the complete mapping.
     ///
-    /// This describes index geometry only: callers still check concrete bounds, repeated/unused grid axes, coverage,
-    /// and access policy. Every instruction must contribute a recognized output, so this proof never skips a dead
+    /// This describes indexing only: callers still check concrete bounds, repeated/unused grid axes, coverage, and
+    /// access policy. Every instruction must contribute a recognized output, so this proof never skips a dead
     /// arithmetic instruction or a runtime dimension requirement that ordinary mapping evaluation would execute.
     pub fn tiling_axes(&self) -> Option<Vec<Option<usize>>> {
         if self.program.instructions().iter().any(|instruction| {

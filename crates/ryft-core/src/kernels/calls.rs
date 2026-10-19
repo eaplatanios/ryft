@@ -30,7 +30,7 @@ use crate::parameters::Placeholder;
 use crate::programs::{
     Atom, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter, ProgramBuilder,
     ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    Type, TypeError, TypeRefinements, TypeIdentityRenaming, Typed,
+    Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1190,7 +1190,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Rematerialize(_)
                 | ArrayOperation::Assert(_)
                 | ArrayOperation::Guard(_)
-                | ArrayOperation::Retype(_)
+                | ArrayOperation::Cast(_)
                 | ArrayOperation::Print(_)
                 | ArrayOperation::CustomFunction(_)
                 | ArrayOperation::LinearCall(_) => {}
@@ -1246,7 +1246,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Guard(_)
-            | ArrayIrOperation::Retype(_)
+            | ArrayIrOperation::Cast(_)
             | ArrayIrOperation::Rematerialize(_) => {}
             // Kernel definitions reject `shard_map` instructions (refer to `KernelError::UnsupportedOperation`), so no
             // definition reaches this arm. The `Debug` rendering above would nevertheless encode every boundary field

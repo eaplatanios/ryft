@@ -14,8 +14,8 @@ use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{
-    CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Typed, Value,
-    validate_reference_boundary,
+    CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
+    Value, validate_reference_boundary,
 };
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
@@ -123,7 +123,10 @@ impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Inp
 ///
 /// This trait encapsulates the structured generic bounds so concrete domains can implement staging without refining
 /// the trait method's requirements. Construct requests with [`CompilationStagingRequest::new`].
-pub trait StageRequest<D: CompilationDomain>: Sized {
+pub trait StageRequest<D: CompilationDomain>: Sized
+where
+    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+{
     /// Structured abstract input type.
     type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>;
 
@@ -322,6 +325,7 @@ where
     Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
     Output::To<CompilationTracer<D>>:
         Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
 {
     type Input = Input;
     type Output = Output;
@@ -1151,6 +1155,12 @@ where
 /// effectful operations. High-cardinality static values can cause repeated tracing and LRU eviction, so arrays and
 /// frequently changing data should remain dynamic inputs.
 ///
+/// Every runtime input is specialized at its own type by default, and eager values are typed exactly (e.g., an eager
+/// array by its static shape and an eager first-class dimension by its extent), so each distinct extent gets its own
+/// specialization. [`Self::with_staged_input_types`] instead declares the types at which selected inputs are staged
+/// (e.g., `dimension<n ∈ [1, 9)>` for a dimension input), so that one specialization serves every runtime input whose
+/// type refines them.
+///
 /// The dispatcher identity only namespaces this process-local specialization cache. For domains that cache compiled
 /// programs, executable correctness and reuse still depend on
 /// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key), which
@@ -1210,8 +1220,20 @@ struct CompiledFunctionDispatcherState<
     domain: D,
     function: F,
     options: D::Options,
+    staged_input_types: Option<StagedInputTypes<D::Type, Input::ParameterStructure>>,
     specializations: TransformCache<JitCompilationTransform, JitCompilationSource<D, Static, Input, Output>>,
     statistics: JitCacheStatisticsState,
+}
+
+/// Staged input types declared for a [`CompiledFunctionDispatcher`] (refer to
+/// [`CompiledFunctionDispatcher::with_staged_input_types`]), stored flattened so that the dispatcher needs no
+/// `Option`-leaved instantiation of its input family outside of the functions that declare and return them.
+struct StagedInputTypes<T, Structure> {
+    /// Parameter structure of the declared inputs.
+    structure: Structure,
+
+    /// Declared staged type of each flattened input, or [`None`] for an input that is staged at its own type.
+    types: Vec<Option<T>>,
 }
 
 impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
@@ -1246,6 +1268,7 @@ where
                 domain: domain.clone(),
                 function,
                 options,
+                staged_input_types: None,
                 specializations: TransformCache::<
                     JitCompilationTransform,
                     JitCompilationSource<D, Static, Input, Output>,
@@ -1255,10 +1278,52 @@ where
         }
     }
 
+    /// Returns this dispatcher with the types at which its runtime inputs are staged (i.e., traced, keyed, and
+    /// compiled) declared in the structure of its inputs, as JAX's `abstracted_axes` does. A `Some` leaf stages its
+    /// input at that type instead of at the input's own type, so that one specialization serves every runtime input
+    /// whose type refines it, and a `None` leaf keeps its input exact (as in [`Parameterized::replace_parameters`]).
+    /// For example, declaring `Some(dimension<n ∈ [1, 9)>)` for a first-class dimension input reuses one
+    /// specialization for every extent from 1 to 8. Inputs declared with one shared identity (e.g., two `dimension<n>`
+    /// inputs, or a `dimension<n>` input and an `f32[n]` input) must agree at runtime. Every call validates its inputs
+    /// against the declared types before dispatching, and rejects a violation (including inputs whose structure
+    /// differs from the declaration) rather than producing another specialization. The declared types are created
+    /// once by the caller, so their identities, and thus the dispatch keys, are stable across calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this dispatcher was already cloned, since its clones share one specialization cache
+    /// that must not mix specializations of different declarations.
+    pub fn with_staged_input_types(
+        mut self,
+        staged_input_types: Input::To<Option<D::Type>>,
+    ) -> Result<Self, ProgramError>
+    where
+        Input::Family: ParameterizedFamily<Option<D::Type>>,
+    {
+        let state = Arc::get_mut(&mut self.state).ok_or_else(|| ProgramError::InvalidArgument {
+            message: "staged input types must be declared before a jit dispatcher is shared".to_string(),
+        })?;
+        state.staged_input_types = Some(StagedInputTypes {
+            structure: staged_input_types.parameter_structure(),
+            types: staged_input_types.into_parameters().collect(),
+        });
+        Ok(self)
+    }
+
     /// Returns the compilation domain used by this dispatcher.
     #[inline]
     pub fn domain(&self) -> &D {
         &self.state.domain
+    }
+
+    /// Returns the declared staged input types of this dispatcher (refer to [`Self::with_staged_input_types`]), or
+    /// [`None`] when every input is staged at its own type.
+    pub fn staged_input_types(&self) -> Option<Input::To<Option<D::Type>>>
+    where
+        Input::Family: ParameterizedFamily<Option<D::Type>>,
+    {
+        let StagedInputTypes { structure, types } = self.state.staged_input_types.as_ref()?;
+        Some(Input::To::<Option<D::Type>>::from_parameters(structure.clone(), types.iter().cloned()).unwrap())
     }
 
     /// Returns the fixed compilation options used for every specialization.
@@ -1323,10 +1388,13 @@ where
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<D>>:
             Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+        DomainTracingContext<D, D::Value>:
+            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
     {
         let abstractification_start = Instant::now();
         let input_structure = inputs.parameter_structure();
         let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let runtime_input_types = self.staged_runtime_input_types(&input_structure, runtime_input_types)?;
         let (dispatch_key, effective_input_types) =
             self.state.domain.dispatch_signature(runtime_input_types, &self.state.options)?;
         let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
@@ -1399,6 +1467,51 @@ where
         Ok(producer.insert(compiled.into_executable_function()))
     }
 
+    /// Validates `input_types`, the flattened runtime input types of inputs with structure `input_structure`, against
+    /// the declared staged input types (refer to [`Self::with_staged_input_types`]) and replaces every declared one by
+    /// its staged type.
+    fn staged_runtime_input_types(
+        &self,
+        input_structure: &Input::ParameterStructure,
+        mut input_types: Vec<D::Type>,
+    ) -> Result<Vec<D::Type>, D::Error> {
+        let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types else {
+            return Ok(input_types);
+        };
+        if structure != input_structure {
+            return Err(ProgramError::InvalidArgument {
+                message: "jit inputs do not have the structure of their declared staged input types".to_string(),
+            }
+            .into());
+        }
+        let declared = types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, r#type)| Some((index, r#type.as_ref()?)))
+            .collect::<Vec<_>>();
+        for &(index, staged_type) in &declared {
+            if !staged_type.is_refined_by(&input_types[index]) {
+                let (path, _) = structure.named_parameters().nth(index).unwrap();
+                return Err(ProgramError::from(TypeError::invalid(format!(
+                    "jit input `{path}` has type `{}`, which does not refine its declared staged type `{staged_type}`",
+                    input_types[index],
+                )))
+                .into());
+            }
+        }
+        // Inputs that share an identity in their declared types must agree, which establishing the facts of all of
+        // them together checks.
+        <D::Type as Type>::Refinements::new(
+            declared.iter().map(|(_, staged_type)| *staged_type),
+            declared.iter().map(|(index, _)| &input_types[*index]),
+        )
+        .map_err(ProgramError::from)?;
+        for (index, staged_type) in declared {
+            input_types[index] = staged_type.clone();
+        }
+        Ok(input_types)
+    }
+
     /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
     pub fn call(&self, static_parameters: Static, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, D::Error>
     where
@@ -1416,6 +1529,8 @@ where
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<D>>:
             Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+        DomainTracingContext<D, D::Value>:
+            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
     {
         let executable = self.specialization(static_parameters, &inputs)?;
         call_function(&self.state.domain, &executable, inputs)
@@ -1446,6 +1561,8 @@ where
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<D>>:
             Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+        DomainTracingContext<D, D::Value>:
+            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
     {
         let executable = match self.specialization(static_parameters, &inputs) {
             Ok(executable) => executable,
@@ -1479,6 +1596,8 @@ where
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
         Output::To<CompilationTracer<D>>:
             Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+        DomainTracingContext<D, D::Value>:
+            StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
     {
         let executable = self.specialization(static_parameters, &inputs)?;
         call_function_statefully(&self.state.domain, &executable, inputs)
@@ -1560,6 +1679,7 @@ where
     Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type>,
     Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
 {
     try_jit_with_options(domain, move |static_parameters, inputs| Ok(function(static_parameters, inputs)), options)
 }
@@ -1586,6 +1706,7 @@ where
     Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type>,
     Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
 {
     jit_with_options(domain, function, D::Options::default())
 }
@@ -1606,6 +1727,7 @@ where
     Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
     Output::To<CompilationTracer<D>>:
         Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
 {
     domain.stage(CompilationStagingRequest::new(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options))
 }
@@ -1688,6 +1810,7 @@ where
     Output::To<CompilationTracer<D>>:
         Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
     NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>,
+    DomainTracingContext<D, D::Value>: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
 {
     validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
     let context = DomainTracingContext::<D, D::Value>::new();
@@ -1741,16 +1864,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionError,
         DimensionType, DimensionValue, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::ZeroOperation;
+    use crate::operations::{GuardOperation, ZeroOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, RegionInterface, Type, TypeError};
+    use crate::programs::{EmptyRegionDriver, Operation, OperationProvider, RegionInterface, Type, TypeError};
 
     use super::*;
 
@@ -1773,6 +1896,13 @@ mod tests {
                 return Err(TypeError::invalid(format!("test_negate expects 1 input but got {}", input_types.len())));
             }
             Ok(input_types.to_vec())
+        }
+    }
+    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for NegateOperation {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
         }
     }
 
@@ -2396,36 +2526,50 @@ mod tests {
     #[test]
     fn test_compiled_function_dispatcher_reuses_specialization_across_runtime_extents() {
         let domain = TestArrayIrDomain::new();
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
-            try_jit(&domain, |(), extent: CompilationTracer<TestArrayIrDomain>| {
-                let ArrayIrType::Dimension(extent_type) = extent.r#type().into_owned() else {
-                    return Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() });
-                };
-                Ok(extent
-                    .context()
-                    .bind(
-                        ZeroOperation::new(ArrayType::new(
-                            DataType::F32,
-                            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
-                        )),
-                        Vec::new(),
-                        std::slice::from_ref(&extent),
-                    )?
-                    .remove(0))
-            });
-
-        // Two calls with different runtime extents share one abstract input type, and therefore one retained trace,
-        // lowering, and compiled specialization, while still producing outputs with different logical shapes. This is
-        // the retained-JIT contract that would break if concrete extents ever became part of type or cache identity.
+        let zeros = |(), extent: CompilationTracer<TestArrayIrDomain>| {
+            let ArrayIrType::Dimension(extent_type) = extent.r#type().into_owned() else {
+                return Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() });
+            };
+            // A static (e.g., exact eager) extent is part of the output type and needs no dimension input.
+            let dimension = extent_type.dimension().clone();
+            let inputs = if dimension.variable().is_some() { vec![extent.clone()] } else { Vec::new() };
+            Ok(extent
+                .context()
+                .bind(
+                    ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![dimension]))),
+                    Vec::new(),
+                    &inputs,
+                )?
+                .remove(0))
+        };
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let four = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap());
+        let three_zeros = ArrayIrValue::Array(Array::vector(vec![0f32; 3]).unwrap());
+        let four_zeros = ArrayIrValue::Array(Array::vector(vec![0f32; 4]).unwrap());
+
+        // Eager dimension values have static types, so by default each runtime extent gets its own specialization,
+        // which separately created values of that extent share because static types have no identity.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+            try_jit(&domain, zeros);
+        assert_eq!(function.call((), three.clone()), Ok(three_zeros.clone()));
+        assert_eq!(function.call((), four.clone()), Ok(four_zeros.clone()));
         assert_eq!(
-            function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap())),
+            function.call((), ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
+            Ok(three_zeros.clone()),
         );
-        assert_eq!(
-            function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0, 0.0]).unwrap())),
-        );
+        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.statistics().dispatch_hits, 1);
+        assert_eq!(domain.compilation_count(), 2);
+
+        // Declaring a symbolic staged type for the input makes calls with different runtime extents share one staged
+        // input type, and therefore one retained trace, lowering, and compiled specialization, while still producing
+        // outputs with different logical shapes.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+            try_jit(&domain, zeros).with_staged_input_types(Some(extent_type.clone().into())).unwrap();
+        assert_eq!(function.staged_input_types(), Some(Some(extent_type.clone().into())));
+        assert_eq!(function.call((), three), Ok(three_zeros));
+        assert_eq!(function.call((), four), Ok(four_zeros));
         assert_eq!(function.specialization_count(), 1);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_misses, 1);
@@ -2433,102 +2577,124 @@ mod tests {
         assert_eq!(statistics.traces, 1);
         assert_eq!(statistics.lowerings, 1);
         assert_eq!(statistics.compilation_requests, 1);
-        assert_eq!(domain.compilation_count(), 1);
+        assert_eq!(domain.compilation_count(), 3);
+
+        // An input whose type does not refine its declared staged type is rejected rather than specialized.
+        let wide_type = DimensionType::new("wide", DimensionBounds::new(1, Some(9)).unwrap());
+        assert_eq!(
+            function.call((), ArrayIrValue::Dimension(DimensionValue::new(wide_type, 7).unwrap())),
+            Err(TypeError::invalid(
+                "jit input `$` has type `dimension<7>`, which does not refine its declared staged type \
+                 `dimension<extent ∈ [1, 5)>`",
+            )
+            .into()),
+        );
+        assert_eq!(function.specialization_count(), 1);
+
+        // Staged input types must be declared before the dispatcher is shared.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+            try_jit(&domain, zeros);
+        let _clone = function.clone();
+        assert!(matches!(
+            function.with_staged_input_types(Some(extent_type.into())),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "staged input types must be declared before a jit dispatcher is shared",
+        ));
     }
 
     #[test]
-    fn test_compiled_function_dispatcher_specializes_on_dimension_identity() {
+    fn test_compiled_function_dispatcher_declares_staged_dimension_identities() {
         let domain = TestArrayIrDomain::new();
-        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            try_jit(&domain, |(), extents: Vec<CompilationTracer<TestArrayIrDomain>>| {
-                let dimensions = extents
-                    .iter()
-                    .map(|extent| match extent.r#type().into_owned() {
-                        ArrayIrType::Dimension(extent_type) => Ok(Dimension::Dynamic(extent_type.variable().clone())),
-                        ArrayIrType::Array(_) => {
-                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
-                        }
-                        ArrayIrType::Reference(_) => {
-                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(extents[0]
-                    .context()
-                    .bind(
-                        ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(dimensions))),
-                        Vec::new(),
-                        extents.as_slice(),
-                    )?
-                    .remove(0))
-            });
-
+        let zeros = |(), extents: Vec<CompilationTracer<TestArrayIrDomain>>| {
+            let dimensions = extents
+                .iter()
+                .map(|extent| match extent.r#type().into_owned() {
+                    ArrayIrType::Dimension(extent_type) => Ok(extent_type.dimension().clone()),
+                    _ => Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Static (e.g., exact eager) extents are part of the output type and need no dimension inputs.
+            let inputs = extents
+                .iter()
+                .zip(&dimensions)
+                .filter(|(_, dimension)| dimension.variable().is_some())
+                .map(|(extent, _)| extent.clone())
+                .collect::<Vec<_>>();
+            Ok(extents[0]
+                .context()
+                .bind(ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(dimensions))), Vec::new(), &inputs)?
+                .remove(0))
+        };
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let rows = DimensionType::new("rows", bounds);
         let columns = DimensionType::new("columns", bounds);
+        let extents = |rows_extent, columns_extent| {
+            vec![
+                ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), rows_extent).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), columns_extent).unwrap()),
+            ]
+        };
 
-        // Only the declared dimension identities enter the dispatch key, so two calls that differ solely in their
-        // runtime extents share one specialization.
+        // Distinct declared identities abstract each input independently, so calls that differ only in their runtime
+        // extents share one specialization.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit(&domain, zeros)
+                .with_staged_input_types(vec![Some(rows.clone().into()), Some(columns.clone().into())])
+                .unwrap();
         assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 2).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 3).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())),
+            function.call((), extents(2, 3)),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0f32; 6]).unwrap())),
         );
         assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 3).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 2).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap())),
+            function.call((), extents(3, 2)),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0f32; 6]).unwrap())),
         );
-        assert_eq!(function.statistics().dispatch_hits, 1);
         assert_eq!(function.specialization_count(), 1);
 
-        // New dimension variables have distinct identities even when their names and bounds match. They therefore
-        // change the input types and require a separate compiled specialization.
-        let independent_rows = DimensionType::new("rows", bounds);
-        let independent_columns = DimensionType::new("columns", bounds);
+        // One declared identity shared by both inputs requires their runtime extents to agree.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit(&domain, zeros)
+                .with_staged_input_types(vec![Some(rows.clone().into()), Some(rows.clone().into())])
+                .unwrap();
         assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(independent_rows, 2).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(independent_columns, 3).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())),
+            function.call((), extents(2, 2)),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![0f32; 4]).unwrap())),
         );
+        assert_eq!(
+            function.call((), extents(2, 3)),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "rows".to_string(),
+                expected: 2,
+                actual: 3,
+            })
+            .into()),
+        );
+        assert_eq!(function.specialization_count(), 1);
+
+        // A `None` leaf keeps its input exact, so only calls that also agree on that input's extent share one
+        // specialization.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit(&domain, zeros).with_staged_input_types(vec![Some(rows.clone().into()), None]).unwrap();
+        assert_eq!(function.staged_input_types(), Some(vec![Some(rows.clone().into()), None]));
+        for (rows_extent, columns_extent) in [(2, 3), (3, 3), (2, 4)] {
+            assert_eq!(
+                function.call((), extents(rows_extent, columns_extent)),
+                Ok(ArrayIrValue::Array(
+                    Array::matrix(rows_extent, columns_extent, vec![0f32; rows_extent * columns_extent]).unwrap(),
+                )),
+            );
+        }
         assert_eq!(function.specialization_count(), 2);
 
-        // A permutation of the *same* two live identities also stays distinct, because the key is the ordered list of
-        // input types rather than the set of identities they mention.
-        assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(columns, 3).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(rows, 2).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap())),
-        );
-        assert_eq!(function.specialization_count(), 3);
-
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_hits, 1);
-        assert_eq!(statistics.dispatch_misses, 3);
-        assert_eq!(statistics.traces, 3);
-        assert_eq!(statistics.lowerings, 3);
-        assert_eq!(statistics.compilation_requests, 3);
-        assert_eq!(domain.compilation_count(), 3);
+        // Inputs must have the structure of the declaration, which otherwise would apply its leaves to other inputs.
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit(&domain, zeros).with_staged_input_types(vec![Some(rows.clone().into())]).unwrap();
+        assert!(matches!(
+            function.call((), extents(2, 3)),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "jit inputs do not have the structure of their declared staged input types",
+        ));
+        assert_eq!(function.specialization_count(), 0);
     }
 
     #[test]
