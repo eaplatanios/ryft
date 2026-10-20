@@ -5563,7 +5563,7 @@ mod tests {
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
-        DifferentiationTracer, TransposableOperation, TranspositionContext,
+        DifferentiationTracer, ResidualZeroProvider, TransposableOperation, TranspositionContext,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
@@ -5618,6 +5618,8 @@ mod tests {
             Self::new()
         }
     }
+
+    impl ResidualZeroProvider<ArrayType> for TestUnaryOperation<ArrayType> {}
 
     impl From<TransposeOperation> for TestUnaryOperation<ArrayType> {
         fn from(_operation: TransposeOperation) -> Self {
@@ -5681,6 +5683,8 @@ mod tests {
             Self::new()
         }
     }
+
+    impl ResidualZeroProvider<ArrayType> for TestBinaryOperation<ArrayType> {}
 
     impl From<TransposeOperation> for TestBinaryOperation<ArrayType> {
         fn from(_operation: TransposeOperation) -> Self {

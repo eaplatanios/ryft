@@ -14,17 +14,52 @@ use crate::differentiation::{
 };
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, GuardOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
-    ReferenceReadOperation, Zero, ZeroOperation,
+    ReferenceReadOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
-    AtomId, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, TypeError, Typed, Value,
-    ValueProjection,
+    AtomId, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// Homogeneous array operations construct input-free zeros from their output types. We keep this blanket implementation
-// specific to `ArrayType` so that it is disjoint from the runtime-extent protocol for `ArrayIrType` below.
-impl<O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>>> ResidualZeroProvider<ArrayType> for O {}
+// Homogeneous array operations construct input-free zeros when their output types need no runtime extent source.
+// Symbolic zeros instead require an exact-type source, because this universe has no first-class dimension values.
+// Keep this blanket specific to `ArrayType`, disjoint from the runtime-extent protocol for `ArrayIrType` below.
+impl<O> ResidualZeroProvider<ArrayType> for O
+where
+    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ZeroLikeOperation<ArrayType>>,
+{
+    fn materialize_zero_from_residual_sources<
+        'v,
+        C: Context<Type = ArrayType, Value: 'v, Operation = O> + Zero<C::Value>,
+        I: IntoIterator<Item = &'v C::Value>,
+    >(
+        context: &C,
+        zero: MaybeZero<C::Value>,
+        sources: I,
+    ) -> Result<C::Value, ProgramError> {
+        let r#type = match zero {
+            MaybeZero::Value(value) => return Ok(value),
+            MaybeZero::Zero(r#type) => r#type,
+        };
+
+        if !r#type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
+            return context.zero(&r#type);
+        }
+
+        // Inspect candidates before binding anything: another representation or merely equal bounds cannot supply
+        // this zero's complete type. The consumer owns the source; no exemplar is captured as a residual here.
+        let source = sources.into_iter().find(|source| source.r#type().as_ref() == &r#type).ok_or_else(|| {
+            ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot materialize a zero of type {type} because no value in scope has exactly that type",
+                ),
+            }
+        })?;
+
+        Ok(context.bind(O::from(ZeroLikeOperation::new()), Vec::new(), std::slice::from_ref(source))?.remove(0))
+    }
+}
 
 // Array-IR operation families share declaration, capture, and assembly regardless of their backend representation.
 // Static zeros use the family's `OperationProvider`. Dynamic zeros consume one extent input per dynamic axis.
@@ -518,6 +553,7 @@ pub fn materialize_array_tangent<
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
@@ -529,9 +565,131 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, ReverseModeDifferentiate};
     use crate::parameters::Placeholder;
-    use crate::programs::{MaybeZero, ReferenceType, TypeError};
+    use crate::programs::ReferenceType;
 
     use super::*;
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![2.into()]));
+        let source = context.input(r#type.clone());
+        let live = ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Value(source.clone()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(live.atom_id(), source.atom_id());
+        let zero = ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(r#type),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![live.atom_id().unwrap(), zero.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = zero [type=f32[2]]
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![3f32, 4f32]).unwrap()]),
+            Ok(vec![Array::vector(vec![3f32, 4f32]).unwrap(), Array::vector(vec![0f32, 0f32]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources_symbolic() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::unbounded());
+        let shape = Shape::new(vec![extent.into()]);
+        let r#type = ArrayType::new(DataType::F32, shape.clone());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let other_representation = context.input(ArrayType::new(DataType::F64, shape));
+        let other_shape = context.input(ArrayType::new(DataType::F32, Shape::new(vec![2.into()])));
+        let first = context.input(r#type.clone());
+        let second = context.input(r#type.clone());
+        let zero = ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(r#type.clone()),
+            [&other_representation, &other_shape, &first, &second],
+        )
+        .unwrap();
+        assert_eq!(zero.r#type().as_ref(), &r#type);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![zero.atom_id().unwrap()], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:f32[2], %2:f32[extent], %3:f32[extent] .
+                let %4:f32[extent] = zero_like %2
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![1f64, 2f64, 3f64]).unwrap(),
+                Array::vector(vec![1f32, 2f32]).unwrap(),
+                Array::vector(vec![4f32, 5f32, 6f32]).unwrap(),
+                Array::vector(vec![7f32, 8f32, 9f32]).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![0f32; 3]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources_missing_exact_type() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::unbounded());
+        let shape = Shape::new(vec![extent.into()]);
+        let r#type = ArrayType::new(DataType::F32, shape.clone());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let other_representation = context.input(ArrayType::new(DataType::F8E8M0FNU, shape));
+        let other_identity = context.input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::unbounded()).into()]),
+        ));
+        let expected = Err(ProgramError::UnsupportedOperation {
+            message: "cannot materialize a zero of type f32[extent] because no value in scope has exactly that type"
+                .into(),
+        });
+        assert_eq!(
+            ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+                &context,
+                MaybeZero::Zero(r#type.clone()),
+                &[],
+            )
+            .map(|_| ()),
+            expected,
+        );
+        assert_eq!(
+            ArrayOperation::<Array>::materialize_zero_from_residual_sources(
+                &context,
+                MaybeZero::Zero(r#type),
+                [&other_representation, &other_identity],
+            )
+            .map(|_| ()),
+            expected,
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
 
     #[test]
     fn test_array_ir_operation_zero_residual_types() {

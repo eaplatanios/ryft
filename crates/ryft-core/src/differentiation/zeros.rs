@@ -63,11 +63,13 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///
 /// # Who Implements It
 ///
-/// Homogeneous array families with a `From<ZeroOperation<ArrayType>>` conversion receive the input-free defaults:
-/// they declare nothing, capture nothing, and construct a type-only zero. Unexpected residuals are rejected rather
-/// than silently ignored. Eligible [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket
-/// implementation that captures runtime dimensions and assembles zeros with explicit extent inputs. This includes
-/// both the core composite family and its XLA counterpart; neither needs its own residual-protocol implementation.
+/// Homogeneous array families with `From<ZeroOperation<ArrayType>>` and `From<ZeroLikeOperation<ArrayType>>`
+/// conversions declare and capture no residuals. They construct a type-only zero when the type needs no runtime extent
+/// source; boundary materialization of a symbolic zero instead binds [`ZeroLikeOperation`](crate::ZeroLikeOperation)
+/// on the first source with exactly the requested type. Unexpected residuals are rejected rather than silently ignored.
+/// Eligible [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket implementation that captures
+/// runtime dimensions and assembles zeros with explicit extent inputs. This includes both the core composite family
+/// and its XLA backend counterpart; neither needs its own residual-protocol implementation.
 ///
 /// Other type universes opt in explicitly. An input-free family can use an empty implementation when it already
 /// implements `OperationProvider<T, ZeroOperation<T>>`; a family requiring residuals overrides declaration, capture,
@@ -180,17 +182,21 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
     /// widened differential representation (e.g., an `f8e8m0fnu[n]` primal whose tangent is `f32[n]`). Naming the
     /// runtime quantity instead of matching the whole type accepts them all.
     ///
-    /// A type that declares no residuals keeps the type-only nullary zero, so a statically shaped program stages
-    /// no additional instruction and its zero-producing marker keeps higher-order partial evaluation structural. A
-    /// declared residual that no candidate supplies is a loud [`ProgramError::UnsupportedOperation`] naming the type
-    /// and the missing quantity, never a silently wrong-shaped zero.
+    /// The default keeps the type-only nullary zero for a type that declares no residuals, so a statically shaped
+    /// program stages no additional instruction and its zero-producing marker keeps higher-order partial evaluation
+    /// structural. Homogeneous array families override this function for symbolic zeros: without first-class dimension
+    /// values, they require a source of exactly the requested type and bind
+    /// [`ZeroLikeOperation`](crate::ZeroLikeOperation) on it. A declared residual that no candidate supplies, or a
+    /// symbolic homogeneous zero with no exact-type source, produces [`ProgramError::UnsupportedOperation`] rather
+    /// than a silently wrong-shaped zero.
     ///
     /// # Parameters
     ///
     ///   - `context`: [`Context`] in which the zero and any dimension reads are staged or computed.
     ///   - `zero`: Structural zero or live value to materialize.
     ///   - `sources`: Candidate values in scope at the boundary, searched in order for each declared residual.
-    ///     Only zero types that declare residuals consult them.
+    ///     The default consults them only for zero types that declare residuals; homogeneous symbolic zeros search
+    ///     for an exact-type source instead.
     fn materialize_zero_from_residual_sources<
         'v,
         C: Context<Type = T, Value: 'v, Operation = Self::Operation> + Zero<C::Value>,

@@ -20,7 +20,7 @@ use crate::programs::types::Typed;
 /// transitively through rules without ever inspecting a program or materializing a buffer. A zero is _materialized_
 /// into a real value only at boundaries where one is structurally required (e.g., a nested sub-program input, a
 /// program output, or an eagerly returned tangent), which is also where its carried [`Type`](crate::Type) is consumed.
-#[derive(Clone, Debug, Parameter)]
+#[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum MaybeZero<V: Typed> {
     /// Structural zero of the carried [`Type`](crate::Type) (i.e., no value exists and nothing has been staged or
     /// computed for it).
@@ -176,6 +176,17 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
 
     use super::*;
+
+    #[test]
+    fn test_maybe_zero() {
+        let zero = MaybeZero::<Array>::Zero(ArrayType::scalar(DataType::F32));
+        let value = MaybeZero::Value(Array::scalar(0f32).unwrap());
+        assert_eq!(zero, zero.clone());
+        assert_eq!(value, value.clone());
+        assert_ne!(zero, MaybeZero::Zero(ArrayType::scalar(DataType::F64)));
+        assert_ne!(value, MaybeZero::Value(Array::scalar(1f32).unwrap()));
+        assert_ne!(zero, value);
+    }
 
     #[test]
     fn test_atom_id() {

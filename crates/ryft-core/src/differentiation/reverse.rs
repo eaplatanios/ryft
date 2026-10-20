@@ -4365,6 +4365,9 @@ pub(crate) mod tests {
 
     impl_guardless_operation!(TestLinearOperation);
 
+    // This narrow family exercises static linear maps and has no exemplar-based zero operation.
+    impl ResidualZeroProvider<ArrayType> for TestLinearOperation {}
+
     impl From<AddOperation<ArrayType>> for TestLinearOperation {
         #[inline]
         fn from(_operation: AddOperation<ArrayType>) -> Self {
