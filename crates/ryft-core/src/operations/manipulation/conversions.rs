@@ -84,8 +84,8 @@ use ryft_macros::capability;
 use crate::arrays::types::dimensions::{DimensionComparison, DimensionRefinementFact};
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue,
-    ArrayType, DataType, Dimension, DimensionRefinements, DimensionType, DimensionTypeRefinements, Layout,
-    MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f16,
+    ArrayType, DataType, Dimension, DimensionRefinements, DimensionType, DimensionTypeRefinements, DimensionVariable,
+    Layout, MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f16,
 };
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -101,6 +101,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
 use crate::partial::{
@@ -1015,13 +1016,15 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 /// from major to minor, so the axes up to and including an auto or manual axis determine which block of the dimension
 /// each of its shards holds. Each dimension therefore keeps its axes up to and including its last auto or manual axis,
 /// and only explicit axes minor to all of them may be added, removed, or reordered (e.g., `[m, x]` may become `[m]` or
-/// `[m, y]` but not `[x, m]`). Every mesh axis that carries such preserved state keeps its definition (i.e., its size
-/// and type) in the output mesh, including an explicit axis that carries reduction state; only explicit axes referenced
-/// solely by dimension placement may be redefined or dropped. Further inputs act as _witnesses_, meaning values whose
-/// types make output identities available to the instruction (e.g., a value of type `f32[n]` lets `f32[2]` widen to
-/// `f32[n]`). Witnesses carry no derivatives. Every output identity must occur in an input declaration, and the output
-/// type may not define an identity. First-class dimension types define their names, so casts of dimension values can
-/// only target static types.
+/// `[m, y]` but not `[x, m]`). Since axis sizes fix those blocks, every mesh axis in such a preserved prefix keeps its
+/// definition (i.e., its size and type) in the output mesh, explicit axes included (e.g., an explicit `x` in `[x, a]`
+/// over an auto `a` cannot change its size), and so does every mesh axis that carries manual variation or reduction
+/// state. Explicit axes may therefore be redefined or dropped only when they are minor to every auto and manual axis in
+/// each dimension and carry no such state. Further inputs act as _witnesses_, meaning values whose types make output
+/// identities available to the instruction (e.g., a value of type `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses
+/// carry no derivatives. Every output identity must occur in an input declaration, and the output type may not define
+/// an identity. First-class dimension types define their names, so casts of dimension values can only target static
+/// types.
 ///
 /// The complete [input declarations](Self::input_types) preserve nominal bindings during concrete execution. Source,
 /// output and witness declarations share their dimension identities: widening `f32[2]` to `f32[n]` next to a witness
@@ -1048,9 +1051,14 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 ///     needs its check, and a proven single-input identity cast folds to its input.
 ///   - An [unchecked](Self::unchecked) cast assumes the relationship. It is pure and has no runtime cost beyond the
 ///     representation change (e.g., none at all for first-class dimensions). Transforms emit unchecked casts right
-///     after proving their relationship: a [`GuardOperation`](crate::GuardOperation) converts the tangents of its
-///     outputs with them, and the transpose of a cast is the unchecked cast of its output cotangent back to its
-///     input's cotangent type, with witnesses that carry the required input identities.
+///     after proving their relationship: the tangent of a cast or of a [`GuardOperation`](crate::GuardOperation)
+///     output is the unchecked cast of the input tangent, and the transpose of a cast is the unchecked cast of its
+///     output cotangent back to its input's cotangent type, with witnesses that carry the required input identities.
+///     A tangent cast is witnessed only for the identities that one of its sides does not carry, by a value whose type
+///     carries each such identity, read from the primal input or output with [`CastType::IdentityWitnessOperation`]
+///     (e.g., a `dimension<n>` scalar in the composite [`ArrayIrType`] family), or by that whole primal value in
+///     families without such an operation. Forward-mode programs that interleave primal and tangent computations
+///     also make it depend on the primal output, so that it stays behind the primal check.
 ///
 /// Batching lifts the declared types by the mapped axis and binds the cast over the packed values. A proven one-input
 /// identity keeps its carrier unchanged, including any bounded ragged axes. Every other cast over a bounded ragged
@@ -1226,12 +1234,24 @@ impl<T: Type> CastOperation<T> {
 
     /// Binds the tangent of a value whose `primal` was converted into `output` by a cast or by a guard, returning the
     /// `tangent` at the tangent type of `output` through an unchecked cast in the tangent context. The relationship is
-    /// proven by the primal conversion, so the tangent cast only needs witnesses for the extents that the output
-    /// tangent type no longer carries and, when `needs_ordering` holds, a data dependency on the primal result so that
-    /// the tangent stays behind the primal check in a fused forward-mode program. One source-typed value can carry both
-    /// a lost name and that dependency: the primal is re-cast at its own type with the output as witness when it
-    /// carries every output identity, and separate witnesses are kept only when the output introduces names that
-    /// the source cannot carry.
+    /// proven by the primal conversion, so the tangent cast only needs these witnesses:
+    ///
+    ///   - One witness per identity that the tangent carries but the output tangent type does not (e.g., `n` when
+    ///     narrowing `f32[n]` to `f32[2]`), read from `primal`, so that the transpose of the tangent cast, which
+    ///     converts a cotangent back to the tangent's type, finds that identity. One witness per identity that the
+    ///     output tangent type carries but the tangent does not (e.g., `n` when widening `f32[2]` to `f32[n]`), read
+    ///     from `output`, which the tangent cast itself requires. Each witness is the value of the identity's
+    ///     [`CastType::IdentityWitnessOperation`] bound in the primal context (e.g., a `dimension<n>` scalar in the
+    ///     composite [`ArrayIrType`] family). Families without such an operation retain the whole value instead.
+    ///   - When `needs_ordering` holds, a data dependency on `output` so that the tangent stays behind the primal check
+    ///     and its witness producers in a fused forward-mode program. A witness read from `output` already provides
+    ///     it. Otherwise, `output` itself is a witness, unless a whole `primal` is retained, which is then re-cast at
+    ///     its own type with `output` as its witness so that one value carries both.
+    ///
+    /// Witnesses reach the tangent context through [`DifferentiationContext::primal_to_tangent`]. A partitioned
+    /// tangent program runs only after the primal program completes, so it retains only identity witnesses as its
+    /// residuals. Scalar identity witnesses keep whole arrays out of those residuals and, having static types, can
+    /// cross static region boundaries (e.g., those of [`ShardMapOperation`](crate::ShardMapOperation) bodies).
     ///
     /// # Parameters
     ///
@@ -1243,7 +1263,10 @@ impl<T: Type> CastOperation<T> {
     ///   - `needs_ordering`: Whether the tangent must depend on `output` even when the output tangent type carries
     ///     every identity of the tangent (i.e., in a fused program whose primal conversion still runs a check or
     ///     depends on witness producers).
-    pub(crate) fn bind_tangent<C: Context<Type = T, Operation: From<Self>>, P: DifferentiationPolicy<C>>(
+    pub(crate) fn bind_tangent<
+        C: Context<Type = T, Operation: From<Self> + From<T::IdentityWitnessOperation>>,
+        P: DifferentiationPolicy<C>,
+    >(
         context: &DifferentiationContext<C, P>,
         primal: &C::Value,
         output: &C::Value,
@@ -1251,37 +1274,50 @@ impl<T: Type> CastOperation<T> {
         needs_ordering: bool,
     ) -> Result<C::Value, ProgramError>
     where
-        T: DifferentiableType,
+        T: DifferentiableType + CastType,
     {
+        let source_type = tangent.r#type().into_owned();
         let tangent_type = output.r#type().tangent()?;
-        let mut witnesses = Vec::new();
 
-        // Retain source names only when the output tangent will no longer carry them. Static extents and names already
-        // present in that tangent need no saved primal value.
-        let needs_source = tangent
-            .r#type()
-            .identities()
-            .any(|(_, identity)| !tangent_type.identities().any(|(_, available)| available == identity));
-        let source_carries_output = tangent_type
-            .identities()
-            .all(|(_, identity)| tangent.r#type().identities().any(|(_, available)| available == identity));
-        if needs_source {
-            let source = if needs_ordering && source_carries_output {
-                Self::bind_unchecked(
-                    context.primal(),
-                    primal,
-                    std::slice::from_ref(output),
-                    primal.r#type().into_owned(),
-                )?
-            } else {
-                primal.clone()
-            };
-            witnesses.push(context.primal_to_tangent(source)?);
+        let lost = Self::identity_witness_operations(primal.r#type().as_ref(), &source_type, &tangent_type)?;
+        let introduced = Self::identity_witness_operations(output.r#type().as_ref(), &tangent_type, &source_type)?;
+
+        let read = |value: &C::Value, operation: T::IdentityWitnessOperation| -> Result<C::Value, ProgramError> {
+            let mut outputs = context.primal().bind(operation, Vec::new(), std::slice::from_ref(value))?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(context.primal_to_tangent(outputs.remove(0))?)
+        };
+
+        // A witness read from `output` (or `output` itself) orders the tangent behind the primal conversion. Without
+        // one, a whole retained source is re-cast at its own type with `output` as its witness, so that one value
+        // carries both its identities and that dependency, and otherwise `output` itself becomes the last witness.
+        let mut ordered = !needs_ordering || introduced.as_ref().is_none_or(|operations| !operations.is_empty());
+        let mut witnesses = Vec::new();
+        match lost {
+            Some(operations) => {
+                for operation in operations {
+                    witnesses.push(read(primal, operation)?);
+                }
+            }
+            None if ordered => witnesses.push(context.primal_to_tangent(primal.clone())?),
+            None => {
+                ordered = true;
+                let primal_type = primal.r#type().into_owned();
+                let source = Self::bind_unchecked(context.primal(), primal, std::slice::from_ref(output), primal_type)?;
+                witnesses.push(context.primal_to_tangent(source)?);
+            }
         }
 
-        // In a fused forward-mode program the primal result retains every witness and check producer. A partitioned
-        // tangent program runs only after the primal completes and needs residuals only for missing extents.
-        if !source_carries_output || (needs_ordering && !needs_source) {
+        match introduced {
+            Some(operations) => {
+                for operation in operations {
+                    witnesses.push(read(output, operation)?);
+                }
+            }
+            None => witnesses.push(context.primal_to_tangent(output.clone())?),
+        }
+
+        if !ordered {
             witnesses.push(context.primal_to_tangent(output.clone())?);
         }
 
@@ -1343,6 +1379,33 @@ impl<T: Type> CastOperation<T> {
         let mut outputs = context.bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+
+    /// Returns the [`CastType::IdentityWitnessOperation`]s that read every identity of `from` that `to` does not carry
+    /// from a value of type `value_type`, one per identity in order of first occurrence, or `None` when one of them has
+    /// no such operation and the whole value must be retained instead (refer to [`Self::bind_tangent`]).
+    fn identity_witness_operations(
+        value_type: &T,
+        from: &T,
+        to: &T,
+    ) -> Result<Option<Vec<T::IdentityWitnessOperation>>, TypeError>
+    where
+        T: CastType,
+    {
+        let mut identities = Vec::new();
+        for (_, identity) in from.identities() {
+            if !to.identities().any(|(_, available)| available == identity) && !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        let mut operations = Vec::with_capacity(identities.len());
+        for identity in identities {
+            match T::identity_witness_operation(value_type, identity)? {
+                Some(operation) => operations.push(operation),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(operations))
     }
 
     /// Returns the inferred output type for direct interpretation over values of the supplied `input_types`,
@@ -1543,7 +1606,7 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
 
 impl<T: DifferentiableType + CastType, C: Context<Type = T>> DifferentiableOperation<C> for CastOperation<T>
 where
-    C::Operation: From<CastOperation<T>>,
+    C::Operation: From<CastOperation<T>> + From<T::IdentityWitnessOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1607,7 +1670,8 @@ where
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "cannot transpose a checked `{CAST_OPERATION_NAME}` without the primal {missing} its check \
-                     needs; linearize the program first",
+                     needs; linearize the program first, or use `cast_unchecked` with witnesses for a tangent that an \
+                     earlier check already proved",
                 ),
             }
             .into());
@@ -1667,6 +1731,15 @@ where
 /// to materialize any requested representation changes. The built-in implementations use [`TypeRefinements`] to
 /// validate dimension and identity relationships and infer the output's representation.
 pub trait CastType: Type {
+    /// [`Operation`] that reads one identity of a value of this type into a value whose type carries that identity
+    /// (e.g., the [`DimensionSizeOperation`] that reads the extent `n` of an `f32[n]` array as a `dimension<n>`).
+    /// Differentiation binds it to give a tangent cast a scalar witness for an identity in place of the whole primal
+    /// value (refer to [`CastOperation`]), which keeps whole arrays out of the residuals of partitioned programs.
+    /// Families without such an operation name [`CastOperation<Self>`], which every operation family that
+    /// differentiates casts already converts from, and never select it, so that generic rules that bind
+    /// witnesses need no operation conversions beyond those of the cast itself.
+    type IdentityWitnessOperation: Operation<Type = Self>;
+
     /// Validates `operation` against `input_types` (the value followed by its witnesses) and returns the inferred
     /// output type together with an optional output representation for direct interpretation. The latter is present
     /// only when the supplied types prove the complete shape without a runtime check; its identities must be carried by
@@ -1689,9 +1762,33 @@ pub trait CastType: Type {
         operation: &CastOperation<Self>,
         input_types: &[Self],
     ) -> Result<(Self, Option<Self>), TypeError>;
+
+    /// Returns the [`Self::IdentityWitnessOperation`] that reads `identity` from a value of type `value_type`, or
+    /// [`None`] when this family has no operation for that identity (e.g., because `value_type` does not carry it, or
+    /// because the family has no such operation), in which case transforms retain the whole value as the witness. The
+    /// selected operation takes the value as its only input and returns one value whose type carries `identity`. The
+    /// default implementation returns [`None`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `value_type` carries `identity` but the selected operation cannot be constructed to
+    /// read it (e.g., in [`ArrayIrType`], when the lower bound of the identity exceeds the largest extent that a
+    /// first-class dimension can represent). Transforms propagate this error rather than retaining the whole value, so
+    /// that, for example, differentiating such a cast fails loudly instead of silently retaining a whole array as a
+    /// residual.
+    #[inline]
+    fn identity_witness_operation(
+        value_type: &Self,
+        identity: &Self::Identity,
+    ) -> Result<Option<Self::IdentityWitnessOperation>, TypeError> {
+        let _ = (value_type, identity);
+        Ok(None)
+    }
 }
 
 impl CastType for DataType {
+    type IdentityWitnessOperation = CastOperation<Self>;
+
     #[inline]
     fn infer_cast_output_type(
         operation: &CastOperation<Self>,
@@ -1710,6 +1807,8 @@ impl CastType for DataType {
 }
 
 impl CastType for ArrayType {
+    type IdentityWitnessOperation = CastOperation<Self>;
+
     #[inline]
     fn infer_cast_output_type(
         operation: &CastOperation<Self>,
@@ -1736,6 +1835,8 @@ impl CastType for ArrayType {
 }
 
 impl CastType for DimensionType {
+    type IdentityWitnessOperation = CastOperation<Self>;
+
     #[inline]
     fn infer_cast_output_type(
         operation: &CastOperation<Self>,
@@ -1762,6 +1863,8 @@ impl CastType for DimensionType {
 }
 
 impl CastType for ArrayIrType {
+    type IdentityWitnessOperation = DimensionSizeOperation;
+
     #[inline]
     fn infer_cast_output_type(
         operation: &CastOperation<Self>,
@@ -1860,17 +1963,19 @@ impl CastType for ArrayIrType {
                     // adding or removing an explicit axis major to one of them, would move data between auto or manual
                     // shards (i.e., perform an implicit collective). Each dimension must therefore keep its axes up to
                     // and including its last auto or manual axis, and only explicit axes minor to them may change.
-                    let preserved_prefix =
-                        |sharding: &Sharding, dimension: usize| match &sharding.dimensions()[dimension] {
+                    fn preserved_prefix(sharding: &Sharding, dimension: usize) -> &[String] {
+                        match &sharding.dimensions()[dimension] {
                             ShardingDimension::Sharded(axis_names) => {
                                 let end = axis_names
                                     .iter()
                                     .rposition(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit))
                                     .map_or(0, |index| index + 1);
-                                axis_names[..end].to_vec()
+                                &axis_names[..end]
                             }
-                            ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
-                        };
+                            ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
+                        }
+                    }
+
                     if let Some(dimension) = (0..output.rank()).find(|dimension| {
                         preserved_prefix(output_sharding, *dimension)
                             != input
@@ -1885,23 +1990,18 @@ impl CastType for ArrayIrType {
                         )));
                     }
 
-                    // The checks above compare axis names only, but the size and type of a mesh axis are semantic.
-                    // Every auto or manual axis whose placement the output carries forward, and every axis of any
-                    // type that carries manual variation or reduction state, must therefore keep its definition. An
-                    // explicit axis is exempt only when it is referenced solely by dimension placement, which may
-                    // change. The output mesh may still add or drop other axes (e.g., to request an explicit
-                    // redistribution).
+                    // The checks above compare axis names only, but the size and type of a mesh axis are semantic:
+                    // the sizes of all axes in the preserved prefix of a dimension, explicit axes included, fix the
+                    // blocks of its auto and manual shards. Every axis in such a prefix, and every axis of any type
+                    // that carries manual variation or reduction state, must therefore keep its definition. An
+                    // explicit axis is exempt only when it is minor to every auto and manual axis of each dimension
+                    // that it shards and carries no such state. The output mesh may still add or drop other axes
+                    // (e.g., to request an explicit redistribution).
                     if let Some(input_sharding) = input.sharding() {
                         let input_mesh = input_sharding.mesh();
                         let output_mesh = output_sharding.mesh();
-                        let preserved_axes = input_sharding
-                            .dimensions()
-                            .iter()
-                            .flat_map(|dimension| match dimension {
-                                ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
-                                ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
-                            })
-                            .filter(|axis_name| input_mesh.axis_type(axis_name) != Some(MeshAxisType::Explicit))
+                        let preserved_axes = (0..input_sharding.dimensions().len())
+                            .flat_map(|dimension| preserved_prefix(input_sharding, dimension))
                             .chain(input_sharding.varying_manual_axes())
                             .chain(input_sharding.unreduced_axes())
                             .chain(input_sharding.reduced_axes())
@@ -2117,6 +2217,25 @@ impl CastType for ArrayIrType {
 
         Ok((represent(dimensions), interpreted.map(represent)))
     }
+
+    fn identity_witness_operation(
+        value_type: &Self,
+        identity: &DimensionVariable,
+    ) -> Result<Option<DimensionSizeOperation>, TypeError> {
+        // An array reads the extent of the first axis that carries the identity as a `dimension` scalar, whose type
+        // carries that identity. A first-class dimension value already is such a scalar, and references are never
+        // cast, so both keep the whole value.
+        let Self::Array(array_type) = value_type else {
+            return Ok(None);
+        };
+        array_type
+            .shape()
+            .dimensions()
+            .iter()
+            .position(|dimension| dimension.variable() == Some(identity))
+            .map(|axis| DimensionSizeOperation::new(array_type, axis))
+            .transpose()
+    }
 }
 
 /// Represents the ability to return a value at a different but related type representation, through a [`CastOperation`]
@@ -2330,9 +2449,9 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding,
-        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2,
-        u4,
+        DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, RaggedAxis,
+        Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2,
+        f8e8m0fnu, i4, u2, u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -2358,6 +2477,8 @@ mod tests {
     // An independent type family can implement the operation-specific contract without changing `TypeRefinements`.
     // The impl lives at module level because trait impls are never scoped to a function.
     impl CastType for ProjectedMemberType<0> {
+        type IdentityWitnessOperation = CastOperation<Self>;
+
         fn infer_cast_output_type(
             operation: &CastOperation<Self>,
             input_types: &[Self],
@@ -4706,8 +4827,9 @@ mod tests {
     fn test_cast_type_inference_mesh_axis_definitions() {
         // Auto and manual axes that the output carries forward keep their mesh axis definitions (size and type), even
         // when only their names are compared for placement and manual variation, whereas the output mesh may still add
-        // or drop unrelated axes. Axes that carry reduction state keep their definitions even when they are explicit,
-        // whereas explicit axes referenced only by dimension placement may be redefined.
+        // or drop unrelated axes. Axes that carry reduction state, and explicit axes major to an auto or manual axis in
+        // a dimension (whose sizes fix the blocks of its shards), keep their definitions, whereas explicit axes minor to
+        // every auto and manual axis and referenced only by dimension placement may be redefined or replaced.
         let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
             LogicalMesh::new(
                 axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap()).collect(),
@@ -4743,6 +4865,11 @@ mod tests {
         let manual = |size: usize| mesh(&[("x", size, MeshAxisType::Manual)]);
         let explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Explicit)]);
         let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Auto), ("y", 2, MeshAxisType::Explicit)]);
+        let major_explicit = ShardingDimension::sharded(["x", "a"]);
+        let major_manual = ShardingDimension::sharded(["x", "m"]);
+        let minor_explicit = ShardingDimension::sharded(["a", "x"]);
+        let with_minor_explicit =
+            mesh(&[("a", 2, MeshAxisType::Auto), ("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)]);
         let cases = [
             (
                 placed(auto(2), sharded.clone()),
@@ -4796,6 +4923,30 @@ mod tests {
             (
                 unreduced(explicit(2)),
                 unreduced(mesh(&[("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)])),
+                Ok(()),
+            ),
+            (
+                placed(mesh(&[("x", 2, MeshAxisType::Explicit), ("a", 2, MeshAxisType::Auto)]), major_explicit.clone()),
+                placed(mesh(&[("x", 4, MeshAxisType::Explicit), ("a", 2, MeshAxisType::Auto)]), major_explicit.clone()),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=4:explicit`",
+                )),
+            ),
+            (
+                placed(mesh(&[("x", 2, MeshAxisType::Explicit), ("m", 2, MeshAxisType::Manual)]), major_manual.clone()),
+                placed(mesh(&[("x", 4, MeshAxisType::Explicit), ("m", 2, MeshAxisType::Manual)]), major_manual),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=4:explicit`",
+                )),
+            ),
+            (
+                placed(mesh(&[("a", 2, MeshAxisType::Auto), ("x", 2, MeshAxisType::Explicit)]), minor_explicit.clone()),
+                placed(mesh(&[("a", 2, MeshAxisType::Auto), ("x", 4, MeshAxisType::Explicit)]), minor_explicit.clone()),
+                Ok(()),
+            ),
+            (
+                placed(with_minor_explicit.clone(), minor_explicit),
+                placed(with_minor_explicit, ShardingDimension::sharded(["a", "y"])),
                 Ok(()),
             ),
             (placed(explicit(2), sharded.clone()), placed(explicit(4), sharded), Ok(())),
@@ -6877,6 +7028,110 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_differentiation_identity_witnesses() {
+        // In the composite family, a tangent cast is witnessed by the first-class dimension of each identity that one
+        // of its sides does not carry, read with `dimension_size` from the primal source (narrowing) or the checked
+        // primal output (widening), so linearization retains `dimension<n>` scalars rather than `f32[n]` arrays. The
+        // fused narrowing tangent also depends on the checked output, whereas a witness read from the widened output
+        // already provides that dependency.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])));
+        let exact = ArrayIrType::from(ArrayType::new_static(DataType::F32, [2]));
+        let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].cast(exact.clone(), &[])?]),
+            vec![symbolic.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                    %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                    %4:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>, f32[2]]] %1 %3 %2
+                in (%2, %4)"},
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[n] .
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                    %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                in (%1, %2)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:dimension<n ∈ [1, 8)> .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %0 %1
+                in (%2)"},
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:dimension<n ∈ [1, 8)> .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %1
+                in (%2)"},
+        );
+        let mut outputs = linearization.primal().interpret(vec![vector(vec![1.0, 2.0])]).unwrap();
+        let residuals = outputs.split_off(1);
+        assert_eq!(outputs, vec![vector(vec![1.0, 2.0])]);
+        let mut pullback_inputs = vec![vector(vec![3.0, 4.0])];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![vector(vec![3.0, 4.0])]));
+
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(value, witness)| value.cast(symbolic.clone(), &[witness]),
+            (exact.clone(), symbolic.clone()),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n], %2:f32[2], %3:f32[n] .
+                let %4:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %0 %1
+                    %5:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %4
+                    %6:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %2 %5
+                in (%4, %6)"},
+        );
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %0 %1
+                    %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %2
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:dimension<n ∈ [1, 8)> .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %1
+                in (%2)"},
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:dimension<n ∈ [1, 8)> .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %0 %1
+                in (%2)"},
+        );
+        let mut outputs =
+            linearization.primal().interpret(vec![vector(vec![1.0, 2.0]), vector(vec![0.0, 0.0])]).unwrap();
+        let residuals = outputs.split_off(1);
+        assert_eq!(outputs, vec![vector(vec![1.0, 2.0])]);
+        let mut pullback_inputs = vec![vector(vec![3.0, 4.0])];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![vector(vec![3.0, 4.0])]));
+    }
+
+    #[test]
     fn test_cast_differentiation_layout_and_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_type = ArrayType::scalar(DataType::F64)
@@ -7468,7 +7723,8 @@ mod tests {
         // A live result, a discarded result and a zero-output program must all preserve the primal precondition.
         let expected = DifferentiationError::Program(ProgramError::UnsupportedOperation {
             message: "cannot transpose a checked `cast` without the primal value its check needs; linearize the \
-                      program first"
+                      program first, or use `cast_unchecked` with witnesses for a tangent that an earlier check \
+                      already proved"
                 .to_owned(),
         });
         for outputs in 0..3 {
@@ -7547,7 +7803,8 @@ mod tests {
             program.transpose_with_respect_to(&[1], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message: "cannot transpose a checked `cast` without the primal witnesses its check needs; linearize \
-                          the program first"
+                          the program first, or use `cast_unchecked` with witnesses for a tangent that an earlier \
+                          check already proved"
                     .to_owned(),
             }),
         );
@@ -7604,7 +7861,8 @@ mod tests {
             program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message: "cannot transpose a checked `cast` without the primal value its check needs; linearize the \
-                          program first"
+                          program first, or use `cast_unchecked` with witnesses for a tangent that an earlier check \
+                          already proved"
                     .to_owned(),
             }),
         );
@@ -8226,6 +8484,49 @@ mod tests {
             ),
             Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
         );
+    }
+
+    #[test]
+    fn test_cast_type_identity_witness_operation() {
+        // The composite universe reads an array identity from the first axis that carries it as a first-class
+        // dimension, whose type carries the same identity.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionVariable::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let array =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), n.clone().into(), n.clone().into()]));
+        let operation = ArrayIrType::identity_witness_operation(&array.clone().into(), &n).unwrap().unwrap();
+        assert_eq!(operation, DimensionSizeOperation::new(&array, 1).unwrap());
+        assert_eq!(operation.to_string(), "dimension_size [axis=1]");
+        assert_eq!(
+            operation.infer_output_types(&[array.clone().into()], &[]),
+            Ok(vec![DimensionType::from(Dimension::Dynamic(n.clone())).into()]),
+        );
+
+        // Values that do not carry the identity, first-class dimensions (which already are such scalars), and
+        // references have no identity witness operation.
+        assert_eq!(ArrayIrType::identity_witness_operation(&array.clone().into(), &m), Ok(None));
+        let dimension = ArrayIrType::Dimension(DimensionType::from(Dimension::Dynamic(n.clone())));
+        assert_eq!(ArrayIrType::identity_witness_operation(&dimension, &n), Ok(None));
+        let reference = ArrayIrType::from(ReferenceType::new(array.clone()));
+        assert_eq!(ArrayIrType::identity_witness_operation(&reference, &n), Ok(None));
+
+        // An identity that the value carries but that cannot be read as a first-class dimension value is an error
+        // rather than `None`, so that transforms fail instead of silently retaining the whole array.
+        let wide = DimensionVariable::new("wide", DimensionBounds::new(MAX_DIMENSION_EXTENT + 1, None).unwrap());
+        let wide_array = ArrayType::new(DataType::F32, Shape::new(vec![wide.clone().into()]));
+        assert_eq!(
+            ArrayIrType::identity_witness_operation(&wide_array.into(), &wide),
+            Err(DimensionError::ExtentExceedsBackendWidth {
+                value: MAX_DIMENSION_EXTENT + 1,
+                maximum: MAX_DIMENSION_EXTENT,
+            }
+            .into()),
+        );
+
+        // Homogeneous families have no such operation and retain whole values instead.
+        assert_eq!(ArrayType::identity_witness_operation(&array, &n), Ok(None));
+        let dimension = DimensionType::from(Dimension::Dynamic(n.clone()));
+        assert_eq!(DimensionType::identity_witness_operation(&dimension, &n), Ok(None));
     }
 
     #[test]
