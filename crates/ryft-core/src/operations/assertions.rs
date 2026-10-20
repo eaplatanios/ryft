@@ -615,7 +615,6 @@ where
 impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 
-// TODO(eaplatanios): Review this.
 /// Prepares array assertions for an [`ArrayExtentBatchingPolicy`]. An extent policy implements this trait for itself
 /// to support assertion batching, where `P` is the extent policy of the supplied batching context.
 ///
@@ -624,10 +623,10 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// along the batch axis, before delegating the assertion to the parent context. This trait supplies the batch item
 /// indices and the empty-batch handling that the rule uses, while the rule materializes inputs through the extent
 /// policy's own [`match_axis`](ArrayExtentBatchingPolicy::match_axis) and
-/// [`broadcast_input`](ArrayExtentBatchingPolicy::broadcast_input). [`ArrayBatchingPolicy`] runs the rule with its own
-/// extent policy. [`ArrayIrBatchingPolicy`] runs it over the array inputs of its projected
-/// [`DynamicArrayExtentBatchingPolicy`] view, whose implementation of this trait binds the extent computations in the
-/// composite parent context, and then reinserts replicated dimension observations, which have no array view.
+/// [`broadcast_input`](ArrayExtentBatchingPolicy::broadcast_input). [`ArrayBatchingPolicy`] runs the rule
+/// with its own extent policy. [`ArrayIrBatchingPolicy`] runs it over the array inputs of its projected
+/// [`DynamicArrayExtentBatchingPolicy`] view, whose implementation of this trait binds the extent computations
+/// in the composite parent context, and then reinserts replicated dimension observations, which have no array view.
 ///
 /// [`StaticArrayExtentBatchingPolicy`] implements this trait for every array context and
 /// [`DynamicArrayExtentBatchingPolicy`] for projected composite contexts. Both implementations are generic over `P`, so
@@ -638,23 +637,55 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// Implementations must preserve logical extents, memory placement, and manual variation. They must reject unsupported
 /// ragged inputs rather than report padding as logical assertion elements.
 pub trait ArrayAssertionBatchingPolicy<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> {
-    /// Returns the index of every batch item along the leading axis of `r#type`. Its extent must describe the logical
-    /// batch, including when that extent is supplied as a first-class dimension value.
+    /// Returns an array of type `r#type` containing leading-axis coordinates: each element at `[i, ...]` has value
+    /// `i` represented in the requested element data type. The leading dimension must match the logical batch extent.
+    /// The policy supplies any first-class extent input needed to construct the indices for a dynamic batch.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active batching context that supplies the logical batch extent and receives the index computation
+    ///     in its parent context.
+    ///   - `r#type`: Requested index array type, including its shape, element data type, memory space, and sharding.
+    ///     Its shape must have a leading dimension describing the batch extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the requested index array cannot be constructed, including dynamic extents that
+    /// the policy cannot supply, and propagates errors from extent inspection and binding the index computation.
     fn batch_item_indices(
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         r#type: &ArrayType,
     ) -> Result<C::Value, ProgramError>;
 
-    /// Makes the scalar `condition` true when the batch is empty. This gives a replicated false condition the same
-    /// empty-batch semantics as a mapped condition reduced over zero items.
+    /// Returns a scalar Boolean condition equivalent to `batch_extent == 0 || condition`. Empty batches therefore
+    /// pass vacuously, while nonempty batches retain the original condition's truth value. This gives a replicated
+    /// condition the same empty-batch semantics as a mapped condition reduced over zero items. The caller performs
+    /// the assertion using the returned condition.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active batching context whose logical batch extent determines whether the condition is masked.
+    ///   - `condition`: Already validated scalar Boolean condition shared by every batch item.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ProgramError`]s from extent inspection and the array operations used to handle an empty batch.
     fn mask_empty_batch_condition(
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         condition: C::Value,
     ) -> Result<C::Value, ProgramError>;
 
     /// Makes selecting item zero from a mapped observation safe when the batch may be empty. Static policies can
-    /// return `observation` unchanged; dynamic policies pad it. `padded_extent` caches the padded extent across all
-    /// observations of one assertion, avoiding repeated staging of the same extent calculation.
+    /// return `observation` unchanged; dynamic policies pad it.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active batching context whose mapped extent determines whether padding is needed.
+    ///   - `observation`: Mapped observation to make safe for selection at item zero.
+    ///   - `padded_extent`: Mutable cache shared across observations of one assertion in `context`. Initialize it to
+    ///     `None`. On the first call requiring padding, the function computes and stores the padded extent; later
+    ///     calls reuse it, avoiding repeated staging of the same extent calculation. Policies requiring no padding
+    ///     leave the cache unchanged. Do not reuse it for a different assertion, batching context, or mapped extent.
     fn pad_empty_batch_observation(
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         observation: C::Value,
