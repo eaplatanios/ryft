@@ -2059,7 +2059,10 @@ mod tests {
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
 
             // The tangent cast has its own data input. The converted primal proof must remain a dependency even
-            // though it is not numerically used; that proof already depends on the assertion token.
+            // though it is not numerically used; that proof already depends on the assertion token. The homogeneous
+            // tangent cast is witnessed by the primal input and the converted primal themselves, whereas the composite
+            // one is witnessed by their extents, read as first-class dimensions, of which the second one still depends
+            // on the proof.
             let jvp = program.jvp().unwrap();
             let tangent_module = to_mlir_module_for_program(
                 &jvp,
@@ -2085,10 +2088,11 @@ mod tests {
             };
             let barrier = tangent_module
                 .lines()
-                .find(|line| {
-                    line.contains(&format!("stablehlo.optimization_barrier {}, {},", entry_value(3), entry_value(1),))
-                })
+                .find(|line| line.contains(&format!("stablehlo.optimization_barrier {},", entry_value(3))))
                 .unwrap();
+            if !composite {
+                assert!(barrier.contains(&format!("{}, {},", entry_value(3), entry_value(1))), "{tangent_module}");
+            }
             let primal_barrier = tangent_module
                 .lines()
                 .find(|line| line.contains("stablehlo.optimization_barrier") && line.contains(token))
@@ -2110,7 +2114,23 @@ mod tests {
                 .split_once(" = ")
                 .unwrap()
                 .0;
-            assert!(barrier.contains(&format!(", {proof} :")), "{tangent_module}");
+            let proof_dependency = if composite {
+                let assignment = |pattern: String| {
+                    tangent_module
+                        .lines()
+                        .find(|line| line.contains(&pattern))
+                        .unwrap()
+                        .trim()
+                        .split_once(" = ")
+                        .unwrap()
+                        .0
+                };
+                let size = assignment(format!("stablehlo.get_dimension_size {proof},"));
+                assignment(format!("stablehlo.convert {size} :"))
+            } else {
+                proof
+            };
+            assert!(barrier.contains(&format!(", {proof_dependency} :")), "{tangent_module}");
             let values = barrier.trim().split_once(':').unwrap().0;
             assert!(tangent_module.contains(&format!("stablehlo.get_dimension_size {values}#0")), "{tangent_module}");
             let inputs = [inputs[0].clone(), inputs[1].clone(), inputs[0].clone(), inputs[1].clone()];

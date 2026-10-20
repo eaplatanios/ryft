@@ -10143,11 +10143,11 @@ mod tests {
     #[test]
     fn test_composite_condition_linearization_transposes_checked_casts_over_symbolic_inputs() {
         // The `true` branch narrows `x: f32[n]` to `f32[2]` with a checked cast, while the `false` branch returns `y`.
-        // Linearization retains `x` as the witness of the tangent cast in the `true` branch, and a `dimension<n>` in the
-        // `false` branch, in which `x` is disconnected and its cotangent zero needs the runtime value of `n`. The
-        // placeholder of each edge in the peer branch takes `n` from the known `x`: the `f32[n]` edge is a zero built
-        // from its extent, and the non-zeroable `dimension<n>` edge is read from it directly. Transposing the `false`
-        // branch then constructs the zero cotangent of `x` from the extents retained in its known inputs.
+        // Linearization retains a `dimension<n>` read from `x` as the witness of the tangent cast in the `true` branch,
+        // and another one in the `false` branch, in which `x` is disconnected and its cotangent zero needs the runtime
+        // value of `n`. The placeholder of each edge in the peer branch is that non-zeroable `dimension<n>`, read from
+        // the known `x` directly. Transposing the `true` branch converts the cotangent back to `f32[n]` with its
+        // retained extent, and transposing the `false` branch constructs the zero cotangent of `x` from it.
         type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
@@ -10169,19 +10169,19 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[n], %2:f32[2] .
-                let %3:f32[2], %4:f32[n], %5:dimension<n ∈ [1, 8)> = condition %0 %1 %2 [
+                let %3:f32[2], %4:dimension<n ∈ [1, 8)>, %5:dimension<n ∈ [1, 8)> = condition %0 %1 %2 [
                     true={
                         lambda %0:f32[n], %1:f32[2] .
                         let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
                             %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                        in (%2, %0, %3)
+                            %4:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                        in (%2, %3, %4)
                     },
                     false={
                         lambda %0:f32[n], %1:f32[2] .
                         let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                            %3:f32[n] = zero [type=f32[n]] %2
-                            %4:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                        in (%1, %3, %4)
+                            %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                        in (%1, %2, %3)
                     },
                 ]
                 in (%3, %0, %4, %5)"},
@@ -10189,15 +10189,15 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-                lambda %0:f32[n], %1:f32[2], %2:bool[], %3:f32[n], %4:dimension<n ∈ [1, 8)> .
+                lambda %0:f32[n], %1:f32[2], %2:bool[], %3:dimension<n ∈ [1, 8)>, %4:dimension<n ∈ [1, 8)> .
                 let %5:f32[2] = condition %2 %0 %1 %3 %4 [
                     true={
-                        lambda %0:f32[n], %1:f32[2], %2:f32[n], %3:dimension<n ∈ [1, 8)> .
-                        let %4:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %2
+                        lambda %0:f32[n], %1:f32[2], %2:dimension<n ∈ [1, 8)>, %3:dimension<n ∈ [1, 8)> .
+                        let %4:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %0 %2
                         in (%4)
                     },
                     false={
-                        lambda %0:f32[n], %1:f32[2], %2:f32[n], %3:dimension<n ∈ [1, 8)> .
+                        lambda %0:f32[n], %1:f32[2], %2:dimension<n ∈ [1, 8)>, %3:dimension<n ∈ [1, 8)> .
                         in (%1)
                     },
                 ]
@@ -10207,19 +10207,18 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f32[2], %1:bool[], %2:f32[n], %3:dimension<n ∈ [1, 8)> .
+                lambda %0:f32[2], %1:bool[], %2:dimension<n ∈ [1, 8)>, %3:dimension<n ∈ [1, 8)> .
                 let %4:f32[n], %5:f32[2] = condition %1 %0 %2 %3 [
                     true={
-                        lambda %0:f32[2], %1:f32[n], %2:dimension<n ∈ [1, 8)> .
-                        let %3:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
+                        lambda %0:f32[2], %1:dimension<n ∈ [1, 8)>, %2:dimension<n ∈ [1, 8)> .
+                        let %3:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %1
                             %4:f32[2] = zero [type=f32[2]]
                         in (%3, %4)
                     },
                     false={
-                        lambda %0:f32[2], %1:f32[n], %2:dimension<n ∈ [1, 8)> .
-                        let %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %1
-                            %4:f32[n] = zero [type=f32[n]] %3
-                        in (%4, %0)
+                        lambda %0:f32[2], %1:dimension<n ∈ [1, 8)>, %2:dimension<n ∈ [1, 8)> .
+                        let %3:f32[n] = zero [type=f32[n]] %1
+                        in (%3, %0)
                     },
                 ]
                 in (%4, %5)"},

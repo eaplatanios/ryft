@@ -172,8 +172,8 @@ use thiserror::Error;
 use crate::arrays::sharding::meshes::render_mesh_axis_name;
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType,
-    Dimension, DimensionType, DimensionValue, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension,
-    ShardingError,
+    Dimension, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, Shape, Sharding,
+    ShardingDimension, ShardingError,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
@@ -207,7 +207,7 @@ use crate::partial::{
     PartiallyEvaluatableOperation, ResidualInputSource,
 };
 use crate::programs::{
-    CalleeRegionDriver, EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, Operation,
+    AtomId, CalleeRegionDriver, EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, Operation,
     OperationBoundaryPruning, OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ProjectedValue, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
@@ -3538,12 +3538,31 @@ where
             _ => reshape_array(builder, value, <&ArrayType>::try_from(target)?),
         }
     };
+
+    // Several residual edges can carry the same dimension identity (e.g., an extent that both a primal value and a
+    // tangent conversion read), but only one value may define that identity on entry. Equal identities denote equal
+    // extents, so the other edges reuse the value converted first.
+    let mut dimension_inputs = Vec::<(DimensionVariable, AtomId)>::new();
     let converted_inputs = inputs
         .iter()
         .copied()
         .zip(input_types.iter().zip(program.input_types()))
-        .map(|(input, (source, target))| reshape(&mut builder, input, source, &target))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(input, (source, target))| {
+            let variable = match (source, &target) {
+                (ArrayIrType::Array(_), ArrayIrType::Dimension(target)) => target.variable().cloned(),
+                _ => None,
+            };
+            let Some(variable) = variable else {
+                return reshape(&mut builder, input, source, &target);
+            };
+            if let Some((_, value)) = dimension_inputs.iter().find(|(defined, _)| *defined == variable) {
+                return Ok(*value);
+            }
+            let value = reshape(&mut builder, input, source, &target)?;
+            dimension_inputs.push((variable, value));
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, ProgramError>>()?;
     let outputs = builder.splice_program(program, &converted_inputs)?;
     let outputs = outputs
         .into_iter()
@@ -13907,32 +13926,405 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_differentiation_rejects_dynamic_cast_residuals() {
-        // The tangent conversion of a cast retains a primal value of type `f32[n]` for the extent `n` that the
-        // converted tangent no longer carries (e.g., the source of a narrowing cast and the output of a widening one),
-        // so splitting such a body into primal and tangent maps needs a dynamically shaped residual, which the static
-        // boundary rejects, although the first-class dimension `n`, which would cross the boundary as its scalar value,
-        // carries the same extent.
-        let expected = ShardMapError::DynamicResidualNotSupported { residual_index: 1, dimension: 0 };
+    fn test_shard_map_differentiation_of_bodies_with_symbolic_casts() {
+        // The tangent conversion of a cast whose output tangent type drops the extent `n` (narrowing) or introduces it
+        // (widening) is witnessed by the first-class dimension `n`, read with `dimension_size` from the primal source
+        // or output, rather than by a primal value of type `f32[n]`. That scalar crosses the static boundary between
+        // the primal and tangent maps as an integer residual edge, so both directions differentiate inside a
+        // `shard_map` body. The tangent body converts every edge that carries `n` from the first of them.
+        fn value(r#type: &ArrayIrType, elements: &[f32]) -> TestValue {
+            let ArrayIrType::Array(r#type) = r#type else { unreachable!() };
+            TestValue::Array(Array::from_elements(r#type.clone(), elements).unwrap())
+        }
+        let replicated = Sharding::replicated(manual_mesh(), 0);
+        let sharded = sharded_along_x();
+        let varying = Sharding::replicated(manual_mesh(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let scalar_varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
+        let a_type = f32_scalar_type().with_sharding(replicated.clone()).unwrap();
+        let two_global = f32_vector_type(2).with_sharding(sharded.clone()).unwrap();
+        let four_global = f32_vector_type(4).with_sharding(sharded.clone()).unwrap();
+        let extents_global = ArrayType::new_static(DataType::I64, [2]).with_sharding(sharded.clone()).unwrap();
+        let one_local = f32_vector_type(1).with_sharding(varying.clone()).unwrap();
+        let two_local = f32_vector_type(2).with_sharding(varying.clone()).unwrap();
+        let extent_local = ArrayType::new_static(DataType::I64, [1]).with_sharding(varying.clone()).unwrap();
+        let n_local = format!("f32[n][sharding={varying}]");
+        let count_replicated = ArrayType::scalar(DataType::I64).with_sharding(replicated.clone()).unwrap();
+        let count_varying = ArrayType::scalar(DataType::I64).with_sharding(scalar_varying.clone()).unwrap();
+        let n = "dimension<n ∈ [0, 5)>";
+
+        // Narrowing `f32[n]` to `f32[2]` reads `n` from the primal source, so that the transpose of the tangent cast can
+        // convert the cotangent back to `f32[n]`. When `a` is not `2`, the checked cast of the primal map fails.
         let program = narrowing_cast_shard_map_program(true);
-        assert!(matches!(
-            program.jvp_with_respect_to(&[1]),
-            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-        ));
-        assert!(matches!(
-            program.linearize_with_respect_to(&[1]),
-            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-        ));
-        let expected = ShardMapError::DynamicResidualNotSupported { residual_index: 0, dimension: 0 };
+        let input_types = program.input_types();
+        let output_type = &program.output_types()[0];
+        let a = value(&input_types[0], &[2.0]);
+        let x = value(&input_types[1], &[1.0, 2.0]);
+        let tangent = value(&input_types[1], &[3.0, 4.0]);
+        let jvp = program.jvp_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            formatdoc! {r#"
+                lambda %0:{a_type}, %1:{two_global}, %2:{two_global} .
+                let %3:{four_global}, %4:{extents_global}, %5:{extents_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}, {sharded}],
+                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{a_type}, {two_global}],
+                    global_output_types=[{four_global}, {extents_global}, {extents_global}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:f32[], %1:{one_local} .
+                        let %2:i64[] = convert_element_type [data_type=i64] %0
+                            %3:{n} = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:{n_local} = broadcast [output_axes=[0]] %1 %3
+                            %5:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}],
+                                checked=true,
+                            ] %4
+                            %6:{n} = dimension_size [axis=0] %4
+                            %7:i64[] = dimension_to_scalar %3
+                            %8:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %7
+                            %9:{count_varying} = parallel_vary [axis_name="x"] %8
+                            %10:{extent_local} = reshape [shape=[1], output_sharding={varying}] %9
+                            %11:i64[] = dimension_to_scalar %6
+                            %12:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %11
+                            %13:{count_varying} = parallel_vary [axis_name="x"] %12
+                            %14:{extent_local} = reshape [shape=[1], output_sharding={varying}] %13
+                        in (%5, %10, %14)
+                    }},
+                ]
+                    %6:{four_global} = shard_map [
+                        mesh=['x'=2:manual],
+                        in_shardings=[{sharded}, {sharded}, {sharded}],
+                        out_shardings=[{sharded}],
+                        manual_axes=['x'],
+                        global_input_types=[{two_global}, {extents_global}, {extents_global}],
+                        global_output_types=[{four_global}],
+                    ] %2 %4 %5 [
+                        body={{
+                            lambda %0:{one_local}, %1:{extent_local}, %2:{extent_local} .
+                            let %3:{count_varying} = reshape [shape=[], output_sharding={scalar_varying}] %1
+                                %4:{n} = dimension_from_scalar [bounds=[0, 5)] %3
+                                %5:{n_local} = broadcast [output_axes=[0]] %0 %4
+                                %6:{two_local} = cast [
+                                    type={two_local},
+                                    inputs=[{n_local}, {n}],
+                                ] %5 %4
+                            in (%6)
+                        }},
+                    ]
+                in (%3, %6)"#},
+        );
+        assert_eq!(
+            jvp.interpret(vec![a.clone(), x.clone(), tangent.clone()]),
+            Ok(vec![value(output_type, &[1.0, 1.0, 2.0, 2.0]), value(output_type, &[3.0, 3.0, 4.0, 4.0])]),
+        );
+        assert_eq!(
+            jvp.interpret(vec![value(&input_types[0], &[3.0]), x.clone(), tangent.clone()]),
+            Err(TypeError::invalid(format!(
+                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type `{two_local}`",
+            ))
+            .into()),
+        );
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {r#"
+                lambda %0:{a_type}, %1:{two_global} .
+                let %2:{four_global}, %3:{extents_global}, %4:{extents_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}, {sharded}],
+                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{a_type}, {two_global}],
+                    global_output_types=[{four_global}, {extents_global}, {extents_global}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:f32[], %1:{one_local} .
+                        let %2:i64[] = convert_element_type [data_type=i64] %0
+                            %3:{n} = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:{n_local} = broadcast [output_axes=[0]] %1 %3
+                            %5:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}],
+                                checked=true,
+                            ] %4
+                            %6:i64[] = dimension_to_scalar %3
+                            %7:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %6
+                            %8:{count_varying} = parallel_vary [axis_name="x"] %7
+                            %9:{extent_local} = reshape [shape=[1], output_sharding={varying}] %8
+                            %10:{n} = dimension_size [axis=0] %4
+                            %11:i64[] = dimension_to_scalar %10
+                            %12:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %11
+                            %13:{count_varying} = parallel_vary [axis_name="x"] %12
+                            %14:{extent_local} = reshape [shape=[1], output_sharding={varying}] %13
+                        in (%5, %9, %14)
+                    }},
+                ]
+                in (%2, %3, %4)"#},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{two_global}, %1:{extents_global}, %2:{extents_global} .
+                let %3:{four_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{two_global}, {extents_global}, {extents_global}],
+                    global_output_types=[{four_global}],
+                ] %0 %1 %2 [
+                    body={{
+                        lambda %0:{one_local}, %1:{extent_local}, %2:{extent_local} .
+                        let %3:{count_varying} = reshape [shape=[], output_sharding={scalar_varying}] %1
+                            %4:{n} = dimension_from_scalar [bounds=[0, 5)] %3
+                            %5:{n_local} = broadcast [output_axes=[0]] %0 %4
+                            %6:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}, {n}],
+                            ] %5 %4
+                        in (%6)
+                    }},
+                ]
+                in (%3)"},
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            formatdoc! {"
+                lambda %0:{four_global}, %1:{extents_global}, %2:{extents_global} .
+                let %3:{two_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{four_global}, {extents_global}, {extents_global}],
+                    global_output_types=[{two_global}],
+                ] %0 %1 %2 [
+                    body={{
+                        lambda %0:{two_local}, %1:{extent_local}, %2:{extent_local} .
+                        let %3:{count_varying} = reshape [shape=[], output_sharding={scalar_varying}] %1
+                            %4:{n} = dimension_from_scalar [bounds=[0, 5)] %3
+                            %5:{n_local} = cast [
+                                type={n_local},
+                                inputs=[{two_local}, {n}],
+                            ] %0 %4
+                            %6:f32[][sharding={scalar_varying}] = reduce [kind=sum, axes=[0]] %5
+                            %7:{one_local} = reshape [shape=[1]] %6
+                        in (%7)
+                    }},
+                ]
+                in (%3)"},
+        );
+        let mut outputs = linearization.primal().interpret(vec![a.clone(), x]).unwrap();
+        let residuals = outputs.split_off(1);
+        assert_eq!(outputs, vec![value(output_type, &[1.0, 1.0, 2.0, 2.0])]);
+        let mut tangent_inputs = vec![tangent];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![value(output_type, &[3.0, 3.0, 4.0, 4.0])]),
+        );
+        let mut pullback_inputs = vec![value(output_type, &[1.0, 2.0, 3.0, 4.0])];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![value(&input_types[1], &[3.0, 7.0])]));
+
+        // Widening `f32[2]` to `f32[n]` reads `n` from the checked primal output, which the tangent cast requires and
+        // which also orders the fused tangent behind the check. The unchecked narrowing back to `f32[2]` drops `n`
+        // again, which the tangent program reads from the doubled `f32[n]` value.
         let program = widening_cast_shard_map_program();
-        assert!(matches!(
-            program.jvp_with_respect_to(&[1]),
-            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-        ));
-        assert!(matches!(
-            program.linearize_with_respect_to(&[1]),
-            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-        ));
+        let input_types = program.input_types();
+        let output_type = &program.output_types()[0];
+        let x = value(&input_types[1], &[1.0, 2.0, 3.0, 4.0]);
+        let tangent = value(&input_types[1], &[5.0, 6.0, 7.0, 8.0]);
+        let jvp = program.jvp_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            formatdoc! {r#"
+                lambda %0:{a_type}, %1:{four_global}, %2:{four_global} .
+                let %3:{four_global}, %4:{extents_global}, %5:{extents_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}, {sharded}],
+                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{a_type}, {four_global}],
+                    global_output_types=[{four_global}, {extents_global}, {extents_global}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:f32[], %1:{two_local} .
+                        let %2:i64[] = convert_element_type [data_type=i64] %0
+                            %3:{n} = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:{n_local} = cast [
+                                type={n_local},
+                                inputs=[{two_local}, {n}],
+                                checked=true,
+                            ] %1 %3
+                            %5:{n_local} = add %4 %4
+                            %6:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}, {two_local}],
+                            ] %5 %1
+                            %7:{n} = dimension_size [axis=0] %4
+                            %8:{n} = dimension_size [axis=0] %5
+                            %9:i64[] = dimension_to_scalar %7
+                            %10:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %9
+                            %11:{count_varying} = parallel_vary [axis_name="x"] %10
+                            %12:{extent_local} = reshape [shape=[1], output_sharding={varying}] %11
+                            %13:i64[] = dimension_to_scalar %8
+                            %14:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %13
+                            %15:{count_varying} = parallel_vary [axis_name="x"] %14
+                            %16:{extent_local} = reshape [shape=[1], output_sharding={varying}] %15
+                        in (%6, %12, %16)
+                    }},
+                ]
+                    %6:{four_global} = shard_map [
+                        mesh=['x'=2:manual],
+                        in_shardings=[{sharded}, {sharded}, {sharded}],
+                        out_shardings=[{sharded}],
+                        manual_axes=['x'],
+                        global_input_types=[{four_global}, {extents_global}, {extents_global}],
+                        global_output_types=[{four_global}],
+                    ] %2 %4 %5 [
+                        body={{
+                            lambda %0:{two_local}, %1:{extent_local}, %2:{extent_local} .
+                            let %3:{count_varying} = reshape [shape=[], output_sharding={scalar_varying}] %1
+                                %4:{n} = dimension_from_scalar [bounds=[0, 5)] %3
+                                %5:{n_local} = cast [
+                                    type={n_local},
+                                    inputs=[{two_local}, {n}],
+                                ] %0 %4
+                                %6:{n_local} = add %5 %5
+                                %7:{two_local} = cast [
+                                    type={two_local},
+                                    inputs=[{n_local}, {n}],
+                                ] %6 %4
+                            in (%7)
+                        }},
+                    ]
+                in (%3, %6)"#},
+        );
+        assert_eq!(
+            jvp.interpret(vec![a.clone(), x.clone(), tangent.clone()]),
+            Ok(vec![value(output_type, &[2.0, 4.0, 6.0, 8.0]), value(output_type, &[10.0, 12.0, 14.0, 16.0])]),
+        );
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {r#"
+                lambda %0:{a_type}, %1:{four_global} .
+                let %2:{four_global}, %3:{extents_global}, %4:{extents_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}, {sharded}],
+                    out_shardings=[{sharded}, {sharded}, {sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{a_type}, {four_global}],
+                    global_output_types=[{four_global}, {extents_global}, {extents_global}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:f32[], %1:{two_local} .
+                        let %2:i64[] = convert_element_type [data_type=i64] %0
+                            %3:{n} = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:{n_local} = cast [
+                                type={n_local},
+                                inputs=[{two_local}, {n}],
+                                checked=true,
+                            ] %1 %3
+                            %5:{n_local} = add %4 %4
+                            %6:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}, {two_local}],
+                            ] %5 %1
+                            %7:{n} = dimension_size [axis=0] %4
+                            %8:i64[] = dimension_to_scalar %7
+                            %9:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %8
+                            %10:{count_varying} = parallel_vary [axis_name="x"] %9
+                            %11:{extent_local} = reshape [shape=[1], output_sharding={varying}] %10
+                            %12:{n} = dimension_size [axis=0] %5
+                            %13:i64[] = dimension_to_scalar %12
+                            %14:{count_replicated} = broadcast [output_type={count_replicated}, output_axes=[]] %13
+                            %15:{count_varying} = parallel_vary [axis_name="x"] %14
+                            %16:{extent_local} = reshape [shape=[1], output_sharding={varying}] %15
+                        in (%6, %11, %16)
+                    }},
+                ]
+                in (%2, %3, %4)"#},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{four_global}, %1:{extents_global}, %2:{extents_global} .
+                let %3:{four_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{four_global}, {extents_global}, {extents_global}],
+                    global_output_types=[{four_global}],
+                ] %0 %1 %2 [
+                    body={{
+                        lambda %0:{two_local}, %1:{extent_local}, %2:{extent_local} .
+                        let %3:{count_varying} = reshape [shape=[], output_sharding={scalar_varying}] %1
+                            %4:{n} = dimension_from_scalar [bounds=[0, 5)] %3
+                            %5:{n_local} = cast [
+                                type={n_local},
+                                inputs=[{two_local}, {n}],
+                            ] %0 %4
+                            %6:{n_local} = add %5 %5
+                            %7:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}, {n}],
+                            ] %6 %4
+                        in (%7)
+                    }},
+                ]
+                in (%3)"},
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            formatdoc! {"
+                lambda %0:{four_global}, %1:{extents_global}, %2:{extents_global} .
+                let %3:{four_global} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{four_global}, {extents_global}, {extents_global}],
+                    global_output_types=[{four_global}],
+                ] %0 %1 %2 [
+                    body={{
+                        lambda %0:{two_local}, %1:{extent_local}, %2:{extent_local} .
+                        let %3:{count_varying} = reshape [shape=[], output_sharding={scalar_varying}] %1
+                            %4:{n} = dimension_from_scalar [bounds=[0, 5)] %3
+                            %5:{n_local} = cast [
+                                type={n_local},
+                                inputs=[{two_local}, {n}],
+                            ] %0 %4
+                            %6:{n_local} = add %5 %5
+                            %7:{two_local} = cast [
+                                type={two_local},
+                                inputs=[{n_local}, {n}],
+                            ] %6 %4
+                        in (%7)
+                    }},
+                ]
+                in (%3)"},
+        );
+        let mut outputs = linearization.primal().interpret(vec![a, x]).unwrap();
+        let residuals = outputs.split_off(1);
+        assert_eq!(outputs, vec![value(output_type, &[2.0, 4.0, 6.0, 8.0])]);
+        let mut tangent_inputs = vec![tangent];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![value(output_type, &[10.0, 12.0, 14.0, 16.0])]),
+        );
+        let mut pullback_inputs = vec![value(output_type, &[1.0, 2.0, 3.0, 4.0])];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![value(&input_types[1], &[2.0, 4.0, 6.0, 8.0])]));
     }
 
     #[test]

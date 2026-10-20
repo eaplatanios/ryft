@@ -3123,7 +3123,8 @@ mod tests {
             linearization.tangent().transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "cannot transpose a checked `cast` without the primal value its check needs; \
-                               linearize the program first",
+                               linearize the program first, or use `cast_unchecked` with witnesses for a tangent \
+                               that an earlier check already proved",
         ));
     }
 

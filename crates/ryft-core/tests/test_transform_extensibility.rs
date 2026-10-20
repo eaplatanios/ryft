@@ -227,7 +227,11 @@ fn test_external_cast_type_owns_inference() {
         }
     }
 
+    // The family has no identities and so no operation that reads one, so it names the cast itself, whose conversion
+    // every operation family that differentiates its casts already provides, and keeps the default selector.
     impl CastType for ExternalCastType {
+        type IdentityWitnessOperation = CastOperation<Self>;
+
         fn infer_cast_output_type(
             operation: &CastOperation<Self>,
             input_types: &[Self],

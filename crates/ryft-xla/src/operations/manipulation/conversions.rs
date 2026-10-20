@@ -1634,23 +1634,21 @@ mod tests {
                     inputs=[{declared}],
                     checked=true,
                 ] %0
-                    %3:{input} = cast [
-                        type={input},
-                        inputs=[{input}, {output}],
-                    ] %0 %2
+                    %3:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %0
                     %4:{output} = cast [
                         type={output},
-                        inputs=[{input}, {input}],
-                    ] %1 %3
+                        inputs=[{input}, dimension<n ∈ [1, 5)>, {output}],
+                    ] %1 %3 %2
                 in (%2, %4)"},
         );
+
         // Distinct explicit shardings on one device exercise representation changes without moving physical buffers.
         // The tangent conversion must remain behind the primal shape check.
         let client = execution_client();
         let primal = MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]);
         let tangent = MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]);
         assert_eq!(
-            execute_mixed_program(&client, &jvp, &[primal.clone(), tangent], &[2, 2]),
+            execute_mixed_program(&client, &jvp, &[primal, tangent], &[2, 2]),
             Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0], vec![2])]),
         );
         let wrong = MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]);
@@ -1664,15 +1662,20 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             formatdoc! {"
-                lambda %0:{output}, %1:{input} .
+                lambda %0:{output}, %1:dimension<n ∈ [1, 5)> .
                 let %2:{input} = cast [
                     type={input},
-                    inputs=[{output}, {input}],
+                    inputs=[{output}, dimension<n ∈ [1, 5)>],
                 ] %0 %1
                 in (%2)"},
         );
         assert_eq!(
-            execute_mixed_program(&client, &pullback, &[MixedValue::Array(vec![5.0, 6.0], vec![2]), primal], &[2],),
+            execute_mixed_program(
+                &client,
+                &pullback,
+                &[MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)],
+                &[],
+            ),
             Ok(vec![MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
         );
     }
@@ -1714,8 +1717,9 @@ mod tests {
         assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
 
         // The forward-mode derivative retains the guard on the primal inputs and converts each tangent to the type of
-        // its guarded primal with a `cast` that the primals witness. The bounded dynamic tangent is narrowed to the
-        // static extent, which slices its physical buffer.
+        // its guarded primal with a `cast` that the guarded primal witnesses. The bounded dynamic tangent is narrowed
+        // to the static extent, which slices its physical buffer, and its cast is also witnessed by the extent `n` read
+        // from the primal input, which the pullback needs to restore that extent.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -1723,8 +1727,8 @@ mod tests {
                 lambda %0:f64[2], %1:f64[n], %2:f64[2], %3:f64[n] .
                 let %4:f64[2], %5:f64[2] = guard [boundary=\"region\", declared_types=[f64[n], f64[n]]] %0 %1
                     %6:f64[2] = cast [type=f64[2], inputs=[f64[2], f64[2]]] %2 %4
-                    %7:f64[n] = cast [type=f64[n], inputs=[f64[n], f64[2]]] %1 %5
-                    %8:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %3 %7
+                    %7:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %1
+                    %8:f64[2] = cast [type=f64[2], inputs=[f64[n], dimension<n ∈ [1, 5)>, f64[2]]] %3 %7 %5
                     %9:f64[2] = add %4 %5
                     %10:f64[2] = add %6 %8
                 in (%9, %10)"},
@@ -1742,21 +1746,21 @@ mod tests {
         );
 
         // The pullback widens the static cotangent back to the bounded dynamic input with a `cast` that the residual
-        // primal input witnesses, which pads its physical buffer and restores the logical extent.
+        // extent `n` witnesses, which pads its physical buffer and restores the logical extent.
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f64[2], %1:f64[n] .
-                let %2:f64[n] = cast [type=f64[n], inputs=[f64[2], f64[n]]] %0 %1
+                lambda %0:f64[2], %1:dimension<n ∈ [1, 5)> .
+                let %2:f64[n] = cast [type=f64[n], inputs=[f64[2], dimension<n ∈ [1, 5)>]] %0 %1
                 in (%0, %2)"},
         );
         assert_eq!(
             execute_mixed_program(
                 &client,
                 &pullback,
-                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), inputs[1].clone()],
-                &[2],
+                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
+                &[],
             ),
             Ok(vec![
                 MixedValue::Array(vec![1.0, 2.0], vec![2]),

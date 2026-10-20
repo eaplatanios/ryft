@@ -5567,10 +5567,9 @@ mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation,
-        ConvertElementTypeOperation, DivOperation, ElementwiseOperation, ExpOperation, GuardOperation, MulOperation,
-        Neg, NegOperation, ParallelVaryOperation, Reduce, ReductionKind, SinOperation, Sub, SubOperation,
-        TransposeOperation, ZeroLikeOperation, ZeroOperation,
+        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, DivOperation,
+        ElementwiseOperation, ExpOperation, GuardOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation,
+        Reduce, ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{
@@ -5616,18 +5615,6 @@ mod tests {
 
     impl From<ZeroOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
         fn from(_operation: ZeroOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<ZeroLikeOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: ZeroLikeOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<ConvertElementTypeOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: ConvertElementTypeOperation<ArrayType>) -> Self {
             Self::new()
         }
     }
@@ -5691,18 +5678,6 @@ mod tests {
 
     impl From<ZeroOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
         fn from(_operation: ZeroOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<ZeroLikeOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: ZeroLikeOperation<ArrayType>) -> Self {
-            Self::new()
-        }
-    }
-
-    impl From<ConvertElementTypeOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: ConvertElementTypeOperation<ArrayType>) -> Self {
             Self::new()
         }
     }
