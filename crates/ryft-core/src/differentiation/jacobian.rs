@@ -4,12 +4,12 @@ use ryft_macros::Parameterized;
 
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
-use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation};
+use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation, TransposedProgramCotangent};
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ZeroOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -453,11 +453,8 @@ where
     JacobianMode::Reverse.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
 
-    // Validate the input coordinate spaces before deriving the pullback, so a non-finite input coordinate space
-    // reports its input role instead of the type-identity-dependent nullary-constructor error that materializing a zero
-    // input cotangent during the pullback trace would otherwise raise first. This pre-validation remains necessary
-    // while pullback tracing can materialize a dynamic nullary cotangent before reporting that the corresponding
-    // coordinate space is non-finite. A future input-relative zero operation may make it redundant.
+    // Dense Jacobians enumerate every input coordinate, including disconnected inputs. Validate those coordinate
+    // spaces before tracing the pullback so unsupported dynamic inputs report their original boundary role.
     coordinate_prefix_offsets::<C, _>(
         &input_types,
         DerivativeTransform::JacobianReverse,
@@ -502,7 +499,7 @@ where
     // The reverse Jacobian materializes returned cotangents only, so it takes the reference-free, all-`Return`
     // transposition of the retained linear program.
     let (transposed, residuals) = pullback.into_transposed_parts()?;
-    let program = transposed.into_program();
+    let program = transposed.program();
     let program_input_types = program.input_types();
     let cotangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(
@@ -551,7 +548,42 @@ where
     // contains that input parameter's sensitivities to every flattened output coordinate.
     let packed_outputs =
         C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
-    check_count!("output", packed_outputs, input_types.parameter_count(), ProgramError);
+    check_count!("output", packed_outputs, program.output_ids().len(), ProgramError);
+    if transposed.cotangents().len() != input_types.parameter_count() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "reverse Jacobian pullback has {} cotangent slots for {} input leaves",
+            transposed.cotangents().len(),
+            input_types.parameter_count(),
+        ))
+        .into());
+    }
+
+    let mut outputs = packed_outputs.into_iter();
+    let packed_outputs = transposed
+        .cotangents()
+        .iter()
+        .zip(input_types.parameters())
+        .map(|(slot, input_type)| {
+            match slot {
+                TransposedProgramCotangent::Output => Ok(outputs.next().unwrap()),
+                TransposedProgramCotangent::Zero => {
+                    // Dense coordinate spaces were validated above, so a type-only zero is sufficient. Sharing it
+                    // across packed directions avoids materializing a zero in the compact pullback program.
+                    let mut zero = context.bind(
+                        C::Operation::provide(ZeroOperation::new(input_type.cotangent()?), &[])?,
+                        Vec::new(),
+                        &[],
+                    )?;
+                    check_count!("output", zero, 1, ProgramError);
+                    Ok(C::Type::replicated(zero.remove(0)))
+                }
+                TransposedProgramCotangent::Absent => Err(ProgramError::MalformedProgram(
+                    "reverse Jacobian pullback omitted a returned cotangent".to_string(),
+                )
+                .into()),
+            }
+        })
+        .collect::<Result<Vec<_>, DifferentiationError>>()?;
 
     // Slice each packed input sensitivity by output-coordinate range and orient it as an output/input block.
     // The loop order restores the same output-major/input-minor representation produced by forward mode.
@@ -1020,6 +1052,23 @@ mod tests {
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(4.0, 2.0)]),
         );
+    }
+
+    #[test]
+    fn test_jacobian_reverse_disconnected_inputs() {
+        let jacobian = differentiate_at((Array::vector(vec![1f64, 2.0]).unwrap(), Array::scalar(3f64).unwrap()))
+            .jacobian_reverse(|(_, live)| Ok(live))
+            .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value(), &Array::vector(vec![0f64, 0.0]).unwrap());
+        assert_eq!(blocks[1].value(), &Array::scalar(1f64).unwrap());
+
+        // All cotangents can be structural zeros: dense block construction still creates the complete input tree.
+        let jacobian = differentiate_at(Array::vector(vec![1f64, 2.0]).unwrap())
+            .jacobian_reverse(|input| input.context().lift(Array::scalar(7f64).unwrap()))
+            .unwrap();
+        assert_eq!(jacobian.values(), &[Array::vector(vec![0f64, 0.0]).unwrap()]);
     }
 
     #[test]

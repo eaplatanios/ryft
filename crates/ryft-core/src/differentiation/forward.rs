@@ -10,8 +10,7 @@ use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, Stag
 use crate::differentiation::reverse::{TransposableOperation, TransposedProgram};
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
-    ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole,
-    capture_and_validate_zero_residual_values,
+    ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, capture_and_validate_zero_residual_values,
 };
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::macros::check_count;
@@ -246,11 +245,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// errors. [`Program::linearize`] is the function that typically calls this function and constructs
     /// [`Linearization`]s.
     ///
-    /// Note that the stability of the tangent program's boundary liveness is load-bearing beyond construction.
-    /// Transposition recovers the residual partition and each disconnected input's residual mapping by *recomputing*
-    /// which tangent inputs are live from the stored program, rather than storing that partition here. Any pass that
-    /// rewrites the tangent program between linearization and transposition must therefore preserve its input liveness
-    /// exactly, or the pairing degrades to the residual-count check and typed extent-mismatch errors.
+    /// Residuals carry values used by the tangent computation, including allocation shapes needed by reference
+    /// transposition. Disconnected input cotangents remain structural zeros at the pullback boundary and need no
+    /// additional residuals. The trailing residual count therefore determines the transposition boundary directly.
     ///
     /// # Parameters
     ///
@@ -449,18 +446,18 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// sub-programs. Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured
     /// factor (e.g., folding a scalar `Mul` against a known input into a multiply-by-a-captured-constant) by folding
     /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `O`
-    /// and transposes it through [`RegionRef::transpose_shared`], using the retained dimension inputs needed for
-    /// disconnected cotangent zeros. The tangent sub-program's inputs are `(ẋ, r)`, so it is transposed with respect
-    /// to the leading tangent inputs `ẋ` while the trailing [`residual_count`](Self::residual_count) residual inputs
-    /// are held as known parameters. Partition-aware transposition then threads each known residual through to the
-    /// pullback as a pullback input (consumed by the adjoint operation that the bilinear operation's transpose rule
-    /// stages), rather than folding it into a captured factor, so the returned pullback program stays over the primal
-    /// operation family `O` and produces the cotangents of the linear tangent inputs only, in the selected input order
-    /// used to construct this linearization.
+    /// and transposes it through [`RegionRef::transpose_shared`]. The tangent sub-program's inputs are `(ẋ, r)`, so it
+    /// is transposed with respect to the leading tangent inputs `ẋ` while the trailing
+    /// [`residual_count`](Self::residual_count) residual inputs are held as known parameters. Transposition threads
+    /// each known residual through to the pullback as a pullback input (consumed by the adjoint operation that its
+    /// transpose rule stages), rather than folding it into a captured factor, so the returned pullback program stays
+    /// over the primal operation family `O` and produces the cotangents of the linear tangent inputs only, in the
+    /// selected input order used to construct this linearization.
     ///
     /// The returned [`TransposedProgram`] contains the shared pullback program and metadata describing each selected
-    /// input cotangent. Structural zeros are instantiated into concrete program outputs. Transposition is served from
-    /// the tangent region's retained transform cache; repeated calls share its program without cloning the program.
+    /// input cotangent. Structural zeros have no executable output and remain in the metadata. Transposition is served
+    /// from the tangent region's retained transform cache; repeated calls share its program without cloning the
+    /// program.
     #[inline]
     pub fn pullback(&self) -> Result<TransposedProgram<V, O>, DifferentiationError>
     where
@@ -2620,36 +2617,32 @@ where
         }
 
         // Reference transposition can need the full allocation shape even when a live tangent or its output describes
-        // only a view. Retain dimensions of ordinary primal inputs without introducing reference reads. Without
-        // reference state, only disconnected tangent inputs require additional zero-construction residuals.
+        // only a view. Retain dimensions of ordinary primal inputs without introducing reference reads. Reference-free
+        // programs return disconnected cotangents structurally and need no additional residuals.
         let has_references = tangent_program.entry_region_ref().contains_references_in_closure();
-
-        // Deferred work can consume a tangent without returning its cotangent. Retained extents must therefore follow
-        // output liveness, matching the trailing-residual mapping recovered during transposition.
-        let tangent_live_sets = tangent_program.live_sets();
-        let differentiable_primal_inputs = arguments
-            .input_indices
-            .iter()
-            .map(|&index| (&self.atoms()[self.input_ids()[index].index()], primal_input_atoms[index]));
         let mut zero_residual_types = Vec::new();
-        for (((input, primal_input), tangent_input), tangent_input_atom) in differentiable_primal_inputs
-            .zip(tangent_program.inputs().take(tangent_input_count))
-            .zip(tangent_program.input_ids().iter().copied().take(tangent_input_count))
-        {
-            let tangent_type = tangent_input.r#type().into_owned();
-            if tangent_type.is_reference() || (!has_references && tangent_live_sets.atoms()[tangent_input_atom.index()])
+        if has_references {
+            let differentiable_primal_inputs = arguments
+                .input_indices
+                .iter()
+                .map(|&index| (&self.atoms()[self.input_ids()[index].index()], primal_input_atoms[index]));
+            for ((input, primal_input), tangent_input) in
+                differentiable_primal_inputs.zip(tangent_program.inputs().take(tangent_input_count))
             {
-                continue;
+                let tangent_type = tangent_input.r#type().into_owned();
+                if tangent_type.is_reference() {
+                    continue;
+                }
+                let expected_types = O::zero_residual_types(&tangent_type);
+                let residuals = capture_and_validate_zero_residual_atoms(
+                    &mut primal_builder.borrow_mut(),
+                    primal_input,
+                    &tangent_type,
+                    &format!("transposition allocation shape for input type {}", input.r#type()),
+                )?;
+                residual_output_atoms.extend(residuals);
+                zero_residual_types.extend(expected_types);
             }
-            let expected_types = O::zero_residual_types(&tangent_type);
-            let residuals = capture_and_validate_zero_residual_atoms(
-                &mut primal_builder.borrow_mut(),
-                primal_input,
-                &tangent_type,
-                &format!("transposition zero for input type {}", input.r#type()),
-            )?;
-            residual_output_atoms.extend(residuals);
-            zero_residual_types.extend(expected_types);
         }
 
         if !zero_residual_types.is_empty() {
@@ -3248,12 +3241,8 @@ where
         primal_outputs.push(primal);
         tangent_outputs.push(tangent);
     }
-    let tangent_reconstruction = ZeroSpaceBoundaryReconstruction::capture(
-        context,
-        primal_outputs.as_slice(),
-        output_types.as_slice(),
-        ZeroSpaceBoundaryRole::OutputTangent,
-    )?;
+    let tangent_reconstruction =
+        ZeroSpaceBoundaryReconstruction::capture(context, primal_outputs.as_slice(), output_types.as_slice())?;
     let output = Output::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
     // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
@@ -3289,36 +3278,31 @@ where
 
     // Preserve allocation shapes for reference adjoints, including live inputs whose outputs describe only a view.
     // Only ordinary inputs supply these extra dimensions as reading a primal reference solely for its extents could
-    // move a synchronization or lifecycle error ahead of the original computation. For reference-free programs,
-    // disconnected tangent inputs alone require extra extents for their zeros.
+    // move a synchronization or lifecycle error ahead of the original computation. Reference-free programs leave
+    // disconnected cotangents structural at the pullback boundary.
     let mut program = evaluation.program;
     let has_references = program.entry_region_ref().contains_references_in_closure();
-
-    // A tangent retained only by deferred work can still receive a structural-zero cotangent. Keep its extents using
-    // output liveness, matching transposition's reconstruction of the trailing residual boundary.
-    let live_sets = program.live_sets();
-    let differentiable_primal_inputs = input_values
-        .iter()
-        .map(|value| Ok((value.r#type().tangent()?, value)))
-        .collect::<Result<Vec<_>, DifferentiationError>>()?
-        .into_iter()
-        .filter_map(|(tangent_type, value)| (!tangent_type.is_zero_space()).then_some(value));
     let mut zero_residuals = Vec::new();
-    for ((primal, tangent_input), tangent_input_atom) in differentiable_primal_inputs
-        .zip(program.inputs().take(tangent_input_count))
-        .zip(program.input_ids().iter().copied().take(tangent_input_count))
-    {
-        let tangent_type = tangent_input.r#type().into_owned();
-        if tangent_type.is_reference() || (!has_references && live_sets.atoms()[tangent_input_atom.index()]) {
-            continue;
+    if has_references {
+        let differentiable_primal_inputs = input_values
+            .iter()
+            .map(|value| Ok((value.r#type().tangent()?, value)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
+            .filter_map(|(tangent_type, value)| (!tangent_type.is_zero_space()).then_some(value));
+        for (primal, tangent_input) in differentiable_primal_inputs.zip(program.inputs().take(tangent_input_count)) {
+            let tangent_type = tangent_input.r#type().into_owned();
+            if tangent_type.is_reference() {
+                continue;
+            }
+            let values = capture_and_validate_zero_residual_values(
+                context,
+                primal,
+                &tangent_type,
+                &format!("transposition allocation shape for input type {}", primal.r#type()),
+            )?;
+            zero_residuals.extend(values);
         }
-        let values = capture_and_validate_zero_residual_values(
-            context,
-            primal,
-            &tangent_type,
-            &format!("transposition zero for input type {}", primal.r#type()),
-        )?;
-        zero_residuals.extend(values);
     }
 
     if !zero_residuals.is_empty() {
@@ -3597,14 +3581,17 @@ pub(crate) mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
-    use crate::differentiation::reverse::{CotangentDestinationKind, ReverseModeDifferentiate};
+    use crate::differentiation::reverse::{
+        CotangentDestinationKind, ReverseModeDifferentiate, TransposedProgramCotangent,
+    };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::{impl_guardless_operation, impl_non_transposable_operation};
     use crate::operations::{
         AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, LinearCallOperation, Mul,
-        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient, StopGradientOperation, ZeroOperation,
+        MulOperation, NegOperation, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient,
+        StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -4295,12 +4282,7 @@ pub(crate) mod tests {
         let context = EagerContext::new();
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
         let output_types = outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
-            &context,
-            outputs,
-            &output_types,
-            ZeroSpaceBoundaryRole::OutputTangent,
-        )?;
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(&context, outputs, &output_types)?;
         let references = ReferenceBoundary::new_for_differentiation(&context, inputs, &[], &[])?;
         Pushforward::new(
             context,
@@ -4539,18 +4521,18 @@ pub(crate) mod tests {
         let transposed = linearization.pullback().unwrap();
         let repeated = linearization.pullback().unwrap();
         assert!(Arc::ptr_eq(transposed.program(), repeated.program()));
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output],);
         assert_eq!(
             transposed.program().to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = zero [type=f64[]]
-                in (%1, %0)
+                in (%0)
             "}
             .trim_end(),
         );
         assert_eq!(
             transposed.program().interpret(vec![Array::scalar(3f64).unwrap()]),
-            Ok(vec![Array::scalar(0f64).unwrap(), Array::scalar(3f64).unwrap()]),
+            Ok(vec![Array::scalar(3f64).unwrap()]),
         );
         assert!(Arc::ptr_eq(&transposed.into_program(), repeated.program()));
     }
@@ -4882,8 +4864,14 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(output, Array::scalar(27f64).unwrap());
         assert_eq!(pullback.residuals(), &[Array::scalar(3f64).unwrap()]);
-        assert_eq!(pullback.apply(Array::scalar(2f64).unwrap()).unwrap(), Array::scalar(54f64).unwrap());
-        assert_eq!(pullback.apply(Array::scalar(4f64).unwrap()).unwrap(), Array::scalar(108f64).unwrap());
+        assert_eq!(
+            pullback.apply(Array::scalar(2f64).unwrap()).unwrap(),
+            MaybeZero::Value(Array::scalar(54f64).unwrap())
+        );
+        assert_eq!(
+            pullback.apply(Array::scalar(4f64).unwrap()).unwrap(),
+            MaybeZero::Value(Array::scalar(108f64).unwrap())
+        );
     }
 
     #[test]
@@ -5155,7 +5143,7 @@ pub(crate) mod tests {
 
         // Reverse differentiates the forward rule's coefficient: `d(3x² * 2)/dx = 12x`.
         assert_eq!(tangent, Array::scalar(54f64).unwrap());
-        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(Array::scalar(36f64).unwrap()));
+        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(MaybeZero::Value(Array::scalar(36f64).unwrap())));
     }
 
     #[test]
@@ -5175,7 +5163,7 @@ pub(crate) mod tests {
                         input,
                         (),
                     )?;
-                    pullback.apply(context.lift(Array::scalar(1f64).unwrap())?)
+                    pullback.apply_materialized(context.lift(Array::scalar(1f64).unwrap())?)
                 },
                 Array::scalar(3f64).unwrap(),
                 Array::scalar(1f64).unwrap(),
@@ -5205,14 +5193,14 @@ pub(crate) mod tests {
                         input,
                         (),
                     )?;
-                    pullback.apply(context.lift(Array::scalar(1f64).unwrap())?)
+                    pullback.apply_materialized(context.lift(Array::scalar(1f64).unwrap())?)
                 },
                 Array::scalar(3f64).unwrap(),
                 (),
             )
             .unwrap();
         assert_eq!(gradient, Array::scalar(27f64).unwrap());
-        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(Array::scalar(18f64).unwrap()));
+        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(MaybeZero::Value(Array::scalar(18f64).unwrap())));
     }
 
     #[test]
@@ -5248,7 +5236,10 @@ pub(crate) mod tests {
         assert_eq!(output, vec![Array::vector(vec![27f64, 128f64]).unwrap()]);
         assert_eq!(
             pullback.apply(vec![ones]),
-            Ok((Array::vector(vec![27f64, 64f64]).unwrap(), Array::vector(vec![27f64, 96f64]).unwrap())),
+            Ok((
+                MaybeZero::Value(Array::vector(vec![27f64, 64f64]).unwrap()),
+                MaybeZero::Value(Array::vector(vec![27f64, 96f64]).unwrap()),
+            )),
         );
 
         // The rules save different residuals: the JVP rule saves both coefficients, while the reverse rule saves the
@@ -5316,7 +5307,7 @@ pub(crate) mod tests {
                         input,
                         (),
                     )?;
-                    pullback.apply(seed)
+                    pullback.apply_materialized(seed)
                 },
                 Array::scalar(3f64).unwrap(),
                 Array::scalar(1f64).unwrap(),
@@ -5339,14 +5330,14 @@ pub(crate) mod tests {
                         input,
                         (),
                     )?;
-                    pullback.apply(seed)
+                    pullback.apply_materialized(seed)
                 },
                 Array::scalar(3f64).unwrap(),
                 (),
             )
             .unwrap();
         assert_eq!(cotangent, Array::scalar(3f64).unwrap());
-        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(Array::scalar(3f64).unwrap()));
+        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(MaybeZero::Value(Array::scalar(3f64).unwrap())));
     }
 
     #[test]
@@ -5737,7 +5728,7 @@ pub(crate) mod tests {
                 })
                 .unwrap();
             let Value::Array(gradient) =
-                pullback.apply(Value::Array(Array::matrix(2, 3, vec![1.0; 6]).unwrap())).unwrap()
+                pullback.apply_materialized(Value::Array(Array::matrix(2, 3, vec![1.0; 6]).unwrap())).unwrap()
             else {
                 panic!("expected an array gradient");
             };
@@ -6228,7 +6219,7 @@ pub(crate) mod tests {
     fn test_region_linearize_retains_no_zero_residuals_for_write_only_tangent_references() {
         // `f(r, x) = { write(r, x); x }` stores into the reference without reading it back, so the tangent reference is
         // reached by no tangent output even though its state is live. A reference has no value cotangent to construct,
-        // so the dead-tangent-input residual pass skips it and nothing crosses as a residual.
+        // so allocation-shape capture skips it and nothing crosses as a residual.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(scalar_type.clone()).into());
@@ -6929,6 +6920,164 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_program_linearize_disconnected_symbolic_input() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(dynamic_type.clone());
+        let live = builder.add_input(scalar_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:f32[] .
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(linearization.tangent().to_string(), linearization.primal().to_string());
+        let transposed = linearization.pullback().unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.assemble_cotangents(&[dynamic_type, scalar_type], [Array::scalar(3f32).unwrap()]),
+            Ok(vec![
+                Some(MaybeZero::Zero(program.input_types()[0].cotangent().unwrap())),
+                Some(MaybeZero::Value(Array::scalar(3f32).unwrap())),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_program_linearize_disconnected_composite_symbolic_input() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(dynamic_type.into());
+        let live = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![live],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:f32[] .
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(linearization.tangent().to_string(), linearization.primal().to_string());
+        let transposed = linearization.pullback().unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_linearize_reference_shape_residual_after_disconnected_input() {
+        let dead_extent = DimensionVariable::new("dead", DimensionBounds::new(2, Some(8)).unwrap());
+        let live_extent = DimensionVariable::new("live", DimensionBounds::new(2, Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![dead_extent.into()])).into());
+        let live = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![live_extent.into()])).into());
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![live], None).unwrap()[0];
+        let contents =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum)),
+                Vec::new(),
+                vec![contents],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 3);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[dead], %1:f32[live] .
+                let %2:ref<f32[live]> = reference_new %1
+                    %3:f32[live] = reference_read %2
+                    %4:f32[] = reduce [kind=sum, axes=[0]] %3
+                    %5:dimension<live ∈ [2, 8)> = dimension_size [axis=0] %3
+                    %6:dimension<dead ∈ [2, 8)> = dimension_size [axis=0] %0
+                    %7:dimension<live ∈ [2, 8)> = dimension_size [axis=0] %1
+                in (%4, %5, %6, %7)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[dead], %1:f32[live], %2:dimension<live ∈ [2, 8)>, \
+                    %3:dimension<dead ∈ [2, 8)>, %4:dimension<live ∈ [2, 8)> .
+                let %5:ref<f32[live]> = reference_new %1
+                    %6:f32[live] = reference_read %5
+                    %7:f32[] = linear_call [residual_count=1] %2 %6 [
+                        forward={
+                            lambda %0:dimension<live ∈ [2, 8)>, %1:f32[live] .
+                            let %2:f32[] = reduce [kind=sum, axes=[0]] %1
+                            in (%2)
+                        },
+                        transpose={
+                            lambda %0:dimension<live ∈ [2, 8)>, %1:f32[] .
+                            let %2:f32[live] = broadcast [output_axes=[]] %1 %0
+                            in (%2)
+                        },
+                    ]
+                in (%7)
+            "}
+            .trim_end(),
+        );
+        let primals = vec![
+            ArrayIrValue::Array(Array::vector(vec![4f32, 5.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![6f32, 7.0, 8.0]).unwrap()),
+        ];
+        let mut primal_outputs = linearization.primal().interpret(primals).unwrap();
+        assert_eq!(primal_outputs.remove(0), ArrayIrValue::Array(Array::scalar(21f32).unwrap()));
+        let transposed = linearization.pullback().unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        let mut inputs = vec![ArrayIrValue::Array(Array::scalar(2f32).unwrap())];
+        inputs.extend(primal_outputs);
+        assert_eq!(
+            transposed.program().interpret(inputs),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2f32; 3]).unwrap())]),
+        );
+    }
+
+    #[test]
     fn test_program_linearize_with_local_references() {
         // `f(x) = freeze(add_update(new(x), x)) = 2x` reads, modifies, and writes a local reference. Linearization
         // keeps the primal accesses in the primal program and stages the tangent accesses, over a tangent reference
@@ -7189,6 +7338,7 @@ pub(crate) mod tests {
             TestValue::Array(Array::scalar(2.0_f32).unwrap()),
             TestValue::Array(Array::scalar(7.0_f32).unwrap()),
         ];
+
         // The saved coefficient follows both known original outputs in the known program. Its residual feeder must
         // use that offset rather than mistake the known zero tangent for the coefficient.
         assert_eq!(
@@ -7199,6 +7349,7 @@ pub(crate) mod tests {
                 PartialEvaluationOutput::Known(1)
             ],
         );
+
         assert_eq!(
             partition.interpret_in_context(&context, &inputs, 1),
             Ok(vec![
@@ -7207,6 +7358,7 @@ pub(crate) mod tests {
                 TestValue::Array(Array::scalar(0.0_f32).unwrap()),
             ]),
         );
+
         assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32).unwrap()));
     }
 

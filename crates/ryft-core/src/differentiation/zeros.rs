@@ -1,8 +1,6 @@
-use std::fmt::Display;
 use std::ops::Range;
 
 use crate::contexts::Context;
-use crate::differentiation::DifferentiationError;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::{Zero, ZeroOperation};
@@ -15,8 +13,9 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///
 /// Structural zeros carry only their [`Type`] while they flow through differentiation and cross pullback boundaries.
 /// A disconnected input cotangent therefore needs no executable output or saved primal extent. The consumer that
-/// owns an extent source materializes it when a concrete value is required: scalar gradients use their primal input,
-/// and region boundaries use live cotangents or known dimensions when their signatures require concrete zeros.
+/// owns an extent source materializes it when a concrete value is required: pullbacks and scalar gradients use the
+/// primal inputs that the pullback retains, and region boundaries use live cotangents or known dimensions when their
+/// signatures require concrete zeros.
 ///
 /// Dynamic array types carry dimension identities and bounds, rather than defining runtime extents. Constructing a
 /// zero of such a type can therefore require explicit extent inputs. This trait declares those inputs and obtains
@@ -48,9 +47,9 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// zero.
 ///
 /// [`Self::materialize_zero_from_residual_sources`] performs these steps together from values already available to
-/// the consumer. A gradient supplies its primal leaf; region transposition may instead supply live sibling cotangents,
-/// known inputs, or first-class dimensions. Composite families can gather each required extent from a different
-/// source, including for cotangent representations whose complete type differs from the primal type.
+/// the consumer. A pullback supplies its retained primal leaf; region transposition may instead supply live sibling
+/// cotangents, known inputs, or first-class dimensions. Composite families can gather each required extent from a
+/// different source, including for cotangent representations whose complete type differs from the primal type.
 ///
 /// # Who Implements It
 ///
@@ -293,36 +292,9 @@ pub(crate) fn capture_and_validate_zero_residual_values<
     Ok(residuals)
 }
 
-/// Role of a differential boundary whose zero-space leaves are reconstructed by [`ZeroSpaceBoundaryReconstruction`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ZeroSpaceBoundaryRole {
-    /// Tangents of the primal output boundary, returned by a _pushforward_ function.
-    OutputTangent,
-}
-
-impl ZeroSpaceBoundaryRole {
-    /// Returns the differential [`Type`] represented by this [`ZeroSpaceBoundaryRole`] for `primal_type`.
-    #[inline]
-    fn differential_type<T: DifferentiableType>(self, primal_type: &T) -> Result<T, DifferentiationError> {
-        match self {
-            Self::OutputTangent => primal_type.tangent(),
-        }
-    }
-
-    /// Returns the concise description of this [`ZeroSpaceBoundaryRole`] to be used in diagnostics.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::OutputTangent => "output tangent boundary",
-        }
-    }
-}
-
-impl Display for ZeroSpaceBoundaryRole {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+/// Diagnostic name of the differential boundary reconstructed by [`ZeroSpaceBoundaryReconstruction`]
+/// (i.e., the tangents of the primal output boundary, returned by a _pushforward_ function).
+const OUTPUT_TANGENT_BOUNDARY: &str = "output tangent boundary";
 
 /// Reconstruction metadata for one zero-space leaf omitted from a compact derivative boundary.
 /// This is only used as part of [`ZeroSpaceBoundaryReconstruction`].
@@ -358,12 +330,9 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
 /// These are **boundary reconstruction residuals**, not ordinary executable-program residuals. They are retained beside
 /// the reusable derivative callable and are consumed only while restoring its public boundary. They never become
 /// otherwise-unused inputs of the derivative program. The wrapper retains the boundary size, the position and type of
-/// every omitted zero, and the range of residuals that reconstructs it. The tangent/cotangent mapping and primal
-/// boundary are therefore consumed exactly once during capture and cannot be changed later during reconstruction.
+/// every omitted zero, and the range of residuals that reconstructs it. The tangent mapping and primal boundary are
+/// therefore consumed exactly once during capture and cannot be changed later during reconstruction.
 pub(crate) struct ZeroSpaceBoundaryReconstruction<V: Value> {
-    /// Semantic role of the differential boundary reconstructed by this instance.
-    role: ZeroSpaceBoundaryRole,
-
     /// Residual values supplying runtime dimensions, flattened in zero-leaf and provider-declaration order.
     residuals: Vec<V>,
 
@@ -377,19 +346,18 @@ pub(crate) struct ZeroSpaceBoundaryReconstruction<V: Value> {
 impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// Captures the runtime dimensions and reconstruction plan for every zero-space leaf of one differential boundary.
     ///
-    /// For each primal leaf type `Tᵢ`, `role` determines the boundary type `D(Tᵢ)`. A nonzero-space `D(Tᵢ)` remains a
-    /// live input or output of the compact derivative program and needs no entry in the stored plan. For a zero-space
+    /// For each primal output leaf type `Tᵢ`, the boundary type is its tangent type `D(Tᵢ)`. A nonzero-space `D(Tᵢ)`
+    /// remains a live output of the compact derivative program and needs no entry in the stored plan. For a zero-space
     /// `D(Tᵢ)`, this function captures and validates the runtime values declared by
     /// [`ResidualZeroProvider::zero_residual_types`] from the corresponding primal value, then records the leaf index,
     /// differential type, and captured residual range. Reconstruction therefore never needs the primal boundary or
-    /// differential mapping again.
+    /// tangent mapping again.
     ///
     /// # Parameters
     ///
     ///   - `context`: Context in which the operation family reads runtime dimensions from the primal values.
     ///   - `primal_values`: Complete flattened primal boundary values in leaf order.
     ///   - `primal_types`: Complete flattened primal boundary types in the same order as `primal_values`.
-    ///   - `role`: Semantic boundary role that selects the tangent/cotangent mapping and identifies diagnostics.
     ///
     /// # Errors
     ///
@@ -401,12 +369,11 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         context: &C,
         primal_values: &[C::Value],
         primal_types: &[C::Type],
-        role: ZeroSpaceBoundaryRole,
     ) -> Result<Self, ProgramError> {
         if primal_values.len() != primal_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} has {} primal values but {} primal types",
-                role,
+                OUTPUT_TANGENT_BOUNDARY,
                 primal_values.len(),
                 primal_types.len(),
             )));
@@ -414,14 +381,14 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         let mut residuals = Vec::new();
         let mut zero_leaves = Vec::new();
         for (index, (value, primal_type)) in primal_values.iter().zip(primal_types).enumerate() {
-            let differential_type = role.differential_type(primal_type)?;
+            let differential_type = primal_type.tangent()?;
             if differential_type.is_zero_space() {
                 let residual_start = residuals.len();
                 residuals.extend(capture_and_validate_zero_residual_values(
                     context,
                     value,
                     &differential_type,
-                    role.as_str(),
+                    OUTPUT_TANGENT_BOUNDARY,
                 )?);
                 zero_leaves.push(ZeroSpaceBoundaryLeaf {
                     index,
@@ -430,7 +397,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
                 });
             }
         }
-        Ok(Self { role, residuals, boundary_size: primal_types.len(), zero_leaves })
+        Ok(Self { residuals, boundary_size: primal_types.len(), zero_leaves })
     }
 
     /// Rebuilds the complete differential boundary described by this instance, interleaving materialized zero-space
@@ -459,13 +426,14 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         let values = self.rebuild_with(context, &[], |_, zero| match zero {
             Some(zero) => Ok(zero),
             None => live_values.next().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("{} omitted a nonzero differential value", self.role))
+                ProgramError::MalformedProgram(format!(
+                    "{OUTPUT_TANGENT_BOUNDARY} omitted a nonzero differential value",
+                ))
             }),
         })?;
         if live_values.next().is_some() {
             return Err(ProgramError::MalformedProgram(format!(
-                "{} produced too many nonzero differential values",
-                self.role,
+                "{OUTPUT_TANGENT_BOUNDARY} produced too many nonzero differential values",
             )));
         }
         Ok(values)
@@ -734,13 +702,9 @@ mod tests {
 
         // Capture retains the key's dynamic extent and records that only the accumulator tangent remains live in the
         // compact output boundary. Rebuild must recover the omitted key tangent from that stored plan.
-        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
-            &context,
-            primal_values.as_slice(),
-            primal_types.as_slice(),
-            ZeroSpaceBoundaryRole::OutputTangent,
-        )
-        .unwrap();
+        let reconstruction =
+            ZeroSpaceBoundaryReconstruction::capture(&context, primal_values.as_slice(), primal_types.as_slice())
+                .unwrap();
         let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
         let key_tangent_type = ArrayIrType::Array(key_type.tangent().unwrap());
         assert_eq!(outputs.len(), 2);
@@ -767,13 +731,9 @@ mod tests {
             ArrayType::scalar(DataType::I32),
         ];
         let primal_values = primal_types.iter().map(|r#type| context.input(r#type.clone())).collect::<Vec<_>>();
-        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
-            &context,
-            primal_values.as_slice(),
-            primal_types.as_slice(),
-            ZeroSpaceBoundaryRole::OutputTangent,
-        )
-        .unwrap();
+        let reconstruction =
+            ZeroSpaceBoundaryReconstruction::capture(&context, primal_values.as_slice(), primal_types.as_slice())
+                .unwrap();
 
         // Each callback receives its original boundary index and only zero-space leaves carry a materialized value.
         let leaves = reconstruction
@@ -821,13 +781,11 @@ mod tests {
         let primal = Array::scalar(3.0).unwrap();
         let primal_type = ArrayType::scalar(DataType::F64);
 
-        // The output-tangent role retained during capture identifies a missing compact-program result without a
-        // caller-supplied diagnostic context.
+        // The reconstruction identifies a missing compact-program result without a caller-supplied diagnostic context.
         let output_tangent = ZeroSpaceBoundaryReconstruction::capture(
             &context,
             std::slice::from_ref(&primal),
             std::slice::from_ref(&primal_type),
-            ZeroSpaceBoundaryRole::OutputTangent,
         )
         .unwrap();
         assert_eq!(
@@ -837,7 +795,7 @@ mod tests {
             )),
         );
 
-        // The stored output-tangent role also identifies an excessive compact-program result.
+        // It also identifies an excessive compact-program result.
         assert_eq!(
             output_tangent.rebuild(&context, [Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()]),
             Err(ProgramError::MalformedProgram(
