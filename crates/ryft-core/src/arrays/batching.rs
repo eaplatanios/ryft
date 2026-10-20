@@ -5173,7 +5173,7 @@ pub(crate) mod tests {
             ArrayBatch::new(packed, Some(0)).unwrap().with_ragged_axes(vec![RaggedAxis::new(
                 0,
                 extents,
-                variable,
+                variable.clone(),
                 vec![0]
             )]),
             Err(BatchingError::InvalidBatchMetadata {
