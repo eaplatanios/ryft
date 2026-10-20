@@ -31,8 +31,9 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// [`Operation`] that reshards its input to a target [`Sharding`]. This operation is the Ryft analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html). The array's elements, shape, and data
 /// type are unchanged, and the output type carries the target sharding in place of the input's, extended with the
-/// manual variation and reduction facts of its input. The target may only name [`MeshAxisType::Explicit`] mesh axes.
-/// Placement over [`MeshAxisType::Auto`] axes belongs to backend compilers and can be constrained using
+/// manual variation and reduction facts of its input, so the target mesh must define each of those manual axes with
+/// the same size and type. The target may only name [`MeshAxisType::Explicit`] mesh axes. Placement over
+/// [`MeshAxisType::Auto`] axes belongs to backend compilers and can be constrained using
 /// [`ConstrainShardingOperation`]s while transitions over [`MeshAxisType::Manual`] axes require their corresponding
 /// collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
@@ -127,14 +128,10 @@ impl Operation for ReshardOperation {
             )));
         }
 
-        // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
-        // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
-        let input_sharding = input.sharding();
-
         // The preserved manual axes are carried onto the target by name, but the size and type of a mesh axis are
         // semantic. The target mesh must therefore define every one of them identically, whereas it may still add
         // or drop other axes.
-        if let Some(input_sharding) = input_sharding {
+        if let Some(input_sharding) = input.sharding() {
             let input_mesh = input_sharding.mesh();
             let target_mesh = self.sharding.mesh();
             let preserved_axes = input_sharding
@@ -157,6 +154,9 @@ impl Operation for ReshardOperation {
             }
         }
 
+        // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
+        // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
+        let input_sharding = input.sharding();
         let manual_unreduced = input_sharding
             .into_iter()
             .flat_map(|sharding| {
@@ -565,6 +565,63 @@ mod tests {
                 &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_reshard_type_inference_mesh_axis_definitions() {
+        // Manual axes that the output carries forward keep their mesh axis definitions (size and type) in the target
+        // mesh, whose names alone would otherwise silently redefine them, whereas the target mesh may still add
+        // unrelated explicit axes.
+        let manual_mesh = |size: usize| {
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", size, MeshAxisType::Manual).unwrap(),
+                MeshAxis::new("e", 2, MeshAxisType::Explicit).unwrap(),
+            ])
+            .unwrap()
+        };
+        let input_type = ArrayType::new_static(DataType::F32, [8]);
+        let varying_input_type = input_type
+            .clone()
+            .with_sharding(
+                Sharding::replicated(
+                    LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    1,
+                )
+                .with_varying_manual_axes(["x"])
+                .unwrap(),
+            )
+            .unwrap();
+        let unreduced_input_type = input_type
+            .clone()
+            .with_sharding(Sharding::replicated(manual_mesh(2), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let redefined_target = Sharding::new(manual_mesh(4), vec![ShardingDimension::sharded(["e"])]).unwrap();
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(redefined_target),
+            cases = [{
+                input_types = [varying_input_type.clone()],
+                error = format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot redefine preserved manual mesh axis `'x'=2:manual` as \
+                     `'x'=4:manual`",
+                ),
+            }, {
+                input_types = [unreduced_input_type],
+                error = format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot redefine preserved manual mesh axis `'x'=2:manual` as \
+                     `'x'=4:manual`",
+                ),
+            }],
+        );
+        let extended_target = Sharding::new(manual_mesh(2), vec![ShardingDimension::sharded(["e"])]).unwrap();
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(extended_target.clone()),
+            cases = [{
+                input_types = [varying_input_type],
+                output_types = [input_type
+                    .with_sharding(extended_target.with_varying_manual_axes(["x"]).unwrap())
+                    .unwrap()],
+            }],
         );
     }
 

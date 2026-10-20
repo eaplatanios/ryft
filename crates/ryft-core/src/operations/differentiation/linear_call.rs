@@ -297,15 +297,14 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
         check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
 
-        // Rebinding the call must reconcile type views that agree only for dense batches. For example, a ragged mapped
-        // input is packed at its declared bound, so its physical type strictly refines the logical boundary retained
-        // by the structurally batched regions, while `linear_call` inference requires its regions' boundaries to match
-        // the input types exactly. Both regions are therefore specialized to the packed input types (which is a
-        // no-op whenever the boundaries already agree, which is true for every dense batch), and the transpose's
-        // cotangent inputs derive from the specialized forward's physical outputs for the same reason. The bound call's
-        // results are plain values that cannot carry batch metadata, so each output carrier is restored through the
-        // driver from the source region's per-item logical output type and the input carriers; wrapping them as bare
-        // `P::batch` carriers would present bound padding as live data.
+        // Rebinding the call must reconcile the boundaries of the structurally batched regions with the packed input
+        // types, because `linear_call` inference requires its regions' boundaries to match the input types exactly.
+        // The two can differ even though every carrier here is dense: a region may retain a symbolic source extent
+        // (e.g., `f64[batch, n]`) that the packed inputs refine to a concrete one (e.g., `f64[batch, 3]`). Both regions
+        // are therefore specialized to the packed input types (which is a no-op whenever the boundaries already agree),
+        // and the transpose's cotangent inputs derive from the specialized forward's physical outputs for the same
+        // reason. The bound call's results are plain values that cannot carry batch metadata, so each output carrier is
+        // restored through the driver from the source region's per-item logical output type and the input carriers.
         let mut packed_inputs = P::boundary_inputs(context.axis_extent());
         let boundary_input_count = packed_inputs.len();
         packed_inputs.extend(input_values);
@@ -313,8 +312,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
 
         // Refine the logical boundary using the carriers' per-item types before restoring output metadata. For example,
         // a retained source extent `n` may now be 3 for every mapped item. Using the old `f64[n]` declaration with a
-        // concrete `f64[batch, 3]` result would incorrectly demand ragged extent metadata. Ragged carriers retain their
-        // symbolic per-item types here, so their metadata is still restored below.
+        // concrete `f64[batch, 3]` result would incorrectly demand ragged extent metadata. Ragged carriers were
+        // rejected above, so no input carries per-item extents that its packed value does not name.
         let logical_input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
         let forward_output_types = driver.region(0)?.to_program().specialize(&logical_input_types)?.output_types();
         let forward = forward.specialize(forward_input_types.as_slice())?;
