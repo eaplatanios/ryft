@@ -58,7 +58,7 @@ pub use collectives::{
     ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelPermute,
     ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelReduce,
     ParallelReduceOperation, ParallelSumScatter, ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation,
-    ShapeChangingCollectiveValue,
+    RaggedArrayExtentAggregationBatchingPolicy, ShapeChangingCollectiveValue,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use complex::{

@@ -3227,9 +3227,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<batch ∈ [0, 5)>, %1:bool[batch], %2:i32[batch] .
-                let %3:bool[batch] = broadcast [output_axes=[0]] %1 %0
-                    %4:i32[batch] = broadcast [output_axes=[0]] %2 %0
-                    () = assert [message=\"dimension\", labels=[\"size\", \"value\"], failure_limit=2] %3 %0 %4
+                let () = assert [message=\"dimension\", labels=[\"size\", \"value\"], failure_limit=2] %1 %0 %2
                 in ()"
             },
         );
@@ -3570,8 +3568,8 @@ mod tests {
     fn test_assert_batching_with_limit_manual_variation() {
         type ArrayTrace = TracingContext<Array, ArrayOperation<Array>>;
 
-        // Inside a manual region, each device records its own observations, so materializing an observation along
-        // the batch axis keeps its own manual variation rather than taking that of the condition.
+        // Inside a manual region, each device records its own observations, so an observation already laid out along
+        // the batch axis reaches the assertion with its own manual variation rather than taking that of the condition.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let condition_type = ArrayType::new_static(DataType::Boolean, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
@@ -3604,9 +3602,7 @@ mod tests {
             indoc! {"
                 lambda %0:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
                     %1:i32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                let %2:i32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast \
-                    [output_type=i32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %1
-                    () = assert [message=\"valid\", labels=[\"value\"], failure_limit=1] %0 %2
+                let () = assert [message=\"valid\", labels=[\"value\"], failure_limit=1] %0 %1
                 in ()"
             },
         );

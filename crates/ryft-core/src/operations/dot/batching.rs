@@ -131,8 +131,8 @@ where
         let contracting_axes = [dimensions.lhs_contracting_dimensions(), dimensions.rhs_contracting_dimensions()];
         let batching_axes = [dimensions.lhs_batching_dimensions(), dimensions.rhs_batching_dimensions()];
         // Equal dimension identities describe equal extents only at corresponding coordinates. Dot pairs its batch
-        // and contracting axes, while left and right free axes vary independently. Storage order does not matter,
-        // and a singleton extent array still ranges over the full domain of the data axis it indexes.
+        // and contracting axes, while left and right free axes vary independently. Storage order does not matter:
+        // carrier construction already guarantees one extent per coordinate of every data axis the extents index.
         let paired_axes = batching_axes[0]
             .iter()
             .zip(batching_axes[1])

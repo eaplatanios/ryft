@@ -1060,22 +1060,21 @@ fn test_dot_batching_contracts_matching_ragged_coordinates() -> Result<(), Progr
         vec![0],
         vec![1],
     ))));
-    // Singleton extent storage over the mapped axis is the same coordinate domain, with equal lengths in every
-    // mapped item. It may contract with the equivalent fully stored metadata on the other input.
-    let compact_left = left.clone().with_ragged_axes(vec![RaggedAxis::new(
+    // Extents that repeat across mapped items are still stored once per item, in each input's own storage order.
+    let repeated_left = left.clone().with_ragged_axes(vec![RaggedAxis::new(
         2,
         ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 3, 1, 3])?),
         length.clone(),
         vec![0, 1],
     )])?;
-    let compact_right = right.clone().with_ragged_axes(vec![RaggedAxis::new(
+    let repeated_right = right.clone().with_ragged_axes(vec![RaggedAxis::new(
         0,
-        ArrayIrValue::Array(Array::matrix(2, 1, vec![1i32, 3])?),
+        ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 1, 3, 3])?),
         length.clone(),
         vec![1, 2],
     )])?;
     for (inputs, expected) in
-        [([left, right], vec![2f32, 6.0, 4.0, 0.0]), ([compact_left, compact_right], vec![2f32, 6.0, 2.0, 6.0])]
+        [([left, right], vec![2f32, 6.0, 4.0, 0.0]), ([repeated_left, repeated_right], vec![2f32, 6.0, 2.0, 6.0])]
     {
         let (outputs, consumed) = operation.batch(&context, &EmptyRegionDriver, &inputs)?.into_parts();
         assert_eq!(
@@ -1134,7 +1133,7 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
         Array::from_elements::<f32>(plain_array(&[3, 2]), &(1..=6).map(|value| value as f32).collect::<Vec<_>>())
             .unwrap(),
     )
-    .with_ragged_axes(vec![RaggedAxis::new(0, extents, variable, vec![])])
+    .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(3_i32).unwrap(), variable, vec![])])
     .unwrap();
     assert_eq!(
         DotOperation::matmul()

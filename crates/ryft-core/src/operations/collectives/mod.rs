@@ -192,7 +192,9 @@ pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, Par
 pub use parallel_ragged_all_to_all::{
     PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
 };
-pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
+pub use parallel_reduce::{
+    PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation, RaggedArrayExtentAggregationBatchingPolicy,
+};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 
