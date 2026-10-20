@@ -3497,7 +3497,7 @@ mod tests {
             &self,
             _region: RegionRef<'_, Array, ArrayOperation<Array>>,
             _input_indices: &[usize],
-            _instantiate_zeros: &[bool],
+            _materialize_zeros: &[bool],
             _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<TransposedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
             Err(ProgramError::UnsupportedOperation {

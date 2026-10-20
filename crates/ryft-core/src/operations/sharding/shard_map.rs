@@ -5269,7 +5269,7 @@ mod tests {
             &self,
             region: RegionRef<'_, TestValue, TestOperation>,
             input_indices: &[usize],
-            _instantiate_zeros: &[bool],
+            _materialize_zeros: &[bool],
             destination_kinds: &[CotangentDestinationKind],
         ) -> Result<TransposedProgram<TestValue, TestOperation>, DifferentiationError> {
             let input_types = region.input_types();

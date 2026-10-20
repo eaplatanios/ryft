@@ -1920,7 +1920,7 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     ///   - `input_indices`: Unique indices of the region inputs to transpose with respect to, in the desired cotangent
     ///     order. Each index must be in range. Unselected inputs are known parameters of the linear map. An empty slice
     ///     selects no inputs. This is the same selection convention as [`RegionRef::transpose`].
-    ///   - `instantiate_zeros`: One flag per selected input, or empty to preserve every structural zero. A `true` flag
+    ///   - `materialize_zeros`: One flag per selected input, or empty to preserve every structural zero. A `true` flag
     ///     requires a disconnected returned cotangent to be materialized based on the region's available extent
     ///     sources.
     ///   - `destination_kinds`: One [`CotangentDestinationKind`] per selected input, in `input_indices` order, or empty
@@ -1932,7 +1932,7 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
         &self,
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
-        instantiate_zeros: &[bool],
+        materialize_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<V, O>, DifferentiationError>;
 
@@ -1954,7 +1954,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for Empty
         &self,
         _region: RegionRef<'_, V, O>,
         _input_indices: &[usize],
-        _instantiate_zeros: &[bool],
+        _materialize_zeros: &[bool],
         _destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot transpose a program".to_string()).into())
@@ -2025,10 +2025,10 @@ where
         &self,
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
-        instantiate_zeros: &[bool],
+        materialize_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
-        region.transpose_shared(input_indices, instantiate_zeros, destination_kinds)
+        region.transpose_shared(input_indices, materialize_zeros, destination_kinds)
     }
 
     #[inline]
@@ -2292,7 +2292,7 @@ where
     ///
     ///   - `input_indices`: Selected linear input indices, in requested cotangent order. Each index must be in range
     ///     and appear at most once. An empty slice selects no inputs.
-    ///   - `instantiate_zeros`: One flag per selected input, or empty to preserve every structural zero. A `true` flag
+    ///   - `materialize_zeros`: One flag per selected input, or empty to preserve every structural zero. A `true` flag
     ///     materializes a disconnected returned cotangent using known inputs and output-cotangent seeds that supply
     ///     its extents. A `false` flag records a structural zero without a program output. Flags do not affect ignored
     ///     destinations, reference destinations, or cotangents that already have values.
@@ -2303,13 +2303,13 @@ where
     pub fn transpose(
         &self,
         input_indices: &[usize],
-        instantiate_zeros: &[bool],
+        materialize_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         self.transpose_impl(&TranspositionTransformArguments::new(
             *self,
             input_indices,
-            instantiate_zeros,
+            materialize_zeros,
             destination_kinds,
         )?)
     }
@@ -2329,11 +2329,11 @@ where
     pub fn transpose_shared(
         &self,
         input_indices: &[usize],
-        instantiate_zeros: &[bool],
+        materialize_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         let arguments =
-            TranspositionTransformArguments::new(*self, input_indices, instantiate_zeros, destination_kinds)?;
+            TranspositionTransformArguments::new(*self, input_indices, materialize_zeros, destination_kinds)?;
         let artifact =
             (*self).transform::<TranspositionTransform, _, DifferentiationError>(arguments, |region, arguments| {
                 let program = region.transpose_impl(arguments)?;
@@ -2353,7 +2353,7 @@ where
         arguments: &TranspositionTransformArguments,
     ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         let input_indices = arguments.input_indices.as_slice();
-        let instantiate_zeros = arguments.instantiate_zeros.as_slice();
+        let materialize_zeros = arguments.materialize_zeros.as_slice();
         let destination_kinds = arguments.destination_kinds.as_slice();
 
         // Index the validated selection and its destination kinds by program input for linearity propagation and
@@ -3220,7 +3220,7 @@ where
                     outputs.push(adjoint.atom_id()?);
                     cotangents.push(TransposedProgramCotangent::Output);
                 }
-                MaybeZero::Zero(r#type) if instantiate_zeros[output_index] => {
+                MaybeZero::Zero(r#type) if materialize_zeros[output_index] => {
                     let zero = O::materialize_zero_from_residual_sources(
                         &*context,
                         MaybeZero::Zero(r#type),
@@ -4078,7 +4078,7 @@ struct TranspositionTransformArguments {
     input_indices: Vec<usize>,
 
     /// Whether each selected input needs a concrete zero at the executable boundary.
-    instantiate_zeros: Vec<bool>,
+    materialize_zeros: Vec<bool>,
 
     /// Resolved cotangent [`CotangentDestinationKind`] of every selected input, aligned with `input_indices`.
     destination_kinds: Vec<CotangentDestinationKind>,
@@ -4086,20 +4086,20 @@ struct TranspositionTransformArguments {
 
 impl TranspositionTransformArguments {
     /// Creates a new [`TranspositionTransformArguments`] instance by validating the selected inputs and mask counts
-    /// and resolving default destination kinds and zero-instantiation flags before cache lookup. Input order and the
+    /// and resolving default destination kinds and zero-materialization flags before cache lookup. Input order and the
     /// normalized mask determine the executable output boundary and the structural cotangent metadata.
     fn new<V: Value, O: Operation<Type = V::Type>>(
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
-        instantiate_zeros: &[bool],
+        materialize_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<Self, DifferentiationError> {
-        // A nonempty mask follows selected-input order; empty means that no zero is instantiated.
-        if !instantiate_zeros.is_empty() && instantiate_zeros.len() != input_indices.len() {
+        // A nonempty mask follows selected-input order; empty means that no zero is materialized.
+        if !materialize_zeros.is_empty() && materialize_zeros.len() != input_indices.len() {
             return Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "transposition received {} zero-instantiation flags for {} selected inputs",
-                    instantiate_zeros.len(),
+                    "transposition received {} zero-materialization flags for {} selected inputs",
+                    materialize_zeros.len(),
                     input_indices.len(),
                 ),
             }
@@ -4170,10 +4170,10 @@ impl TranspositionTransformArguments {
         // Preserve selection order as both the program boundary and metadata follow it.
         Ok(Self {
             input_indices: input_indices.to_vec(),
-            instantiate_zeros: if instantiate_zeros.is_empty() {
+            materialize_zeros: if materialize_zeros.is_empty() {
                 vec![false; input_indices.len()]
             } else {
-                instantiate_zeros.to_vec()
+                materialize_zeros.to_vec()
             },
             destination_kinds,
         })
@@ -6081,7 +6081,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_region_transpose_instantiates_zero_from_known_dimension() {
+    fn test_region_transpose_materializes_zero_from_known_dimension() {
         use crate::arrays::{DimensionType, DimensionValue};
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
@@ -6123,7 +6123,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_region_transpose_instantiates_zero_from_output_cotangent() {
+    fn test_region_transpose_materializes_zero_from_output_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -6167,7 +6167,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_region_transpose_instantiates_homogeneous_zero_from_output_cotangent() {
+    fn test_region_transpose_materializes_homogeneous_zero_from_output_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into()]));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -6194,7 +6194,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_region_transpose_shared_specializes_by_zero_instantiation() {
+    fn test_region_transpose_shared_specializes_by_zero_materialization() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
         let live = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -6231,7 +6231,7 @@ pub(crate) mod tests {
         assert!(matches!(
             region.transpose_shared(&[0, 1], &[true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "transposition received 1 zero-instantiation flags for 2 selected inputs",
+                if message == "transposition received 1 zero-materialization flags for 2 selected inputs",
         ));
     }
 
@@ -6298,7 +6298,7 @@ pub(crate) mod tests {
         assert!(matches!(
             region.transpose(&[0], &[false, false], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "transposition received 2 zero-instantiation flags for 1 selected inputs",
+                if message == "transposition received 2 zero-materialization flags for 1 selected inputs",
         ));
     }
 
@@ -6368,7 +6368,7 @@ pub(crate) mod tests {
         let interned = RegionRef::new(&outer_builder.regions, interned).unwrap();
         assert!(Arc::ptr_eq(&interned.transpose_shared(&[0, 1], &[true, true], &[]).unwrap().into_program(), &both));
 
-        // The zero-instantiation flags change the transposed program too, so they separate entries as well.
+        // The zero-materialization flags change the transposed program too, so they separate entries as well.
         let residualized = interned.transpose_shared(&[0, 1], &[false, false], &[]).unwrap().into_program();
         assert!(!Arc::ptr_eq(&residualized, &both));
         assert_eq!(residualized.to_string(), both.to_string());
@@ -6391,7 +6391,7 @@ pub(crate) mod tests {
         region.insert_transform_artifact_for_testing::<TranspositionTransform, _>(
             TranspositionTransformArguments {
                 input_indices: vec![0, 1],
-                instantiate_zeros: vec![false; 2],
+                materialize_zeros: vec![false; 2],
                 destination_kinds: vec![CotangentDestinationKind::Return; 2],
             },
             TransformArtifact::new(
@@ -6429,7 +6429,7 @@ pub(crate) mod tests {
         assert!(matches!(
             region.transpose_shared(&[0], &[false, false], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "transposition received 2 zero-instantiation flags for 1 selected inputs",
+                if message == "transposition received 2 zero-materialization flags for 1 selected inputs",
         ));
     }
 
@@ -6456,7 +6456,7 @@ pub(crate) mod tests {
         program.entry_region_ref().insert_transform_artifact_for_testing::<TranspositionTransform, _>(
             TranspositionTransformArguments {
                 input_indices: vec![0, 1],
-                instantiate_zeros: vec![true; 2],
+                materialize_zeros: vec![true; 2],
                 destination_kinds: vec![CotangentDestinationKind::Return; 2],
             },
             TransformArtifact::new(vec![unrelated], vec![TransposedProgramCotangent::Output; 2]),

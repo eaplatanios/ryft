@@ -16348,7 +16348,7 @@ mod tests {
                 &self,
                 _region: RegionRef<'_, Array, TestOperation>,
                 _input_indices: &[usize],
-                _instantiate_zeros: &[bool],
+                _materialize_zeros: &[bool],
                 _destination_kinds: &[CotangentDestinationKind],
             ) -> Result<TransposedProgram<Array, TestOperation>, DifferentiationError> {
                 panic!("invalid source scans must fail before body transposition")

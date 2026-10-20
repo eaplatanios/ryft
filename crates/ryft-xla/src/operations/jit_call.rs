@@ -1363,7 +1363,7 @@ mod tests {
             &self,
             region: RegionRef<'_, XlaConstant, XlaOperation>,
             input_indices: &[usize],
-            _instantiate_zeros: &[bool],
+            _materialize_zeros: &[bool],
             destination_kinds: &[CotangentDestinationKind],
         ) -> Result<TransposedProgram<XlaConstant, XlaOperation>, DifferentiationError> {
             let input_types = region.input_types();
