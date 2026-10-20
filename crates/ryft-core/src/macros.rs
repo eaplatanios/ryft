@@ -1448,13 +1448,13 @@ macro_rules! define_elementwise_capability {
 /// Implements the [`OperationProvider`](crate::OperationProvider) trait for [`GuardOperation`](crate::GuardOperation)
 /// requests of a handwritten operation family that stores no guard. Every [`Context`](crate::Context) requires its
 /// operation family to provide guard requests, and the generated provider rejects each one with
-/// [`GuardOperation::unsupported_family_error`](crate::GuardOperation::unsupported_family_error), so that the family
-/// can be used as a context's family while replays that need a runtime input check fail with an explicit error instead
-/// of dropping the check. `#[derive(Operation)]` generates the same provider for a derived family without a native
-/// guard variant, so derived families never use this macro. The provider is coherent with the blanket provider for
-/// families with a `From<GuardOperation<T>>` conversion only while the family has no such conversion. The optional
-/// leading generic list declares operation-specific type or `const` parameters, and an optional `where` clause can
-/// provide any bounds needed to make the operation type well-formed.
+/// [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), so that the family can be used as
+/// a context's family while replays that need a runtime input check fail with an explicit error instead of dropping the
+/// check. `#[derive(Operation)]` generates the same provider for a derived family without a native guard variant, so
+/// derived families never use this macro. The provider is coherent with the blanket provider for families with a
+/// `From<GuardOperation<T>>` conversion only while the family has no such conversion. The optional leading generic list
+/// declares operation-specific type or `const` parameters, and an optional `where` clause can provide any bounds needed
+/// to make the operation type well-formed.
 ///
 /// # Examples
 ///
@@ -1520,7 +1520,7 @@ macro_rules! impl_guardless_operation {
                 request: $crate::GuardOperation<__T>,
                 _input_types: &[&__T],
             ) -> ::std::result::Result<Self, $crate::ProgramError> {
-                ::std::result::Result::Err(request.unsupported_family_error())
+                ::std::result::Result::Err(request.unsupported_error())
             }
         }
     };

@@ -388,13 +388,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     These conversions fail with `Error = TypeError`, reporting `"cannot project operation '<name>' into a '<payload
 ///     type>' payload"`, where `<name>` is the stored operation's [`Operation::name`] and `<payload type>` is the
 ///     statically expected payload type.
-///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request with
-///     [`GuardOperation::unsupported_family_error`](crate::GuardOperation::unsupported_family_error), generated only
-///     when no composite-native variant stores a [`GuardOperation`](crate::GuardOperation). Every
-///     [`Context`](crate::Context) requires its operation family to provide guard requests, so this lets a family that
-///     stores no guard serve as a context's family without a handwritten provider. A family with a native guard variant
-///     instead provides guards through the blanket implementation over its generated `From<GuardOperation<T>>`
-///     conversion.
+///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
+///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
+///     composite-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
+///     requires its operation family to provide guard requests, so this lets a family that stores no guard serve as a
+///     context's family without a handwritten provider. A family with a native guard variant instead provides guards
+///     through the blanket implementation over its generated `From<GuardOperation<T>>` conversion.
 ///
 /// ## Requirements And Limitations
 ///

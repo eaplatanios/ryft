@@ -1421,7 +1421,7 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///
 /// Operation families construct guards through [`OperationProvider`]. Families with an ordinary
 /// `From<GuardOperation<T>>` conversion receive a blanket provider implementation. Other families reject guard requests
-/// with [`unsupported_family_error`](Self::unsupported_family_error) through a provider that `#[derive(Operation)]`
+/// with [`unsupported_family_error`](Self::unsupported_error) through a provider that `#[derive(Operation)]`
 /// generates for a derived family without a native guard variant and that
 /// [`impl_guardless_operation!`](crate::impl_guardless_operation) generates for handwritten families. A family can
 /// also implement the provider explicitly to accept only the requests it can represent. No guard-specific derive
@@ -1499,7 +1499,7 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///      after its rule has transformed the request and the inputs.
 ///   7. Errors keep their variants. Interpreting a relationship that symbolic types leave unproven fails with
 ///      [`ProgramError::Concretization`], and a family or carrier that cannot represent the check fails with an
-///      explicit unsupported-operation error (e.g., [`unsupported_family_error`](Self::unsupported_family_error)).
+///      explicit unsupported-operation error (e.g., [`unsupported_family_error`](Self::unsupported_error)).
 ///      An unsupported check never counts as success.
 ///   8. Enforcement runs under the ambient [`Provenance`](crate::Provenance) of the replay that requested the guard.
 ///
@@ -1546,8 +1546,6 @@ pub struct GuardOperation<T: Type> {
     reference_anchor_inputs: Vec<usize>,
 }
 
-// TODO(eaplatanios): Review from here onward.
-
 impl<T: Type> GuardOperation<T> {
     /// Creates a new [`GuardOperation`] that checks its inputs against `declared_types`, using `boundary` as the
     /// diagnostic name of the guarded boundary.
@@ -1561,14 +1559,14 @@ impl<T: Type> GuardOperation<T> {
         Self { boundary: boundary.into(), declared_types, retained_identities: Vec::new(), reference_anchor_inputs }
     }
 
-    /// Returns a guard that checks inputs of the `actual` types against `declared`, together with the positions of the
-    /// guarded members among those inputs (in increasing order), or [`None`] when the actual types prove every
-    /// relationship expressed by `declared` (refer to [the standalone
-    /// query](crate::programs::types::type_identities_needing_runtime_checks)). The guard takes every member that
-    /// carries an unproven identity, including reference members, and every non-reference member whose actual type the
-    /// checked relationships narrow, so that its outputs carry each narrowing justified by those checks. Without
-    /// unproven relationships, a narrowing can only come from an actual identity whose own bounds admit a single
-    /// extent, which needs no check.
+    /// Creates a new [`GuardOperation`] that checks inputs of the `actual` types against `declared`, together with
+    /// the positions of the guarded members among those inputs (in increasing order), or [`None`] when the actual
+    /// types prove every relationship expressed by `declared` (for more information on this check, refer to
+    /// [`type_identities_needing_runtime_checks`](crate::type_identities_needing_runtime_checks)). The guard takes
+    /// every member that carries an unproven identity, including reference members, and every non-reference member
+    /// whose actual type the checked relationships narrow, so that its outputs carry each narrowing justified by those
+    /// checks. Without unproven relationships, a narrowing can only come from an actual identity whose own bounds admit
+    /// a single extent, which needs no check.
     ///
     /// # Parameters
     ///
@@ -1611,12 +1609,12 @@ impl<T: Type> GuardOperation<T> {
         self
     }
 
-    /// Returns this [`GuardOperation`] with its [retained](Self::retained_identities) identities chosen from the
+    /// Returns this [`GuardOperation`] with its [retained identities](Self::retained_identities) chosen from the
     /// relationships between its declared types and the actual `input_types`, so that each class of related identities
     /// keeps one representation. References take precedence over known values: every actual reference identity in a
     /// class is retained (several may be linked by unknown dimensions, and the guard recovers their per-formal anchors
     /// from its reference inputs), and a reference with an exact shape but no identity also wins over a symbolic known
-    /// candidate, which may consequently become residual. Otherwise an unfixed class retains the first `pinned`
+    /// candidate, which may consequently become residual. Otherwise, an unfixed class retains the first `pinned`
     /// identity it contains, else the boundary's own identity when an actual input carries it, else its first actual
     /// identity, which avoids unnecessary replay renaming; an exact class without a pinned identity retains nothing.
     ///
@@ -1638,11 +1636,13 @@ impl<T: Type> GuardOperation<T> {
             if class.actual().len() == 1 && !class.is_exact() {
                 continue;
             }
+
             let reference_identities = references
                 .iter()
                 .flat_map(|(_, actual)| actual.identities().map(|(_, identity)| identity).collect::<Vec<_>>())
                 .filter(|identity| class.actual().contains(identity))
                 .collect::<Vec<_>>();
+
             if !reference_identities.is_empty() {
                 // Keep all immutable names, including distinct reference identities linked by unknown dimensions.
                 for identity in reference_identities {
@@ -1652,14 +1652,16 @@ impl<T: Type> GuardOperation<T> {
                 }
                 continue;
             }
+
             if references
                 .iter()
                 .any(|(declared, _)| declared.identities().any(|(_, identity)| class.declared().contains(identity)))
             {
-                // A reference without a nominal actual identity has an exact shape. That representation must win over a
-                // symbolic known candidate; the checked output may consequently become residual.
+                // A reference without a nominal actual identity has an exact shape. That representation must win
+                // over a symbolic known candidate; the checked output may consequently become residual.
                 continue;
             }
+
             let representative = pinned.iter().find(|identity| class.actual().contains(identity));
             let representative = representative.or_else(|| {
                 if class.is_exact() {
@@ -1672,6 +1674,7 @@ impl<T: Type> GuardOperation<T> {
                         .or_else(|| class.actual().first())
                 }
             });
+
             if let Some(representative) = representative {
                 retained_identities.push(representative.clone());
             }
@@ -1685,9 +1688,9 @@ impl<T: Type> GuardOperation<T> {
         &self.boundary
     }
 
-    /// Returns the declared types of the guarded boundary members, in input order. Their identities are local to the
-    /// guard: they name the relationships that the inputs must satisfy, not identities of the surrounding program, and
-    /// so type-identity renamings of the surrounding program leave them unchanged.
+    /// Returns the declared types of the guarded boundary members, in input order. Their identities are local to
+    /// the guard (i.e., they name the relationships that the inputs must satisfy, not identities of the surrounding
+    /// program, and so [`TypeIdentity`] renamings of the surrounding program leave them unchanged).
     #[inline]
     pub fn declared_types(&self) -> &[T] {
         &self.declared_types
@@ -1696,9 +1699,9 @@ impl<T: Type> GuardOperation<T> {
     /// Returns the identities of the surrounding program that this guard's outputs keep symbolic even when the checked
     /// relationships fix them (empty by default). A consumer that seeds a body with the outputs retains the identities
     /// of the values that it cannot narrow alongside them (e.g., references, which are never cast), so that the body
-    /// sees one type per identity: with a retained `n`, an `f32[n, m]` input whose checked relationships fix `n = 2`
-    /// and `m = 3` becomes `f32[n, 3]`, next to a `ref<f32[n]>`. Unlike the declared types, these identities name
-    /// values of the surrounding program, so they follow its type-identity renamings.
+    /// sees one type per identity (e.g., with a retained `n`, an `f32[n, m]` input whose checked relationships fix
+    /// `n = 2` and `m = 3` becomes `f32[n, 3]`, next to a `ref<f32[n]>`). Unlike the declared types, these identities
+    /// name values of the surrounding program, so they follow its [`TypeIdentity`] renamings.
     #[inline]
     pub fn retained_identities(&self) -> &[T::Identity] {
         &self.retained_identities
@@ -1706,11 +1709,12 @@ impl<T: Type> GuardOperation<T> {
 
     /// Returns the [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error that an operation family which
     /// stores no guard returns from its [`OperationProvider`] implementation for this request, because it cannot
-    /// represent the runtime input checks that this guard carries. `#[derive(Operation)]` generates that provider for
-    /// a derived family without a native guard variant, and
-    /// [`impl_guardless_operation!`](crate::impl_guardless_operation) generates it for a hand-written family. Both
-    /// call this function, which owns the diagnostic text.
-    pub fn unsupported_family_error(&self) -> ProgramError {
+    /// represent the runtime input checks that this guard carries. `#[derive(Operation)]` generates that provider
+    /// for a derived operation family without a native guard variant, and
+    /// [`impl_guardless_operation!`](crate::impl_guardless_operation) generates it for handwritten families.
+    /// Both call this function, which owns the diagnostic text.
+    #[inline]
+    pub fn unsupported_error(&self) -> ProgramError {
         ProgramError::UnsupportedOperation {
             message: format!(
                 "the input types of `{}` leave identity relationships unproven, but the operation family \
@@ -1754,12 +1758,13 @@ impl<T: Type> Operation for GuardOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, self.declared_types.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
+
         // Mixed refinements are admitted exactly like the program or region call this guard replaces; only runtime
-        // extents decide.
-        // The declared identities are local to the guard, so its inputs enter them through scoped correspondences,
-        // which a consistent renaming of the surrounding program does not affect. Each non-reference output is its
-        // input narrowed by the actual facts that the declared relationships prove.
+        // extents decide. The declared identities are local to the guard, so its inputs enter them through scoped
+        // correspondences, which a consistent renaming of the surrounding program does not affect. Each non-reference
+        // output is its input narrowed by the actual facts that the declared relationships prove.
         let refinements = T::Refinements::from_local_declarations(self.declared_types.iter(), input_types.iter())?;
+
         // Original reference facts preserve the declared anchor of each immutable handle, even after discharge turns
         // that handle into a value. The complete invocation may connect two anchors through unknown dimensions, but
         // runtime equality does not permit retyping the handles. Cast values through their anchors first.
@@ -1767,6 +1772,7 @@ impl<T: Type> Operation for GuardOperation<T> {
             self.reference_anchor_inputs.iter().map(|&index| &self.declared_types[index]),
             self.reference_anchor_inputs.iter().map(|&index| &input_types[index]),
         )?;
+
         self.declared_types
             .iter()
             .zip(input_types)
@@ -1838,6 +1844,8 @@ impl<T: Type> Operation for GuardOperation<T> {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onward.
 
 impl<C: Context<Type: ReferenceMemberType, Operation: From<GuardOperation<C::Type>>>, P: ReferenceDischargePolicy<C>>
     ReferenceDischargeableOperation<C, P> for GuardOperation<C::Type>

@@ -3929,7 +3929,7 @@ mod tests {
                 _input_types: &[&ArrayIrType],
             ) -> Result<Self, ProgramError> {
                 if request.declared_types().len() > 2 {
-                    return Err(request.unsupported_family_error());
+                    return Err(request.unsupported_error());
                 }
                 Ok(Self(request))
             }
