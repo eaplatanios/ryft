@@ -1068,21 +1068,20 @@ pub struct CastOperation<T: Type> {
     checked: bool,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type> CastOperation<T> {
     /// Creates a new checked [`CastOperation`] that returns its first input at `output_type`. `input_types` declares
     /// the value followed by its witnesses and must contain the first input. Staged and compiled programs check the
-    /// relationship that the cast states at runtime (refer to the type documentation).
+    /// relationship that the cast states at runtime. Refer to the documentation of [`CastOperation`] for more
+    /// information.
     #[inline]
     pub fn checked(output_type: T, input_types: Vec<T>) -> Self {
         Self { input_types, output_type, checked: true }
     }
 
-    /// Creates a new unchecked [`CastOperation`] that returns its first input at `output_type`. `input_types`
-    /// declares the value followed by its witnesses and must contain the first input. Use this only right after
-    /// proving the relationship that the cast states (refer to the type documentation), and use [`Self::checked`]
-    /// otherwise.
+    /// Creates a new unchecked [`CastOperation`] that returns its first input at `output_type`. `input_types` declares
+    /// the value followed by its witnesses and must contain the first input. Use this only right after proving the
+    /// relationship that the cast states, and use [`Self::checked`] otherwise. Refer to the documentation of
+    /// [`CastOperation`] for more information.
     ///
     /// <div class="warning">
     ///
@@ -1102,11 +1101,11 @@ impl<T: Type> CastOperation<T> {
         &self.input_types
     }
 
-    /// Returns the requested type of the first input's new representation. Type inference preserves identities
-    /// carried by the inputs. When concrete inputs no longer carry names from the input or witness declarations, it
-    /// substitutes their known exact extents so they do not become unbound names in a staged program, and when a
-    /// first-class dimension witness instantiates a declared identity under another name, it carries that supplied
-    /// name instead of the requested one.
+    /// Returns the requested type of the first input's new representation. Type inference preserves identities carried
+    /// by the inputs. When concrete inputs no longer carry names from the input or witness declarations, it substitutes
+    /// their known exact extents so they do not become unbound names in a staged program, and when a first-class
+    /// dimension witness instantiates a declared identity under another name, it carries that supplied name instead
+    /// of the requested one.
     #[inline]
     pub fn output_type(&self) -> &T {
         &self.output_type
@@ -1121,12 +1120,13 @@ impl<T: Type> CastOperation<T> {
         self.checked
     }
 
-    /// Returns this cast normalized against the `input_types` it is about to be bound to: a checked cast whose
+    /// Returns this cast normalized against the `input_types` it is about to be bound to (i.e., a checked cast whose
     /// relationship those types already prove needs no runtime check and becomes unchecked, so that it is pure and
-    /// declares no ordered effect. Unchecked casts, casts that still need a check, and casts whose declaration the
+    /// declares no ordered effect). Unchecked casts, casts that still need a check, and casts whose declaration the
     /// types do not admit (which binding then rejects) are returned unchanged. The proof uses the actual types rather
     /// than the stored declaration, because a declaration can admit weaker actual relationships that still require a
     /// check (e.g., `f32[n], f32[n]` admits `f32[2], f32[n]`), and later transforms only refine the bound types.
+    #[inline]
     pub fn normalized(mut self, input_types: &[T]) -> Self
     where
         T: CastType,
@@ -1137,7 +1137,9 @@ impl<T: Type> CastOperation<T> {
         self
     }
 
-    /// Validates the family-independent part of the cast contract against the supplied `input_types` (the value
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Validates the family-independent part of the cast contract against the supplied `input_types` (i.e., the value
     /// followed by its witnesses) and returns the output identities that live inputs carry, which the inferred output
     /// preserves. The declaration must name a first input, the supplied types must match it in count and be admitted
     /// by it, no input or output may be a reference type, the output may not define a type identity, and every output
@@ -1149,10 +1151,12 @@ impl<T: Type> CastOperation<T> {
     ///
     /// Returns a [`TypeError`] describing the first violated requirement.
     pub fn validate_declaration(&self, input_types: &[T]) -> Result<Vec<T::Identity>, TypeError> {
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        // TODO(eaplatanios): Shouldn't this check be moved to `Self::checked` and `Self::unchecked`?
         if self.input_types.is_empty() {
             return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
         }
-        check_count!("input", input_types, self.input_types.len(), TypeError);
+
         if let Some(reference) = input_types
             .iter()
             .chain(&self.input_types)
@@ -1163,13 +1167,16 @@ impl<T: Type> CastOperation<T> {
                 "`{CAST_OPERATION_NAME}` does not support reference type `{reference}`",
             )));
         }
+
         if self.output_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition) {
             return Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` output type `{}` cannot define a type identity",
-                self.output_type,
+                "`{}` output type `{}` cannot define a type identity",
+                CAST_OPERATION_NAME, self.output_type,
             )));
         }
+
         T::Refinements::new(&self.input_types, input_types)?;
+
         // Live names are preserved only in the final representation; all input and output constraints still participate
         // in the complete shape comparison.
         let mut preserved = Vec::new();
