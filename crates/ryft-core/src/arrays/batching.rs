@@ -290,11 +290,11 @@ impl<V> RaggedAxis<V> {
     }
 
     /// Validates every packed-axis position this metadata stores against the packed array it is being attached to:
-    /// [`axis`](Self::axis) must name an existing axis of `packed_type` other than the mapped batch axis, whose static
-    /// storage extent must admit the lower bound of [`dimension`](Self::dimension) (otherwise no extent could satisfy
-    /// both the bounds and the storage), and each entry of [`extent_axes`](Self::extent_axes) must name a distinct
-    /// existing axis of `packed_type` other than the ragged axis itself, which the extents describe and so never vary
-    /// along.
+    /// [`axis`](Self::axis) must name an existing axis of `packed_type` other than the mapped batch axis, whose storage
+    /// extent must admit the lower bound of [`dimension`](Self::dimension) in every execution (a static extent itself,
+    /// and the lower bound of a symbolic one; otherwise an execution could have no extent that satisfies both the
+    /// bounds and the storage), and each entry of [`extent_axes`](Self::extent_axes) must name a distinct existing axis
+    /// of `packed_type` other than the ragged axis itself, which the extents describe and so never vary along.
     ///
     /// These are properties of the metadata _and_ its carrier together, not of the metadata alone, which is why they
     /// are not checked by [`new`](Self::new). A [`RaggedAxis`] is constructed detached from any packed array, and the
@@ -324,13 +324,17 @@ impl<V> RaggedAxis<V> {
                 ),
             });
         }
-        if let Dimension::Static(storage) = packed_type.dimension(self.axis)
-            && storage < self.dimension.bounds().lower()
-        {
+        let (capacity, storage) = match packed_type.dimension(self.axis) {
+            Dimension::Static(storage) => (storage, storage.to_string()),
+            Dimension::Dynamic(storage) => {
+                (storage.bounds().lower(), format!("`{storage}` with lower bound {}", storage.bounds().lower()))
+            }
+        };
+        if capacity < self.dimension.bounds().lower() {
             return Err(BatchingError::InvalidBatchMetadata {
                 message: format!(
                     "ragged axis {} of packed array type {} has storage extent {storage}, which cannot hold the lower \
-                     bound {} of bounded ragged dimension `{}`",
+                     bound {} of bounded ragged dimension `{}` in every execution",
                     self.axis,
                     packed_type,
                     self.dimension.bounds().lower(),
@@ -5008,8 +5012,9 @@ pub(crate) mod tests {
                 if message == "ragged axis 1 maps more than one extent axis to packed axis 0",
         ));
 
-        // The static storage of the ragged axis must admit the dimension's lower bound; a symbolic storage extent
-        // is not checked, because its bounds are related to the dimension's when the carrier is consumed.
+        // The storage of the ragged axis must admit the dimension's lower bound in every execution: a static storage
+        // extent itself, and the lower bound of a symbolic one, since an execution at that bound would otherwise have
+        // no extent that satisfies both the bounds and the storage.
         let wide = DimensionVariable::new("wide", DimensionBounds::new(4, Some(6)).unwrap());
         assert!(matches!(
             RaggedAxis::new(1, extents.clone(), wide.clone(), vec![0])
@@ -5017,18 +5022,35 @@ pub(crate) mod tests {
             Err(BatchingError::InvalidBatchMetadata { message })
                 if message
                     == "ragged axis 1 of packed array type f32[2, 3] has storage extent 3, which cannot hold the lower \
-                        bound 4 of bounded ragged dimension `wide`",
+                        bound 4 of bounded ragged dimension `wide` in every execution",
         ));
-        let symbolic_packed_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                Dimension::Static(2),
-                Dimension::Dynamic(DimensionVariable::new("storage", DimensionBounds::new(0, Some(4)).unwrap())),
-            ]),
-        );
+        let symbolic_packed_type = |lower: usize| {
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![
+                    Dimension::Static(2),
+                    Dimension::Dynamic(DimensionVariable::new(
+                        "storage",
+                        DimensionBounds::new(lower, Some(8)).unwrap(),
+                    )),
+                ]),
+            )
+        };
+        assert!(matches!(
+            RaggedAxis::new(1, extents.clone(), wide.clone(), vec![0]).validate_axis_mapping(
+                &symbolic_packed_type(0),
+                BatchAxis::new(0),
+                Some(0)
+            ),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message
+                    == "ragged axis 1 of packed array type f32[2, storage] has storage extent `storage` with lower \
+                        bound 0, which cannot hold the lower bound 4 of bounded ragged dimension `wide` in every \
+                        execution",
+        ));
         assert_eq!(
             RaggedAxis::new(1, extents, wide, vec![0]).validate_axis_mapping(
-                &symbolic_packed_type,
+                &symbolic_packed_type(4),
                 BatchAxis::new(0),
                 Some(0)
             ),
