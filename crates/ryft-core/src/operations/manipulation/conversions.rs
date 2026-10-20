@@ -23,23 +23,27 @@
 //!     floating-point elements to the values of a format with fewer exponent or mantissa bits while keeping their
 //!     element type, so that the precision of a narrower format can be simulated without converting to it.
 //!   - The [`Cast`] value capability and the [`CastOperation`] that it stages, which preserve element values while
-//!     changing their type representation. A checked cast validates the required type relationships at runtime.
-//!     An unchecked cast assumes those relationships, for example after a [`GuardOperation`](crate::GuardOperation)
-//!     has checked them. Differentiation and transposition use unchecked casts for tangent and cotangent
-//!     representations whose relationships the primal computation has established. The [`CastType`] type capability
-//!     infers the output type and validates the complete relationship, including dimension identities, extents,
-//!     element types, and layout constraints.
+//!     changing their type representation, including the layout and the placement over explicit mesh axes. A checked
+//!     cast validates the required type relationships at runtime. An unchecked cast assumes those relationships, for
+//!     example after a [`GuardOperation`](crate::GuardOperation) has checked them. Differentiation and transposition
+//!     use unchecked casts for tangent and cotangent representations whose relationships the primal computation has
+//!     proven. The [`CastType`] type trait infers the output type and validates the complete relationship, including
+//!     dimension identities, extents, element types, and layout constraints.
 //!
 //! Numerical conversion is linear, so differentiation converts the primal and aligns the tangent with the output's
 //! tangent type, transposition converts the cotangent back to the input's cotangent type, and conversions into or
 //! out of a type without a tangent space (e.g., integers) produce structural zeros. A bitcast has a structural zero
 //! derivative and cannot be transposed. Precision reduction is treated as linear and as its own transpose, so that
 //! tangents and cotangents carry the same precision as the primal. Batching keeps the mapped axis in place, except that
-//! a widening bitcast moves it away from the trailing position it would otherwise consume. Backends lower numerical
+//! a widening bitcast moves it away from the trailing position it would otherwise consume. A type-representation cast
+//! is the identity: its tangent and cotangent are unchecked casts to the tangent and cotangent representations that
+//! stay behind the primal check, and batching lifts its declarations by the mapped axis. Backends lower numerical
 //! conversion, bitcasts, and precision reduction to their element-conversion, bit-reinterpretation, and
 //! precision-reduction constructs (e.g., [`stablehlo.convert`](https://openxla.org/stablehlo/spec#convert),
 //! [`stablehlo.bitcast_convert`](https://openxla.org/stablehlo/spec#bitcast_convert), and
-//! [`stablehlo.reduce_precision`](https://openxla.org/stablehlo/spec#reduce_precision) in the XLA backend).
+//! [`stablehlo.reduce_precision`](https://openxla.org/stablehlo/spec#reduce_precision) in the XLA backend), and a
+//! cast to the runtime checks that its actual input types leave unproven, followed by the shape, layout and placement
+//! conversion.
 //!
 //! # Example
 //!
@@ -77,12 +81,15 @@ use std::marker::PhantomData;
 
 use ryft_macros::capability;
 
+use crate::arrays::types::dimensions::{DimensionComparison, DimensionRefinementFact};
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue,
-    ArrayType, BatchingTypePolicy, DataType, Dimension, DimensionType, Layout, ShardingDimension, bf16, f16,
+    ArrayType, DataType, Dimension, DimensionRefinements, DimensionType, DimensionTypeRefinements, DimensionVariable,
+    Layout, MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f16,
 };
 use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -95,10 +102,14 @@ use crate::macros::{check_count, impl_differentiable_operation, impl_reference_d
 use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::{
-    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type,
-    TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter, ProgramError,
+    RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value,
     ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -990,230 +1001,88 @@ impl ReducePrecision for Array {
     }
 }
 
-/// Infers the output of a [`CastOperation`] for this type family, validating the complete relationship between its
-/// input, output, and witness types. This includes dimension extents and identities as well as other type properties.
-/// For arrays, element [`DataType`], [`Shape`](crate::Shape) rank, and [`Memory`](crate::Memory) must agree. Optional
-/// [`Layout`] and [`Sharding`](crate::Sharding) constraints must agree when both types specify them; an unspecified
-/// field imposes no constraint. For example, an input specifying a layout and an output specifying a sharding can
-/// describe the same value, whereas two different specified layouts cannot.
-///
-/// Custom type families implement this capability to use [`CastOperation`]. The built-in implementations use
-/// [`TypeRefinements`] to validate dimension and identity relationships and infer the output's representation.
-pub trait CastType: Type {
-    /// Validates `operation` against `input_types` (the value followed by its witnesses) and returns its inferred
-    /// output type. Both checked and unchecked casts use the same type rules: statically contradictory relationships
-    /// are errors, while relationships requiring runtime checks are permitted. This function does not check runtime
-    /// values; the cast's mode determines whether staged and compiled programs check or assume those relationships.
-    ///
-    /// Without an explicit [relation](CastOperation::relation), one of the input and requested output types
-    /// must refine the other. With a relation, both must instantiate that local declaration, and the original
-    /// [input declaration](CastOperation::input_type) and [witness declarations](CastOperation::witness_types)
-    /// must agree with the supplied types. References and outputs defining identities are unsupported. The inferred
-    /// output preserves names carried by live operands and resolves names lost during concretization to exact extents
-    /// (refer to [`CastOperation::output_type`]). Invalid input counts must return an error, even when called directly.
-    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError>;
-}
-
-impl CastType for DataType {
-    #[inline]
-    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
-        infer_cast_output_type(operation, input_types, |input, output| input == output)
-    }
-}
-
-impl CastType for ArrayType {
-    #[inline]
-    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
-        infer_cast_output_type(operation, input_types, array_cast_types_match)
-    }
-}
-
-impl CastType for DimensionType {
-    #[inline]
-    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
-        infer_cast_output_type(operation, input_types, |_, _| true)
-    }
-}
-
-impl CastType for ArrayIrType {
-    #[inline]
-    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
-        infer_cast_output_type(operation, input_types, |input, output| match (input, output) {
-            (Self::Array(input), Self::Array(output)) => array_cast_types_match(input, output),
-            (Self::Dimension(_), Self::Dimension(_)) => true,
-            _ => false,
-        })
-    }
-}
-
-/// Compares array properties that a local dimension relation does not constrain. Dimension extents and identities
-/// are validated separately by the scoped refinements in [`infer_cast_output_type`].
-fn array_cast_types_match(input: &ArrayType, output: &ArrayType) -> bool {
-    input.data_type() == output.data_type()
-        && input.rank() == output.rank()
-        && input.memory() == output.memory()
-        && input.layout().zip(output.layout()).is_none_or(|(input, output)| input == output)
-        && input.sharding().zip(output.sharding()).is_none_or(|(input, output)| input == output)
-}
-
-/// Infers a built-in family's complete cast relationship, using `types_match` for properties outside the local
-/// dimension relation. All dimension and identity comparisons use the family's existing [`TypeRefinements`].
-fn infer_cast_output_type<T: Type>(
-    operation: &CastOperation<T>,
-    input_types: &[T],
-    types_match: impl FnOnce(&T, &T) -> bool,
-) -> Result<T, TypeError> {
-    check_count!("input", input_types, 1 + operation.witness_types.len(), TypeError);
-    let input_type = &input_types[0];
-    if let Some(reference) = input_types
-        .iter()
-        .chain(&operation.witness_types)
-        .chain([&operation.output_type])
-        .chain(operation.input_type())
-        .chain(operation.relation())
-        .find(|r#type| r#type.is_reference())
-    {
-        return Err(TypeError::invalid(format!(
-            "`{CAST_OPERATION_NAME}` does not support reference type `{reference}`",
-        )));
-    }
-
-    if operation.output_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition) {
-        return Err(TypeError::invalid(format!(
-            "`{}` output type `{}` cannot define a type identity",
-            CAST_OPERATION_NAME, operation.output_type,
-        )));
-    }
-
-    // A relation is a local declaration that the value and the output must both instantiate, through scoped
-    // correspondences that admit differently named identities, while the witnesses must instantiate their
-    // declared types.
-    let (refinements, local) = if let Some((declared_input, relation)) = operation.relation.as_deref() {
-        let refinements = T::Refinements::new(
-            std::iter::once(declared_input).chain(&operation.witness_types).collect::<Vec<_>>(),
-            input_types.iter(),
-        )?;
-
-        // Witness identities belong to the surrounding program, while the relation's identities are local. Apply
-        // ambient facts to both sides before checking the local relation, so a concrete witness cannot contradict
-        // an extent determined by the value (e.g., output `a = 5` next to a value of extent `3`).
-        let input = refinements.refine_actual(input_type, &[])?;
-        let output = refinements.refine_declared(&operation.output_type, &[])?;
-        if !types_match(&input, &output) {
-            return Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` cannot convert type `{input}` to unrelated type `{output}`",
-            )));
-        }
-        let local = T::Refinements::from_local_declarations([relation, relation], [&input, &output])?;
-        (refinements, Some(local))
-    } else {
-        // The cast relates the value at the more general of its two types to the witnesses at their declared types.
-        // Static types must not contradict that relationship (e.g., a witness of static extent `5` next to widening
-        // `f32[2]` to `f32[n]`).
-        let (general, specific) = if operation.output_type.is_refined_by(input_type) {
-            (&operation.output_type, input_type)
-        } else if input_type.is_refined_by(&operation.output_type) {
-            (input_type, &operation.output_type)
-        } else {
-            return Err(TypeError::invalid(format!(
-                "`{}` cannot convert type `{}` to unrelated type `{}`",
-                CAST_OPERATION_NAME, input_type, operation.output_type,
-            )));
-        };
-        let refinements = T::Refinements::new(
-            std::iter::once(general).chain(&operation.witness_types).collect::<Vec<_>>(),
-            std::iter::once(specific).chain(&input_types[1..]).collect::<Vec<_>>(),
-        )?;
-        (refinements, None)
-    };
-
-    // Preserve names carried by live operands, including nominal cotangent types. Resolve names lost when declared
-    // operands became concrete, but leave names absent from those declarations alone: ordinary graph validation must
-    // still reject widening to an identity for which the caller supplied no witness.
-    let preserved = operation
-        .output_type
-        .identities()
-        .filter_map(|(_, identity)| {
-            let carries = |r#type: &T| r#type.identities().any(|(_, available)| available == identity);
-            (input_types.iter().any(carries)
-                || !operation.input_type().into_iter().chain(&operation.witness_types).any(carries))
-            .then(|| identity.clone())
-        })
-        .collect::<Vec<_>>();
-    let output = refinements.refine_declared(&operation.output_type, &preserved)?;
-    let output = match local {
-        Some(local) => local.refine_actual(&output, &preserved)?,
-        None => output,
-    };
-
-    Ok(output)
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`CastOperation`].
 pub const CAST_OPERATION_NAME: &str = "cast";
 
-/// [`Operation`] that returns its first input at a different type representation (e.g., `f32[n]` as `f32[2]`). Without
-/// an explicit [relation](Self::relation), one type must refine the other (e.g., `f32[n]` and `f32[2]`, or
-/// `dimension<m>` and `dimension<2>`). A relation also permits renamed identities and casts that narrow some components
-/// while widening others, but does not permit incompatible layouts, shardings, or memory placements.
-/// Further inputs are _witnesses_: values whose types make the output's identities available to
-/// the instruction (e.g., a value of type `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses carry no derivatives
-/// and are otherwise unused. The output type may not define a type identity.
+/// [`Operation`] that returns its first input at a different type representation (e.g., `f32[n]` as `f32[2]`). The
+/// input and output describe the same value, with equal extents on corresponding axes. Arrays require equal element
+/// types, rank and memory space. Layout may change, and so may placement over [`MeshAxisType::Explicit`] mesh axes
+/// under the rules of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation.
+/// Placement over [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs
+/// to backend compilers (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter
+/// only changes through manual collectives, and so are manual variation and reduction state. Further inputs act as
+/// _witnesses_, meaning values whose types make output identities available to the instruction (e.g., a value of type
+/// `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses carry no derivatives. Every output identity must occur in an
+/// input declaration, and the output type may not define an identity. First-class dimension types define their
+/// names, so casts of dimension values can only target static types.
 ///
-/// A cast states a relationship between its first input at the output type and its witnesses at their
-/// [declared types](Self::witness_types): every relationship that their shared identities express (e.g., widening
-/// `f32[2]` to `f32[n]` next to a witness of type `f32[n]` states that `n = 2`, and so does narrowing `f32[n]` to
-/// `f32[2]`). Type inference rejects relationships that the static types already contradict, and interpretation checks
-/// the complete relationship over the concrete types of its inputs (e.g., a witness of extent 5 rejects the widening
-/// above). With an explicit relation, it also retains the [declared input type](Self::input_type), so the original
-/// identity assignments survive concrete execution. For example, casting `f32[a, b]` to `f32[b, a]` requires equal
-/// axis extents; a value with shape `[2, 3]` cannot change `a = 2, b = 3` into `a = 3, b = 2`.
-/// Staged and compiled programs differ by mode:
+/// The complete [input declarations](Self::input_types) preserve nominal bindings during concrete execution. Source,
+/// output and witness declarations share their dimension identities: widening `f32[2]` to `f32[n]` next to a witness
+/// of type `f32[n]` requires that witness to have extent `2`, and a static output next to two witnesses declared as
+/// `dimension<n>` requires those witnesses to agree, so a cast can also act as a guard over its witnesses. Casting
+/// `f32[a, b]` to `f32[b, a]` requires equal axis extents; a value with shape `[2, 3]` cannot change `a = 2, b = 3`
+/// into `a = 3, b = 2`. Narrowing some axes while widening others uses the same rule. Array witnesses must carry the
+/// declared identities nominally, whereas first-class dimension witnesses may instantiate them under another name
+/// within their bounds, in which case the inferred output carries the supplied name (refer to [`Self::output_type`]).
+/// Conditions beyond those expressed by these types belong in a [`GuardOperation`](crate::GuardOperation), which
+/// checks declared type relationships. Type inference rejects static contradictions, and interpretation checks the
+/// relationship over concrete inputs and materializes the requested representation, retaining exact concrete shapes.
+/// Host arrays use dense row-major storage for an unspecified layout, share storage for sharding annotations, and
+/// re-encode logical bytes when the layout changes. Optional layout and sharding constraints on inputs belong to their
+/// declarations; the output independently requests its layout and sharding, and an output without a sharding is
+/// untracked rather than replicated. Carrying an existing sharding forward requests no redistribution: backends
+/// constrain placement only when the explicit placement changes. Derivative conversions request their tangent or exact
+/// cotangent representation in one cast. Staged and compiled programs differ by mode:
 ///
 ///   - A [checked](Self::checked) cast requires the relationship at runtime. It declares
-///     [`EffectClass::OrderedAssertion`], so it is ordered like an assertion and is never removed as dead code, and a
-///     violated relationship fails the program instead of producing a value.
+///     [`EffectClass::OrderedAssertion`], so conditional checks survive dead-code elimination and execute in assertion
+///     order, and a violated relationship fails the program. Binding a checked cast to values whose types already prove
+///     the relationship [normalizes](Self::normalized) it into an unchecked cast, so a checked cast in a program still
+///     needs its check, and a proven single-input identity cast folds to its input.
 ///   - An [unchecked](Self::unchecked) cast assumes the relationship. It is pure and has no runtime cost beyond the
 ///     representation change (e.g., none at all for first-class dimensions). Transforms emit unchecked casts right
-///     after proving their relationship: a [`GuardOperation`](crate::operations::assertions::GuardOperation) converts
-///     the tangents of its outputs with them, and the transpose of a cast is the unchecked cast of its output cotangent
-///     back to its input's cotangent type, with witnesses that carry the required input identities.
+///     after proving their relationship: a [`GuardOperation`](crate::GuardOperation) converts the tangents of its
+///     outputs with them, and the transpose of a cast is the unchecked cast of its output cotangent back to its
+///     input's cotangent type, with witnesses that carry the required input identities.
 ///
-/// The [`Cast`] capability applies both modes to values. Transposition assumes the forward relationship has already
-/// been established. Identities needed by the input cotangent must be carried by a live output cotangent, a known
-/// witness, or a retained dimension source. For example, directly transposing `f32[n]` to `f32[2]` without any saved
-/// value carrying `n` is unsupported. Linearize the program before transposing it to retain the primal witnesses and
-/// execute its checks; the resulting tangent program uses unchecked casts.
+/// Batching lifts the declared types by the mapped axis and binds the cast over the packed values. A proven one-input
+/// identity keeps its carrier unchanged, including any bounded ragged axes. Every other cast over a bounded ragged
+/// carrier is rejected, because the carrier's per-item extents live outside the packed types that the lifted cast
+/// relates.
+///
+/// Raw transposition rejects conditional checked casts whose check needs an unavailable linear primal value or witness,
+/// including cases whose shapes could be checked using known witnesses, because preserving assertion order requires
+/// forward check scheduling (i.e., linearizing a checked program before transposing it, which executes its checks and
+/// retains the necessary primal extents in the unchecked tangent program). An unchecked transpose needs every input
+/// cotangent identity carried by its output cotangent, a known witness or a retained dimension source, and reports
+/// unavailable extents rather than inventing names.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CastOperation<T: Type> {
+    /// Refer to the documentation of [`input_types`](Self::input_types) for more information.
+    input_types: Vec<T>,
+
     /// Refer to the documentation of [`output_type`](Self::output_type) for more information.
     output_type: T,
-
-    /// Refer to the documentation of [`witness_types`](Self::witness_types) for more information.
-    witness_types: Vec<T>,
-
-    /// Declared first input type and local relation, boxed to keep operation families from storing both types inline.
-    /// Refer to [`Self::input_type`] and [`Self::relation`].
-    relation: Option<Box<(T, T)>>,
 
     /// Refer to the documentation of [`is_checked`](Self::is_checked) for more information.
     checked: bool,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<T: Type> CastOperation<T> {
-    /// Creates a new checked [`CastOperation`] that returns its first input at `output_type`, with one further witness
-    /// input for each of the `witness_types`. Staged and compiled programs check the relationship that the cast states
-    /// at runtime (refer to the type documentation).
+    /// Creates a new checked [`CastOperation`] that returns its first input at `output_type`. `input_types` declares
+    /// the value followed by its witnesses and must contain the first input. Staged and compiled programs check the
+    /// relationship that the cast states at runtime (refer to the type documentation).
     #[inline]
-    pub fn checked(output_type: T, witness_types: Vec<T>) -> Self {
-        Self { output_type, witness_types, relation: None, checked: true }
+    pub fn checked(output_type: T, input_types: Vec<T>) -> Self {
+        Self { input_types, output_type, checked: true }
     }
 
-    /// Creates a new unchecked [`CastOperation`] that returns its first input at `output_type`, with one further
-    /// witness input for each of the `witness_types`. Use this only right after proving the relationship that the cast
-    /// states (refer to the type documentation), and use [`Self::checked`] otherwise.
+    /// Creates a new unchecked [`CastOperation`] that returns its first input at `output_type`. `input_types`
+    /// declares the value followed by its witnesses and must contain the first input. Use this only right after
+    /// proving the relationship that the cast states (refer to the type documentation), and use [`Self::checked`]
+    /// otherwise.
     ///
     /// <div class="warning">
     ///
@@ -1222,120 +1091,220 @@ impl<T: Type> CastOperation<T> {
     ///
     /// </div>
     #[inline]
-    pub fn unchecked(output_type: T, witness_types: Vec<T>) -> Self {
-        Self { output_type, witness_types, relation: None, checked: false }
+    pub fn unchecked(output_type: T, input_types: Vec<T>) -> Self {
+        Self { input_types, output_type, checked: false }
     }
 
-    /// Returns this [`CastOperation`] with its [declared input type](Self::input_type) set to `input_type` and its
-    /// [local relation](Self::relation) set to `relation`. Retaining the input declaration preserves the original
-    /// identity assignments when the operation executes on concrete values (refer to the type documentation).
+    /// Returns the declared types of the value followed by its shape witnesses. These declarations retain the
+    /// surrounding program's identities when actual values become concrete, and all follow its identity renamings.
     #[inline]
-    pub fn with_relation(mut self, input_type: T, relation: T) -> Self {
-        self.relation = Some(Box::new((input_type, relation)));
-        self
-    }
-
-    /// Returns the declared type of the first input when this cast has an explicit [relation](Self::relation).
-    /// Its identities belong to the surrounding program, like those in the output and witness types. The actual
-    /// input must refine this declaration, and its original identity assignments must agree with the output and
-    /// witnesses. Ordinary casts without an explicit relation need no separate input declaration.
-    #[inline]
-    pub fn input_type(&self) -> Option<&T> {
-        self.relation.as_deref().map(|(input_type, _)| input_type)
+    pub fn input_types(&self) -> &[T] {
+        &self.input_types
     }
 
     /// Returns the requested type of the first input's new representation. Type inference preserves identities
-    /// carried by the inputs. When concrete operands no longer carry names from the input or witness declarations,
-    /// it substitutes their known exact extents so they do not become unbound names in a staged program.
+    /// carried by the inputs. When concrete inputs no longer carry names from the input or witness declarations, it
+    /// substitutes their known exact extents so they do not become unbound names in a staged program, and when a
+    /// first-class dimension witness instantiates a declared identity under another name, it carries that supplied
+    /// name instead of the requested one.
     #[inline]
     pub fn output_type(&self) -> &T {
         &self.output_type
     }
 
-    /// Returns the declared types of the witness inputs, whose identities the relationship that this cast states
-    /// shares with the [output type](Self::output_type).
-    #[inline]
-    pub fn witness_types(&self) -> &[T] {
-        &self.witness_types
-    }
-
-    /// Returns the type that the first input and the output must both instantiate, if any. Without a relation, one of
-    /// the two types must refine the other. A relation also admits casts that rename identities or that narrow some
-    /// components while widening others (e.g., `f32[q]` to `f32[n]` when both instantiate a declared `f32[p]` whose
-    /// relationships a [`GuardOperation`](crate::operations::assertions::GuardOperation) checked). Like the declared
-    /// types of a guard, the relation's identities are local to the cast, so type-identity renamings of the surrounding
-    /// program leave it unchanged.
-    #[inline]
-    pub fn relation(&self) -> Option<&T> {
-        self.relation.as_deref().map(|(_, relation)| relation)
-    }
-
-    /// Returns `true` if staged and compiled programs check the relationship that this cast states at runtime (refer to
-    /// [`Self::checked`] and [`Self::unchecked`]).
+    /// Returns whether this cast declares checked mode (refer to [`Self::checked`] and [`Self::unchecked`]). Every
+    /// path that binds a cast to actual values normalizes it first (refer to [`Self::normalized`]), so a checked cast
+    /// in a program still needs a runtime check, whereas an explicitly constructed checked cast that a program builder
+    /// stages directly keeps its ordered effect even when backends omit its proven check.
     #[inline]
     pub fn is_checked(&self) -> bool {
         self.checked
     }
 
+    /// Returns this cast normalized against the `input_types` it is about to be bound to: a checked cast whose
+    /// relationship those types already prove needs no runtime check and becomes unchecked, so that it is pure and
+    /// declares no ordered effect. Unchecked casts, casts that still need a check, and casts whose declaration the
+    /// types do not admit (which binding then rejects) are returned unchanged. The proof uses the actual types rather
+    /// than the stored declaration, because a declaration can admit weaker actual relationships that still require a
+    /// check (e.g., `f32[n], f32[n]` admits `f32[2], f32[n]`), and later transforms only refine the bound types.
+    pub fn normalized(mut self, input_types: &[T]) -> Self
+    where
+        T: CastType,
+    {
+        if self.checked && matches!(T::infer_cast_output_type(&self, input_types), Ok((_, Some(_)))) {
+            self.checked = false;
+        }
+        self
+    }
+
+    /// Validates the family-independent part of the cast contract against the supplied `input_types` (the value
+    /// followed by its witnesses) and returns the output identities that live inputs carry, which the inferred output
+    /// preserves. The declaration must name a first input, the supplied types must match it in count and be admitted
+    /// by it, no input or output may be a reference type, the output may not define a type identity, and every output
+    /// identity must be carried by a declared input. [`CastType::infer_cast_output_type`] implementations call this
+    /// first and then validate and infer the family-specific relationship; the built-in families additionally resolve
+    /// preserved identities and solve the dimension relationships.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] describing the first violated requirement.
+    pub fn validate_declaration(&self, input_types: &[T]) -> Result<Vec<T::Identity>, TypeError> {
+        if self.input_types.is_empty() {
+            return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
+        }
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        if let Some(reference) = input_types
+            .iter()
+            .chain(&self.input_types)
+            .chain([&self.output_type])
+            .find(|r#type| r#type.is_reference())
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` does not support reference type `{reference}`",
+            )));
+        }
+        if self.output_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition) {
+            return Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` output type `{}` cannot define a type identity",
+                self.output_type,
+            )));
+        }
+        T::Refinements::new(&self.input_types, input_types)?;
+        // Live names are preserved only in the final representation; all input and output constraints still participate
+        // in the complete shape comparison.
+        let mut preserved = Vec::new();
+        for (_, identity) in self.output_type.identities() {
+            let carries = |r#type: &T| r#type.identities().any(|(_, available)| available == identity);
+            if !self.input_types.iter().any(carries) {
+                return Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` output identity `{identity}` is not carried by a declared input",
+                )));
+            }
+            if input_types.iter().any(carries) {
+                preserved.push(identity.clone());
+            }
+        }
+        Ok(preserved)
+    }
+
     /// Returns `value` at `output_type` through an unchecked [`CastOperation`] bound in `context` with the provided
-    /// `witnesses` (at their current types) and optional [relation](Self::relation), or `value` itself when it already
-    /// has that type, so that no-op conversions stage nothing. Transformation rules use this to bind into the specific
-    /// context that they target (e.g., the tangent context of a forward-mode rule), and must have proven the
-    /// relationship that the cast states.
+    /// `witnesses` (at their current types), or `value` itself when it already has that type and there are no
+    /// witnesses. Witness producers remain explicit dependencies even for identity conversions. Transformation rules
+    /// use this to bind into their target context (e.g., the tangent context of a forward-mode rule), and must have
+    /// proven the relationship that the cast states.
     pub(crate) fn bind_unchecked<C: Context<Type = T, Operation: From<Self>>>(
         context: &C,
         value: &C::Value,
         witnesses: &[C::Value],
         output_type: T,
-        relation: Option<T>,
     ) -> Result<C::Value, ProgramError> {
-        if value.r#type().as_ref() == &output_type {
+        if witnesses.is_empty() && value.r#type().as_ref() == &output_type {
             return Ok(value.clone());
         }
-        let witness_types = witnesses.iter().map(|witness| witness.r#type().into_owned()).collect();
         let inputs = std::iter::once(value).chain(witnesses).cloned().collect::<Vec<_>>();
-        let mut operation = Self::unchecked(output_type, witness_types);
-        if let Some(relation) = relation {
-            operation = operation.with_relation(value.r#type().into_owned(), relation);
-        }
-        let mut outputs = context.bind(operation, Vec::new(), &inputs)?;
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
+        let mut outputs = context.bind(Self::unchecked(output_type, input_types), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 
-    /// Checks the complete relationship over `input_types` (the value followed by the witnesses), in both modes.
-    /// Concrete extents complete the check; symbolic types must prove the relationship without runtime checks.
-    fn validate_concrete_inputs(
+    /// Binds the tangent of a value whose `primal` was converted into `output` by a cast or by a guard, returning the
+    /// `tangent` at the tangent type of `output` through an unchecked cast in the tangent context. The relationship is
+    /// proven by the primal conversion, so the tangent cast only needs witnesses for the extents that the output
+    /// tangent type no longer carries and, when `needs_ordering` holds, a data dependency on the primal result so that
+    /// the tangent stays behind the primal check in a fused forward-mode program. One source-typed value can carry both
+    /// a lost name and that dependency: the primal is re-cast at its own type with the output as witness when it
+    /// carries every output identity, and separate witnesses are kept only when the output introduces names that the
+    /// source cannot carry.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Differentiation context whose primal side produced `output` and whose tangent side receives
+    ///     the converted tangent.
+    ///   - `primal`: Primal value that was converted.
+    ///   - `output`: Converted primal value, whose tangent type the returned tangent has.
+    ///   - `tangent`: Tangent of `primal`.
+    ///   - `needs_ordering`: Whether the tangent must depend on `output` even when the output tangent type carries
+    ///     every identity of the tangent (i.e., in a fused program whose primal conversion still runs a check or
+    ///     depends on witness producers).
+    pub(crate) fn bind_tangent<C: Context<Type = T, Operation: From<Self>>, P: DifferentiationPolicy<C>>(
+        context: &DifferentiationContext<C, P>,
+        primal: &C::Value,
+        output: &C::Value,
+        tangent: &C::Value,
+        needs_ordering: bool,
+    ) -> Result<C::Value, ProgramError>
+    where
+        T: DifferentiableType,
+    {
+        let tangent_type = output.r#type().tangent()?;
+        let mut witnesses = Vec::new();
+        // Retain source names only when the output tangent will no longer carry them. Static extents and names already
+        // present in that tangent need no saved primal value.
+        let needs_source = tangent
+            .r#type()
+            .identities()
+            .any(|(_, identity)| !tangent_type.identities().any(|(_, available)| available == identity));
+        let source_carries_output = tangent_type
+            .identities()
+            .all(|(_, identity)| tangent.r#type().identities().any(|(_, available)| available == identity));
+        if needs_source {
+            let source = if needs_ordering && source_carries_output {
+                Self::bind_unchecked(
+                    context.primal(),
+                    primal,
+                    std::slice::from_ref(output),
+                    primal.r#type().into_owned(),
+                )?
+            } else {
+                primal.clone()
+            };
+            witnesses.push(context.primal_to_tangent(source)?);
+        }
+        // In a fused forward-mode program the primal result retains every witness and check producer. A partitioned
+        // tangent program runs only after the primal completes and needs residuals only for missing extents.
+        if !source_carries_output || (needs_ordering && !needs_source) {
+            witnesses.push(context.primal_to_tangent(output.clone())?);
+        }
+        Self::bind_unchecked(context.tangent(), tangent, &witnesses, tangent_type)
+    }
+
+    /// Validates operation structure before delegating the complete cast contract to its type trait.
+    fn validate_structure(&self, input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> Result<(), TypeError> {
+        if self.input_types.is_empty() {
+            return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
+        }
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        Ok(())
+    }
+
+    /// Returns the inferred output type for direct interpretation over values of the supplied `input_types`, after
+    /// proving the complete relationship in both modes. Concrete extents complete the proof, whereas symbolic
+    /// relationships that still need a runtime check are rejected with [`ProgramError::Concretization`], since an
+    /// interpreter has no check to run. Backends that interpret casts eagerly (e.g., first-class dimension casts) use
+    /// this instead of [`Operation::infer_output_types`] so that they never skip a required check.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Types of the value followed by its witnesses.
+    ///   - `region_interfaces`: Interfaces of the attached regions, which must be empty.
+    pub fn infer_interpreted_output_type(
         &self,
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
-    ) -> Result<(), ProgramError>
+    ) -> Result<T, ProgramError>
     where
         T: CastType,
     {
-        self.infer_output_types(input_types, region_interfaces)?;
-        let refinements = T::Refinements::new(
-            std::iter::once(&self.output_type)
-                .chain(&self.witness_types)
-                .chain(self.input_type())
-                .collect::<Vec<_>>(),
-            input_types.iter().chain(self.input_type().map(|_| &input_types[0])).collect::<Vec<_>>(),
-        )?;
-        let mut needs_runtime_checks = !refinements.identities_needing_runtime_checks().is_empty();
-        if !needs_runtime_checks && let Some(relation) = self.relation() {
-            // The output represents this same value. Check the local relation against its actual input type, rather
-            // than treating the requested output type as an independent observation of runtime geometry.
-            let local = T::Refinements::from_local_declarations([relation], [&input_types[0]])?;
-            needs_runtime_checks = !local.identities_needing_runtime_checks().is_empty();
-        }
-        if needs_runtime_checks {
-            return Err(ProgramError::Concretization {
-                message: "`cast` cannot check symbolic type relationships during interpretation; \
-                          bind the operation through its context"
-                    .to_owned(),
-            });
-        }
-        Ok(())
+        self.validate_structure(input_types, region_interfaces)?;
+        let (_, interpreted) = T::infer_cast_output_type(self, input_types)?;
+        interpreted.ok_or_else(|| ProgramError::Concretization {
+            message: format!(
+                "`{CAST_OPERATION_NAME}` cannot check symbolic type relationships during interpretation; \
+                 bind the operation through its context",
+            ),
+        })
     }
 }
 
@@ -1359,9 +1328,22 @@ impl<T: CastType> Operation for CastOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        check_count!("input", input_types, 1 + self.witness_types.len(), TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-        Ok(vec![T::infer_cast_output_type(self, input_types)?])
+        self.validate_structure(input_types, region_interfaces)?;
+        let (output, _) = T::infer_cast_output_type(self, input_types)?;
+        Ok(vec![output])
+    }
+
+    fn fold(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        self.validate_structure(input_types, region_interfaces)?;
+        let (_, interpreted) = T::infer_cast_output_type(self, input_types)?;
+        // Witnesses can carry the check that justifies a transform's cast. Keep their producers as explicit value
+        // dependencies even when the returned representation is unchanged.
+        Ok((input_types.len() == 1 && interpreted.as_ref() == Some(&input_types[0]))
+            .then(|| vec![OperationFoldOutput::Input(0)]))
     }
 
     #[inline]
@@ -1373,24 +1355,15 @@ impl<T: CastType> Operation for CastOperation<T> {
         }
     }
 
-    #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        // Unlike the declared types of a guard, the input, output and witness types name identities of the
-        // surrounding program, so they follow its renamings. The relation is a local declaration and stays unchanged.
+        // Every stored declaration names identities of the surrounding program.
         Ok(Self {
-            output_type: self.output_type.rename_identities(renaming)?,
-            witness_types: self
-                .witness_types
+            input_types: self
+                .input_types
                 .iter()
                 .map(|r#type| r#type.rename_identities(renaming))
                 .collect::<Result<_, _>>()?,
-            relation: self
-                .relation
-                .as_deref()
-                .map(|(input_type, relation)| {
-                    input_type.rename_identities(renaming).map(|input_type| Box::new((input_type, relation.clone())))
-                })
-                .transpose()?,
+            output_type: self.output_type.rename_identities(renaming)?,
             checked: self.checked,
         })
     }
@@ -1398,21 +1371,7 @@ impl<T: CastType> Operation for CastOperation<T> {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("type", &self.output_type)?;
-            if let Some(input_type) = self.input_type() {
-                operation.field("input_type", input_type)?;
-            }
-            if !self.witness_types.is_empty() {
-                operation.field(
-                    "witnesses",
-                    format_args!(
-                        "[{}]",
-                        self.witness_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-                    ),
-                )?;
-            }
-            if let Some(relation) = self.relation() {
-                operation.field("relation", relation)?;
-            }
+            operation.list("inputs", &self.input_types)?;
             if self.checked {
                 operation.field("checked", true)?;
             }
@@ -1423,30 +1382,52 @@ impl<T: CastType> Operation for CastOperation<T> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> CastOperation<T> where T: CastType);
 
-impl<C: Domain<Type: CastType>> InterpretableOperation<C> for CastOperation<C::Type> {
+impl<C: Domain<Type: CastType, Value: Cast<C::Type>>> InterpretableOperation<C> for CastOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Concrete values carry their geometry in their types. For symbolic values, conditional facts cannot replace
-        // a runtime check: interpretation accepts only relationships already proved by the types, in both modes.
-        self.validate_concrete_inputs(
-            &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
+        // Concrete values carry their extents in their types. For symbolic values, conditional facts cannot replace a
+        // runtime check: interpretation accepts only relationships already proven by the types, in both modes.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let output_type = self.infer_interpreted_output_type(
+            &input_types,
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
-        Ok(vec![inputs[0].clone()])
+        if inputs.len() == 1 && inputs[0].r#type().as_ref() == &output_type {
+            return Ok(vec![inputs[0].clone()]);
+        }
+        // The complete original declaration has been proven. Materialize the requested representation once;
+        // the value capability retains every witness producer, including for an unchanged representation.
+        Ok(vec![inputs[0].cast_unchecked(output_type, &inputs[1..])?])
     }
 }
 
 impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
     for CastOperation<C::Type>
 {
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Residual inputs may be more refined than the original declaration (e.g., a known value with an exact shape),
+        // so normalize against them before the default rule folds or residualizes the cast: a proven cast is pure and
+        // must not be ordered behind earlier assertions.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        context.fold_or_residualize(
+            self.clone().normalized(&input_types),
+            driver.regions().map(|region| region.to_program()).collect(),
+            inputs,
+        )
+    }
 }
 
-impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: BatchingTypePolicy<C>>
-    BatchableOperation<C, P> for CastOperation<C::Type>
+impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
+    for CastOperation<C::Type>
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -1454,45 +1435,45 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // The stacked value and witnesses are retyped with the batch axis of each one inserted into its type, and the
-        // output keeps the batch axis of the value.
+        // Validate the original declaration before lifting can erase its layout constraints. Reconstructed per-item
+        // types have already lost layout and may carry manual variation introduced by the batch axis, so they are not
+        // the original invocation's representations. The parent validates the supplied values against the lifted
+        // declaration, preserving source/witness shapes, layout and sharding unrelated to the mapped axes.
+        check_count!("input", inputs, self.input_types.len(), ProgramError);
         self.infer_output_types(
-            &inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>(),
+            &self.input_types,
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
-        let extent = P::batch_extent(context)?;
-        let output_type =
-            P::batched_declared_type(context, CAST_OPERATION_NAME, &inputs[0], &self.output_type, &extent)?;
-        let witness_types = self
-            .witness_types
-            .iter()
-            .zip(&inputs[1..])
-            .map(|(witness_type, witness)| {
-                P::batched_declared_type(context, CAST_OPERATION_NAME, witness, witness_type, &extent)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut operation = CastOperation { output_type, witness_types, relation: None, checked: self.checked };
-        if let Some((input_type, relation)) = self.relation.as_deref() {
-            // Only the relation's names are local to this cast. Keep output and witness names in their ambient scope.
-            let mut renaming = TypeIdentityRenaming::new();
-            for (_, identity) in relation.identities() {
-                if renaming.target(identity).is_none() {
-                    renaming.insert(identity.clone(), identity.fresh())?;
-                }
-            }
-            let relation = relation.rename_identities(&renaming)?;
-            let relation = P::batched_declared_type(context, CAST_OPERATION_NAME, &inputs[0], &relation, &extent)?;
-            let input_type = P::batched_declared_type(context, CAST_OPERATION_NAME, &inputs[0], input_type, &extent)?;
-            operation = operation.with_relation(input_type, relation);
+        // An exact one-input identity has no relationship left to check. Keep its original carrier, including
+        // physical layout and ragged extents that are absent from the logical per-item type. Witnesses or different
+        // declarations can impose additional relationships, so they must continue through the lifted primitive.
+        if let [input] = inputs
+            && self.input_types[0] == self.output_type
+            && P::unbatched_type(input).as_ref() == &self.output_type
+        {
+            return Ok(vec![input.clone()].into());
         }
+        let input_types = self
+            .input_types
+            .iter()
+            .zip(inputs)
+            .map(|(r#type, input)| P::batched_type(context, input, r#type))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_type = P::batched_type(context, &inputs[0], &self.output_type)?;
         let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
+        let operation = CastOperation { input_types, output_type, checked: self.checked }
+            .normalized(&values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>());
         let mut outputs = context.parent().bind(operation, Vec::new(), &values)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![P::batch(outputs.remove(0), P::batch_axis(&inputs[0]))?].into())
     }
 }
 
-impl<C: Context<Type = T>, T: DifferentiableType + CastType> DifferentiableOperation<C> for CastOperation<T>
+// The differentiation and transposition rules are hand-written rather than generated through the
+// `impl_differentiable_operation!` macro because the forward-mode rule consults the differentiation policy
+// (`PRIMAL_COMPLETES_BEFORE_TANGENT`), which the macro does not expose, and the transpose rule needs the context's
+// retained dimension sources.
+impl<T: DifferentiableType + CastType, C: Context<Type = T>> DifferentiableOperation<C> for CastOperation<T>
 where
     C::Operation: From<CastOperation<T>>,
 {
@@ -1502,29 +1483,20 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // A cast is the identity on values, so the tangent of its first input is retyped to the output's tangent type
-        // by an unchecked cast, behind the primal cast (which checks the relationship when this cast is checked). The
-        // primal inputs witness that tangent cast, which keeps the identities of the first input in scope for its
-        // transpose. The primal output of a checked cast witnesses it too, so that the tangent conversion depends on
-        // the check. Witnesses carry no derivatives.
+        // The tangent is an unchecked cast behind the primal conversion (refer to `bind_tangent`). Shape witnesses
+        // carry no derivatives. In a fused JVP, the tangent must stay behind the primal check and behind the witness
+        // producers, which may themselves be the checks that justify an unchecked cast.
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut outputs = context.primal().bind(self.clone(), Vec::new(), &primals)?;
+        let primal_types = primals.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let operation = self.clone().normalized(&primal_types);
+        let needs_ordering = !P::PRIMAL_COMPLETES_BEFORE_TANGENT && (primals.len() > 1 || operation.checked);
+        let mut outputs = context.primal().bind(operation, Vec::new(), &primals)?;
         check_count!("output", outputs, 1, ProgramError);
         let output = outputs.remove(0);
         Ok(vec![match inputs[0].tangent() {
             MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(output)?,
             MaybeZero::Value(tangent) => {
-                let tangent_type = output.r#type().tangent()?;
-                let mut witnesses = primals
-                    .iter()
-                    .map(|primal| context.primal_to_tangent(primal.clone()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if self.checked {
-                    witnesses.push(context.primal_to_tangent(output.clone())?);
-                }
-                let relation = self.relation().map(DifferentiableType::tangent).transpose()?;
-                let tangent =
-                    CastOperation::bind_unchecked(context.tangent(), tangent, &witnesses, tangent_type, relation)?;
+                let tangent = Self::bind_tangent(context, &primals[0], &output, tangent, needs_ordering)?;
                 DifferentiationDual::new(output, tangent)?
             }
         }])
@@ -1536,35 +1508,46 @@ impl<
     V: Value<Type = T>,
     O: Operation<Type = T> + From<AddOperation<T>> + From<CastOperation<T>>,
 > TransposableOperation<V, O> for CastOperation<T>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
-        _driver: &D,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         // The transpose of the identity is the identity, at the cotangent type of the linear first input, converted by
-        // an unchecked cast because the forward program already established the relationship. The known witnesses keep
-        // that type's identities in scope; a linear witness would have no value to witness with.
+        // an unchecked cast after proving its relationship. Conditional checked primal casts must be linearized first.
+        // Known witnesses keep that type's identities in scope. Linear witnesses have zero cotangents and need no
+        // primal value unless their extents are required below; retained sources can supply missing identities.
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        let mut witnesses = inputs[1..]
-            .iter()
-            .map(|witness| {
-                witness.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
-                    message: format!("`{CAST_OPERATION_NAME}` cannot transpose a linear witness"),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.validate_structure(&input_types, &driver.regions().map(|region| region.interface()).collect::<Vec<_>>())?;
+        let (_, interpreted) = T::infer_cast_output_type(self, &input_types)?;
+        if self.checked && inputs.iter().any(PartialValue::is_unknown) && interpreted.is_none() {
+            let missing = if inputs[0].is_unknown() { "value" } else { "witnesses" };
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot transpose a checked `{CAST_OPERATION_NAME}` without the primal {missing} its check \
+                     needs; linearize the program first",
+                ),
+            }
+            .into());
+        }
+        if !accumulators[0].is_needed() {
+            return Ok(());
+        }
+        let mut witnesses = inputs[1..].iter().filter_map(|input| input.as_known().cloned()).collect::<Vec<_>>();
         let cotangent_type = inputs[0].r#type().cotangent()?;
-        let relation = self.relation().map(DifferentiableType::cotangent).transpose()?;
         let contribution = match &outputs[0] {
             MaybeZero::Zero(_) => MaybeZero::Zero(cotangent_type),
             MaybeZero::Value(cotangent) => {
                 // The accumulator requires the original nominal type, even when the forward cast fixed its extent.
-                // Retained primal geometry can witness that name without changing the accumulator's contract.
+                // Retained primal extents can witness that name without changing the accumulator's contract.
                 let mut missing = cotangent_type.identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>();
                 for value in std::iter::once(cotangent).chain(&witnesses) {
                     let r#type = value.r#type();
@@ -1589,32 +1572,389 @@ impl<
                     }
                     .into());
                 }
-                MaybeZero::Value(CastOperation::bind_unchecked(
-                    &**context,
-                    cotangent,
-                    &witnesses,
-                    cotangent_type,
-                    relation,
-                )?)
+                MaybeZero::Value(CastOperation::bind_unchecked(&**context, cotangent, &witnesses, cotangent_type)?)
             }
         };
         accumulators[0].accumulate(context, contribution)
     }
 }
 
+/// Infers the output of a [`CastOperation`] for this type family, validating the complete relationship between its
+/// input, output, and witness types. This includes dimension extents and identities as well as other type properties.
+/// The value and representation constraints are described by [`CastOperation`]. This trait validates them
+/// together with the complete source and witness declarations.
+///
+/// Custom type families implement this trait to use [`CastOperation`]. Their interpreted values implement [`Cast`]
+/// to materialize any requested representation changes. The built-in implementations use [`TypeRefinements`] to
+/// validate dimension and identity relationships and infer the output's representation.
+pub trait CastType: Type {
+    /// Validates `operation` against `input_types` (the value followed by its witnesses) and returns the inferred
+    /// output type together with an optional output representation for direct interpretation. The latter is present
+    /// only when the supplied types prove the complete shape without a runtime check; its identities must be carried by
+    /// live inputs, with erased declared names resolved to proven extents. Every requested output name must occur in
+    /// the declared input signature, consistently for direct interpretation and staging.
+    ///
+    /// Both checked and unchecked casts use the same type rules: statically contradictory relationships are errors,
+    /// while relationships requiring runtime checks are permitted. A missing interpretation representation permits
+    /// staging but requires concrete shapes before interpretation, including for unchecked casts. The mode determines
+    /// whether staged and compiled programs check or assume those relationships. Optional layout and sharding changes
+    /// do not require runtime shape checks and retain the requested representation fields.
+    ///
+    /// The declared input signature must contain the first input and admit the supplied types. The input and requested
+    /// output must describe the same value: corresponding dimensions have equal extents and shared identities agree
+    /// across the input, output, and witnesses. The remaining type requirements are described by [`CastOperation`].
+    /// The inferred output preserves names carried by corresponding live inputs and resolves names lost during
+    /// concretization to exact extents (refer to [`CastOperation::output_type`]). Invalid input counts must return an
+    /// error, even when called directly.
+    fn infer_cast_output_type(
+        operation: &CastOperation<Self>,
+        input_types: &[Self],
+    ) -> Result<(Self, Option<Self>), TypeError>;
+}
+
+impl CastType for DataType {
+    #[inline]
+    fn infer_cast_output_type(
+        operation: &CastOperation<Self>,
+        input_types: &[Self],
+    ) -> Result<(Self, Option<Self>), TypeError> {
+        operation.validate_declaration(input_types)?;
+        if input_types[0] == operation.output_type {
+            Ok((operation.output_type, Some(operation.output_type)))
+        } else {
+            Err(unrelated_cast_types(&input_types[0], &operation.output_type))
+        }
+    }
+}
+
+impl CastType for ArrayType {
+    #[inline]
+    fn infer_cast_output_type(
+        operation: &CastOperation<Self>,
+        input_types: &[Self],
+    ) -> Result<(Self, Option<Self>), TypeError> {
+        // The composite contract preserves the requested output's member kind, which is an array here.
+        infer_member_cast_output_type(operation, input_types, |output| match output {
+            ArrayIrType::Array(output) => output,
+            _ => unreachable!(),
+        })
+    }
+}
+
+impl CastType for DimensionType {
+    #[inline]
+    fn infer_cast_output_type(
+        operation: &CastOperation<Self>,
+        input_types: &[Self],
+    ) -> Result<(Self, Option<Self>), TypeError> {
+        // The composite contract preserves the requested output's member kind, which is a dimension here.
+        infer_member_cast_output_type(operation, input_types, |output| match output {
+            ArrayIrType::Dimension(output) => output,
+            _ => unreachable!(),
+        })
+    }
+}
+
+impl CastType for ArrayIrType {
+    #[inline]
+    fn infer_cast_output_type(
+        operation: &CastOperation<Self>,
+        input_types: &[Self],
+    ) -> Result<(Self, Option<Self>), TypeError> {
+        let preserved = operation.validate_declaration(input_types)?;
+        match (&input_types[0], &operation.output_type) {
+            (Self::Array(input), Self::Array(output)) => {
+                // Admission above guarantees that the declared first input has the supplied input's member kind.
+                let Self::Array(declared) = &operation.input_types[0] else { unreachable!() };
+                validate_array_cast_types(declared, input, output)?;
+            }
+            (Self::Dimension(input), Self::Dimension(output)) => {
+                if matches!((input.extent(), output.extent()), (Some(input), Some(output)) if input != output) {
+                    return Err(unrelated_cast_types(input, output));
+                }
+            }
+            _ => return Err(unrelated_cast_types(&input_types[0], &operation.output_type)),
+        }
+        let (dimensions, interpreted) = infer_cast_dimensions(
+            operation.input_types.iter().map(cast_ir_dimensions),
+            input_types.iter().map(cast_ir_dimensions),
+            cast_ir_dimensions(&operation.output_type),
+            &preserved,
+        )?;
+        // `validate_declaration` rejected reference types, and a dimension output has exactly one dimension.
+        let represent = |dimensions: Vec<Dimension>| match &operation.output_type {
+            Self::Array(output) => Self::Array(output.clone().with_shape(Shape::new(dimensions))),
+            Self::Dimension(_) => Self::Dimension(DimensionType::from(dimensions.into_iter().next().unwrap())),
+            Self::Reference(_) => unreachable!(),
+        };
+        Ok((represent(dimensions), interpreted.map(represent)))
+    }
+}
+
+/// Infers a native array or dimension cast through the composite type contract, keeping one implementation for
+/// homogeneous and mixed families. The requested output's member kind is preserved.
+fn infer_member_cast_output_type<T: Type + Into<ArrayIrType>>(
+    operation: &CastOperation<T>,
+    input_types: &[T],
+    project: impl Fn(ArrayIrType) -> T,
+) -> Result<(T, Option<T>), TypeError> {
+    let operation = CastOperation {
+        input_types: operation.input_types.iter().cloned().map(Into::into).collect(),
+        output_type: operation.output_type.clone().into(),
+        checked: operation.checked,
+    };
+    let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
+    let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
+    Ok((project(output), interpreted.map(project)))
+}
+
+/// Returns the dimensions of a composite cast input after reference types have been rejected.
+fn cast_ir_dimensions(r#type: &ArrayIrType) -> &[Dimension] {
+    match r#type {
+        ArrayIrType::Array(r#type) => r#type.shape().dimensions(),
+        ArrayIrType::Dimension(r#type) => std::slice::from_ref(r#type.dimension()),
+        ArrayIrType::Reference(_) => unreachable!(),
+    }
+}
+
+/// Returns the diagnostic for incompatible cast types.
+fn unrelated_cast_types(input: &impl Display, output: &impl Display) -> TypeError {
+    TypeError::invalid(format!("`{CAST_OPERATION_NAME}` cannot convert type `{input}` to unrelated type `{output}`"))
+}
+
+/// Validates input admission, value-preserving array properties and directly contradictory static axes. Layout and
+/// placement over explicit mesh axes may change, while placement over auto and manual mesh axes, manual variation
+/// and reduction state must remain unchanged.
+fn validate_array_cast_types(declared: &ArrayType, input: &ArrayType, output: &ArrayType) -> Result<(), TypeError> {
+    if declared.unreduced_axes() != input.unreduced_axes() || declared.reduced_axes() != input.reduced_axes() {
+        return Err(TypeError::invalid(format!(
+            "`{CAST_OPERATION_NAME}` supplied input changes the declared reduction state",
+        )));
+    }
+    if input.data_type() != output.data_type()
+        || input.rank() != output.rank()
+        || input.memory() != output.memory()
+        || input.unreduced_axes() != output.unreduced_axes()
+        || input.reduced_axes() != output.reduced_axes()
+        || input.shape().dimensions().iter().zip(output.shape().dimensions()).any(|(input, output)| {
+            matches!((input, output), (Dimension::Static(input), Dimension::Static(output)) if input != output)
+        })
+    {
+        return Err(unrelated_cast_types(input, output));
+    }
+    // These are semantic dependencies, not optional placement constraints. An absent sharding is invariant, and
+    // changing variation requires the corresponding operation (whose transpose performs the required reduction).
+    if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[declared, input]).is_err() {
+        return Err(TypeError::invalid(format!(
+            "`{CAST_OPERATION_NAME}` supplied input changes the declared manual variation",
+        )));
+    }
+    if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[input, output]).is_err() {
+        return Err(TypeError::invalid(format!(
+            "`{CAST_OPERATION_NAME}` cannot change varying manual axes; use `parallel_vary` to add variation \
+             or a reduction to remove it",
+        )));
+    }
+    // Placement follows the rules of `reshard`: the type system tracks placement over explicit mesh axes, so the
+    // output may request a new one, whereas placement over auto axes belongs to backend compilers and transitions
+    // over manual axes require manual collectives. The output therefore names the same auto and manual axes as the
+    // input on every dimension. Carrying them forward requests no redistribution, and an output without a sharding
+    // stays untracked rather than requesting replication.
+    if let Some(output_sharding) = output.sharding() {
+        let named_axes =
+            |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding.dimensions()[dimension] {
+                ShardingDimension::Sharded(axis_names) => axis_names
+                    .iter()
+                    .filter(|name| sharding.mesh().axis_type(name) == Some(axis_type))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
+            };
+        for (axis_type, remedy) in [
+            (MeshAxisType::Auto, format!("use `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them")),
+            (MeshAxisType::Manual, "use manual collectives for transitions over them".to_owned()),
+        ] {
+            if (0..output.rank()).any(|dimension| {
+                named_axes(output_sharding, dimension, axis_type)
+                    != input.sharding().map(|sharding| named_axes(sharding, dimension, axis_type)).unwrap_or_default()
+            }) {
+                return Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` cannot change placement over {axis_type} mesh axes; {remedy}",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Solves all dimension relationships of a cast in one set of scoped classes. Input and output declarations share the
+/// declared scope; supplied inputs share the actual scope. The output observes the same first actual input as the
+/// source declaration, but its per-axis comparisons admit conditional narrowing and differently bounded identities.
+fn infer_cast_dimensions<'o>(
+    declared: impl Iterator<Item = &'o [Dimension]>,
+    actual: impl Iterator<Item = &'o [Dimension]>,
+    output: &'o [Dimension],
+    preserved_identities: &[DimensionVariable],
+) -> Result<(Vec<Dimension>, Option<Vec<Dimension>>), TypeError> {
+    let declared = declared.collect::<Vec<_>>();
+    let actual = actual.collect::<Vec<_>>();
+    let mut facts = declared
+        .iter()
+        .zip(&actual)
+        .flat_map(|(declared, actual)| {
+            declared.iter().zip(actual.iter()).flat_map(|(declared, actual)| {
+                DimensionRefinements::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+            })
+        })
+        .collect::<Vec<_>>();
+    for (declared, actual) in output.iter().zip(actual[0]) {
+        // A singleton output declaration supplies an exact fact even when actual types no longer carry its name.
+        if let Dimension::Dynamic(variable) = declared
+            && let Some(extent) = variable.bounds().extent()
+        {
+            facts.push(Ok(DimensionRefinementFact::Declared(variable, extent)));
+        }
+        match (declared, actual) {
+            (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) => {
+                facts.push(Ok(DimensionRefinementFact::Correspondence(declared, actual)));
+            }
+            (Dimension::Static(_), Dimension::Dynamic(_)) => {
+                // Reversing ordinary refinement admits narrowing to a static axis. Its extent belongs to the
+                // supplied source variable, so retain the actual scope when recording that fact.
+                facts.extend(
+                    DimensionRefinements::refinement_facts(actual, declared, DimensionComparison::LocalDeclarations)
+                        .map(|fact| {
+                            fact.map(|fact| match fact {
+                                DimensionRefinementFact::Declared(variable, extent) => {
+                                    DimensionRefinementFact::Actual(variable, extent)
+                                }
+                                _ => unreachable!(),
+                            })
+                        }),
+                );
+            }
+            _ => facts.extend(DimensionRefinements::refinement_facts(
+                declared,
+                actual,
+                DimensionComparison::LocalDeclarations,
+            )),
+        }
+    }
+    let refinements = DimensionRefinements::from_refinement_facts(facts)?;
+    for class in refinements.identity_classes() {
+        // Every identity class has at least one member, so the maximal lower bound exists.
+        let lower = class
+            .declared()
+            .iter()
+            .chain(class.actual())
+            .map(|variable| variable.bounds().lower())
+            .max()
+            .unwrap();
+        if class
+            .declared()
+            .iter()
+            .chain(class.actual())
+            .any(|variable| variable.bounds().upper().is_some_and(|upper| upper <= lower))
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` cannot equate dimensions with disjoint bounds: {}",
+                class
+                    .declared()
+                    .iter()
+                    .chain(class.actual().iter().filter(|variable| !class.declared().contains(variable)))
+                    .map(|variable| format!("`{variable}` ∈ {}", variable.bounds()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+    }
+    // A formal identity may be the same object as an unrelated actual identity. Preserve its name only when
+    // its scoped correspondence reaches that actual identity; otherwise resolve its own class below.
+    let preserved_identities = preserved_identities
+        .iter()
+        .filter(|variable| {
+            refinements
+                .identity_classes()
+                .any(|class| class.declared().contains(variable) && class.actual().contains(variable))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // Full cast inference has validated compatibility. Ordinary refinement of shapes alone now distinguishes
+    // relationships already proven by the supplied types from conditional equalities that need a runtime check. Layout
+    // and sharding are intentionally absent: changing them adds no runtime shape constraint.
+    let proof_declarations = std::iter::once(output)
+        .chain(declared.iter().copied())
+        .flatten()
+        .cloned()
+        .map(DimensionType::from)
+        .collect::<Vec<_>>();
+    let proof_actual = std::iter::once(actual[0])
+        .chain(actual.iter().copied())
+        .flatten()
+        .cloned()
+        .map(DimensionType::from)
+        .collect::<Vec<_>>();
+    // The complete scoped signature proves equality when every occurrence observes an already equal actual
+    // dimension. A consistent formal-to-actual renaming does not require an additional runtime check. Ordinary
+    // refinement does not admit a conditional relationship at all (e.g., a supplied `n` against a requested static
+    // extent), so a failure here means that the relationship needs a runtime check, not that it is contradictory:
+    // contradictions were rejected by the scoped facts above.
+    let proven = match DimensionTypeRefinements::new(&proof_declarations, &proof_actual) {
+        Ok(proof) => proof.identities_needing_runtime_checks().is_empty(),
+        Err(_) => false,
+    };
+    let actual_identities = actual
+        .iter()
+        .flat_map(|dimensions| dimensions.iter())
+        .filter_map(Dimension::variable)
+        .cloned()
+        .collect::<Vec<_>>();
+    let output: Vec<_> = output
+        .iter()
+        .map(|dimension| {
+            let refined = refinements.refine_declared_dimension(dimension, &preserved_identities);
+            if let Dimension::Dynamic(variable) = &refined
+                && !actual_identities.contains(variable)
+            {
+                let represented = refinements.retype_actual_dimension(dimension, &refined, &actual_identities);
+                if let Dimension::Dynamic(variable) = &represented
+                    && !actual_identities.contains(variable)
+                {
+                    return Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` output identity `{variable}` has no compatible \
+                         supplied input identity",
+                    )));
+                }
+                Ok(represented)
+            } else {
+                Ok(refined)
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    let interpreted = proven.then(|| output.clone());
+    Ok((output, interpreted))
+}
+
 /// Represents the ability to return a value at a different but related type representation, through a [`CastOperation`]
 /// (e.g., an `f32[n]` value whose runtime extent is 2 as `f32[2]`, or an `f32[2]` value as `f32[n]` next to a witness
 /// of type `f32[n]`). The value at the output type and the witnesses at their own types must satisfy every relationship
 /// that their shared identities express (refer to [`CastOperation`]). Concrete values have exact types, so a cast
-/// checks immediately that the value's type refines the output type (their witnesses carry no identities).
-/// Context-carrying values apply the operation through their context, where symbolic witness types relate the output's
-/// identities to other values. An [`ArrayIrValue`] delegates array casts to its array member, including when that
-/// member is a tracer; its concrete dimension witnesses have exact types and introduce no shared identities.
-/// [`cast`](Self::cast) checks the relationship in staged and compiled programs too,
-/// whereas [`cast_unchecked`](Self::cast_unchecked) assumes it there.
+/// checks shapes immediately and materializes the requested representation. Concrete witnesses carry no identities:
+/// they cannot supply a nominal output name, so requesting an output name absent from the declared inputs is rejected
+/// in both direct execution and staging. Host arrays retain exact shapes and use dense row-major storage when the
+/// layout is unspecified. Context-carrying values apply the operation through their context, where symbolic witness
+/// types relate the output's identities to other values. An [`ArrayIrValue`] delegates array casts to its array member,
+/// including when that member is a tracer; its concrete dimension witnesses have exact types and introduce no shared
+/// identities. Host dimension results reject array witnesses that their member context cannot resolve as constants; use
+/// a composite context to retain staged dependencies or observe backend completion. [`cast`](Self::cast) checks the
+/// relationship in staged and compiled programs too, whereas [`cast_unchecked`](Self::cast_unchecked) assumes it there.
 ///
 /// Casting is not elementwise: each value has its own output type and witnesses, so this capability applies to
 /// individual values rather than to [`Parameterized`](crate::parameters::Parameterized) structures.
+///
+/// Placement over explicit mesh axes may change under the rules of [`Reshard`](crate::Reshard), whereas placement
+/// over auto and manual mesh axes is preserved (refer to [`CastOperation`]). The XLA backend requires finite dimension
+/// bounds when changing physical allocation bounds, and constrains placement only when the explicit placement changes.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
@@ -1628,8 +1968,8 @@ impl<
 /// let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
 /// let value = Array::vector(vec![1f32, 2f32])?;
 ///
-/// // A concrete value of extent 2 can be represented as `f32[n]` or `f32[2]`, but not as `f32[3]`.
-/// assert_eq!(value.cast(symbolic, &[])?, value);
+/// // Concrete inputs cannot supply the nominal name `n`; exact shapes still support representation changes.
+/// assert!(value.cast(symbolic, &[]).is_err());
 /// assert_eq!(value.cast(ArrayType::new_static(DataType::F32, [2]), &[])?, value);
 /// assert!(value.cast(ArrayType::new_static(DataType::F32, [3]), &[]).is_err());
 /// # Ok(())
@@ -1674,62 +2014,81 @@ pub trait Cast<T = <Self as Capability>::Universe>: Capability + Sized {
     fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError>;
 }
 
+impl<
+    T: CastType,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<CastOperation<T>>>>,
+> Cast<T> for V
+{
+    fn cast(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
+        bind_cast(self, output_type, witnesses, true)
+    }
+
+    fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
+        bind_cast(self, output_type, witnesses, false)
+    }
+}
+
 impl Cast for Array {
     #[inline]
     fn cast(&self, output_type: ArrayType, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        cast_array(CastOperation::checked(output_type, Vec::new()), self, witnesses)
+        cast_array(self, output_type, witnesses, true)
     }
 
     #[inline]
     fn cast_unchecked(&self, output_type: ArrayType, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        cast_array(CastOperation::unchecked(output_type, Vec::new()), self, witnesses)
+        cast_array(self, output_type, witnesses, false)
     }
 }
 
-impl<A: Value<Type = ArrayType> + Cast<ArrayType>> Cast for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayType>> Cast for ArrayIrValue<A> {
     #[inline]
     fn cast(&self, output_type: ArrayIrType, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        cast_array_ir_value(CastOperation::checked(output_type, Vec::new()), self, witnesses)
+        cast_array_ir_value(self, output_type, witnesses, true)
     }
 
     #[inline]
     fn cast_unchecked(&self, output_type: ArrayIrType, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        cast_array_ir_value(CastOperation::unchecked(output_type, Vec::new()), self, witnesses)
+        cast_array_ir_value(self, output_type, witnesses, false)
     }
 }
 
-impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<CastOperation<T>>>>>
-    Cast<T> for V
-{
-    fn cast(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        bind_cast(CastOperation::checked(output_type, Vec::new()), self, witnesses)
-    }
-
-    fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        bind_cast(CastOperation::unchecked(output_type, Vec::new()), self, witnesses)
-    }
-}
-
-/// Applies `operation`, whose witness types are not yet set, to the concrete array `value` and `witnesses` by checking
-/// its complete relationship over their exact types.
-fn cast_array(operation: CastOperation<ArrayType>, value: &Array, witnesses: &[Array]) -> Result<Array, ProgramError> {
+/// Casts the concrete array `value` to `output_type`, validating its complete relationship with `witnesses`.
+fn cast_array(
+    value: &Array,
+    output_type: ArrayType,
+    witnesses: &[Array],
+    checked: bool,
+) -> Result<Array, ProgramError> {
     let input_types =
         std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    CastOperation { witness_types: input_types[1..].to_vec(), ..operation }
-        .validate_concrete_inputs(&input_types, &[])?;
-    Ok(value.clone())
+    let output_type = CastOperation { input_types: input_types.clone(), output_type, checked }
+        .infer_interpreted_output_type(&input_types, &[])?;
+    let input_type = value.r#type();
+    // Materialized arrays retain exact shapes after declared names have been resolved to their known extents.
+    // All other representation fields follow the request, including dense default storage for an unspecified layout.
+    let representation = output_type.with_shape(input_type.shape().clone());
+    if representation == *input_type {
+        Ok(value.clone())
+    } else if representation.layout() == input_type.layout() {
+        // Sharding annotations do not change host-array storage.
+        Ok(Array::new_unchecked(representation, value.shared_storage_bytes().clone()))
+    } else {
+        // Layout determines physical addressing. Re-encode logical bytes to preserve exact element bits,
+        // including low-precision encodings and NaN payloads, rather than relabeling the original physical buffer.
+        Array::from_logical_bytes(representation, &value.logical_bytes())
+    }
 }
 
-/// Applies `operation` through the array member's execution context, or validates a concrete dimension cast. Check
-/// every member before omitting dimension witnesses: their exact types carry no identities, while reference witnesses
-/// are invalid. Array members may themselves be tracers, so their symbolic relationships must not be checked as if
-/// they were concrete values.
-fn cast_array_ir_value<A: Value<Type = ArrayType> + Cast<ArrayType>>(
-    operation: CastOperation<ArrayIrType>,
+/// Casts through the array member's execution context, or validates a concrete dimension cast. Rejects reference
+/// witnesses before omitting concrete dimension witnesses, whose exact types carry no identities. Array members may
+/// themselves be tracers, so their symbolic relationships must not be checked as if they were concrete values.
+fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayType>>(
     value: &ArrayIrValue<A>,
+    output_type: ArrayIrType,
     witnesses: &[ArrayIrValue<A>],
+    checked: bool,
 ) -> Result<ArrayIrValue<A>, ProgramError> {
-    if let (ArrayIrValue::Array(value), ArrayIrType::Array(output_type)) = (value, operation.output_type()) {
+    if let (ArrayIrValue::Array(value), ArrayIrType::Array(output_type)) = (value, &output_type) {
         let witnesses = witnesses
             .iter()
             .filter_map(|witness| match witness {
@@ -1741,7 +2100,7 @@ fn cast_array_ir_value<A: Value<Type = ArrayType> + Cast<ArrayType>>(
                 )))),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(ArrayIrValue::Array(if operation.is_checked() {
+        return Ok(ArrayIrValue::Array(if checked {
             value.cast(output_type.clone(), &witnesses)?
         } else {
             value.cast_unchecked(output_type.clone(), &witnesses)?
@@ -1749,49 +2108,72 @@ fn cast_array_ir_value<A: Value<Type = ArrayType> + Cast<ArrayType>>(
     }
     let input_types =
         std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let operation = CastOperation { witness_types: input_types[1..].to_vec(), ..operation };
-    operation.validate_concrete_inputs(&input_types, &[])?;
+    let operation = CastOperation { input_types: input_types.clone(), output_type, checked };
+    operation.infer_interpreted_output_type(&input_types, &[])?;
+    for witness in witnesses {
+        if let ArrayIrValue::Array(witness) = witness
+            && !witness
+                .domain()
+                .resolve(witness)
+                .into_constant()
+                .is_some_and(|constant| constant.capture_index().is_none())
+        {
+            return Err(ProgramError::Concretization {
+                message: format!(
+                    "host dimension `{CAST_OPERATION_NAME}` cannot retain an array witness producer; bind the \
+                     cast through a composite context",
+                ),
+            });
+        }
+    }
     Ok(value.clone())
 }
 
-/// Binds `operation`, whose witness types are not yet set, to `value` and `witnesses` through the domain of `value`.
-fn bind_cast<V: Value<Domain: Context<Operation: From<CastOperation<V::Type>>>>>(
-    operation: CastOperation<V::Type>,
+/// Captures the complete input signature and binds a cast through the domain of `value`.
+fn bind_cast<V: Value<Type: CastType, Domain: Context<Operation: From<CastOperation<V::Type>>>>>(
     value: &V,
+    output_type: V::Type,
     witnesses: &[V],
+    checked: bool,
 ) -> Result<V, ProgramError> {
     let inputs = std::iter::once(value).chain(witnesses).cloned().collect::<Vec<_>>();
-    let witness_types = witnesses.iter().map(|witness| witness.r#type().into_owned()).collect();
-    let mut outputs = value.domain().bind(CastOperation { witness_types, ..operation }, Vec::new(), &inputs)?;
+    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let operation = CastOperation { input_types: input_types.clone(), output_type, checked }.normalized(&input_types);
+    let mut outputs = value.domain().bind(operation, Vec::new(), &inputs)?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use indoc::{formatdoc, indoc};
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
-        Array, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout,
-        Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
+        Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
     };
-    use crate::batching::BatchAxis;
+    use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
+    use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
         TranspositionContext, differentiate_at,
     };
     use crate::macros::{
-        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference, dispatch_on_array_element_type,
     };
     use crate::operations::assertions::{AssertOperation, AssertionError, GuardOperation};
+    use crate::operations::control_flow::condition::ConditionOperation;
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EffectClasses, Effects, EmptyRegionDriver, ProgramBuilder, ReferenceType, Typed};
@@ -1799,10 +2181,15 @@ mod tests {
 
     use super::*;
 
-    // An independent type family can implement the operation-specific contract without changing TypeRefinements.
+    // An independent type family can implement the operation-specific contract without changing `TypeRefinements`.
+    // The impl lives at module level because trait impls are never scoped to a function.
     impl CastType for ProjectedMemberType<0> {
-        fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
-            infer_cast_output_type(operation, input_types, |_, _| true)
+        fn infer_cast_output_type(
+            operation: &CastOperation<Self>,
+            input_types: &[Self],
+        ) -> Result<(Self, Option<Self>), TypeError> {
+            operation.validate_declaration(input_types)?;
+            Ok((operation.output_type.clone(), Some(operation.output_type.clone())))
         }
     }
 
@@ -2207,10 +2594,7 @@ mod tests {
         let array = Array::from_elements(ArrayType::new_static(DataType::U16, [2, 3, 2]), &[0u16; 12]).unwrap();
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
-        let input = ArrayBatch::new(array.clone(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(array.clone(), extents.clone(), &variable, 1).unwrap();
         let ragged_axes = input.ragged_axes().to_vec();
         let (outputs, _) = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
             .batch(&context, &EmptyRegionDriver, &[input])
@@ -2219,10 +2603,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::new_static(DataType::U32, [2, 3]));
         assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
-        let input = ArrayBatch::new(array, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(2, extents, variable, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(array, extents, &variable, 2).unwrap();
         assert_eq!(
             ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
                 .batch(&context, &EmptyRegionDriver, &[input])
@@ -2831,7 +3212,7 @@ mod tests {
         assert_eq!(converted.elements::<i32>(), Ok(vec![1, -2]));
         assert_eq!(converted.storage_bytes().len(), 12);
 
-        // Tiled layouts count elements, so widening preserves their tile geometry and logical element order.
+        // Tiled layouts count elements, so widening preserves their tile shape and logical element order.
         let input_type = ArrayType::new_static(DataType::F32, [3])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         let widened = Array::from_elements(input_type.clone(), &[1.5f32, -2.5, 3.0])
@@ -3162,7 +3543,7 @@ mod tests {
 
     #[test]
     fn test_array_reduce_precision() {
-        // Reference arrays keep their type while rounding every element.
+        // Host arrays keep their type while rounding every element.
         let input = Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.00048828125f32, 1e10]).unwrap();
         let output = input.reduce_precision(5, 10).unwrap();
         assert_eq!(output.r#type(), input.r#type());
@@ -3309,149 +3690,324 @@ mod tests {
         assert_eq!(output.into_iter().map(bf16::to_bits).collect::<Vec<_>>(), expected);
     }
 
-    // TODO(eaplatanios): Review from here onwards.
+    #[test]
+    fn test_cast() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let operation = CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]);
+        assert_eq!(operation.name(), CAST_OPERATION_NAME);
+        assert_eq!(operation.input_types(), &[symbolic.clone(), symbolic.clone()]);
+        assert_eq!(operation.output_type(), &symbolic);
+        assert!(!operation.is_checked());
+        assert_eq!(operation.effects().classes(), Effects::empty().classes());
+        assert_eq!(operation.to_string(), "cast [type=f32[n], inputs=[f32[n], f32[n]]]");
+        assert_eq!(
+            CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]).to_string(),
+            "cast [type=f32[n], inputs=[f32[n]]]",
+        );
+
+        // A checked cast is ordered like an assertion and renders its mode.
+        let checked = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]);
+        assert!(checked.is_checked());
+        assert_eq!(checked.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        assert_eq!(checked.to_string(), "cast [type=f32[n], inputs=[f32[n], f32[n]], checked=true]");
+        assert_eq!(
+            format!("{:?}", CastOperation::checked(DataType::F32, vec![DataType::F32])),
+            "CastOperation { input_types: [F32], output_type: F32, checked: true }",
+        );
+
+        // Equality and hashing follow the declarations and the mode.
+        assert_eq!(operation, CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]));
+        assert_ne!(operation, checked);
+        assert_ne!(operation, CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]));
+        let operations = HashSet::from([operation.clone(), checked.clone()]);
+        assert!(operations.contains(&operation));
+        assert!(operations.contains(&checked));
+        assert!(!operations.contains(&CastOperation::unchecked(symbolic.clone(), vec![symbolic])));
+    }
 
     #[test]
-    fn test_cast_type_infer_cast_output_type() {
-        check_operation_type_inference!(
-            operation = CastOperation::checked(ProjectedMemberType::<0>, Vec::new())
-                .with_relation(ProjectedMemberType::<0>, ProjectedMemberType::<0>),
-            cases = [{ input_types = [ProjectedMemberType::<0>], output_types = [ProjectedMemberType::<0>] }],
+    fn test_cast_normalized() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+
+        // Actual types that prove the relationship turn a checked cast into an unchecked one, an unproven narrowing
+        // keeps its check, and an unchecked cast is returned unchanged.
+        assert_eq!(
+            CastOperation::checked(laid_out.clone(), vec![exact.clone()]).normalized(&[exact.clone()]),
+            CastOperation::unchecked(laid_out, vec![exact.clone()]),
         );
         assert_eq!(
-            DataType::infer_cast_output_type(&CastOperation::checked(DataType::F32, Vec::new()), &[DataType::F32]),
-            Ok(DataType::F32),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).normalized(&[exact.clone()]),
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]),
         );
         assert_eq!(
-            DataType::infer_cast_output_type(&CastOperation::checked(DataType::F64, Vec::new()), &[DataType::F32]),
-            Err(TypeError::invalid("`cast` cannot convert type `f32` to unrelated type `f64`")),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).normalized(&[symbolic.clone()]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]),
+        );
+        assert_eq!(
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).normalized(&[symbolic.clone()]),
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]),
         );
 
-        // Direct capability calls validate complete shapes, not just element types or element counts, in both modes.
-        let array = ArrayType::new_static(DataType::F32, [2, 3]);
+        // The proof uses the actual types: a declaration admitting weaker actual types still needs its check.
+        let widening = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]);
+        assert_eq!(widening.clone().normalized(&[exact.clone(), symbolic]), widening);
+
+        // A cast whose declaration the actual types do not admit is returned unchanged for binding to reject.
+        let unrelated = CastOperation::checked(exact.clone(), vec![exact]);
+        assert_eq!(unrelated.clone().normalized(&[ArrayType::new_static(DataType::F32, [3])]), unrelated);
+    }
+
+    #[test]
+    fn test_cast_validate_declaration() {
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
-        let [n, p, q] = ["n", "p", "q"].map(|name| DimensionType::new(name, bounds));
-        let relation =
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()]));
-        for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            assert_eq!(
-                ArrayType::infer_cast_output_type(
-                    &constructor(array.clone(), Vec::new()),
-                    std::slice::from_ref(&array),
-                ),
-                Ok(array.clone()),
-            );
-            for output in [
-                ArrayType::scalar(DataType::F32),
-                ArrayType::new_static(DataType::F32, [1, 6]),
-                array.clone().with_memory(Memory::Host { pinned: true }),
-            ] {
-                let unrelated = Err(TypeError::invalid(format!(
-                    "`cast` cannot convert type `{array}` to unrelated type `{output}`",
-                )));
-                let related_error = if output == ArrayType::new_static(DataType::F32, [1, 6]) {
-                    Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-                        dimension: "p".to_owned(),
-                        expected: 2,
-                        actual: 1,
-                    }))
-                } else {
-                    unrelated.clone()
-                };
-                let operation = constructor(output, Vec::new());
-                assert_eq!(ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&array)), unrelated);
-                let related = operation.with_relation(array.clone(), relation.clone());
-                assert_eq!(ArrayType::infer_cast_output_type(&related, std::slice::from_ref(&array)), related_error);
-            }
+        let [n, m] = ["n", "m"].map(|name| DimensionType::new(name, bounds));
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let static_dimension: ArrayIrType = DimensionType::from(Dimension::Static(2)).into();
 
-            // A concrete witness can contradict a symbolic output even when each type is individually admissible.
-            let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-            let operation = constructor(symbolic.clone(), vec![symbolic.clone()]);
-            let exact = |extent| ArrayType::new_static(DataType::F32, [extent]);
-            assert_eq!(ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(2)]), Ok(exact(2)));
-            assert_eq!(
-                ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(3)]),
-                Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-                    dimension: "n".to_owned(),
-                    expected: 2,
-                    actual: 3,
-                })),
-            );
-            assert_eq!(
-                ArrayType::infer_cast_output_type(&operation, &[]),
-                Err(TypeError::invalid("expected 2 inputs but got 0")),
-            );
-            assert_eq!(
-                ArrayType::infer_cast_output_type(&operation, &[exact(2)]),
-                Err(TypeError::invalid("expected 2 inputs but got 1")),
-            );
-        }
+        // The returned identities are the output identities that live inputs still carry.
+        let widening = CastOperation::checked(symbolic.clone(), vec![exact.clone(), n.clone().into()]);
+        assert_eq!(widening.validate_declaration(&[exact.clone(), n.clone().into()]), Ok(vec![n.to_variable()]));
+        assert_eq!(widening.validate_declaration(&[exact.clone(), static_dimension]), Ok(Vec::new()));
 
-        let dimension = DimensionType::from(Dimension::Static(2));
-        let output = DimensionType::from(Dimension::Static(3));
+        // Each family-independent requirement is reported in turn.
         assert_eq!(
-            DimensionType::infer_cast_output_type(
-                &CastOperation::checked(output, Vec::new()),
-                std::slice::from_ref(&dimension),
-            ),
-            Err(TypeError::invalid("`cast` cannot convert type `dimension<2>` to unrelated type `dimension<3>`")),
+            CastOperation::checked(exact.clone(), Vec::new()).validate_declaration(&[]),
+            Err(TypeError::invalid("`cast` requires a declared first input type")),
         );
         assert_eq!(
-            DimensionType::infer_cast_output_type(
-                &CastOperation::checked(n, Vec::new()),
-                std::slice::from_ref(&dimension),
-            ),
+            widening.validate_declaration(&[exact.clone()]),
+            Err(TypeError::invalid("expected 2 inputs but got 1")),
+        );
+        let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
+        assert_eq!(
+            CastOperation::checked(exact.clone(), vec![exact.clone(), reference.clone()])
+                .validate_declaration(&[exact.clone(), reference]),
+            Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2]>`")),
+        );
+        assert_eq!(
+            CastOperation::checked(n.clone().into(), vec![exact.clone()]).validate_declaration(&[exact.clone()]),
             Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
         );
+        let wrong: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
         assert_eq!(
-            ArrayIrType::infer_cast_output_type(
-                &CastOperation::checked(ArrayIrType::Dimension(dimension), Vec::new()),
-                &[ArrayIrType::Array(array.clone())],
-            ),
-            Err(TypeError::invalid("`cast` cannot convert type `f32[2, 3]` to unrelated type `dimension<2>`")),
+            CastOperation::checked(exact.clone(), vec![exact.clone()]).validate_declaration(&[wrong]),
+            Err(TypeError::invalid("dimension 3 does not refine declared dimension 2")),
         );
-        let reference: ArrayIrType = ReferenceType::new(array.clone()).into();
         assert_eq!(
-            ArrayIrType::infer_cast_output_type(
-                &CastOperation::checked(array.into(), vec![reference.clone()]),
-                &[ArrayType::new_static(DataType::F32, [2, 3]).into(), reference],
-            ),
-            Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
+            CastOperation::checked(symbolic, vec![exact.clone(), m.clone().into()])
+                .validate_declaration(&[exact, m.into()]),
+            Err(TypeError::invalid("`cast` output identity `n` is not carried by a declared input")),
         );
     }
 
     #[test]
-    fn test_cast() {
+    fn test_cast_bind_unchecked() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let operation = CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]);
-        assert_eq!(operation.name(), CAST_OPERATION_NAME);
-        assert_eq!(operation.output_type(), &symbolic);
-        assert_eq!(operation.input_type(), None);
-        assert_eq!(operation.witness_types(), std::slice::from_ref(&symbolic));
-        assert!(!operation.is_checked());
-        assert_eq!(operation.effects().classes(), Effects::empty().classes());
-        assert_eq!(operation.to_string(), "cast [type=f32[n], witnesses=[f32[n]]]");
-        assert_eq!(CastOperation::unchecked(symbolic.clone(), Vec::new()).to_string(), "cast [type=f32[n]]");
+        let exact = ArrayType::new_static(DataType::F32, [2]);
 
-        // A checked cast is ordered like an assertion and renders its mode.
-        let checked = CastOperation::checked(symbolic.clone(), vec![symbolic.clone()]);
-        assert!(checked.is_checked());
-        assert_eq!(checked.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(checked.to_string(), "cast [type=f32[n], witnesses=[f32[n]], checked=true]");
+        // A value that already has the output type is returned as is when there are no witnesses, whereas witnesses
+        // stay explicit dependencies even for an identity conversion, and a representation change binds one unchecked
+        // cast.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                let context = inputs[0].context();
+                let identity = CastOperation::bind_unchecked(context, &inputs[0], &[], exact.clone())?;
+                assert_eq!(identity, inputs[0]);
+                let witnessed = CastOperation::bind_unchecked(context, &inputs[0], &inputs[1..], exact.clone())?;
+                let widened = CastOperation::bind_unchecked(context, &inputs[0], &inputs[1..], symbolic.clone())?;
+                Ok(vec![witnessed, widened])
+            },
+            vec![exact.clone(), symbolic.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[2], f32[n]]] %0 %1
+                    %3:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
+                in (%2, %3)"},
+        );
+    }
 
-        // The output and witness types name identities of the surrounding program, so they follow its renamings.
+    #[test]
+    fn test_cast_infer_interpreted_output_type() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+
+        // Concrete extents prove the relationship and the inferred representation is returned, in both modes.
+        let narrowing = CastOperation::checked(exact.clone(), vec![symbolic.clone()]);
+        assert_eq!(narrowing.infer_interpreted_output_type(&[exact.clone()], &[]), Ok(exact.clone()));
+        assert_eq!(
+            CastOperation::unchecked(laid_out.clone(), vec![exact.clone()])
+                .infer_interpreted_output_type(&[exact.clone()], &[]),
+            Ok(laid_out),
+        );
+
+        // A relationship that still needs a runtime check has no interpretation, even for an unchecked cast.
+        let unproven = Err(ProgramError::Concretization {
+            message: "`cast` cannot check symbolic type relationships during interpretation; \
+                      bind the operation through its context"
+                .to_owned(),
+        });
+        assert_eq!(narrowing.infer_interpreted_output_type(&[symbolic.clone()], &[]), unproven);
+        assert_eq!(
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()])
+                .infer_interpreted_output_type(&[symbolic], &[]),
+            unproven,
+        );
+
+        // Structural and type errors are reported before the proof.
+        assert_eq!(
+            narrowing.infer_interpreted_output_type(&[], &[]),
+            Err(ProgramError::Type(TypeError::invalid("expected 1 input but got 0"))),
+        );
+        assert_eq!(
+            narrowing.infer_interpreted_output_type(
+                &[exact.clone()],
+                &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
+            ),
+            Err(ProgramError::Type(TypeError::invalid("expected 0 regions but got 1"))),
+        );
+        assert_eq!(
+            CastOperation::checked(exact.clone(), vec![exact])
+                .infer_interpreted_output_type(&[ArrayType::new_static(DataType::F32, [3])], &[]),
+            Err(ProgramError::Type(TypeError::invalid("dimension 3 does not refine declared dimension 2"))),
+        );
+    }
+
+    #[test]
+    fn test_cast_rename_type_identities() {
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, m, a, b] = ["n", "m", "a", "b"].map(|name| DimensionType::new(name, bounds));
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+
+        // The declarations name identities of the surrounding program, so they follow its renamings in both modes,
+        // and renaming back restores the original operation.
+        let operation = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()]);
         let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(n.variable().unwrap().clone(), m.variable().unwrap().clone()).unwrap();
+        renaming.insert(n.to_variable(), m.to_variable()).unwrap();
+        let renamed = operation.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed.to_string(), "cast [type=f32[m], inputs=[f32[2], f32[m]], checked=true]");
+        let mut inverse = TypeIdentityRenaming::new();
+        inverse.insert(m.to_variable(), n.to_variable()).unwrap();
+        assert_eq!(renamed.rename_type_identities(&inverse), Ok(operation));
+
+        // A swap is simultaneous.
+        let array = |dimensions: Vec<Dimension>| ArrayType::new(DataType::F32, Shape::new(dimensions));
+        let mixed = CastOperation::unchecked(
+            array(vec![Dimension::Static(3), a.simplified_dimension()]),
+            vec![array(vec![b.simplified_dimension(), Dimension::Static(3)]), array(vec![a.simplified_dimension()])],
+        );
+        let mut swap = TypeIdentityRenaming::new();
+        swap.insert(a.to_variable(), b.to_variable()).unwrap();
+        swap.insert(b.to_variable(), a.to_variable()).unwrap();
         assert_eq!(
-            operation.rename_type_identities(&renaming).unwrap().to_string(),
-            "cast [type=f32[m], witnesses=[f32[m]]]",
+            mixed.rename_type_identities(&swap).unwrap().to_string(),
+            "cast [type=f32[3, b], inputs=[f32[a, 3], f32[b]]]",
+        );
+
+        // A first-class dimension declaration cannot be renamed to a variable with wider bounds.
+        let wide = DimensionType::new("wide", DimensionBounds::positive(Some(16)).unwrap());
+        let mut widening = TypeIdentityRenaming::new();
+        widening.insert(n.to_variable(), wide.to_variable()).unwrap();
+        assert_eq!(
+            CastOperation::<ArrayIrType>::checked(exact.clone().into(), vec![exact.into(), n.into()])
+                .rename_type_identities(&widening),
+            Err(TypeError::invalid(
+                "cannot rename dimension variable n with bounds [1, 8) to wide with bounds [1, 16)",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_cast_fold() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+
+        // A proven single-input identity folds to its input, whereas a representation change, an unproven
+        // relationship, and a witnessed cast do not: witness producers stay explicit dependencies even when the
+        // representation is unchanged.
+        let folded = Ok(Some(vec![OperationFoldOutput::Input(0)]));
+        assert_eq!(CastOperation::checked(exact.clone(), vec![symbolic.clone()]).fold(&[exact.clone()], &[]), folded);
+        assert_eq!(CastOperation::unchecked(exact.clone(), vec![exact.clone()]).fold(&[exact.clone()], &[]), folded);
+        assert_eq!(CastOperation::checked(laid_out, vec![exact.clone()]).fold(&[exact.clone()], &[]), Ok(None));
+        assert_eq!(
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).fold(&[symbolic.clone()], &[]),
+            Ok(None),
         );
         assert_eq!(
-            checked.rename_type_identities(&renaming).unwrap().to_string(),
-            "cast [type=f32[m], witnesses=[f32[m]], checked=true]",
+            CastOperation::checked(exact.clone(), vec![exact.clone(), symbolic.clone()])
+                .fold(&[exact.clone(), symbolic], &[]),
+            Ok(None),
         );
+
+        // Structural and type errors are reported.
+        assert_eq!(
+            CastOperation::checked(exact.clone(), Vec::new()).fold(&[], &[]),
+            Err(TypeError::invalid("`cast` requires a declared first input type")),
+        );
+        assert_eq!(
+            CastOperation::checked(exact.clone(), vec![exact.clone()])
+                .fold(&[exact.clone()], &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+        assert_eq!(
+            CastOperation::checked(exact.clone(), vec![exact]).fold(&[ArrayType::new_static(DataType::F32, [3])], &[]),
+            Err(TypeError::invalid("dimension 3 does not refine declared dimension 2")),
+        );
+    }
+
+    #[test]
+    fn test_cast_fold_preserves_witness_dependencies() {
+        // Interpreting a cast through a staging context binds it, so a proven identity folds to its input only when
+        // it has no witnesses: a witnessed identity keeps its checked witness producer in the staged program.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let vector = |extent| Array::vector(vec![1f32; extent]).unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |inputs: Vec<Tracer<_>>| {
+                    let witness = inputs[1].cast(symbolic.clone(), &[inputs[0].clone()])?;
+                    constructor(symbolic.clone(), vec![symbolic.clone(); 2]).interpret(
+                        inputs[0].context(),
+                        &EmptyRegionDriver,
+                        &[inputs[0].clone(), witness],
+                    )
+                },
+                vec![symbolic.clone(), exact.clone()],
+            )
+            .unwrap();
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[n], %1:f32[2] .
+                    let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %1 %0
+                        %3:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[n]]] %0 %2
+                    in (%3)"},
+            );
+            assert_eq!(program.interpret(vec![vector(2), vector(2)]), Ok(vec![vector(2)]));
+            assert_eq!(
+                program.interpret(vec![vector(3), vector(2)]),
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 3,
+                    actual: 2,
+                }))),
+            );
+        }
     }
 
     #[test]
@@ -3463,193 +4019,484 @@ mod tests {
 
         // Narrowing and widening are both admitted, for arrays and for first-class dimensions, and witnesses scope the
         // identities that a widened output type mentions.
-        let narrowing = CastOperation::unchecked(exact(2), vec![symbolic.clone()]);
-        assert_eq!(narrowing.infer_output_types(&[symbolic.clone(), symbolic.clone()], &[]), Ok(vec![exact(2)]));
-        let widening = CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]);
-        assert_eq!(widening.infer_output_types(&[exact(2), symbolic.clone()], &[]), Ok(vec![symbolic.clone()]));
-        assert_eq!(
-            CastOperation::unchecked(static_dimension(2), Vec::new()).infer_output_types(&[n.clone().into()], &[]),
-            Ok(vec![static_dimension(2)]),
+        let narrowing = CastOperation::unchecked(exact(2), vec![symbolic.clone(), symbolic.clone()]);
+        check_operation_type_inference!(
+            operation = narrowing.clone(),
+            cases = [{ input_types = [symbolic.clone(), symbolic.clone()], output_types = [exact(2)] }],
+        );
+        let widening = CastOperation::unchecked(symbolic.clone(), vec![exact(2), symbolic.clone()]);
+        check_operation_type_inference!(
+            operation = widening.clone(),
+            cases = [
+                { input_types = [exact(2), symbolic.clone()], output_types = [symbolic.clone()] },
+                { input_types = [exact(2)], error = "expected 2 inputs but got 1" },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = CastOperation::unchecked(static_dimension(2), vec![n.clone().into()]),
+            cases = [{ input_types = [n.clone().into()], output_types = [static_dimension(2)] }],
         );
 
         // A relationship that the static types already contradict is rejected in both directions.
         let mismatch = Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-            dimension: "n".to_string(),
-            expected: 2,
-            actual: 5,
+            dimension: "n".to_owned(),
+            expected: 5,
+            actual: 2,
         }));
         assert_eq!(widening.infer_output_types(&[exact(2), exact(5)], &[]), mismatch);
-        let widening_with_dimension = CastOperation::unchecked(symbolic.clone(), vec![n.clone().into()]);
+        let widening_with_dimension = CastOperation::unchecked(symbolic.clone(), vec![exact(2), n.clone().into()]);
         assert_eq!(widening_with_dimension.infer_output_types(&[exact(2), static_dimension(5)], &[]), mismatch);
         assert_eq!(narrowing.infer_output_types(&[symbolic.clone(), exact(5)], &[]), mismatch);
 
-        // Unrelated types, identity-defining output types, references, and wrong arities are rejected.
-        assert_eq!(
-            CastOperation::unchecked(exact(2), Vec::new()).infer_output_types(&[exact(3)], &[]),
-            Err(TypeError::invalid("`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`")),
+        // Unrelated types, identity-defining output types, and references are rejected.
+        check_operation_type_inference!(
+            operation = CastOperation::unchecked(exact(2), vec![exact(3)]),
+            cases = [{
+                input_types = [exact(3)],
+                error = "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
+            }],
         );
-        assert_eq!(
-            CastOperation::unchecked(n.clone().into(), Vec::new()).infer_output_types(&[static_dimension(2)], &[]),
-            Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
+        check_operation_type_inference!(
+            operation = CastOperation::unchecked(n.clone().into(), vec![static_dimension(2)]),
+            cases = [{
+                input_types = [static_dimension(2)],
+                error = "`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity",
+            }],
         );
         let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
-        assert_eq!(
-            CastOperation::unchecked(reference.clone(), Vec::new()).infer_output_types(&[reference], &[]),
-            Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2]>`")),
+        check_operation_type_inference!(
+            operation = CastOperation::unchecked(reference.clone(), vec![reference.clone()]),
+            cases = [{
+                input_types = [reference],
+                error = "`cast` does not support reference type `ref<f32[2]>`",
+            }],
         );
+
+        // The same operation infers bare element types in the `DataType` universe, where only identities are related.
+        check_operation_type_inference!(
+            operation = CastOperation::checked(DataType::F32, vec![DataType::F32]),
+            cases = [
+                { input_types = [DataType::F32], output_types = [DataType::F32] },
+                { input_types = [DataType::F64], error = "type f64 does not refine declared type f32" },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = CastOperation::checked(DataType::F64, vec![DataType::F32]),
+            cases = [{
+                input_types = [DataType::F32],
+                error = "`cast` cannot convert type `f32` to unrelated type `f64`",
+            }],
+        );
+
+        // The operation cannot own nested regions.
         assert_eq!(
-            widening.infer_output_types(&[exact(2)], &[]),
-            Err(TypeError::invalid("expected 2 inputs but got 1"))
+            narrowing.infer_output_types(
+                &[symbolic.clone(), symbolic],
+                &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
         );
     }
 
     #[test]
-    fn test_cast_type_inference_relations() {
-        // `f32[a]` and `f32[b, 3]`-style casts that rename an identity or narrow one component while widening another
-        // relate neither type to the other, so they need a relation that both instantiate. The relation is local: it
-        // renders, survives renamings of the surrounding program, and its bounds must contain both sides.
+    fn test_cast_type_inference_mixed_dimensions() {
+        // Narrowing some axes while widening others uses the per-axis rule: the source fixes `b` and its static axis,
+        // the witness must agree with that static axis through `a`, and a static output contradicting the declared
+        // source is rejected.
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
-        let [p, a, b] = ["p", "a", "b"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let array = |dimensions: Vec<Dimension>| -> ArrayIrType {
             ArrayType::new(DataType::F32, Shape::new(dimensions)).into()
         };
-        let relation = array(vec![p.simplified_dimension(), p.simplified_dimension()]);
         let input = array(vec![b.simplified_dimension(), Dimension::Static(3)]);
         let output = array(vec![Dimension::Static(3), a.simplified_dimension()]);
         let witness = array(vec![a.simplified_dimension()]);
-        let plain = CastOperation::unchecked(output.clone(), vec![witness.clone()]);
-        assert_eq!(
-            plain.infer_output_types(&[input.clone(), witness.clone()], &[]),
-            Err(TypeError::invalid("`cast` cannot convert type `f32[b, 3]` to unrelated type `f32[3, a]`")),
-        );
-        let related = plain.with_relation(input.clone(), relation.clone());
-        assert_eq!(related.input_type(), Some(&input));
-        assert_eq!(related.relation(), Some(&relation));
-        assert_eq!(related.infer_output_types(&[input.clone(), witness.clone()], &[]), Ok(vec![output.clone()]));
-        assert_eq!(
-            related.to_string(),
-            "cast [type=f32[3, a], input_type=f32[b, 3], witnesses=[f32[a]], relation=f32[p, p]]",
+        let operation = CastOperation::unchecked(output.clone(), vec![input.clone(), witness.clone()]);
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [{ input_types = [input.clone(), witness.clone()], output_types = [output] }],
         );
         assert_eq!(
-            related.infer_output_types(&[input.clone(), array(vec![Dimension::Static(5)])], &[]),
+            operation.infer_output_types(&[input.clone(), array(vec![Dimension::Static(5)])], &[]),
             Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "p".to_owned(),
-                expected: 3,
-                actual: 5,
+                dimension: "a".to_owned(),
+                expected: 5,
+                actual: 3,
             })),
         );
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(a.to_variable(), b.to_variable()).unwrap();
-        renaming.insert(b.to_variable(), a.to_variable()).unwrap();
-        let renamed = related.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed.input_type(), Some(&array(vec![a.simplified_dimension(), Dimension::Static(3)])));
-        assert_eq!(renamed.output_type(), &array(vec![Dimension::Static(3), b.simplified_dimension()]));
-        assert_eq!(renamed.relation(), Some(&relation));
-
-        // A relation whose bounds do not contain both sides, or that the static types contradict, is rejected.
-        let narrow = DimensionType::new("narrow", DimensionBounds::positive(Some(3)).unwrap());
-        let narrow_relation = array(vec![narrow.simplified_dimension(), narrow.simplified_dimension()]);
-        assert!(
-            CastOperation::unchecked(output.clone(), vec![witness.clone()])
-                .with_relation(input.clone(), narrow_relation)
-                .infer_output_types(&[input.clone(), witness.clone()], &[])
-                .is_err(),
-        );
-        let contradicted = array(vec![Dimension::Static(4), a.simplified_dimension()]);
-        assert!(
-            CastOperation::unchecked(contradicted, vec![witness.clone()])
-                .with_relation(input.clone(), relation)
-                .infer_output_types(&[input, witness], &[])
-                .is_err(),
+        check_operation_type_inference!(
+            operation = CastOperation::unchecked(
+                array(vec![Dimension::Static(4), Dimension::Static(4)]),
+                vec![input.clone(), witness.clone()],
+            ),
+            cases = [{
+                input_types = [input, witness],
+                error = "`cast` cannot convert type `f32[b, 3]` to unrelated type `f32[4, 4]`",
+            }],
         );
     }
 
     #[test]
-    fn test_cast_type_inference_relation_metadata() {
+    fn test_cast_type_inference_layout_and_sharding() {
+        // Changing the layout or the explicit placement preserves logical values, so each kind of transition (adding,
+        // changing, and dropping either annotation, or both at once) infers the requested output, in both modes and
+        // in both universes.
         let plain = ArrayType::new_static(DataType::F32, [2]);
-        let layouts = [
-            None,
-            Some(Layout::Strided(StridedLayout::new(vec![4]))),
-            Some(Layout::Strided(StridedLayout::new(vec![8]))),
-        ];
+        let narrow = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let wide = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let shardings = [
-            None,
-            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
-            Some(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap()),
-        ];
-        // Unspecified constraints admit either concrete value. Equal specified constraints agree; different ones
-        // conflict. Apply this truth table independently to all 81 combinations of layout and sharding declarations.
-        let compatible = [[true, true, true], [true, true, false], [true, false, true]];
-        for checked in [true, false] {
-            for (input_layout, layout) in layouts.iter().enumerate() {
-                for (output_layout, output_layout_value) in layouts.iter().enumerate() {
-                    for (input_sharding, sharding) in shardings.iter().enumerate() {
-                        for (output_sharding, output_sharding_value) in shardings.iter().enumerate() {
-                            let input =
-                                plain.clone().with_layout(layout.clone()).with_sharding(sharding.clone()).unwrap();
-                            let output = plain
-                                .clone()
-                                .with_layout(output_layout_value.clone())
-                                .with_sharding(output_sharding_value.clone())
-                                .unwrap();
-                            let expected = if compatible[input_layout][output_layout]
-                                && compatible[input_sharding][output_sharding]
-                            {
-                                Ok(vec![output.clone()])
-                            } else {
-                                Err(TypeError::invalid(format!(
-                                    "`cast` cannot convert type `{input}` to unrelated type `{output}`",
-                                )))
-                            };
-                            let operation = if checked {
-                                CastOperation::checked(output.clone(), Vec::new())
-                            } else {
-                                CastOperation::unchecked(output.clone(), Vec::new())
-                            }
-                            .with_relation(input.clone(), plain.clone());
-                            assert_eq!(operation.infer_output_types(&[input.clone()], &[]), expected);
-                            let operation = if checked {
-                                CastOperation::<ArrayIrType>::checked(output.into(), Vec::new())
-                            } else {
-                                CastOperation::<ArrayIrType>::unchecked(output.into(), Vec::new())
-                            }
-                            .with_relation(input.clone().into(), plain.clone().into());
-                            assert_eq!(
-                                operation.infer_output_types(&[input.into()], &[]),
-                                expected.map(|types| types.into_iter().map(ArrayIrType::from).collect()),
-                            );
-                        }
-                    }
-                }
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
+        let placed = plain.clone().with_sharding(sharded.clone()).unwrap();
+        let unplaced = plain.clone().with_sharding(replicated.clone()).unwrap();
+        let narrow_placed = narrow.clone().with_sharding(sharded).unwrap();
+        let wide_unplaced = wide.clone().with_sharding(replicated).unwrap();
+        for (input, output) in [
+            (plain.clone(), plain.clone()),
+            (plain.clone(), narrow.clone()),
+            (narrow.clone(), wide.clone()),
+            (wide, plain.clone()),
+            (plain.clone(), placed.clone()),
+            (placed.clone(), unplaced.clone()),
+            (unplaced, plain),
+            (narrow_placed.clone(), narrow_placed.clone()),
+            (narrow_placed.clone(), wide_unplaced.clone()),
+            (wide_unplaced, narrow_placed),
+            (narrow, placed),
+        ] {
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                assert_eq!(
+                    constructor(output.clone(), vec![input.clone()]).infer_output_types(&[input.clone()], &[]),
+                    Ok(vec![output.clone()]),
+                );
+            }
+            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+                assert_eq!(
+                    constructor(output.clone().into(), vec![input.clone().into()])
+                        .infer_output_types(&[input.clone().into()], &[]),
+                    Ok(vec![output.clone().into()]),
+                );
             }
         }
     }
 
     #[test]
-    fn test_cast_type_inference_relation_bounds() {
+    fn test_cast_type_inference_tiled_layout() {
+        // Tiled layouts are representation changes like strided ones.
+        let plain = ArrayType::new_static(DataType::F32, [4]);
+        let tiled = plain
+            .clone()
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        check_operation_type_inference!(
+            operation = CastOperation::checked(tiled.clone(), vec![plain.clone()]),
+            cases = [{ input_types = [plain.clone()], output_types = [tiled.clone()] }],
+        );
+        check_operation_type_inference!(
+            operation = CastOperation::unchecked(plain.clone(), vec![tiled.clone()]),
+            cases = [{ input_types = [tiled], output_types = [plain] }],
+        );
+    }
+
+    #[test]
+    fn test_cast_type_inference_distributed_semantics() {
+        // Manual variation and reduction state are semantic rather than optional placement: a supplied input may not
+        // carry variation or reduction state that the declared source lacks, and the output may not add or drop them,
+        // even when the supplied input matches the requested output exactly.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh, 1);
+        let varying = plain.clone().with_sharding(replicated.clone().with_varying_manual_axes(["x"]).unwrap()).unwrap();
+        let unreduced = plain.clone().with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap()).unwrap();
+        let reduced = plain.clone().with_sharding(replicated.with_reduced_axes(["x"]).unwrap()).unwrap();
+        let variation = TypeError::invalid("`cast` supplied input changes the declared manual variation");
+        let reduction = TypeError::invalid("`cast` supplied input changes the declared reduction state");
+        let variation_change = TypeError::invalid(
+            "`cast` cannot change varying manual axes; use `parallel_vary` to add variation or a reduction to \
+             remove it",
+        );
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let infer = |output: &ArrayType, declared: &ArrayType, actual: &ArrayType| {
+                constructor(output.clone(), vec![declared.clone()]).infer_output_types(&[actual.clone()], &[])
+            };
+            assert_eq!(infer(&varying, &plain, &varying), Err(variation.clone()));
+            assert_eq!(infer(&unreduced, &plain, &unreduced), Err(reduction.clone()));
+            assert_eq!(infer(&reduced, &plain, &reduced), Err(reduction.clone()));
+            assert_eq!(infer(&varying, &plain, &plain), Err(variation_change.clone()));
+            assert_eq!(infer(&plain, &varying, &varying), Err(variation_change.clone()));
+            assert_eq!(infer(&unreduced, &plain, &plain), Err(unrelated_cast_types(&plain, &unreduced)));
+            assert_eq!(infer(&plain, &unreduced, &unreduced), Err(unrelated_cast_types(&unreduced, &plain)));
+            assert_eq!(infer(&reduced, &plain, &plain), Err(unrelated_cast_types(&plain, &reduced)));
+            assert_eq!(infer(&plain, &reduced, &reduced), Err(unrelated_cast_types(&reduced, &plain)));
+        }
+
+        // The composite universe applies the same rules to its array members.
+        assert_eq!(
+            CastOperation::<ArrayIrType>::checked(varying.clone().into(), vec![plain.clone().into()])
+                .infer_output_types(&[varying.into()], &[]),
+            Err(variation),
+        );
+        assert_eq!(
+            CastOperation::<ArrayIrType>::unchecked(plain.clone().into(), vec![reduced.clone().into()])
+                .infer_output_types(&[reduced.clone().into()], &[]),
+            Err(unrelated_cast_types(&reduced, &plain)),
+        );
+    }
+
+    #[test]
+    fn test_cast_type_inference_placement() {
+        // Placement follows the rules of `reshard`: explicit placement may be requested, changed, and dropped from
+        // tracking, whereas the auto and manual axes that each dimension names are carried forward unchanged.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let plain = ArrayType::new_static(DataType::F32, [4, 4]);
+        let placed = |dimensions: [ShardingDimension; 2]| {
+            plain.clone().with_sharding(Sharding::new(mesh.clone(), dimensions.to_vec()).unwrap()).unwrap()
+        };
+        let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
+        let replicated = ShardingDimension::replicated;
+        let auto_error = TypeError::invalid(
+            "`cast` cannot change placement over auto mesh axes; use `constrain_sharding` to constrain placement \
+             over them",
+        );
+        let manual_error = TypeError::invalid(
+            "`cast` cannot change placement over manual mesh axes; use manual collectives for transitions over them",
+        );
+        let cases = [
+            (plain.clone(), placed([sharded(&["x"]), replicated()]), Ok(())),
+            (placed([sharded(&["x"]), replicated()]), placed([replicated(), sharded(&["x"])]), Ok(())),
+            (placed([sharded(&["x"]), replicated()]), plain.clone(), Ok(())),
+            // Replicating over a mesh with auto axes names none of them.
+            (plain.clone(), placed([replicated(), replicated()]), Ok(())),
+            // Auto placement is carried forward or left untracked, never introduced, dropped, or moved.
+            (placed([sharded(&["a"]), replicated()]), placed([sharded(&["x", "a"]), replicated()]), Ok(())),
+            (placed([sharded(&["x", "a"]), replicated()]), placed([sharded(&["a"]), replicated()]), Ok(())),
+            (placed([sharded(&["a"]), replicated()]), plain.clone(), Ok(())),
+            (plain.clone(), placed([sharded(&["a"]), replicated()]), Err(auto_error.clone())),
+            (placed([sharded(&["a"]), replicated()]), placed([replicated(), replicated()]), Err(auto_error.clone())),
+            (placed([sharded(&["a"]), replicated()]), placed([replicated(), sharded(&["a"])]), Err(auto_error)),
+            // Manual placement is carried forward, never introduced or dropped.
+            (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m"]), sharded(&["x"])]), Ok(())),
+            (plain.clone(), placed([sharded(&["m"]), replicated()]), Err(manual_error.clone())),
+            (placed([sharded(&["m"]), replicated()]), placed([sharded(&["x"]), replicated()]), Err(manual_error)),
+        ];
+        for (input, output, expected) in cases {
+            let expected = expected.map(|()| vec![output.clone()]);
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                assert_eq!(
+                    constructor(output.clone(), vec![input.clone()]).infer_output_types(&[input.clone()], &[]),
+                    expected,
+                );
+            }
+            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+                assert_eq!(
+                    constructor(output.clone().into(), vec![input.clone().into()])
+                        .infer_output_types(&[input.clone().into()], &[]),
+                    expected.clone().map(|types| types.into_iter().map(ArrayIrType::from).collect()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_type_inference_bounds() {
+        // Differently bounded identities may be equated as long as their bounds overlap; the output then carries the
+        // requested names together with its own layout and sharding, and disjoint bounds are rejected.
         let wide = DimensionBounds::positive(Some(8)).unwrap();
         let narrow = DimensionBounds::positive(Some(4)).unwrap();
-        let [p, q, a, d] = ["p", "q", "a", "d"].map(|name| DimensionType::new(name, wide));
+        let [a, d] = ["a", "d"].map(|name| DimensionType::new(name, wide));
         let [b, c] = ["b", "c"].map(|name| DimensionType::new(name, narrow));
-        let input = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), c.simplified_dimension()]));
-        let output =
-            ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), d.simplified_dimension()]));
-
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), c.simplified_dimension()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated(); 2]).unwrap();
-        let input = input.with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
-        let output = output.with_sharding(sharding).unwrap();
-        // Opposing symbolic bounds, repeated local names, and independent layout/sharding constraints remain supported.
-        // Inference must preserve the requested nominal output names rather than selecting another representation.
-        for relation in [
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()])),
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(); 2])),
-        ] {
-            check_operation_type_inference!(
-                operation = CastOperation::checked(output.clone(), vec![output.clone()])
-                    .with_relation(input.clone(), relation),
-                cases = [{ input_types = [input.clone(), output.clone()], output_types = [output.clone()] }],
+        let output =
+            ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), d.simplified_dimension()]))
+                .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated(); 2]).unwrap())
+                .unwrap();
+        check_operation_type_inference!(
+            operation = CastOperation::checked(output.clone(), vec![input.clone(), output.clone()]),
+            cases = [{ input_types = [input.clone(), output.clone()], output_types = [output.clone()] }],
+        );
+        let disjoint = DimensionType::new("disjoint", DimensionBounds::new(4, Some(8)).unwrap());
+        let disjoint =
+            ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), disjoint.simplified_dimension()]));
+        check_operation_type_inference!(
+            operation = CastOperation::checked(disjoint.clone(), vec![input.clone(), disjoint.clone()]),
+            cases = [{
+                input_types = [input, disjoint],
+                error = "`cast` cannot equate dimensions with disjoint bounds: `c` ∈ [1, 4), `disjoint` ∈ [4, 8)",
+            }],
+        );
+    }
+
+    #[test]
+    fn test_cast_type_inference_declared_witnesses() {
+        // Supplied identities cannot fill a missing declaration: that association would disappear when those
+        // inputs become concrete. The declaration must retain the original witness's nominal identity.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let n = DimensionType::new("n", bounds);
+        let other = DimensionType::new("other", bounds);
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let output: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        check_operation_type_inference!(
+            operation = CastOperation::checked(output.clone(), vec![exact.clone(), other.into()]),
+            cases = [{
+                input_types = [exact.clone(), n.clone().into()],
+                error = "`cast` output identity `n` is not carried by a declared input",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = CastOperation::checked(output.clone(), vec![exact.clone(), n.clone().into()]),
+            cases = [{ input_types = [exact.clone(), n.into()], output_types = [output] }],
+        );
+
+        // This also applies to singleton actual axes, which can instantiate a static declaration without retaining
+        // their names in it. Recording that name keeps the cast valid after all-known partial evaluation.
+        let fixed = DimensionType::new("fixed", DimensionBounds::new(2, Some(3)).unwrap());
+        let symbolic: ArrayIrType =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(fixed.to_variable())])).into();
+        check_operation_type_inference!(
+            operation = CastOperation::checked(symbolic.clone(), vec![exact.clone()]),
+            cases = [{
+                input_types = [symbolic.clone()],
+                error = "`cast` output identity `fixed` is not carried by a declared input",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = CastOperation::checked(symbolic.clone(), vec![symbolic]),
+            cases = [{ input_types = [exact.clone()], output_types = [exact] }],
+        );
+    }
+
+    #[test]
+    fn test_cast_type_inference_renamed_dimension_witness() {
+        // A first-class dimension witness may instantiate the declared identity under another name within its bounds.
+        // The source keeps its own name, which the inferred output then carries instead of the requested one.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [k, n, m] = ["k", "n", "m"].map(|name| DimensionType::new(name, bounds));
+        let source: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![k.simplified_dimension()])).into();
+        let target: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                constructor(target.clone(), vec![source.clone(), n.clone().into()])
+                    .infer_output_types(&[source.clone(), m.clone().into()], &[]),
+                Ok(vec![source.clone()]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_type_inference_proven_renaming() {
+        // A consistent formal-to-actual renaming proves the relationship without a runtime check, so the inferred
+        // output also has an interpretation representation.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [m, n] = ["m", "n"].map(|name| DimensionType::new(name, bounds));
+        let source = ArrayType::new(DataType::F32, Shape::new(vec![m.simplified_dimension()]));
+        let output = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let operation = CastOperation::<ArrayIrType>::checked(output.into(), vec![source.clone().into(), n.into()]);
+        assert_eq!(
+            ArrayIrType::infer_cast_output_type(&operation, &[source.clone().into(), m.into()]),
+            Ok((source.clone().into(), Some(source.into()))),
+        );
+    }
+
+    #[test]
+    fn test_cast_type_inference_refined_layout_and_sharding() {
+        // A supplied input may carry a layout or sharding that the unannotated declaration leaves unspecified, and the
+        // output still takes the requested representation rather than the supplied one.
+        let plain = ArrayType::new_static(DataType::U8, [2]);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let actual = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        let target = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![3])));
+        let actual_sharding = plain.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let target_sharding = plain.clone().with_sharding(Sharding::replicated(other_mesh, 1)).unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                constructor(target.clone(), vec![plain.clone()]).infer_output_types(&[actual.clone()], &[]),
+                Ok(vec![target.clone()]),
+            );
+            assert_eq!(
+                constructor(target_sharding.clone(), vec![plain.clone()])
+                    .infer_output_types(&[actual_sharding.clone()], &[]),
+                Ok(vec![target_sharding.clone()]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_type_inference_output_identity_classes() {
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, m, other] = ["n", "m", "other"].map(|name| DimensionType::new(name, bounds));
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let output: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation = constructor(output.clone(), vec![exact.clone(), n.clone().into(), other.clone().into()]);
+            // Declared n corresponds to supplied m. The other supplied n has a separate role and cannot supply the
+            // output's nominal binding merely because it uses the same identity object as the declaration. Resolve
+            // the formal n through its own class to the source's exact extent instead.
+            assert_eq!(
+                operation.infer_output_types(&[exact.clone(), m.clone().into(), n.clone().into()], &[]),
+                Ok(vec![exact.clone()]),
+            );
+            assert_eq!(
+                operation.infer_output_types(&[exact.clone(), n.clone().into(), m.clone().into()], &[]),
+                Ok(vec![output.clone()]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_type_inference_symbolic_witness_bounds() {
+        // A differently named witness instantiates the declared identity only within its own bounds, so a static
+        // output outside those bounds is rejected.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let n = DimensionType::new("n", bounds);
+        let m = DimensionType::new("m", DimensionBounds::new(4, Some(8)).unwrap());
+        let source: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact = |extent| ArrayIrType::from(ArrayType::new_static(DataType::F32, [extent]));
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let declarations = vec![source.clone(), n.clone().into()];
+            let actual = [source.clone(), m.clone().into()];
+            assert_eq!(
+                constructor(exact(2), declarations.clone()).infer_output_types(&actual, &[]),
+                Err(TypeError::custom(DimensionError::BindingOutOfBounds {
+                    variable: "m".to_owned(),
+                    value: 2,
+                    bounds: m.bounds(),
+                })),
+            );
+            assert_eq!(constructor(exact(5), declarations).infer_output_types(&actual, &[]), Ok(vec![exact(5)]));
+        }
+
+        // Neither witness class is exact. Joining them through the cast still requires a common admitted extent.
+        let other = DimensionType::new("other", bounds);
+        let lower = DimensionType::new("lower", DimensionBounds::positive(Some(4)).unwrap());
+        let upper = DimensionType::new("upper", DimensionBounds::new(4, Some(8)).unwrap());
+        let overlapping = DimensionType::new("overlapping", DimensionBounds::new(3, Some(8)).unwrap());
+        let output: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![other.simplified_dimension()])).into();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let declarations = vec![source.clone(), n.clone().into(), output.clone(), other.clone().into()];
+            let operation = constructor(output.clone(), declarations);
+            assert_eq!(
+                operation.infer_output_types(
+                    &[source.clone(), lower.clone().into(), output.clone(), upper.clone().into()],
+                    &[],
+                ),
+                Err(TypeError::invalid(
+                    "`cast` cannot equate dimensions with disjoint bounds: `n` ∈ [1, 8), `other` ∈ [1, 8), \
+                     `lower` ∈ [1, 4), `upper` ∈ [4, 8)",
+                )),
+            );
+            assert_eq!(
+                operation.infer_output_types(
+                    &[source.clone(), lower.clone().into(), output.clone(), overlapping.clone().into()],
+                    &[],
+                ),
+                Ok(vec![output.clone()]),
             );
         }
     }
@@ -3658,26 +4505,25 @@ mod tests {
     fn test_cast_interpretation() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
         let vector = |extent: usize| ArrayIrValue::Array(Array::vector(vec![1f32; extent]).unwrap());
         let dimension = |extent: usize| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 
-        // Interpretation checks the complete relationship over the concrete types: widening `f32[2]` to `f32[n]` next
-        // to a witness of extent 5 is rejected, and so is narrowing a value of the wrong extent.
-        let widening = CastOperation::unchecked(symbolic.clone(), vec![n.clone().into()]);
+        // Interpretation checks the complete relationship over the concrete types in both modes: widening `f32[2]` to
+        // `f32[n]` next to a witness of extent 5 is rejected, and so is narrowing a value of the wrong extent.
+        let mismatch = Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "n".to_owned(),
+            expected: 5,
+            actual: 2,
+        })));
+        let widening = CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]);
         assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2)]), Ok(vec![vector(2)]));
-        assert_eq!(
-            widening.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(5)]),
-            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "n".to_string(),
-                expected: 2,
-                actual: 5,
-            }))),
-        );
-        let checked = CastOperation::checked(symbolic.clone(), vec![n.clone().into()]);
+        assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(5)]), mismatch);
+        let checked = CastOperation::checked(symbolic.clone(), vec![exact.clone(), n.clone().into()]);
         assert_eq!(checked.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2)]), Ok(vec![vector(2)]));
-        assert!(checked.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(5)]).is_err());
-        let narrowing = CastOperation::unchecked(ArrayType::new_static(DataType::F32, [2]).into(), Vec::new());
+        assert_eq!(checked.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(5)]), mismatch);
+        let narrowing = CastOperation::unchecked(exact.clone(), vec![symbolic]);
         assert_eq!(narrowing.interpret(&context, &EmptyRegionDriver, &[vector(2)]), Ok(vec![vector(2)]));
         assert_eq!(
             narrowing.interpret(&context, &EmptyRegionDriver, &[vector(3)]),
@@ -3685,193 +4531,394 @@ mod tests {
                 "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
             ))),
         );
+
+        // Witnesses declared with a shared identity must agree with each other even when the output is static, so a
+        // cast can act as a guard over its witnesses.
+        let guard = CastOperation::checked(exact.clone(), vec![exact.clone(), n.clone().into(), n.into()]);
+        assert_eq!(
+            guard.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2), dimension(2)]),
+            Ok(vec![vector(2)]),
+        );
+        assert_eq!(
+            guard.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2), dimension(3)]),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_owned(),
+                expected: 2,
+                actual: 3,
+            }))),
+        );
+
+        // A reference cannot be the source of a cast.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap()));
+        assert_eq!(
+            CastOperation::unchecked(exact.clone(), vec![exact]).interpret(&context, &EmptyRegionDriver, &[reference]),
+            Err(ProgramError::Type(TypeError::invalid("`cast` does not support reference type `ref<f32[2]>`"))),
+        );
     }
 
     #[test]
     fn test_cast_interpretation_symbolic_relationships() {
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
-        let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let vector = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension()]));
         let matrix =
             ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let relation = ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(); 2]));
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let exact = context.input(ArrayType::new_static(DataType::F32, [2]));
         let witness = context.input(vector.clone());
         let value = context.input(matrix.clone());
         let expected = Err(ProgramError::Concretization {
             message: "`cast` cannot check symbolic type relationships during interpretation; \
-                          bind the operation through its context"
+                      bind the operation through its context"
                 .to_owned(),
         });
-        for checked in [true, false] {
-            let widening = if checked {
-                CastOperation::checked(vector.clone(), vec![vector.clone()])
-            } else {
-                CastOperation::unchecked(vector.clone(), vec![vector.clone()])
-            };
-            assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[exact.clone(), witness.clone()]), expected,);
-            let related = if checked {
-                CastOperation::checked(matrix.clone(), Vec::new())
-            } else {
-                CastOperation::unchecked(matrix.clone(), Vec::new())
-            }
-            .with_relation(matrix.clone(), relation.clone());
-            assert_eq!(related.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&value)), expected);
+
+        // Symbolic values carry no concrete extents, so a relationship that needs a runtime check is rejected in both
+        // modes rather than staged.
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let widening = constructor(vector.clone(), vec![ArrayType::new_static(DataType::F32, [2]), vector.clone()]);
+            assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[exact.clone(), witness.clone()]), expected);
         }
+
         // A type-level proof is sufficient when no runtime relationship remains to be checked.
         assert_eq!(
-            CastOperation::checked(matrix, Vec::new()).interpret(
+            CastOperation::checked(matrix.clone(), vec![matrix]).interpret(
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&value),
             ),
             Ok(vec![value]),
         );
+
         // A requested symbolic output is not a second runtime observation. The exact input proves this relation.
         assert_eq!(
-            CastOperation::checked(vector, Vec::new())
-                .with_relation(
-                    ArrayType::new_static(DataType::F32, [2]),
-                    ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension()])),
-                )
-                .interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&exact)),
+            CastOperation::checked(vector.clone(), vec![vector]).interpret(
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&exact),
+            ),
             Ok(vec![exact]),
         );
+
+        // Optional layout and sharding must not turn an unproven narrowing into a type-level proof or stage it before
+        // rejecting the input.
+        let narrowed =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let symbolic = context.input(ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension()])));
+        let operation = CastOperation::checked(narrowed, vec![symbolic.r#type().into_owned()]);
+        assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[symbolic.clone()]), expected);
+
+        // Equal bounds do not prove a different nominal output identity, and interpretation must not stage it.
+        let fresh = DimensionType::new("fresh", bounds);
+        let unrelated = ArrayType::new(DataType::F32, Shape::new(vec![fresh.simplified_dimension()]));
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation = constructor(unrelated.clone(), vec![symbolic.r#type().into_owned()]);
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[symbolic.r#type().into_owned()]),
+                Err(TypeError::invalid("`cast` output identity `fresh` is not carried by a declared input")),
+            );
+            assert_eq!(
+                operation.interpret(&context, &EmptyRegionDriver, &[symbolic.clone()]),
+                Err(ProgramError::Type(TypeError::invalid(
+                    "`cast` output identity `fresh` is not carried by a declared input",
+                ))),
+            );
+        }
         assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]
-    fn test_cast_interpretation_relations() {
+    fn test_cast_interpretation_symbolic_layout_and_sharding() {
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let name = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output = ArrayType::new(DataType::F32, Shape::new(vec![name.simplified_dimension()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let exact_output = output.clone().with_shape(plain.shape().clone());
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation =
+                constructor(output.clone(), vec![output.clone().with_layout(None).with_sharding(None).unwrap()]);
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[plain.clone()]),
+                Ok((exact_output.clone(), Some(exact_output.clone()))),
+            );
+            // The original declaration carries the output name, and the exact input proves its extent. Only the
+            // representation change is staged, with no unbound identity after concretization.
+            let (inferred, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |value| {
+                    let mut outputs = operation.interpret(value.context(), &EmptyRegionDriver, &[value.clone()])?;
+                    Ok(outputs.remove(0))
+                },
+                plain.clone(),
+            )
+            .unwrap();
+            assert_eq!(inferred, exact_output);
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[2] .
+                    let %1:f32[2][layout=strided{8}][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
+                        type=f32[2][layout=strided{8}][sharding={mesh<['x'=1:explicit]>, [{}]}],
+                        inputs=[f32[2]],
+                    ] %0
+                    in (%1)"},
+            );
+            let value = Array::vector(vec![1f32, 2f32]).unwrap();
+            assert_eq!(
+                program.interpret(value),
+                Ok(Array::from_elements(exact_output.clone(), &[1f32, 2f32]).unwrap()),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_interpretation_declared_dimensions() {
         let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
-        let [a, b, p, q] = ["a", "b", "p", "q"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output =
             ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let relation =
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()]));
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let square = Array::matrix(2, 2, vec![1f32; 4]).unwrap();
         let rectangular = Array::matrix(2, 3, vec![1f32; 6]).unwrap();
         let empty = Array::matrix(0, 0, Vec::<f32>::new()).unwrap();
         let mismatch = Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
-            dimension: "p".to_owned(),
-            expected: 2,
-            actual: 3,
+            dimension: "b".to_owned(),
+            expected: 3,
+            actual: 2,
         })));
 
         // Concrete execution must retain a = 2, b = 3 from the input declaration. It cannot assign those same names
-        // new extents from the requested output, even though the independently scoped relation has no repeated name.
-        for operation in
-            [CastOperation::checked(output.clone(), Vec::new()), CastOperation::unchecked(output, Vec::new())]
-        {
-            let operation = operation.with_relation(input.clone(), relation.clone());
+        // new extents from the requested output, even when each axis would separately admit the requested extent.
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation = constructor(output.clone(), vec![input.clone()]);
             assert_eq!(
                 operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&square)),
-                Ok(vec![square.clone()])
+                Ok(vec![square.clone()]),
             );
             assert_eq!(operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&rectangular)), mismatch);
             assert_eq!(
                 operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&empty)),
-                Ok(vec![empty.clone()])
+                Ok(vec![empty.clone()]),
             );
         }
 
-        // Reusing ambient identity objects in the local relation does not link their two scopes. Keeping the input's
-        // representation is valid for rectangular geometry, even when the local declaration uses the opposite names.
-        let local = ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let operation = CastOperation::checked(input.clone(), Vec::new()).with_relation(input, local);
+        // A cast that preserves its declared type accepts rectangular shapes.
+        let operation = CastOperation::checked(input.clone(), vec![input]);
         assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[rectangular.clone()]), Ok(vec![rectangular]));
     }
 
     #[test]
-    fn test_cast_interpretation_relation_metadata() {
+    fn test_cast_interpretation_dimension_matrix() {
+        // Each requested axis is compared with the unchanged runtime shape under the names that the source and witness
+        // declarations assign, so every combination of renaming, narrowing to a static axis, and witnessed axes
+        // accepts exactly the shapes that agree with those names.
+        let bounds = DimensionBounds::non_negative(Some(4)).unwrap();
+        let [a, b, c] = ["a", "b", "c"].map(|name| DimensionType::new(name, bounds));
+        let source =
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let witness = ArrayType::new(DataType::F32, Shape::new(vec![c.simplified_dimension()]));
+        let target = |dimensions: Vec<Dimension>| ArrayType::new(DataType::F32, Shape::new(dimensions));
+        let matrix = |rows, columns| Array::matrix(rows, columns, vec![1f32; rows * columns]).unwrap();
+        let vector = |extent| Array::vector(vec![1f32; extent]).unwrap();
+        let mismatch = |dimension: &str, expected, actual| {
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: dimension.to_owned(),
+                expected,
+                actual,
+            })))
+        };
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let interpret = |dimensions: Vec<Dimension>, value: Array, witness_value: Array| {
+                constructor(target(dimensions), vec![source.clone(), witness.clone()]).interpret(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[value, witness_value],
+                )
+            };
+            let identity = vec![a.simplified_dimension(), b.simplified_dimension()];
+            assert_eq!(interpret(identity.clone(), matrix(2, 3), vector(2)), Ok(vec![matrix(2, 3)]));
+            assert_eq!(interpret(identity, matrix(0, 0), vector(0)), Ok(vec![matrix(0, 0)]));
+            let swapped = vec![b.simplified_dimension(), a.simplified_dimension()];
+            assert_eq!(interpret(swapped.clone(), matrix(2, 2), vector(2)), Ok(vec![matrix(2, 2)]));
+            assert_eq!(interpret(swapped.clone(), matrix(0, 0), vector(0)), Ok(vec![matrix(0, 0)]));
+            assert_eq!(interpret(swapped, matrix(2, 3), vector(2)), mismatch("b", 3, 2));
+            let narrowed_rows = vec![Dimension::Static(2), a.simplified_dimension()];
+            assert_eq!(interpret(narrowed_rows.clone(), matrix(2, 2), vector(2)), Ok(vec![matrix(2, 2)]));
+            assert_eq!(
+                interpret(narrowed_rows, matrix(3, 3), vector(2)),
+                Err(ProgramError::Type(TypeError::invalid(
+                    "`cast` cannot convert type `f32[3, 3]` to unrelated type `f32[2, a]`",
+                ))),
+            );
+            let narrowed_columns = vec![b.simplified_dimension(), Dimension::Static(2)];
+            assert_eq!(interpret(narrowed_columns.clone(), matrix(2, 2), vector(2)), Ok(vec![matrix(2, 2)]));
+            assert_eq!(interpret(narrowed_columns, matrix(3, 2), vector(2)), mismatch("b", 2, 3));
+            let witnessed = vec![c.simplified_dimension(), a.simplified_dimension()];
+            assert_eq!(interpret(witnessed.clone(), matrix(2, 2), vector(2)), Ok(vec![matrix(2, 2)]));
+            assert_eq!(interpret(witnessed, matrix(2, 2), vector(3)), mismatch("c", 3, 2));
+            let fixed = vec![Dimension::Static(2), Dimension::Static(2)];
+            assert_eq!(interpret(fixed.clone(), matrix(2, 2), vector(2)), Ok(vec![matrix(2, 2)]));
+            assert_eq!(
+                interpret(fixed, matrix(2, 3), vector(2)),
+                Err(ProgramError::Type(TypeError::invalid(
+                    "`cast` cannot convert type `f32[2, 3]` to unrelated type `f32[2, 2]`",
+                ))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_interpretation_layout_and_sharding() {
+        // A layout change re-encodes the logical bytes and a sharding annotation only relabels them, in both modes,
+        // whether or not the supplied input already carries the requested sharding.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
         let output = plain.clone().with_sharding(sharding.clone()).unwrap();
-        let actual_type = input.clone().with_sharding(sharding).unwrap();
-        let actual = Array::from_elements(actual_type, &[1f32, 2f32]).unwrap();
+        let expected_value = Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap();
+        let unannotated = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+        let actual = Array::from_elements(input.clone().with_sharding(sharding).unwrap(), &[1f32, 2f32]).unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
-        let mut outputs = Vec::new();
-        for operation in
-            [CastOperation::checked(output.clone(), Vec::new()), CastOperation::unchecked(output, Vec::new())]
-        {
-            outputs.push(
-                builder
-                    .add_instruction(
-                        operation.with_relation(input.clone(), plain.clone()),
-                        Vec::new(),
-                        vec![value],
-                        None,
-                    )
-                    .unwrap()[0],
-            );
-        }
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder; 2]).unwrap();
+        let checked = builder
+            .add_instruction(CastOperation::checked(output.clone(), vec![input.clone()]), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        let unchecked = builder
+            .add_instruction(CastOperation::unchecked(output, vec![input]), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![checked, unchecked], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2][layout=strided{4}] .
                 let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
                     type=f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}],
-                    input_type=f32[2][layout=strided{4}],
-                    relation=f32[2],
+                    inputs=[f32[2][layout=strided{4}]],
                     checked=true,
                 ] %0
                     %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
                         type=f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}],
-                        input_type=f32[2][layout=strided{4}],
-                        relation=f32[2],
+                        inputs=[f32[2][layout=strided{4}]],
                     ] %0
                 in (%1, %2)"},
         );
-        assert_eq!(program.interpret(vec![actual.clone()]), Ok(vec![actual.clone(); 2]));
-        let context = EagerContext::new();
-        let known = [PartialValue::Known(actual.clone())];
-        let folded = program.partially_evaluate(&known).unwrap();
-        assert_eq!(folded.program().to_string(), "lambda  .\nin ()");
-        assert_eq!(folded.interpret(&context, &[]), Ok(vec![actual.clone(); 2]));
-        let residual = program.partially_evaluate(&[PartialValue::Unknown(input)]).unwrap();
-        assert_eq!(residual.program().to_string(), program.to_string());
-        assert_eq!(residual.interpret(&context, &[actual.clone()]), Ok(vec![actual.clone(); 2]));
-        let deferred = program.entry_region_ref().partially_evaluate_in_context(&context, &known, false).unwrap();
-        assert_eq!(
-            deferred.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2][layout=strided{4}][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
-                    type=f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}],
-                    input_type=f32[2][layout=strided{4}],
-                    relation=f32[2],
-                    checked=true,
-                ] %0
-                in (%1)"},
-        );
-        assert_eq!(deferred.interpret(&context, &[]), Ok(vec![actual; 2]));
+        assert_eq!(program.interpret(vec![actual]), Ok(vec![expected_value.clone(); 2]));
+        assert_eq!(program.interpret(vec![unannotated]), Ok(vec![expected_value; 2]));
     }
 
     #[test]
-    fn test_cast_interpretation_relation_ordering() {
+    fn test_cast_interpretation_unspecified_layout_and_sharding() {
+        // An output that adds a layout, a sharding, or both to an unannotated input materializes the requested
+        // representation in both modes and in both universes.
+        let input = Array::vector(vec![10u8, 20]).unwrap();
+        let plain = input.r#type().into_owned();
+        let layout = Layout::Strided(StridedLayout::new(vec![2]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+        for output_type in [
+            plain.clone().with_layout(layout.clone()),
+            plain.clone().with_sharding(sharding.clone()).unwrap(),
+            plain.clone().with_layout(layout).with_sharding(sharding).unwrap(),
+        ] {
+            let expected = Array::from_elements(output_type.clone(), &[10u8, 20]).unwrap();
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                assert_eq!(
+                    constructor(output_type.clone(), vec![plain.clone()]).interpret(
+                        &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                        &EmptyRegionDriver,
+                        &[input.clone()],
+                    ),
+                    Ok(vec![expected.clone()]),
+                );
+            }
+            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+                assert_eq!(
+                    constructor(output_type.clone().into(), vec![plain.clone().into()]).interpret(
+                        &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                        &EmptyRegionDriver,
+                        &[ArrayIrValue::Array(input.clone())],
+                    ),
+                    Ok(vec![ArrayIrValue::Array(expected.clone())]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_interpretation_refined_layout_and_sharding() {
+        // A supplied input whose layout or sharding the declaration leaves unspecified is re-encoded or relabeled into
+        // the requested representation.
+        let plain = ArrayType::new_static(DataType::U8, [2]);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let actual = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        let target = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![3])));
+        let actual_sharding = plain.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let target_sharding = plain.clone().with_sharding(Sharding::replicated(other_mesh, 1)).unwrap();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                constructor(target.clone(), vec![plain.clone()]).interpret(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[Array::from_elements(actual.clone(), &[10u8, 20]).unwrap()],
+                ),
+                Ok(vec![Array::from_elements(target.clone(), &[10u8, 20]).unwrap()]),
+            );
+            assert_eq!(
+                constructor(target_sharding.clone(), vec![plain.clone()]).interpret(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[Array::from_elements(actual_sharding.clone(), &[10u8, 20]).unwrap()],
+                ),
+                Ok(vec![Array::from_elements(target_sharding.clone(), &[10u8, 20]).unwrap()]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_interpretation_witnessed_storage_sharing() {
+        // A witnessed cast that keeps the layout shares the input's storage, whether or not it adds a sharding.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let annotated = strided.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let value = Array::from_elements(strided.clone(), &[1f32, 2f32]).unwrap();
+        let witness = Array::vector(vec![3f32, 4f32]).unwrap();
+        for output in [strided, annotated] {
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                let operation = constructor(output.clone(), vec![plain.clone(), plain.clone()]);
+                let result = operation
+                    .interpret(
+                        &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                        &EmptyRegionDriver,
+                        &[value.clone(), witness.clone()],
+                    )
+                    .unwrap();
+                assert_eq!(result, vec![Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap()]);
+                assert!(Arc::ptr_eq(value.shared_storage_bytes(), result[0].shared_storage_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_interpretation_ordering() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b, p, q] = ["a", "b", "p", "q"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output =
             ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let relation =
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()]));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         builder
-            .add_instruction(
-                CastOperation::checked(output, Vec::new()).with_relation(input, relation),
-                Vec::new(),
-                vec![value],
-                None,
-            )
+            .add_instruction(CastOperation::checked(output, vec![input]), Vec::new(), vec![value], None)
             .unwrap();
         let condition = builder.add_constant(Array::scalar(false).unwrap());
         builder
@@ -3882,7 +4929,7 @@ mod tests {
             program.to_string(),
             indoc! {r#"
                 lambda %0:f32[a, b] .
-                let %1:f32[b, a] = cast [type=f32[b, a], input_type=f32[a, b], relation=f32[p, q], checked=true] %0
+                let %1:f32[b, a] = cast [type=f32[b, a], inputs=[f32[a, b]], checked=true] %0
                     %2:bool[] = const false
                     () = assert [message="later assertion", labels=[]] %2
                 in ()"#},
@@ -3890,120 +4937,227 @@ mod tests {
 
         // A discarded result must still check immediately, before the following ordered assertion. The valid square
         // control reaches that assertion, proving that the failing rectangular case stops at the cast itself.
-        assert_eq!(
-            program.interpret(vec![Array::matrix(2, 3, vec![1f32; 6]).unwrap()]),
-            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "p".to_owned(),
-                expected: 2,
-                actual: 3,
-            }))),
-        );
+        let mismatch = ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "b".to_owned(),
+            expected: 3,
+            actual: 2,
+        }));
+        assert_eq!(program.interpret(vec![Array::matrix(2, 3, vec![1f32; 6]).unwrap()]), Err(mismatch.clone()));
         let error = program.interpret(vec![Array::matrix(2, 2, vec![1f32; 4]).unwrap()]).unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
             Some(&AssertionError::Failed { message: "later assertion".to_owned(), observations: Vec::new() }),
         );
-        let error = program
-            .partially_evaluate(&[PartialValue::Known(Array::matrix(2, 3, vec![1f32; 6]).unwrap())])
-            .unwrap_err();
         assert_eq!(
-            error,
-            ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "p".to_owned(),
-                expected: 2,
-                actual: 3,
-            })),
+            program
+                .partially_evaluate(&[PartialValue::Known(Array::matrix(2, 3, vec![1f32; 6]).unwrap())])
+                .unwrap_err(),
+            mismatch,
+        );
+    }
+
+    #[test]
+    fn test_cast_interpretation_renamed_dimension_witness() {
+        // A staged cast whose first-class dimension witness instantiates the declared identity under another name
+        // keeps the source's name in its output, and concrete execution still checks the witness against the source.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [k, n, m] = ["k", "n", "m"].map(|name| DimensionType::new(name, bounds));
+        let source: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![k.simplified_dimension()])).into();
+        let target: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let value = ArrayIrValue::Array(Array::vector(vec![1f32, 2f32]).unwrap());
+        let dimension = |extent: usize| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
+        let constructors: [(fn(ArrayIrType, Vec<ArrayIrType>) -> CastOperation<ArrayIrType>, &str); 2] =
+            [(CastOperation::checked, ", checked=true"), (CastOperation::unchecked, "")];
+        for (constructor, mode) in constructors {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(source.clone());
+            let witness = builder.add_input(m.clone().into());
+            let output = builder
+                .add_instruction(
+                    constructor(target.clone(), vec![source.clone(), n.clone().into()]),
+                    vec![],
+                    vec![input, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                    lambda %0:f32[k], %1:dimension<m ∈ [1, 8)> .
+                    let %2:f32[k] = cast [type=f32[n], inputs=[f32[k], dimension<n ∈ [1, 8)>]{mode}] %0 %1
+                    in (%2)"},
+            );
+            assert_eq!(program.interpret(vec![value.clone(), dimension(2)]), Ok(vec![value.clone()]));
+            assert_eq!(
+                program.interpret(vec![value.clone(), dimension(3)]),
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 3,
+                    actual: 2,
+                }))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_interpretation_refined_representation_witness_identity() {
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let n = DimensionType::new("n", bounds);
+        let m = DimensionType::new("m", bounds);
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let source = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let target = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let operation = CastOperation::<ArrayIrType>::checked(target.clone().into(), vec![declared.into(), m.into()]);
+        // The witness's actual n instantiates declared m. It does not bind the source declaration's separate n,
+        // whose extent is already 2, so replay must not acquire the witness's nominal identity.
+        let (_, replayed) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |values: Vec<Tracer<_>>| operation.interpret(&values[0].domain(), &EmptyRegionDriver, &values),
+            vec![ArrayIrType::from(source.clone()), ArrayIrType::from(n.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            replayed.to_string(),
+            formatdoc! {"
+                lambda %0:{source}, %1:{n} .
+                let %2:{target} = cast [
+                    type={target},
+                    inputs=[{source}, {n}],
+                ] %0 %1
+                in (%2)"},
+        );
+        let value = Array::from_elements(source, &[1f32, 2f32]).unwrap();
+        assert_eq!(
+            replayed.interpret(vec![ArrayIrValue::Array(value), DimensionValue::constant(3).unwrap().into()]),
+            Ok(vec![ArrayIrValue::Array(Array::from_elements(target, &[1f32, 2f32]).unwrap())]),
         );
     }
 
     #[test]
     fn test_cast_partial_evaluation() {
-        // A checked cast of a known value checks its relationship while partial evaluation folds it, and a checked cast
-        // of an unknown value stays checked in the residual program.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        check_operation_partial_evaluation!(
+            operation = CastOperation::checked(laid_out.clone(), vec![plain]),
+            inputs = [Array::vector(vec![1f32, 2f32]).unwrap()],
+            expected = Array::from_elements(laid_out, &[1f32, 2f32]).unwrap(),
+        );
+
+        // A checked cast of a known value checks its relationship while partial evaluation folds it, and a checked
+        // cast of an unknown value stays checked in the residual program.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
+        check_operation_partial_evaluation!(
+            operation = CastOperation::checked(exact.clone(), vec![symbolic.clone()]),
+            cases = [
+                {
+                    inputs = [(@known, vector(2))],
+                    outputs = [(@known, vector(2))],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = symbolic.clone(), replay = vector(2)))],
+                    outputs = [(@residual, vector(2))],
+                    residual_instructions = 1,
+                },
+            ],
+        );
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].cast(ArrayType::new_static(DataType::F32, [2]), &[])?]),
+            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].cast(exact.clone(), &[])?]),
             vec![symbolic.clone()],
         )
         .unwrap();
-        let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
-        let folded = program.partially_evaluate(&[PartialValue::Known(vector(2))]).unwrap();
-        assert_eq!(folded.program().to_string(), "lambda  .\nin ()");
-        assert!(program.partially_evaluate(&[PartialValue::Known(vector(3))]).is_err());
+        assert_eq!(
+            program.partially_evaluate(&[PartialValue::Known(vector(3))]).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`")),
+        );
         let residual = program.partially_evaluate(&[PartialValue::Unknown(symbolic)]).unwrap();
         assert_eq!(
             residual.program().to_string(),
             indoc! {"
                 lambda %0:f32[n] .
-                let %1:f32[2] = cast [type=f32[2], checked=true] %0
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
                 in (%1)"},
         );
     }
 
     #[test]
-    fn test_cast_partial_evaluation_relations() {
+    fn test_cast_partial_evaluation_declared_dimensions() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b, p, q] = ["a", "b", "p", "q"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output =
             ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let relation =
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()]));
+        let square = Array::matrix(2, 2, vec![1f32; 4]).unwrap();
+        let rectangular = Array::matrix(2, 3, vec![1f32; 6]).unwrap();
+
+        // All-known folding checks before removing the instruction, while unknown inputs keep the complete source
+        // declaration in the residual.
+        check_operation_partial_evaluation!(
+            operation = CastOperation::checked(output.clone(), vec![input.clone()]),
+            cases = [
+                {
+                    inputs = [(@known, square.clone())],
+                    outputs = [(@known, square.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.clone(), replay = square.clone()))],
+                    outputs = [(@residual, square.clone())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
-            .add_instruction(
-                CastOperation::checked(output, Vec::new()).with_relation(input.clone(), relation),
-                Vec::new(),
-                vec![value],
-                None,
-            )
+            .add_instruction(CastOperation::checked(output, vec![input.clone()]), Vec::new(), vec![value], None)
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
-        let square = Array::matrix(2, 2, vec![1f32; 4]).unwrap();
-        let rectangular = Array::matrix(2, 3, vec![1f32; 6]).unwrap();
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-
-        // All-known folding checks before removing the instruction, while unknown operands keep the complete source
-        // declaration in the residual. A folded valid output remains available through the evaluation's output map.
-        let error = program.partially_evaluate(&[PartialValue::Known(rectangular.clone())]).unwrap_err();
-        let expected = ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
-            dimension: "p".to_owned(),
-            expected: 2,
-            actual: 3,
+        let mismatch = ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "b".to_owned(),
+            expected: 3,
+            actual: 2,
         }));
-        assert_eq!(error, expected);
-        let folded = program.partially_evaluate(&[PartialValue::Known(square.clone())]).unwrap();
-        assert_eq!(folded.program().to_string(), "lambda  .\nin ()");
-        assert_eq!(folded.interpret(&context, &[]), Ok(vec![square.clone()]));
+        assert_eq!(program.partially_evaluate(&[PartialValue::Known(rectangular.clone())]).unwrap_err(), mismatch);
         let residual = program.partially_evaluate(&[PartialValue::Unknown(input.clone())]).unwrap();
-        assert_eq!(residual.program().to_string(), program.to_string());
-        assert_eq!(residual.interpret(&context, &[square.clone()]), Ok(vec![square.clone()]));
-        assert_eq!(residual.interpret(&context, &[rectangular.clone()]), Err(expected.clone()));
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {"
+                lambda %0:f32[a, b] .
+                let %1:f32[b, a] = cast [type=f32[b, a], inputs=[f32[a, b]], checked=true] %0
+                in (%1)"},
+        );
+        assert_eq!(residual.interpret(&context, &[rectangular.clone()]), Err(mismatch.clone()));
 
-        // Disabling effect folding retains valid all-known checks. Concrete operands supply exact extents rather
-        // than nominal names, while the payload retains the original declaration needed to validate the relationship.
+        // A fully proven identity also folds when effect folding is disabled. Contradictory concrete shapes must still
+        // fail before the operation can be omitted.
         let deferred = program
             .entry_region_ref()
             .partially_evaluate_in_context(&context, &[PartialValue::Known(square.clone())], false)
             .unwrap();
-        assert_eq!(
-            deferred.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2, 2] .
-                let %1:f32[2, 2] = cast [type=f32[b, a], input_type=f32[a, b], relation=f32[p, q], checked=true] %0
-                in (%1)"},
-        );
+        assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
         assert_eq!(deferred.interpret(&context, &[]), Ok(vec![square]));
-        let error = program
-            .entry_region_ref()
-            .partially_evaluate_in_context(&context, &[PartialValue::Known(rectangular)], false)
-            .unwrap_err();
-        assert_eq!(error, expected);
+        assert_eq!(
+            program
+                .entry_region_ref()
+                .partially_evaluate_in_context(&context, &[PartialValue::Known(rectangular)], false)
+                .unwrap_err(),
+            mismatch,
+        );
 
-        // Known operands in an outer trace are still symbolic. Folding into that trace must preserve the checked
+        // Known inputs in an outer trace are still symbolic. Folding into that trace must preserve the checked
         // primitive and its original ambient declaration rather than treating conditional facts as runtime checks.
         let (_, staged) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |values: Vec<Tracer<_>>| {
@@ -4023,33 +5177,222 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let exact = ArrayType::new_static(DataType::F32, [2]);
+        let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
+
+        // Known inputs with exact shapes prove the widening and fold it. An unknown witness keeps the checked cast in
+        // the residual, whereas a known witness proves the relationship for an unknown source, which normalizes the
+        // residual cast into an unchecked one.
+        check_operation_partial_evaluation!(
+            operation = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()]),
+            cases = [
+                {
+                    inputs = [(@known, vector(2)), (@known, vector(2))],
+                    outputs = [(@known, vector(2))],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@known, vector(2)), (@unknown(type = symbolic.clone(), replay = vector(2)))],
+                    outputs = [(@residual, vector(2))],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [(@unknown(type = exact.clone(), replay = vector(2))), (@known, vector(2))],
+                    outputs = [(@residual, vector(2))],
+                    residual_instructions = 1,
+                },
+            ],
+        );
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(value, witness)| value.cast(symbolic.clone(), &[witness]),
-            (exact, symbolic.clone()),
+            (exact.clone(), symbolic.clone()),
         )
         .unwrap();
-        let value = Array::vector(vec![1f32, 2f32]).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %0 %1
+                in (%2)"},
+        );
+        let unknown_witness = program
+            .to_flat_program()
+            .partially_evaluate(&[PartialValue::Known(vector(2)), PartialValue::Unknown(symbolic.clone())])
+            .unwrap();
+        assert_eq!(
+            unknown_witness.program().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[2] .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %1 %0
+                in (%2)"},
+        );
+        let known_witness = program
+            .to_flat_program()
+            .partially_evaluate(&[PartialValue::Unknown(exact.clone()), PartialValue::Known(vector(2))])
+            .unwrap();
+        assert_eq!(
+            known_witness.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
+                in (%2)"},
+        );
+
+        // Known inputs with exact shapes prove the widening, so partial evaluation normalizes the checked cast and
+        // folds it even when effect folding is disabled; contradictory known shapes are still rejected.
         let context = EagerContext::new();
         let deferred = program
             .entry_region_ref()
             .partially_evaluate_in_context(
                 &context,
-                &[PartialValue::Known(value.clone()), PartialValue::Known(value.clone())],
+                &[PartialValue::Known(vector(2)), PartialValue::Known(vector(2))],
                 false,
             )
             .unwrap();
+        assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(deferred.interpret(&context, &[]), Ok(vec![vector(2)]));
+        let mismatch = Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "n".to_owned(),
+            expected: 3,
+            actual: 2,
+        })));
         assert_eq!(
-            deferred.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2], %1:f32[2] .
-                let %2:f32[2] = cast [type=f32[n], witnesses=[f32[n]], checked=true] %0 %1
-                in (%2)"},
+            program
+                .entry_region_ref()
+                .partially_evaluate_in_context(
+                    &context,
+                    &[PartialValue::Known(vector(2)), PartialValue::Known(vector(3))],
+                    false,
+                )
+                .map(|_| ()),
+            mismatch,
         );
-        assert_eq!(deferred.interpret(&context, &[]), Ok(vec![value]));
+
+        // An unchecked cast of contradictory known inputs is rejected as well, since folding checks the shapes.
+        let (_, unchecked) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(value, witness)| value.cast_unchecked(symbolic.clone(), &[witness]),
+            (exact, symbolic.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            unchecked
+                .to_flat_program()
+                .partially_evaluate(&[PartialValue::Known(vector(2)), PartialValue::Known(vector(3))])
+                .map(|_| ()),
+            mismatch,
+        );
+    }
+
+    #[test]
+    fn test_cast_partial_evaluation_layout_and_sharding() {
+        // Known inputs fold a representation change whether or not they already carry the requested sharding, also
+        // when effect folding is disabled, because the proven relationship normalizes the explicitly checked cast
+        // into the pure unchecked one. The residual of an unknown input is normalized the same way.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
+        let output = plain.clone().with_sharding(sharding.clone()).unwrap();
+        let expected_value = Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap();
+        let unannotated = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+        let actual = Array::from_elements(input.clone().with_sharding(sharding).unwrap(), &[1f32, 2f32]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let value = builder.add_input(input.clone());
+        let checked = builder
+            .add_instruction(CastOperation::checked(output.clone(), vec![input.clone()]), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        let unchecked = builder
+            .add_instruction(CastOperation::unchecked(output, vec![input.clone()]), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![checked, unchecked], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let context = EagerContext::new();
+        let known = [PartialValue::Known(actual.clone())];
+        let unannotated_inputs = [PartialValue::Known(unannotated.clone())];
+        let converted = program.partially_evaluate(&unannotated_inputs).unwrap();
+        assert_eq!(converted.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(converted.interpret(&context, &[]), Ok(vec![expected_value.clone(); 2]));
+        let folded = program.partially_evaluate(&known).unwrap();
+        assert_eq!(folded.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(folded.interpret(&context, &[]), Ok(vec![expected_value.clone(); 2]));
+        let residual = program.partially_evaluate(&[PartialValue::Unknown(input)]).unwrap();
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][layout=strided{4}] .
+                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
+                    type=f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}],
+                    inputs=[f32[2][layout=strided{4}]],
+                ] %0
+                    %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
+                        type=f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}],
+                        inputs=[f32[2][layout=strided{4}]],
+                    ] %0
+                in (%1, %2)"},
+        );
+        assert_eq!(residual.interpret(&context, &[actual]), Ok(vec![expected_value.clone(); 2]));
+        assert_eq!(residual.interpret(&context, &[unannotated]), Ok(vec![expected_value.clone(); 2]));
+        let deferred_missing = program
+            .entry_region_ref()
+            .partially_evaluate_in_context(&context, &unannotated_inputs, false)
+            .unwrap();
+        assert_eq!(deferred_missing.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(deferred_missing.interpret(&context, &[]), Ok(vec![expected_value.clone(); 2]));
+        let deferred = program.entry_region_ref().partially_evaluate_in_context(&context, &known, false).unwrap();
+        assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(deferred.interpret(&context, &[]), Ok(vec![expected_value; 2]));
+    }
+
+    #[test]
+    fn test_cast_partial_evaluation_unspecified_layout_and_sharding() {
+        let plain = ArrayType::new_static(DataType::U8, [2]);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output = plain
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![2])))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |value| value.cast(output.clone(), &[]),
+            plain.clone(),
+        )
+        .unwrap();
+        let expected = indoc! {"
+            lambda %0:u8[2] .
+            let %1:u8[2][layout=strided{2}][sharding={mesh<['x'=1:explicit]>, [{}]}] = cast [
+                type=u8[2][layout=strided{2}][sharding={mesh<['x'=1:explicit]>, [{}]}],
+                inputs=[u8[2]],
+            ] %0
+            in (%1)"};
+        assert_eq!(program.to_string(), expected);
+        let input = Array::vector(vec![10u8, 20]).unwrap();
+        let expected_value = Array::from_elements(output, &[10u8, 20]).unwrap();
+        assert_eq!(program.interpret(input.clone()), Ok(expected_value.clone()));
+        let context = EagerContext::new();
+        let known = [PartialValue::Known(input.clone())];
+        let folded = program.to_flat_program().partially_evaluate(&known).unwrap();
+        assert_eq!(folded.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(folded.interpret(&context, &[]), Ok(vec![expected_value.clone()]));
+        let residual = program.to_flat_program().partially_evaluate(&[PartialValue::Unknown(plain)]).unwrap();
+        assert_eq!(residual.program().to_string(), expected);
+        assert_eq!(residual.interpret(&context, &[input]), Ok(vec![expected_value.clone()]));
+        let deferred = program.entry_region_ref().partially_evaluate_in_context(&context, &known, false).unwrap();
+        assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(deferred.interpret(&context, &[]), Ok(vec![expected_value]));
     }
 
     #[test]
     fn test_cast_batching() {
+        let scalar = ArrayType::scalar(DataType::F32);
+        check_operation_batching!(
+            @exact,
+            operation = CastOperation::unchecked(scalar.clone(), vec![scalar]),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1f32, 2f32]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1f32, 2f32]).unwrap())],
+            }],
+        );
         // A mapped value is retyped with the batch axis inserted into the output type, and keeps that axis, while a
         // replicated witness keeps its declared type. Batching preserves the mode of the cast.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -4057,8 +5400,8 @@ mod tests {
         let symbolic = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])));
         let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
         for (operation, mode) in [
-            (CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]), ""),
-            (CastOperation::checked(exact.clone(), vec![symbolic.clone()]), ", checked=true"),
+            (CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]), ""),
+            (CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]), ", checked=true"),
         ] {
             let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
                 |(extent, mapped, witness)| {
@@ -4086,16 +5429,367 @@ mod tests {
                 program.to_string(),
                 formatdoc! {"
                     lambda %0:dimension<batch ∈ [0, 5)>, %1:f32[batch, n], %2:f32[n] .
-                    let %3:f32[batch, 2] = cast [type=f32[batch, 2], witnesses=[f32[n]]{mode}] %1 %2
+                    let %3:f32[batch, 2] = cast [type=f32[batch, 2], inputs=[f32[batch, n], f32[n]]{mode}] %1 %2
                     in (%3)"},
             );
         }
     }
 
     #[test]
-    fn test_cast_batching_local_relation() {
-        // The relation's repeated `n` means equal item dimensions, independently of an ambient batch named `n`.
-        // The output and witness keep their ambient names, including a retained symbolic output dimension.
+    fn test_cast_batching_mapped_witness() {
+        // A witness mapped on another physical axis is lifted in place, so the output follows the source's batch
+        // axis while the witness declaration gains the batch axis where its value carries it.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let batch = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+        let symbolic = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])));
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(extent, mapped, witness)| {
+                let batching = BatchingContext::new(extent.domain(), extent);
+                let outputs = CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()])
+                    .batch(
+                        &batching,
+                        &EmptyRegionDriver,
+                        &[
+                            ArrayIrBatch::new(mapped, BatchAxis::new(0))?,
+                            ArrayIrBatch::new(witness, BatchAxis::new(1))?,
+                        ],
+                    )?
+                    .into_parts()
+                    .0;
+                assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+                Ok(outputs[0].value().clone())
+            },
+            (
+                ArrayIrType::Dimension(batch.clone()),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![batch.simplified_dimension(), n.simplified_dimension()]),
+                )),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![n.simplified_dimension(), batch.simplified_dimension()]),
+                )),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [0, 5)>, %1:f32[batch, n], %2:f32[n, batch] .
+                let %3:f32[batch, 2] = cast [type=f32[batch, 2], inputs=[f32[batch, n], f32[n, batch]]] %1 %2
+                in (%3)"},
+        );
+    }
+
+    #[test]
+    fn test_cast_batching_replicated_source_mapped_witness() {
+        // A replicated source stays replicated, and the mapped witness only contributes its per-item extents.
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        check_operation_batching!(
+            @exact,
+            operation = CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]),
+            axis_size = 3,
+            cases = [{
+                inputs = [
+                    (@replicated, Array::vector(vec![1f32, 2f32]).unwrap()),
+                    (@mapped(axis = 0), Array::matrix(3, 2, vec![0f32; 6]).unwrap()),
+                ],
+                outputs = [(@replicated, Array::vector(vec![1f32, 2f32]).unwrap())],
+            }],
+        );
+        check_operation_batching!(
+            @exact,
+            operation = CastOperation::unchecked(exact, vec![symbolic.clone(), symbolic]),
+            axis_size = 3,
+            cases = [{
+                inputs = [
+                    (@replicated, Array::vector(vec![1f32, 2f32]).unwrap()),
+                    (@mapped(axis = 0), Array::matrix(3, 2, vec![0f32; 6]).unwrap()),
+                ],
+                outputs = [(@replicated, Array::vector(vec![1f32, 2f32]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_cast_batching_witnessed_tracer() {
+        // A batching tracer casts through its context with its witnesses, so a mapped source narrowed next to a
+        // replicated witness is checked per item and keeps its batch axis.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let value = Array::matrix(3, 2, vec![1f32; 6]).unwrap();
+        let source = BatchingTracer::new(context.clone(), ArrayBatch::new(value.clone(), BatchAxis::new(0)).unwrap());
+        let witness = BatchingTracer::new(context, ArrayBatch::replicated(Array::vector(vec![0f32; 2]).unwrap()));
+        assert_eq!(source.r#type().as_ref(), &exact);
+        let output = source.cast(exact.clone(), &[witness.clone()]).unwrap().into_batch();
+        assert_eq!(output, ArrayBatch::new(value.clone(), BatchAxis::new(0)).unwrap());
+        let output = source.cast_unchecked(exact.clone(), &[witness.clone()]).unwrap().into_batch();
+        assert_eq!(output, ArrayBatch::new(value, BatchAxis::new(0)).unwrap());
+        let error = source.cast(symbolic, &[witness]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<BatchingError>(),
+            Some(&BatchingError::Type(TypeError::invalid(
+                "`cast` output identity `n` is not carried by a declared input",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_cast_batching_identity_ragged() {
+        // A one-input identity keeps its original ragged carrier, including its storage, in both modes and universes.
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        for lengths in [vec![], vec![0], vec![1, 3]] {
+            let size = lengths.len();
+            let value = Array::matrix(size, 3, vec![1f32; size * 3]).unwrap();
+            let extents = Array::vector(lengths).unwrap();
+            let input = ragged_array_batch(value.clone(), extents.clone(), &variable, 1).unwrap();
+            let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), size);
+            let tracer = BatchingTracer::new(context, input.clone());
+            let output_type = tracer.r#type().into_owned();
+            let output = tracer.cast(output_type.clone(), &[]).unwrap().into_batch();
+            assert_eq!(output, input);
+            assert!(Arc::ptr_eq(output.value().shared_storage_bytes(), value.shared_storage_bytes()));
+            let output = tracer.cast_unchecked(output_type, &[]).unwrap().into_batch();
+            assert_eq!(output, input);
+            assert!(Arc::ptr_eq(output.value().shared_storage_bytes(), value.shared_storage_bytes()));
+            let composite =
+                ragged_batch(ArrayIrValue::Array(value.clone()), ArrayIrValue::Array(extents), &variable, 1).unwrap();
+            let context = BatchingContext::new(
+                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                ArrayIrValue::Dimension(DimensionValue::constant(size).unwrap()),
+            );
+            let composite_tracer = BatchingTracer::new(context, composite.clone());
+            let output_type = composite_tracer.r#type().into_owned();
+            assert_eq!(composite_tracer.cast(output_type.clone(), &[]).unwrap().into_batch(), composite);
+            assert_eq!(composite_tracer.cast_unchecked(output_type, &[]).unwrap().into_batch(), composite);
+        }
+    }
+
+    #[test]
+    fn test_cast_batching_identity_ragged_staging() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        for checked in [true, false] {
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |(value, extents)| {
+                    let context = BatchingContext::new(value.domain(), 2);
+                    let input = ragged_array_batch(value, extents.clone(), &variable, 1)?;
+                    let tracer = BatchingTracer::new(context, input.clone());
+                    let output_type = tracer.r#type().into_owned();
+                    let output = if checked {
+                        tracer.cast(output_type, &[])?
+                    } else {
+                        tracer.cast_unchecked(output_type, &[])?
+                    }
+                    .into_batch();
+                    assert_eq!(output, input);
+                    Ok(vec![output.into_value(), extents])
+                },
+                (ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::I32, [2])),
+            )
+            .unwrap();
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[2, 3], %1:i32[2] .
+                    in (%0, %1)"},
+            );
+            let value = Array::matrix(2, 3, vec![1f32; 6]).unwrap();
+            let extents = Array::vector(vec![1i32, 3]).unwrap();
+            assert_eq!(program.interpret((value.clone(), extents.clone())), Ok(vec![value, extents]));
+        }
+    }
+
+    #[test]
+    fn test_cast_batching_identity_validates_contract() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let logical = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![1f32; 6]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
+        let other = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "other",
+                DimensionBounds::new(0, Some(4)).unwrap(),
+            ))]),
+        );
+        let exact = ArrayType::new_static(DataType::F32, [3]);
+        let ragged = Err(BatchingError::UnsupportedOperation {
+            message: "cannot batch ragged array type `f32[length]`".to_owned(),
+        });
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            // A different declaration or a narrowing is not an identity of this carrier's logical type. A foreign
+            // declaration does not describe the carrier at all, and a narrowing would have to check the per-item
+            // extents, which lifting the declarations cannot express, so batching rejects the ragged carrier.
+            assert_eq!(
+                constructor(other.clone(), vec![other.clone()]).batch(&context, &EmptyRegionDriver, &[input.clone()]),
+                Err(BatchingError::Type(TypeError::invalid(
+                    "type f32[length] does not refine declared type f32[other]"
+                ))),
+            );
+            assert_eq!(
+                constructor(exact.clone(), vec![logical.clone()]).batch(&context, &EmptyRegionDriver, &[input.clone()]),
+                ragged,
+            );
+            // The witness would require every item to have length 3. Matching source and output declarations must not
+            // erase that additional relationship, even though the first input otherwise looks like an identity.
+            let witness = ArrayBatch::replicated(Array::vector(vec![1f32; 3]).unwrap());
+            assert_eq!(
+                constructor(logical.clone(), vec![logical.clone(), logical.clone()]).batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[input.clone(), witness],
+                ),
+                ragged,
+            );
+        }
+
+        // The composite policy rejects a non-identity cast over a ragged carrier in the same way.
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ragged_batch(
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
+            &variable,
+            1,
+        )
+        .unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                constructor(exact.clone().into(), vec![logical.clone().into()]).batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    std::slice::from_ref(&input),
+                ),
+                Err(BatchingError::UnsupportedOperation {
+                    message: "cannot batch mapped member type `f32[length]`".to_owned(),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_batching_layout() {
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let declared = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        for checked in [true, false] {
+            let (_, source) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |value| if checked { value.cast(plain.clone(), &[]) } else { value.cast_unchecked(plain.clone(), &[]) },
+                declared.clone(),
+            )
+            .unwrap();
+            let expected_source = indoc! {"
+                lambda %0:f32[2][layout=strided{4}] .
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{4}]]] %0
+                in (%1)"};
+            assert_eq!(source.to_string(), expected_source);
+            let composite_declared: ArrayIrType = declared.clone().into();
+            let (_, composite) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |value| {
+                    if checked {
+                        value.cast(plain.clone().into(), &[])
+                    } else {
+                        value.cast_unchecked(plain.clone().into(), &[])
+                    }
+                },
+                composite_declared,
+            )
+            .unwrap();
+            assert_eq!(composite.to_string(), expected_source);
+            // Rank-changing packing clears layout. The complete original cast remains valid, while the packed
+            // declaration and input agree on the new representation, including empty and singleton batches.
+            for extent in [0, 1, 3] {
+                let (program, axes) = source
+                    .to_flat_program()
+                    .batched(
+                        extent,
+                        ShardingDimension::replicated(),
+                        &[BatchAxis::new(0)],
+                        ProgramBatchingOutputAxesPolicy::Natural,
+                    )
+                    .unwrap()
+                    .into_parts();
+                assert_eq!(axes, vec![BatchAxis::new(0)]);
+                assert_eq!(
+                    program.to_string(),
+                    formatdoc! {"
+                        lambda %0:f32[{extent}, 2] .
+                        in (%0)"},
+                );
+                let value = Array::matrix(extent, 2, vec![1f32; extent * 2]).unwrap();
+                assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value.clone()]));
+                let (program, axes) = composite
+                    .to_flat_program()
+                    .batched_with_threaded_extent(
+                        DimensionType::from(Dimension::Static(extent)),
+                        ShardingDimension::replicated(),
+                        &[BatchAxis::new(0)],
+                        ProgramBatchingOutputAxesPolicy::Natural,
+                    )
+                    .unwrap()
+                    .into_parts();
+                assert_eq!(axes, vec![BatchAxis::new(0)]);
+                assert_eq!(
+                    program.to_string(),
+                    formatdoc! {"
+                        lambda %0:dimension<{extent}>, %1:f32[{extent}, 2] .
+                        in (%0, %1)"},
+                );
+                let dimension = ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
+                let value = ArrayIrValue::Array(value);
+                assert_eq!(program.interpret(vec![dimension.clone(), value.clone()]), Ok(vec![dimension, value]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_batching_validates_declarations() {
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let declared = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let conflicting =
+            ArrayType::new_static(DataType::F64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let input = ArrayBatch::new(Array::matrix(3, 2, vec![1f32; 6]).unwrap(), BatchAxis::new(0)).unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            // Lifting may erase layouts, but must still reject an invalid element-type change in the original cast.
+            let operation = constructor(conflicting.clone(), vec![declared.clone()]);
+            assert_eq!(
+                operation.batch(&context, &EmptyRegionDriver, &[input.clone()]).map(|_| ()),
+                Err(TypeError::invalid(
+                    "`cast` cannot convert type `f32[2][layout=strided{4}]` \
+                     to unrelated type `f64[2][layout=strided{8}]`",
+                )
+                .into()),
+            );
+            let operation = constructor(plain.clone(), vec![declared.clone()]);
+            assert_eq!(
+                operation.batch(&context, &EmptyRegionDriver, &[]).map(|_| ()),
+                Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into()),
+            );
+            let wrong = ArrayBatch::new(Array::matrix(3, 4, vec![1f32; 12]).unwrap(), BatchAxis::new(0)).unwrap();
+            assert_eq!(
+                operation.batch(&context, &EmptyRegionDriver, &[wrong]).map(|_| ()),
+                Err(ProgramError::Type(TypeError::invalid("dimension 4 does not refine declared dimension 2")).into()),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_batching_mixed_dimensions() {
+        // Mixed item dimensions require both item extents to be 3, independently of the ambient batch extent.
+        // Source, output and witness declarations keep their ambient names.
         let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
         let [n, a, b] = ["n", "a", "b"].map(|name| DimensionType::new(name, bounds));
         let witness = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension()])));
@@ -4103,23 +5797,24 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]),
         ));
-        let relation = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(); 2])));
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, mapped, witness_value)| {
                 let batching = BatchingContext::new(extent.domain(), extent);
-                let outputs = CastOperation::unchecked(output.clone(), vec![witness.clone()])
-                    .with_relation(
+                let outputs = CastOperation::unchecked(
+                    output.clone(),
+                    vec![
                         ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]))
                             .into(),
-                        relation.clone(),
-                    )
-                    .batch(
-                        &batching,
-                        &EmptyRegionDriver,
-                        &[ArrayIrBatch::new(mapped, BatchAxis::new(0))?, ArrayIrBatch::replicated(witness_value)],
-                    )?
-                    .into_parts()
-                    .0;
+                        witness.clone(),
+                    ],
+                )
+                .batch(
+                    &batching,
+                    &EmptyRegionDriver,
+                    &[ArrayIrBatch::new(mapped, BatchAxis::new(0))?, ArrayIrBatch::replicated(witness_value)],
+                )?
+                .into_parts()
+                .0;
                 Ok(outputs[0].value().clone())
             },
             (
@@ -4133,33 +5828,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            program.output_types(),
-            vec![ArrayIrType::Array(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![n.simplified_dimension(), Dimension::Static(3), a.simplified_dimension()]),
-            ))],
-        );
-        assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<n ∈ [0, 8)>, %1:f32[n, b, 3], %2:f32[a] .
-                let %3:f32[n, 3, a] = cast [
-                    type=f32[n, 3, a],
-                    input_type=f32[n, b, 3],
-                    witnesses=[f32[a]],
-                    relation=f32[n, n, n],
-                ] %1 %2
+                let %3:f32[n, 3, a] = cast [type=f32[n, 3, a], inputs=[f32[n, b, 3], f32[a]]] %1 %2
                 in (%3)"},
-        );
-        let ArrayIrOperation::Cast(cast) = program.instructions()[0].operation() else {
-            panic!("expected a cast");
-        };
-        assert_eq!(
-            cast.input_type(),
-            Some(&ArrayIrType::Array(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![n.simplified_dimension(), b.simplified_dimension(), Dimension::Static(3)]),
-            ))),
         );
         for extent in [0, 2] {
             let dimension = ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
@@ -4171,8 +5844,15 @@ mod tests {
                 .unwrap(),
             );
             let witness = |extent| ArrayIrValue::Array(Array::vector(vec![1f32; extent]).unwrap());
-            assert_eq!(program.interpret((dimension.clone(), mapped.clone(), witness(3))), Ok(mapped.clone()),);
-            assert!(program.interpret((dimension, mapped, witness(4))).is_err());
+            assert_eq!(program.interpret((dimension.clone(), mapped.clone(), witness(3))), Ok(mapped.clone()));
+            assert_eq!(
+                program.interpret((dimension, mapped, witness(4))),
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "a".to_owned(),
+                    expected: 4,
+                    actual: 3,
+                }))),
+            );
         }
     }
 
@@ -4194,18 +5874,20 @@ mod tests {
                 |(extent, mapped, witness)| {
                     let batching = BatchingContext::new(extent.domain(), extent)
                         .with_axis_sharding(ShardingDimension::sharded(["x"]));
-                    let outputs = CastOperation::unchecked(per_item.clone().into(), vec![per_item.clone().into()])
-                        .with_relation(per_item.clone().into(), per_item.clone().into())
-                        .batch(
-                            &batching,
-                            &EmptyRegionDriver,
-                            &[
-                                ArrayIrBatch::new(mapped, BatchAxis::new(0))?,
-                                ArrayIrBatch::new(witness, BatchAxis::new(0))?,
-                            ],
-                        )?
-                        .into_parts()
-                        .0;
+                    let outputs = CastOperation::unchecked(
+                        per_item.clone().into(),
+                        vec![per_item.clone().into(), per_item.clone().into()],
+                    )
+                    .batch(
+                        &batching,
+                        &EmptyRegionDriver,
+                        &[
+                            ArrayIrBatch::new(mapped, BatchAxis::new(0))?,
+                            ArrayIrBatch::new(witness, BatchAxis::new(0))?,
+                        ],
+                    )?
+                    .into_parts()
+                    .0;
                     Ok(outputs[0].value().clone())
                 },
                 (
@@ -4222,9 +5904,7 @@ mod tests {
                     lambda %0:dimension<2>, %1:{expected_type}, %2:{expected_type} .
                     let %3:{expected_type} = cast [
                         type={expected_type},
-                        input_type={expected_type},
-                        witnesses=[{expected_type}],
-                        relation={expected_type},
+                        inputs=[{expected_type}, {expected_type}],
                     ] %1 %2
                     in (%3)"},
             );
@@ -4232,10 +5912,117 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_batching_manual_variation() {
+        // Batching over a manual mesh axis adds that axis's variation to every mapped value. An identity cast keeps
+        // the item's own variation, an unspecified output placement still receives the batch axis's variation, and
+        // existing variation on another axis cannot be dropped by the original cast.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let plain = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let varying = plain
+            .clone()
+            .with_sharding(plain.sharding().unwrap().clone().with_varying_manual_axes(["y"]).unwrap())
+            .unwrap();
+        let unannotated = ArrayType::new_static(DataType::F32, [2]);
+        for (item, output) in
+            [(plain.clone(), plain.clone()), (plain.clone(), unannotated.clone()), (varying.clone(), varying.clone())]
+        {
+            let packed = item.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
+            let expected_source = if item == output {
+                formatdoc! {"
+                    lambda %0:{item} .
+                    in (%0)"}
+            } else {
+                formatdoc! {"
+                    lambda %0:{item} .
+                    let %1:{output} = cast [
+                        type={output},
+                        inputs=[{item}],
+                    ] %0
+                    in (%1)"}
+            };
+            for checked in [true, false] {
+                let (_, source) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                    |value| {
+                        if checked {
+                            value.cast(output.clone(), &[])
+                        } else {
+                            value.cast_unchecked(output.clone(), &[])
+                        }
+                    },
+                    item.clone(),
+                )
+                .unwrap();
+                assert_eq!(source.to_string(), expected_source);
+                let (program, axes) = source
+                    .to_flat_program()
+                    .batched(
+                        4,
+                        ShardingDimension::sharded(["x"]),
+                        &[BatchAxis::new(0)],
+                        ProgramBatchingOutputAxesPolicy::Natural,
+                    )
+                    .unwrap()
+                    .into_parts();
+                assert_eq!(axes, vec![BatchAxis::new(0)]);
+                assert_eq!(
+                    program.to_string(),
+                    formatdoc! {"
+                        lambda %0:{packed} .
+                        in (%0)"},
+                );
+                let value = Array::from_elements(packed.clone(), &[1f32; 8]).unwrap();
+                assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value]));
+            }
+        }
+
+        // Only x belongs to this mapped axis. An unexpected change on y must remain an input-contract error.
+        let packed = plain.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
+        let wrong_type = packed
+            .clone()
+            .with_sharding(packed.sharding().unwrap().clone().with_varying_manual_axes(["x", "y"]).unwrap())
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4)
+            .with_axis_sharding(ShardingDimension::sharded(["x"]));
+        let input =
+            ArrayBatch::new(Array::from_elements(wrong_type.clone(), &[1f32; 8]).unwrap(), BatchAxis::new(0)).unwrap();
+        for declared in [plain, unannotated] {
+            assert_eq!(
+                CastOperation::checked(declared.clone(), vec![declared])
+                    .batch(&context, &EmptyRegionDriver, &[input.clone()])
+                    .map(|_| ()),
+                Err(ProgramError::Type(TypeError::invalid(format!(
+                    "type {wrong_type} does not refine declared type {packed}"
+                )))
+                .into()),
+            );
+        }
+    }
+
+    #[test]
     fn test_cast_differentiation() {
-        // The primal cast keeps its mode, while the tangent is converted by an unchecked cast that the primal input
-        // and, for a checked cast, the primal output witness, so that the tangent conversion depends on the check. The
-        // pullback converts the cotangent back with an unchecked cast.
+        let scalar = ArrayType::scalar(DataType::F64);
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 0.0),
+            operation = CastOperation::unchecked(scalar.clone(), vec![scalar.clone(), scalar]),
+            cases = [{
+                primals = [Array::scalar(2f64).unwrap(), Array::scalar(4f64).unwrap()],
+                tangents = [Array::scalar(3f64).unwrap(), Array::scalar(5f64).unwrap()],
+                primal_outputs = [Array::scalar(2f64).unwrap()],
+                tangent_outputs = [Array::scalar(3f64).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = cast [type=f64[], inputs=[f64[], f64[]]] %0 %1
+                        %5:f64[] = cast [type=f64[], inputs=[f64[], f64[]]] %2 %4
+                    in (%4, %5)"},
+            }],
+        );
+
+        // A source-typed identity retains both nominal shape and the checked result dependency in one residual. The
+        // tangent conversion is unchecked because that residual carries the primal check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let exact = ArrayType::new_static(DataType::F32, [2]);
@@ -4248,88 +6035,482 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[n] .
-                let %1:f32[2] = cast [type=f32[2], checked=true] %0
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
                 in (%1)"},
         );
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f32[n], %1:f32[n] .
-                let %2:f32[2] = cast [type=f32[2], checked=true] %0
-                    %3:f32[2] = cast [type=f32[2], witnesses=[f32[n], f32[2]]] %1 %0 %2
-                in (%2, %3)"},
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                    %3:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[2]]] %0 %2
+                    %4:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %1 %3
+                in (%2, %4)"},
         );
-        let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[n] .
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                in (%1, %0)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_cast_differentiation_zero_tangent() {
+        // A symbolic-zero source tangent stays symbolic: only the primal cast is bound, and witness tangents never
+        // contribute, so differentiating with respect to the witness alone yields a zero output tangent.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let primal = context.input(exact.clone());
+        let witness = context.input(symbolic.clone());
+        let witness_tangent = context.input(symbolic.clone());
+        let outputs = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()])
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(primal).unwrap(),
+                    DifferentiationDual::new(witness, witness_tangent).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(outputs[0].tangent().is_zero());
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &symbolic);
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
+
+        // At the program level, the zero output tangent of a static output is materialized at the boundary.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(value, witness)| value.cast(exact.clone(), &[witness]),
+            (symbolic.clone(), symbolic),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.jvp_with_respect_to(&[1]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n], %2:f32[n] .
+                let %3:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]], checked=true] %0 %1
+                    %4:f32[2] = zero [type=f32[2]]
+                in (%3, %4)"},
+        );
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]], checked=true] %0 %1
+                in (%2)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n] .
+                let %1:f32[2] = zero [type=f32[2]]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_cast_differentiation_widening() {
+        // Widening with a witness carries the witnessed name in the output tangent type, so the fused tangent only
+        // depends on the checked result, and split linearization retains that result as its one residual.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(value, witness)| value.cast(symbolic.clone(), &[witness]),
+            (exact, symbolic.clone()),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n], %2:f32[2], %3:f32[n] .
+                let %4:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %0 %1
+                    %5:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %2 %4
+                in (%4, %5)"},
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %0 %1
+                in (%2, %2)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n], %2:f32[n] .
+                let %3:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %2
+                in (%3)"},
+        );
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
+                in (%2)"},
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f32[2], %1:f32[n], %2:f32[2] .
-                let %3:f32[n] = cast [type=f32[n], witnesses=[f32[n], f32[2]]] %0 %1 %2
-                in (%3)"},
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %1
+                in (%2)"},
         );
         let vector = |values: Vec<f32>| Array::vector(values).unwrap();
-        let inputs = pullback.input_types().iter().map(|_| vector(vec![1.0, 2.0])).collect::<Vec<_>>();
-        assert_eq!(pullback.interpret(inputs), Ok(vec![vector(vec![1.0, 2.0])]));
+        assert_eq!(
+            pullback.interpret(vec![vector(vec![1.0, 2.0]), vector(vec![0.0, 0.0])]),
+            Ok(vec![vector(vec![1.0, 2.0])]),
+        );
+    }
+
+    #[test]
+    fn test_cast_differentiation_layout_and_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_type = ArrayType::scalar(DataType::F64)
+            .with_layout(Layout::Strided(StridedLayout::new(Vec::new())))
+            .with_sharding(Sharding::replicated(mesh, 0))
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |value| value.cast(output_type.clone(), &[]),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        // The static input proves the relationship, so the checked cast is bound unchecked and linearization keeps
+        // no residual: the tangent program converts the tangent representation on its own.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[][layout=strided{}][sharding={mesh<['x'=1:explicit]>, []}] = cast [
+                    type=f64[][layout=strided{}][sharding={mesh<['x'=1:explicit]>, []}],
+                    inputs=[f64[]],
+                ] %0
+                in (%1)"},
+        );
+        let linearization = program.to_flat_program().linearize().unwrap();
+        assert_eq!(linearization.primal().to_string(), program.to_string());
+        assert_eq!(linearization.tangent().to_string(), program.to_string());
+        for checked in [true, false] {
+            let input = Array::scalar(2f64).unwrap();
+            let (primal, tangent) = differentiate_at(input.clone())
+                .jvp(Array::scalar(3f64).unwrap(), |value| {
+                    if checked {
+                        value.cast(output_type.clone(), &[])
+                    } else {
+                        value.cast_unchecked(output_type.clone(), &[])
+                    }
+                })
+                .unwrap();
+            assert_eq!(primal, Array::from_elements(output_type.clone(), &[2f64]).unwrap());
+            assert_eq!(tangent, Array::from_elements(output_type.clone(), &[3f64]).unwrap());
+            // Reverse mode must restore its exact nominal accumulator descriptor, rather than inheriting the output's
+            // optional annotations into the inverse cast. Concrete results must honor that representation too.
+            check_gradient!(
+                |value| if checked {
+                    value.cast(output_type.clone(), &[])
+                } else {
+                    value.cast_unchecked(output_type.clone(), &[])
+                },
+                at = input,
+                step = 1e-6,
+                tolerance = 1e-6,
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_differentiation_refined_representation() {
+        // Layout and sharding change directly, with one tangent conversion and no erased intermediate. The static
+        // input type proves the relationship, so the JVP normalizes the checked primal cast as well, and split
+        // linearization needs no primal residual for ordering. The composite universe stages the same programs.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let first_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let second_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_input = plain.clone().with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
+        let sharded_output = plain.clone().with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
+        let expected_layout = formatdoc! {"
+            lambda %0:{input}, %1:{input} .
+            let %2:{output} = cast [type={output}, inputs=[f32[2]]] %0
+                %3:{output} = cast [type={output}, inputs=[{input}]] %1
+            in (%2, %3)"};
+        let expected_sharding = formatdoc! {"
+            lambda %0:{sharded_input}, %1:{sharded_input} .
+            let %2:{sharded_output} = cast [type={sharded_output}, inputs=[f32[2]]] %0
+                %3:{sharded_output} = cast [
+                    type={sharded_output},
+                    inputs=[{sharded_input}],
+                ] %1
+            in (%2, %3)"};
+        let expected_tangent_layout = formatdoc! {"
+            lambda %0:{input} .
+            let %1:{output} = cast [type={output}, inputs=[{input}]] %0
+            in (%1)"};
+        let expected_tangent_sharding = formatdoc! {"
+            lambda %0:{sharded_input} .
+            let %1:{sharded_output} = cast [
+                type={sharded_output},
+                inputs=[{sharded_input}],
+            ] %0
+            in (%1)"};
+        for (input, output, expected, expected_tangent) in [
+            (input, output, expected_layout, expected_tangent_layout),
+            (sharded_input, sharded_output, expected_sharding, expected_tangent_sharding),
+        ] {
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+                let value = builder.add_input(input.clone());
+                let result = builder
+                    .add_instruction(constructor(output.clone(), vec![plain.clone()]), vec![], vec![value], None)
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder])
+                    .unwrap();
+                let jvp = program.jvp().unwrap();
+                assert_eq!(jvp.to_string(), expected);
+                let primal = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+                let tangent = Array::from_elements(input.clone(), &[3f32, 4f32]).unwrap();
+                let expected_values = vec![
+                    Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
+                    Array::from_elements(output.clone(), &[3f32, 4f32]).unwrap(),
+                ];
+                assert_eq!(jvp.interpret(vec![primal.clone(), tangent.clone()]), Ok(expected_values.clone()));
+                let linearization = program.linearize().unwrap();
+                assert_eq!(linearization.residual_count(), 0);
+                assert_eq!(linearization.tangent().to_string(), expected_tangent);
+                let composite = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+                let composite_jvp = composite.jvp().unwrap();
+                assert_eq!(composite_jvp.to_string(), expected);
+                assert_eq!(
+                    composite_jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
+                    Ok(expected_values.into_iter().map(ArrayIrValue::Array).collect()),
+                );
+                assert_eq!(composite.linearize().unwrap().tangent().to_string(), expected_tangent);
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_differentiation_refined_representation_checked_shape() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let input = declared.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let output =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let value = builder.add_input(input.clone());
+        let result = builder
+            .add_instruction(CastOperation::checked(output.clone(), vec![declared.clone()]), vec![], vec![value], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
+        let jvp = program.jvp().unwrap();
+        // One retained source carries n and the primal check into the fused tangent conversion.
+        assert_eq!(
+            jvp.to_string(),
+            formatdoc! {"
+                lambda %0:{input}, %1:{input} .
+                let %2:{output} = cast [type={output}, inputs=[{declared}], checked=true] %0
+                    %3:{input} = cast [
+                        type={input},
+                        inputs=[{input}, {output}],
+                    ] %0 %2
+                    %4:{output} = cast [
+                        type={output},
+                        inputs=[{input}, {input}],
+                    ] %1 %3
+                in (%2, %4)"},
+        );
+        let exact = input.clone().with_shape(Shape::new(vec![Dimension::Static(2)]));
+        let primal = Array::from_elements(exact.clone(), &[1f32, 2f32]).unwrap();
+        let tangent = Array::from_elements(exact, &[3f32, 4f32]).unwrap();
+        assert_eq!(
+            jvp.interpret(vec![primal, tangent]),
+            Ok(vec![
+                Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
+                Array::from_elements(output.clone(), &[3f32, 4f32]).unwrap(),
+            ]),
+        );
+        let wrong_type = input.with_shape(Shape::new(vec![Dimension::Static(3)]));
+        let wrong = Array::from_elements(wrong_type.clone(), &[1f32, 2f32, 3f32]).unwrap();
+        assert_eq!(
+            jvp.interpret(vec![wrong.clone(), wrong]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`cast` cannot convert type `{wrong_type}` to unrelated type `{output}`",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_cast_differentiation_refined_representation_witness_identity() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let output = plain.with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let value = builder.add_input(input.clone());
+        let witness = builder.add_input(declared.clone());
+        let result = builder
+            .add_instruction(
+                CastOperation::checked(output.clone(), vec![declared.clone(), declared.clone()]),
+                vec![],
+                vec![value, witness],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        // The source has an exact shape. The fused tangent depends on the checked result without introducing n, and
+        // split linearization needs no residual once the primal has completed.
+        let expected = formatdoc! {"
+            lambda %0:{input}, %1:{declared}, %2:{input}, %3:{declared} .
+            let %4:{output} = cast [type={output}, inputs=[{declared}, {declared}], checked=true] %0 %1
+                %5:{output} = cast [
+                    type={output},
+                    inputs=[{input}, {output}],
+                ] %2 %4
+            in (%4, %5)"};
+        assert_eq!(program.jvp().unwrap().to_string(), expected);
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{input} .
+                let %1:{output} = cast [type={output}, inputs=[{input}]] %0
+                in (%1)"},
+        );
+        let primal = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+        let tangent = Array::from_elements(input, &[3f32, 4f32]).unwrap();
+        let witness = Array::vector(vec![0f32; 2]).unwrap();
+        let inputs = vec![primal, witness.clone(), tangent, witness];
+        let expected_values = vec![
+            Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
+            Array::from_elements(output, &[3f32, 4f32]).unwrap(),
+        ];
+        assert_eq!(program.jvp().unwrap().interpret(inputs.clone()), Ok(expected_values.clone()));
+        let composite = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+        let composite_jvp = composite.jvp().unwrap();
+        assert_eq!(composite_jvp.to_string(), expected);
+        assert_eq!(
+            composite_jvp.interpret(inputs.into_iter().map(ArrayIrValue::Array).collect()),
+            Ok(expected_values.into_iter().map(ArrayIrValue::Array).collect()),
+        );
     }
 
     #[test]
     fn test_cast_differentiation_validates_witnesses() {
+        // A tangent cast staged by a guard's derivative witnesses the renamed output with the primal input and output,
+        // so concrete witnesses must agree with the source extent that the output name was renamed from.
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
-        let [p, a, b] = ["p", "a", "b"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let vector = |dimension: &DimensionType| {
             ArrayType::new(DataType::F32, Shape::new(vec![dimension.simplified_dimension()]))
         };
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let first = builder.add_input(vector(&a));
-        let second = builder.add_input(vector(&b));
-        let guarded = builder
-            .add_instruction(
-                GuardOperation::new("region", vec![vector(&p), vector(&p)]).with_retained(vec![a.to_variable()]),
-                vec![],
-                vec![first, second],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let sum = builder.add_instruction(AddOperation::new(), vec![], guarded, None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:f32[a], %1:f32[b], %2:f32[a], %3:f32[b] .
-                let %4:f32[a], %5:f32[a] = guard [boundary="region", types=[f32[p], f32[p]], retained=[a]] %0 %1
-                    %6:f32[a] = cast [type=f32[a], input_type=f32[b], witnesses=[f32[b], f32[a]], relation=f32[p]] %3 %1 %5
-                    %7:f32[a] = add %4 %5
-                    %8:f32[a] = add %2 %6
-                in (%7, %8)"#},
-        );
-        let operation = program
-            .instructions()
-            .iter()
-            .find_map(|instruction| match instruction.operation() {
-                ArrayOperation::Cast(operation) => Some(operation),
-                _ => None,
-            })
-            .unwrap();
         let exact = |extent| ArrayType::new_static(DataType::F32, [extent]);
+        let operation = CastOperation::unchecked(vector(&a), vec![vector(&b), vector(&b), vector(&a)]);
         assert_eq!(
             operation.infer_output_types(&[exact(3), exact(3), exact(5)], &[]),
             Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "p".to_owned(),
-                expected: 3,
-                actual: 5,
+                dimension: "a".to_owned(),
+                expected: 5,
+                actual: 3,
             })),
         );
         assert_eq!(operation.infer_output_types(&[exact(3), exact(3), exact(3)], &[]), Ok(vec![exact(3)]));
     }
 
     #[test]
+    fn test_cast_differentiation_preserves_witness_dependencies() {
+        // The tangent cast stays behind every witness producer, here a guard, through one source-typed residual that
+        // retains n together with the checked result, in both modes.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        for (checked, mode) in [(true, ", checked=true"), (false, "")] {
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |inputs: Vec<Tracer<_>>| {
+                    let context = inputs[1].context();
+                    let fixed = context.constant(Array::vector(vec![0f32; 2])?);
+                    let witnesses = context.bind(
+                        GuardOperation::new("witness", vec![symbolic.clone(); 2]),
+                        vec![],
+                        &[inputs[1].clone(), fixed],
+                    )?;
+                    Ok(vec![if checked {
+                        inputs[0].cast(exact.clone(), &witnesses)?
+                    } else {
+                        inputs[0].cast_unchecked(exact.clone(), &witnesses)?
+                    }])
+                },
+                vec![symbolic.clone(); 2],
+            )
+            .unwrap();
+            assert_eq!(
+                program.jvp().unwrap().to_string(),
+                formatdoc! {r#"
+                    lambda %0:f32[n], %1:f32[n], %2:f32[n], %3:f32[n] .
+                    let %4:f32[2] = const [0.0, 0.0]
+                        %5:f32[2], %6:f32[2] = guard [boundary="witness", types=[f32[n], f32[n]]] %1 %4
+                        %7:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[2]]] %1 %5
+                        %8:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %3 %7
+                        %9:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[2], f32[2]]{mode}] %0 %5 %6
+                        %10:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[2]]] %0 %9
+                        %11:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %2 %10
+                    in (%9, %11)"#},
+            );
+            let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+            assert_eq!(linearization.residual_count(), 1);
+            assert_eq!(
+                linearization.tangent().to_string(),
+                indoc! {"
+                    lambda %0:f32[n], %1:f32[n] .
+                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %1
+                    in (%2)"},
+            );
+        }
+    }
+
+    #[test]
     fn test_cast_transposition() {
         let exact = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        check_operation_transposition!(
+            @exact,
+            operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]),
+            cases = [{
+                inputs = [(@linear(type = exact.clone()))],
+                output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
+                input_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[2][layout=strided{8}] .
+                    let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
+                    in (%1)"},
+            }],
+        );
+
+        // A proven identity binds nothing, so its transpose is the identity as well.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].cast(exact.clone(), &[])?]),
             vec![exact.clone()],
@@ -4339,8 +6520,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2] .
-                let %1:f32[2] = cast [type=f32[2], checked=true] %0
-                in (%1)"},
+                in (%0)"},
         );
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         let value = Array::vector(vec![1f32, 2f32]).unwrap();
@@ -4352,24 +6532,547 @@ mod tests {
         );
         assert_eq!(transposed.interpret(vec![value.clone()]), Ok(vec![value]));
 
-        // Structural zeros retain the original nominal cotangent type and require no materialized witness.
+        // The linearized tangent of a checked narrowing is an unchecked cast whose source-typed residual carries the
+        // primal check, so its transpose widens the cotangent back with that residual as witness.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let operation = CastOperation::checked(exact.clone(), Vec::new());
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].cast(exact.clone(), &[])?]),
+            vec![symbolic],
+        )
+        .unwrap();
+        let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
+                in (%2)"},
+        );
+        let vector = |values: Vec<f32>| Array::vector(values).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![vector(vec![1.0, 2.0]), vector(vec![3.0, 4.0])]),
+            Ok(vec![vector(vec![1.0, 2.0])]),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_zero_cotangents() {
+        // Structural zeros retain the original nominal cotangent types and require no materialized witness.
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let witness = ArrayType::new_static(DataType::F32, [3]);
+        let operation = CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), witness.clone()]);
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
-        let accumulator = context.cotangent_accumulator(symbolic.clone(), true);
+        let inputs = [PartialValue::Unknown(symbolic.clone()), PartialValue::Unknown(witness.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Zero(exact)], &accumulators)
+            .unwrap();
+        let cotangents = context.take_cotangents(&accumulators).unwrap();
+        assert!(matches!(cotangents.as_slice(), [MaybeZero::Zero(first), MaybeZero::Zero(second)]
+            if *first == symbolic && *second == witness));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_cast_transposition_unneeded_cotangent() {
+        // A source whose cotangent is not needed stages nothing, even for a live output cotangent.
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]);
+        let tracing = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let cotangent = tracing.input(laid_out);
+        let mut context = TranspositionContext::new(tracing.clone());
+        let accumulator = context.cotangent_accumulator(exact.clone(), false);
+        assert!(!accumulator.is_needed());
         operation
             .transpose(
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(symbolic.clone())],
-                &[MaybeZero::Zero(exact)],
+                &[PartialValue::Unknown(exact.clone())],
+                &[MaybeZero::Value(cotangent)],
                 std::slice::from_ref(&accumulator),
             )
             .unwrap();
         let cotangents = context.take_cotangents(&[accumulator]).unwrap();
-        assert!(matches!(cotangents.as_slice(), [MaybeZero::Zero(r#type)] if *r#type == symbolic));
-        assert!(context.builder().borrow().instructions().is_empty());
+        assert!(matches!(cotangents.as_slice(), [MaybeZero::Zero(r#type)] if *r#type == exact));
+        assert!(tracing.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_cast_transposition_refined_representation() {
+        // Reversing a representation change restores the exact nominal input representation, in both modes and
+        // universes, directly and through linearization.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let first_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let second_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_input = plain.clone().with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
+        let sharded_output = plain.clone().with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
+        let expected_layout = formatdoc! {"
+            lambda %0:{output} .
+            let %1:{input} = cast [type={input}, inputs=[{output}]] %0
+            in (%1)"};
+        let expected_sharding = formatdoc! {"
+            lambda %0:{sharded_output} .
+            let %1:{sharded_input} = cast [
+                type={sharded_input},
+                inputs=[{sharded_output}],
+            ] %0
+            in (%1)"};
+        let cotangent = Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap();
+        let expected_cotangent = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+        let sharded_cotangent = Array::from_elements(sharded_output.clone(), &[1f32, 2f32]).unwrap();
+        let expected_sharded_cotangent = Array::from_elements(sharded_input.clone(), &[1f32, 2f32]).unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = CastOperation::checked(output.clone(), vec![plain.clone()]),
+            cases = [{
+                inputs = [(@linear(type = input.clone()))],
+                output_cotangents = [cotangent.clone()],
+                input_cotangents = [expected_cotangent.clone()],
+                pullback = expected_layout.clone(),
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = CastOperation::unchecked(output.clone(), vec![plain.clone()]),
+            cases = [{
+                inputs = [(@linear(type = input.clone()))],
+                output_cotangents = [cotangent.clone()],
+                input_cotangents = [expected_cotangent.clone()],
+                pullback = expected_layout.clone(),
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = CastOperation::checked(sharded_output.clone(), vec![plain.clone()]),
+            cases = [{
+                inputs = [(@linear(type = sharded_input.clone()))],
+                output_cotangents = [sharded_cotangent.clone()],
+                input_cotangents = [expected_sharded_cotangent.clone()],
+                pullback = expected_sharding.clone(),
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = CastOperation::unchecked(sharded_output.clone(), vec![plain.clone()]),
+            cases = [{
+                inputs = [(@linear(type = sharded_input.clone()))],
+                output_cotangents = [sharded_cotangent.clone()],
+                input_cotangents = [expected_sharded_cotangent.clone()],
+                pullback = expected_sharding.clone(),
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = CastOperation::unchecked(output.clone().into(), vec![ArrayIrType::from(plain.clone())]),
+            cases = [{
+                inputs = [(@linear(type = ArrayIrType::from(input.clone())))],
+                output_cotangents = [ArrayIrValue::Array(cotangent.clone())],
+                input_cotangents = [ArrayIrValue::Array(expected_cotangent.clone())],
+                pullback = expected_layout.clone(),
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = CastOperation::checked(sharded_output.clone().into(), vec![ArrayIrType::from(plain.clone())]),
+            cases = [{
+                inputs = [(@linear(type = ArrayIrType::from(sharded_input.clone())))],
+                output_cotangents = [ArrayIrValue::Array(sharded_cotangent.clone())],
+                input_cotangents = [ArrayIrValue::Array(expected_sharded_cotangent.clone())],
+                pullback = expected_sharding.clone(),
+            }],
+        );
+
+        // Linearizing first changes nothing: the shape is already proven, so the tangent program is the same unchecked
+        // cast and its pullback is the same inverse cast.
+        for (input, output, expected, cotangent, expected_cotangent) in [
+            (input, output, expected_layout, cotangent, expected_cotangent),
+            (sharded_input, sharded_output, expected_sharding, sharded_cotangent, expected_sharded_cotangent),
+        ] {
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+                let value = builder.add_input(input.clone());
+                let result = builder
+                    .add_instruction(constructor(output.clone(), vec![plain.clone()]), vec![], vec![value], None)
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder])
+                    .unwrap();
+                let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+                assert_eq!(pullback.to_string(), expected);
+                assert_eq!(pullback.interpret(vec![cotangent.clone()]), Ok(vec![expected_cotangent.clone()]));
+                let composite = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+                let composite_pullback =
+                    composite.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+                assert_eq!(composite_pullback.to_string(), expected);
+                assert_eq!(
+                    composite_pullback.interpret(vec![ArrayIrValue::Array(cotangent.clone())]),
+                    Ok(vec![ArrayIrValue::Array(expected_cotangent.clone())]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_transposition_checked_assertions() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let layout = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+
+        // A checked cast whose relationship the input types prove transposes like an unchecked one.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(exact.clone());
+        let output = builder
+            .add_instruction(CastOperation::checked(layout.clone(), vec![exact.clone()]), vec![], vec![input], None)
+            .unwrap()[0];
+        let proven = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .transpose()
+            .unwrap();
+        assert_eq!(
+            proven.to_string(),
+            indoc! {"
+                lambda %0:f32[2][layout=strided{8}] .
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
+                in (%1)"},
+        );
+        assert_eq!(
+            proven.interpret(vec![Array::from_elements(layout, &[1f32, 2f32]).unwrap()]),
+            Ok(vec![Array::vector(vec![1f32, 2f32]).unwrap()]),
+        );
+
+        // A live result, a discarded result and a zero-output program must all preserve the primal precondition.
+        let expected = DifferentiationError::Program(ProgramError::UnsupportedOperation {
+            message: "cannot transpose a checked `cast` without the primal value its check needs; linearize the \
+                      program first"
+                .to_owned(),
+        });
+        for outputs in 0..3 {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let value = builder.add_input(symbolic.clone());
+            let witness = builder.add_input(symbolic.clone());
+            let result = builder
+                .add_instruction(
+                    CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]),
+                    vec![],
+                    vec![value, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let outputs = match outputs {
+                0 => vec![result],
+                1 => vec![value],
+                _ => vec![],
+            };
+            let output_structure = vec![Placeholder; outputs.len()];
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], output_structure).unwrap();
+            assert_eq!(program.transpose_with_respect_to(&[0], &[]).unwrap_err(), expected);
+        }
+
+        // Known checks are replayed even when their results have no cotangents.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let value = builder.add_input(exact.clone());
+        let known = builder.add_input(symbolic.clone());
+        builder
+            .add_instruction(CastOperation::checked(exact.clone(), vec![symbolic]), vec![], vec![known], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %1
+                in (%0)"},
+        );
+        let vector = |extent| Array::vector(vec![1f32; extent]).unwrap();
+        assert_eq!(pullback.interpret(vec![vector(2), vector(2)]), Ok(vec![vector(2)]));
+        assert_eq!(
+            pullback.interpret(vec![vector(2), vector(5)]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `f32[5]` to unrelated type `f32[2]`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_linear_witness_known_source() {
+        // A checked cast whose source is known but whose linear witness its check needs cannot be transposed either,
+        // since the witness has no primal value during the reverse walk.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let value = builder.add_input(symbolic.clone());
+        let witness = builder.add_input(symbolic.clone());
+        let result = builder
+            .add_instruction(
+                CastOperation::checked(exact, vec![symbolic.clone(), symbolic]),
+                vec![],
+                vec![value, witness],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[1], &[]).unwrap_err(),
+            DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "cannot transpose a checked `cast` without the primal witnesses its check needs; linearize \
+                          the program first"
+                    .to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_validates_inputs() {
+        // The rule validates its input count and the supplied input types before using any accumulator.
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let operation = CastOperation::unchecked(exact.clone(), vec![exact.clone()]);
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(
+            operation.transpose(&mut context, &EmptyRegionDriver, &[], &[MaybeZero::Zero(exact.clone())], &[]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid("expected 1 input but got 0")))),
+        );
+        let wrong = ArrayType::new_static(DataType::F32, [3]);
+        let accumulator = context.cotangent_accumulator(wrong.clone(), false);
+        assert_eq!(
+            operation.transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(wrong)],
+                &[MaybeZero::Zero(exact)],
+                &[accumulator],
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid(
+                "dimension 3 does not refine declared dimension 2",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_known_shape() {
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let source = builder.add_input(exact.clone());
+        let witness = builder.add_input(symbolic.clone());
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(symbolic.clone(), vec![exact, symbolic]),
+                vec![],
+                vec![source, witness],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        // The witness could prove the shape, but checking it during the reverse walk could reorder assertions. Require
+        // linearization, which executes the primal check in forward order.
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
+            DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "cannot transpose a checked `cast` without the primal value its check needs; linearize the \
+                          program first"
+                    .to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_known_region_checks() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = |extent| ArrayType::new_static(DataType::F32, [extent]);
+        let mut checking_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let checking_input = checking_builder.add_input(symbolic.clone());
+        checking_builder
+            .add_instruction(
+                CastOperation::checked(exact(2), vec![symbolic.clone()]),
+                vec![],
+                vec![checking_input],
+                None,
+            )
+            .unwrap();
+        let checking_branch = checking_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![checking_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut identity_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let identity_input = identity_builder.add_input(symbolic.clone());
+        let identity_branch = identity_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![identity_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let linear = builder.add_input(exact(2));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let known = builder.add_input(symbolic.clone());
+        let regions = vec![builder.import_program(checking_branch), builder.import_program(identity_branch)];
+        builder.add_instruction(ConditionOperation::new(), regions, vec![predicate, known], None).unwrap();
+        builder
+            .add_instruction(CastOperation::checked(exact(3), vec![symbolic]), vec![], vec![known], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![linear], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:bool[], %2:f32[n] .
+                let %3:f32[n] = condition %1 %2 [
+                    true={
+                        lambda %0:f32[n] .
+                        let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                        in (%0)
+                    },
+                    false={
+                        lambda %0:f32[n] .
+                        in (%0)
+                    },
+                ]
+                    %4:f32[3] = cast [type=f32[3], inputs=[f32[n]], checked=true] %2
+                in (%0)"},
+        );
+        let vector = |extent| Array::vector(vec![1f32; extent]).unwrap();
+        // An unselected branch never checks, and a selected branch checks before the following assertion.
+        assert_eq!(pullback.interpret(vec![vector(2), Array::scalar(false).unwrap(), vector(3)]), Ok(vec![vector(2)]));
+        assert_eq!(
+            pullback.interpret(vec![vector(2), Array::scalar(true).unwrap(), vector(5)]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `f32[5]` to unrelated type `f32[2]`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_linear_witnesses() {
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let witness = ArrayType::new_static(DataType::F32, [3]);
+        for checked in [true, false] {
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |(value, witness)| {
+                    if checked {
+                        value.cast(plain.clone(), &[witness])
+                    } else {
+                        value.cast_unchecked(plain.clone(), &[witness])
+                    }
+                },
+                (plain.clone(), witness.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[2], %1:f32[3] .
+                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[2], f32[3]]] %0 %1
+                    in (%2)"},
+            );
+            let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+            assert_eq!(
+                transposed.to_string(),
+                indoc! {"
+                    lambda %0:f32[2] .
+                    let %1:f32[3] = zero [type=f32[3]]
+                    in (%0, %1)"},
+            );
+            let value = Array::vector(vec![1f32, 2f32]).unwrap();
+            assert_eq!(
+                transposed.interpret(vec![value.clone()]),
+                Ok(vec![value, Array::vector(vec![0f32; 3]).unwrap()]),
+            );
+        }
+
+        // A representation change still needs no value from an irrelevant static linear witness.
+        let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(value, witness)| value.cast_unchecked(output.clone(), &[witness]),
+            (plain.clone(), witness.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[3] .
+                let %2:f32[2][layout=strided{8}] = cast [type=f32[2][layout=strided{8}], inputs=[f32[2], f32[3]]] %0 %1
+                in (%2)"},
+        );
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[2][layout=strided{8}] .
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
+                    %2:f32[3] = zero [type=f32[3]]
+                in (%1, %2)"},
+        );
+        let value = Array::from_elements(output, &[1f32, 2f32]).unwrap();
+        assert_eq!(
+            transposed.interpret(vec![value]),
+            Ok(vec![Array::vector(vec![1f32, 2f32]).unwrap(), Array::vector(vec![0f32; 3]).unwrap()]),
+        );
+
+        // A linear witness does not provide a value for a required nominal identity. Keep the existing useful error.
+        let name = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![name.simplified_dimension()]));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(value, witness)| value.cast_unchecked(plain.clone(), &[witness]),
+            (symbolic.clone(), symbolic),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %1
+                in (%2)"},
+        );
+        assert_eq!(
+            program.transpose_with_respect_to(&[0, 1], &[]).unwrap_err(),
+            DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "`cast` transposition needs a known witness for input identity `n`; \
+                          linearize the program before transposing it"
+                    .to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_known_witnesses() {
+        // Known witnesses are kept as witnesses of the cotangent cast, so their producers stay explicit dependencies.
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        check_operation_transposition!(
+            @exact,
+            operation = CastOperation::unchecked(
+                laid_out.clone(),
+                vec![exact.clone(), ArrayType::new_static(DataType::F32, [3])],
+            ),
+            cases = [{
+                inputs = [(@linear(type = exact.clone())), (@known, Array::vector(vec![1f32; 3]).unwrap())],
+                output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
+                input_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[2][layout=strided{8}], %1:f32[3] .
+                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}], f32[3]]] %0 %1
+                    in (%2)"},
+            }],
+        );
     }
 
     #[test]
@@ -4378,10 +7081,10 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(symbolic);
+        let input = builder.add_input(symbolic.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(ArrayType::new_static(DataType::F32, [2]), Vec::new()),
+                CastOperation::unchecked(ArrayType::new_static(DataType::F32, [2]), vec![symbolic]),
                 Vec::new(),
                 vec![input],
                 None,
@@ -4393,17 +7096,19 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[n] .
-                let %1:f32[2] = cast [type=f32[2], checked=true] %0
+                let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]]] %0
                 in (%1)"},
         );
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "`cast` transposition needs a known witness for input identity `n`; linearize the program before transposing it".to_owned(),
+                message: "`cast` transposition needs a known witness for input identity `n`; \
+                          linearize the program before transposing it"
+                    .to_owned(),
             }),
         );
 
-        // A known dimension can witness a narrowed axis without being an explicit operand of the forward cast.
+        // A known dimension can witness a narrowed axis without being an explicit input of the forward cast.
         // The unchanged n is carried by the cotangent, and the unrelated known dimension must not become a witness.
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let unrelated = DimensionType::new("unrelated", DimensionBounds::positive(Some(8)).unwrap());
@@ -4416,7 +7121,12 @@ mod tests {
         builder.add_input(unrelated.into());
         let input = builder.add_input(input_type.clone());
         let output = builder
-            .add_instruction(CastOperation::checked(output_type.clone(), Vec::new()), Vec::new(), vec![input], None)
+            .add_instruction(
+                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]),
+                Vec::new(),
+                vec![input],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -4429,7 +7139,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<m ∈ [1, 8)>, %1:dimension<unrelated ∈ [1, 8)>, %2:f32[n, m] .
-                let %3:f32[n, 2] = cast [type=f32[n, 2], checked=true] %2
+                let %3:f32[n, 2] = cast [type=f32[n, 2], inputs=[f32[n, m]]] %2
                 in (%3)"},
         );
         let transposed = program.transpose_with_respect_to(&[2], &[]).unwrap();
@@ -4437,10 +7147,9 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[n, 2], %1:dimension<m ∈ [1, 8)>, %2:dimension<unrelated ∈ [1, 8)> .
-                let %3:f32[n, m] = cast [type=f32[n, m], witnesses=[dimension<m ∈ [1, 8)>]] %0 %1
+                let %3:f32[n, m] = cast [type=f32[n, m], inputs=[f32[n, 2], dimension<m ∈ [1, 8)>]] %0 %1
                 in (%3)"},
         );
-        assert_eq!(transposed.output_types(), vec![input_type]);
         let value = ArrayIrValue::Array(Array::matrix(3, 2, vec![1f32; 6]).unwrap());
         assert_eq!(
             transposed.interpret(vec![
@@ -4453,23 +7162,152 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_transposition_relations() {
+    fn test_cast_transposition_known_intermediate() {
+        // A known intermediate that defines an identity (here, a dimension decoded from a known scalar) supplies that
+        // identity to the cotangent cast of a narrowing when no known program input carries it, and the pullback
+        // replays its pure producer.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let value = builder.add_input(exact.clone());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(n.clone()), Vec::new(), vec![scalar], None)
+            .unwrap()[0];
+        let widened = builder
+            .add_instruction(
+                CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]),
+                Vec::new(),
+                vec![value, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let narrowed = builder
+            .add_instruction(CastOperation::unchecked(exact.clone(), vec![symbolic]), Vec::new(), vec![widened], None)
+            .unwrap()[0];
+        // The reverse walk materializes a known intermediate when a rule first consumes it, so a later consumer
+        // makes the dimension available to the narrowing's transpose, which is not an explicit input of it.
+        let witnessed = builder
+            .add_instruction(
+                CastOperation::unchecked(exact.clone(), vec![exact.clone(), n.clone().into()]),
+                Vec::new(),
+                vec![narrowed, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![witnessed],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:f32[2] .
+                let %2:dimension<n ∈ [1, 8)> = dimension_from_scalar [bounds=[1, 8)] %0
+                    %3:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %1 %2
+                    %4:f32[2] = cast [type=f32[2], inputs=[f32[n]]] %3
+                    %5:f32[2] = cast [type=f32[2], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %4 %2
+                in (%5)"},
+        );
+        let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:i32[] .
+                let %2:dimension<n ∈ [1, 8)> = dimension_from_scalar [bounds=[1, 8)] %1
+                    %3:f32[2] = cast [type=f32[2], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %2
+                    %4:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %3 %2
+                    %5:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %4 %2
+                in (%5)"},
+        );
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![1f32, 2f32]).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![cotangent.clone(), ArrayIrValue::Array(Array::scalar(2i32).unwrap())]),
+            Ok(vec![cotangent.clone()]),
+        );
+        assert_eq!(
+            pullback.interpret(vec![cotangent, ArrayIrValue::Array(Array::scalar(3i32).unwrap())]),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_owned(),
+                expected: 3,
+                actual: 2,
+            }))),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_known_intermediate_without_consumer() {
+        // A known intermediate whose only use is as the witness of a narrowing is never an input of a transpose rule.
+        // Its producer is a known assertion, so the pullback replays it before the reverse walk, and that replay must
+        // supply its identity to the cotangent cast of the narrowing.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let value = builder.add_input(exact.clone());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(n.clone()), Vec::new(), vec![scalar], None)
+            .unwrap()[0];
+        let widened = builder
+            .add_instruction(
+                CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]),
+                Vec::new(),
+                vec![value, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let narrowed = builder
+            .add_instruction(CastOperation::unchecked(exact, vec![symbolic]), Vec::new(), vec![widened], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![narrowed],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:f32[2] .
+                let %2:dimension<n ∈ [1, 8)> = dimension_from_scalar [bounds=[1, 8)] %0
+                    %3:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %1 %2
+                    %4:f32[2] = cast [type=f32[2], inputs=[f32[n]]] %3
+                in (%4)"},
+        );
+        let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:i32[] .
+                let %2:dimension<n ∈ [1, 8)> = dimension_from_scalar [bounds=[1, 8)] %1
+                    %3:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %2
+                    %4:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %3 %2
+                in (%4)"},
+        );
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![1f32, 2f32]).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![cotangent.clone(), ArrayIrValue::Array(Array::scalar(2i32).unwrap())]),
+            Ok(vec![cotangent]),
+        );
+    }
+
+    #[test]
+    fn test_cast_transposition_declared_dimensions() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b, p, q] = ["a", "b", "p", "q"].map(|name| DimensionType::new(name, bounds));
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output =
             ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let relation =
-            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()]));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
-            .add_instruction(
-                CastOperation::checked(output, Vec::new()).with_relation(input, relation),
-                Vec::new(),
-                vec![value],
-                None,
-            )
+            .add_instruction(CastOperation::unchecked(output, vec![input]), Vec::new(), vec![value], None)
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -4477,7 +7315,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[a, b] .
-                let %1:f32[b, a] = cast [type=f32[b, a], input_type=f32[a, b], relation=f32[p, q], checked=true] %0
+                let %1:f32[b, a] = cast [type=f32[b, a], inputs=[f32[a, b]]] %0
                 in (%1)"},
         );
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
@@ -4488,7 +7326,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[b, a] .
-                let %1:f32[a, b] = cast [type=f32[a, b], input_type=f32[b, a], relation=f32[p, q]] %0
+                let %1:f32[a, b] = cast [type=f32[a, b], inputs=[f32[b, a]]] %0
                 in (%1)"},
         );
         let value = Array::matrix(2, 2, vec![1f32; 4]).unwrap();
@@ -4497,39 +7335,313 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f32[b, a], %1:f32[a, b], %2:f32[b, a] .
-                let %3:f32[a, b] = cast [
-                    type=f32[a, b],
-                    input_type=f32[b, a],
-                    witnesses=[f32[a, b], f32[b, a]],
-                    relation=f32[p, q],
-                ] %0 %1 %2
-                in (%3)"},
+                lambda %0:f32[b, a] .
+                let %1:f32[a, b] = cast [type=f32[a, b], inputs=[f32[b, a]]] %0
+                in (%1)"},
         );
-        let inputs = pullback.input_types().iter().map(|_| value.clone()).collect();
-        assert_eq!(pullback.interpret(inputs), Ok(vec![value]));
+        assert_eq!(pullback.interpret(vec![value.clone()]), Ok(vec![value]));
+    }
+
+    #[test]
+    fn test_cast_type_infer_cast_output_type() {
+        // An independent type family can implement the operation-specific contract without changing
+        // `TypeRefinements` (refer to the module-level fixture).
+        check_operation_type_inference!(
+            operation = CastOperation::checked(ProjectedMemberType::<0>, vec![ProjectedMemberType::<0>]),
+            cases = [{ input_types = [ProjectedMemberType::<0>], output_types = [ProjectedMemberType::<0>] }],
+        );
+
+        // Bare data types relate only to themselves.
+        assert_eq!(
+            DataType::infer_cast_output_type(
+                &CastOperation::checked(DataType::F32, vec![DataType::F32]),
+                &[DataType::F32],
+            ),
+            Ok((DataType::F32, Some(DataType::F32))),
+        );
+        assert_eq!(
+            DataType::infer_cast_output_type(
+                &CastOperation::checked(DataType::F64, vec![DataType::F32]),
+                &[DataType::F32],
+            ),
+            Err(TypeError::invalid("`cast` cannot convert type `f32` to unrelated type `f64`")),
+        );
+
+        // Arrays keep their element type, rank, and memory space, and the representation is interpretable exactly when
+        // the supplied types prove the shape, in both modes.
+        let array = ArrayType::new_static(DataType::F32, [2, 3]);
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = |extent| ArrayType::new_static(DataType::F32, [extent]);
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                ArrayType::infer_cast_output_type(
+                    &constructor(array.clone(), vec![array.clone()]),
+                    std::slice::from_ref(&array),
+                ),
+                Ok((array.clone(), Some(array.clone()))),
+            );
+            for output in [
+                ArrayType::scalar(DataType::F32),
+                ArrayType::new_static(DataType::F32, [1, 6]),
+                array.clone().with_memory(Memory::Host { pinned: true }),
+            ] {
+                assert_eq!(
+                    ArrayType::infer_cast_output_type(
+                        &constructor(output.clone(), vec![array.clone()]),
+                        std::slice::from_ref(&array),
+                    ),
+                    Err(unrelated_cast_types(&array, &output)),
+                );
+            }
+            let operation = constructor(symbolic.clone(), vec![exact(2), symbolic.clone()]);
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(2)]),
+                Ok((exact(2), Some(exact(2)))),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(3)]),
+                Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 3,
+                    actual: 2,
+                })),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[]),
+                Err(TypeError::invalid("expected 2 inputs but got 0")),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[exact(2)]),
+                Err(TypeError::invalid("expected 2 inputs but got 1")),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&constructor(array.clone(), Vec::new()), &[]),
+                Err(TypeError::invalid("`cast` requires a declared first input type")),
+            );
+        }
+
+        // Conditional narrowing can be staged, while nominal identity and concrete extents prove the relationship.
+        let narrowing = CastOperation::checked(exact(2), vec![symbolic.clone()]);
+        assert_eq!(ArrayType::infer_cast_output_type(&narrowing, &[symbolic.clone()]), Ok((exact(2), None)));
+        assert_eq!(ArrayType::infer_cast_output_type(&narrowing, &[exact(2)]), Ok((exact(2), Some(exact(2)))));
+        assert_eq!(
+            ArrayType::infer_cast_output_type(
+                &CastOperation::checked(symbolic.clone(), vec![symbolic.clone()]),
+                &[symbolic.clone()],
+            ),
+            Ok((symbolic.clone(), Some(symbolic.clone()))),
+        );
+
+        // Representation changes alone never need a runtime check.
+        let plain = ArrayType::new_static(DataType::U8, [2]);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let annotated = plain
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![2])))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                ArrayType::infer_cast_output_type(
+                    &constructor(annotated.clone(), vec![plain.clone()]),
+                    &[plain.clone()],
+                ),
+                Ok((annotated.clone(), Some(annotated.clone()))),
+            );
+        }
+
+        // First-class dimensions narrow to static types, which a differently named actual instantiates only within
+        // its own bounds, and cannot target identity-defining types.
+        let dimension = DimensionType::from(Dimension::Static(2));
+        let static_narrowing = CastOperation::checked(dimension.clone(), vec![n.clone()]);
+        assert_eq!(
+            DimensionType::infer_cast_output_type(&static_narrowing, std::slice::from_ref(&n)),
+            Ok((dimension.clone(), None)),
+        );
+        assert_eq!(
+            DimensionType::infer_cast_output_type(&static_narrowing, std::slice::from_ref(&dimension)),
+            Ok((dimension.clone(), Some(dimension.clone()))),
+        );
+        let narrow = DimensionType::new("narrow", DimensionBounds::new(4, Some(8)).unwrap());
+        assert_eq!(
+            DimensionType::infer_cast_output_type(&static_narrowing, std::slice::from_ref(&narrow)),
+            Err(TypeError::custom(DimensionError::BindingOutOfBounds {
+                variable: "narrow".to_owned(),
+                value: 2,
+                bounds: narrow.bounds(),
+            })),
+        );
+        assert_eq!(
+            DimensionType::infer_cast_output_type(
+                &CastOperation::checked(DimensionType::from(Dimension::Static(3)), vec![dimension.clone()]),
+                std::slice::from_ref(&dimension),
+            ),
+            Err(unrelated_cast_types(&dimension, &DimensionType::from(Dimension::Static(3)))),
+        );
+        assert_eq!(
+            DimensionType::infer_cast_output_type(
+                &CastOperation::checked(n, vec![dimension.clone()]),
+                &[dimension.clone()],
+            ),
+            Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
+        );
+
+        // The composite universe rejects casts across member kinds and references.
+        assert_eq!(
+            ArrayIrType::infer_cast_output_type(
+                &CastOperation::checked(ArrayIrType::Dimension(dimension), vec![array.clone().into()]),
+                &[array.clone().into()],
+            ),
+            Err(TypeError::invalid("`cast` cannot convert type `f32[2, 3]` to unrelated type `dimension<2>`")),
+        );
+        let reference: ArrayIrType = ReferenceType::new(array.clone()).into();
+        assert_eq!(
+            ArrayIrType::infer_cast_output_type(
+                &CastOperation::checked(array.clone().into(), vec![array.into(), reference.clone()]),
+                &[ArrayType::new_static(DataType::F32, [2, 3]).into(), reference],
+            ),
+            Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
+        );
+    }
+
+    #[test]
+    fn test_cast_cast() {
+        // Context-carrying values bind a checked cast through their context, which the static input type may already
+        // prove, and a checked cast next to an unchecked one with a witness.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let (_, proven) =
+            TracingContext::<Array, ArrayOperation<Array>>::trace(|value| value.cast(laid_out.clone(), &[]), plain)
+                .unwrap();
+        assert_eq!(
+            proven.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2][layout=strided{8}] = cast [type=f32[2][layout=strided{8}], inputs=[f32[2]]] %0
+                in (%1)"},
+        );
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(value, witness)| {
+                let checked = value.cast(exact.clone(), &[])?;
+                let unchecked = value.cast_unchecked(exact.clone(), &[witness])?;
+                Ok((checked, unchecked))
+            },
+            (symbolic.clone(), symbolic.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                    %3:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %1
+                in (%2, %3)"},
+        );
+
+        // A name absent from both the value and its declared witnesses is not a lost identity from concretization.
+        // Do not erase it and admit a widening for which no input supplies the requested relationship.
+        let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(value, _witness)| value.cast(symbolic.clone(), &[]),
+            (exact, symbolic.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::Type(TypeError::invalid("`cast` output identity `n` is not carried by a declared input")),
+        );
+    }
+
+    #[test]
+    fn test_cast_cast_unchecked() {
+        // An unchecked cast binds without a check and materializes the requested representation when interpreted.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let laid_out = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |value| value.cast_unchecked(laid_out.clone(), &[]),
+            plain,
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2][layout=strided{8}] = cast [type=f32[2][layout=strided{8}], inputs=[f32[2]]] %0
+                in (%1)"},
+        );
+        assert_eq!(
+            program.interpret(Array::vector(vec![1f32, 2f32]).unwrap()),
+            Ok(Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()),
+        );
     }
 
     #[test]
     fn test_array_cast() {
-        // Concrete values have exact types, so a cast checks immediately that the value's type refines the output type,
-        // in both modes. Concrete witnesses carry no identities, so they relate to nothing.
+        // Concrete values cannot supply nominal names, with or without exact shape witnesses, in either mode.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let exact = |extent: usize| ArrayType::new_static(DataType::F32, [extent]);
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
-        assert_eq!(vector(2).cast(symbolic.clone(), &[]), Ok(vector(2)));
-        assert_eq!(vector(2).cast_unchecked(symbolic.clone(), &[vector(3)]), Ok(vector(2)));
+        let missing_name = Err(ProgramError::Type(TypeError::invalid(
+            "`cast` output identity `n` is not carried by a declared input",
+        )));
+        for witnesses in [vec![], vec![vector(2)], vec![vector(3)], vec![vector(2), vector(2)]] {
+            assert_eq!(vector(2).cast(symbolic.clone(), &witnesses), missing_name);
+            assert_eq!(vector(2).cast_unchecked(symbolic.clone(), &witnesses), missing_name);
+        }
         assert_eq!(vector(2).cast(exact(2), &[]), Ok(vector(2)));
         let unrelated = Err(ProgramError::Type(TypeError::invalid(
             "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
         )));
         assert_eq!(vector(3).cast(exact(2), &[]), unrelated);
         assert_eq!(vector(3).cast_unchecked(exact(2), &[]), unrelated);
-        assert_eq!(
-            vector(2).cast(symbolic.clone(), &[vector(2), vector(2)]).map(|value| value.r#type().into_owned()),
-            Ok(exact(2)),
-        );
+    }
+
+    #[test]
+    fn test_array_cast_unspecified_layout_and_sharding() {
+        // A sharding annotation shares the input's storage, whereas a layout re-encodes the logical bytes into dense
+        // padded storage, in both modes.
+        let input = Array::vector(vec![10u8, 20]).unwrap();
+        let plain = input.r#type().into_owned();
+        let layout = Layout::Strided(StridedLayout::new(vec![2]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+        for output_type in [
+            plain.clone().with_layout(layout.clone()),
+            plain.clone().with_sharding(sharding.clone()).unwrap(),
+            plain.with_layout(layout).with_sharding(sharding).unwrap(),
+        ] {
+            let expected = Array::from_elements(output_type.clone(), &[10u8, 20]).unwrap();
+            for result in [input.cast(output_type.clone(), &[]), input.cast_unchecked(output_type.clone(), &[])] {
+                let result = result.unwrap();
+                assert_eq!(result, expected);
+                assert_eq!(result.r#type().as_ref(), &output_type);
+                assert_eq!(result.logical_bytes(), vec![10, 20]);
+                if output_type.layout().is_some() {
+                    assert_eq!(result.storage_bytes(), &[10, 0, 20]);
+                } else {
+                    assert!(Arc::ptr_eq(result.shared_storage_bytes(), input.shared_storage_bytes()));
+                }
+            }
+        }
+
+        // Layout materialization copies element encodings exactly, including a NaN payload and a signed zero.
+        let input = Array::vector(vec![f32::from_bits(0x7fc12345), f32::from_bits(0x80000000)]).unwrap();
+        let output_type = input.r#type().clone().into_owned().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let result = input.cast(output_type.clone(), &[]).unwrap();
+        assert_eq!(result.r#type().as_ref(), &output_type);
+        assert_eq!(result.logical_bytes(), input.logical_bytes());
+        assert_eq!(result.storage_bytes().len(), 12);
+        assert_eq!(&result.storage_bytes()[4..8], &[0, 0, 0, 0]);
+        // Removing a layout returns to canonical dense storage; relabeling a padded buffer would read holes as data.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let dense = result.cast(plain.clone(), &[]).unwrap();
+        assert_eq!(dense.r#type().as_ref(), &plain);
+        assert_eq!(dense.logical_bytes(), input.logical_bytes());
+        assert_eq!(dense.storage_bytes().len(), 8);
     }
 
     #[test]
@@ -4539,11 +7651,25 @@ mod tests {
         let exact = |extent: usize| ArrayType::new_static(DataType::F32, [extent]);
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
 
-        // Composite values behave the same. A first-class dimension type defines its identity, which the output type of
-        // a cast may not, so only exact dimension types are valid outputs for dimension values.
+        // Composite array members behave like arrays, including representation changes, and reference witnesses are
+        // rejected.
         let composite = |extent: usize| ArrayIrValue::<Array>::Array(vector(extent));
-        assert_eq!(composite(2).cast(symbolic.clone().into(), &[]), Ok(composite(2)));
-        assert!(composite(3).cast_unchecked(exact(2).into(), &[]).is_err());
+        assert_eq!(
+            composite(2).cast(symbolic.clone().into(), &[]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` output identity `n` is not carried by a declared input",
+            ))),
+        );
+        assert_eq!(
+            composite(3).cast_unchecked(exact(2).into(), &[]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
+            ))),
+        );
+        let laid_out = exact(2).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let expected = Ok(ArrayIrValue::Array(Array::from_elements(laid_out.clone(), &[1f32, 1f32]).unwrap()));
+        assert_eq!(composite(2).cast(laid_out.clone().into(), &[]), expected);
+        assert_eq!(composite(2).cast_unchecked(laid_out.into(), &[]), expected);
         let reference = ArrayIrValue::Reference(ArrayReference::new(vector(2)));
         let expected = Err(ProgramError::Type(TypeError::invalid(format!(
             "`cast` does not support reference type `{}`",
@@ -4551,10 +7677,19 @@ mod tests {
         ))));
         assert_eq!(composite(2).cast(exact(2).into(), std::slice::from_ref(&reference)), expected);
         assert_eq!(composite(2).cast_unchecked(exact(2).into(), &[reference]), expected);
+
+        // A first-class dimension type defines its identity, which the output type of a cast may not, so only exact
+        // dimension types are valid outputs for dimension values, and concrete witnesses carry no identities.
         let dimension = |extent: usize| ArrayIrValue::<Array>::Dimension(DimensionValue::constant(extent).unwrap());
         let exact_dimension = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
         assert_eq!(dimension(2).cast(exact_dimension.clone(), &[]), Ok(dimension(2)));
-        assert!(dimension(3).cast(exact_dimension, &[]).is_err());
+        assert_eq!(dimension(2).cast(exact_dimension.clone(), &[composite(2)]), Ok(dimension(2)));
+        assert_eq!(
+            dimension(3).cast(exact_dimension, &[]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `dimension<3>` to unrelated type `dimension<2>`",
+            ))),
+        );
         assert_eq!(
             dimension(2).cast(ArrayIrType::Dimension(n), &[]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -4565,11 +7700,38 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_cast_wrapped_tracers() {
+        // A composite value whose array member is a tracer delegates array casts to that member's context, so symbolic
+        // relationships are staged and checked at runtime rather than inspected eagerly, whereas a host dimension cast
+        // cannot retain a staged array witness.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
+        let unretained = ProgramError::Concretization {
+            message: "host dimension `cast` cannot retain an array witness producer; \
+                      bind the cast through a composite context"
+                .to_owned(),
+        };
+        let context = TracingContext::<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>>::new();
+        let captured = context.constant(CaptureReference::new(0, exact.clone()));
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[ArrayIrValue::Array(captured)]),
+            Err(unretained.clone()),
+        );
         for (checked, mode) in [(true, ", checked=true"), (false, "")] {
+            let rejected_dimension = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |witness| {
+                    let value = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
+                    let witnesses = [ArrayIrValue::Array(witness)];
+                    let target = DimensionType::from(Dimension::Static(2)).into();
+                    let result =
+                        if checked { value.cast(target, &witnesses) } else { value.cast_unchecked(target, &witnesses) };
+                    result.map(|_| ())
+                },
+                exact.clone(),
+            );
+            assert_eq!(rejected_dimension.map(|_| ()), Err(unretained.clone()));
             let rejected = TracingContext::<Array, ArrayOperation<Array>>::trace(
                 |value| {
                     let reference = ArrayIrValue::Reference(ArrayReference::new(value.clone()));
@@ -4609,17 +7771,18 @@ mod tests {
             .unwrap();
             let expected = formatdoc! {"
                 lambda %0:f32[2], %1:f32[n] .
-                let %2:f32[n] = cast [type=f32[n], witnesses=[f32[n]]{mode}] %0 %1
+                let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]{mode}] %0 %1
                 in (%2)"};
             assert_eq!(program.to_string(), expected);
             assert_eq!(program.interpret((vector(2), vector(2))), Ok(vector(2)));
-            // Interpretation validates concrete geometry in both modes; unchecked lowering alone assumes it.
+            // Interpretation validates concrete shapes in both modes; unchecked lowering alone assumes them.
+            // The input witness binds n = 3 before the output observes the value's extent 2.
             assert_eq!(
                 program.interpret((vector(2), vector(3))),
                 Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
                     dimension: "n".to_owned(),
-                    expected: 2,
-                    actual: 3,
+                    expected: 3,
+                    actual: 2,
                 }))),
             );
             let residual = program
@@ -4628,7 +7791,7 @@ mod tests {
                 .unwrap();
             assert_eq!(residual.program().to_string(), expected);
 
-            // Narrowing a wrapped tracer must stage rather than attempting to inspect symbolic geometry eagerly.
+            // Narrowing a wrapped tracer must stage rather than attempting to inspect symbolic shapes eagerly.
             let (_, narrowed) = TracingContext::<Array, ArrayOperation<Array>>::trace(
                 |value| {
                     let value = ArrayIrValue::Array(value);
@@ -4647,50 +7810,16 @@ mod tests {
                 narrowed.to_string(),
                 formatdoc! {"
                     lambda %0:f32[n] .
-                    let %1:f32[2] = cast [type=f32[2]{mode}] %0
+                    let %1:f32[2] = cast [type=f32[2], inputs=[f32[n]]{mode}] %0
                     in (%1)"},
             );
             assert_eq!(narrowed.interpret(vector(2)), Ok(vector(2)));
-            assert!(matches!(narrowed.interpret(vector(3)), Err(ProgramError::Type(_))));
+            assert_eq!(
+                narrowed.interpret(vector(3)),
+                Err(ProgramError::Type(TypeError::invalid(
+                    "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
+                ))),
+            );
         }
-    }
-
-    #[test]
-    fn test_tracer_cast() {
-        // Context-carrying values bind a checked or an unchecked cast through their context.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
-        let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(value, witness)| {
-                let checked = value.cast(exact.clone(), &[])?;
-                let unchecked = value.cast_unchecked(exact.clone(), &[witness])?;
-                Ok((checked, unchecked))
-            },
-            (symbolic.clone(), symbolic.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[n], %1:f32[n] .
-                let %2:f32[2] = cast [type=f32[2], checked=true] %0
-                    %3:f32[2] = cast [type=f32[2], witnesses=[f32[n]]] %0 %1
-                in (%2, %3)"},
-        );
-
-        // A name absent from both the value and its declared witnesses is not a lost identity from concretization.
-        // Do not erase it and admit a widening for which no operand supplies the requested relationship.
-        let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(value, _witness)| value.cast(symbolic.clone(), &[]),
-            (exact, symbolic.clone()),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            ProgramError::Type(TypeError::invalid(
-                "operation `cast` output type references identity n without consuming or defining it",
-            )),
-        );
     }
 }
