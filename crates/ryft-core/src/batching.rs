@@ -609,12 +609,12 @@ pub trait BatchableType: Type {
 ///     Every selected carrier implements [`BatchedProgram`], while [`Self::boundary_inputs`] and
 ///     [`Self::adapt_batched_program`] let consumers complete or shed policy-specific widening.
 ///
-/// The policy is deliberately limited to carrier selection, construction, access, and invariant enforcement.
-/// Array-specific alignment and broadcasting are represented as functions on [`ArrayBatch`](crate::ArrayBatch) (a
-/// composite policy may project an array member into that carrier to reuse an existing array rule). Batching nested
-/// [`Region`](crate::Region) support is provided separately by the [`RecursiveBatchingPolicy`] trait, allowing a
-/// batching carrier to support region-free operations without also supporting recursive transformation of nested
-/// programs.
+/// The policy is deliberately limited to carrier selection, construction, access, type derivation,
+/// and invariant enforcement. Array-specific alignment and broadcasting are represented as functions on
+/// [`ArrayBatch`](crate::ArrayBatch) (a composite policy may project an array member into that carrier to reuse
+/// an existing array rule). Batching nested [`Region`](crate::Region) support is provided separately by the
+/// [`RecursiveBatchingPolicy`] trait, allowing a batching carrier to support region-free operations without
+/// also supporting recursive transformation of nested programs.
 ///
 /// Carrier metadata that is not represented by [`Type`] is guarded at the three boundaries where it could otherwise
 /// escape the policy's sight. Every rule application is checked by [`Self::validate_operation_outputs`] against the
@@ -654,7 +654,46 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Returns the [`BatchAxis`] carried by `batch`.
     fn batch_axis(batch: &Self::Batch) -> BatchAxis;
 
-    /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
+    /// Lifts the per-item declaration type, `declared`, to a packed type using `input` as the carrier template. The
+    /// result is `declared` with `input`'s mapped batch axis inserted, using the batch extent and the axis sharding
+    /// of `context`. A replicated `input` has no mapped axis to insert, and so the result is `declared` unchanged.
+    ///
+    /// The declaration is supplied independently of the actual per-item type returned by [`Self::unbatched_type`].
+    /// For example, a declaration `f32[n]` lifts to `f32[b, n]` for a leading mapped axis of extent `b`, even when the
+    /// carrier's actual packed type is `f32[b, 5]`. Keeping `n` preserves the declaration's relationships with other
+    /// inputs. The carrier supplies the mapped-axis position, member representation, and existing manual variation;
+    /// the context supplies the batching level's extent and axis sharding. These inputs are needed to construct the
+    /// lifted declaration, whereas reading an existing carrier's per-item type needs only that carrier.
+    ///
+    /// Operations that preserve their inputs' logical values (e.g., guards and casts) use this function to lift their
+    /// per-item declarations to the packed values that they bind in the parent context. It only derives a type and
+    /// creates no value, so the inserted axis preserves `input`'s existing variation on the manual mesh axes of the
+    /// mapped dimension, while every other constraint (including variation on other manual axes) remains as declared.
+    /// Callers remain responsible for validating the original per-item contract before lifting it and for validating
+    /// the packed values against the lifted declaration, preserving any runtime relationship checks that it requires.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`BatchingContext`] that supplies the batch extent and the axis sharding.
+    ///   - `input`: Carrier supplying the mapped-axis position, member representation, and existing manual variation.
+    ///   - `declared`: Per-item declaration to lift, which may differ from the carrier's actual per-item type and may
+    ///     describe an operation's output carried like `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when a mapped `input` has a type that cannot carry a batch axis, or when `input`
+    /// carries per-item metadata that a lifted declaration cannot relate (e.g., the per-item extents of a bounded
+    /// ragged axis). Implementations may also reject a `declared` type that does not describe `input`. Diagnostics
+    /// name the offending type rather than an operation, so callers that want to attribute an error to an operation
+    /// must map it themselves.
+    fn batched_type(
+        context: &BatchingContext<C, Self>,
+        input: &Self::Batch,
+        declared: &C::Type,
+    ) -> Result<C::Type, BatchingError>;
+
+    /// Returns the per-item type represented by `batch` after removing its mapped batch axis, if any. The carrier's
+    /// packed value and metadata determine this type, so no separate declaration or batching context is needed.
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type>;
 
     /// Validates the batch carriers produced by one operation's batching rule against the carriers that rule consumed.
@@ -2364,6 +2403,19 @@ mod tests {
             batch.batch_axis
         }
 
+        fn batched_type(
+            _context: &BatchingContext<C, Self>,
+            input: &Self::Batch,
+            declared: &C::Type,
+        ) -> Result<C::Type, BatchingError> {
+            // The fixture's types have no axes. A mapped carrier records its batch axis beside its packed value,
+            // so there is no packed type into which that axis could be inserted.
+            if input.batch_axis.is_replicated() {
+                return Ok(declared.clone());
+            }
+            Err(BatchingError::UnsupportedOperation { message: format!("type `{declared}` cannot carry a batch axis") })
+        }
+
         fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
             batch.r#type()
         }
@@ -2448,6 +2500,19 @@ mod tests {
 
         fn batch_axis(batch: &Self::Batch) -> BatchAxis {
             batch.batch_axis
+        }
+
+        fn batched_type(
+            _context: &BatchingContext<C, Self>,
+            input: &Self::Batch,
+            declared: &C::Type,
+        ) -> Result<C::Type, BatchingError> {
+            // The fixture's types have no axes. A mapped carrier records its batch axis beside its packed value,
+            // so there is no packed type into which that axis could be inserted.
+            if input.batch_axis.is_replicated() {
+                return Ok(declared.clone());
+            }
+            Err(BatchingError::UnsupportedOperation { message: format!("type `{declared}` cannot carry a batch axis") })
         }
 
         fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
@@ -2962,6 +3027,19 @@ mod tests {
 
             fn batch_axis(batch: &Self::Batch) -> BatchAxis {
                 batch.batch_axis()
+            }
+
+            fn batched_type(
+                context: &BatchingContext<C, Self>,
+                input: &Self::Batch,
+                declared: &ArrayType,
+            ) -> Result<ArrayType, BatchingError> {
+                let context = BatchingContext::<C, StaticArrayExtentBatchingPolicy>::with_policy(
+                    context.parent().clone(),
+                    *context.axis_extent(),
+                )
+                .with_axis_sharding(context.axis_sharding().clone());
+                StaticArrayExtentBatchingPolicy::batched_type(&context, input, declared)
             }
 
             fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {

@@ -1354,6 +1354,15 @@ impl<C: Context<Type = RegisterIrType>> BatchingPolicy<C> for RegisterBatching {
         BatchAxis::replicated()
     }
 
+    fn batched_type(
+        _context: &BatchingContext<C, Self>,
+        _input: &Self::Batch,
+        declared: &RegisterIrType,
+    ) -> Result<RegisterIrType, BatchingError> {
+        // Every carrier is replicated, so there is never a mapped axis to insert.
+        Ok(declared.clone())
+    }
+
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, RegisterIrType> {
         batch.r#type()
     }
