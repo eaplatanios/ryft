@@ -1138,7 +1138,7 @@ mod tests {
         assert!(
             pullback
                 .linear_program()
-                .transpose_linearization_shared(pullback.residuals().len(), &[])
+                .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
                 .unwrap()
                 .program()
                 .to_string()
@@ -1288,11 +1288,11 @@ mod tests {
             // The same computation differentiated eagerly at this concrete extent, which never involves a runtime
             // extent and therefore never takes the replication path.
             let primals = (Array::matrix(rows, 2, values).unwrap(), Array::vector(scale_values.clone()).unwrap());
-            let (eager_loss, eager_pullback) = differentiate_at(primals.clone())
+            let (eager_loss, eager_pullback) = differentiate_at(primals)
                 .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)?))
                 .unwrap();
             let (input_cotangent, scale_cotangent) =
-                eager_pullback.apply_materialized(Array::scalar(1.0).unwrap(), &primals).unwrap();
+                eager_pullback.apply_materialized(Array::scalar(1.0).unwrap()).unwrap();
             assert_eq!(primal_outputs, vec![ArrayIrValue::Array(eager_loss)]);
             assert_eq!(
                 pullback.interpret(pullback_inputs),

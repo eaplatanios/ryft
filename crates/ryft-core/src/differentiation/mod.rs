@@ -1003,7 +1003,8 @@ impl<Input, ContextState>
     /// The returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
     /// arguments and reconstructs the structured input cotangents as [`MaybeZero`] leaves. Disconnected inputs
     /// return structural zeros without retaining extent residuals. Callers that need concrete values can use
-    /// [`Pullback::apply_materialized`] with their primal inputs.
+    /// [`Pullback::apply_materialized`], which constructs them from the primal inputs that the pullback retains as
+    /// extent sources.
     ///
     /// # Parameters
     ///
@@ -1751,8 +1752,8 @@ impl<Input, Capture, ContextState>
     /// selects [`DifferentiableOperation::jvp_for_transpose`] and transposes the active derivative carrier. Captures
     /// may remain among the residuals closed over by the [`Pullback`], but callers provide only output cotangents and
     /// receive [`MaybeZero`] cotangents only for `x`; no capture cotangent tree is constructed. Disconnected leaves
-    /// remain structural zeros. [`Pullback::apply_materialized`] uses the caller's primal inputs when concrete
-    /// cotangents are required.
+    /// remain structural zeros. [`Pullback::apply_materialized`] constructs concrete cotangents from the primal inputs
+    /// that the pullback retains as extent sources.
     ///
     /// The active primal tree, not the capture tree, must contain at least one leaf.
     ///
@@ -2870,7 +2871,7 @@ mod tests {
             .vjp(|input, scale| Ok(input * scale))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
-        assert_eq!(pullback.apply_materialized(Array::scalar(2.0).unwrap(), &primal).unwrap().to_f64s(), vec![6.0]);
+        assert_eq!(pullback.apply_materialized(Array::scalar(2.0).unwrap()).unwrap().to_f64s(), vec![6.0]);
 
         // Scalar-gradient projection returns no gradient leaf for the capture.
         let (value, gradient) = differentiate_at(primal)
