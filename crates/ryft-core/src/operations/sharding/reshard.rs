@@ -38,7 +38,8 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// [`Sharding::local_sharding`]), so replacing it is an ordinary redistribution that backends stage for the output
 /// type. A reshard changes placement but never reduction state: the target must restate the input's unreduced and
 /// reduced [`MeshAxisType::Explicit`] mesh axes exactly, since changing them requires a reduction or the corresponding
-/// collective. The target mesh must also define every mesh axis that carries manual variation or reduction state with
+/// collective, and an input with reduction state over [`MeshAxisType::Auto`] axes is rejected, since the target cannot
+/// name them. The target mesh must also define every mesh axis that carries manual variation or reduction state with
 /// the same size and type, explicit axes included, whereas it may add or drop other axes. Each Ryft type carries its
 /// own mesh, so without this check a target could silently redefine such an axis (e.g., JAX's `reshard` does not
 /// validate reduction state). The target may only name explicit mesh axes. Placement over auto axes belongs to backend
@@ -165,23 +166,24 @@ impl Operation for ReshardOperation {
             }
         }
 
-        // A reshard changes placement only. Reduction state over explicit axes records pending or completed
-        // cross-device reductions, so the target must restate the input's explicit unreduced and reduced axes exactly
-        // (the target can only name explicit axes, as checked above). Dropping or adding them would silently discard
-        // or invent a reduction, which belongs to a reduction or the corresponding collective instead.
-        let explicit_axes = |axes: fn(&Sharding) -> &BTreeSet<String>| match input.sharding() {
+        // A reshard changes placement only. Reduction state over explicit and auto axes records pending or completed
+        // cross-device reductions, so the target must restate the input's unreduced and reduced axes of both types
+        // exactly. Dropping or adding them would silently discard or invent a reduction, which belongs to a reduction
+        // or the corresponding collective instead. The target can only name explicit axes (as checked above), so any
+        // input reduction state over auto axes is rejected here, whereas manual state is carried forward below.
+        let non_manual_axes = |axes: fn(&Sharding) -> &BTreeSet<String>| match input.sharding() {
             Some(sharding) => axes(sharding)
                 .iter()
-                .filter(|axis| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Explicit))
+                .filter(|axis| sharding.mesh().axis_type(axis) != Some(MeshAxisType::Manual))
                 .collect::<BTreeSet<_>>(),
             None => BTreeSet::new(),
         };
-        if self.sharding.unreduced_axes().iter().collect::<BTreeSet<_>>() != explicit_axes(Sharding::unreduced_axes)
-            || self.sharding.reduced_axes().iter().collect::<BTreeSet<_>>() != explicit_axes(Sharding::reduced_axes)
+        if self.sharding.unreduced_axes().iter().collect::<BTreeSet<_>>() != non_manual_axes(Sharding::unreduced_axes)
+            || self.sharding.reduced_axes().iter().collect::<BTreeSet<_>>() != non_manual_axes(Sharding::reduced_axes)
         {
             return Err(TypeError::invalid(format!(
-                "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit mesh axes; use a reduction \
-                 (or the corresponding collective) instead",
+                "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit or auto mesh axes; use a \
+                 reduction (or the corresponding collective) instead",
             )));
         }
 
@@ -700,12 +702,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reshard_type_inference_explicit_reduction_state() {
+    fn test_reshard_type_inference_reduction_state() {
         // A reshard changes placement but never reduction state: the target must restate the input's unreduced and
-        // reduced explicit axes exactly, whereas manual reduction state is carried forward without being restated.
+        // reduced explicit axes exactly, reduction state over auto axes cannot be restated (the target cannot name auto
+        // axes) and is therefore rejected rather than dropped, and manual reduction state is carried forward without
+        // being restated.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
@@ -715,9 +720,11 @@ mod tests {
         let with_sharding = |sharding: Sharding| input_type.clone().with_sharding(sharding).unwrap();
         let unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["x", "m"]).unwrap());
         let reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["x"]).unwrap());
+        let auto_unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["a"]).unwrap());
+        let auto_reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["a"]).unwrap());
         let error = format!(
-            "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit mesh axes; use a reduction (or the \
-             corresponding collective) instead",
+            "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit or auto mesh axes; use a reduction \
+             (or the corresponding collective) instead",
         );
         check_operation_type_inference!(
             operation = ReshardOperation::new(placed.clone().with_unreduced_axes(["x"]).unwrap()),
@@ -749,6 +756,12 @@ mod tests {
                 error = error.clone(),
             }, {
                 input_types = [reduced_input_type],
+                error = error.clone(),
+            }, {
+                input_types = [auto_unreduced_input_type],
+                error = error.clone(),
+            }, {
+                input_types = [auto_reduced_input_type],
                 error = error,
             }],
         );

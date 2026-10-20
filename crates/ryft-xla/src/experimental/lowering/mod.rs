@@ -690,7 +690,10 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        // The placement of local outputs is validated by the enclosing family (refer to `XlaOperation::lower`).
+        // This function does not validate the placement of local outputs. `XlaOperation::lower` validates it for every
+        // variant, including this projected one, whereas downstream families that embed `ArrayOperation` must reject
+        // outputs that shard a local dimension over a bound manual mesh axis themselves (refer to
+        // `validate_local_output_placement`).
         lower_operation_variants!(
             self, ArrayOperation, lowerer, input_values, input_types, output_types;
             Zero, ZeroLike, One, OneLike, Constant, Iota, Min, Max, Clamp, Sign, Neg, Add, Sub, Mul, Div, Rem, Pow, Sqrt,

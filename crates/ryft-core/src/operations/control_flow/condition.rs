@@ -10050,8 +10050,8 @@ mod tests {
     #[test]
     fn test_condition_linearization_forwards_symbolic_residual_placeholders() {
         // Only the `true` branch retains its `f32[n]` input as a residual, so the `false` branch needs a placeholder for
-        // that edge. Homogeneous array operations construct only type-only zeros, which cannot name `n`, so the
-        // placeholder forwards the branch input of the identical type, which carries the runtime value of `n`.
+        // that edge. Homogeneous array operations can only construct zeros from types, which cannot supply the runtime
+        // extent of `n`, so the placeholder forwards the `false` branch input of the identical type instead.
         type Branch = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
@@ -10120,7 +10120,8 @@ mod tests {
                 in (%3)"},
         );
 
-        // Each extent of `n` selects the runtime branch, and the untaken branch's residual is never consumed.
+        // Both branches differentiate at every extent of `n`. When the `false` branch runs, the pullback never consumes
+        // the placeholder that it forwarded.
         for (predicate, input, expected_value, expected_gradient) in [
             (true, vec![2f32, 3.0], vec![4f32, 9.0], vec![4f32, 6.0]),
             (false, vec![2f32, 3.0], vec![2f32, 3.0], vec![1f32, 1.0]),
@@ -10147,7 +10148,10 @@ mod tests {
         // and another one in the `false` branch, in which `x` is disconnected and its cotangent zero needs the runtime
         // value of `n`. The placeholder of each edge in the peer branch is that non-zeroable `dimension<n>`, read from
         // the known `x` directly. Transposing the `true` branch converts the cotangent back to `f32[n]` with its
-        // retained extent, and transposing the `false` branch constructs the zero cotangent of `x` from it.
+        // retained extent. Transposing the `false` branch gathers dimension sources from its known inputs in input
+        // order, so it constructs the zero cotangent of `x` from the first edge that carries `n` (i.e., the `true`
+        // branch's witness slot, `%1`), and its own edge (`%2`) is a dead residual. This is sound because both edges
+        // carry the same identity and the zero only reads its extent.
         type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));

@@ -2064,6 +2064,7 @@ mod tests {
             // one is witnessed by their extents, read as first-class dimensions, of which the second one still depends
             // on the proof.
             let jvp = program.jvp().unwrap();
+            eprintln!("G8MARK guard_jvp_{composite}\n{jvp}\nG8END");
             let tangent_module = to_mlir_module_for_program(
                 &jvp,
                 &[],
@@ -2074,6 +2075,7 @@ mod tests {
                 None,
             )
             .unwrap();
+            eprintln!("G8MARK guard_module_{composite}\n{tangent_module}\nG8END");
             let assertion = tangent_module.lines().find(|line| line.contains("@ryft.assert")).unwrap();
             let token = assertion.trim().split_once(" = ").unwrap().0;
             let entry_value = |index| {

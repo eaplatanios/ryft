@@ -7695,7 +7695,7 @@ pub(crate) mod tests {
         let replicated = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 99.0]).unwrap()))
             .with_ragged_axes(vec![RaggedAxis::new(
                 0,
-                ArrayIrValue::Array(Array::scalar(2_i32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
                 length.clone(),
                 vec![],
             )])
@@ -7703,7 +7703,7 @@ pub(crate) mod tests {
         assert_eq!(ArrayIrBatchingPolicy::batched_type(&context, &replicated, &declared.clone().into()), ragged);
         let mapped = ragged_batch(
             ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
             &length,
             1,
         )
@@ -7721,7 +7721,7 @@ pub(crate) mod tests {
         // A mapped first-class dimension carries no ragged axes but holds its per-item extents in its packed value,
         // which no lifted declaration can describe either.
         let dimension = ArrayIrBatch::mapped_dimension(
-            ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
             BatchAxis::new(0),
             DimensionType::from(length.clone()),
         )

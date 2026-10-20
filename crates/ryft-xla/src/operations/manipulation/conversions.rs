@@ -258,9 +258,10 @@ impl LowerableOperation for CastOperation<ArrayIrType> {
 }
 
 /// Lowers the same complete cast contract for native and composite type families. Witness producers are explicit
-/// dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered like an
-/// assertion, so its dependency barrier consumes the current assertion token whether or not it emits a check of its
-/// own (it emits none when the actual input types prove its relationship), whereas an unchecked cast never does.
+/// dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered after preceding
+/// assertions: its dependency barrier consumes the current assertion token, without advancing it, whether or not the
+/// cast emits a check of its own (it emits none when the actual input types prove its relationship), whereas an
+/// unchecked cast never consumes that token.
 fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
     operation: &CastOperation<T>,
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
@@ -272,9 +273,9 @@ fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: 
     if input_values.is_empty() || input_types.is_empty() {
         return Err(LoweringError::UnsupportedOp { op: format!("`{}` expects at least 1 input", operation.name()) });
     }
-    // A checked cast is ordered like an assertion even when the actual types prove its relationship and no check is
-    // emitted (binding normalizes proven casts to unchecked ones, so this only affects casts staged directly through
-    // a program builder); the dependency barrier therefore follows the mode rather than the emitted check.
+    // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
+    // check is emitted (binding normalizes proven casts to unchecked ones, so this only affects casts staged directly
+    // through a program builder); the dependency barrier therefore follows the mode rather than the emitted check.
     lower_cast_check(operation, input_values, input_types, lowerer)?;
     let values = lower_dependency_barrier(
         input_values,
@@ -412,25 +413,37 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
     // bound for every dynamic axis of both types, including axes that this conversion leaves unchanged.
     if let (ArrayIrType::Array(input), ArrayIrType::Array(output)) = (input_type, output_type) {
-        let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions());
-        let changed_axis = dimension_pairs.clone().position(|pair| match pair {
+        let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions()).collect::<Vec<_>>();
+        let changed_axis = dimension_pairs.iter().position(|pair| match pair {
             (Dimension::Static(_), Dimension::Static(_)) => false,
             (Dimension::Dynamic(input), Dimension::Dynamic(output)) => {
                 input.bounds().upper() != output.bounds().upper()
             }
             _ => true,
         });
-        let unbounded_dimension = dimension_pairs
-            .enumerate()
-            .flat_map(|(axis, (input, output))| [(axis, input), (axis, output)])
-            .find(|(_, dimension)| dimension.bounds().upper().is_none());
-        if let (Some(changed_axis), Some((axis, dimension))) = (changed_axis, unbounded_dimension) {
-            return Err(LoweringError::UnsupportedOp {
-                op: format!(
-                    "shape conversion along axis {changed_axis} requires finite physical bounds, but axis {axis} has \
-                     unbounded dimension `{dimension}`",
-                ),
-            });
+        let unbounded_dimension = |axis: usize| {
+            let (input, output) = dimension_pairs[axis];
+            [input, output].into_iter().find(|dimension| dimension.bounds().upper().is_none())
+        };
+        if let Some(changed_axis) = changed_axis {
+            if let Some(dimension) = unbounded_dimension(changed_axis) {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "shape conversion along axis {changed_axis} requires a finite physical bound, but that axis \
+                         has unbounded dimension `{dimension}`",
+                    ),
+                });
+            }
+            if let Some((axis, dimension)) =
+                (0..dimension_pairs.len()).find_map(|axis| unbounded_dimension(axis).map(|dimension| (axis, dimension)))
+            {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "shape conversion along axis {changed_axis} requires finite physical bounds for every axis, \
+                         but axis {axis} has unbounded dimension `{dimension}`",
+                    ),
+                });
+            }
         }
     }
     let intermediate_type = match (input_type, output_type) {
@@ -1344,8 +1357,9 @@ mod tests {
 
         // Binding normalizes a proven cast to an unchecked one, so a checked cast whose relationship the actual types
         // prove only arises when staged directly through a program builder. It emits no check of its own but is still
-        // ordered like an assertion: its dependency barrier consumes the token of the preceding assertion, whereas
-        // its unchecked twin converts the input directly and leaves the token chain alone.
+        // ordered after preceding assertions: its dependency barrier consumes the token of the preceding assertion,
+        // without advancing it, whereas its unchecked twin converts the input directly and leaves the token chain
+        // alone.
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
         let assertion = "%0 = stablehlo.after_all  : !stablehlo.token\n    \
@@ -1825,6 +1839,7 @@ mod tests {
 
         // Differentiation retains the checked primal relation even when the tangent already has the output type.
         let differentiated = program.jvp().unwrap();
+        eprintln!("G8MARK guarded_cast_jvp\n{differentiated}\nG8END");
         let inputs = [input.clone(), input];
         assert_eq!(
             execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]),
@@ -2454,6 +2469,7 @@ mod tests {
         // The primal of a differentiated cast retains that same source declaration. Tangent casts reverse neither
         // the ambient assignments nor their dependence on the checked primal output.
         let differentiated = program.jvp().unwrap();
+        eprintln!("G8MARK ambient_jvp\n{differentiated}\nG8END");
         assert_eq!(
             execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]),
             Ok(vec![
@@ -2529,6 +2545,9 @@ mod tests {
         assert!(error.contains("must have the declared extent in `cast`"), "{error}");
         let error = execute_mixed_program(&client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
         assert!(error.contains("must have one extent in `cast`"), "{error}");
+        let differentiated = program.jvp().unwrap();
+        eprintln!("G8MARK mixed_jvp\n{differentiated}\nG8END");
+        eprintln!("G8MARK mixed_module\n{}\nG8END", to_mlir_module_for_program(&differentiated, &[], &[], &[], "main", None, None).map_err(|e| e.to_string()).unwrap_or_default());
     }
 
     #[test]
@@ -2786,9 +2805,9 @@ mod tests {
             FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
             XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
         };
-        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
 
         const TARGET: &str = "ryft.test.physical_f64_copy";
         static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
@@ -2820,10 +2839,7 @@ mod tests {
         // operands and results), and every such boundary states the layout of its own declared type. XLA rejects
         // bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only a static
         // result of such a cast can be observed, and its consumer still receives the declared column-major storage.
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -3158,8 +3174,8 @@ mod tests {
                 "},
             ),
         ];
+        assert!(!cast_changes_explicit_placement(&input_type, &input_type));
         for (output_type, expected, expected_executable) in cases {
-            assert!(!cast_changes_explicit_placement(&input_type, &input_type));
             assert_eq!(
                 cast_changes_explicit_placement(&input_type, &output_type),
                 output_type.sharding() != input_type.sharding(),
@@ -3788,7 +3804,7 @@ mod tests {
                 unbounded.clone(),
                 ArrayType::new_static(DataType::F32, [2]),
                 Err(LoweringError::UnsupportedOp {
-                    op: "shape conversion along axis 0 requires finite physical bounds, but axis 0 has unbounded \
+                    op: "shape conversion along axis 0 requires a finite physical bound, but that axis has unbounded \
                          dimension `n`"
                         .to_owned(),
                 }),
@@ -3797,8 +3813,8 @@ mod tests {
                 mixed.clone(),
                 partially_exact,
                 Err(LoweringError::UnsupportedOp {
-                    op: "shape conversion along axis 1 requires finite physical bounds, but axis 0 has unbounded \
-                         dimension `n`"
+                    op: "shape conversion along axis 1 requires finite physical bounds for every axis, but axis 0 \
+                         has unbounded dimension `n`"
                         .to_owned(),
                 }),
             ),

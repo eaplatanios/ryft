@@ -333,6 +333,35 @@ fn test_composite_lowering_rejects_unresolved_reference_type() {
 }
 
 #[test]
+fn test_composite_lowering_rejects_bound_manual_output_placement() {
+    // A composite `XlaOperation::Cast` (i.e., a `CastOperation<ArrayIrType>` rather than a projected
+    // `ArrayOperation::Cast`) lowers without passing through `ArrayOperation::lower`, so only the family-level validation
+    // of `XlaOperation::lower` sees its output placement. Its first output requests a mesh that redefines the bound manual
+    // axis `x` as explicit and shards a local dimension over it, which only the region boundary may do.
+    let vector_type = test_vector_type(4);
+    let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+    let explicit_type = vector_type
+        .clone()
+        .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+        .unwrap();
+    let cast = |output_type: &ArrayType, input_type: &ArrayType| {
+        XlaOperation::Cast(CastOperation::unchecked(output_type.clone().into(), vec![input_type.clone().into()]).unwrap())
+    };
+    let mut builder = CompositeXlaProgramBuilder::new();
+    let input = builder.add_input(vector_type.clone().into());
+    let placed = builder.add_instruction(cast(&explicit_type, &vector_type), Vec::new(), vec![input], None).unwrap()[0];
+    let output = builder.add_instruction(cast(&vector_type, &explicit_type), Vec::new(), vec![placed], None).unwrap()[0];
+    let body = builder
+        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .unwrap();
+    assert!(matches!(
+        lower_replicated_shard_map_body(body, 2),
+        Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+            if message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
+    ));
+}
+
+#[test]
 fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
     use ryft_core::{ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation};
 

@@ -5145,7 +5145,7 @@ mod tests {
         let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 99.0]).unwrap()))
             .with_ragged_axes(vec![RaggedAxis::new(
                 0,
-                ArrayIrValue::Array(Array::scalar(2_i32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
                 length.clone(),
                 vec![],
             )])

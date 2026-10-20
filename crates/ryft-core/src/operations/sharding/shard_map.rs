@@ -3472,7 +3472,10 @@ fn residual_edge_type(local_type: &ArrayIrType, shard_map: &ShardMap) -> Result<
 /// varying scalar residual and its [`promoted_residual_type`]), and reference positions must remain unchanged. A
 /// first-class dimension leaves a body as its integer scalar value, placed on the mesh of the target edge and marked
 /// varying over that edge's manual axes before it is promoted, and re-enters a body by recovering that scalar and
-/// redefining the same dimension variable from it (refer to [`residual_edge_type`]).
+/// redefining the same dimension variable from it (refer to [`residual_edge_type`]). Only the first input edge that
+/// carries a given dimension identity redefines it: later edges that carry an already defined identity reuse the
+/// value converted from that first edge, since equal identities denote equal extents and a program region rejects
+/// defining the same identity more than once.
 fn reshape_program_boundary<V: Value<Type = ArrayIrType>, O>(
     program: &Program<V, O, Vec<V>, Vec<V>>,
     input_types: Vec<ArrayIrType>,
@@ -10537,6 +10540,89 @@ mod tests {
             .unwrap();
         assert!(outer.builder().borrow().instructions().is_empty());
         assert_eq!(evaluation.program().to_string(), residual_program.to_string());
+    }
+
+    #[test]
+    fn test_shard_map_partial_evaluation_threads_repeated_dimension_residuals() {
+        // The unknown half consumes two first-class dimensions that the known half computes with the same identity:
+        // the defining `dimension_from_scalar` and a `dimension_size` read from a known array of that extent. Both cross
+        // the split as separate residual edges, but only the first one redefines `extent` in the residual `shard_map`,
+        // and the second one reuses its value, since a region cannot define the same identity more than once.
+        use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+
+        let array_type = f32_scalar_type();
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let shard_map = ShardMap::from_shardings(
+            mesh,
+            vec![replicated.clone(), replicated.clone()],
+            vec![replicated.clone(), replicated],
+            vec!["x".to_string()],
+        );
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let known_input = builder.add_input(array_type.clone().into());
+        let runtime_input = builder.add_input(array_type.clone().into());
+        let count = builder
+            .add_instruction(
+                ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false)),
+                Vec::new(),
+                vec![known_input],
+                None,
+            )
+            .unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.clone().into()), Vec::new(), vec![count], None)
+            .unwrap()[0];
+        let known_broadcast = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![known_input, dimension], None)
+            .unwrap()[0];
+        let known_broadcast_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let size = builder
+            .add_instruction(
+                DimensionSizeOperation::new(&known_broadcast_type, 0).unwrap(),
+                Vec::new(),
+                vec![known_broadcast],
+                None,
+            )
+            .unwrap()[0];
+        let sums = [dimension, size].map(|dimension| {
+            let broadcast = builder
+                .add_instruction(
+                    DynamicBroadcastOperation::new(Vec::new()),
+                    Vec::new(),
+                    vec![runtime_input, dimension],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .add_instruction(
+                    ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum)),
+                    Vec::new(),
+                    vec![broadcast],
+                    None,
+                )
+                .unwrap()[0]
+        });
+        let body = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(sums.to_vec(), vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let operation = ShardMapOperation::from_boundary(
+            shard_map,
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone(), array_type.clone()],
+        );
+        let program = shard_map_program(operation, body).unwrap();
+
+        let outer = TestContext::new();
+        let known = outer.input(ArrayIrType::Array(array_type.clone()));
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[PartialValue::Known(known), PartialValue::Unknown(ArrayIrType::Array(array_type))],
+            )
+            .unwrap();
+        assert_eq!(evaluation.program().to_string(), indoc! {"PLACEHOLDER"});
     }
 
     #[test]
