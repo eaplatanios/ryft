@@ -72,6 +72,7 @@
 //! ```
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -83,8 +84,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy,
-    StaticArrayExtentBatchingPolicy,
+    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionSource, DimensionType, DimensionValue,
+    DynamicArrayExtentBatchingPolicy, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -112,14 +113,11 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
-use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversions::{CastOperation, ConvertElementType};
 
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::DynamicSlice;
-use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
 
 use crate::partial::{
@@ -624,10 +622,12 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// One shared rule batches [`AssertOperation`]s over the array universe. It validates per-item types, skips statically
 /// empty batches, and either selects the first failing batch item or, with a failure limit, materializes the inputs
 /// along the batch axis, before delegating the assertion to the parent context. This trait supplies the batch item
-/// indices, the empty-batch handling, and the materialized inputs that the rule uses. [`ArrayBatchingPolicy`] runs
-/// the rule with its own extent policy. [`ArrayIrBatchingPolicy`] runs it over the array inputs of its projected
-/// [`DynamicArrayExtentBatchingPolicy`] view, whose implementation of this trait binds the extent computations in
-/// the composite parent context, and then reinserts replicated dimension observations, which have no array view.
+/// indices and the empty-batch handling that the rule uses, while the rule materializes inputs through the extent
+/// policy's own [`match_axis`](ArrayExtentBatchingPolicy::match_axis) and
+/// [`broadcast_input`](ArrayExtentBatchingPolicy::broadcast_input). [`ArrayBatchingPolicy`] runs the rule with its own
+/// extent policy. [`ArrayIrBatchingPolicy`] runs it over the array inputs of its projected
+/// [`DynamicArrayExtentBatchingPolicy`] view, whose implementation of this trait binds the extent computations in the
+/// composite parent context, and then reinserts replicated dimension observations, which have no array view.
 ///
 /// [`StaticArrayExtentBatchingPolicy`] implements this trait for every array context and
 /// [`DynamicArrayExtentBatchingPolicy`] for projected composite contexts. Both implementations are generic over `P`, so
@@ -660,18 +660,11 @@ pub trait ArrayAssertionBatchingPolicy<C: Context<Type = ArrayType>, P: ArrayExt
         observation: C::Value,
         padded_extent: &mut Option<P::Extent>,
     ) -> Result<C::Value, ProgramError>;
-
-    /// Moves batch axes to the front and broadcasts shaped observations to the condition's shape, keeping scalar
-    /// observations scalar. Assertions with a failure limit use these arrays to report individual failing elements.
-    fn materialize_inputs(
-        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<C::Value>, BatchingError>;
 }
 
 // TODO(eaplatanios): Review this.
 impl<
-    C: Context<Type = ArrayType, Value: Reduce, Operation: From<IotaOperation<ArrayType>> + From<BroadcastOperation>>,
+    C: Context<Type = ArrayType, Value: Reduce, Operation: From<IotaOperation<ArrayType>>>,
     P: ArrayExtentBatchingPolicy<C>,
 > ArrayAssertionBatchingPolicy<C, P> for StaticArrayExtentBatchingPolicy
 {
@@ -711,52 +704,6 @@ impl<
         // mapped observation has at least one item.
         Ok(observation)
     }
-
-    fn materialize_inputs(
-        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<C::Value>, BatchingError> {
-        ArrayBatch::reject_ragged_inputs(&AssertOperation::<ArrayType>::new(""), inputs)?;
-        let condition = P::match_axis(context, &inputs[0], Axis::from(0))?.value().clone();
-        let condition_type = condition.r#type().into_owned();
-        let mut arguments = vec![condition];
-        for input in &inputs[1..] {
-            let value = if input.batch_axis().is_replicated() {
-                input.value().clone()
-            } else {
-                P::match_axis(context, input, Axis::from(0))?.value().clone()
-            };
-            let input_type = value.r#type();
-            if input_type.rank() == 0 {
-                arguments.push(value);
-                continue;
-            }
-            let output_axes = if input.batch_axis().is_replicated() {
-                (1..=input_type.rank()).collect::<Vec<_>>()
-            } else {
-                (0..input_type.rank()).collect::<Vec<_>>()
-            };
-
-            // Each device records its own observations, so an observation keeps its memory space, placement, and
-            // manual variation, with its sharding mapped onto the condition's axes and any new axis replicated, as
-            // the array IR policy's dynamic broadcast infers. Assertions do not require their inputs to share manual
-            // variation, and a broadcast cannot change it.
-            let output_sharding = input_type
-                .sharding()
-                .map(|sharding| sharding.with_broadcasted_dimensions(condition_type.rank(), &output_axes))
-                .transpose()
-                .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
-            let output_type = ArrayType::new(input_type.data_type(), condition_type.shape().clone())
-                .with_memory(input_type.memory())
-                .with_sharding(output_sharding)
-                .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
-            let mut outputs =
-                context.parent().bind(BroadcastOperation::new(output_type, output_axes), Vec::new(), &[value])?;
-            check_count!("output", outputs, 1, ProgramError);
-            arguments.push(outputs.remove(0));
-        }
-        Ok(arguments)
-    }
 }
 
 // TODO(eaplatanios): Review this.
@@ -771,15 +718,13 @@ where
             Type = ArrayIrType,
             Value = V,
             Operation: From<ConstantOperation<DimensionValue>>
-                           + From<IotaOperation<ArrayType>>
                            + From<ZeroOperation<ArrayType>>
+                           + From<IotaOperation<ArrayType>>
                            + From<DimensionAddOperation>
                            + From<CompareOperation<ArrayIrType>>
-                           + From<PadOperation<ArrayIrType>>
-                           + From<DynamicBroadcastOperation>
-                           + From<DimensionSizeOperation>,
+                           + From<PadOperation<ArrayIrType>>,
         >,
-    V: ValueProjection<ArrayType, Projected: Select + Transpose>,
+    V: ValueProjection<ArrayType, Projected: Select>,
     P: ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>, Extent = C::Value>,
 {
     fn batch_item_indices(
@@ -855,53 +800,6 @@ where
         let mut outputs = parent.bind(operation, Vec::new(), &arguments)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0).into_projected()?)
-    }
-
-    fn materialize_inputs(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<P>>,
-        inputs: &[ArrayBatch<<V as ValueProjection<ArrayType>>::Projected>],
-    ) -> Result<Vec<<V as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        ArrayBatch::reject_ragged_inputs(&AssertOperation::<ArrayType>::new(""), inputs)?;
-        let parent = context.parent().parent();
-        let condition = V::from_projected(inputs[0].value().clone());
-        let condition_type = inputs[0].value().r#type().into_owned();
-        let mut dimensions = vec![context.axis_extent().clone()];
-        let mapped_axis = inputs[0].batch_axis_position();
-        for axis in (0..condition_type.rank()).filter(|axis| Some(*axis) != mapped_axis) {
-            let mut outputs = parent.bind(
-                DimensionSizeOperation::new(&condition_type, axis)?,
-                Vec::new(),
-                std::slice::from_ref(&condition),
-            )?;
-            check_count!("output", outputs, 1, ProgramError);
-            dimensions.push(outputs.remove(0));
-        }
-        let mut arguments = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let mut value = input.value().clone();
-            let rank = value.r#type().rank();
-            if !arguments.is_empty() && rank == 0 {
-                arguments.push(value);
-                continue;
-            }
-            let output_axes = if let Some(mapped_axis) = input.batch_axis_position() {
-                if mapped_axis != 0 {
-                    let permutation = std::iter::once(mapped_axis)
-                        .chain((0..rank).filter(|axis| *axis != mapped_axis))
-                        .collect::<Vec<_>>();
-                    value = value.transpose(permutation)?;
-                }
-                (0..rank).collect::<Vec<_>>()
-            } else {
-                (1..=rank).collect::<Vec<_>>()
-            };
-            let inputs =
-                std::iter::once(V::from_projected(value)).chain(dimensions.iter().cloned()).collect::<Vec<_>>();
-            let mut outputs = parent.bind(DynamicBroadcastOperation::new(output_axes), Vec::new(), &inputs)?;
-            check_count!("output", outputs, 1, ProgramError);
-            arguments.push(outputs.remove(0).into_projected()?);
-        }
-        Ok(arguments)
     }
 }
 
@@ -1282,8 +1180,8 @@ impl<V: Value<Type = ArrayType>> BatchedAssertion<V> {
     /// rule reduces the condition to one scalar Boolean and selects the observations of the first failing batch item,
     /// adding that item's index as an observation when any input is mapped. With a failure limit, it instead
     /// materializes the inputs along the batch axis so that the parent reports individual failing elements. `P`
-    /// supplies the batch item indices, the empty-batch handling, and the materialized inputs through
-    /// [`ArrayAssertionBatchingPolicy`].
+    /// supplies the batch item indices and the empty-batch handling through [`ArrayAssertionBatchingPolicy`],
+    /// and the axis alignment and broadcasts of that materialization through [`ArrayExtentBatchingPolicy`].
     ///
     /// The constructor neither validates the per-item signature nor asserts. Callers validate in their own universe
     /// first, and they assert afterwards, so that observations without an array view can rejoin the prepared ones.
@@ -1321,8 +1219,75 @@ impl<V: Value<Type = ArrayType>> BatchedAssertion<V> {
         // Preserve individual conditions and observations so the parent can report multiple failing elements.
         // Materialization broadcasts replicated inputs and arranges mapped inputs along the batch axis.
         if operation.failure_limit.is_some() {
-            let mut observations = P::materialize_inputs(context, inputs)?;
-            let condition = observations.remove(0);
+            // Padding in bounded ragged inputs is not logical data and must not be reported as failed elements.
+            ArrayBatch::reject_ragged_inputs(&AssertOperation::<ArrayType>::new(""), inputs)?;
+
+            // Move a mapped condition's batch axis to the front, or insert a leading batch axis for a replicated one.
+            let condition = P::match_axis(context, &inputs[0], Axis::from(0))?.into_value();
+            let condition_type = condition.r#type().into_owned();
+            let condition_rank = condition_type.rank();
+
+            // Every shaped observation takes the aligned condition's dimensions: the transform's extent along the
+            // batch axis, exact static extents, and reads of the aligned condition for dynamic dimensions.
+            let dimension_sources = condition_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(axis, dimension)| match dimension {
+                    _ if axis == 0 => DimensionSource::BatchExtent,
+                    Dimension::Static(extent) => DimensionSource::Static(*extent),
+                    _ => DimensionSource::Value { source: condition.clone(), axis },
+                })
+                .collect::<Vec<_>>();
+
+            let mut observations = Vec::with_capacity(inputs.len() - 1);
+            for input in &inputs[1..] {
+                let input_type = input.r#type();
+                let rank = input_type.rank();
+
+                // Scalar observations are shared by every failing element and do not need broadcasting.
+                if rank == 0 {
+                    observations.push(input.value().clone());
+                    continue;
+                }
+
+                // A replicated observation gains the leading batch axis. A mapped observation moves its batch axis
+                // to the front in the same broadcast, so the mapping is not monotonic for a non-leading batch axis.
+                let output_axes = match input.batch_axis_position() {
+                    Some(mapped_axis) => (0..rank)
+                        .map(|axis| match axis.cmp(&mapped_axis) {
+                            Ordering::Less => axis + 1,
+                            Ordering::Equal => 0,
+                            Ordering::Greater => axis,
+                        })
+                        .collect::<Vec<_>>(),
+                    None => (1..=rank).collect::<Vec<_>>(),
+                };
+
+                // Each device records its own observations, so an observation keeps its memory space, placement, and
+                // manual variation, with its sharding mapped onto the condition's axes and any new axis replicated.
+                // Assertions do not require their inputs to share manual variation, and a broadcast cannot change it.
+                let output_sharding = input_type
+                    .sharding()
+                    .map(|sharding| sharding.with_broadcasted_dimensions(condition_rank, &output_axes))
+                    .transpose()
+                    .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
+                let output_type = ArrayType::new(input_type.data_type(), condition_type.shape().clone())
+                    .with_memory(input_type.memory())
+                    .with_sharding(output_sharding)
+                    .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
+                let output = P::broadcast_input(
+                    context,
+                    input,
+                    output_type,
+                    output_axes,
+                    Axis::from(0),
+                    dimension_sources.clone(),
+                )?;
+
+                observations.push(output.into_value());
+            }
             return Ok(Some(Self { condition, observations, batch_index_label: None }));
         }
 
@@ -2647,11 +2612,7 @@ mod tests {
         }
 
         impl<
-            C: Context<
-                    Type = ArrayType,
-                    Value: Broadcast + Reduce + Transpose,
-                    Operation: From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
-                >,
+            C: Context<Type = ArrayType, Value: Broadcast + Reduce + Transpose, Operation: From<IotaOperation<ArrayType>>>,
         > ArrayAssertionBatchingPolicy<C, Self> for CustomExtent
         {
             #[inline]
@@ -2684,16 +2645,6 @@ mod tests {
                     context,
                     observation,
                     padded_extent,
-                )
-            }
-
-            #[inline]
-            fn materialize_inputs(
-                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-                inputs: &[ArrayBatch<C::Value>],
-            ) -> Result<Vec<C::Value>, BatchingError> {
-                <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::materialize_inputs(
-                    context, inputs,
                 )
             }
         }
