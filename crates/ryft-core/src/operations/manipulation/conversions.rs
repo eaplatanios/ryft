@@ -2330,8 +2330,9 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding,
+        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2,
+        u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -6312,7 +6313,7 @@ mod tests {
             );
         }
 
-        // The composite policy rejects a non-identity cast over a ragged carrier in the same way.
+        // The composite policy rejects a non-identity cast over a ragged array carrier in the same way.
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -6332,7 +6333,39 @@ mod tests {
                     std::slice::from_ref(&input),
                 ),
                 Err(BatchingError::UnsupportedOperation {
-                    message: "cannot batch mapped member type `f32[length]`".to_owned(),
+                    message: "cannot batch ragged array type `f32[length]`".to_owned(),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_batching_replicated_ragged_source() {
+        // A replicated carrier holds the same ragged item for every batch item, here with packed storage `[1, 2, 99]`
+        // and live extent 2. Narrowing it to `f32[3]` would read the padding as data, so the composite policy rejects
+        // it like a mapped ragged carrier rather than returning the padded storage.
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let logical = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2f32, 99f32]).unwrap()))
+            .with_ragged_axes(vec![RaggedAxis::new(
+                0,
+                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
+                variable,
+                vec![],
+            )])
+            .unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                constructor(ArrayType::new_static(DataType::F32, [3]).into(), vec![logical.clone().into()])
+                    .unwrap()
+                    .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
+                    .map(|outputs| outputs.into_parts().0),
+                Err(BatchingError::UnsupportedOperation {
+                    message: "cannot batch ragged array type `f32[length]`".to_owned(),
                 }),
             );
         }
@@ -7144,7 +7177,7 @@ mod tests {
                 formatdoc! {r#"
                     lambda %0:f32[n], %1:f32[n], %2:f32[n], %3:f32[n] .
                     let %4:f32[2] = const [0.0, 0.0]
-                        %5:f32[2], %6:f32[2] = guard [boundary="witness", types=[f32[n], f32[n]]] %1 %4
+                        %5:f32[2], %6:f32[2] = guard [boundary="witness", declared_types=[f32[n], f32[n]]] %1 %4
                         %7:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[2]]] %1 %5
                         %8:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %3 %7
                         %9:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[2], f32[2]]{mode}] %0 %5 %6

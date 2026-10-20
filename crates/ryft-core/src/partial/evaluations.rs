@@ -468,7 +468,7 @@ mod tests {
             lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)> .
             let %2:dimension<a ∈ [1, 8)>, %3:dimension<a ∈ [1, 8)> = guard [
                 boundary="partial evaluation",
-                types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                 retained_identities=[a],
             ] %0 %1
             in ()"#},
@@ -676,7 +676,11 @@ mod tests {
             evaluation.interpret(&context, std::slice::from_ref(&mismatching)),
             program.interpret(vec![extent, mismatching]),
         );
-        let guard = r#"guard [boundary="partial evaluation", types=[dimension<extent ∈ [1, 8)>, f32[extent]]]"#;
+        let guard = indoc! {r#"
+            guard [
+                boundary="partial evaluation",
+                declared_types=[dimension<extent ∈ [1, 8)>, f32[extent]],
+            ]"#};
         assert_eq!(
             evaluation.program().to_string(),
             formatdoc! {"
@@ -744,7 +748,7 @@ mod tests {
                 PartialValue::Known(known.clone()),
             ])
             .unwrap();
-        let guard = r#"guard [boundary="partial evaluation", types=[dimension<m ∈ [1, 8)>, f32[m]]]"#;
+        let guard = r#"guard [boundary="partial evaluation", declared_types=[dimension<m ∈ [1, 8)>, f32[m]]]"#;
         assert_eq!(
             evaluation.program().to_string(),
             formatdoc! {"
@@ -784,7 +788,7 @@ mod tests {
                 lambda %0:dimension<m ∈ [1, 8)>, %1:dimension<m ∈ [1, 8)>, %2:f32[2] .
                 let %3:dimension<2>, %4:dimension<2>, %5:f32[2] = guard [
                     boundary="partial evaluation",
-                    types=[dimension<n ∈ [1, 8)>, dimension<p ∈ [1, 8)>, f32[n]],
+                    declared_types=[dimension<n ∈ [1, 8)>, dimension<p ∈ [1, 8)>, f32[n]],
                 ] %0 %1 %2
                 in (%3, %4)"#},
         );
@@ -833,7 +837,7 @@ mod tests {
                 lambda %0:ref<f32[n]>, %1:f32[n, m], %2:f32[m], %3:dimension<2>, %4:f32[2] .
                 let %5:dimension<2>, %6:f32[n, 2], %7:f32[2] = guard [
                     boundary="partial evaluation",
-                    types=[dimension<m ∈ [1, 8)>, f32[n, m], f32[m]],
+                    declared_types=[dimension<m ∈ [1, 8)>, f32[n, m], f32[m]],
                 ] %3 %1 %2
                     %8:f32[2] = add %7 %4
                 in (%8)"#},
@@ -910,7 +914,7 @@ mod tests {
                 lambda %0:ref<f32[n]>, %1:f32[n, m], %2:f32[m, 1], %3:f32[2], %4:f32[3] .
                 let %5:f32[n, 3], %6:f32[3, 1], %7:f32[n], %8:f32[3] = guard [
                     boundary="partial evaluation",
-                    types=[ref<f32[n]>, f32[n, m], f32[m, 1], f32[n], f32[m]],
+                    declared_types=[ref<f32[n]>, f32[n, m], f32[m, 1], f32[n], f32[m]],
                     retained_identities=[n],
                 ] %0 %1 %2 %3 %4
                     %9:f32[n, 1] = dot [
@@ -1065,7 +1069,7 @@ mod tests {
                 lambda %0:ref<f32[wide]>, %1:{supplied}, %2:{supplied}, %3:f32[narrow] .
                 let %4:dimension<narrow ∈ [1, 4)>, %5:dimension<wide ∈ [1, 8)>, %6:f32[narrow] = guard [
                     boundary="partial evaluation",
-                    types=[ref<f32[wide]>, dimension<narrow ∈ [1, 4)>, dimension<wide ∈ [1, 8)>, f32[narrow]],
+                    declared_types=[ref<f32[wide]>, dimension<narrow ∈ [1, 4)>, dimension<wide ∈ [1, 8)>, f32[narrow]],
                     retained_identities=[wide],
                 ] %0 %1 %2 %3
                     %7:f32[narrow] = zero [type=f32[narrow]] %4
@@ -1120,7 +1124,7 @@ mod tests {
                 lambda %0:dimension<q ∈ [1, 8)>, %1:f32[n] .
                 let %2:dimension<n ∈ [1, 8)>, %3:f32[n] = guard [
                     boundary="partial evaluation",
-                    types=[dimension<n ∈ [1, 8)>, f32[n]],
+                    declared_types=[dimension<n ∈ [1, 8)>, f32[n]],
                     retained_identities=[n],
                 ] %0 %1
                     %4:f32[n] = zero [type=f32[n]] %2
@@ -1177,7 +1181,7 @@ mod tests {
                 indoc! {r#"
                     guard [
                         boundary="partial evaluation",
-                        types=[ref<f32[n]>, f32[n]],
+                        declared_types=[ref<f32[n]>, f32[n]],
                         retained_identities=[n],
                     ] %0 %1"#}
                 .trim_end()
@@ -1185,7 +1189,7 @@ mod tests {
                 indoc! {r#"
                     guard [
                         boundary="partial evaluation",
-                        types=[f32[n], ref<f32[n]>],
+                        declared_types=[f32[n], ref<f32[n]>],
                         retained_identities=[n],
                     ] %1 %0"#}
                 .trim_end()
@@ -1258,7 +1262,7 @@ mod tests {
                 lambda %0:dimension<a ∈ [1, 8)>, %1:f32[n], %2:dimension<3>, %3:f32[3] .
                 let %4:dimension<n ∈ [1, 8)>, %5:f32[n], %6:dimension<3> = guard [
                     boundary="partial evaluation",
-                    types=[dimension<n ∈ [1, 8)>, f32[n], dimension<m ∈ [1, 8)>],
+                    declared_types=[dimension<n ∈ [1, 8)>, f32[n], dimension<m ∈ [1, 8)>],
                     retained_identities=[n],
                 ] %0 %1 %2
                     %7:f32[3] = zero [type=f32[m]] %6
@@ -1314,18 +1318,19 @@ mod tests {
                 if reversed_reads { ("f32[3]", 1, "f32[n]", 0) } else { ("f32[n]", 0, "f32[3]", 1) };
             assert_eq!(
                 evaluation.program().to_string(),
-                formatdoc! {r#"
+                formatdoc! {"
                 lambda %0:ref<f32[n]>, %1:ref<f32[3]> .
                 let () = guard [
-                    boundary="partial evaluation",
-                    types=[ref<f32[n]>, ref<f32[n]>],
+                    boundary=\"partial evaluation\",
+                    declared_types=[ref<f32[n]>, ref<f32[n]>],
                     retained_identities=[n],
                 ] %0 %1
                     %2:{first_type} = reference_read %{first_input}
                     %3:{second_type} = reference_read %{second_input}
-                    %4:f32[n], %5:f32[n] = guard [boundary="add", types=[f32[n], f32[n]], retained_identities=[n]] %2 %3
+                    %4:f32[n], %5:f32[n] = guard [boundary=\"add\", \
+                        declared_types=[f32[n], f32[n]], retained_identities=[n]] %2 %3
                     %6:f32[n] = add %4 %5
-                in (%6)"#},
+                in (%6)"},
             );
             let eager = EagerContext::<TestValue, TestOperation>::new();
             let reference =
@@ -1400,18 +1405,19 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 evaluation.program().to_string(),
-                indoc! {r#"
+                indoc! {"
             lambda %0:ref<f32[n]>, %1:ref<f32[3]>, %2:dimension<n ∈ [1, 8)> .
             let %3:dimension<n ∈ [1, 8)> = guard [
-                boundary="partial evaluation",
-                types=[ref<f32[n]>, ref<f32[n]>, dimension<n ∈ [1, 8)>],
+                boundary=\"partial evaluation\",
+                declared_types=[ref<f32[n]>, ref<f32[n]>, dimension<n ∈ [1, 8)>],
                 retained_identities=[n],
             ] %0 %1 %2
                 %4:f32[n] = reference_read %0
                 %5:f32[3] = reference_read %1
-                %6:f32[n], %7:f32[n] = guard [boundary="add", types=[f32[n], f32[n]], retained_identities=[n]] %4 %5
+                %6:f32[n], %7:f32[n] = guard [boundary=\"add\", \
+                    declared_types=[f32[n], f32[n]], retained_identities=[n]] %4 %5
                 %8:f32[n] = add %6 %7
-            in (%8, %3)"#},
+            in (%8, %3)"},
             );
             let eager = EagerContext::<TestValue, TestOperation>::new();
             let reference =
@@ -1472,7 +1478,7 @@ mod tests {
                 lambda %0:ref<f32[n]>, %1:ref<f32[3]> .
                 let () = guard [
                     boundary="partial evaluation",
-                    types=[ref<f32[n]>, ref<f32[n]>],
+                    declared_types=[ref<f32[n]>, ref<f32[n]>],
                     retained_identities=[n],
                 ] %0 %1
                     %2:f32[n] = reference_read %0
@@ -1482,20 +1488,21 @@ mod tests {
                     %6:f32[3] = add %3 %5
                 in (%6)"#}
             } else {
-                indoc! {r#"
+                indoc! {"
                 lambda %0:ref<f32[n]>, %1:ref<f32[3]> .
                 let () = guard [
-                    boundary="partial evaluation",
-                    types=[ref<f32[n]>, ref<f32[n]>],
+                    boundary=\"partial evaluation\",
+                    declared_types=[ref<f32[n]>, ref<f32[n]>],
                     retained_identities=[n],
                 ] %0 %1
                     %2:f32[n] = reference_read %0
                     %3:f32[3] = reference_read %1
                     %4:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %2
                     %5:f32[n] = zero [type=f32[n]] %4
-                    %6:f32[n], %7:f32[n] = guard [boundary="add", types=[f32[n], f32[n]], retained_identities=[n]] %3 %5
+                    %6:f32[n], %7:f32[n] = guard [boundary=\"add\", \
+                        declared_types=[f32[n], f32[n]], retained_identities=[n]] %3 %5
                     %8:f32[n] = add %6 %7
-                in (%8)"#}
+                in (%8)"}
             };
             assert_eq!(evaluation.program().to_string(), expected);
             let eager = EagerContext::<TestValue, TestOperation>::new();
@@ -1560,18 +1567,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             evaluation.program().to_string(),
-            indoc! {r#"
+            indoc! {"
             lambda %0:ref<f32[n]>, %1:ref<f32[3]> .
             let () = guard [
-                boundary="partial evaluation",
-                types=[ref<f32[n]>, ref<f32[n]>],
+                boundary=\"partial evaluation\",
+                declared_types=[ref<f32[n]>, ref<f32[n]>],
                 retained_identities=[n],
             ] %0 %1
                 %2:f32[n] = reference_read %0
                 %3:f32[3] = reference_read %1
-                %4:f32[n], %5:f32[n] = guard [boundary="add", types=[f32[n], f32[n]], retained_identities=[n]] %2 %3
+                %4:f32[n], %5:f32[n] = guard [boundary=\"add\", \
+                    declared_types=[f32[n], f32[n]], retained_identities=[n]] %2 %3
                 %6:f32[n] = add %4 %5
-            in (%6)"#},
+            in (%6)"},
         );
         let reference = || TestValue::Reference(ArrayReference::new(Array::vector(vec![1f32; 3]).unwrap()));
         assert_eq!(
@@ -1676,7 +1684,7 @@ mod tests {
             lambda %0:ref<f32[a]>, %1:ref<f32[b]>, %2:dimension<c ∈ [1, 8)>, %3:dimension<c ∈ [1, 8)> .
             let %4:dimension<a ∈ [1, 8)>, %5:dimension<b ∈ [1, 8)> = guard [
                 boundary="partial evaluation",
-                types=[ref<f32[a]>, ref<f32[b]>, dimension<a ∈ [1, 8)>, dimension<b ∈ [1, 8)>],
+                declared_types=[ref<f32[a]>, ref<f32[b]>, dimension<a ∈ [1, 8)>, dimension<b ∈ [1, 8)>],
                 retained_identities=[a, b],
             ] %0 %1 %2 %3
                 %6:f32[a] = reference_read %0
@@ -1791,7 +1799,7 @@ mod tests {
             lambda %0:ref<f32[n]>, %1:f32[2], %2:f32[] .
             let %3:f32[n] = guard [
                 boundary="partial evaluation",
-                types=[ref<f32[n]>, f32[n]],
+                declared_types=[ref<f32[n]>, f32[n]],
                 retained_identities=[n],
             ] %0 %1
                 %4:f32[] = print [label=known] %2
@@ -2408,7 +2416,7 @@ mod tests {
         let guard = indoc! {r#"
             guard [
                 boundary="partial evaluation",
-                types=[dimension<n ∈ [1, 8)>, f32[n]],
+                declared_types=[dimension<n ∈ [1, 8)>, f32[n]],
                 retained_identities=[m],
             ]"#}
         .trim();
@@ -2482,7 +2490,7 @@ mod tests {
                 lambda %0:dimension<m ∈ [1, 8)>, %1:dimension<2>, %2:f32[2] .
                 let %3:dimension<2>, %4:dimension<2>, %5:f32[2] = guard [
                     boundary="partial evaluation",
-                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, f32[n]],
+                    declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, f32[n]],
                 ] %1 %0 %2
                 in (%4)"#},
         );
@@ -2580,7 +2588,7 @@ mod tests {
         let guard = indoc! {r#"
             guard [
                 boundary="partial evaluation",
-                types=[dimension<n ∈ [1, 8)>, f32[n]],
+                declared_types=[dimension<n ∈ [1, 8)>, f32[n]],
                 retained_identities=[m],
             ]"#}
         .trim();
@@ -2640,7 +2648,7 @@ mod tests {
                 lambda %0:f32[2], %1:ref<f32[n]> .
                 let %2:f32[n] = guard [
                     boundary="partial evaluation",
-                    types=[ref<f32[n]>, f32[n]],
+                    declared_types=[ref<f32[n]>, f32[n]],
                     retained_identities=[n],
                 ] %1 %0
                 in (%2)"#},
@@ -2713,7 +2721,7 @@ mod tests {
                 lambda %0:f32[m], %1:dimension<2>, %2:f32[n, 2], %3:f32[2] .
                 let %4:dimension<2>, %5:f32[n, 2], %6:f32[2] = guard [
                     boundary="partial evaluation",
-                    types=[dimension<m ∈ [1, 8)>, f32[n, m], f32[m]],
+                    declared_types=[dimension<m ∈ [1, 8)>, f32[n, m], f32[m]],
                 ] %1 %2 %0
                     %7:f32[2] = add %6 %3
                 in (%7)"#},
@@ -2726,17 +2734,19 @@ mod tests {
             .clone()
             .build::<Vec<TestValue>, Vec<TestValue>>(output_atoms, vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let guard = r#"guard [boundary="partial evaluation", types=[dimension<m ∈ [1, 8)>, f32[n, m]]]"#;
         assert_eq!(
             replayed.to_string(),
-            formatdoc! {r#"
+            indoc! {r#"
                 lambda %1:f32[n, m], %5:f32[m] .
                 let %0:dimension<2> = const 2
-                    %2:dimension<2>, %3:f32[n, 2] = {guard} %0 %1
+                    %2:dimension<2>, %3:f32[n, 2] = guard [
+                        boundary="partial evaluation",
+                        declared_types=[dimension<m ∈ [1, 8)>, f32[n, m]],
+                    ] %0 %1
                     %4:f32[2] = zero [type=f32[m]] %0
                     %6:dimension<2>, %7:f32[n, 2], %8:f32[2] = guard [
                         boundary="partial evaluation",
-                        types=[dimension<m ∈ [1, 8)>, f32[n, m], f32[m]],
+                        declared_types=[dimension<m ∈ [1, 8)>, f32[n, m], f32[m]],
                     ] %0 %3 %5
                     %9:f32[2] = add %8 %4
                 in (%9)"#},
@@ -2798,7 +2808,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {r#"
             lambda %0:ref<f32[3]>, %1:f32[n] .
-            let %2:f32[3] = guard [boundary="partial evaluation", types=[ref<f32[n]>, f32[n]]] %0 %1
+            let %2:f32[3] = guard [boundary="partial evaluation", declared_types=[ref<f32[n]>, f32[n]]] %0 %1
                 %3:f32[3] = reference_read %0
                 %4:f32[3] = add %3 %2
             in (%4)"#},
@@ -2872,7 +2882,7 @@ mod tests {
             lambda %0:ref<f32[q]>, %1:dimension<c ∈ [1, 4)>, %2:dimension<c ∈ [1, 4)>, %3:f32[3] .
             let %4:dimension<3>, %5:dimension<q ∈ [1, 8)>, %6:f32[3] = guard [
                 boundary="partial evaluation",
-                types=[ref<f32[q]>, dimension<n ∈ [1, 4)>, dimension<q ∈ [1, 8)>, f32[n]],
+                declared_types=[ref<f32[q]>, dimension<n ∈ [1, 4)>, dimension<q ∈ [1, 8)>, f32[n]],
                 retained_identities=[q],
             ] %0 %1 %2 %3
                 %7:f32[3] = zero [type=f32[n]] %4
@@ -2942,7 +2952,7 @@ mod tests {
             lambda %0:{dimension_c}, %1:{dimension_c}, %2:{dimension_a}, %3:{dimension_b} .
             let %4:{dimension_a}, %5:{dimension_a}, %6:{dimension_a}, %7:{dimension_a} = guard [
                 boundary="partial evaluation",
-                types=[{dimension_p}, {dimension_p}, {dimension_q}, {dimension_q}],
+                declared_types=[{dimension_p}, {dimension_p}, {dimension_q}, {dimension_q}],
                 retained_identities=[a],
             ] %2 %0 %3 %1
             in (%6)"#},
@@ -3012,7 +3022,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[], %2:f32[n], %3:f32[] .
-                let %4:f32[n], %5:f32[n] = guard [boundary="partial evaluation", types=[f32[n], f32[n]]] %2 %0
+                let %4:f32[n], %5:f32[n] = guard [boundary="partial evaluation", declared_types=[f32[n], f32[n]]] %2 %0
                     %6:f32[] = print [label=known] %3
                     %7:f32[] = print [label=unknown] %1
                 in (%5, %6, %7)"#},

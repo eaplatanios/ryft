@@ -3050,7 +3050,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[2] .
-                let %2:f32[2], %3:f32[2] = guard [boundary="partial evaluation", types=[f32[n], f32[n]]] %1 %0
+                let %2:f32[2], %3:f32[2] = guard [boundary="partial evaluation", declared_types=[f32[n], f32[n]]] %1 %0
                 in ()"#},
         );
         let eager = EagerContext::<TestValue, TestOperation>::new();
@@ -3105,7 +3105,7 @@ mod tests {
                 lambda %0:ref<f32[wide]>, %1:f32[exact, exact] .
                 let %2:f32[3, wide] = guard [
                     boundary="partial evaluation",
-                    types=[ref<f32[wide]>, f32[narrow, wide]],
+                    declared_types=[ref<f32[wide]>, f32[narrow, wide]],
                     retained_identities=[wide],
                 ] %0 %1
                 in ()"#},
@@ -3447,7 +3447,7 @@ mod tests {
                 lambda %0:ref<f32[n]>, %1:f32[3], %2:f32[] .
                 let %3:f32[n] = guard [
                     boundary="partial evaluation",
-                    types=[ref<f32[n]>, f32[n]],
+                    declared_types=[ref<f32[n]>, f32[n]],
                     retained_identities=[n],
                 ] %0 %1
                     %4:f32[] = print [label=known] %2
@@ -3803,7 +3803,7 @@ mod tests {
                 lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)> .
                 let %2:dimension<a ∈ [1, 8)>, %3:dimension<a ∈ [1, 8)> = guard [
                     boundary="partial evaluation",
-                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                     retained_identities=[a],
                 ] %0 %1
                 in ()"#},
@@ -3838,12 +3838,12 @@ mod tests {
                 lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)>, %2:dimension<a ∈ [1, 8)> .
                 let %3:dimension<a ∈ [1, 8)>, %4:dimension<a ∈ [1, 8)> = guard [
                     boundary="earlier",
-                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                     retained_identities=[a],
                 ] %0 %1
                     %5:dimension<a ∈ [1, 8)>, %6:dimension<a ∈ [1, 8)> = guard [
                         boundary="partial evaluation",
-                        types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                        declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                         retained_identities=[a],
                     ] %2 %1
                 in ()"#},
@@ -3882,12 +3882,12 @@ mod tests {
                 lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)>, %2:dimension<c ∈ [1, 8)> .
                 let %3:dimension<b ∈ [1, 8)>, %4:dimension<b ∈ [1, 8)> = guard [
                     boundary="partial evaluation",
-                    types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                     retained_identities=[b],
                 ] %1 %2
                     %5:dimension<b ∈ [1, 8)>, %6:dimension<b ∈ [1, 8)>, %7:dimension<b ∈ [1, 8)> = guard [
                         boundary="partial evaluation",
-                        types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                        declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                         retained_identities=[b],
                     ] %1 %4 %0
                 in (%7)"#},

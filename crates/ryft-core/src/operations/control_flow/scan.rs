@@ -10659,7 +10659,7 @@ mod tests {
                     },
                 ]
                     %2:f32[4] = const [2.0, 2.0, 2.0, 2.0]
-                    %3:f32[4], %4:f32[4] = guard [boundary=\"region\", types=[f32[n], f32[n]]] %2 %0
+                    %3:f32[4], %4:f32[4] = guard [boundary=\"region\", declared_types=[f32[n], f32[n]]] %2 %0
                     %5:f32[4] = scan [carry_count=1, length=2, reverse=false] %3 [
                         body={
                             lambda %0:i64[], %1:f32[4] .

@@ -1811,7 +1811,7 @@ impl<T: Type> Operation for GuardOperation<T> {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("boundary", format_args!("{:?}", self.boundary))?;
             operation.field(
-                "types",
+                "declared_types",
                 format_args!(
                     "[{}]",
                     self.declared_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
@@ -4104,7 +4104,7 @@ mod tests {
         assert_eq!(guard.boundary(), "region");
         assert_eq!(guard.declared_types(), declared.as_slice());
         assert_eq!(guard.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(guard.to_string(), r#"guard [boundary="region", types=[f32[n], f32[n]]]"#);
+        assert_eq!(guard.to_string(), r#"guard [boundary="region", declared_types=[f32[n], f32[n]]]"#);
 
         // Proven entries need no guard, while mixed entries guard every member that carries an unproven identity.
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
@@ -4279,7 +4279,12 @@ mod tests {
         );
         assert_eq!(
             guard.to_string(),
-            r#"guard [boundary="region", types=[f32[p, q], f32[p], f32[q]], retained_identities=[a]]"#,
+            indoc! {r#"
+                guard [
+                    boundary="region",
+                    declared_types=[f32[p, q], f32[p], f32[q]],
+                    retained_identities=[a],
+                ]"#},
         );
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(a.to_variable(), c.to_variable()).unwrap();
@@ -4468,9 +4473,8 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[n], %1:f32[n] .
-                let %2:f32[n], %3:f32[n] = guard [boundary=\"region\", types=[f32[n], f32[n]], \
-            reference_anchor_inputs=[0]] \
-                    %0 %1
+                let %2:f32[n], %3:f32[n] = guard [boundary=\"region\", \
+                    declared_types=[f32[n], f32[n]], reference_anchor_inputs=[0]] %0 %1
                 in (%3)"},
         );
     }
@@ -4514,7 +4518,7 @@ mod tests {
                 lambda %0:f32[p], %1:f32[q], %2:dimension<c ∈ [1, 8)>, %3:dimension<c ∈ [1, 8)> .
                 let %4:f32[p], %5:f32[q], %6:dimension<p ∈ [1, 8)>, %7:dimension<q ∈ [1, 8)> = guard [
                     boundary="partial evaluation",
-                    types=[f32[p], f32[q], dimension<p ∈ [1, 8)>, dimension<q ∈ [1, 8)>],
+                    declared_types=[f32[p], f32[q], dimension<p ∈ [1, 8)>, dimension<q ∈ [1, 8)>],
                     retained_identities=[p, q],
                     reference_anchor_inputs=[0, 1],
                 ] %0 %1 %2 %3
@@ -4588,11 +4592,12 @@ mod tests {
                 lambda %0:f32[n], %1:f32[3] .
                 let %2:f32[n], %3:f32[n] = guard [
                     boundary=\"partial evaluation\",
-                    types=[f32[n], f32[n]],
+                    declared_types=[f32[n], f32[n]],
                     retained_identities=[n],
                     reference_anchor_inputs=[0, 1],
                 ] %0 %1
-                    %4:f32[n], %5:f32[n] = guard [boundary=\"add\", types=[f32[n], f32[n]], retained_identities=[n]] \
+                    %4:f32[n], %5:f32[n] = guard [boundary=\"add\", \
+                        declared_types=[f32[n], f32[n]], retained_identities=[n]] \
                         {operands}
                     %6:f32[n] = add %4 %5
                 in (%6)"},
@@ -4691,8 +4696,8 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[3] .
-                let %2:f32[3], %3:f32[3] = guard [boundary="partial evaluation", types=[f32[n], f32[n]]] %1 %0
-                    %4:f32[3], %5:f32[3] = guard [boundary="region", types=[f32[n], f32[n]]] %1 %3
+                let %2:f32[3], %3:f32[3] = guard [boundary="partial evaluation", declared_types=[f32[n], f32[n]]] %1 %0
+                    %4:f32[3], %5:f32[3] = guard [boundary="region", declared_types=[f32[n], f32[n]]] %1 %3
                 in ()"#},
         );
     }
@@ -4725,10 +4730,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:dimension<batch ∈ [0, 5)>, %1:f32[batch, 4], %2:f32[n] .
-                let %3:f32[batch, 4], %4:f32[4] = guard [boundary="region", types=[f32[batch, n], f32[n]]] %1 %2
-                in ()"#},
+                let %3:f32[batch, 4], %4:f32[4] = guard [boundary=\"region\", \
+                    declared_types=[f32[batch, n], f32[n]]] %1 %2
+                in ()"},
         );
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let mapped = ArrayIrValue::Array(
@@ -4782,7 +4788,7 @@ mod tests {
             let expected = if declared.sharding().is_some() {
                 formatdoc! {r#"
                     lambda %0:{declared} .
-                    let %1:{declared} = guard [boundary="entry", types=[{declared}]] %0
+                    let %1:{declared} = guard [boundary="entry", declared_types=[{declared}]] %0
                         %2:{output} = cast [
                             type={output},
                             inputs=[{declared}],
@@ -4792,7 +4798,7 @@ mod tests {
             } else {
                 formatdoc! {r#"
                     lambda %0:{declared} .
-                    let %1:{declared} = guard [boundary="entry", types=[{declared}]] %0
+                    let %1:{declared} = guard [boundary="entry", declared_types=[{declared}]] %0
                         %2:{output} = cast [type={output}, inputs=[{declared}], checked=true] %1
                     in (%2)"#}
             };
@@ -4815,13 +4821,13 @@ mod tests {
                         lambda %0:{packed} .
                         let %1:{packed} = guard [
                             boundary="entry",
-                            types=[{packed}],
+                            declared_types=[{packed}],
                         ] %0
                         in (%1)"#}
                 } else {
                     formatdoc! {r#"
                         lambda %0:{packed} .
-                        let %1:{packed} = guard [boundary="entry", types=[{packed}]] %0
+                        let %1:{packed} = guard [boundary="entry", declared_types=[{packed}]] %0
                         in (%1)"#}
                 };
                 assert_eq!(program.to_string(), expected);
@@ -5225,7 +5231,7 @@ mod tests {
                 lambda %0:dimension<2>, %1:f32[a], %2:f32[b], %3:dimension<c ∈ [1, 8)> .
                 let %4:f32[a], %5:f32[b], %6:dimension<a ∈ [1, 8)>, %7:dimension<b ∈ [1, 8)> = guard [
                     boundary="region",
-                    types=[f32[p], f32[q], dimension<p ∈ [1, 8)>, dimension<q ∈ [1, 8)>],
+                    declared_types=[f32[p], f32[q], dimension<p ∈ [1, 8)>, dimension<q ∈ [1, 8)>],
                     retained_identities=[a, b],
                     reference_anchor_inputs=[0, 1],
                 ] %1 %2 %3 %3
@@ -5262,7 +5268,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[2], %2:f32[n], %3:f32[2] .
-                let %4:f32[2], %5:f32[2] = guard [boundary="region", types=[f32[n], f32[n]]] %0 %1
+                let %4:f32[2], %5:f32[2] = guard [boundary="region", declared_types=[f32[n], f32[n]]] %0 %1
                     %6:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[2]]] %0 %4
                     %7:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %2 %6
                     %8:f32[2] = cast [type=f32[2], inputs=[f32[2], f32[2]]] %3 %5
@@ -5370,9 +5376,8 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f32[a], %1:f32[b], %2:f32[a], %3:f32[b] .
-                let %4:f32[a], %5:f32[a] = guard [boundary=\"region\", types=[f32[p], f32[p]], \
-            retained_identities=[a]] \
-                    %0 %1
+                let %4:f32[a], %5:f32[a] = guard [boundary=\"region\", \
+                    declared_types=[f32[p], f32[p]], retained_identities=[a]] %0 %1
                     %6:f32[a] = cast [type=f32[a], inputs=[f32[a], f32[a]]] %2 %4
                     %7:f32[a] = cast [type=f32[a], inputs=[f32[b], f32[b], f32[a]]] %3 %1 %5
                     %8:f32[a] = add %4 %5

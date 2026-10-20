@@ -3710,9 +3710,9 @@ mod tests {
 
     #[test]
     fn test_custom_function_with_vjp_cotangent_casts() {
-        // The forward rule narrows `x: f64[n]` to `f64[2]` with a checked cast and saves `x` with the derivative, and the
-        // backward rule widens the cotangent back to `f64[n]` with a checked cast that names `x` as its witness. The
-        // staged pullback keeps both checks, the first one before the backward rule, in both orders of batching and
+        // The forward rule narrows `x: f64[n]` to `f64[2]` with a checked cast and saves `x` with the derivative, and
+        // the backward rule widens the cotangent back to `f64[n]` with a checked cast that names `x` as its witness.
+        // The staged pullback keeps both checks, the first one before the backward rule, in both orders of batching and
         // reverse-mode differentiation.
         type Tracer = DomainTracer<ArrayContext>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());

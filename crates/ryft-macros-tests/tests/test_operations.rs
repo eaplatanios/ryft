@@ -2000,7 +2000,7 @@ mod guard_provision {
             indoc! {r#"
                 lambda %1:f32[n] .
                 let %0:f32[2] = const [1.0, 2.0]
-                    %2:f32[2], %3:f32[2] = guard [boundary="region", types=[f32[n], f32[n]]] %0 %1
+                    %2:f32[2], %3:f32[2] = guard [boundary="region", declared_types=[f32[n], f32[n]]] %0 %1
                     %4:f32[2] = tag [key=first] %2
                 in (%4)"#},
         );

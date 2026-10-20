@@ -1813,7 +1813,7 @@ mod tests {
             indoc! {r#"
                 lambda %1:f32[n] .
                 let %0:f32[4] = const [2.0, 2.0, 2.0, 2.0]
-                    %2:f32[4], %3:f32[4] = guard [boundary="region", types=[f32[n], f32[n]]] %0 %1
+                    %2:f32[4], %3:f32[4] = guard [boundary="region", declared_types=[f32[n], f32[n]]] %0 %1
                 in (%2)"#},
         );
         assert_eq!(traced.interpret(vec![four.clone()]), Ok(vec![four]));
@@ -2274,11 +2274,12 @@ mod tests {
             assert_eq!(
                 replayed.to_string(),
                 formatdoc! {
-                    r#"
+                    "
                         lambda %0:dimension<{name} ∈ [1, 8)>, %1:f32[2] .
-                        let %2:dimension<2>, %3:f32[2] = guard [boundary="region", types=[dimension<n ∈ [1, 8)>, f32[n]]] %0 %1
+                        let %2:dimension<2>, %3:f32[2] = guard [boundary=\"region\", \
+                            declared_types=[dimension<n ∈ [1, 8)>, f32[n]]] %0 %1
                             %4:f32[2] = zero [type=f32[n]] %2
-                        in (%4)"#,
+                        in (%4)",
                     name = name,
                 },
             );

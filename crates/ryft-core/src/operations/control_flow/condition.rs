@@ -6430,7 +6430,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[3] .
-                let %2:f32[3], %3:f32[3] = guard [boundary="partial evaluation", types=[f32[n], f32[n]]] %1 %0
+                let %2:f32[3], %3:f32[3] = guard [boundary="partial evaluation", declared_types=[f32[n], f32[n]]] %1 %0
                     %4:f32[3] = mul %3 %3
                 in (%4)"#},
         );
@@ -6508,7 +6508,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(vector_type.clone())]).unwrap();
-        let guard = r#"guard [boundary="partial evaluation", types=[dimension<n ∈ [1, 8)>, f32[n]]]"#;
+        let guard = r#"guard [boundary="partial evaluation", declared_types=[dimension<n ∈ [1, 8)>, f32[n]]]"#;
         assert_eq!(
             evaluation.program.to_string(),
             formatdoc! {"
@@ -6593,7 +6593,7 @@ mod tests {
                     %3:f32[n] = add %0 %0
                     %4:dimension<n ∈ [1, 8)>, %5:f32[n] = guard [
                         boundary="partial evaluation",
-                        types=[dimension<n ∈ [1, 8)>, f32[n], ref<f32[n]>],
+                        declared_types=[dimension<n ∈ [1, 8)>, f32[n], ref<f32[n]>],
                         retained_identities=[n],
                     ] %2 %3 %1
                     () = reference_write %1 %5
@@ -6760,7 +6760,7 @@ mod tests {
                 let %2:dimension<2> = const 2
                     %3:dimension<2>, %4:f32[2] = guard [
                         boundary="partial evaluation",
-                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                        declared_types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
                     ] %2 %0 %1
                     () = reference_write %1 %4
                     %5:f32[2] = reference_read %1
@@ -6836,13 +6836,13 @@ mod tests {
                 let %2:dimension<2> = const 2
                     %3:dimension<2>, %4:f32[2] = guard [
                         boundary="partial evaluation",
-                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                        declared_types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
                     ] %2 %0 %1
                     %5:dimension<2> = const 2
                     () = reference_write %1 %4
                     %6:dimension<2>, %7:f32[2] = guard [
                         boundary="partial evaluation",
-                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                        declared_types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
                     ] %5 %0 %1
                     () = reference_write %1 %7
                 in ()"#},
@@ -6896,7 +6896,7 @@ mod tests {
                     %3:dimension<2> = const 2
                     %4:dimension<2>, %5:f32[2] = guard [
                         boundary="partial evaluation",
-                        types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
+                        declared_types=[dimension<extent ∈ [1, 8)>, f32[extent], ref<f32[extent]>],
                     ] %3 %0 %1
                     () = reference_write %1 %5
                 in (%2)"#},
@@ -7959,7 +7959,7 @@ mod tests {
             lambda %0:bool[], %1:f64[extent], %2:dimension<3>, %3:f64[3] .
             let %4:dimension<3>, %5:f64[3], %6:f64[3] = guard [
                 boundary="partial evaluation",
-                types=[dimension<extent ∈ [1, 8)>, f64[extent], f64[extent]],
+                declared_types=[dimension<extent ∈ [1, 8)>, f64[extent], f64[extent]],
             ] %2 %3 %1
                 %7:f64[3] = condition %0 %2 %3 %6 [
                     true={
