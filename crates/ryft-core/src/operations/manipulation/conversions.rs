@@ -1645,12 +1645,10 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Infers the output of a [`CastOperation`] for this type family, validating the complete relationship between its
 /// input, output, and witness types. This includes dimension extents and identities as well as other type properties.
-/// The value and representation constraints are described by [`CastOperation`]. This trait validates them
-/// together with the complete source and witness declarations.
+/// The value and representation constraints are described by [`CastOperation`]. This trait validates them together
+/// with the complete source and witness declarations.
 ///
 /// Custom type families implement this trait to use [`CastOperation`]. Their interpreted values implement [`Cast`]
 /// to materialize any requested representation changes. The built-in implementations use [`TypeRefinements`] to
@@ -1691,8 +1689,8 @@ impl CastType for DataType {
             Ok((operation.output_type, Some(operation.output_type)))
         } else {
             Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                &input_types[0], &operation.output_type,
+                "`{}` cannot convert type `{}` to unrelated type `{}`",
+                CAST_OPERATION_NAME, input_types[0], operation.output_type,
             )))
         }
     }
@@ -1710,13 +1708,16 @@ impl CastType for ArrayType {
             output_type: operation.output_type.clone().into(),
             checked: operation.checked,
         };
+
         let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
         let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
+
         // The composite contract preserves the requested output's member kind.
         let project = |output| match output {
             ArrayIrType::Array(output) => output,
             _ => unreachable!(),
         };
+
         Ok((project(output), interpreted.map(project)))
     }
 }
@@ -1733,13 +1734,16 @@ impl CastType for DimensionType {
             output_type: operation.output_type.clone().into(),
             checked: operation.checked,
         };
+
         let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
         let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
+
         // The composite contract preserves the requested output's member kind.
         let project = |output| match output {
             ArrayIrType::Dimension(output) => output,
             _ => unreachable!(),
         };
+
         Ok((project(output), interpreted.map(project)))
     }
 }
@@ -1753,10 +1757,11 @@ impl CastType for ArrayIrType {
         let preserved = operation.validate_declaration(input_types)?;
         match (&input_types[0], &operation.output_type) {
             (Self::Array(input), Self::Array(output)) => {
-                // Admission above guarantees that the declared first input has the supplied input's member kind.
+                // The validation above guarantees that the declared first input has the supplied input's member kind.
                 let Self::Array(declared) = &operation.input_types[0] else { unreachable!() };
-                // Arrays preserve their value properties and static extents. Layout and explicit placement may change,
-                // while auto/manual placement, manual variation, and reduction state remain constrained.
+
+                // Arrays preserve the input value properties and static extents. Layout and explicit placement may
+                // change, while auto/manual placement, manual variation, and reduction state remain constrained.
                 if declared.unreduced_axes() != input.unreduced_axes()
                     || declared.reduced_axes() != input.reduced_axes()
                 {
@@ -1764,6 +1769,7 @@ impl CastType for ArrayIrType {
                         "`{CAST_OPERATION_NAME}` supplied input changes the declared reduction state",
                     )));
                 }
+
                 if input.data_type() != output.data_type()
                     || input.rank() != output.rank()
                     || input.memory() != output.memory()
@@ -1780,6 +1786,7 @@ impl CastType for ArrayIrType {
                         "`{CAST_OPERATION_NAME}` cannot convert type `{input}` to unrelated type `{output}`",
                     )));
                 }
+
                 // These are semantic dependencies, not optional placement constraints. An absent sharding is invariant,
                 // and changing variation requires the corresponding operation (whose transpose performs the required
                 // reduction).
@@ -1788,17 +1795,19 @@ impl CastType for ArrayIrType {
                         "`{CAST_OPERATION_NAME}` supplied input changes the declared manual variation",
                     )));
                 }
+
                 if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[input, output]).is_err() {
                     return Err(TypeError::invalid(format!(
                         "`{CAST_OPERATION_NAME}` cannot change varying manual axes; use `parallel_vary` to add \
                          variation or a reduction to remove it",
                     )));
                 }
-                // Placement follows the rules of `reshard`: the type system tracks placement over explicit mesh axes,
-                // so the output may request a new one, whereas placement over auto axes belongs to backend compilers
-                // and transitions over manual axes require manual collectives. The output therefore names the same auto
-                // and manual axes as the input on every dimension. Carrying them forward requests no redistribution,
-                // and an output without a sharding stays untracked rather than requesting replication.
+
+                // Placement follows the rules of `reshard` (i.e., the type system tracks placement over explicit
+                // mesh axes, so the output may request a new one, whereas placement over auto axes belongs to backend
+                // compilers and transitions over manual axes require manual collectives). The output therefore names
+                // the same auto and manual axes as the input on every dimension. Carrying them forward requests no
+                // redistribution, and an output without a sharding stays untracked rather than requesting replication.
                 if let Some(output_sharding) = output.sharding() {
                     let named_axes = |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding
                         .dimensions()[dimension]
@@ -1810,6 +1819,7 @@ impl CastType for ArrayIrType {
                             .collect::<Vec<_>>(),
                         ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
                     };
+
                     for (axis_type, remedy) in [
                         (
                             MeshAxisType::Auto,
@@ -1829,23 +1839,62 @@ impl CastType for ArrayIrType {
                             )));
                         }
                     }
+
+                    // The checks above compare axis names only, but the size and type of a mesh axis are semantic.
+                    // Every auto or manual axis whose placement, manual variation, or reduction state the output
+                    // carries forward must therefore keep its definition, whereas the output mesh may still add or
+                    // drop other axes (e.g., to request an explicit redistribution).
+                    if let Some(input_sharding) = input.sharding() {
+                        let input_mesh = input_sharding.mesh();
+                        let output_mesh = output_sharding.mesh();
+                        let preserved_axes = input_sharding
+                            .dimensions()
+                            .iter()
+                            .flat_map(|dimension| match dimension {
+                                ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
+                                ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
+                            })
+                            .chain(input_sharding.varying_manual_axes())
+                            .chain(input_sharding.unreduced_axes())
+                            .chain(input_sharding.reduced_axes())
+                            .filter_map(|axis_name| {
+                                input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index])
+                            })
+                            .filter(|axis| axis.r#type() != MeshAxisType::Explicit);
+                        for input_axis in preserved_axes {
+                            let output_axis =
+                                output_mesh.axis_index(input_axis.name()).map(|index| &output_mesh.axes()[index]);
+                            if output_axis != Some(input_axis) {
+                                let output_axis = output_axis
+                                    .map_or_else(|| "an undefined axis".to_owned(), |axis| format!("`{axis}`"));
+                                return Err(TypeError::invalid(format!(
+                                    "`{}` cannot redefine preserved {} mesh axis `{}` as {}",
+                                    CAST_OPERATION_NAME,
+                                    input_axis.r#type(),
+                                    input_axis,
+                                    output_axis,
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             (Self::Dimension(input), Self::Dimension(output)) => {
                 if matches!((input.extent(), output.extent()), (Some(input), Some(output)) if input != output) {
                     return Err(TypeError::invalid(format!(
-                        "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                        input, output,
+                        "`{}` cannot convert type `{}` to unrelated type `{}`",
+                        CAST_OPERATION_NAME, input, output,
                     )));
                 }
             }
             _ => {
                 return Err(TypeError::invalid(format!(
-                    "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                    &input_types[0], &operation.output_type,
+                    "`{}` cannot convert type `{}` to unrelated type `{}`",
+                    CAST_OPERATION_NAME, &input_types[0], &operation.output_type,
                 )));
             }
         }
+
         // Solve all dimensions together: input and output declarations share the declared scope, and supplied inputs
         // share the actual scope. The output observes the first actual input, admitting conditional narrowing and
         // differently bounded identities without changing the meaning of a shared declared name.
@@ -1898,6 +1947,7 @@ impl CastType for ArrayIrType {
                 )),
             }
         }
+
         let refinements = DimensionRefinements::from_refinement_facts(facts)?;
         for class in refinements.identity_classes() {
             // Every identity class has at least one member, so the maximal lower bound exists.
@@ -1915,7 +1965,8 @@ impl CastType for ArrayIrType {
                 .any(|variable| variable.bounds().upper().is_some_and(|upper| upper <= lower))
             {
                 return Err(TypeError::invalid(format!(
-                    "`{CAST_OPERATION_NAME}` cannot equate dimensions with disjoint bounds: {}",
+                    "`{}` cannot equate dimensions with disjoint bounds: {}",
+                    CAST_OPERATION_NAME,
                     class
                         .declared()
                         .iter()
@@ -1926,6 +1977,7 @@ impl CastType for ArrayIrType {
                 )));
             }
         }
+
         // A formal identity may be the same object as an unrelated actual identity. Preserve its name only when its
         // scoped correspondence reaches that actual identity; otherwise resolve its own class below.
         let preserved_identities = preserved
@@ -1937,6 +1989,7 @@ impl CastType for ArrayIrType {
             })
             .cloned()
             .collect::<Vec<_>>();
+
         // Full cast inference has validated compatibility. Ordinary refinement of shapes alone now distinguishes
         // relationships already proven by the supplied types from conditional equalities that need a runtime check.
         // Layout and sharding are intentionally absent: changing them adds no runtime shape constraint.
@@ -1952,6 +2005,7 @@ impl CastType for ArrayIrType {
             .cloned()
             .map(DimensionType::from)
             .collect::<Vec<_>>();
+
         // The complete scoped signature proves equality when every occurrence observes an already equal actual
         // dimension. A consistent formal-to-actual renaming does not require an additional runtime check. Ordinary
         // refinement does not admit a conditional relationship at all (e.g., a supplied `n` against a requested static
@@ -1967,6 +2021,7 @@ impl CastType for ArrayIrType {
             .filter_map(Dimension::variable)
             .cloned()
             .collect::<Vec<_>>();
+
         // The output observes the first actual input, so a symbolic output dimension must name a supplied identity of
         // the declared output identity's own correspondence class. Another supplied identity that merely shares the
         // declared name (e.g., a supplied `dimension<b>` witnessing a declared `dimension<a>`) belongs to a different
@@ -1999,15 +2054,19 @@ impl CastType for ArrayIrType {
             })
             .collect::<Result<_, _>>()?;
         let interpreted = proven.then(|| dimensions.clone());
+
         // `validate_declaration` rejected reference types, and a dimension output has exactly one dimension.
         let represent = |dimensions: Vec<Dimension>| match &operation.output_type {
             Self::Array(output) => Self::Array(output.clone().with_shape(Shape::new(dimensions))),
             Self::Dimension(_) => Self::Dimension(DimensionType::from(dimensions.into_iter().next().unwrap())),
             Self::Reference(_) => unreachable!(),
         };
+
         Ok((represent(dimensions), interpreted.map(represent)))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to return a value at a different but related type representation, through a [`CastOperation`]
 /// (e.g., an `f32[n]` value whose runtime extent is 2 as `f32[2]`, or an `f32[2]` value as `f32[n]` next to a witness
@@ -4487,6 +4546,69 @@ mod tests {
                         .unwrap()
                         .infer_output_types(&[input.clone().into()], &[]),
                     expected.clone().map(|types| types.into_iter().map(ArrayIrType::from).collect()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_type_inference_mesh_axis_definitions() {
+        // Auto and manual axes that the output carries forward keep their mesh axis definitions (size and type), even
+        // when only their names are compared for placement and manual variation, whereas the output mesh may still add
+        // or drop unrelated axes.
+        let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
+            LogicalMesh::new(
+                axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap()).collect(),
+            )
+            .unwrap()
+        };
+        let placed = |mesh: LogicalMesh, dimension: ShardingDimension| {
+            ArrayType::new_static(DataType::F32, [8])
+                .with_sharding(Sharding::new(mesh, vec![dimension]).unwrap())
+                .unwrap()
+        };
+        let varying = |size: usize| {
+            ArrayType::new_static(DataType::F32, [8])
+                .with_sharding(
+                    Sharding::replicated(mesh(&[("x", size, MeshAxisType::Manual)]), 1)
+                        .with_varying_manual_axes(["x"])
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let sharded = ShardingDimension::sharded(["x"]);
+        let auto = |size: usize| mesh(&[("x", size, MeshAxisType::Auto)]);
+        let manual = |size: usize| mesh(&[("x", size, MeshAxisType::Manual)]);
+        let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Auto), ("y", 2, MeshAxisType::Explicit)]);
+        let cases = [
+            (
+                placed(auto(2), sharded.clone()),
+                placed(auto(4), sharded.clone()),
+                Err(TypeError::invalid("`cast` cannot redefine preserved auto mesh axis `'x'=2:auto` as `'x'=4:auto`")),
+            ),
+            (
+                placed(manual(2), sharded.clone()),
+                placed(manual(4), sharded.clone()),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved manual mesh axis `'x'=2:manual` as `'x'=4:manual`",
+                )),
+            ),
+            (
+                varying(2),
+                varying(4),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved manual mesh axis `'x'=2:manual` as `'x'=4:manual`",
+                )),
+            ),
+            (placed(auto(2), sharded.clone()), placed(with_explicit(2), sharded.clone()), Ok(())),
+            (placed(with_explicit(2), sharded.clone()), placed(auto(2), sharded), Ok(())),
+        ];
+        for (input, output, expected) in cases {
+            let expected = expected.map(|()| vec![output.clone()]);
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                assert_eq!(
+                    constructor(output.clone(), vec![input.clone()]).unwrap().infer_output_types(&[input.clone()], &[]),
+                    expected,
                 );
             }
         }
