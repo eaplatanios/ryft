@@ -533,7 +533,7 @@ where
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
 
-        let Some(assertion) = batch_assertion(self, context, inputs)? else {
+        let Some(assertion) = BatchedAssertion::from_inputs(self, context, inputs)? else {
             return Ok(Vec::new().into());
         };
 
@@ -592,7 +592,7 @@ where
             )
             .with_axis_name(context.axis_name().map(str::to_owned))
             .with_axis_sharding(context.axis_sharding().clone());
-        let Some(assertion) = batch_assertion(self, &projected_context, &array_inputs)? else {
+        let Some(assertion) = BatchedAssertion::from_inputs(self, &projected_context, &array_inputs)? else {
             return Ok(Vec::new().into());
         };
         let mut array_observations = assertion.observations.into_iter().map(C::Value::from_projected);
@@ -614,9 +614,8 @@ where
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Condition and observations that one batched [`AssertOperation`] forwards to its parent context, as prepared by
-/// [`batch_assertion`].
+/// Condition and observations that one batched [`AssertOperation`] forwards to its parent context,
+/// as prepared by [`from_inputs`](Self::from_inputs).
 struct BatchedAssertion<V> {
     /// Condition reduced to one scalar Boolean or, with a failure limit, materialized along the batch axis.
     condition: V,
@@ -629,131 +628,137 @@ struct BatchedAssertion<V> {
     batch_index_label: Option<String>,
 }
 
-// TODO(eaplatanios): Review this.
-/// Prepares one assertion in the parent context for an [`AssertOperation`] batched over the array universe, returning
-/// `None` for a statically empty batch, which passes vacuously. This is the shared batching rule behind both batching
-/// entry points: [`ArrayBatchingPolicy`] applies it directly, and [`ArrayIrBatchingPolicy`] applies it to the array
-/// inputs of its projected [`DynamicArrayExtentBatchingPolicy`] view. Without a failure limit, the rule reduces the
-/// condition to one scalar Boolean and selects the observations of the first failing batch item, adding that item's
-/// index as an observation when any input is mapped. With a failure limit, it instead materializes the inputs along
-/// the batch axis so that the parent reports individual failing elements. `P` supplies the batch item indices, the
-/// empty-batch handling, and the materialized inputs through [`ArrayAssertionBatchingPolicy`].
-///
-/// The function neither validates the per-item signature nor asserts. Callers validate in their own universe first,
-/// and they assert afterwards, so that observations without an array view can rejoin the prepared ones.
-///
-/// # Parameters
-///
-///   - `operation`: Assertion being batched, whose failure limit selects the preparation and whose labels keep the
-///     added batch index label unique.
-///   - `context`: Active array [`BatchingContext`] whose parent context receives the prepared assertion.
-///   - `inputs`: Condition followed by the array observations, in operation order.
-///
-/// # Errors
-///
-/// Returns [`BatchingError::UnsupportedOperation`] when selecting a mapped input's first failure needs a batch index or
-/// a padded extent outside the `i32` range, and propagates the errors of the [`ArrayAssertionBatchingPolicy`]
-/// functions and of the array capabilities used for the selection.
-fn batch_assertion<
-    T: Type + Into<ArrayIrType>,
-    C: Context<Type = ArrayType, Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike>,
-    P: ArrayExtentBatchingPolicy<C> + ArrayAssertionBatchingPolicy<C, P>,
->(
-    operation: &AssertOperation<T>,
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    inputs: &[ArrayBatch<C::Value>],
-) -> Result<Option<BatchedAssertion<C::Value>>, BatchingError> {
-    // Empty batches pass even when the predicate is replicated and false. Check the extent before replaying.
-    let extent = P::axis_dimension(context)?;
-    if extent.value() == Some(0) {
-        return Ok(None);
-    }
-
-    // Preserve individual conditions and observations so the parent can report multiple failing elements.
-    // Materialization broadcasts replicated inputs and arranges mapped inputs along the batch axis.
-    if operation.failure_limit.is_some() {
-        let mut observations = P::materialize_inputs(context, inputs)?;
-        let condition = observations.remove(0);
-        return Ok(Some(BatchedAssertion { condition, observations, batch_index_label: None }));
-    }
-
-    let mapped = inputs.iter().any(|input| input.batch_axis().axis().is_some());
-    if !mapped {
-        // Every item has the same condition and observations, so one assertion suffices. A dynamic extent
-        // may still be zero at execution time; mask the condition so that case passes vacuously.
-        let condition = P::mask_empty_batch_condition(context, inputs[0].value().clone())?;
-        let observations = inputs[1..].iter().map(|input| input.value().clone()).collect();
-        return Ok(Some(BatchedAssertion { condition, observations, batch_index_label: None }));
-    }
-
-    // Failure selection uses signed 32-bit indices. Check the extent's upper bound before staging that work.
-    let (_, maximum) = extent.bounds().representable_extent_range().map_err(ProgramError::from)?;
-    if maximum > i32::MAX as usize {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "mapped assertion batch extent exceeds the supported `i32` index range".to_owned(),
-        });
-    }
-
-    // Backends also represent logical padded extents with signed indices; reserve the fallback item before staging.
-    if maximum == i32::MAX as usize
-        && extent.bounds().lower() == 0
-        && inputs[1..].iter().any(|input| input.batch_axis().axis().is_some())
+impl<V: Value<Type = ArrayType>> BatchedAssertion<V> {
+    /// Prepares one assertion in the parent context for an [`AssertOperation`] batched over the array universe,
+    /// returning `None` for a statically empty batch, which passes vacuously. This is the shared batching rule behind
+    /// both batching entry points: [`ArrayBatchingPolicy`] applies it directly, and [`ArrayIrBatchingPolicy`] applies
+    /// it to the array inputs of its projected [`DynamicArrayExtentBatchingPolicy`] view. Without a failure limit, the
+    /// rule reduces the condition to one scalar Boolean and selects the observations of the first failing batch item,
+    /// adding that item's index as an observation when any input is mapped. With a failure limit, it instead
+    /// materializes the inputs along the batch axis so that the parent reports individual failing elements. `P`
+    /// supplies the batch item indices, the empty-batch handling, and the materialized inputs through
+    /// [`ArrayAssertionBatchingPolicy`].
+    ///
+    /// The constructor neither validates the per-item signature nor asserts. Callers validate in their own universe
+    /// first, and they assert afterwards, so that observations without an array view can rejoin the prepared ones.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Assertion being batched, whose failure limit selects the preparation and whose labels keep the
+    ///     added batch index label unique.
+    ///   - `context`: Active array [`BatchingContext`] whose parent context receives the prepared assertion.
+    ///   - `inputs`: Condition followed by the array observations, in operation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchingError::UnsupportedOperation`] when selecting a mapped input's first failure needs a batch
+    /// index or a padded extent outside the `i32` range, and propagates the errors of the
+    /// [`ArrayAssertionBatchingPolicy`] functions and of the array capabilities used for the selection.
+    fn from_inputs<
+        T: Type + Into<ArrayIrType>,
+        C: Context<Type = ArrayType, Value = V>,
+        P: ArrayExtentBatchingPolicy<C> + ArrayAssertionBatchingPolicy<C, P>,
+    >(
+        operation: &AssertOperation<T>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Option<Self>, BatchingError>
+    where
+        V: ZeroLike + ConvertElementType + Select + DynamicSlice + Reshape + Reduce,
     {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "padded assertion batch extent exceeds the supported `i32` extent range".to_owned(),
-        });
-    }
-
-    let condition = inputs[0].value();
-    let (condition, index) = if inputs[0].batch_axis().axis().is_some() {
-        let coordinates_type = condition.r#type().into_owned().with_data_type(DataType::I32);
-        let coordinates = P::batch_item_indices(context, &coordinates_type)?;
-
-        // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
-        // first failure. Successful and empty batches are handled by the independent Boolean reduction.
-        let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
-        let candidates = condition.select(&sentinel, &coordinates)?;
-        let index = candidates.reduce(&[0], ReductionKind::Min)?;
-        let condition = condition.reduce(&[0], ReductionKind::All)?;
-
-        // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
-        let index = condition.select(&index.zero_like()?, &index)?;
-        (condition, index)
-    } else {
-        // Only observations vary across items. A replicated false condition fails first at index zero,
-        // while a dynamically empty batch must still pass.
-        let condition = P::mask_empty_batch_condition(context, condition.clone())?;
-        let index = condition.convert_element_type(DataType::I32)?.zero_like()?;
-        (condition, index)
-    };
-
-    // Select each mapped observation at the first failing index and keep replicated observations unchanged.
-    // Padding supplies a valid fallback element when the dynamic batch is empty, even though it passes.
-    let mut observations = Vec::with_capacity(inputs.len());
-    let mut padded_extent = None;
-    for input in &inputs[1..] {
-        if input.batch_axis().axis().is_some() {
-            let input = P::pad_empty_batch_observation(context, input.value().clone(), &mut padded_extent)?;
-
-            // The selected batch index is never negative, so the clamp-only policy keeps this slice on the single
-            // gather path even when the mapped axis is dynamic.
-            let observation = input.dynamic_slice_with_negative_indices(std::slice::from_ref(&index), &[1], false)?;
-            observations.push(observation.reshape([])?);
-        } else {
-            observations.push(input.value().clone());
+        // Empty batches pass even when the predicate is replicated and false. Check the extent before replaying.
+        let extent = P::axis_dimension(context)?;
+        if extent.value() == Some(0) {
+            return Ok(None);
         }
-    }
-    observations.push(index);
 
-    // Include the selected index in the diagnostic without colliding with user labels or indices already
-    // introduced by another batching level.
-    let mut label = "batch_index".to_owned();
-    let mut suffix = 1;
-    while operation.labels.contains(&label) {
-        label = format!("batch_index_{suffix}");
-        suffix += 1;
+        // Preserve individual conditions and observations so the parent can report multiple failing elements.
+        // Materialization broadcasts replicated inputs and arranges mapped inputs along the batch axis.
+        if operation.failure_limit.is_some() {
+            let mut observations = P::materialize_inputs(context, inputs)?;
+            let condition = observations.remove(0);
+            return Ok(Some(Self { condition, observations, batch_index_label: None }));
+        }
+
+        let mapped = inputs.iter().any(|input| input.batch_axis().axis().is_some());
+        if !mapped {
+            // Every item has the same condition and observations, so one assertion suffices. A dynamic extent
+            // may still be zero at execution time; mask the condition so that case passes vacuously.
+            let condition = P::mask_empty_batch_condition(context, inputs[0].value().clone())?;
+            let observations = inputs[1..].iter().map(|input| input.value().clone()).collect();
+            return Ok(Some(Self { condition, observations, batch_index_label: None }));
+        }
+
+        // Failure selection uses signed 32-bit indices. Check the extent's upper bound before staging that work.
+        let (_, maximum) = extent.bounds().representable_extent_range().map_err(ProgramError::from)?;
+        if maximum > i32::MAX as usize {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "mapped assertion batch extent exceeds the supported `i32` index range".to_owned(),
+            });
+        }
+
+        // Backends also represent logical padded extents with signed indices; reserve the fallback item before staging.
+        if maximum == i32::MAX as usize
+            && extent.bounds().lower() == 0
+            && inputs[1..].iter().any(|input| input.batch_axis().axis().is_some())
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "padded assertion batch extent exceeds the supported `i32` extent range".to_owned(),
+            });
+        }
+
+        let condition = inputs[0].value();
+        let (condition, index) = if inputs[0].batch_axis().axis().is_some() {
+            let coordinates_type = condition.r#type().into_owned().with_data_type(DataType::I32);
+            let coordinates = P::batch_item_indices(context, &coordinates_type)?;
+
+            // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
+            // first failure. Successful and empty batches are handled by the independent Boolean reduction.
+            let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
+            let candidates = condition.select(&sentinel, &coordinates)?;
+            let index = candidates.reduce(&[0], ReductionKind::Min)?;
+            let condition = condition.reduce(&[0], ReductionKind::All)?;
+
+            // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
+            let index = condition.select(&index.zero_like()?, &index)?;
+            (condition, index)
+        } else {
+            // Only observations vary across items. A replicated false condition fails first at index zero,
+            // while a dynamically empty batch must still pass.
+            let condition = P::mask_empty_batch_condition(context, condition.clone())?;
+            let index = condition.convert_element_type(DataType::I32)?.zero_like()?;
+            (condition, index)
+        };
+
+        // Select each mapped observation at the first failing index and keep replicated observations unchanged.
+        // Padding supplies a valid fallback element when the dynamic batch is empty, even though it passes.
+        let mut observations = Vec::with_capacity(inputs.len());
+        let mut padded_extent = None;
+        for input in &inputs[1..] {
+            if input.batch_axis().axis().is_some() {
+                let input = P::pad_empty_batch_observation(context, input.value().clone(), &mut padded_extent)?;
+
+                // The selected batch index is never negative, so the clamp-only policy keeps this slice on the single
+                // gather path even when the mapped axis is dynamic.
+                let observation =
+                    input.dynamic_slice_with_negative_indices(std::slice::from_ref(&index), &[1], false)?;
+                observations.push(observation.reshape([])?);
+            } else {
+                observations.push(input.value().clone());
+            }
+        }
+        observations.push(index);
+
+        // Include the selected index in the diagnostic without colliding with user labels or indices already
+        // introduced by another batching level.
+        let mut label = "batch_index".to_owned();
+        let mut suffix = 1;
+        while operation.labels.contains(&label) {
+            label = format!("batch_index_{suffix}");
+            suffix += 1;
+        }
+        Ok(Some(Self { condition, observations, batch_index_label: Some(label) }))
     }
-    Ok(Some(BatchedAssertion { condition, observations, batch_index_label: Some(label) }))
 }
 
 impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
