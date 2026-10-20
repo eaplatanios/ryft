@@ -806,7 +806,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     /// Returns a [`BatchingError`] for an incompatible ragged declaration, an unsupported bounded ragged carrier,
     /// an invalid mapped-axis position, or invalid resulting sharding.
-    fn batch_declared_type(
+    fn batched_declaration(
         &self,
         declared: &ArrayType,
         extent: &Dimension,
@@ -827,7 +827,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             None => Ok(declared.clone()),
             Some(axis) => {
                 let axis = axis.normalize(declared.rank() + 1).map_err(ProgramError::from)?;
-                declared.batch_declared(self.value().r#type().as_ref(), axis, extent, axis_sharding)
+                declared.batched_declaration(self.value().r#type().as_ref(), axis, extent, axis_sharding)
             }
         }
     }
@@ -1668,7 +1668,7 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayExtentBatchi
         declared: &ArrayType,
     ) -> Result<ArrayType, BatchingError> {
         let extent = Dimension::Static(*context.axis_extent());
-        input.batch_declared_type(declared, &extent, context.axis_sharding())
+        input.batched_declaration(declared, &extent, context.axis_sharding())
     }
 
     #[inline]
@@ -1878,7 +1878,7 @@ impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchingPolicy<Project
     ) -> Result<ArrayType, BatchingError> {
         // The mapped axis is described by the _type_ of the first-class extent value, as in `axis_dimension`.
         let extent = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
-        input.batch_declared_type(declared, &extent, context.axis_sharding())
+        input.batched_declaration(declared, &extent, context.axis_sharding())
     }
 
     #[inline]
@@ -2751,11 +2751,11 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
 
         match (declared, actual.as_ref()) {
             (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if input.ragged_axes().is_empty() => {
-                Ok(declared.batch_declared(actual, axis, &extent, context.axis_sharding())?.into())
+                Ok(declared.batched_declaration(actual, axis, &extent, context.axis_sharding())?.into())
             }
             (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) if input.ragged_axes().is_empty() => {
                 // A mapped reference carries its batch axis in its referent, whose shape the operation relates.
-                Ok(ReferenceType::new(declared.referent().batch_declared(
+                Ok(ReferenceType::new(declared.referent().batched_declaration(
                     actual.referent(),
                     axis,
                     &extent,
@@ -4454,7 +4454,6 @@ impl ArrayType {
         ))
     }
 
-    // TODO(eaplatanios): Review this.
     /// Returns this per-item [`ArrayType`] with a batch dimension inserted at `axis`, preserving the existing packed
     /// value's variation on the mapped manual mesh axes. Guards and casts use this derivation because they keep the
     /// value's physical batch axis and introduce no new variation. Every other constraint stays as declared, so
@@ -4470,7 +4469,7 @@ impl ArrayType {
     /// # Errors
     ///
     /// Returns a [`BatchingError`] when the inserted axis or resulting sharding is invalid.
-    fn batch_declared(
+    fn batched_declaration(
         &self,
         actual: &Self,
         axis: usize,
