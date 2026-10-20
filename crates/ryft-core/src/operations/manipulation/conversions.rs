@@ -1483,8 +1483,6 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>> Partia
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
     for CastOperation<C::Type>
 {
@@ -1503,15 +1501,17 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
             &self.input_types,
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
-        // An exact one-input identity has no relationship left to check. Keep its original carrier, including
-        // physical layout and ragged extents that are absent from the logical per-item type. Witnesses or different
-        // declarations can impose additional relationships, so they must continue through the lifted primitive.
+
+        // An exact one-input identity has no relationship left to check. Keep its original carrier, including physical
+        // layout and ragged extents that are absent from the logical per-item type. Witnesses or different declarations
+        // can impose additional relationships, so they must continue through the lifted primitive.
         if let [input] = inputs
             && self.input_types[0] == self.output_type
             && P::unbatched_type(input).as_ref() == &self.output_type
         {
             return Ok(vec![input.clone()].into());
         }
+
         let input_types = self
             .input_types
             .iter()
@@ -1528,10 +1528,6 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
     }
 }
 
-// The differentiation and transposition rules are hand-written rather than generated through the
-// `impl_differentiable_operation!` macro because the forward-mode rule consults the differentiation policy
-// (`PRIMAL_COMPLETES_BEFORE_TANGENT`), which the macro does not expose, and the transpose rule needs the context's
-// retained dimension sources.
 impl<T: DifferentiableType + CastType, C: Context<Type = T>> DifferentiableOperation<C> for CastOperation<T>
 where
     C::Operation: From<CastOperation<T>>,
@@ -1542,9 +1538,10 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The tangent is an unchecked cast behind the primal conversion (refer to `bind_tangent`). Shape witnesses
-        // carry no derivatives. In a fused JVP, the tangent must stay behind the primal check and behind the witness
-        // producers, which may themselves be the checks that justify an unchecked cast.
+        // The tangent is an unchecked cast behind the primal conversion (refer to `CastOperation::bind_tangent`). Shape
+        // witnesses carry no derivatives. In a fused Jacobian-Vector Product (JVP), the tangent must stay behind the
+        // primal check and behind the witness producers, which may themselves be the checks that justify an unchecked
+        // cast.
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_types = primals.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = self.clone().normalized(&primal_types);
@@ -1584,10 +1581,13 @@ where
         // primal value unless their extents are required below; retained sources can supply missing identities.
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
+
         check_count!("input", input_types, self.input_types.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
+
         let (_, interpreted) = T::infer_cast_output_type(self, &input_types)?;
         if self.checked && inputs.iter().any(PartialValue::is_unknown) && interpreted.is_none() {
             let missing = if inputs[0].is_unknown() { "value" } else { "witnesses" };
@@ -1599,9 +1599,11 @@ where
             }
             .into());
         }
+
         if !accumulators[0].is_needed() {
             return Ok(());
         }
+
         let mut witnesses = inputs[1..].iter().filter_map(|input| input.as_known().cloned()).collect::<Vec<_>>();
         let cotangent_type = inputs[0].r#type().cotangent()?;
         let contribution = match &outputs[0] {
@@ -1614,6 +1616,7 @@ where
                     let r#type = value.r#type();
                     missing.retain(|identity| !r#type.identities().any(|(_, available)| available == identity));
                 }
+
                 for source in context.dimension_sources() {
                     if missing.is_empty() {
                         break;
@@ -1624,6 +1627,7 @@ where
                         witnesses.push(source.clone());
                     }
                 }
+
                 if let Some(identity) = missing.first() {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
@@ -1636,9 +1640,12 @@ where
                 MaybeZero::Value(CastOperation::bind_unchecked(&**context, cotangent, &witnesses, cotangent_type)?)
             }
         };
+
         accumulators[0].accumulate(context, contribution)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Infers the output of a [`CastOperation`] for this type family, validating the complete relationship between its
 /// input, output, and witness types. This includes dimension extents and identities as well as other type properties.
