@@ -890,9 +890,32 @@ where
             message: format!("lower bound of bounded ragged dimension `{dimension}` exceeds the `i64` extent range"),
         })?;
 
-        let lower = dispatch_on_array_element_type!(aggregate.r#type().data_type(), |Element| {
+        // The constant is built in the extents' data type, which must represent the lower bound exactly, and in the
+        // aggregate's memory space, so that the clamp never combines values that live in different spaces.
+        let aggregate_type = aggregate.r#type().into_owned();
+        let representable = dispatch_on_array_element_type!(aggregate_type.data_type(), |Element| {
+            <Element as ArrayElement>::from_signed(lower)?.convert_to::<i64>()? == lower
+        });
+        if !representable {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "lower bound {} of bounded ragged dimension `{}` is not representable \
+                     in the extents data type `{}`",
+                    lower,
+                    dimension,
+                    aggregate_type.data_type(),
+                ),
+            });
+        }
+
+        let lower = dispatch_on_array_element_type!(aggregate_type.data_type(), |Element| {
             Array::scalar(<Element as ArrayElement>::from_signed(lower)?)?
         });
+
+        let lower = Array::new(
+            lower.r#type().into_owned().with_memory(aggregate_type.memory()),
+            lower.storage_bytes().to_vec(),
+        )?;
 
         let mut lower = context.parent().bind(ConstantOperation::new(lower), Vec::new(), &[])?;
         check_count!("output", lower, 1, ProgramError);
@@ -910,6 +933,7 @@ mod tests {
     use ryft_macros::Operation;
 
     use crate::arrays::batching::tests::ragged_array_batch;
+    use crate::arrays::types::memories::Memory;
     use crate::arrays::{
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
         DimensionValue, MeshAxis, MeshAxisType, Shape, Sharding,
@@ -2083,6 +2107,57 @@ mod tests {
                 ]),
             );
         }
+
+        // The lower-bound constant lives in the extents' memory space, so host-resident extents stay on the host.
+        let host = Memory::Host { pinned: false };
+        let length = DimensionVariable::new("length", DimensionBounds::new(2, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()),
+        )
+        .with_axis_name("i".to_string());
+        let input = ragged_array_batch(
+            Array::matrix(0, 3, Vec::<f32>::new()).unwrap().transfer_to_memory(host).unwrap(),
+            Array::vector(Vec::<i64>::new()).unwrap().transfer_to_memory(host).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|outputs| outputs.into_parts().0),
+            Ok(vec![
+                ArrayBatch::replicated(Array::vector(vec![0f32; 3]).unwrap().transfer_to_memory(host).unwrap())
+                    .with_ragged_axes(vec![RaggedAxis::new(
+                        0,
+                        Array::scalar(2i64).unwrap().transfer_to_memory(host).unwrap(),
+                        length,
+                        Vec::new(),
+                    )])
+                    .unwrap(),
+            ]),
+        );
+
+        // A lower bound that the extents' data type cannot represent is rejected rather than wrapped.
+        let length = DimensionVariable::new("length", DimensionBounds::new(128, Some(130)).unwrap());
+        let input = ragged_array_batch(
+            Array::matrix(0, 129, Vec::<f32>::new()).unwrap(),
+            Array::vector(Vec::<i8>::new()).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|outputs| outputs.into_parts().0),
+            Err(BatchingError::UnsupportedOperation {
+                message: "lower bound 128 of bounded ragged dimension `length` is not representable in the extents \
+                          data type `i8`"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
