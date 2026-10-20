@@ -510,7 +510,6 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<C, P> BatchableOperation<C, ArrayBatchingPolicy<P>> for AssertOperation<ArrayType>
 where
     C: Context<
@@ -533,6 +532,7 @@ where
                 .collect::<Vec<_>>(),
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
+
         let Some(assertion) = batch_assertion(self, context, inputs)? else {
             return Ok(Vec::new().into());
         };
@@ -544,16 +544,16 @@ where
             Some(limit) => assertion.condition.assert_with_limit(&self.message, &observations, limit)?,
             None => assertion.condition.assert(&self.message, &observations)?,
         }
+
         Ok(Vec::new().into())
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType, Value: Assert>> BatchableOperation<C, ArrayIrBatchingPolicy>
     for AssertOperation<ArrayIrType>
 where
     <C::Value as ValueProjection<ArrayType>>::Projected:
-        Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
+        ZeroLike + ConvertElementType + Select + DynamicSlice + Reshape + Reduce,
     DynamicArrayExtentBatchingPolicy: ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>, Extent = C::Value>
         + ArrayAssertionBatchingPolicy<ProjectedContext<C, ArrayType>, DynamicArrayExtentBatchingPolicy>,
 {
