@@ -1408,7 +1408,7 @@ impl<V: Value<Type = ArrayType>> BatchedAssertion<V> {
 /// Canonical operation name for [`GuardOperation`].
 pub const GUARD_OPERATION_NAME: &str = "guard";
 
-/// [`Operation`] that checks declared type-identity relationships between its inputs at runtime and returns the
+/// [`Operation`] that checks declared [`TypeIdentity`] relationships between its inputs at runtime and returns the
 /// non-reference inputs with type representations justified by a successful check. The supplied types may admit these
 /// relationships without proving them. A guard preserves the check when a transform removes the program or region
 /// boundary that would otherwise enforce it.
@@ -1422,38 +1422,54 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 /// actual input types. Boundaries whose actual types prove every relationship need no guard.
 ///
 /// Operation families construct guards through [`OperationProvider`]. Families with an ordinary
-/// `From<GuardOperation<T>>` conversion receive a blanket provider implementation; other families reject guard requests
+/// `From<GuardOperation<T>>` conversion receive a blanket provider implementation. Other families reject guard requests
 /// with [`unsupported_family_error`](Self::unsupported_family_error) through a provider that `#[derive(Operation)]`
 /// generates for a derived family without a native guard variant and that
-/// [`impl_guardless_operation!`](crate::impl_guardless_operation) generates for a hand-written family. A family can
+/// [`impl_guardless_operation!`](crate::impl_guardless_operation) generates for handwritten families. A family can
 /// also implement the provider explicitly to accept only the requests it can represent. No guard-specific derive
 /// attribute is needed.
 ///
 /// The guard is a checked cast: it produces one output per non-reference input, which is that input at the type that
-/// [`TypeRefinements::retype_actual`](crate::TypeRefinements::retype_actual) derives from the guard's declared types
-/// and its [retained](Self::retained) identities (e.g., `dimension<2>` and `f32[2]` in the example above). That is the
-/// input narrowed by the facts that the checked relationships prove, except that retained identities stay symbolic and
-/// the other inputs of their classes take compatible representatives, according to the declared component's bounds and
-/// the [`TypeRefinements::retype_actual`](crate::TypeRefinements::retype_actual) fallback rules. Code that specializes
-/// the body using those types consumes the outputs instead of the inputs, so that the specialization only takes effect
-/// after the check while the program or region still accepts the supplied input types. Consumers that only need the
-/// check ignore the outputs. The guard declares [`EffectClass::OrderedAssertion`], so dead-code elimination never
-/// removes it and it orders like an assertion. Backends additionally order every later ordered I/O effect after it,
-/// but, like any assertion, it does not order [unordered](EffectClass::UnorderedIo) effects, which a compiled program
-/// may execute before a failing check. Interpretation fails with the same errors as the program's or region's input
-/// checks (e.g., [`DimensionError::InputDimensionMismatch`](crate::DimensionError::InputDimensionMismatch)).
+/// [`TypeRefinements::retype_actual`] derives from the guard's declared types and its
+/// [retained](Self::retained_identities) identities (e.g., `dimension<2>` and `f32[2]` in the example above). That is
+/// the input narrowed by the facts that the checked relationships prove, except that retained identities stay symbolic
+/// and the other inputs of their classes take compatible representatives, according to the declared component's bounds
+/// and the [`TypeRefinements::retype_actual`] fallback rules. Code that specializes the body using those types consumes
+/// the outputs instead of the inputs, so that the specialization only takes effect after the check while the program or
+/// region still accepts the supplied input types. Consumers that only need the check ignore the outputs. The guard
+/// declares [`EffectClass::OrderedAssertion`], so dead-code elimination never removes it and it orders like an
+/// assertion. Backends additionally order every later ordered I/O effect after it, but, like any assertion, it does not
+/// order [unordered](EffectClass::UnorderedIo) effects, which a compiled program may execute before a failing check.
+/// Interpretation fails with the same errors as the program's or region's input checks (e.g.,
+/// [`DimensionError::InputDimensionMismatch`](crate::DimensionError::InputDimensionMismatch)).
 ///
-/// A reference member is checked through its referent's shape, which the reference fixes when it is allocated but which
-/// another member may still contradict (e.g., supplying `ref<f32[3]>` and `f32[2]` as inputs declared as
+/// A reference member is checked through its referent's shape, which the reference fixes when it is allocated
+/// but which another member may still contradict (e.g., supplying `ref<f32[3]>` and `f32[2]` as inputs declared as
 /// `[ref<f32[n]>, f32[n]]`). The guard declares a [read](ReferenceAccessMode::Read) of each reference member, so that
 /// the check is ordered with the other accesses of its allocation, but it never observes the referenced contents and
-/// produces no output for a reference member. Reference discharge checks the referent of a discharged allocation as an
-/// ordinary value.
+/// produces no output for a reference member. Reference discharge checks the referent of a discharged allocation as
+/// an ordinary value.
 ///
 /// Batching lifts the declared types by the mapped axis and guards the packed values at once, freshening the guard's
 /// local identities so the inserted batch dimension cannot alias them. Bounded ragged carriers and mapped first-class
 /// dimensions hold their per-item extents outside their packed types, which the lifted guard cannot relate, so
 /// batching rejects them.
+///
+/// The guard's stored state has three semantic roles:
+///
+///   - [`declared_types`](Self::declared_types) defines the joint input contract. Its identities are local names for
+///     relationships: `[f32[n], f32[n]]` requires equal lengths, even when the actual inputs use different names.
+///   - [`retained_identities`](Self::retained_identities) chooses which identities of the surrounding program stay
+///     symbolic in the output types after the check. For example, inputs `[f32[m], f32[3]]` entering that contract
+///     normally produce `[f32[3], f32[3]]`; retaining `m` instead produces `[f32[m], f32[m]]` after checking `m = 3`.
+///     This keeps the outputs compatible with other values whose types still use `m`.
+///   - The private `reference_anchor_inputs` records the input positions originally occupied by immutable references.
+///     Their referent shapes determine the representation of related outputs. Discharge turns references into ordinary
+///     values, so these positions preserve a role that can no longer be recovered from the rewritten declarations.
+///
+/// [`boundary`](Self::boundary) names the validation site for diagnostics; it does not select the relationships being
+/// checked. Ordinary construction derives reference anchor positions automatically and retains no identities by
+/// default.
 ///
 /// # Enforcement
 ///
@@ -1464,17 +1480,17 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///   1. The inputs are the complete guarded input sequence, aligned with [`declared_types`](Self::declared_types) and
 ///      including reference members. Malformed arities or types are rejected even when the input types prove every
 ///      declared relationship.
-///   2. Enforcement yields one output per non-reference declaration, in declaration order, carrying the checked
-///      representation that the guard infers (i.e., the input narrowed, renamed, or widened to a
-///      [retained](Self::retained) symbolic representative). Returning the original symbolic inputs instead would lose
-///      that representation.
-///   3. Reference members are shape anchors: their referent relationships are checked without reading the referenced
+///   2. Enforcement yields one output per non-reference declaration, in declaration order, carrying
+///      the checked representation that the guard infers (i.e., the input narrowed, renamed, or widened to a
+///      [retained](Self::retained_identities) symbolic representative). Returning the original symbolic inputs instead
+///      would lose that representation.
+///   3. Reference members are shape anchors. Their referent relationships are checked without reading the referenced
 ///      contents, changing handle identities, or retyping the handles, and they yield no output. After reference
 ///      discharge, a former reference member is an ordinary value that yields an output, while the saved anchor
 ///      positions still constrain the representation of the other outputs; the discharge rule drops those extra
 ///      outputs.
-///   4. The declared identities are local to the guard: type-identity renamings of the surrounding program change its
-///      [retained](Self::retained) identities but never its declarations. Anchor positions, the
+///   4. The declared identities are local to the guard. [`TypeIdentity`] renamings of the surrounding program change
+///      its [retained](Self::retained_identities) identities but never its declarations. Anchor positions, the
 ///      [boundary](Self::boundary) name, reference access effects, input order, and input multiplicity are preserved,
 ///      so a guard is never rebuilt from its declared types alone.
 ///   5. Success means that the check ran immediately or became a dependency that runs before the outputs are used.
@@ -1483,7 +1499,7 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///   6. Under a transform, enforcement applies that transform's rule for this operation and validates its carriers
 ///      (e.g., batching rejects bounded ragged carriers). A transform may forward the guard to its parent context only
 ///      after its rule has transformed the request and the inputs.
-///   7. Errors keep their variants: interpreting a relationship that symbolic types leave unproven fails with
+///   7. Errors keep their variants. Interpreting a relationship that symbolic types leave unproven fails with
 ///      [`ProgramError::Concretization`], and a family or carrier that cannot represent the check fails with an
 ///      explicit unsupported-operation error (e.g., [`unsupported_family_error`](Self::unsupported_family_error)).
 ///      An unsupported check never counts as success.
@@ -1527,19 +1543,21 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuardOperation<T: Type> {
-    /// Refer to the documentation of [`boundary`](Self::boundary) for more information.
+    /// Diagnostic name of the validation site, independent of the checked type relationships.
     boundary: String,
 
-    /// Refer to the documentation of [`declared_types`](Self::declared_types) for more information.
+    /// Joint input contract, in input order. Repeated guard-local identities express relationships between inputs;
+    /// actual inputs enter those identities through scoped correspondences.
     declared_types: Vec<T>,
 
-    /// Refer to the documentation of [`retained`](Self::retained) for more information.
-    retained: Vec<T::Identity>,
+    /// Identities of the surrounding program to preserve symbolically in the checked output types. These control
+    /// output representation and follow ambient identity renaming, while the declared identities stay local.
+    retained_identities: Vec<T::Identity>,
 
-    /// Positions of immutable reference shape anchors in the original declaration. Discharge replaces their references
-    /// with values, but their declared identity correspondences for each input must still determine the guard's
-    /// outputs.
-    anchors: Vec<usize>,
+    /// Zero-based input positions originally occupied by immutable references, derived by the constructor. Their
+    /// declared-to-actual shape correspondences anchor the output representations even after reference discharge
+    /// replaces those inputs with ordinary values.
+    reference_anchor_inputs: Vec<usize>,
 }
 
 impl<T: Type> GuardOperation<T> {
@@ -1547,12 +1565,12 @@ impl<T: Type> GuardOperation<T> {
     /// diagnostic name of the guarded boundary.
     #[inline]
     pub fn new<B: Into<String>>(boundary: B, declared_types: Vec<T>) -> Self {
-        let anchors = declared_types
+        let reference_anchor_inputs = declared_types
             .iter()
             .enumerate()
             .filter_map(|(index, declared)| declared.is_reference().then_some(index))
             .collect();
-        Self { boundary: boundary.into(), declared_types, retained: Vec::new(), anchors }
+        Self { boundary: boundary.into(), declared_types, retained_identities: Vec::new(), reference_anchor_inputs }
     }
 
     /// Returns a guard that checks inputs of the `actual` types against `declared`, together with the positions of the
@@ -1597,18 +1615,19 @@ impl<T: Type> GuardOperation<T> {
         Ok(Some((Self::new(boundary, declared_types), members)))
     }
 
-    /// Returns this [`GuardOperation`] with its [retained](Self::retained) identities set to `retained`.
+    /// Returns this [`GuardOperation`] with its [retained](Self::retained_identities) identities set to
+    /// `retained_identities`.
     #[inline]
-    pub fn with_retained(mut self, retained: Vec<T::Identity>) -> Self {
-        self.retained = retained;
+    pub fn with_retained_identities(mut self, retained_identities: Vec<T::Identity>) -> Self {
+        self.retained_identities = retained_identities;
         self
     }
 
-    /// Returns this [`GuardOperation`] with its [retained](Self::retained) identities chosen from the relationships
-    /// between its declared types and the actual `input_types`, so that each class of related identities keeps one
-    /// representation. References take precedence over known values: every actual reference identity in a class is
-    /// retained (several may be linked by unknown dimensions, and the guard recovers their per-formal anchors from its
-    /// reference inputs), and a reference with an exact shape but no identity also wins over a symbolic known
+    /// Returns this [`GuardOperation`] with its [retained](Self::retained_identities) identities chosen from the
+    /// relationships between its declared types and the actual `input_types`, so that each class of related identities
+    /// keeps one representation. References take precedence over known values: every actual reference identity in a
+    /// class is retained (several may be linked by unknown dimensions, and the guard recovers their per-formal anchors
+    /// from its reference inputs), and a reference with an exact shape but no identity also wins over a symbolic known
     /// candidate, which may consequently become residual. Otherwise an unfixed class retains the first `pinned`
     /// identity it contains, else the boundary's own identity when an actual input carries it, else its first actual
     /// identity, which avoids unnecessary replay renaming; an exact class without a pinned identity retains nothing.
@@ -1626,7 +1645,7 @@ impl<T: Type> GuardOperation<T> {
             .zip(input_types)
             .filter(|(declared, _)| declared.is_reference())
             .collect::<Vec<_>>();
-        let mut retained = Vec::new();
+        let mut retained_identities = Vec::new();
         for class in refinements.identity_classes() {
             if class.actual().len() == 1 && !class.is_exact() {
                 continue;
@@ -1639,8 +1658,8 @@ impl<T: Type> GuardOperation<T> {
             if !reference_identities.is_empty() {
                 // Keep all immutable names, including distinct reference identities linked by unknown dimensions.
                 for identity in reference_identities {
-                    if !retained.contains(identity) {
-                        retained.push(identity.clone());
+                    if !retained_identities.contains(identity) {
+                        retained_identities.push(identity.clone());
                     }
                 }
                 continue;
@@ -1666,10 +1685,10 @@ impl<T: Type> GuardOperation<T> {
                 }
             });
             if let Some(representative) = representative {
-                retained.push(representative.clone());
+                retained_identities.push(representative.clone());
             }
         }
-        Ok(self.with_retained(retained))
+        Ok(self.with_retained_identities(retained_identities))
     }
 
     /// Returns the diagnostic name of the guarded boundary.
@@ -1693,8 +1712,8 @@ impl<T: Type> GuardOperation<T> {
     /// and `m = 3` becomes `f32[n, 3]`, next to a `ref<f32[n]>`. Unlike the declared types, these identities name
     /// values of the surrounding program, so they follow its type-identity renamings.
     #[inline]
-    pub fn retained(&self) -> &[T::Identity] {
-        &self.retained
+    pub fn retained_identities(&self) -> &[T::Identity] {
+        &self.retained_identities
     }
 
     /// Returns the [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error that an operation family which
@@ -1727,8 +1746,8 @@ impl<T: Type + Hash> Hash for GuardOperation<T> {
         // hash equally, because equality compares the retained identities themselves.
         self.boundary.hash(state);
         self.declared_types.hash(state);
-        self.retained.len().hash(state);
-        self.anchors.hash(state);
+        self.retained_identities.len().hash(state);
+        self.reference_anchor_inputs.hash(state);
     }
 }
 
@@ -1757,16 +1776,17 @@ impl<T: Type> Operation for GuardOperation<T> {
         // that handle into a value. The complete invocation may connect two anchors through unknown dimensions, but
         // runtime equality does not permit retyping the handles. Cast values through their anchors first.
         let reference_refinements = T::Refinements::from_local_declarations(
-            self.anchors.iter().map(|&index| &self.declared_types[index]),
-            self.anchors.iter().map(|&index| &input_types[index]),
+            self.reference_anchor_inputs.iter().map(|&index| &self.declared_types[index]),
+            self.reference_anchor_inputs.iter().map(|&index| &input_types[index]),
         )?;
         self.declared_types
             .iter()
             .zip(input_types)
             .filter(|(declared_type, _)| !declared_type.is_reference())
             .map(|(declared_type, input_type)| {
-                let anchored = reference_refinements.retype_actual(declared_type, input_type, &self.retained)?;
-                refinements.retype_actual(declared_type, &anchored, &self.retained)
+                let anchored =
+                    reference_refinements.retype_actual(declared_type, input_type, &self.retained_identities)?;
+                refinements.retype_actual(declared_type, &anchored, &self.retained_identities)
             })
             .collect()
     }
@@ -1793,7 +1813,10 @@ impl<T: Type> Operation for GuardOperation<T> {
         // satisfy), so an ambient renaming of the surrounding program, which may also narrow bounds, must not change
         // them. The guard's outputs carry only identities of its inputs, which the program renames separately, and the
         // retained identities name those same input identities, so they follow the renaming.
-        Ok(Self { retained: self.retained.iter().map(|identity| renaming.rename(identity)).collect(), ..self.clone() })
+        Ok(Self {
+            retained_identities: self.retained_identities.iter().map(|identity| renaming.rename(identity)).collect(),
+            ..self.clone()
+        })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1806,19 +1829,22 @@ impl<T: Type> Operation for GuardOperation<T> {
                     self.declared_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 ),
             )?;
-            if !self.retained.is_empty() {
+            if !self.retained_identities.is_empty() {
                 operation.field(
-                    "retained",
-                    format_args!("[{}]", self.retained.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),),
+                    "retained_identities",
+                    format_args!(
+                        "[{}]",
+                        self.retained_identities.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                    ),
                 )?;
             }
-            if self.anchors.iter().copied().ne(self
+            if self.reference_anchor_inputs.iter().copied().ne(self
                 .declared_types
                 .iter()
                 .enumerate()
                 .filter_map(|(index, declared)| declared.is_reference().then_some(index)))
             {
-                operation.field("anchors", format_args!("{:?}", self.anchors))?;
+                operation.field("reference_anchor_inputs", format_args!("{:?}", self.reference_anchor_inputs))?;
             }
             Ok(())
         })
@@ -2053,7 +2079,7 @@ mod tests {
     use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         ArrayBatch, ArrayIrOperation, ArrayOperation, ArrayReference, Dimension, DimensionBounds, DimensionError,
-        DimensionSource, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionSource, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding,
         ShardingDimension, StaticArrayExtentBatchingPolicy, StridedLayout,
     };
     use crate::axes::NamedAxis;
@@ -4248,13 +4274,13 @@ mod tests {
         let exact = |extent: usize| ArrayIrType::from(ArrayType::new_static(DataType::F32, [extent]));
         let inputs = vec![array(vec![a.simplified_dimension(), b.simplified_dimension()]), exact(2), exact(3)];
         let guard = GuardOperation::new("region", declared.clone());
-        assert_eq!(guard.retained(), &[]);
+        assert_eq!(guard.retained_identities(), &[]);
         assert_eq!(
             guard.infer_output_types(&inputs, &[]),
             Ok(vec![array(vec![Dimension::Static(2), Dimension::Static(3)]), exact(2), exact(3)]),
         );
-        let guard = guard.with_retained(vec![a.to_variable()]);
-        assert_eq!(guard.retained(), &[a.to_variable()]);
+        let guard = guard.with_retained_identities(vec![a.to_variable()]);
+        assert_eq!(guard.retained_identities(), &[a.to_variable()]);
         assert_eq!(
             guard.infer_output_types(&inputs, &[]),
             Ok(vec![
@@ -4263,11 +4289,14 @@ mod tests {
                 exact(3)
             ]),
         );
-        assert_eq!(guard.to_string(), r#"guard [boundary="region", types=[f32[p, q], f32[p], f32[q]], retained=[a]]"#,);
+        assert_eq!(
+            guard.to_string(),
+            r#"guard [boundary="region", types=[f32[p, q], f32[p], f32[q]], retained_identities=[a]]"#,
+        );
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(a.to_variable(), c.to_variable()).unwrap();
         let renamed = guard.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed.retained(), &[c.to_variable()]);
+        assert_eq!(renamed.retained_identities(), &[c.to_variable()]);
         assert_eq!(renamed.declared_types(), declared.as_slice());
     }
 
@@ -4291,7 +4320,8 @@ mod tests {
             c.clone().into(),
             ArrayType::new_static(DataType::F32, [3, 3]).into(),
         ];
-        let guard = GuardOperation::new("region", declared).with_retained(vec![a.to_variable(), b.to_variable()]);
+        let guard =
+            GuardOperation::new("region", declared).with_retained_identities(vec![a.to_variable(), b.to_variable()]);
         assert_eq!(
             guard.infer_output_types(&actual, &[]),
             Ok(vec![a.clone().into(), b.clone().into(), array(&a, &b).into()]),
@@ -4314,13 +4344,13 @@ mod tests {
         let discharged = GuardOperation { declared_types: referents(guard.declared_types()), ..guard.clone() };
         let outputs = discharged.infer_output_types(&referents(&crossed), &[]).unwrap();
         assert_eq!(&outputs[2..], expected.as_slice());
-        assert_eq!(discharged.anchors, vec![0, 1]);
+        assert_eq!(discharged.reference_anchor_inputs, vec![0, 1]);
 
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(a.to_variable(), p.to_variable()).unwrap();
         renaming.insert(b.to_variable(), q.to_variable()).unwrap();
         let renamed = discharged.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed.anchors, discharged.anchors);
+        assert_eq!(renamed.reference_anchor_inputs, discharged.reference_anchor_inputs);
         assert_eq!(
             renamed
                 .infer_output_types(
@@ -4349,7 +4379,7 @@ mod tests {
         let actual = vec![vector(&p).into(), reference(&q), c.clone().into(), c.clone().into()];
         let pinned = vec![p.to_variable()];
         let guard = GuardOperation::new("region", declared.clone()).retaining(&actual, &pinned).unwrap();
-        assert_eq!(guard.retained(), &[q.to_variable()]);
+        assert_eq!(guard.retained_identities(), &[q.to_variable()]);
         assert_eq!(
             guard.infer_output_types(&actual, &[]),
             Ok(vec![vector(&q).into(), q.clone().into(), q.clone().into()])
@@ -4357,20 +4387,20 @@ mod tests {
         let reversed_declared = declared.into_iter().rev().collect::<Vec<_>>();
         let reversed_actual = actual.into_iter().rev().collect::<Vec<_>>();
         let guard = GuardOperation::new("region", reversed_declared).retaining(&reversed_actual, &pinned).unwrap();
-        assert_eq!(guard.retained(), &[q.to_variable()]);
+        assert_eq!(guard.retained_identities(), &[q.to_variable()]);
 
         // Several immutable names in one complete class keep their own formal anchors.
         let declared = vec![reference(&p), reference(&q), p.clone().into(), q.clone().into()];
         let actual = vec![reference(&p), reference(&q), c.clone().into(), c.clone().into()];
         let guard = GuardOperation::new("region", declared).retaining(&actual, &[]).unwrap();
-        assert_eq!(guard.retained(), &[p.to_variable(), q.to_variable()]);
+        assert_eq!(guard.retained_identities(), &[p.to_variable(), q.to_variable()]);
         assert_eq!(guard.infer_output_types(&actual, &[]), Ok(vec![p.clone().into(), q.into()]));
 
         // An exact reference shape has priority even when it carries no nominal identity.
         let declared = vec![reference(&p), vector(&p).into()];
         let actual = vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into(), vector(&p).into()];
         let guard = GuardOperation::new("region", declared).retaining(&actual, &[p.to_variable()]).unwrap();
-        assert_eq!(guard.retained(), &[]);
+        assert_eq!(guard.retained_identities(), &[]);
         assert_eq!(guard.infer_output_types(&actual, &[]), Ok(vec![ArrayType::new_static(DataType::F32, [3]).into()]));
     }
 
@@ -4448,10 +4478,12 @@ mod tests {
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[n], %1:f32[n] .
-                let %2:f32[n], %3:f32[n] = guard [boundary="region", types=[f32[n], f32[n]], anchors=[0]] %0 %1
-                in (%3)"#},
+                let %2:f32[n], %3:f32[n] = guard [boundary=\"region\", types=[f32[n], f32[n]], \
+            reference_anchor_inputs=[0]] \
+                    %0 %1
+                in (%3)"},
         );
     }
 
@@ -4495,8 +4527,8 @@ mod tests {
                 let %4:f32[p], %5:f32[q], %6:dimension<p ∈ [1, 8)>, %7:dimension<q ∈ [1, 8)> = guard [
                     boundary="partial evaluation",
                     types=[f32[p], f32[q], dimension<p ∈ [1, 8)>, dimension<q ∈ [1, 8)>],
-                    retained=[p, q],
-                    anchors=[0, 1],
+                    retained_identities=[p, q],
+                    reference_anchor_inputs=[0, 1],
                 ] %0 %1 %2 %3
                     %8:f32[q] = zero [type=f32[q]] %7
                     %9:f32[q] = add %1 %8
@@ -4564,17 +4596,18 @@ mod tests {
             let operands = if reversed_reads { "%1 %0" } else { "%0 %1" };
             assert_eq!(
                 discharged.program().to_string(),
-                formatdoc! {r#"
+                formatdoc! {"
                 lambda %0:f32[n], %1:f32[3] .
                 let %2:f32[n], %3:f32[n] = guard [
-                    boundary="partial evaluation",
+                    boundary=\"partial evaluation\",
                     types=[f32[n], f32[n]],
-                    retained=[n],
-                    anchors=[0, 1],
+                    retained_identities=[n],
+                    reference_anchor_inputs=[0, 1],
                 ] %0 %1
-                    %4:f32[n], %5:f32[n] = guard [boundary="add", types=[f32[n], f32[n]], retained=[n]] {operands}
+                    %4:f32[n], %5:f32[n] = guard [boundary=\"add\", types=[f32[n], f32[n]], retained_identities=[n]] \
+                        {operands}
                     %6:f32[n] = add %4 %5
-                in (%6)"#},
+                in (%6)"},
             );
             let vector = |extent| ArrayIrValue::Array(Array::vector(vec![1f32; extent]).unwrap());
             assert_eq!(
@@ -4873,7 +4906,7 @@ mod tests {
                 |(extent, mapped, replicated)| {
                     let batching = BatchingContext::new(extent.domain(), extent);
                     let outputs = GuardOperation::new("region", declared.clone())
-                        .with_retained(vec![batch.to_variable()])
+                        .with_retained_identities(vec![batch.to_variable()])
                         .batch(
                             &batching,
                             &EmptyRegionDriver,
@@ -5085,6 +5118,34 @@ mod tests {
     }
 
     #[test]
+    fn test_guard_batching_rejects_replicated_ragged_carriers() {
+        // A replicated carrier keeps the per-item extents of its bounded ragged axes outside its packed type too, so
+        // guarding its padded storage (`[1, 2, 99]` with live extent 2) would read the padding as data.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let declared = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 99.0]).unwrap()))
+            .with_ragged_axes(vec![RaggedAxis::new(
+                0,
+                ArrayIrValue::Array(Array::scalar(2_i32).unwrap()),
+                length.clone(),
+                vec![],
+            )])
+            .unwrap();
+        assert_eq!(
+            GuardOperation::new("region", vec![declared.into()])
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|_| ()),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`guard` does not support bounded ragged dimension `length` on input 0".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_guard_batching_rejects_ragged_carriers_in_eager_replay() {
         // Replaying `[f32[length], f32[length]]` through a batching context over an eager parent, at a bounded ragged
         // `f32[length]` and a replicated `f32[3]`, leaves their relationship unproven by the carrier types. Although
@@ -5134,7 +5195,7 @@ mod tests {
                 q.clone().into(),
             ],
         )
-        .with_retained(vec![a.to_variable(), b.to_variable()]);
+        .with_retained_identities(vec![a.to_variable(), b.to_variable()]);
         let discharged = GuardOperation {
             declared_types: vec![vector(&p).into(), vector(&q).into(), p.clone().into(), q.clone().into()],
             ..original
@@ -5169,7 +5230,7 @@ mod tests {
         let ArrayIrOperation::Guard(guard) = program.instructions()[0].operation() else {
             panic!("expected a guard");
         };
-        assert_eq!(guard.anchors, vec![0, 1]);
+        assert_eq!(guard.reference_anchor_inputs, vec![0, 1]);
         assert_eq!(
             program.to_string(),
             indoc! {r#"
@@ -5177,8 +5238,8 @@ mod tests {
                 let %4:f32[a], %5:f32[b], %6:dimension<a ∈ [1, 8)>, %7:dimension<b ∈ [1, 8)> = guard [
                     boundary="region",
                     types=[f32[p], f32[q], dimension<p ∈ [1, 8)>, dimension<q ∈ [1, 8)>],
-                    retained=[a, b],
-                    anchors=[0, 1],
+                    retained_identities=[a, b],
+                    reference_anchor_inputs=[0, 1],
                 ] %1 %2 %3 %3
                 in (%4, %5, %6, %7)"#},
         );
@@ -5263,7 +5324,7 @@ mod tests {
         let outputs = builder
             .add_instruction(
                 GuardOperation::new("region", vec![symbolic.clone(), symbolic.clone()])
-                    .with_retained(vec![n.to_variable()]),
+                    .with_retained_identities(vec![n.to_variable()]),
                 Vec::new(),
                 vec![first, second],
                 None,
@@ -5306,7 +5367,8 @@ mod tests {
         let second = builder.add_input(vector(&b));
         let outputs = builder
             .add_instruction(
-                GuardOperation::new("region", vec![vector(&p), vector(&p)]).with_retained(vec![a.to_variable()]),
+                GuardOperation::new("region", vec![vector(&p), vector(&p)])
+                    .with_retained_identities(vec![a.to_variable()]),
                 Vec::new(),
                 vec![first, second],
                 None,
@@ -5318,14 +5380,16 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         assert_eq!(
             program.jvp().unwrap().to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f32[a], %1:f32[b], %2:f32[a], %3:f32[b] .
-                let %4:f32[a], %5:f32[a] = guard [boundary="region", types=[f32[p], f32[p]], retained=[a]] %0 %1
+                let %4:f32[a], %5:f32[a] = guard [boundary=\"region\", types=[f32[p], f32[p]], \
+            retained_identities=[a]] \
+                    %0 %1
                     %6:f32[a] = cast [type=f32[a], inputs=[f32[a], f32[a]]] %2 %4
                     %7:f32[a] = cast [type=f32[a], inputs=[f32[b], f32[b], f32[a]]] %3 %1 %5
                     %8:f32[a] = add %4 %5
                     %9:f32[a] = add %6 %7
-                in (%8, %9)"#},
+                in (%8, %9)"},
         );
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
         let rendering = pullback.to_string();
