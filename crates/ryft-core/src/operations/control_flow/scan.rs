@@ -4700,10 +4700,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, DataType,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension,
+        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchingTracer, RecursiveBatchingDriver, batch};
@@ -12126,10 +12127,13 @@ mod tests {
         // substitute the storage bound for that extent, including when no body iteration would execute.
         let context = BatchingContext::new(TestEagerContext::new(), 2);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
-        let carry = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f64, 900.0, 800.0, 4.0, 5.0, 700.0]).unwrap(), 0)
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i64, 2]).unwrap(), extent, vec![0])])
-            .unwrap();
+        let carry = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0f64, 900.0, 800.0, 4.0, 5.0, 700.0]).unwrap(),
+            Array::vector(vec![1i64, 2]).unwrap(),
+            &extent,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             TestScanOperation::new(1, 0).batch(&context, &EmptyRegionDriver, &[carry]).unwrap_err(),
             BatchingError::UnsupportedOperation {
@@ -12146,12 +12150,12 @@ mod tests {
             TestIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
-        let carry = ArrayIrBatch::new(
+        let carry = ragged_batch(
             array(Array::matrix(2, 3, vec![1.0f64, 900.0, 800.0, 4.0, 5.0, 700.0]).unwrap()),
-            BatchAxis::new(0),
+            array(Array::vector(vec![1i64, 2]).unwrap()),
+            &extent,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, array(Array::vector(vec![1i64, 2]).unwrap()), extent, vec![0])])
         .unwrap();
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(1, 3).batch(&context, &EmptyRegionDriver, &[carry]).unwrap_err(),

@@ -1770,9 +1770,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, MeshAxis, MeshAxisType,
-        RaggedAxis,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -2919,9 +2919,13 @@ mod tests {
         // One per-item logical extent does not determine the per-peer sizes and offsets of an explicitly packed
         // exchange, so batching rejects inputs that carry a `RaggedAxis` before choosing any batching path.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged_operand = item(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap())
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), length, vec![0])])
-            .unwrap();
+        let ragged_operand = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
                 &context,

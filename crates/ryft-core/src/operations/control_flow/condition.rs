@@ -2354,12 +2354,12 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_batch;
+    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
         DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
@@ -8182,10 +8182,13 @@ mod tests {
         // branch transformation.
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), 0)
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i64, 2]).unwrap(), dimension, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            Array::vector(vec![1i64, 2]).unwrap(),
+            &dimension,
+            1,
+        )
+        .unwrap();
         let inputs = [ArrayBatch::replicated(Array::scalar(true).unwrap()), input];
         assert_eq!(
             ConditionOperation::new().batch(&context, &EmptyRegionDriver, &inputs).unwrap_err(),
@@ -8204,12 +8207,12 @@ mod tests {
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayIrBatch::new(
+        let input = ragged_batch(
             array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            BatchAxis::new(0),
+            array(Array::vector(vec![1i64, 2]).unwrap()),
+            &dimension,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, array(Array::vector(vec![1i64, 2]).unwrap()), dimension, vec![0])])
         .unwrap();
         let inputs = [ArrayIrBatch::replicated(array(Array::scalar(true).unwrap())), input];
         assert_eq!(

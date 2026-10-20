@@ -787,6 +787,51 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         }
     }
 
+    /// Returns the packed form of `declared` using this [`ArrayBatch`]'s mapped axis and the provided batch extent and
+    /// [`ShardingDimension`]. A replicated array batch keeps `declared` unchanged. Every homogeneous array extent
+    /// policy uses this derivation; the policy supplies its extent separately.
+    ///
+    /// Bounded ragged batches keep per-item extents outside their packed types, so a lifted declaration cannot relate
+    /// those extents. Their logical shapes are validated against `declared` before rejecting them, so a mismatched
+    /// declaration reports the type mismatch first. Callers validate the resulting packed declaration against the
+    /// supplied values to enforce its type relationships.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Per-item declaration to lift using this [`ArrayBatch`]'s representation.
+    ///   - `extent`: Extent of the mapped batch dimension.
+    ///   - `axis_sharding`: Sharding of the mapped batch dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] for an incompatible ragged declaration, an unsupported bounded ragged carrier,
+    /// an invalid mapped-axis position, or invalid resulting sharding.
+    fn batch_declared_type(
+        &self,
+        declared: &ArrayType,
+        extent: &Dimension,
+        axis_sharding: &ShardingDimension,
+    ) -> Result<ArrayType, BatchingError> {
+        if !self.ragged_axes().is_empty() {
+            let actual = self.unbatched_type();
+            if !declared.shape().is_refined_by(actual.shape()) {
+                return Err(
+                    TypeError::invalid(format!("type {actual} does not refine declared type {declared}")).into()
+                );
+            }
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("cannot batch ragged array type `{declared}`"),
+            });
+        }
+        match self.batch_axis().axis() {
+            None => Ok(declared.clone()),
+            Some(axis) => {
+                let axis = axis.normalize(declared.rank() + 1).map_err(ProgramError::from)?;
+                declared.batch_declared(self.value().r#type().as_ref(), axis, extent, axis_sharding)
+            }
+        }
+    }
+
     /// Rejects an operation that forgets an input's ragged dimension without explicitly consuming it. This is the
     /// conservation check behind [`BatchingPolicy::validate_operation_outputs`] for the homogeneous extent policies:
     /// every bounded ragged [`DimensionVariable`] of `inputs` must either survive on some output or be named in
@@ -1623,7 +1668,7 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayExtentBatchi
         declared: &ArrayType,
     ) -> Result<ArrayType, BatchingError> {
         let extent = Dimension::Static(*context.axis_extent());
-        batched_declared_array_batch_type(input, declared, &extent, context.axis_sharding())
+        input.batch_declared_type(declared, &extent, context.axis_sharding())
     }
 
     #[inline]
@@ -1833,7 +1878,7 @@ impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchingPolicy<Project
     ) -> Result<ArrayType, BatchingError> {
         // The mapped axis is described by the _type_ of the first-class extent value, as in `axis_dimension`.
         let extent = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
-        batched_declared_array_batch_type(input, declared, &extent, context.axis_sharding())
+        input.batch_declared_type(declared, &extent, context.axis_sharding())
     }
 
     #[inline]
@@ -2691,7 +2736,10 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
             return Ok(declared.clone());
         };
 
-        let extent = context.axis_dimension()?;
+        let extent = match context.axis_extent().r#type().as_ref() {
+            ArrayIrType::Dimension(dimension) => dimension.simplified_dimension(),
+            _ => return Err(TypeError::invalid("batch extent must be a dimension").into()),
+        };
         let actual = input.value().r#type();
         if !input.ragged_axes().is_empty()
             && let (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) =
@@ -2703,12 +2751,11 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
 
         match (declared, actual.as_ref()) {
             (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if input.ragged_axes().is_empty() => {
-                Ok(batched_declared_array_type(declared, actual, axis, &extent, context.axis_sharding())?.into())
+                Ok(declared.batch_declared(actual, axis, &extent, context.axis_sharding())?.into())
             }
             (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) if input.ragged_axes().is_empty() => {
                 // A mapped reference carries its batch axis in its referent, whose shape the operation relates.
-                Ok(ReferenceType::new(batched_declared_array_type(
-                    declared.referent(),
+                Ok(ReferenceType::new(declared.referent().batch_declared(
                     actual.referent(),
                     axis,
                     &extent,
@@ -3555,94 +3602,6 @@ where
         let r#type = <&T>::try_from(unbatched_type.as_ref())?.clone();
         Ok(ProjectedValue::new(self, r#type))
     }
-}
-
-// TODO(eaplatanios): Review this.
-impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
-    /// Returns the mapped-axis [`Dimension`] described by the type of this context's first-class extent value (i.e.,
-    /// an exact dimension when the extent is a constant, and the symbolic dimension it names otherwise). Reading it
-    /// stages nothing, so shape computations can construct batched types without forcing the extent to be statically
-    /// known. This is the composite counterpart of [`ArrayExtentBatchingPolicy::axis_dimension`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`BatchingError::Type`] when the extent value is not a first-class dimension.
-    pub(crate) fn axis_dimension(&self) -> Result<Dimension, BatchingError> {
-        match self.axis_extent().r#type().as_ref() {
-            ArrayIrType::Dimension(dimension) => Ok(dimension.simplified_dimension()),
-            _ => Err(TypeError::invalid("batch extent must be a dimension").into()),
-        }
-    }
-}
-
-// TODO(eaplatanios): Review this.
-// Every homogeneous array extent policy derives batched declared types the same way and differs only in how it
-// describes its mapped extent. A bounded ragged carrier is rejected, because a lifted declaration cannot relate the
-// per-item extents that live outside the packed type, but only after its logical type is checked against `declared`,
-// so a foreign declaration reports that mismatch rather than the unsupported carrier.
-fn batched_declared_array_batch_type<V: Value<Type = ArrayType>>(
-    input: &ArrayBatch<V>,
-    declared: &ArrayType,
-    extent: &Dimension,
-    axis_sharding: &ShardingDimension,
-) -> Result<ArrayType, BatchingError> {
-    if !input.ragged_axes().is_empty() {
-        let actual = input.unbatched_type();
-        if !declared.shape().is_refined_by(actual.shape()) {
-            return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")).into());
-        }
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!("cannot batch ragged array type `{declared}`"),
-        });
-    }
-    match input.batch_axis().axis() {
-        None => Ok(declared.clone()),
-        Some(axis) => {
-            let axis = axis.normalize(declared.rank() + 1).map_err(ProgramError::from)?;
-            batched_declared_array_type(declared, input.value().r#type().as_ref(), axis, extent, axis_sharding)
-        }
-    }
-}
-
-// TODO(eaplatanios): Review this.
-// Guard and cast keep their inputs' physical batch axes. Preserve supplied variation on the inserted manual axes,
-// while retaining the declaration's other variation constraints so lifting cannot hide an unrelated mismatch.
-fn batched_declared_array_type(
-    declared: &ArrayType,
-    actual: &ArrayType,
-    axis: usize,
-    extent: &Dimension,
-    axis_sharding: &ShardingDimension,
-) -> Result<ArrayType, BatchingError> {
-    let mut batched = declared.batched(axis, extent.clone(), axis_sharding.clone())?;
-    if batched.sharding().is_none()
-        && let Some(actual) = actual.sharding()
-        && !axis_sharding.manual_axes(actual.mesh()).is_empty()
-    {
-        // Unspecified placement still needs a mesh to express batch-induced manual variation. Choose the supplied
-        // placement, enforcing the batch axis's placement, without adopting unrelated variation or reduction state.
-        let dimensions = actual
-            .dimensions()
-            .iter()
-            .enumerate()
-            .map(|(position, placement)| if position == axis { axis_sharding.clone() } else { placement.clone() })
-            .collect();
-        let sharding = Sharding::new(actual.mesh().clone(), dimensions).map_err(TypeError::from)?;
-        batched = batched.with_sharding(sharding).map_err(TypeError::from)?;
-    }
-    if let (Some(sharding), Some(actual)) = (batched.sharding(), actual.sharding()) {
-        let mut varying = sharding.varying_manual_axes().clone();
-        for axis in axis_sharding.manual_axes(sharding.mesh()) {
-            if actual.varying_manual_axes().contains(&axis) {
-                varying.insert(axis);
-            } else {
-                varying.remove(&axis);
-            }
-        }
-        let sharding = sharding.clone().with_varying_manual_axes(varying).map_err(TypeError::from)?;
-        batched = batched.with_sharding(sharding).map_err(TypeError::from)?;
-    }
-    Ok(batched)
 }
 
 // Blanket `BatchableOperation` implementation for any `ElementwiseOperation`, so per-operation `BatchableOperation`
@@ -4493,6 +4452,61 @@ impl ArrayType {
             }),
             batch_axis,
         ))
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns this per-item [`ArrayType`] with a batch dimension inserted at `axis`, preserving the existing packed
+    /// value's variation on the mapped manual mesh axes. Guards and casts use this derivation because they keep the
+    /// value's physical batch axis and introduce no new variation. Every other constraint stays as declared, so
+    /// lifting cannot hide an unrelated mismatch. Callers validate the packed value against the returned type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `actual`: Type of the existing packed value, supplying its placement and mapped manual-axis variation.
+    ///   - `axis`: Position at which to insert the mapped batch dimension.
+    ///   - `extent`: Extent of the mapped batch dimension.
+    ///   - `axis_sharding`: Sharding of the mapped batch dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when the inserted axis or resulting sharding is invalid.
+    fn batch_declared(
+        &self,
+        actual: &Self,
+        axis: usize,
+        extent: &Dimension,
+        axis_sharding: &ShardingDimension,
+    ) -> Result<Self, BatchingError> {
+        let mut batched = self.batched(axis, extent.clone(), axis_sharding.clone())?;
+        if batched.sharding().is_none()
+            && let Some(actual) = actual.sharding()
+            && !axis_sharding.manual_axes(actual.mesh()).is_empty()
+        {
+            // Unspecified placement still needs a mesh to express batch-induced manual variation. Choose the supplied
+            // placement, enforcing the batch axis's placement, without adopting unrelated variation or reduction state.
+            let dimensions = actual
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(position, placement)| if position == axis { axis_sharding.clone() } else { placement.clone() })
+                .collect();
+            let sharding = Sharding::new(actual.mesh().clone(), dimensions).map_err(TypeError::from)?;
+            batched = batched.with_sharding(sharding).map_err(TypeError::from)?;
+        }
+
+        if let (Some(sharding), Some(actual)) = (batched.sharding(), actual.sharding()) {
+            let mut varying = sharding.varying_manual_axes().clone();
+            for axis in axis_sharding.manual_axes(sharding.mesh()) {
+                if actual.varying_manual_axes().contains(&axis) {
+                    varying.insert(axis);
+                } else {
+                    varying.remove(&axis);
+                }
+            }
+            let sharding = sharding.clone().with_varying_manual_axes(varying).map_err(TypeError::from)?;
+            batched = batched.with_sharding(sharding).map_err(TypeError::from)?;
+        }
+        Ok(batched)
     }
 }
 
@@ -7373,6 +7387,25 @@ pub(crate) mod tests {
             ArrayIrBatchingPolicy::batched_type(&context, &dimension, dimension.value().r#type().as_ref()),
             Ok(dimension.value().r#type().into_owned()),
         );
+
+        // Mapped declarations require a first-class extent, whose symbolic identity is retained without staging work.
+        let invalid = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            *context.parent(),
+            ArrayIrValue::Array(Array::scalar(3i32).unwrap()),
+        );
+        assert_eq!(
+            ArrayIrBatchingPolicy::batched_type(&invalid, &input, &input.unbatched_type()),
+            Err(TypeError::invalid("batch extent must be a dimension").into()),
+        );
+        let parent = TracingContext::<ArrayIrValue<Array>, ConstantOperation<ArrayIrValue<Array>>>::new();
+        let dimension = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+        let context =
+            BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), parent.input(dimension.clone().into()));
+        let declared = ArrayType::new_static(DataType::F32, [2]);
+        let packed = ArrayType::new(DataType::F32, Shape::new(vec![dimension.simplified_dimension(), 2.into()]));
+        let input = ArrayIrBatch::new(parent.input(packed.clone().into()), BatchAxis::new(0)).unwrap();
+        assert_eq!(ArrayIrBatchingPolicy::batched_type(&context, &input, &declared.into()), Ok(packed.into()));
+        assert!(parent.builder().borrow().instructions().is_empty());
     }
 
     #[test]
@@ -9115,29 +9148,6 @@ pub(crate) mod tests {
                 message: "member input 0 of type dimension<4> must be replicated but is mapped at axis 0".to_string(),
             }),
         );
-    }
-
-    #[test]
-    fn test_batching_context_axis_dimension() {
-        // Reading the mapped dimension stages nothing, so it needs no operations beyond constants in the mixed context.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ConstantOperation<ArrayIrValue<Array>>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
-        );
-        assert_eq!(context.axis_dimension(), Ok(Dimension::Static(3)));
-        let invalid = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            context.parent().clone(),
-            ArrayIrValue::Array(Array::scalar(3i32).unwrap()),
-        );
-        assert_eq!(invalid.axis_dimension(), Err(TypeError::invalid("batch extent must be a dimension").into()));
-
-        // A staged first-class extent keeps its dimension variable rather than requiring a host size.
-        let parent = TracingContext::<ArrayIrValue<Array>, ConstantOperation<ArrayIrValue<Array>>>::new();
-        let dimension = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
-        let input = parent.builder().borrow_mut().add_input(dimension.clone().into());
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), parent.tracer(input, None));
-        assert_eq!(context.axis_dimension(), Ok(dimension.simplified_dimension()));
-        assert!(parent.builder().borrow().instructions().is_empty());
     }
 
     #[test]
