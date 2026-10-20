@@ -4691,7 +4691,7 @@ fn broadcast_replicated_array<V: Clone + DimensionSize + DynamicBroadcast>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::borrow::Cow;
 
     use indoc::indoc;
@@ -4731,11 +4731,37 @@ mod tests {
     use crate::tests::{TestArrayContext, TestArrayOperation};
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
-    use super::testing::{ArrayIrTraceContext, ragged_array_batch, ragged_batch};
     use super::*;
 
     /// Eager composite context shared by array, dimension, and reference batching tests.
     type ArrayIrEagerContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Tracing composite context of the ragged batching tests.
+    type ArrayIrTraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Wraps the packed `value` as a composite carrier mapped along axis `0` whose packed `axis` is the bounded ragged
+    /// axis `variable` with the per-item `extents`, which vary along that batch axis.
+    pub(crate) fn ragged_batch<V: Value<Type = ArrayIrType>>(
+        value: V,
+        extents: V,
+        variable: &DimensionVariable,
+        axis: usize,
+    ) -> Result<ArrayIrBatch<V>, BatchingError> {
+        let ragged_axis = RaggedAxis::new(axis, extents, variable.clone(), vec![0]);
+        ArrayIrBatch::new(value, BatchAxis::new(0))?.with_ragged_axes(vec![ragged_axis])
+    }
+
+    /// Homogeneous counterpart of [`ragged_batch`], which wraps the packed `value` as an [`ArrayBatch`] mapped along
+    /// axis `0` whose packed `axis` is the bounded ragged axis `variable` with the per-item `extents`.
+    pub(crate) fn ragged_array_batch<V: Value<Type = ArrayType>>(
+        value: V,
+        extents: V,
+        variable: &DimensionVariable,
+        axis: usize,
+    ) -> Result<ArrayBatch<V>, BatchingError> {
+        let ragged_axis = RaggedAxis::new(axis, extents, variable.clone(), vec![0]);
+        ArrayBatch::new(value, BatchAxis::new(0))?.with_ragged_axes(vec![ragged_axis])
+    }
 
     #[test]
     fn test_ragged_axis() {
@@ -11523,45 +11549,5 @@ mod tests {
             .trim_end(),
         );
         Ok(())
-    }
-}
-
-// TODO(eaplatanios): Review this.
-/// Shared fixtures for the ragged batching tests of this crate. They build the standard ragged carrier, a packed value
-/// mapped along axis `0` with one bounded ragged axis whose per-item extents vary along that batch axis, so that tests
-/// do not assemble its [`RaggedAxis`] by hand. Other carriers (e.g., with nested or transposed extents, or replicated
-/// carriers that keep the ragged axes of an outer batch) are the subject of their tests and remain spelled out there.
-#[cfg(test)]
-pub(crate) mod testing {
-    use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::ArrayIrOperation;
-
-    use super::*;
-
-    /// Tracing composite context of the ragged batching tests.
-    pub(crate) type ArrayIrTraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-    /// Wraps the packed `value` as a composite carrier mapped along axis `0` whose packed `axis` is the bounded ragged
-    /// axis `variable` with the per-item `extents`, which vary along that batch axis.
-    pub(crate) fn ragged_batch<V: Value<Type = ArrayIrType>>(
-        value: V,
-        extents: V,
-        variable: &DimensionVariable,
-        axis: usize,
-    ) -> Result<ArrayIrBatch<V>, BatchingError> {
-        let ragged_axis = RaggedAxis::new(axis, extents, variable.clone(), vec![0]);
-        ArrayIrBatch::new(value, BatchAxis::new(0))?.with_ragged_axes(vec![ragged_axis])
-    }
-
-    /// Homogeneous counterpart of [`ragged_batch`], which wraps the packed `value` as an [`ArrayBatch`] mapped along
-    /// axis `0` whose packed `axis` is the bounded ragged axis `variable` with the per-item `extents`.
-    pub(crate) fn ragged_array_batch<V: Value<Type = ArrayType>>(
-        value: V,
-        extents: V,
-        variable: &DimensionVariable,
-        axis: usize,
-    ) -> Result<ArrayBatch<V>, BatchingError> {
-        let ragged_axis = RaggedAxis::new(axis, extents, variable.clone(), vec![0]);
-        ArrayBatch::new(value, BatchAxis::new(0))?.with_ragged_axes(vec![ragged_axis])
     }
 }

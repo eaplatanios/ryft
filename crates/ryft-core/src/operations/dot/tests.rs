@@ -4,7 +4,7 @@ use indoc::indoc;
 use num_complex::Complex as ComplexNumber;
 use pretty_assertions::assert_eq;
 
-use crate::arrays::batching::testing::ragged_array_batch;
+use crate::arrays::batching::tests::ragged_array_batch;
 use crate::arrays::{
     Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Layout,

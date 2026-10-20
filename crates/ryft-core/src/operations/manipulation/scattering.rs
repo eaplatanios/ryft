@@ -2342,7 +2342,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::testing::ragged_array_batch;
+    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout,

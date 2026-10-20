@@ -279,7 +279,7 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::testing::ragged_array_batch;
+    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
     };

@@ -332,7 +332,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::testing::ragged_array_batch;
+    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayBatch, ArrayElement, ArrayIrOperation, ArrayOperation, DataType, DimensionBounds,
         DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Sharding, TiledLayout,

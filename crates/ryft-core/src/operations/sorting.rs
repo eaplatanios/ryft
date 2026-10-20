@@ -941,7 +941,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::testing::ragged_array_batch;
+    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, Layout,
         LogicalMesh, MeshAxis, MeshAxisType, Sharding, StridedLayout, i4,

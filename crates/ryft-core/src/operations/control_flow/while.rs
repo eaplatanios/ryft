@@ -3280,7 +3280,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::arrays::batching::testing::ragged_batch;
+    use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,

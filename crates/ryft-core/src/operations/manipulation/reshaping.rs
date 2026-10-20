@@ -1702,7 +1702,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
+    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
         DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis,
