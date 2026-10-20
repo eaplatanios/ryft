@@ -1560,6 +1560,7 @@ impl LowerableOperation for AssertOperation<ArrayIrType> {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, CompareOperation, DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue,
@@ -2061,10 +2062,34 @@ mod tests {
             // The tangent cast has its own data input. The converted primal proof must remain a dependency even
             // though it is not numerically used; that proof already depends on the assertion token. The homogeneous
             // tangent cast is witnessed by the primal input and the converted primal themselves, whereas the composite
-            // one is witnessed by their extents, read as first-class dimensions, of which the second one still depends
-            // on the proof.
+            // one is witnessed by their extents, read as first-class dimensions with `dimension_size`, of which the
+            // second one still depends on the proof.
             let jvp = program.jvp().unwrap();
-            eprintln!("G8MARK guard_jvp_{composite}\n{jvp}\nG8END");
+            let expected_jvp = if composite {
+                indoc! {"
+                    lambda %0:f64[m], %1:f64[k], %2:f64[m], %3:f64[k] .
+                    let %4:f64[m], %5:f64[m] = guard [boundary=\"region\", declared_types=[f64[n], f64[n]], \
+                        retained_identities=[m]] %0 %1
+                        %6:f64[m] = cast [type=f64[m], inputs=[f64[m], f64[m]]] %2 %4
+                        %7:dimension<k ∈ [1, 9)> = dimension_size [axis=0] %1
+                        %8:dimension<m ∈ [1, 5)> = dimension_size [axis=0] %5
+                        %9:f64[m] = cast [type=f64[m], inputs=[f64[k], dimension<k ∈ [1, 9)>, dimension<m ∈ [1, 5)>]] \
+                            %3 %7 %8
+                        %10:f64[m] = add %4 %5
+                        %11:f64[m] = add %6 %9
+                    in (%10, %11)"}
+            } else {
+                indoc! {"
+                    lambda %0:f64[m], %1:f64[k], %2:f64[m], %3:f64[k] .
+                    let %4:f64[m], %5:f64[m] = guard [boundary=\"region\", declared_types=[f64[n], f64[n]], \
+                        retained_identities=[m]] %0 %1
+                        %6:f64[m] = cast [type=f64[m], inputs=[f64[m], f64[m]]] %2 %4
+                        %7:f64[m] = cast [type=f64[m], inputs=[f64[k], f64[k], f64[m]]] %3 %1 %5
+                        %8:f64[m] = add %4 %5
+                        %9:f64[m] = add %6 %7
+                    in (%8, %9)"}
+            };
+            assert_eq!(jvp.to_string(), expected_jvp);
             let tangent_module = to_mlir_module_for_program(
                 &jvp,
                 &[],
@@ -2075,66 +2100,152 @@ mod tests {
                 None,
             )
             .unwrap();
-            eprintln!("G8MARK guard_module_{composite}\n{tangent_module}\nG8END");
-            let assertion = tangent_module.lines().find(|line| line.contains("@ryft.assert")).unwrap();
-            let token = assertion.trim().split_once(" = ").unwrap().0;
-            let entry_value = |index| {
-                tangent_module
-                    .lines()
-                    .find(|line| line.contains(&format!("stablehlo.set_dimension_size %arg{index},")))
-                    .unwrap()
-                    .trim()
-                    .split_once(" = ")
-                    .unwrap()
-                    .0
-            };
-            let barrier = tangent_module
-                .lines()
-                .find(|line| line.contains(&format!("stablehlo.optimization_barrier {},", entry_value(3))))
-                .unwrap();
-            if !composite {
-                assert!(barrier.contains(&format!("{}, {},", entry_value(3), entry_value(1))), "{tangent_module}");
-            }
-            let primal_barrier = tangent_module
-                .lines()
-                .find(|line| line.contains("stablehlo.optimization_barrier") && line.contains(token))
-                .unwrap();
-            let primal_values = primal_barrier.trim().split_once(':').unwrap().0;
-            let extent = tangent_module
-                .lines()
-                .find(|line| line.contains(&format!("stablehlo.get_dimension_size {primal_values}#1")))
-                .unwrap()
-                .trim()
-                .split_once(" = ")
-                .unwrap()
-                .0;
-            let proof = tangent_module
-                .lines()
-                .find(|line| line.contains("stablehlo.set_dimension_size") && line.contains(&format!(", {extent},")))
-                .unwrap()
-                .trim()
-                .split_once(" = ")
-                .unwrap()
-                .0;
-            let proof_dependency = if composite {
-                let assignment = |pattern: String| {
-                    tangent_module
-                        .lines()
-                        .find(|line| line.contains(&pattern))
-                        .unwrap()
-                        .trim()
-                        .split_once(" = ")
-                        .unwrap()
-                        .0
-                };
-                let size = assignment(format!("stablehlo.get_dimension_size {proof},"));
-                assignment(format!("stablehlo.convert {size} :"))
+            let expected_tangent_module = if composite {
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<4xf64>, %arg1: tensor<8xf64>, %arg2: tensor<4xf64>, %arg3: \
+                          tensor<8xf64>, %arg4: tensor<i32>, %arg5: tensor<i32>, %arg6: tensor<i32>, %arg7: \
+                          tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, \
+                          tensor<i64>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg0, %arg4, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %1 = stablehlo.set_dimension_size %arg1, %arg5, dim = 0 : (tensor<8xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<8>>
+                        %2 = stablehlo.set_dimension_size %arg2, %arg6, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %3 = stablehlo.set_dimension_size %arg3, %arg7, dim = 0 : (tensor<8xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<8>>
+                        %4 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                        %6 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %7 = stablehlo.convert %6 : (tensor<i32>) -> tensor<i64>
+                        %8 = stablehlo.compare EQ, %7, %5, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                        %9 = stablehlo.after_all  : !stablehlo.token
+                        %10 = stablehlo.custom_call @ryft.assert(%8, %5, %7, %9) {api_version = 4 : i32, \
+                            backend_config = {actor = \"guard\", kind = \"generic\", label_0 = \"expected\", label_1 \
+                            = \"actual\", label_count = \"2\", message = \"input dimension `n` must have one extent \
+                            at the entry of `region`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, \
+                            tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                        %11:3 = stablehlo.optimization_barrier %0, %1, %10 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                            tensor<?xf64, #stablehlo.bounds<8>>, !stablehlo.token
+                        %12 = stablehlo.get_dimension_size %11#1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %c = stablehlo.constant dense<8> : tensor<i32>
+                        %13 = stablehlo.set_dimension_size %11#1, %c, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>, \
+                            tensor<i32>) -> tensor<8xf64>
+                        %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                        %14 = stablehlo.pad %13, %cst, low = [0], high = [-4], interior = [0] : (tensor<8xf64>, \
+                            tensor<f64>) -> tensor<4xf64>
+                        %15 = stablehlo.set_dimension_size %14, %12, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %16:2 = stablehlo.optimization_barrier %2, %11#0 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %17 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %18 = stablehlo.convert %17 : (tensor<i32>) -> tensor<i64>
+                        %19 = stablehlo.get_dimension_size %15, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %20 = stablehlo.convert %19 : (tensor<i32>) -> tensor<i64>
+                        %21:3 = stablehlo.optimization_barrier %3, %18, %20 : tensor<?xf64, #stablehlo.bounds<8>>, \
+                            tensor<i64>, tensor<i64>
+                        %22 = stablehlo.get_dimension_size %21#0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %c_0 = stablehlo.constant dense<8> : tensor<i32>
+                        %23 = stablehlo.set_dimension_size %21#0, %c_0, dim = 0 : (tensor<?xf64, \
+                            #stablehlo.bounds<8>>, tensor<i32>) -> tensor<8xf64>
+                        %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                        %24 = stablehlo.pad %23, %cst_1, low = [0], high = [-4], interior = [0] : (tensor<8xf64>, \
+                            tensor<f64>) -> tensor<4xf64>
+                        %25 = stablehlo.set_dimension_size %24, %22, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %26 = stablehlo.add %11#0, %15 : tensor<?xf64, #stablehlo.bounds<4>>
+                        %27 = stablehlo.add %16#0, %25 : tensor<?xf64, #stablehlo.bounds<4>>
+                        %28:2 = stablehlo.optimization_barrier %26, %27 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %29 = stablehlo.get_dimension_size %26, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %30 = stablehlo.convert %29 : (tensor<i32>) -> tensor<i64>
+                        %31 = stablehlo.get_dimension_size %27, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %32 = stablehlo.convert %31 : (tensor<i32>) -> tensor<i64>
+                        return %28#0, %28#1, %30, %32 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, \
+                            #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
+                      }
+                    }
+                "}
             } else {
-                proof
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<4xf64>, %arg1: tensor<8xf64>, %arg2: tensor<4xf64>, %arg3: \
+                          tensor<8xf64>, %arg4: tensor<i32>, %arg5: tensor<i32>, %arg6: tensor<i32>, %arg7: \
+                          tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, \
+                          tensor<i64>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg0, %arg4, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %1 = stablehlo.set_dimension_size %arg1, %arg5, dim = 0 : (tensor<8xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<8>>
+                        %2 = stablehlo.set_dimension_size %arg2, %arg6, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %3 = stablehlo.set_dimension_size %arg3, %arg7, dim = 0 : (tensor<8xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<8>>
+                        %4 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                        %6 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %7 = stablehlo.convert %6 : (tensor<i32>) -> tensor<i64>
+                        %8 = stablehlo.compare EQ, %7, %5, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                        %9 = stablehlo.after_all  : !stablehlo.token
+                        %10 = stablehlo.custom_call @ryft.assert(%8, %5, %7, %9) {api_version = 4 : i32, \
+                            backend_config = {actor = \"guard\", kind = \"generic\", label_0 = \"expected\", label_1 \
+                            = \"actual\", label_count = \"2\", message = \"input dimension `n` must have one extent \
+                            at the entry of `region`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, \
+                            tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                        %11:3 = stablehlo.optimization_barrier %0, %1, %10 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                            tensor<?xf64, #stablehlo.bounds<8>>, !stablehlo.token
+                        %12 = stablehlo.get_dimension_size %11#1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %c = stablehlo.constant dense<8> : tensor<i32>
+                        %13 = stablehlo.set_dimension_size %11#1, %c, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>, \
+                            tensor<i32>) -> tensor<8xf64>
+                        %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                        %14 = stablehlo.pad %13, %cst, low = [0], high = [-4], interior = [0] : (tensor<8xf64>, \
+                            tensor<f64>) -> tensor<4xf64>
+                        %15 = stablehlo.set_dimension_size %14, %12, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %16:2 = stablehlo.optimization_barrier %2, %11#0 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %17:3 = stablehlo.optimization_barrier %3, %1, %15 : tensor<?xf64, #stablehlo.bounds<8>>, \
+                            tensor<?xf64, #stablehlo.bounds<8>>, tensor<?xf64, #stablehlo.bounds<4>>
+                        %18 = stablehlo.get_dimension_size %17#0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<8>>) -> \
+                            tensor<i32>
+                        %c_0 = stablehlo.constant dense<8> : tensor<i32>
+                        %19 = stablehlo.set_dimension_size %17#0, %c_0, dim = 0 : (tensor<?xf64, \
+                            #stablehlo.bounds<8>>, tensor<i32>) -> tensor<8xf64>
+                        %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                        %20 = stablehlo.pad %19, %cst_1, low = [0], high = [-4], interior = [0] : (tensor<8xf64>, \
+                            tensor<f64>) -> tensor<4xf64>
+                        %21 = stablehlo.set_dimension_size %20, %18, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %22 = stablehlo.add %11#0, %15 : tensor<?xf64, #stablehlo.bounds<4>>
+                        %23 = stablehlo.add %16#0, %21 : tensor<?xf64, #stablehlo.bounds<4>>
+                        %24:2 = stablehlo.optimization_barrier %22, %23 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                            tensor<?xf64, #stablehlo.bounds<4>>
+                        %25 = stablehlo.get_dimension_size %22, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %26 = stablehlo.convert %25 : (tensor<i32>) -> tensor<i64>
+                        %27 = stablehlo.get_dimension_size %23, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                            tensor<i32>
+                        %28 = stablehlo.convert %27 : (tensor<i32>) -> tensor<i64>
+                        return %24#0, %24#1, %26, %28 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, \
+                            #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
+                      }
+                    }
+                "}
             };
-            assert!(barrier.contains(&format!(", {proof_dependency} :")), "{tangent_module}");
-            let values = barrier.trim().split_once(':').unwrap().0;
-            assert!(tangent_module.contains(&format!("stablehlo.get_dimension_size {values}#0")), "{tangent_module}");
+            assert_eq!(tangent_module, expected_tangent_module);
             let inputs = [inputs[0].clone(), inputs[1].clone(), inputs[0].clone(), inputs[1].clone()];
             assert_eq!(
                 execute_mixed_program(&client, &jvp, &inputs, &[2, 2, 2, 2]),

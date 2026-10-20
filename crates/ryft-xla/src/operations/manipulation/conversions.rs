@@ -1837,9 +1837,22 @@ mod tests {
             .to_string();
         assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
 
-        // Differentiation retains the checked primal relation even when the tangent already has the output type.
+        // Differentiation retains the checked primal relation even when the tangent already has the output type. Both
+        // sides of the tangent cast carry `a` and `b`, so it needs no identity witness, but it depends on the guarded
+        // primal output so that it stays behind the check.
         let differentiated = program.jvp().unwrap();
-        eprintln!("G8MARK guarded_cast_jvp\n{differentiated}\nG8END");
+        assert_eq!(
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f64[a, b][layout=tiled{1,0}], %1:f64[a, b][layout=tiled{1,0}] .
+                let %2:f64[a, b][layout=tiled{1,0}] = guard [boundary=\"square\", declared_types=[f64[p, p]], \
+                    retained_identities=[a, b]] %0
+                    %3:f64[a, b][layout=tiled{1,0}] = cast [
+                        type=f64[a, b][layout=tiled{1,0}],
+                        inputs=[f64[a, b][layout=tiled{1,0}], f64[a, b][layout=tiled{1,0}]],
+                    ] %1 %2
+                in (%2, %3)"},
+        );
         let inputs = [input.clone(), input];
         assert_eq!(
             execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]),
@@ -2469,7 +2482,14 @@ mod tests {
         // The primal of a differentiated cast retains that same source declaration. Tangent casts reverse neither
         // the ambient assignments nor their dependence on the checked primal output.
         let differentiated = program.jvp().unwrap();
-        eprintln!("G8MARK ambient_jvp\n{differentiated}\nG8END");
+        assert_eq!(
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f64[a, b], %1:f64[a, b] .
+                let %2:f64[b, a] = cast [type=f64[b, a], inputs=[f64[a, b]], checked=true] %0
+                    %3:f64[b, a] = cast [type=f64[b, a], inputs=[f64[a, b], f64[b, a]]] %1 %2
+                in (%2, %3)"},
+        );
         assert_eq!(
             execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]),
             Ok(vec![
@@ -2545,9 +2565,23 @@ mod tests {
         assert!(error.contains("must have the declared extent in `cast`"), "{error}");
         let error = execute_mixed_program(&client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
         assert!(error.contains("must have one extent in `cast`"), "{error}");
-        let differentiated = program.jvp().unwrap();
-        eprintln!("G8MARK mixed_jvp\n{differentiated}\nG8END");
-        eprintln!("G8MARK mixed_module\n{}\nG8END", to_mlir_module_for_program(&differentiated, &[], &[], &[], "main", None, None).map_err(|e| e.to_string()).unwrap_or_default());
+
+        // The tangent cast is witnessed by the extent of `b`, which its output type no longer carries, read from the
+        // primal input, and by the extent of `a`, which it introduces, read from the checked primal output, so that
+        // the tangent also stays behind the primal check.
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[b, 3], %1:f64[a], %2:f64[b, 3], %3:f64[a] .
+                let %4:f64[3, a] = cast [type=f64[3, a], inputs=[f64[b, 3], f64[a]], checked=true] %0 %1
+                    %5:dimension<b ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %6:dimension<a ∈ [1, 5)> = dimension_size [axis=1] %4
+                    %7:f64[3, a] = cast [
+                        type=f64[3, a],
+                        inputs=[f64[b, 3], dimension<b ∈ [1, 5)>, dimension<a ∈ [1, 5)>],
+                    ] %2 %5 %6
+                in (%4, %7)"},
+        );
     }
 
     #[test]

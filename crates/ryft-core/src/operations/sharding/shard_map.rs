@@ -10546,8 +10546,9 @@ mod tests {
     fn test_shard_map_partial_evaluation_threads_repeated_dimension_residuals() {
         // The unknown half consumes two first-class dimensions that the known half computes with the same identity:
         // the defining `dimension_from_scalar` and a `dimension_size` read from a known array of that extent. Both cross
-        // the split as separate residual edges, but only the first one redefines `extent` in the residual `shard_map`,
-        // and the second one reuses its value, since a region cannot define the same identity more than once.
+        // the split as separate residual edges, but only the first one (`%1`) redefines `extent` in the residual
+        // `shard_map`, and both broadcasts reuse its value, leaving the second edge (`%2`) unused, since equal identities
+        // denote equal extents and a region cannot define the same identity more than once.
         use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 
         let array_type = f32_scalar_type();
@@ -10622,7 +10623,37 @@ mod tests {
                 &[PartialValue::Known(known), PartialValue::Unknown(ArrayIrType::Array(array_type))],
             )
             .unwrap();
-        assert_eq!(evaluation.program().to_string(), indoc! {"PLACEHOLDER"});
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
+                    %2:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
+                let %3:f32[], %4:f32[] = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{'x'}]}, \
+                        {mesh<['x'=2:manual]>, [{'x'}]}],
+                    out_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[], i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}], \
+                        i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[], f32[]],
+                ] %0 %1 %2 [
+                    body={
+                        lambda %0:f32[], %1:i64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                            %2:i64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %3:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reshape [shape=[], \
+                            output_sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] %1
+                            %4:dimension<extent ∈ [0, 5)> = dimension_from_scalar [bounds=[0, 5)] %3
+                            %5:f32[extent] = broadcast [output_axes=[]] %0 %4
+                            %6:f32[] = reduce [kind=sum, axes=[0]] %5
+                            %7:f32[extent] = broadcast [output_axes=[]] %0 %4
+                            %8:f32[] = reduce [kind=sum, axes=[0]] %7
+                        in (%6, %8)
+                    },
+                ]
+                in (%3, %4)"
+            },
+        );
     }
 
     #[test]

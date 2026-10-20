@@ -345,12 +345,15 @@ fn test_composite_lowering_rejects_bound_manual_output_placement() {
         .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
         .unwrap();
     let cast = |output_type: &ArrayType, input_type: &ArrayType| {
-        XlaOperation::Cast(CastOperation::unchecked(output_type.clone().into(), vec![input_type.clone().into()]).unwrap())
+        XlaOperation::Cast(
+            CastOperation::unchecked(output_type.clone().into(), vec![input_type.clone().into()]).unwrap(),
+        )
     };
     let mut builder = CompositeXlaProgramBuilder::new();
     let input = builder.add_input(vector_type.clone().into());
     let placed = builder.add_instruction(cast(&explicit_type, &vector_type), Vec::new(), vec![input], None).unwrap()[0];
-    let output = builder.add_instruction(cast(&vector_type, &explicit_type), Vec::new(), vec![placed], None).unwrap()[0];
+    let output =
+        builder.add_instruction(cast(&vector_type, &explicit_type), Vec::new(), vec![placed], None).unwrap()[0];
     let body = builder
         .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
         .unwrap();

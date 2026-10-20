@@ -4019,7 +4019,7 @@ mod tests {
             "cast [type=f32[n], inputs=[f32[n]]]",
         );
 
-        // A checked cast is ordered like an assertion and renders its mode.
+        // A checked cast declares the ordered-assertion effect and renders its mode.
         let checked = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap();
         assert!(checked.is_checked());
         assert_eq!(checked.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
