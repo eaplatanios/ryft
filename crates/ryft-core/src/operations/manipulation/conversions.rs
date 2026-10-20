@@ -1009,15 +1009,19 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 /// types, rank and memory space. Layout may change, as long as the requested layout addresses the output shape (refer
 /// to [`ArrayType::validate_layout`]), and so may placement over [`MeshAxisType::Explicit`] mesh axes under the rules
 /// of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation. Placement over
-/// [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs to backend
-/// compilers (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter only changes
-/// through manual collectives, and so are manual variation and reduction state. Every mesh axis that carries such
-/// preserved state keeps its definition (i.e., its size and type) in the output mesh, including an explicit axis that
-/// carries reduction state; only explicit axes referenced solely by dimension placement may be redefined or dropped.
-/// Further inputs act as _witnesses_, meaning values whose types make output identities available to the instruction
-/// (e.g., a value of type `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses carry no derivatives. Every output
-/// identity must occur in an input declaration, and the output type may not define an identity. First-class dimension
-/// types define their names, so casts of dimension values can only target static types.
+/// [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs to backend compilers
+/// (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter only changes through
+/// manual collectives, and so are manual variation and reduction state. The axes that shard a dimension are ordered
+/// from major to minor, so the axes up to and including an auto or manual axis determine which block of the dimension
+/// each of its shards holds. Each dimension therefore keeps its axes up to and including its last auto or manual axis,
+/// and only explicit axes minor to all of them may be added, removed, or reordered (e.g., `[m, x]` may become `[m]` or
+/// `[m, y]` but not `[x, m]`). Every mesh axis that carries such preserved state keeps its definition (i.e., its size
+/// and type) in the output mesh, including an explicit axis that carries reduction state; only explicit axes referenced
+/// solely by dimension placement may be redefined or dropped. Further inputs act as _witnesses_, meaning values whose
+/// types make output identities available to the instruction (e.g., a value of type `f32[n]` lets `f32[2]` widen to
+/// `f32[n]`). Witnesses carry no derivatives. Every output identity must occur in an input declaration, and the output
+/// type may not define an identity. First-class dimension types define their names, so casts of dimension values can
+/// only target static types.
 ///
 /// The complete [input declarations](Self::input_types) preserve nominal bindings during concrete execution. Source,
 /// output and witness declarations share their dimension identities: widening `f32[2]` to `f32[n]` next to a witness
@@ -1815,8 +1819,9 @@ impl CastType for ArrayIrType {
                 // Placement follows the rules of `reshard` (i.e., the type system tracks placement over explicit
                 // mesh axes, so the output may request a new one, whereas placement over auto axes belongs to backend
                 // compilers and transitions over manual axes require manual collectives). The output therefore names
-                // the same auto and manual axes as the input on every dimension. Carrying them forward requests no
-                // redistribution, and an output without a sharding stays untracked rather than requesting replication.
+                // the same auto and manual axes as the input on every dimension, in the same position relative to the
+                // explicit axes (refer to the check below). Carrying them forward requests no redistribution, and an
+                // output without a sharding stays untracked rather than requesting replication.
                 if let Some(output_sharding) = output.sharding() {
                     let named_axes = |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding
                         .dimensions()[dimension]
@@ -1847,6 +1852,37 @@ impl CastType for ArrayIrType {
                                 "`{CAST_OPERATION_NAME}` cannot change placement over {axis_type} mesh axes; {remedy}",
                             )));
                         }
+                    }
+
+                    // Comparing names per axis type is not sufficient, because the axes that shard a dimension are
+                    // ordered from major to minor: the sizes of all axes up to and including an auto or manual axis
+                    // determine which block of the dimension each of its shards holds. Reordering those axes, or
+                    // adding or removing an explicit axis major to one of them, would move data between auto or manual
+                    // shards (i.e., perform an implicit collective). Each dimension must therefore keep its axes up to
+                    // and including its last auto or manual axis, and only explicit axes minor to them may change.
+                    let preserved_prefix =
+                        |sharding: &Sharding, dimension: usize| match &sharding.dimensions()[dimension] {
+                            ShardingDimension::Sharded(axis_names) => {
+                                let end = axis_names
+                                    .iter()
+                                    .rposition(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit))
+                                    .map_or(0, |index| index + 1);
+                                axis_names[..end].to_vec()
+                            }
+                            ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
+                        };
+                    if let Some(dimension) = (0..output.rank()).find(|dimension| {
+                        preserved_prefix(output_sharding, *dimension)
+                            != input
+                                .sharding()
+                                .map(|sharding| preserved_prefix(sharding, *dimension))
+                                .unwrap_or_default()
+                    }) {
+                        return Err(TypeError::invalid(format!(
+                            "`{CAST_OPERATION_NAME}` cannot change the mesh axes up to the last auto or manual mesh \
+                             axis of dimension {dimension}; only explicit mesh axes minor to every auto and manual \
+                             axis may change",
+                        )));
                     }
 
                     // The checks above compare axis names only, but the size and type of a mesh axis are semantic.
@@ -4579,9 +4615,11 @@ mod tests {
     #[test]
     fn test_cast_type_inference_placement() {
         // Placement follows the rules of `reshard`: explicit placement may be requested, changed, and dropped from
-        // tracking, whereas the auto and manual axes that each dimension names are carried forward unchanged.
+        // tracking, whereas the auto and manual axes that each dimension names are carried forward unchanged, together
+        // with every explicit axis major to them.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
         ])
@@ -4599,21 +4637,48 @@ mod tests {
         let manual_error = TypeError::invalid(
             "`cast` cannot change placement over manual mesh axes; use manual collectives for transitions over them",
         );
+        let order_error = TypeError::invalid(
+            "`cast` cannot change the mesh axes up to the last auto or manual mesh axis of dimension 0; only explicit \
+             mesh axes minor to every auto and manual axis may change",
+        );
         let cases = [
             (plain.clone(), placed([sharded(&["x"]), replicated()]), Ok(())),
             (placed([sharded(&["x"]), replicated()]), placed([replicated(), sharded(&["x"])]), Ok(())),
             (placed([sharded(&["x"]), replicated()]), plain.clone(), Ok(())),
             // Replicating over a mesh with auto axes names none of them.
             (plain.clone(), placed([replicated(), replicated()]), Ok(())),
-            // Auto placement is carried forward or left untracked, never introduced, dropped, or moved.
-            (placed([sharded(&["a"]), replicated()]), placed([sharded(&["x", "a"]), replicated()]), Ok(())),
-            (placed([sharded(&["x", "a"]), replicated()]), placed([sharded(&["a"]), replicated()]), Ok(())),
+            // Auto placement is carried forward or left untracked, never introduced, dropped, or moved, and the
+            // explicit axes major to it are fixed because they determine which block each auto shard holds.
+            (
+                placed([sharded(&["a"]), replicated()]),
+                placed([sharded(&["x", "a"]), replicated()]),
+                Err(order_error.clone()),
+            ),
+            (
+                placed([sharded(&["x", "a"]), replicated()]),
+                placed([sharded(&["a"]), replicated()]),
+                Err(order_error.clone()),
+            ),
+            (placed([sharded(&["a", "x"]), replicated()]), placed([sharded(&["a", "y"]), replicated()]), Ok(())),
             (placed([sharded(&["a"]), replicated()]), plain.clone(), Ok(())),
             (plain.clone(), placed([sharded(&["a"]), replicated()]), Err(auto_error.clone())),
             (placed([sharded(&["a"]), replicated()]), placed([replicated(), replicated()]), Err(auto_error.clone())),
             (placed([sharded(&["a"]), replicated()]), placed([replicated(), sharded(&["a"])]), Err(auto_error)),
-            // Manual placement is carried forward, never introduced or dropped.
+            // Manual placement is carried forward, never introduced or dropped, and only explicit axes minor to it
+            // may change. Neither manual nor auto axes may be reordered relative to each other or to explicit axes.
             (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m"]), sharded(&["x"])]), Ok(())),
+            (placed([sharded(&["m", "x"]), replicated()]), placed([sharded(&["m"]), replicated()]), Ok(())),
+            (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m", "x"]), replicated()]), Ok(())),
+            (
+                placed([sharded(&["m", "x"]), replicated()]),
+                placed([sharded(&["x", "m"]), replicated()]),
+                Err(order_error.clone()),
+            ),
+            (
+                placed([sharded(&["a", "m"]), replicated()]),
+                placed([sharded(&["m", "a"]), replicated()]),
+                Err(order_error),
+            ),
             (plain.clone(), placed([sharded(&["m"]), replicated()]), Err(manual_error.clone())),
             (placed([sharded(&["m"]), replicated()]), placed([sharded(&["x"]), replicated()]), Err(manual_error)),
         ];
