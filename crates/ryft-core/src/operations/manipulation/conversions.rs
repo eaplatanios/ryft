@@ -84,8 +84,8 @@ use ryft_macros::capability;
 use crate::arrays::types::dimensions::{DimensionComparison, DimensionRefinementFact};
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue,
-    ArrayType, DataType, Dimension, DimensionRefinements, DimensionType, DimensionTypeRefinements, DimensionVariable,
-    Layout, MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f16,
+    ArrayType, DataType, Dimension, DimensionRefinements, DimensionType, DimensionTypeRefinements, Layout,
+    MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f16,
 };
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -1690,7 +1690,10 @@ impl CastType for DataType {
         if input_types[0] == operation.output_type {
             Ok((operation.output_type, Some(operation.output_type)))
         } else {
-            Err(unrelated_cast_types(&input_types[0], &operation.output_type))
+            Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                &input_types[0], &operation.output_type,
+            )))
         }
     }
 }
@@ -1701,11 +1704,20 @@ impl CastType for ArrayType {
         operation: &CastOperation<Self>,
         input_types: &[Self],
     ) -> Result<(Self, Option<Self>), TypeError> {
-        // The composite contract preserves the requested output's member kind, which is an array here.
-        infer_member_cast_output_type(operation, input_types, |output| match output {
+        // Lift the complete declaration and supplied types so native and mixed casts share one inference contract.
+        let operation = CastOperation {
+            input_types: operation.input_types.iter().cloned().map(Into::into).collect(),
+            output_type: operation.output_type.clone().into(),
+            checked: operation.checked,
+        };
+        let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
+        let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
+        // The composite contract preserves the requested output's member kind.
+        let project = |output| match output {
             ArrayIrType::Array(output) => output,
             _ => unreachable!(),
-        })
+        };
+        Ok((project(output), interpreted.map(project)))
     }
 }
 
@@ -1715,11 +1727,20 @@ impl CastType for DimensionType {
         operation: &CastOperation<Self>,
         input_types: &[Self],
     ) -> Result<(Self, Option<Self>), TypeError> {
-        // The composite contract preserves the requested output's member kind, which is a dimension here.
-        infer_member_cast_output_type(operation, input_types, |output| match output {
+        // Lift the complete declaration and supplied types so native and mixed casts share one inference contract.
+        let operation = CastOperation {
+            input_types: operation.input_types.iter().cloned().map(Into::into).collect(),
+            output_type: operation.output_type.clone().into(),
+            checked: operation.checked,
+        };
+        let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
+        let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
+        // The composite contract preserves the requested output's member kind.
+        let project = |output| match output {
             ArrayIrType::Dimension(output) => output,
             _ => unreachable!(),
-        })
+        };
+        Ok((project(output), interpreted.map(project)))
     }
 }
 
@@ -1734,163 +1755,132 @@ impl CastType for ArrayIrType {
             (Self::Array(input), Self::Array(output)) => {
                 // Admission above guarantees that the declared first input has the supplied input's member kind.
                 let Self::Array(declared) = &operation.input_types[0] else { unreachable!() };
-                validate_array_cast_types(declared, input, output)?;
+                // Arrays preserve their value properties and static extents. Layout and explicit placement may change,
+                // while auto/manual placement, manual variation, and reduction state remain constrained.
+                if declared.unreduced_axes() != input.unreduced_axes()
+                    || declared.reduced_axes() != input.reduced_axes()
+                {
+                    return Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` supplied input changes the declared reduction state",
+                    )));
+                }
+                if input.data_type() != output.data_type()
+                    || input.rank() != output.rank()
+                    || input.memory() != output.memory()
+                    || input.unreduced_axes() != output.unreduced_axes()
+                    || input.reduced_axes() != output.reduced_axes()
+                    || input.shape().dimensions().iter().zip(output.shape().dimensions()).any(|(input, output)| {
+                        matches!(
+                            (input, output),
+                            (Dimension::Static(input), Dimension::Static(output)) if input != output,
+                        )
+                    })
+                {
+                    return Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` cannot convert type `{input}` to unrelated type `{output}`",
+                    )));
+                }
+                // These are semantic dependencies, not optional placement constraints. An absent sharding is invariant,
+                // and changing variation requires the corresponding operation (whose transpose performs the required
+                // reduction).
+                if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[declared, input]).is_err() {
+                    return Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` supplied input changes the declared manual variation",
+                    )));
+                }
+                if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[input, output]).is_err() {
+                    return Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` cannot change varying manual axes; use `parallel_vary` to add \
+                         variation or a reduction to remove it",
+                    )));
+                }
+                // Placement follows the rules of `reshard`: the type system tracks placement over explicit mesh axes,
+                // so the output may request a new one, whereas placement over auto axes belongs to backend compilers
+                // and transitions over manual axes require manual collectives. The output therefore names the same auto
+                // and manual axes as the input on every dimension. Carrying them forward requests no redistribution,
+                // and an output without a sharding stays untracked rather than requesting replication.
+                if let Some(output_sharding) = output.sharding() {
+                    let named_axes = |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding
+                        .dimensions()[dimension]
+                    {
+                        ShardingDimension::Sharded(axis_names) => axis_names
+                            .iter()
+                            .filter(|name| sharding.mesh().axis_type(name) == Some(axis_type))
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
+                    };
+                    for (axis_type, remedy) in [
+                        (
+                            MeshAxisType::Auto,
+                            format!("use `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them"),
+                        ),
+                        (MeshAxisType::Manual, "use manual collectives for transitions over them".to_owned()),
+                    ] {
+                        if (0..output.rank()).any(|dimension| {
+                            named_axes(output_sharding, dimension, axis_type)
+                                != input
+                                    .sharding()
+                                    .map(|sharding| named_axes(sharding, dimension, axis_type))
+                                    .unwrap_or_default()
+                        }) {
+                            return Err(TypeError::invalid(format!(
+                                "`{CAST_OPERATION_NAME}` cannot change placement over {axis_type} mesh axes; {remedy}",
+                            )));
+                        }
+                    }
+                }
             }
             (Self::Dimension(input), Self::Dimension(output)) => {
                 if matches!((input.extent(), output.extent()), (Some(input), Some(output)) if input != output) {
-                    return Err(unrelated_cast_types(input, output));
+                    return Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                        input, output,
+                    )));
                 }
             }
-            _ => return Err(unrelated_cast_types(&input_types[0], &operation.output_type)),
-        }
-        let (dimensions, interpreted) = infer_cast_dimensions(
-            operation.input_types.iter().map(cast_ir_dimensions),
-            input_types.iter().map(cast_ir_dimensions),
-            cast_ir_dimensions(&operation.output_type),
-            &preserved,
-        )?;
-        // `validate_declaration` rejected reference types, and a dimension output has exactly one dimension.
-        let represent = |dimensions: Vec<Dimension>| match &operation.output_type {
-            Self::Array(output) => Self::Array(output.clone().with_shape(Shape::new(dimensions))),
-            Self::Dimension(_) => Self::Dimension(DimensionType::from(dimensions.into_iter().next().unwrap())),
-            Self::Reference(_) => unreachable!(),
-        };
-        Ok((represent(dimensions), interpreted.map(represent)))
-    }
-}
-
-/// Infers a native array or dimension cast through the composite type contract, keeping one implementation for
-/// homogeneous and mixed families. The requested output's member kind is preserved.
-fn infer_member_cast_output_type<T: Type + Into<ArrayIrType>>(
-    operation: &CastOperation<T>,
-    input_types: &[T],
-    project: impl Fn(ArrayIrType) -> T,
-) -> Result<(T, Option<T>), TypeError> {
-    let operation = CastOperation {
-        input_types: operation.input_types.iter().cloned().map(Into::into).collect(),
-        output_type: operation.output_type.clone().into(),
-        checked: operation.checked,
-    };
-    let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
-    let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
-    Ok((project(output), interpreted.map(project)))
-}
-
-/// Returns the dimensions of a composite cast input after reference types have been rejected.
-fn cast_ir_dimensions(r#type: &ArrayIrType) -> &[Dimension] {
-    match r#type {
-        ArrayIrType::Array(r#type) => r#type.shape().dimensions(),
-        ArrayIrType::Dimension(r#type) => std::slice::from_ref(r#type.dimension()),
-        ArrayIrType::Reference(_) => unreachable!(),
-    }
-}
-
-/// Returns the diagnostic for incompatible cast types.
-fn unrelated_cast_types(input: &impl Display, output: &impl Display) -> TypeError {
-    TypeError::invalid(format!("`{CAST_OPERATION_NAME}` cannot convert type `{input}` to unrelated type `{output}`"))
-}
-
-/// Validates input admission, value-preserving array properties and directly contradictory static axes. Layout and
-/// placement over explicit mesh axes may change, while placement over auto and manual mesh axes, manual variation
-/// and reduction state must remain unchanged.
-fn validate_array_cast_types(declared: &ArrayType, input: &ArrayType, output: &ArrayType) -> Result<(), TypeError> {
-    if declared.unreduced_axes() != input.unreduced_axes() || declared.reduced_axes() != input.reduced_axes() {
-        return Err(TypeError::invalid(format!(
-            "`{CAST_OPERATION_NAME}` supplied input changes the declared reduction state",
-        )));
-    }
-    if input.data_type() != output.data_type()
-        || input.rank() != output.rank()
-        || input.memory() != output.memory()
-        || input.unreduced_axes() != output.unreduced_axes()
-        || input.reduced_axes() != output.reduced_axes()
-        || input.shape().dimensions().iter().zip(output.shape().dimensions()).any(|(input, output)| {
-            matches!((input, output), (Dimension::Static(input), Dimension::Static(output)) if input != output)
-        })
-    {
-        return Err(unrelated_cast_types(input, output));
-    }
-    // These are semantic dependencies, not optional placement constraints. An absent sharding is invariant, and
-    // changing variation requires the corresponding operation (whose transpose performs the required reduction).
-    if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[declared, input]).is_err() {
-        return Err(TypeError::invalid(format!(
-            "`{CAST_OPERATION_NAME}` supplied input changes the declared manual variation",
-        )));
-    }
-    if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[input, output]).is_err() {
-        return Err(TypeError::invalid(format!(
-            "`{CAST_OPERATION_NAME}` cannot change varying manual axes; use `parallel_vary` to add variation \
-             or a reduction to remove it",
-        )));
-    }
-    // Placement follows the rules of `reshard`: the type system tracks placement over explicit mesh axes, so the
-    // output may request a new one, whereas placement over auto axes belongs to backend compilers and transitions
-    // over manual axes require manual collectives. The output therefore names the same auto and manual axes as the
-    // input on every dimension. Carrying them forward requests no redistribution, and an output without a sharding
-    // stays untracked rather than requesting replication.
-    if let Some(output_sharding) = output.sharding() {
-        let named_axes =
-            |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding.dimensions()[dimension] {
-                ShardingDimension::Sharded(axis_names) => axis_names
-                    .iter()
-                    .filter(|name| sharding.mesh().axis_type(name) == Some(axis_type))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
-            };
-        for (axis_type, remedy) in [
-            (MeshAxisType::Auto, format!("use `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them")),
-            (MeshAxisType::Manual, "use manual collectives for transitions over them".to_owned()),
-        ] {
-            if (0..output.rank()).any(|dimension| {
-                named_axes(output_sharding, dimension, axis_type)
-                    != input.sharding().map(|sharding| named_axes(sharding, dimension, axis_type)).unwrap_or_default()
-            }) {
+            _ => {
                 return Err(TypeError::invalid(format!(
-                    "`{CAST_OPERATION_NAME}` cannot change placement over {axis_type} mesh axes; {remedy}",
+                    "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                    &input_types[0], &operation.output_type,
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-/// Solves all dimension relationships of a cast in one set of scoped classes. Input and output declarations share the
-/// declared scope; supplied inputs share the actual scope. The output observes the same first actual input as the
-/// source declaration, but its per-axis comparisons admit conditional narrowing and differently bounded identities.
-fn infer_cast_dimensions<'o>(
-    declared: impl Iterator<Item = &'o [Dimension]>,
-    actual: impl Iterator<Item = &'o [Dimension]>,
-    output: &'o [Dimension],
-    preserved_identities: &[DimensionVariable],
-) -> Result<(Vec<Dimension>, Option<Vec<Dimension>>), TypeError> {
-    let declared = declared.collect::<Vec<_>>();
-    let actual = actual.collect::<Vec<_>>();
-    let mut facts = declared
-        .iter()
-        .zip(&actual)
-        .flat_map(|(declared, actual)| {
-            declared.iter().zip(actual.iter()).flat_map(|(declared, actual)| {
-                DimensionRefinements::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+        // Solve all dimensions together: input and output declarations share the declared scope, and supplied inputs
+        // share the actual scope. The output observes the first actual input, admitting conditional narrowing and
+        // differently bounded identities without changing the meaning of a shared declared name.
+        let declared = operation.input_types.iter().map(ArrayIrType::dimensions).collect::<Vec<_>>();
+        let actual = input_types.iter().map(ArrayIrType::dimensions).collect::<Vec<_>>();
+        let output = operation.output_type.dimensions();
+        let mut facts = declared
+            .iter()
+            .zip(&actual)
+            .flat_map(|(declared, actual)| {
+                declared.iter().zip(actual.iter()).flat_map(|(declared, actual)| {
+                    DimensionRefinements::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+                })
             })
-        })
-        .collect::<Vec<_>>();
-    for (declared, actual) in output.iter().zip(actual[0]) {
-        // A singleton output declaration supplies an exact fact even when actual types no longer carry its name.
-        if let Dimension::Dynamic(variable) = declared
-            && let Some(extent) = variable.bounds().extent()
-        {
-            facts.push(Ok(DimensionRefinementFact::Declared(variable, extent)));
-        }
-        match (declared, actual) {
-            (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) => {
-                facts.push(Ok(DimensionRefinementFact::Correspondence(declared, actual)));
+            .collect::<Vec<_>>();
+        for (declared, actual) in output.iter().zip(actual[0]) {
+            // A singleton output declaration supplies an exact fact even when actual types no longer carry its name.
+            if let Dimension::Dynamic(variable) = declared
+                && let Some(extent) = variable.bounds().extent()
+            {
+                facts.push(Ok(DimensionRefinementFact::Declared(variable, extent)));
             }
-            (Dimension::Static(_), Dimension::Dynamic(_)) => {
-                // Reversing ordinary refinement admits narrowing to a static axis. Its extent belongs to the
-                // supplied source variable, so retain the actual scope when recording that fact.
-                facts.extend(
-                    DimensionRefinements::refinement_facts(actual, declared, DimensionComparison::LocalDeclarations)
+            match (declared, actual) {
+                (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) => {
+                    facts.push(Ok(DimensionRefinementFact::Correspondence(declared, actual)));
+                }
+                (Dimension::Static(_), Dimension::Dynamic(_)) => {
+                    // Reversing ordinary refinement admits narrowing to a static axis. Its extent belongs to the
+                    // supplied source variable, so retain the actual scope when recording that fact.
+                    facts.extend(
+                        DimensionRefinements::refinement_facts(
+                            actual,
+                            declared,
+                            DimensionComparison::LocalDeclarations,
+                        )
                         .map(|fact| {
                             fact.map(|fact| match fact {
                                 DimensionRefinementFact::Declared(variable, extent) => {
@@ -1899,108 +1889,115 @@ fn infer_cast_dimensions<'o>(
                                 _ => unreachable!(),
                             })
                         }),
-                );
+                    );
+                }
+                _ => facts.extend(DimensionRefinements::refinement_facts(
+                    declared,
+                    actual,
+                    DimensionComparison::LocalDeclarations,
+                )),
             }
-            _ => facts.extend(DimensionRefinements::refinement_facts(
-                declared,
-                actual,
-                DimensionComparison::LocalDeclarations,
-            )),
         }
-    }
-    let refinements = DimensionRefinements::from_refinement_facts(facts)?;
-    for class in refinements.identity_classes() {
-        // Every identity class has at least one member, so the maximal lower bound exists.
-        let lower = class
-            .declared()
-            .iter()
-            .chain(class.actual())
-            .map(|variable| variable.bounds().lower())
-            .max()
-            .unwrap();
-        if class
-            .declared()
-            .iter()
-            .chain(class.actual())
-            .any(|variable| variable.bounds().upper().is_some_and(|upper| upper <= lower))
-        {
-            return Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` cannot equate dimensions with disjoint bounds: {}",
-                class
-                    .declared()
-                    .iter()
-                    .chain(class.actual().iter().filter(|variable| !class.declared().contains(variable)))
-                    .map(|variable| format!("`{variable}` ∈ {}", variable.bounds()))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )));
-        }
-    }
-    // A formal identity may be the same object as an unrelated actual identity. Preserve its name only when
-    // its scoped correspondence reaches that actual identity; otherwise resolve its own class below.
-    let preserved_identities = preserved_identities
-        .iter()
-        .filter(|variable| {
-            refinements
-                .identity_classes()
-                .any(|class| class.declared().contains(variable) && class.actual().contains(variable))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    // Full cast inference has validated compatibility. Ordinary refinement of shapes alone now distinguishes
-    // relationships already proven by the supplied types from conditional equalities that need a runtime check. Layout
-    // and sharding are intentionally absent: changing them adds no runtime shape constraint.
-    let proof_declarations = std::iter::once(output)
-        .chain(declared.iter().copied())
-        .flatten()
-        .cloned()
-        .map(DimensionType::from)
-        .collect::<Vec<_>>();
-    let proof_actual = std::iter::once(actual[0])
-        .chain(actual.iter().copied())
-        .flatten()
-        .cloned()
-        .map(DimensionType::from)
-        .collect::<Vec<_>>();
-    // The complete scoped signature proves equality when every occurrence observes an already equal actual
-    // dimension. A consistent formal-to-actual renaming does not require an additional runtime check. Ordinary
-    // refinement does not admit a conditional relationship at all (e.g., a supplied `n` against a requested static
-    // extent), so a failure here means that the relationship needs a runtime check, not that it is contradictory:
-    // contradictions were rejected by the scoped facts above.
-    let proven = match DimensionTypeRefinements::new(&proof_declarations, &proof_actual) {
-        Ok(proof) => proof.identities_needing_runtime_checks().is_empty(),
-        Err(_) => false,
-    };
-    let actual_identities = actual
-        .iter()
-        .flat_map(|dimensions| dimensions.iter())
-        .filter_map(Dimension::variable)
-        .cloned()
-        .collect::<Vec<_>>();
-    let output: Vec<_> = output
-        .iter()
-        .map(|dimension| {
-            let refined = refinements.refine_declared_dimension(dimension, &preserved_identities);
-            if let Dimension::Dynamic(variable) = &refined
-                && !actual_identities.contains(variable)
+        let refinements = DimensionRefinements::from_refinement_facts(facts)?;
+        for class in refinements.identity_classes() {
+            // Every identity class has at least one member, so the maximal lower bound exists.
+            let lower = class
+                .declared()
+                .iter()
+                .chain(class.actual())
+                .map(|variable| variable.bounds().lower())
+                .max()
+                .unwrap();
+            if class
+                .declared()
+                .iter()
+                .chain(class.actual())
+                .any(|variable| variable.bounds().upper().is_some_and(|upper| upper <= lower))
             {
-                let represented = refinements.retype_actual_dimension(dimension, &refined, &actual_identities);
-                if let Dimension::Dynamic(variable) = &represented
+                return Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` cannot equate dimensions with disjoint bounds: {}",
+                    class
+                        .declared()
+                        .iter()
+                        .chain(class.actual().iter().filter(|variable| !class.declared().contains(variable)))
+                        .map(|variable| format!("`{variable}` ∈ {}", variable.bounds()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            }
+        }
+        // A formal identity may be the same object as an unrelated actual identity. Preserve its name only when its
+        // scoped correspondence reaches that actual identity; otherwise resolve its own class below.
+        let preserved_identities = preserved
+            .iter()
+            .filter(|variable| {
+                refinements
+                    .identity_classes()
+                    .any(|class| class.declared().contains(variable) && class.actual().contains(variable))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Full cast inference has validated compatibility. Ordinary refinement of shapes alone now distinguishes
+        // relationships already proven by the supplied types from conditional equalities that need a runtime check.
+        // Layout and sharding are intentionally absent: changing them adds no runtime shape constraint.
+        let proof_declarations = std::iter::once(output)
+            .chain(declared.iter().copied())
+            .flatten()
+            .cloned()
+            .map(DimensionType::from)
+            .collect::<Vec<_>>();
+        let proof_actual = std::iter::once(actual[0])
+            .chain(actual.iter().copied())
+            .flatten()
+            .cloned()
+            .map(DimensionType::from)
+            .collect::<Vec<_>>();
+        // The complete scoped signature proves equality when every occurrence observes an already equal actual
+        // dimension. A consistent formal-to-actual renaming does not require an additional runtime check. Ordinary
+        // refinement does not admit a conditional relationship at all (e.g., a supplied `n` against a requested static
+        // extent), so a failure here means that the relationship needs a runtime check, not that it is contradictory:
+        // contradictions were rejected by the scoped facts above.
+        let proven = match DimensionTypeRefinements::new(&proof_declarations, &proof_actual) {
+            Ok(proof) => proof.identities_needing_runtime_checks().is_empty(),
+            Err(_) => false,
+        };
+        let actual_identities = actual
+            .iter()
+            .flat_map(|dimensions| dimensions.iter())
+            .filter_map(Dimension::variable)
+            .cloned()
+            .collect::<Vec<_>>();
+        let dimensions: Vec<_> = output
+            .iter()
+            .map(|dimension| {
+                let refined = refinements.refine_declared_dimension(dimension, &preserved_identities);
+                if let Dimension::Dynamic(variable) = &refined
                     && !actual_identities.contains(variable)
                 {
-                    return Err(TypeError::invalid(format!(
-                        "`{CAST_OPERATION_NAME}` output identity `{variable}` has no compatible \
-                         supplied input identity",
-                    )));
+                    let represented = refinements.retype_actual_dimension(dimension, &refined, &actual_identities);
+                    if let Dimension::Dynamic(variable) = &represented
+                        && !actual_identities.contains(variable)
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{CAST_OPERATION_NAME}` output identity `{variable}` has no compatible \
+                             supplied input identity",
+                        )));
+                    }
+                    Ok(represented)
+                } else {
+                    Ok(refined)
                 }
-                Ok(represented)
-            } else {
-                Ok(refined)
-            }
-        })
-        .collect::<Result<_, _>>()?;
-    let interpreted = proven.then(|| output.clone());
-    Ok((output, interpreted))
+            })
+            .collect::<Result<_, _>>()?;
+        let interpreted = proven.then(|| dimensions.clone());
+        // `validate_declaration` rejected reference types, and a dimension output has exactly one dimension.
+        let represent = |dimensions: Vec<Dimension>| match &operation.output_type {
+            Self::Array(output) => Self::Array(output.clone().with_shape(Shape::new(dimensions))),
+            Self::Dimension(_) => Self::Dimension(DimensionType::from(dimensions.into_iter().next().unwrap())),
+            Self::Reference(_) => unreachable!(),
+        };
+        Ok((represent(dimensions), interpreted.map(represent)))
+    }
 }
 
 /// Represents the ability to return a value at a different but related type representation, through a [`CastOperation`]
@@ -4369,10 +4366,34 @@ mod tests {
             assert_eq!(infer(&reduced, &plain, &reduced), Err(reduction.clone()));
             assert_eq!(infer(&varying, &plain, &plain), Err(variation_change.clone()));
             assert_eq!(infer(&plain, &varying, &varying), Err(variation_change.clone()));
-            assert_eq!(infer(&unreduced, &plain, &plain), Err(unrelated_cast_types(&plain, &unreduced)));
-            assert_eq!(infer(&plain, &unreduced, &unreduced), Err(unrelated_cast_types(&unreduced, &plain)));
-            assert_eq!(infer(&reduced, &plain, &plain), Err(unrelated_cast_types(&plain, &reduced)));
-            assert_eq!(infer(&plain, &reduced, &reduced), Err(unrelated_cast_types(&reduced, &plain)));
+            assert_eq!(
+                infer(&unreduced, &plain, &plain),
+                Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                    &plain, &unreduced,
+                )))
+            );
+            assert_eq!(
+                infer(&plain, &unreduced, &unreduced),
+                Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                    &unreduced, &plain,
+                )))
+            );
+            assert_eq!(
+                infer(&reduced, &plain, &plain),
+                Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                    &plain, &reduced,
+                )))
+            );
+            assert_eq!(
+                infer(&plain, &reduced, &reduced),
+                Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                    &reduced, &plain,
+                )))
+            );
         }
 
         // The composite universe applies the same rules to its array members.
@@ -4386,7 +4407,10 @@ mod tests {
             CastOperation::<ArrayIrType>::unchecked(plain.clone().into(), vec![reduced.clone().into()])
                 .unwrap()
                 .infer_output_types(&[reduced.clone().into()], &[]),
-            Err(unrelated_cast_types(&reduced, &plain)),
+            Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                &reduced, &plain,
+            ))),
         );
     }
 
@@ -7615,7 +7639,10 @@ mod tests {
                         &constructor(output.clone(), vec![array.clone()]).unwrap(),
                         std::slice::from_ref(&array),
                     ),
-                    Err(unrelated_cast_types(&array, &output)),
+                    Err(TypeError::invalid(format!(
+                        "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                        &array, &output,
+                    ))),
                 );
             }
             let operation = constructor(symbolic.clone(), vec![exact(2), symbolic.clone()]).unwrap();
@@ -7697,7 +7724,11 @@ mod tests {
                 &CastOperation::checked(DimensionType::from(Dimension::Static(3)), vec![dimension.clone()]).unwrap(),
                 std::slice::from_ref(&dimension),
             ),
-            Err(unrelated_cast_types(&dimension, &DimensionType::from(Dimension::Static(3)))),
+            Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
+                &dimension,
+                &DimensionType::from(Dimension::Static(3))
+            ))),
         );
         assert_eq!(
             DimensionType::infer_cast_output_type(

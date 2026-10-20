@@ -44,6 +44,18 @@ pub enum ArrayIrType {
 }
 
 impl ArrayIrType {
+    /// Returns the [`Dimension`]s described by this [`ArrayIrType`] (i.e., the shape dimensions of an array or
+    /// reference referent, or the single dimension represented by a first-class [`DimensionType`]). Stored dimension
+    /// identities are preserved even when their bounds determine an exact extent.
+    #[inline]
+    pub(crate) fn dimensions(&self) -> &[Dimension] {
+        match self {
+            Self::Array(r#type) => r#type.shape().dimensions(),
+            Self::Dimension(r#type) => std::slice::from_ref(r#type.dimension()),
+            Self::Reference(r#type) => r#type.referent().shape().dimensions(),
+        }
+    }
+
     /// Projects a run of explicit extent input types into the [`Dimension`]s they define, in input order.
     ///
     /// Mixed shape-carrying operations derive their result shape from exactly this projection, so every mixed inference
@@ -754,6 +766,23 @@ mod tests {
                 std::slice::from_ref(&unrelated),
             ),
             Ok(()),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_dimensions() {
+        let dimension = DimensionType::new("n", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimensions = vec![Dimension::Static(2), dimension.simplified_dimension()];
+        let array = ArrayType::new(F32, Shape::new(dimensions.clone()));
+        assert_eq!(ArrayIrType::Array(array.clone()).dimensions(), dimensions.as_slice());
+        assert_eq!(ArrayIrType::Dimension(dimension.clone()).dimensions(), std::slice::from_ref(dimension.dimension()));
+        assert_eq!(ArrayIrType::Reference(ReferenceType::new(array)).dimensions(), dimensions.as_slice());
+        assert_eq!(ArrayIrType::Array(ArrayType::scalar(F32)).dimensions(), &[]);
+        let fixed = DimensionType::new("fixed", DimensionBounds::new(3, Some(4)).unwrap());
+        assert_eq!(ArrayIrType::Dimension(fixed.clone()).dimensions(), &[Dimension::Dynamic(fixed.to_variable())]);
+        assert_eq!(
+            ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3))).dimensions(),
+            &[Dimension::Static(3)],
         );
     }
 
