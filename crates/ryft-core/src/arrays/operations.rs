@@ -3649,10 +3649,9 @@ mod tests {
                 MemberKindSignature::KindPreserving,
             ),
             (
-                ArrayIrOperation::Cast(CastOperation::unchecked(
-                    dynamic_type.clone().into(),
-                    vec![dynamic_type.clone().into()],
-                )),
+                ArrayIrOperation::Cast(
+                    CastOperation::unchecked(dynamic_type.clone().into(), vec![dynamic_type.clone().into()]).unwrap(),
+                ),
                 MemberKindSignature::KindPreserving,
             ),
             (

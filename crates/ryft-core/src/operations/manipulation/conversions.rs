@@ -1275,8 +1275,6 @@ impl<T: Type> CastOperation<T> {
         Self::bind_unchecked(context.tangent(), tangent, &witnesses, tangent_type)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Binds a checked [`CastOperation`] in `context`, capturing the current types of `value` and `witnesses` as its
     /// declaration. Relationships already proven by those types normalize to unchecked casts before binding, while
     /// conditional relationships retain their ordered check. Witness producers remain explicit dependencies.
@@ -1311,7 +1309,7 @@ impl<T: Type> CastOperation<T> {
         Self::unchecked(output_type, input_types)?.bind(context, value, witnesses)
     }
 
-    /// Binds this prepared cast in `context`, preserving witnesses and validating an unchecked identity before
+    /// Binds this [`CastOperation`] in `context`, preserving witnesses and validating an unchecked identity before
     /// returning its input directly. The context's operation family owns validation, so unchecked transformation
     /// helpers need no additional type-family bounds.
     fn bind<C: Context<Type = T, Operation: From<Self>>>(
@@ -1334,24 +1332,16 @@ impl<T: Type> CastOperation<T> {
         Ok(outputs.remove(0))
     }
 
-    /// Validates operation structure before delegating the complete cast contract to its type trait.
-    fn validate_structure(&self, input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> Result<(), TypeError> {
-        check_count!("input", input_types, self.input_types.len(), TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-        Ok(())
-    }
-
-    /// Returns the inferred output type for direct interpretation over values of the supplied `input_types`, after
-    /// proving the complete relationship in both modes. Concrete extents complete the proof, whereas symbolic
-    /// relationships that still need a runtime check are rejected with [`ProgramError::Concretization`], since an
-    /// interpreter has no check to run. Backends that interpret casts eagerly (e.g., first-class dimension casts) use
-    /// this instead of [`Operation::infer_output_types`] so that they never skip a required check.
+    /// Returns the inferred output type for direct interpretation over values of the supplied `input_types`,
+    /// after proving the complete relationship in both modes. Concrete extents complete the proof, whereas symbolic
+    /// relationships that still need a runtime check are rejected with [`ProgramError::Concretization`], since direct
+    /// interpretation cannot emit a deferred runtime check.
     ///
     /// # Parameters
     ///
     ///   - `input_types`: Types of the value followed by its witnesses.
     ///   - `region_interfaces`: Interfaces of the attached regions, which must be empty.
-    pub fn infer_interpreted_output_type(
+    fn infer_interpreted_output_type(
         &self,
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
@@ -1359,7 +1349,8 @@ impl<T: Type> CastOperation<T> {
     where
         T: CastType,
     {
-        self.validate_structure(input_types, region_interfaces)?;
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
         let (_, interpreted) = T::infer_cast_output_type(self, input_types)?;
         interpreted.ok_or_else(|| ProgramError::Concretization {
             message: format!(
@@ -1390,7 +1381,8 @@ impl<T: CastType> Operation for CastOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        self.validate_structure(input_types, region_interfaces)?;
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
         let (output, _) = T::infer_cast_output_type(self, input_types)?;
         Ok(vec![output])
     }
@@ -1400,8 +1392,10 @@ impl<T: CastType> Operation for CastOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
-        self.validate_structure(input_types, region_interfaces)?;
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
         let (_, interpreted) = T::infer_cast_output_type(self, input_types)?;
+
         // Witnesses can carry the check that justifies a transform's cast. Keep their producers as explicit value
         // dependencies even when the returned representation is unchanged.
         Ok((input_types.len() == 1 && interpreted.as_ref() == Some(&input_types[0]))
@@ -1461,6 +1455,7 @@ impl<C: Domain<Type: CastType, Value: Cast<C::Type>>> InterpretableOperation<C> 
         if inputs.len() == 1 && inputs[0].r#type().as_ref() == &output_type {
             return Ok(vec![inputs[0].clone()]);
         }
+
         // The complete original declaration has been proven. Materialize the requested representation once;
         // the value capability retains every witness producer, including for an unchanged representation.
         Ok(vec![inputs[0].cast_unchecked(output_type, &inputs[1..])?])
@@ -1487,6 +1482,8 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>> Partia
         )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
     for CastOperation<C::Type>
@@ -1588,7 +1585,9 @@ where
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_structure(&input_types, &driver.regions().map(|region| region.interface()).collect::<Vec<_>>())?;
+        let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
+        check_count!("input", input_types, self.input_types.len(), TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
         let (_, interpreted) = T::infer_cast_output_type(self, &input_types)?;
         if self.checked && inputs.iter().any(PartialValue::is_unknown) && interpreted.is_none() {
             let missing = if inputs[0].is_unknown() { "value" } else { "witnesses" };

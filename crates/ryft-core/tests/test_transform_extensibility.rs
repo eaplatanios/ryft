@@ -181,7 +181,7 @@ fn test_direct_dispatch_value_implements_domain_binding_capabilities_directly() 
 #[test]
 fn test_cast_type_root_export() {
     let input = ArrayType::scalar(DataType::F32);
-    let operation = CastOperation::checked(input.clone(), vec![input.clone()]);
+    let operation = CastOperation::checked(input.clone(), vec![input.clone()]).unwrap();
     assert_eq!(
         ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&input)),
         Ok((input.clone(), Some(input.clone()))),
@@ -241,7 +241,7 @@ fn test_external_cast_type_owns_inference() {
         }
     }
 
-    let operation = CastOperation::checked(ExternalCastType, vec![ExternalCastType, ExternalCastType]);
+    let operation = CastOperation::checked(ExternalCastType, vec![ExternalCastType, ExternalCastType]).unwrap();
     assert_eq!(operation.infer_output_types(&[ExternalCastType, ExternalCastType], &[]), Ok(vec![ExternalCastType]));
     assert_eq!(INFERENCES.load(Ordering::Relaxed), 1);
     // The primitive owns the arity diagnostic for every family through `validate_declaration`.
@@ -249,15 +249,14 @@ fn test_external_cast_type_owns_inference() {
         ExternalCastType::infer_cast_output_type(&operation, &[ExternalCastType]),
         Err(TypeError::invalid("expected 2 inputs but got 1")),
     );
-    // The primitive enforces its nonempty input structure before delegating to an independent type family.
+    // Constructors reject a missing value without invoking the independent type family's inference.
     assert_eq!(
-        CastOperation::checked(ExternalCastType, Vec::new()).infer_output_types(&[], &[]),
+        CastOperation::checked(ExternalCastType, Vec::new()),
+        Err(TypeError::invalid("`cast` requires a declared first input type")),
+    );
+    assert_eq!(
+        CastOperation::unchecked(ExternalCastType, Vec::new()),
         Err(TypeError::invalid("`cast` requires a declared first input type")),
     );
     assert_eq!(INFERENCES.load(Ordering::Relaxed), 2);
-    assert_eq!(
-        ExternalCastType::infer_cast_output_type(&CastOperation::checked(ExternalCastType, Vec::new()), &[]),
-        Err(TypeError::invalid("`cast` requires a declared first input type")),
-    );
-    assert_eq!(INFERENCES.load(Ordering::Relaxed), 3);
 }

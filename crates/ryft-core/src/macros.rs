@@ -1,4 +1,5 @@
-/// Checks that `values` contains exactly `expected` entries and, if not, returns an error of the specified type.
+/// Checks that `values` contains exactly `expected` entries and, if not, returns an error of the specified type
+/// converted into the enclosing function's error type.
 #[macro_export]
 macro_rules! check_count {
     // This branch reports a program input-count mismatch with the dedicated input error variant.
@@ -36,7 +37,7 @@ macro_rules! check_count {
             let count = values.len();
             let descriptor = $descriptor;
             let noun = if expected == 1 { descriptor.to_string() } else { format!("{descriptor}s") };
-            return Err($crate::TypeError::invalid(format!("expected {expected} {noun} but got {count}")));
+            return Err($crate::TypeError::invalid(format!("expected {expected} {noun} but got {count}")).into());
         }
     }};
 }
@@ -6184,6 +6185,14 @@ mod tests {
             check_count!("input", values, expected, TypeError);
             Ok(())
         };
+        let check_program_input_types = |values: &[usize]| -> Result<(), ProgramError> {
+            check_count!("input", values, 1, TypeError);
+            Ok(())
+        };
+        let check_differentiation_input_types = |values: &[usize]| -> Result<(), DifferentiationError> {
+            check_count!("input", values, 1, TypeError);
+            Ok(())
+        };
         assert_eq!(check_input(&[0]), Ok(()));
         assert_eq!(check_input(&[]), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }));
         assert_eq!(check_output(&[0, 1]), Ok(()));
@@ -6200,6 +6209,16 @@ mod tests {
         assert_eq!(check_input_types(&[0], 1), Ok(()));
         assert_eq!(check_input_types(&[], 1), Err(TypeError::invalid("expected 1 input but got 0".to_string())),);
         assert_eq!(check_input_types(&[0], 2), Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),);
+        assert_eq!(check_program_input_types(&[0]), Ok(()));
+        assert_eq!(
+            check_program_input_types(&[]),
+            Err(ProgramError::Type(TypeError::invalid("expected 1 input but got 0"))),
+        );
+        assert_eq!(check_differentiation_input_types(&[0]), Ok(()));
+        assert_eq!(
+            check_differentiation_input_types(&[]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid("expected 1 input but got 0")))),
+        );
     }
 
     #[test]
