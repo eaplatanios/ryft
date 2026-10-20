@@ -2066,8 +2066,6 @@ impl CastType for ArrayIrType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to return a value at a different but related type representation, through a [`CastOperation`]
 /// (e.g., an `f32[n]` value whose runtime extent is 2 as `f32[2]`, or an `f32[2]` value as `f32[n]` next to a witness
 /// of type `f32[n]`). The value at the output type and the witnesses at their own types must satisfy every relationship
@@ -2081,9 +2079,6 @@ impl CastType for ArrayIrType {
 /// identities. Host dimension results reject array witnesses that their member context cannot resolve as constants; use
 /// a composite context to retain staged dependencies or observe backend completion. [`cast`](Self::cast) checks the
 /// relationship in staged and compiled programs too, whereas [`cast_unchecked`](Self::cast_unchecked) assumes it there.
-///
-/// Casting is not elementwise: each value has its own output type and witnesses, so this capability applies to
-/// individual values rather than to [`Parameterized`](crate::parameters::Parameterized) structures.
 ///
 /// Placement over explicit mesh axes may change under the rules of [`Reshard`](crate::Reshard), whereas placement
 /// over auto and manual mesh axes is preserved (refer to [`CastOperation`]). The XLA backend requires finite dimension
@@ -2120,13 +2115,13 @@ pub trait Cast<T = <Self as Capability>::Universe>: Capability + Sized {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if the types are unrelated, the static types or the concrete values contradict the
-    /// relationship, or the cast cannot be applied in this value's context. A staged cast reports a violated
+    /// Returns a [`ProgramError`] if the types are unrelated, the static types or the concrete values contradict
+    /// the relationship, or the cast cannot be applied in this value's context. A staged cast reports a violated
     /// relationship when the program executes.
     fn cast(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError>;
 
-    /// Returns this value at `output_type` like [`Self::cast`], but through an unchecked [`CastOperation`]: staged and
-    /// compiled programs assume the relationship instead of checking it.
+    /// Returns this value at `output_type` like [`Self::cast`], but through an unchecked [`CastOperation`]. This is
+    /// because staged and compiled programs may assume the relationship instead of checking it.
     ///
     /// <div class="warning">
     ///
@@ -2146,8 +2141,6 @@ pub trait Cast<T = <Self as Capability>::Universe>: Capability + Sized {
     /// relationship, or the cast cannot be applied in this value's context.
     fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError>;
 }
-
-// TODO(eaplatanios): Review up to here.
 
 impl<
     T: CastType,
