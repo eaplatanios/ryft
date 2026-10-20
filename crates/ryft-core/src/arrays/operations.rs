@@ -993,7 +993,7 @@ mod tests {
         ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
         Typed, Value, ValueProjection,
     };
-    use crate::tests::{TestArrayOperation, hash_of};
+    use crate::tests::hash_of;
     use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_pullback_materializes_a_dynamic_zero_space_input_cotangent() {
+    fn test_composite_pullback_preserves_a_dynamic_zero_space_input_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let context = TracingContext::<TestValue, TestOperation>::new();
@@ -1547,10 +1547,11 @@ mod tests {
             context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![key, accumulator], ()).unwrap();
         let cotangent = context.input(ArrayType::scalar(DataType::F64).into());
 
-        // The compact pullback has no result slot for the key's zero differential space. Rebuilding the public result
-        // must use the key extent captured at linearization time rather than attempt a nullary dynamic zero.
+        // The compact pullback has no result slot for the key's zero differential space. The public result preserves
+        // that zero without capturing its extent or constructing an array.
         let cotangents = pullback.apply(cotangent).unwrap();
-        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
+        assert!(pullback.residuals().is_empty());
+        assert_eq!(cotangents[0], MaybeZero::Zero(ArrayIrType::Array(key_type.tangent().unwrap())));
         assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
     }
 
@@ -2839,7 +2840,7 @@ mod tests {
             .unwrap();
         let gradient = pullback.apply(ArrayIrValue::Array(Array::scalar(1.0_f64).unwrap())).unwrap();
         assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64).unwrap()));
-        assert_eq!(gradient, ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()));
+        assert_eq!(gradient, MaybeZero::Value(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())));
 
         // Transposing the raw, un-linearized call directly is still rejected, but now by the composite payload's own
         // non-transposable rule instead of by a projected adapter that never received its regions.
@@ -2899,7 +2900,7 @@ mod tests {
         assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap()));
         assert_eq!(
             pullback.apply(ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap())),
-            Ok(ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap())),
+            Ok(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap()))),
         );
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

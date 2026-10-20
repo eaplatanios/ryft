@@ -25,7 +25,7 @@
 //!     [`DifferentiableOperation::jvp_for_transpose`], then transposes that program to compute the Vector-Jacobian
 //!     Product (VJP). The default rule delegates to [`DifferentiableOperation::jvp`].
 //!   - [`DifferentiationBuilder::value_and_gradient`] and [`DifferentiationBuilder::gradient`] are scalar-output
-//!     conveniences that seed the pullback with one.
+//!     conveniences that seed the pullback with one and materialize structural-zero gradients from primal inputs.
 //!   - [`DifferentiationBuilder::jacobian_forward`] and [`DifferentiationBuilder::jacobian_reverse`] materialize
 //!     complete [`Jacobian`]s by batching coordinate directions through JVPs or pullbacks. Their relative cost depends
 //!     on the input and output coordinate counts.
@@ -123,8 +123,9 @@
 //! [`DifferentiableType`] may describe a tangent or cotangent space containing only zero. Such leaves remain present
 //! in public primal structures but need no Single Static Assignment (SSA) slots in linear tangent or pullback programs.
 //! Derivative entry points omit those internal slots, preserve their boundary positions as metadata, and reconstruct
-//! typed zeros when rebuilding public results. [`MaybeZero`] likewise lets operation rules propagate symbolic zeros
-//! without materializing arrays.
+//! typed zeros when rebuilding public results. Pullbacks preserve those leaves as [`MaybeZero::Zero`], and gradients
+//! materialize them from their primal inputs. [`MaybeZero`] also lets operation rules propagate symbolic zeros without
+//! materializing arrays.
 //!
 //! # Structural Transform Reuse
 //!
@@ -1000,7 +1001,9 @@ impl<Input, ContextState>
     /// the standard JVP rule while overrides can select independent residuals and backward implementations.
     /// [`TransposableOperation`] rules transpose the resulting derivative program in reverse data flow order.
     /// The returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
-    /// arguments and reconstructs the structured input cotangents. Callers only provide output cotangents.
+    /// arguments and reconstructs the structured input cotangents as [`MaybeZero`] leaves. Disconnected inputs
+    /// return structural zeros without retaining extent residuals. Callers that need concrete values can use
+    /// [`Pullback::apply_materialized`] with their primal inputs.
     ///
     /// # Parameters
     ///
@@ -1042,6 +1045,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// validates complex input and output types but cannot prove the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
     ///
+    /// Structural-zero gradients become concrete values using the corresponding primal inputs as extent sources.
     /// Reference inputs return ordinary gradients with respect to their initial contents. The primal runs once,
     /// preserving mutations, and each invocation uses fresh zero cotangent references that are frozen before return.
     /// Refer to the module's [reference gradient contract](self#gradients-of-reference-inputs) for an example and to
@@ -1746,7 +1750,9 @@ impl<Input, Capture, ContextState>
     /// For `y = f(x; c)`, this returns `f(x; c)` and the reusable map `ȳ ↦ x̄ = (∂f/∂x)(x; c)ᵀ · ȳ`. Reverse mode
     /// selects [`DifferentiableOperation::jvp_for_transpose`] and transposes the active derivative carrier. Captures
     /// may remain among the residuals closed over by the [`Pullback`], but callers provide only output cotangents and
-    /// receive cotangents only for `x`; no capture cotangent tree is constructed.
+    /// receive [`MaybeZero`] cotangents only for `x`; no capture cotangent tree is constructed. Disconnected leaves
+    /// remain structural zeros. [`Pullback::apply_materialized`] uses the caller's primal inputs when concrete
+    /// cotangents are required.
     ///
     /// The active primal tree, not the capture tree, must contain at least one leaf.
     ///
@@ -2864,7 +2870,7 @@ mod tests {
             .vjp(|input, scale| Ok(input * scale))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
-        assert_eq!(pullback.apply(Array::scalar(2.0).unwrap()).unwrap().to_f64s(), vec![6.0]);
+        assert_eq!(pullback.apply_materialized(Array::scalar(2.0).unwrap(), &primal).unwrap().to_f64s(), vec![6.0]);
 
         // Scalar-gradient projection returns no gradient leaf for the capture.
         let (value, gradient) = differentiate_at(primal)

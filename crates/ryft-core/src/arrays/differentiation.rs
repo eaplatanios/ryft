@@ -204,17 +204,17 @@ where
 /// only values in scope there are the region's residual inputs. [`ExactShape`] is that plan, containing one
 /// [`ExactShapeDimension`] per axis, referring to static extents directly and to dynamic extents by residual slot
 /// index. It is produced by [`LinearResiduals::retain_shape`] next to the residual list that gives those indices
-/// meaning during rule staging or by [`Self::for_residual_zero`] when planning disconnected-cotangent zeros, and
-/// consumed inside regions after the primal trace is out of reach.
+/// meaning during rule staging or by [`Self::for_residual_zero`] when planning zeros required inside a region.
+/// Consumers that own primal extent sources can also use the plan to materialize structural zeros locally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactShape(Vec<ExactShapeDimension>);
 
 impl ExactShape {
     /// Builds the canonical [`ExactShape`] plan for constructing a zero of [`Shape`] `shape` without any surrounding
     /// [`LinearResiduals`] list, and returns it together with the source axes a caller must read to populate those
-    /// residuals. This is the planning half of the disconnected-cotangent protocol shared by [`ResidualZeroProvider`]
-    /// and the dynamic-zero constructors: when a pullback input receives no cotangent, its zero must still be
-    /// materialized with the primal input's exact runtime extents. Residual slots are assigned by first axis
+    /// residuals. [`ResidualZeroProvider`] and dynamic-zero constructors use this plan when a consumer needs a value,
+    /// such as a reference accumulator allocation or a dense region boundary. Disconnected pullback results remain
+    /// structural zeros until their consumer supplies an extent source. Residual slots are assigned by first axis
     /// occurrence, and repeated uses of one dimension identity reuse the same slot, preserving equality between axes
     /// without retaining duplicate scalar values. The returned list contains one `(axis, variable)` entry per distinct
     /// dynamic identity, in slot order, telling the caller which source axis to read (e.g., with
@@ -563,7 +563,7 @@ mod tests {
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiableType, ReverseModeDifferentiate};
+    use crate::differentiation::{DifferentiableType, ReverseModeDifferentiate, TransposedProgramCotangent};
     use crate::parameters::Placeholder;
     use crate::programs::ReferenceType;
 
@@ -900,75 +900,132 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
+    fn test_array_ir_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(
             DataType::F8E8M0FNU,
             Shape::new(vec![extent_type.dimension().clone(), extent_type.dimension().clone()]),
         );
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        builder.add_input(dynamic_type.into());
+        builder.add_input(dynamic_type.clone().into());
         let scalar = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![scalar],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder; 2],
                 vec![Placeholder],
             )
             .unwrap();
-
-        // The dynamic input is disconnected from the output, so linearization retains its observed extent as one
-        // ordinary residual and the pullback feeds that residual to the mixed zero constructor.
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 1);
-        assert!(matches!(
-            linearization.primal().instructions().last().unwrap().operation(),
-            ArrayIrOperation::DimensionSize(_)
-        ));
-        let pullback = linearization.pullback().unwrap().into_program();
-        let zero = pullback.instructions().last().unwrap();
-        assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
-        assert_eq!(zero.inputs(), &[AtomId::new(1), AtomId::new(1)]);
+        assert_eq!(linearization.residual_count(), 0);
+        assert!(linearization.primal().instructions().is_empty());
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
         assert_eq!(
-            pullback.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
-            ]),
+            pullback.program().to_string(),
+            indoc! {"
+            lambda %0:f64[] .
+            in (%0)
+        "}
+            .trim_end()
+        );
+        let outputs = pullback.program().interpret(vec![ArrayIrValue::Array(Array::scalar(2f64).unwrap())]).unwrap();
+        assert_eq!(
+            pullback.assemble_cotangents(
+                &[dynamic_type.cotangent().unwrap().into(), ArrayType::scalar(DataType::F64).into()],
+                outputs,
+            ),
             Ok(vec![
-                ArrayIrValue::Array(Array::matrix(3, 3, vec![0.0_f32; 9]).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
+                Some(MaybeZero::Zero(dynamic_type.cotangent().unwrap().into())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(2f64).unwrap()))),
             ]),
         );
     }
 
     #[test]
-    fn test_array_ir_nested_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
+    fn test_array_ir_nested_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F64);
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dynamic = context.input(dynamic_type.clone().into());
         let scalar = context.input(scalar_type.clone().into());
-
-        // Value-level reverse mode runs inside the outer trace. It saves only the disconnected array's extent,
-        // and the reusable pullback consumes that dimension residual through the mixed zero constructor.
-        let (_, pullback) =
-            context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
-        assert_eq!(pullback.residuals().len(), 1);
-        assert!(matches!(pullback.residuals()[0].r#type().as_ref(), ArrayIrType::Dimension(_)));
-        let transposed = pullback
-            .linear_program()
-            .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
-            .unwrap()
-            .into_program();
-        let zero = transposed.instructions().last().unwrap();
-        assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
-        assert_eq!(zero.inputs(), &[AtomId::new(1)]);
-
+        let primals = vec![dynamic, scalar];
+        let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), primals.clone(), ()).unwrap();
+        assert!(pullback.residuals().is_empty());
+        let transposed = pullback.transposed_program(&[]).unwrap();
+        assert!(transposed.program().instructions().is_empty());
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
         let cotangent = context.input(scalar_type.into());
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
-        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(dynamic_type.cotangent().unwrap()));
-        assert_eq!(cotangents[1].r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type.cotangent().unwrap().into()));
+        assert!(context.builder().borrow().instructions().is_empty());
+        let materialized = pullback.materialize_cotangents(cotangents, &primals).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                materialized.iter().map(|value| value.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f8e8m0fnu[extent], %1:f64[], %2:f64[] .
+            let %3:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
+                %4:f32[extent] = zero [type=f32[extent]] %3
+            in (%4, %2)
+        "}
+            .trim_end()
+        );
+    }
+
+    #[test]
+    fn test_array_nested_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let dynamic = context.input(dynamic_type.clone());
+        let scalar = context.input(scalar_type.clone());
+        let primals = vec![dynamic, scalar];
+        let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), primals.clone(), ()).unwrap();
+        assert!(pullback.residuals().is_empty());
+        let cotangent = context.input(scalar_type);
+        let cotangents = pullback.apply(vec![cotangent]).unwrap();
+        assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type));
+        assert!(context.builder().borrow().instructions().is_empty());
+        let materialized = pullback.materialize_cotangents(cotangents, &primals).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                materialized.iter().map(|value| value.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[extent], %1:f64[], %2:f64[] .
+            let %3:f32[extent] = zero_like %0
+            in (%3, %2)
+        "}
+            .trim_end()
+        );
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![1f32, 2f32, 3f32]).unwrap(),
+                Array::scalar(7f64).unwrap(),
+                Array::scalar(2f64).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![0f32; 3]).unwrap(), Array::scalar(2f64).unwrap()])
+        );
     }
 
     #[test]

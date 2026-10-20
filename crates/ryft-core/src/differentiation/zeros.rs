@@ -13,18 +13,16 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///
 /// # Why this Protocol Exists
 ///
-/// Differentiation is the one transform that must synthesize values with no data edge to derive them from. For
-/// example, transposition is *defined* to return a cotangent for every differentiated input, including inputs that are
-/// disconnected from every output, and the mathematically determined value for such an input is a zero of its cotangent
-/// type. For a static type this is easy as [`OperationProvider::provide`] constructs the zero from the type, with no
-/// instruction inputs. For a type with dynamic axes it is impossible as a [`Type`] carries only dimension _identities_
-/// and bounds, never defining values, and so the zero operation needs one explicit dimension input per dynamic axis.
-/// Also, the value that could supply those dimension inputs (i.e., the primal program input that the cotangent
-/// corresponds to) is _not an input of the pullback program_ where the zero must be staged. The only moment both the
-/// required zero type and its dimensions are in scope is during linearization, and so the required extents must be
-/// captured then and threaded to transposition as ordinary residuals. This trait is that capture/spend contract,
-/// expressed once per operation _family_. It is a set of associated functions with no receiver (i.e., `self` argument),
-/// because it is invoked precisely when no [`Operation`](crate::Operation) instance exists.
+/// Structural zeros carry only their [`Type`] while they flow through differentiation and cross pullback boundaries.
+/// A disconnected input cotangent therefore needs no executable output or saved primal extent. The consumer that
+/// owns an extent source materializes it when a concrete value is required: scalar gradients use their primal input,
+/// and region boundaries use live cotangents or known dimensions when their signatures require concrete zeros.
+///
+/// Dynamic array types carry dimension identities and bounds, rather than defining runtime extents. Constructing a
+/// zero of such a type can therefore require explicit extent inputs. This trait declares those inputs and obtains
+/// them from values in scope. Reference transposition also uses the protocol to retain allocation shapes, including
+/// dimensions hidden by a live view. Forward-mode output tangents retain their own zero-space reconstruction data.
+/// The associated functions have no receiver because no zero operation exists until the values have been gathered.
 ///
 /// The provider itself need not be an operation. Its emitted family is [`OperationProvider::Operation`], which fixes
 /// the operation type of every builder, context, and assembled zero in the protocol. This separates residual semantics
@@ -36,30 +34,23 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///
 /// The protocol has three steps, executed by the differentiation machinery rather than by implementors:
 ///
-///   1. **Declare:** When linearization finds a differentiated input whose cotangent will be disconnected, it calls
-///      [`Self::zero_residual_types`] with the zero's type to learn which residual values the eventual zero needs
-///      (e.g., one first-class dimension per *distinct* dynamic identity for a composite array type, and nothing for
-///      a static type).
-///   2. **Capture:** While the primal value is still in scope, linearization records those residuals from it.
-///      [`Self::capture_zero_residuals`] stages the reads into the program being built (i.e., the program-level
-///      [`Program::linearize`](crate::Program::linearize) path), and [`Self::capture_zero_residual_values`] is its
-///      value-level counterpart for
-///      reusable derivative callables that close over concrete or tracer values. Program transposition appends captured
-///      residuals to its ordinary trailing residual suffix. Reusable callables retain boundary-reconstruction residuals
-///      beside that executable program.
-///   3. **Spend:** [`Self::zero_operation_with_residuals`] assembles the zero operation and its inputs from the
-///      captured residuals. Callers then stage that operation inside a pullback program or bind it in the originating
-///      [`Context`] of a reusable value-level derivative callable.
+///   1. **Declare:** A consumer that needs a concrete zero calls [`Self::zero_residual_types`] with the zero's type
+///      to learn its residual signature (e.g., one first-class dimension per distinct dynamic identity for a composite
+///      array type, and nothing for a static type).
+///   2. **Capture:** While an extent source is in scope, [`Self::capture_zero_residuals`] stages reads into a program
+///      builder and [`Self::capture_zero_residual_values`] obtains the corresponding values in a context. Forward
+///      linearization retains these values only for concrete output tangents and reference allocation shapes.
+///   3. **Spend:** [`Self::zero_operation_with_residuals`] assembles a zero operation and its inputs from the captured
+///      values. Consumers bind it in their context or stage it inside a region whose boundary requires a value.
 ///
 /// The three steps must agree on residual count and order. Every mismatch is a loud typed error (the capture sites
 /// validate against the declared types, and the spend site validates the residual count), never a silently wrong-shaped
 /// zero.
 ///
-/// [`Self::materialize_zero_from_residual_sources`] runs the same three steps at a transform _boundary_, where the
-/// primal that pinned a zero's extents is out of scope and the named quantities must instead be gathered one at a time
-/// from the peers that are (i.e., live sibling cotangents, known inputs, and first-class dimension inputs). It replaces
-/// the exemplar-matching materialization that structural zeros previously used, which could only construct a zero whose
-/// type some live value reproduced exactly and therefore rejected every widened differential representation.
+/// [`Self::materialize_zero_from_residual_sources`] performs these steps together from values already available to
+/// the consumer. A gradient supplies its primal leaf; region transposition may instead supply live sibling cotangents,
+/// known inputs, or first-class dimensions. Composite families can gather each required extent from a different
+/// source, including for cotangent representations whose complete type differs from the primal type.
 ///
 /// # Who Implements It
 ///
@@ -107,9 +98,9 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
 
     /// Captures the residual values declared by [`Self::zero_residual_types`] from the primal value `source`
     /// in a live `context`, returning them in declaration order. This is the value-level counterpart of
-    /// [`Self::capture_zero_residuals`] used by reusable pullback callables, whose captured residuals are
-    /// concrete values or tracers closed over by the callable rather than atoms of a program under construction. The
-    /// default resolves each declared residual independently through [`Self::capture_zero_residual_value`], which lets
+    /// [`Self::capture_zero_residuals`] used by reusable derivative callables, whose captured residuals are concrete
+    /// values or tracers closed over by the callable rather than atoms of a program under construction. The default
+    /// resolves each declared residual independently through [`Self::capture_zero_residual_value`], which lets
     /// operation families implement one identity-directed value-level capture primitive. Input-free families declare
     /// no residuals and therefore return an empty list without consulting `source`.
     fn capture_zero_residual_values<C: Context<Type = T, Operation = Self::Operation>>(
@@ -305,9 +296,6 @@ pub(crate) fn capture_and_validate_zero_residual_values<
 /// Role of a differential boundary whose zero-space leaves are reconstructed by [`ZeroSpaceBoundaryReconstruction`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ZeroSpaceBoundaryRole {
-    /// Cotangents of the primal input boundary, returned by a _pullback_ function.
-    InputCotangent,
-
     /// Tangents of the primal output boundary, returned by a _pushforward_ function.
     OutputTangent,
 }
@@ -317,7 +305,6 @@ impl ZeroSpaceBoundaryRole {
     #[inline]
     fn differential_type<T: DifferentiableType>(self, primal_type: &T) -> Result<T, DifferentiationError> {
         match self {
-            Self::InputCotangent => primal_type.cotangent(),
             Self::OutputTangent => primal_type.tangent(),
         }
     }
@@ -325,7 +312,6 @@ impl ZeroSpaceBoundaryRole {
     /// Returns the concise description of this [`ZeroSpaceBoundaryRole`] to be used in diagnostics.
     const fn as_str(self) -> &'static str {
         match self {
-            Self::InputCotangent => "input cotangent boundary",
             Self::OutputTangent => "output tangent boundary",
         }
     }
@@ -491,9 +477,9 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// reconstruction does not read the primal values.
     ///
     /// Unlike [`Self::rebuild`], the `reconstruct` callback decides whether a non-zero-space leaf consumes a program
-    /// output and what value to return for it. For example, a pullback can consume an output for an ordinary input but
-    /// return [`None`] without consuming an output for an ignored reference input. The returned vector contains one
-    /// callback result per boundary leaf. Any check for unused program outputs remains the caller's responsibility.
+    /// output and what value to return for it. A consumer can skip an inactive output without consuming a compact
+    /// program result. The returned vector contains one callback result per boundary leaf. Any check for unused
+    /// program outputs remains the caller's responsibility.
     ///
     /// # Parameters
     ///
@@ -785,7 +771,7 @@ mod tests {
             &context,
             primal_values.as_slice(),
             primal_types.as_slice(),
-            ZeroSpaceBoundaryRole::InputCotangent,
+            ZeroSpaceBoundaryRole::OutputTangent,
         )
         .unwrap();
 
@@ -851,18 +837,11 @@ mod tests {
             )),
         );
 
-        // The input-cotangent role independently identifies an excessive compact-program result.
-        let input_cotangent = ZeroSpaceBoundaryReconstruction::capture(
-            &context,
-            std::slice::from_ref(&primal),
-            std::slice::from_ref(&primal_type),
-            ZeroSpaceBoundaryRole::InputCotangent,
-        )
-        .unwrap();
+        // The stored output-tangent role also identifies an excessive compact-program result.
         assert_eq!(
-            input_cotangent.rebuild(&context, [Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()]),
+            output_tangent.rebuild(&context, [Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()]),
             Err(ProgramError::MalformedProgram(
-                "input cotangent boundary produced too many nonzero differential values".to_string(),
+                "output tangent boundary produced too many nonzero differential values".to_string(),
             )),
         );
     }
