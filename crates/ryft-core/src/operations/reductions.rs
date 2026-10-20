@@ -528,6 +528,18 @@ where
         // tells a deliberate consumption apart from a silently dropped extent.
         check_count!("input", inputs, 1, ProgramError);
         let Some(batch_axis) = inputs[0].batch_axis_position() else {
+            // A replicated input is reduced once and shared by every batch item, bypassing masking of reduced
+            // ragged axes, preservation of surviving ones, and evidence of consumed extents, so ragged carriers
+            // are unsupported.
+            if let Some(ragged_axis) = inputs[0].ragged_axes().first() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{}` does not support replicated inputs with bounded ragged dimension `{}`",
+                        self.name(),
+                        ragged_axis.dimension(),
+                    ),
+                });
+            }
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
 
@@ -548,6 +560,23 @@ where
 
         let input = &inputs[0];
         let reduced_axes = operation.axes();
+        for (&axis, &lifted_axis) in self.axes.iter().zip(reduced_axes) {
+            // Removing a packed axis over which per-item extents vary would make the surviving ragged metadata index
+            // an unrelated axis. Such nested extent coordinates cannot be represented by `RaggedAxis::reduced`.
+            if let Some(ragged_axis) =
+                input.ragged_axes().iter().find(|ragged_axis| ragged_axis.extent_axes().contains(&lifted_axis))
+            {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{}` does not support reducing axis {}, over which the per-item extents of bounded \
+                         ragged dimension `{}` vary",
+                        self.name(),
+                        axis,
+                        ragged_axis.dimension(),
+                    ),
+                });
+            }
+        }
 
         // The consumed extents are collected from the unmasked input, because masking rewrites the payload while
         // leaving in place the ragged metadata that the validation boundary is told about.
@@ -2307,8 +2336,9 @@ impl Array {
 /// in the per-item coordinate system, so it shifts past the inserted batch axis, and the output batch axis moves down
 /// by one when the reduced axis precedes it, because the output drops that axis. Padding along a bounded ragged reduced
 /// axis is replaced by `identity` before the reduction, which consumes that axis and is reported as the
-/// [`BatchedOutputs`] evidence, while every other ragged axis survives onto the output. A batch item
-/// whose ragged extent along the reduced axis is zero has no live elements and produces index zero.
+/// [`BatchedOutputs`] evidence, while every other ragged axis survives onto the output. A batch item whose ragged
+/// extent along the reduced axis is zero has no live elements and produces index zero. Replicated ragged inputs and
+/// reduced axes over which per-item extents vary are rejected, as in the [`ReduceOperation`] rule.
 fn batch_index_reduction<
     C: Context<Type = ArrayType>,
     P: RaggedArrayExtentBatchingPolicy<C>,
@@ -2323,15 +2353,42 @@ fn batch_index_reduction<
 ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
     check_count!("input", inputs, 1, ProgramError);
     let Some(batch_axis) = inputs[0].batch_axis_position() else {
+        // A replicated input is reduced once and shared by every batch item, bypassing masking of reduced ragged
+        // axes, preservation of surviving ones, and evidence of consumed extents, so ragged carriers are unsupported.
+        if let Some(ragged_axis) = inputs[0].ragged_axes().first() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{}` does not support replicated inputs with bounded ragged dimension `{}`",
+                    operation_fn(axis).name(),
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
         return Ok(operation_fn(axis).interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
     };
 
     let lifted_axis = if axis < batch_axis { axis } else { axis + 1 };
     let output_axis = if axis < batch_axis { batch_axis - 1 } else { batch_axis };
 
+    // Removing a packed axis over which per-item extents vary would make the surviving ragged metadata index
+    // an unrelated axis. Such nested extent coordinates cannot be represented by `RaggedAxis::reduced`.
+    let input = &inputs[0];
+    if let Some(ragged_axis) =
+        input.ragged_axes().iter().find(|ragged_axis| ragged_axis.extent_axes().contains(&lifted_axis))
+    {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{}` does not support reducing axis {}, over which the per-item extents of bounded \
+                 ragged dimension `{}` vary",
+                operation_fn(axis).name(),
+                axis,
+                ragged_axis.dimension(),
+            ),
+        });
+    }
+
     // The consumed extents are collected from the unmasked input, because masking rewrites the payload while leaving
     // in place the ragged metadata that the validation boundary is told about.
-    let input = &inputs[0];
     let consumed_ragged_dimensions = input
         .ragged_axes()
         .iter()
@@ -2380,7 +2437,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, differentiate_at};
@@ -2883,6 +2940,81 @@ mod tests {
                 Ok((vec![ArrayBatch::new(expected, BatchAxis::new(0)).unwrap()], vec![length.clone()])),
             );
         }
+    }
+
+    #[test]
+    fn test_reduce_batching_nested_extent_axes() {
+        // The per-item extents of `length` vary over the batch axis and over the per-item row axis 0 (i.e., packed
+        // `[2 batch, 2 row, 2 other, 3 length]`). Removing the row axis would leave metadata that indexes an unrelated
+        // surviving axis, which is the nested-coordinates limitation of ragged batching, so reducing it is rejected,
+        // whether or not the ragged axis itself is reduced too.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let extents = Array::matrix(2, 2, vec![1i64, 3, 3, 1]).unwrap();
+        let input = ArrayBatch::new(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 2, 3]), &[1f32; 24]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(3, extents.clone(), length.clone(), vec![0, 1])])
+        .unwrap();
+        for axes in [vec![0], vec![0, 2]] {
+            assert_eq!(
+                ReduceOperation::new(axes, ReductionKind::Sum)
+                    .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
+                    .map(BatchedOutputs::into_parts),
+                Err(BatchingError::UnsupportedOperation {
+                    message: "`reduce` does not support reducing axis 0, over which the per-item extents of bounded \
+                              ragged dimension `length` vary"
+                        .to_string(),
+                }),
+            );
+        }
+
+        // Reducing an axis that the extents do not vary over keeps the ragged axis and its extents.
+        assert_eq!(
+            ReduceOperation::new(vec![1], ReductionKind::Sum)
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(BatchedOutputs::into_parts),
+            Ok((
+                vec![
+                    ArrayBatch::new(
+                        Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 3]), &[2f32; 12]).unwrap(),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap()
+                    .with_ragged_axes(vec![RaggedAxis::new(2, extents, length, vec![0, 1])])
+                    .unwrap(),
+                ],
+                Vec::new(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_reduce_batching_rejects_replicated_ragged_inputs() {
+        // A replicated ragged input (e.g., the output of a ragged `parallel_reduce`) would be reduced once, without
+        // masking its padding or accounting for its ragged axis, so it is rejected with an exact error.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayBatch::replicated(Array::vector(vec![2.0f32, 1.0, 0.0]).unwrap())
+            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i64).unwrap(), length, Vec::new())])
+            .unwrap();
+        assert_eq!(
+            ReduceOperation::new(vec![0], ReductionKind::Sum)
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(BatchedOutputs::into_parts),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`reduce` does not support replicated inputs with bounded ragged dimension `length`"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -4561,6 +4693,53 @@ mod tests {
                 vec![ArrayBatch::new(Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap()],
                 vec![length],
             )),
+        );
+    }
+
+    #[test]
+    fn test_argmax_batching_ragged_unsupported_inputs() {
+        // Index reductions share the reduction rule's exact errors: reducing an axis over which per-item extents vary
+        // (here, packed `[2 batch, 2 row, 3 length]` with extents over the batch and row axes) and reducing a
+        // replicated ragged input are both rejected.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let nested = ArrayBatch::new(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 3]), &[1f32; 12]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(
+            2,
+            Array::matrix(2, 2, vec![1i64, 3, 3, 1]).unwrap(),
+            length.clone(),
+            vec![0, 1],
+        )])
+        .unwrap();
+        assert_eq!(
+            ArgMaxOperation::new(0, DataType::I32)
+                .batch(&context, &EmptyRegionDriver, &[nested])
+                .map(BatchedOutputs::into_parts),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`argmax` does not support reducing axis 0, over which the per-item extents of bounded \
+                          ragged dimension `length` vary"
+                    .to_string(),
+            }),
+        );
+
+        let replicated = ArrayBatch::replicated(Array::vector(vec![2.0f32, 1.0, 0.0]).unwrap())
+            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i64).unwrap(), length, Vec::new())])
+            .unwrap();
+        assert_eq!(
+            ArgMaxOperation::new(0, DataType::I32)
+                .batch(&context, &EmptyRegionDriver, &[replicated])
+                .map(BatchedOutputs::into_parts),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`argmax` does not support replicated inputs with bounded ragged dimension `length`"
+                    .to_string(),
+            }),
         );
     }
 
