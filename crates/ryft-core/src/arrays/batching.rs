@@ -22,7 +22,9 @@
 //       coordinates and aligned by the per-item dimensions they vary over, capacity per carrier axis, dependency
 //       transport through a trailing guard or witness casts) had to be hand-coded against metadata, and the code kept
 //       growing with each contract. The guard rule rejects such carriers through `reject_ragged_carriers` (in the
-//       crate-level `batching` module).
+//       crate-level `batching` module). The cast rule rejects them through the declaration lifting in this module:
+//       `ArrayBatch::batched_declaration` for the homogeneous policies and `ArrayIrBatchingPolicy::batched_type` for
+//       the composite policy.
 //    2. Nested batching: extents that vary over more than the batch axis (an outer batch axis, a scan position, or
 //       another ragged axis). Metadata needs explicit coordinates for them (`extent_axes`), and every rule that moves
 //       axes must translate them; the removed implementation did so and was its main source of defects.
@@ -2808,6 +2810,24 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
         input: &Self::Batch,
         declared: &ArrayIrType,
     ) -> Result<ArrayIrType, BatchingError> {
+        // A bounded ragged carrier keeps its per-item extents outside its packed type, whether it is mapped or
+        // replicated, so no lifted declaration can relate them. Reject it before the replicated shortcut, which would
+        // otherwise let an operation read the padded storage as data, exactly as `ArrayBatch::batched_declaration`
+        // does for the homogeneous policies.
+        if !input.ragged_axes().is_empty() {
+            if let (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) =
+                (declared, <Self as BatchingPolicy<C>>::unbatched_type(input).as_ref())
+                && !declared.shape().is_refined_by(actual.shape())
+            {
+                return Err(
+                    TypeError::invalid(format!("type {actual} does not refine declared type {declared}")).into()
+                );
+            }
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("cannot batch ragged array type `{declared}`"),
+            });
+        }
+
         let Some(axis) = input.batch_axis_position() else {
             return Ok(declared.clone());
         };
@@ -2816,20 +2836,12 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
             ArrayIrType::Dimension(dimension) => dimension.simplified_dimension(),
             _ => return Err(TypeError::invalid("batch extent must be a dimension").into()),
         };
-        let actual = input.value().r#type();
-        if !input.ragged_axes().is_empty()
-            && let (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) =
-                (declared, <Self as BatchingPolicy<C>>::unbatched_type(input).as_ref())
-            && !declared.shape().is_refined_by(actual.shape())
-        {
-            return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")).into());
-        }
 
-        match (declared, actual.as_ref()) {
-            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if input.ragged_axes().is_empty() => {
+        match (declared, input.value().r#type().as_ref()) {
+            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
                 Ok(declared.batched_declaration(actual, axis, &extent, context.axis_sharding())?.into())
             }
-            (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) if input.ragged_axes().is_empty() => {
+            (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) => {
                 // A mapped reference carries its batch axis in its referent, whose shape the operation relates.
                 Ok(ReferenceType::new(declared.referent().batched_declaration(
                     actual.referent(),
@@ -7657,6 +7669,69 @@ pub(crate) mod tests {
         let input = ArrayIrBatch::new(parent.input(packed.clone().into()), BatchAxis::new(0)).unwrap();
         assert_eq!(ArrayIrBatchingPolicy::batched_type(&context, &input, &declared.into()), Ok(packed.into()));
         assert!(parent.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_batched_type_ragged() {
+        // A bounded ragged carrier keeps its per-item extents outside its packed type, so no lifted declaration can
+        // relate them. Replicated and mapped carriers are rejected alike, exactly as the homogeneous policy rejects
+        // them, rather than returning a declaration that would read the padded storage as data.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ConstantOperation<ArrayIrValue<Array>>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let declared = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let other = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "other",
+                DimensionBounds::new(0, Some(4)).unwrap(),
+            ))]),
+        );
+        let ragged = Err(BatchingError::UnsupportedOperation {
+            message: "cannot batch ragged array type `f32[length]`".to_owned(),
+        });
+        let replicated = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 99.0]).unwrap()))
+            .with_ragged_axes(vec![RaggedAxis::new(
+                0,
+                ArrayIrValue::Array(Array::scalar(2_i32).unwrap()),
+                length.clone(),
+                vec![],
+            )])
+            .unwrap();
+        assert_eq!(ArrayIrBatchingPolicy::batched_type(&context, &replicated, &declared.clone().into()), ragged);
+        let mapped = ragged_batch(
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            &length,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ArrayIrBatchingPolicy::batched_type(&context, &mapped, &declared.clone().into()), ragged);
+
+        // A declaration that the carrier's per-item type does not refine is a type error, which takes precedence.
+        for input in [&replicated, &mapped] {
+            assert_eq!(
+                ArrayIrBatchingPolicy::batched_type(&context, input, &other.clone().into()),
+                Err(TypeError::invalid("type f32[length] does not refine declared type f32[other]").into()),
+            );
+        }
+
+        // A mapped first-class dimension carries no ragged axes but holds its per-item extents in its packed value,
+        // which no lifted declaration can describe either.
+        let dimension = ArrayIrBatch::mapped_dimension(
+            ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            BatchAxis::new(0),
+            DimensionType::from(length.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            ArrayIrBatchingPolicy::batched_type(&context, &dimension, &DimensionType::from(length).into()),
+            Err(BatchingError::UnsupportedOperation {
+                message: "cannot batch mapped member type `dimension<length ∈ [0, 4)>`".to_owned(),
+            }),
+        );
     }
 
     #[test]

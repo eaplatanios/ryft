@@ -645,7 +645,7 @@ impl Broadcast for ArrayType {
             }
         }
 
-        validate_broadcast_output_layout(&output_type)?;
+        output_type.validate_layout()?;
         Ok(output_type)
     }
 }
@@ -1858,7 +1858,7 @@ fn infer_explicit_broadcast_output_type(
         output_type = output_type.with_layout(layout.clone());
     }
 
-    validate_broadcast_output_layout(&output_type)?;
+    output_type.validate_layout()?;
     Ok(output_type)
 }
 
@@ -1945,30 +1945,6 @@ fn validate_broadcast_output_axes(
         mapped[output_axis] = true;
     }
     Ok(mapped)
-}
-
-/// Validates broadcast storage metadata using known lower bounds for dynamic extents. Runtime extents can expose
-/// additional stride aliasing or storage overflow, which interpretation validates against the resolved extents.
-fn validate_broadcast_output_layout(output_type: &ArrayType) -> Result<(), TypeError> {
-    if output_type.layout().is_some() {
-        let dimensions = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| match dimension {
-                Dimension::Static(extent) => *extent,
-                Dimension::Dynamic(variable) => variable.bounds().lower(),
-            })
-            .collect::<Vec<_>>();
-        ArrayAddressing::new(
-            output_type.clone().with_shape(Shape::new(dimensions.into_iter().map(Dimension::Static).collect())),
-        )
-        .map_err(|error| match error {
-            ProgramError::Type(error) => error,
-            error => TypeError::invalid(error.to_string()),
-        })?;
-    }
-    Ok(())
 }
 
 /// Lifts an explicit homogeneous broadcast output `layout` across a batch axis of static size `axis_size` inserted at
@@ -5545,28 +5521,6 @@ mod tests {
                  strided layout's byte offsets",
                 isize::MAX as usize + 1,
             ))),
-        );
-    }
-
-    #[test]
-    fn test_validate_broadcast_output_layout() {
-        assert_eq!(validate_broadcast_output_layout(&ArrayType::new_static(DataType::F32, [3])), Ok(()));
-        assert_eq!(
-            validate_broadcast_output_layout(
-                &ArrayType::new_static(DataType::F32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![8]))),
-            ),
-            Ok(()),
-        );
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(5)).unwrap());
-        assert_eq!(
-            validate_broadcast_output_layout(
-                &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
-                    .with_layout(Layout::Strided(StridedLayout::new(vec![2]))),
-            ),
-            Err(TypeError::invalid(
-                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and \
-                 may alias array elements",
-            )),
         );
     }
 }

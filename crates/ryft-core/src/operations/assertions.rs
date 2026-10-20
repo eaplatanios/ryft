@@ -1403,8 +1403,6 @@ impl<V: Value<Type = ArrayType>> BatchedAssertion<V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onward.
-
 /// Canonical operation name for [`GuardOperation`].
 pub const GUARD_OPERATION_NAME: &str = "guard";
 
@@ -1507,37 +1505,25 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///
 /// # Example
 ///
+/// Two inputs declared as `f32[n]` must have equal lengths. Binding the guard checks that relationship and returns
+/// the inputs on success:
+///
 /// ```rust
 /// # use ryft_core::{
-/// #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-/// #     DimensionType, DimensionValue, GuardOperation, Operation, Placeholder, ProgramBuilder, ProgramError,
-/// #     Shape,
+/// #     Array, ArrayType, Context, DataType, DimensionBounds, DimensionType,
+/// #     GuardOperation, ProgramError, Shape, Value,
 /// # };
 /// # fn main() -> Result<(), ProgramError> {
-/// let n = DimensionType::new("n", DimensionBounds::positive(Some(8))?);
-/// let declared: Vec<ArrayIrType> =
-///     vec![n.clone().into(), ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into()];
-/// let m = DimensionType::new("m", DimensionBounds::positive(Some(8))?);
-/// let actual: Vec<ArrayIrType> = vec![m.into(), ArrayType::new_static(DataType::F32, [2]).into()];
-/// let (guard, members) = GuardOperation::for_entry("region", &declared, &actual)?.unwrap();
-/// assert_eq!(members, vec![0, 1]);
-/// assert_eq!(
-///     guard.infer_output_types(&actual, &[])?,
-///     vec![DimensionType::from(Dimension::Static(2)).into(), actual[1].clone()],
-/// );
+/// let n = DimensionType::new("n", DimensionBounds::unbounded());
+/// let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+/// let guard = GuardOperation::new("same_length", vec![vector_type.clone(), vector_type]);
 ///
-/// let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-/// let inputs = actual.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-/// builder.add_instruction(guard, Vec::new(), inputs, None)?;
-/// let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-///     Vec::new(),
-///     vec![Placeholder; 2],
-///     Vec::new(),
-/// )?;
-/// let two = ArrayIrValue::Array(Array::vector(vec![1f32; 2])?);
-/// let dimension = |extent: usize| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
-/// assert_eq!(program.interpret(vec![dimension(2), two.clone()]), Ok(Vec::new()));
-/// assert!(program.interpret(vec![dimension(5), two]).is_err());
+/// let two = Array::vector(vec![1f32, 2.])?;
+/// let three = Array::vector(vec![1f32, 2., 3.])?;
+/// let context = two.domain();
+/// let equal_lengths = vec![two.clone(), two.clone()];
+/// assert_eq!(context.bind(guard.clone(), Vec::new(), &equal_lengths)?, equal_lengths);
+/// assert!(context.bind(guard, Vec::new(), &[two, three]).is_err());
 /// # Ok(())
 /// # }
 /// ```
@@ -1559,6 +1545,8 @@ pub struct GuardOperation<T: Type> {
     /// replaces those inputs with ordinary values.
     reference_anchor_inputs: Vec<usize>,
 }
+
+// TODO(eaplatanios): Review from here onward.
 
 impl<T: Type> GuardOperation<T> {
     /// Creates a new [`GuardOperation`] that checks its inputs against `declared_types`, using `boundary` as the

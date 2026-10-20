@@ -690,21 +690,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        // Manual dimension ownership belongs to region boundaries. Local operations may change variation through
-        // collectives, but must not manufacture a global placement that lowering would silently strip away.
-        if output_types.iter().filter_map(ArrayType::sharding).any(|sharding| {
-            sharding.dimensions().iter().any(|dimension| match dimension {
-                ShardingDimension::Sharded(axes) => {
-                    axes.iter().any(|axis| lowerer.collective_state.bound_manual_axes.contains(axis))
-                }
-                _ => false,
-            })
-        }) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` cannot assign bound manual mesh axes to local output dimensions", self.name()),
-            }
-            .into());
-        }
+        // The placement of local outputs is validated by the enclosing family (refer to `XlaOperation::lower`).
         lower_operation_variants!(
             self, ArrayOperation, lowerer, input_values, input_types, output_types;
             Zero, ZeroLike, One, OneLike, Constant, Iota, Min, Max, Clamp, Sign, Neg, Add, Sub, Mul, Div, Rem, Pow, Sqrt,
@@ -743,6 +729,12 @@ impl LowerableOperation for XlaOperation {
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        // Every variant, including the projected array operations, has its local output placement validated here
+        // exactly once. A nested `shard_map` instead validates its boundary specifications against the enclosing
+        // manual axes itself, reporting the more specific `ShardMapError::SpecificationNamesEnclosingManualAxis`.
+        if !matches!(self, Self::ShardMap(_)) {
+            validate_local_output_placement(self.name(), output_types, &lowerer.collective_state.bound_manual_axes)?;
+        }
         lower_operation_variants!(
             self, XlaOperation, lowerer, input_values, input_types, output_types;
             Kernel,
@@ -789,6 +781,36 @@ impl LowerableOperation for XlaOperation {
             ShardMap => boxed,
         )
     }
+}
+
+/// Rejects array `output_types` of the operation named `operation_name` that shard a local dimension over one of the
+/// `bound_manual_axes` of the enclosing manual regions. Manual dimension ownership belongs to region boundaries: local
+/// operations may change manual variation through collectives, but must not manufacture a global placement, which
+/// lowered sharding constraints would otherwise silently strip (refer to `lower_sharding_constraint`). First-class
+/// dimensions and references carry no placement of their own.
+fn validate_local_output_placement(
+    operation_name: &str,
+    output_types: &[ArrayIrType],
+    bound_manual_axes: &[String],
+) -> Result<(), LoweringError> {
+    let assigns_bound_manual_axis = output_types
+        .iter()
+        .filter_map(|output_type| match output_type {
+            ArrayIrType::Array(output_type) => output_type.sharding(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+        })
+        .flat_map(Sharding::dimensions)
+        .any(|dimension| match dimension {
+            ShardingDimension::Sharded(axes) => axes.iter().any(|axis| bound_manual_axes.contains(axis)),
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+        });
+    if assigns_bound_manual_axis {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!("`{operation_name}` cannot assign bound manual mesh axes to local output dimensions"),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Module-scoped lowering state shared across nested regions. StableHLO collectives use the channel counter and the

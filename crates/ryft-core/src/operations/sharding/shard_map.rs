@@ -5159,8 +5159,8 @@ mod tests {
     use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex,
-        ArraySliceAxis, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Memory, MeshAxis,
-        TiledLayout,
+        ArraySliceAxis, DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable,
+        Memory, MeshAxis, TiledLayout,
     };
     use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingLevelExtent, batch};
@@ -5183,7 +5183,7 @@ mod tests {
     use crate::operations::differentiation::stop_gradient::StopGradient;
     use crate::operations::exponential::Exp;
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
-    use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
+    use crate::operations::manipulation::conversions::{Cast, CastOperation, ConvertElementTypeOperation};
     use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{ReferenceNew, ReferenceRead, ReferenceWrite, ReferenceWriteOperation};
@@ -5455,6 +5455,128 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        shard_map_program(operation, body).unwrap()
+    }
+
+    /// Builds a program staging one `shard_map` over [`manual_mesh`] whose inputs are a replicated `a: f32[]`, from
+    /// which the body defines the first-class dimension `n`, and an `x: f32[2]` sharded along `x`. The body broadcasts
+    /// its varying `f32[1]` shard of `x` to `f32[n]` and narrows the result to `f32[2]` with a checked cast, whose
+    /// relationship holds only when `a` is `2`. The program returns the `f32[4]` output when `live` holds, and returns
+    /// `x` otherwise, which leaves the `shard_map` dead.
+    fn narrowing_cast_shard_map_program(live: bool) -> TestProgram {
+        let mesh = manual_mesh();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![Sharding::replicated(mesh, 0), sharded_along_x()],
+            vec![sharded_along_x()],
+            vec!["x".to_string()],
+        )
+        .unwrap();
+        let local_type = shard_map.local_input_type(1, &f32_vector_type(2)).unwrap();
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(5)).unwrap());
+        let body = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let a = builder.add_input(f32_scalar_type().into());
+            let x = builder.add_input(local_type.clone().into());
+            let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
+            let count = builder.add_instruction(convert, Vec::new(), vec![a], None).unwrap()[0];
+            let dimension = DimensionFromScalarOperation::new(extent.clone().into());
+            let dimension = builder.add_instruction(dimension, Vec::new(), vec![count], None).unwrap()[0];
+            let broadcast = DynamicBroadcastOperation::new(vec![0]);
+            let broadcast = builder.add_instruction(broadcast, Vec::new(), vec![x, dimension], None).unwrap()[0];
+            let symbolic_type = local_type.clone().with_shape(Shape::new(vec![extent.into()]));
+            let static_type = local_type.with_shape(Shape::new(vec![Dimension::Static(2)]));
+            let cast = CastOperation::checked(static_type.into(), vec![symbolic_type.into()]).unwrap();
+            let output = builder.add_instruction(cast, Vec::new(), vec![broadcast], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let input_types = vec![f32_scalar_type().into(), f32_vector_type(2).into()];
+        let operation = ShardMapOperation::from_program(&body, input_types, shard_map).unwrap();
+        if live {
+            return shard_map_program(operation, body).unwrap();
+        }
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let inputs = operation.global_input_types().iter().cloned().map(|r#type| builder.add_input(r#type));
+        let inputs = inputs.collect::<Vec<_>>();
+        let body = builder.import_program(body);
+        let operation = TestOperation::ShardMap(Box::new(operation));
+        builder.add_instruction(operation, vec![body], inputs.clone(), None).unwrap();
+        builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![inputs[1]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Builds a program staging one `shard_map` over [`manual_mesh`] whose inputs are a replicated `a: f32[]`, from
+    /// which the body defines the first-class dimension `n`, and an `x: f32[4]` sharded along `x`. The body widens its
+    /// varying `f32[2]` shard of `x` to `f32[n]` with a checked cast that names the dimension as its witness, which
+    /// holds only when `a` is `2`, doubles the result, and narrows it back to `f32[2]` with an unchecked cast that
+    /// names the shard as its witness.
+    fn widening_cast_shard_map_program() -> TestProgram {
+        let mesh = manual_mesh();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![Sharding::replicated(mesh, 0), sharded_along_x()],
+            vec![sharded_along_x()],
+            vec!["x".to_string()],
+        )
+        .unwrap();
+        let local_type = shard_map.local_input_type(1, &f32_vector_type(4)).unwrap();
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(5)).unwrap());
+        let body = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let a = builder.add_input(f32_scalar_type().into());
+            let x = builder.add_input(local_type.clone().into());
+            let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
+            let count = builder.add_instruction(convert, Vec::new(), vec![a], None).unwrap()[0];
+            let dimension = DimensionFromScalarOperation::new(extent.clone().into());
+            let dimension = builder.add_instruction(dimension, Vec::new(), vec![count], None).unwrap()[0];
+            let symbolic_type = local_type.clone().with_shape(Shape::new(vec![extent.clone().into()]));
+            let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent));
+            let widen =
+                CastOperation::checked(symbolic_type.clone().into(), vec![local_type.clone().into(), dimension_type])
+                    .unwrap();
+            let widened = builder.add_instruction(widen, Vec::new(), vec![x, dimension], None).unwrap()[0];
+            let double = ArrayOperation::Add(AddOperation::new());
+            let doubled = builder.add_instruction(double, Vec::new(), vec![widened, widened], None).unwrap()[0];
+            let narrow =
+                CastOperation::unchecked(local_type.clone().into(), vec![symbolic_type.into(), local_type.into()])
+                    .unwrap();
+            let output = builder.add_instruction(narrow, Vec::new(), vec![doubled, x], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let input_types = vec![f32_scalar_type().into(), f32_vector_type(4).into()];
+        let operation = ShardMapOperation::from_program(&body, input_types, shard_map).unwrap();
+        shard_map_program(operation, body).unwrap()
+    }
+
+    /// Builds a program staging one `shard_map` over [`manual_mesh`] whose inputs `x` and `y` are `f32[4]`s sharded
+    /// along `x` and whose body computes `z * z` for the checked cast `z` of the shard of `x` to its own type that
+    /// names the shard of `y` as its witness. The cast is staged directly as a [`CastOperation`], so it keeps its
+    /// checked mode (and its ordered effect) although the types of its inputs prove its relationship.
+    fn checked_identity_cast_shard_map_program() -> TestProgram {
+        let sharded = sharded_along_x();
+        let shard_map =
+            ShardMap::new(manual_mesh(), vec![sharded.clone(), sharded.clone()], vec![sharded], vec!["x".to_string()])
+                .unwrap();
+        let local_type = ArrayIrType::Array(shard_map.local_input_type(0, &f32_vector_type(4)).unwrap());
+        let body = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let x = builder.add_input(local_type.clone());
+            let y = builder.add_input(local_type.clone());
+            let cast = CastOperation::checked(local_type.clone(), vec![local_type.clone(), local_type]).unwrap();
+            let cast = builder.add_instruction(cast, Vec::new(), vec![x, y], None).unwrap()[0];
+            let square = ArrayOperation::Mul(MulOperation::new());
+            let square = builder.add_instruction(square, Vec::new(), vec![cast, cast], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![square], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let input_types = vec![f32_vector_type(4).into(), f32_vector_type(4).into()];
+        let operation = ShardMapOperation::from_program(&body, input_types, shard_map).unwrap();
         shard_map_program(operation, body).unwrap()
     }
 
@@ -7927,6 +8049,55 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_boundary_pruning_keeps_checked_casts_of_dead_shard_maps() {
+        // A checked cast declares an ordered assertion, so pruning keeps a `shard_map` whose outputs are all dead (with
+        // no outputs) together with the work that its check needs, and the pruned program still fails on the devices
+        // where the relationship of the cast does not hold.
+        let mesh = manual_mesh();
+        let (replicated, sharded) = (Sharding::replicated(mesh.clone(), 0), sharded_along_x());
+        let varying = Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap();
+        let scalar_type = f32_scalar_type().with_sharding(replicated.clone()).unwrap();
+        let global_type = f32_vector_type(2).with_sharding(sharded.clone()).unwrap();
+        let program = narrowing_cast_shard_map_program(false).into_pruned().unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{scalar_type}, %1:{global_type} .
+                let () = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}, {sharded}],
+                    out_shardings=[],
+                    manual_axes=['x'],
+                    global_input_types=[{scalar_type}, {global_type}],
+                    global_output_types=[],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:f32[], %1:f32[1][sharding={varying}] .
+                        let %2:i64[] = convert_element_type [data_type=i64] %0
+                            %3:dimension<n ∈ [0, 5)> = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:f32[n][sharding={varying}] = broadcast [output_axes=[0]] %1 %3
+                            %5:f32[2][sharding={varying}] = cast [
+                                type=f32[2][sharding={varying}],
+                                inputs=[f32[n][sharding={varying}]],
+                                checked=true,
+                            ] %4
+                        in ()
+                    }},
+                ]
+                in (%1)"},
+        );
+        let a = |value: f32| TestValue::Array(Array::from_elements(scalar_type.clone(), &[value]).unwrap());
+        let x = TestValue::Array(Array::from_elements(global_type.clone(), &[1f32, 2.0]).unwrap());
+        assert_eq!(program.interpret(vec![a(2.0), x.clone()]), Ok(vec![x.clone()]));
+        assert_eq!(
+            program.interpret(vec![a(3.0), x]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type `f32[2][sharding={varying}]`",
+            )))),
+        );
+    }
+
+    #[test]
     fn test_shard_map_boundary_pruning_of_fused_jvp_programs() {
         // Pruning a forward-mode program that only uses the output tangents of a fused `shard_map` drops its primal
         // outputs (and the body computation that only they use, here `a + a`) but keeps the primal computation that
@@ -10349,6 +10520,70 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_partial_evaluation_threads_dimension_residuals_into_casts() {
+        // A checked cast that widens the shard of the unknown input to the first-class dimension `n` computed by the
+        // known half stays in the residual `shard_map`, which redefines `n` from its scalar value under the same
+        // identity, so the declared cast types still name `n` and the check runs when the residual program executes.
+        let mesh = manual_mesh();
+        let (replicated, sharded) = (Sharding::replicated(mesh.clone(), 0), sharded_along_x());
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let scalar_varying = Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap();
+        let scalar_type = f32_scalar_type().with_sharding(replicated).unwrap();
+        let global_type = f32_vector_type(4).with_sharding(sharded.clone()).unwrap();
+        let local_type = f32_vector_type(2).with_sharding(varying.clone()).unwrap();
+        let program = widening_cast_shard_map_program();
+        let a = |value: f32| TestValue::Array(Array::from_elements(scalar_type.clone(), &[value]).unwrap());
+        let x = TestValue::Array(Array::from_elements(global_type.clone(), &[1f32, 2.0, 3.0, 4.0]).unwrap());
+        let unknown = PartialValue::Unknown(ArrayIrType::Array(global_type.clone()));
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(a(2.0)), unknown.clone()]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:i64[2][sharding={sharded}] .
+                let %2:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, i64[2][sharding={sharded}]],
+                    global_output_types=[{global_type}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_type}, %1:i64[1][sharding={varying}] .
+                        let %2:i64[][sharding={scalar_varying}] = reshape \
+                            [shape=[], output_sharding={scalar_varying}] %1
+                            %3:dimension<n ∈ [0, 5)> = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:f32[n][sharding={varying}] = cast [
+                                type=f32[n][sharding={varying}],
+                                inputs=[{local_type}, dimension<n ∈ [0, 5)>],
+                                checked=true,
+                            ] %0 %3
+                            %5:f32[n][sharding={varying}] = add %4 %4
+                            %6:{local_type} = cast [
+                                type={local_type},
+                                inputs=[f32[n][sharding={varying}], {local_type}],
+                            ] %5 %0
+                        in (%6)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let doubled = TestValue::Array(Array::from_elements(global_type, &[2f32, 4.0, 6.0, 8.0]).unwrap());
+        assert_eq!(evaluation.interpret(&TestEagerContext::new(), std::slice::from_ref(&x)), Ok(vec![doubled.clone()]));
+        assert_eq!(program.interpret(vec![a(2.0), x.clone()]), Ok(vec![doubled]));
+
+        // With a known extent of `3`, the widening check of every device fails when the residual program executes.
+        let mismatch = Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "n".to_string(),
+            expected: 3,
+            actual: 2,
+        })));
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(a(3.0)), unknown]).unwrap();
+        assert_eq!(evaluation.interpret(&TestEagerContext::new(), std::slice::from_ref(&x)), mismatch);
+        assert_eq!(program.interpret(vec![a(3.0), x]), mismatch);
+    }
+
+    #[test]
     fn test_shard_map_partial_evaluation_keeps_dynamic_residual_boundaries_whole() {
         // Online partial evaluation keeps a `shard_map` whole when splitting it would need a dynamically shaped
         // residual, whose dimension identity is defined inside the known half and therefore cannot cross the static
@@ -10751,6 +10986,132 @@ mod tests {
                 in (%0, %2)"
             },
         );
+    }
+
+    #[test]
+    fn test_shard_map_batching_of_bodies_with_casts() {
+        // Mapped batching batches the body structurally, which lifts the declared types of its casts by the batch
+        // dimension: a checked cast keeps its check for every device and batch item, and the witness of an identity cast
+        // stays unbatched when its input is replicated.
+        let mesh = manual_mesh();
+        let (replicated, sharded) = (Sharding::replicated(mesh.clone(), 0), sharded_along_x());
+        let batched_sharded =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let batched_varying = Sharding::replicated(mesh, 2).with_varying_manual_axes(["x"]).unwrap();
+        let scalar_type = f32_scalar_type().with_sharding(replicated.clone()).unwrap();
+        let extent_type = DimensionValue::constant(3).unwrap().r#type().into_owned();
+        let extent = TestValue::Dimension(DimensionValue::constant(3).unwrap());
+        let batched = |program: &TestProgram, input_axes: &[BatchAxis]| {
+            program
+                .batched_with_threaded_extent(
+                    extent_type.clone(),
+                    ShardingDimension::Replicated,
+                    input_axes,
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let array =
+            |r#type: ArrayType, elements: &[f32]| TestValue::Array(Array::from_elements(r#type, elements).unwrap());
+        let batched_type = |columns: usize| {
+            ArrayType::new_static(DataType::F32, [3, columns]).with_sharding(batched_sharded.clone()).unwrap()
+        };
+
+        // Each device broadcasts its shard of `x` to `f32[n]` and narrows it back to `f32[2]`, which holds when `a` is
+        // `2` and fails otherwise, with and without a batch of `x`.
+        let program = narrowing_cast_shard_map_program(true);
+        let a = |value: f32| array(scalar_type.clone(), &[value]);
+        let x = array(f32_vector_type(2).with_sharding(sharded.clone()).unwrap(), &[1.0, 2.0]);
+        assert_eq!(
+            program.interpret(vec![a(2.0), x.clone()]),
+            Ok(vec![array(f32_vector_type(4).with_sharding(sharded.clone()).unwrap(), &[1.0, 1.0, 2.0, 2.0])]),
+        );
+        assert_eq!(
+            program.interpret(vec![a(3.0), x]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type `f32[2][sharding={varying}]`",
+            )))),
+        );
+        let batched_program = batched(&program, &[BatchAxis::replicated(), BatchAxis::new(0)]);
+        assert_eq!(
+            batched_program.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<3>, %1:{scalar_type}, %2:f32[3, 2][sharding={batched_sharded}] .
+                let %3:f32[3, 4][sharding={batched_sharded}] = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{replicated}, {batched_sharded}],
+                    out_shardings=[{batched_sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{scalar_type}, f32[3, 2][sharding={batched_sharded}]],
+                    global_output_types=[f32[3, 4][sharding={batched_sharded}]],
+                ] %1 %2 [
+                    body={{
+                        lambda %0:f32[], %1:f32[3, 1][sharding={batched_varying}] .
+                        let %2:i64[] = convert_element_type [data_type=i64] %0
+                            %3:dimension<n ∈ [0, 5)> = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:dimension<3> = constant [value=3]
+                            %5:f32[3, n][sharding={batched_varying}] = broadcast [output_axes=[0, 1]] %1 %4 %3
+                            %6:f32[3, 2][sharding={batched_varying}] = cast [
+                                type=f32[3, 2][sharding={batched_varying}],
+                                inputs=[f32[3, n][sharding={batched_varying}]],
+                                checked=true,
+                            ] %5
+                        in (%6)
+                    }},
+                ]
+                in (%0, %3)"},
+        );
+        let batched_x = array(batched_type(2), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let outputs = batched_program.interpret(vec![extent.clone(), a(2.0), batched_x.clone()]).unwrap();
+        assert_eq!(
+            outputs[1..],
+            [array(batched_type(4), &[1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0])],
+        );
+        assert_eq!(
+            batched_program.interpret(vec![extent.clone(), a(3.0), batched_x]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`cast` cannot convert type `f32[3, 3][sharding={batched_varying}]` to unrelated type \
+                 `f32[3, 2][sharding={batched_varying}]`",
+            )))),
+        );
+
+        // The identity cast of a mapped `x` keeps naming the replicated `y` as its witness.
+        let global_type = f32_vector_type(4).with_sharding(sharded.clone()).unwrap();
+        let local_type = f32_vector_type(2).with_sharding(varying).unwrap();
+        let batched_program =
+            batched(&checked_identity_cast_shard_map_program(), &[BatchAxis::new(0), BatchAxis::replicated()]);
+        assert_eq!(
+            batched_program.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<3>, %1:f32[3, 4][sharding={batched_sharded}], %2:{global_type} .
+                let %3:f32[3, 4][sharding={batched_sharded}] = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{batched_sharded}, {sharded}],
+                    out_shardings=[{batched_sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[3, 4][sharding={batched_sharded}], {global_type}],
+                    global_output_types=[f32[3, 4][sharding={batched_sharded}]],
+                ] %1 %2 [
+                    body={{
+                        lambda %0:f32[3, 2][sharding={batched_varying}], %1:{local_type} .
+                        let %2:f32[3, 2][sharding={batched_varying}] = cast [
+                            type=f32[3, 2][sharding={batched_varying}],
+                            inputs=[f32[3, 2][sharding={batched_varying}], {local_type}],
+                        ] %0 %1
+                            %3:f32[3, 2][sharding={batched_varying}] = mul %2 %2
+                        in (%3)
+                    }},
+                ]
+                in (%0, %3)"},
+        );
+        let elements = [1f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let y = array(global_type, &[5.0, 6.0, 7.0, 8.0]);
+        let outputs = batched_program.interpret(vec![extent, array(batched_type(4), &elements), y]).unwrap();
+        assert_eq!(outputs[1..], [array(batched_type(4), &elements.map(|element| element * element))]);
     }
 
     #[test]
@@ -13541,6 +13902,235 @@ mod tests {
             program.entry_region_ref().jvp(&[1]),
             Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
         ));
+    }
+
+    #[test]
+    fn test_shard_map_differentiation_rejects_dynamic_cast_residuals() {
+        // The tangent conversion of a cast retains a primal value of type `f32[n]` for the extent `n` that the
+        // converted tangent no longer carries (e.g., the source of a narrowing cast and the output of a widening one),
+        // so splitting such a body into primal and tangent maps needs a dynamically shaped residual, which the static
+        // boundary rejects, although the first-class dimension `n`, which would cross the boundary as its scalar value,
+        // carries the same extent.
+        let expected = ShardMapError::DynamicResidualNotSupported { residual_index: 1, dimension: 0 };
+        let program = narrowing_cast_shard_map_program(true);
+        assert!(matches!(
+            program.jvp_with_respect_to(&[1]),
+            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+        assert!(matches!(
+            program.linearize_with_respect_to(&[1]),
+            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+        let expected = ShardMapError::DynamicResidualNotSupported { residual_index: 0, dimension: 0 };
+        let program = widening_cast_shard_map_program();
+        assert!(matches!(
+            program.jvp_with_respect_to(&[1]),
+            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+        assert!(matches!(
+            program.linearize_with_respect_to(&[1]),
+            Err(DifferentiationError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+    }
+
+    #[test]
+    fn test_shard_map_differentiation_of_bodies_with_casts() {
+        // A checked cast staged directly keeps its checked mode in the body, whereas the public `cast` capability
+        // normalizes a cast whose input types prove its relationship into an unchecked one, and differentiation
+        // normalizes the staged one when it binds the body. The fused forward-mode body converts the tangent with the
+        // primal conversion as its witness, so the tangent stays behind the primal conversion, and linearization keeps
+        // the varying output of the cast as a residual that crosses the boundary tiled along `x`, while the tangent
+        // program needs no conversion because the cast is an identity.
+        let sharded = sharded_along_x();
+        let varying = Sharding::replicated(manual_mesh(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let global_type = f32_vector_type(4).with_sharding(sharded.clone()).unwrap();
+        let local_type = f32_vector_type(2).with_sharding(varying).unwrap();
+        let program = checked_identity_cast_shard_map_program();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:{global_type} .
+                let %2:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, {global_type}],
+                    global_output_types=[{global_type}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_type}, %1:{local_type} .
+                        let %2:{local_type} = cast [
+                            type={local_type},
+                            inputs=[{local_type}, {local_type}],
+                            checked=true,
+                        ] %0 %1
+                            %3:{local_type} = mul %2 %2
+                        in (%3)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let traced = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |(x, y): (TestTracer, TestTracer)| {
+                            let z = x.cast(x.r#type().into_owned(), &[y]).unwrap();
+                            z.clone() * z
+                        },
+                        (inputs[0].clone(), inputs[1].clone()),
+                        manual_mesh(),
+                        (sharded.clone(), sharded.clone()),
+                        sharded.clone(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_vector_type(4), f32_vector_type(4)],
+            Vec::new(),
+        );
+        assert_eq!(
+            traced.to_string(),
+            formatdoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, {global_type}],
+                    global_output_types=[{global_type}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_type}, %1:{local_type} .
+                        let %2:{local_type} = cast [
+                            type={local_type},
+                            inputs=[{local_type}, {local_type}],
+                        ] %0 %1
+                            %3:{local_type} = mul %2 %2
+                        in (%3)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let array = |elements: &[f32]| TestValue::Array(Array::from_elements(global_type.clone(), elements).unwrap());
+        let (x, y) = (array(&[1.0, 2.0, 3.0, 4.0]), array(&[5.0, 6.0, 7.0, 8.0]));
+        assert_eq!(program.interpret(vec![x.clone(), y.clone()]), Ok(vec![array(&[1.0, 4.0, 9.0, 16.0])]));
+
+        let jvp = program.jvp_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:{global_type}, %2:{global_type} .
+                let %3:{global_type}, %4:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}, {sharded}],
+                    out_shardings=[{sharded}, {sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, {global_type}, {global_type}],
+                    global_output_types=[{global_type}, {global_type}],
+                ] %0 %1 %2 [
+                    body={{
+                        lambda %0:{local_type}, %1:{local_type}, %2:{local_type} .
+                        let %3:{local_type} = cast [
+                            type={local_type},
+                            inputs=[{local_type}, {local_type}],
+                        ] %0 %1
+                            %4:{local_type} = cast [
+                                type={local_type},
+                                inputs=[{local_type}, {local_type}],
+                            ] %2 %3
+                            %5:{local_type} = mul %3 %3
+                            %6:{local_type} = mul %3 %4
+                            %7:{local_type} = mul %3 %4
+                            %8:{local_type} = add %6 %7
+                        in (%5, %8)
+                    }},
+                ]
+                in (%3, %4)"},
+        );
+        assert_eq!(
+            jvp.interpret(vec![x.clone(), y.clone(), array(&[1.0; 4])]),
+            Ok(vec![array(&[1.0, 4.0, 9.0, 16.0]), array(&[2.0, 4.0, 6.0, 8.0])]),
+        );
+
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:{global_type} .
+                let %2:{global_type}, %3:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}],
+                    out_shardings=[{sharded}, {sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, {global_type}],
+                    global_output_types=[{global_type}, {global_type}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_type}, %1:{local_type} .
+                        let %2:{local_type} = cast [
+                            type={local_type},
+                            inputs=[{local_type}, {local_type}],
+                        ] %0 %1
+                            %3:{local_type} = mul %2 %2
+                        in (%3, %2)
+                    }},
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:{global_type} .
+                let %2:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, {global_type}],
+                    global_output_types=[{global_type}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_type}, %1:{local_type} .
+                        let %2:{local_type} = mul %1 %0
+                            %3:{local_type} = mul %1 %0
+                            %4:{local_type} = add %2 %3
+                        in (%4)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            formatdoc! {"
+                lambda %0:{global_type}, %1:{global_type} .
+                let %2:{global_type} = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{sharded}, {sharded}],
+                    out_shardings=[{sharded}],
+                    manual_axes=['x'],
+                    global_input_types=[{global_type}, {global_type}],
+                    global_output_types=[{global_type}],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local_type}, %1:{local_type} .
+                        let %2:{local_type} = mul %1 %0
+                            %3:{local_type} = mul %1 %0
+                            %4:{local_type} = add %2 %3
+                        in (%4)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let mut outputs = linearization.primal().interpret(vec![x, y]).unwrap();
+        let residuals = outputs.split_off(1);
+        assert_eq!(outputs, vec![array(&[1.0, 4.0, 9.0, 16.0])]);
+        let mut pullback_inputs = vec![array(&[1.0; 4])];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(&[2.0, 4.0, 6.0, 8.0])]));
     }
 
     #[test]

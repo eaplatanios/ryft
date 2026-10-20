@@ -3092,6 +3092,24 @@ where
                 MaybeZero::Value(adjoint) => outputs.push(adjoint.atom_id()?),
                 MaybeZero::Zero(_) => {
                     let cotangent_type = input_type.cotangent()?;
+
+                    // A caller that maps no residuals to this input leaves the zero's runtime dimensions to the
+                    // boundary form of the residual protocol, which gathers them from the retained known values
+                    // and cotangents of this region. This is the case for nested branch and body regions, whose
+                    // transposition drivers forward no residual mappings, but whose known inputs carry the residuals
+                    // that their own linearization captured (e.g., a `dimension<n>` for a disconnected `f32[n]`).
+                    if zero_residual_input_indices.get(output_index).is_none_or(Vec::is_empty)
+                        && !O::zero_residual_types(&cotangent_type).is_empty()
+                    {
+                        let zero = O::materialize_zero_from_residual_sources(
+                            &*context,
+                            MaybeZero::Zero(cotangent_type),
+                            context.dimension_sources(),
+                        )?;
+                        outputs.push(zero.atom_id()?);
+                        continue;
+                    }
+
                     let mut builder_borrow = builder.borrow_mut();
 
                     // These indices name source-program inputs, but zero construction occurs in the pullback

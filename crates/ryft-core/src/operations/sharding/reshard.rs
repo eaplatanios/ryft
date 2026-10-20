@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -31,9 +32,13 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// [`Operation`] that reshards its input to a target [`Sharding`]. This operation is the Ryft analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html). The array's elements, shape, and data
 /// type are unchanged, and the output type carries the target sharding in place of the input's, extended with the
-/// manual variation and reduction facts of its input, so the target mesh must define each of those manual axes with
-/// the same size and type. The target may only name [`MeshAxisType::Explicit`] mesh axes. Placement over
-/// [`MeshAxisType::Auto`] axes belongs to backend compilers and can be constrained using
+/// manual variation and manual reduction state of its input. A reshard changes placement but never reduction state:
+/// the target must restate the input's unreduced and reduced [`MeshAxisType::Explicit`] mesh axes exactly, since
+/// changing them requires a reduction or the corresponding collective. The target mesh must also define every mesh
+/// axis that carries manual variation or reduction state with the same size and type, explicit axes included, whereas
+/// it may add or drop other axes. Each Ryft type carries its own mesh, so without this check a target could silently
+/// redefine such an axis (e.g., JAX's `reshard` does not validate reduction state). The target may only name explicit
+/// mesh axes. Placement over [`MeshAxisType::Auto`] axes belongs to backend compilers and can be constrained using
 /// [`ConstrainShardingOperation`]s while transitions over [`MeshAxisType::Manual`] axes require their corresponding
 /// collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
@@ -128,9 +133,10 @@ impl Operation for ReshardOperation {
             )));
         }
 
-        // The preserved manual axes are carried onto the target by name, but the size and type of a mesh axis are
-        // semantic. The target mesh must therefore define every one of them identically, whereas it may still add
-        // or drop other axes.
+        // Manual variation and reduction state are preserved by name (manual state is carried onto the target below,
+        // and the target restates explicit reduction state), but the size and type of a mesh axis are semantic. The
+        // target mesh must therefore define every axis that carries such state identically, explicit axes included,
+        // whereas it may still add or drop other axes.
         if let Some(input_sharding) = input.sharding() {
             let input_mesh = input_sharding.mesh();
             let target_mesh = self.sharding.mesh();
@@ -139,19 +145,41 @@ impl Operation for ReshardOperation {
                 .iter()
                 .chain(input_sharding.unreduced_axes())
                 .chain(input_sharding.reduced_axes())
-                .filter_map(|axis_name| input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index]))
-                .filter(|axis| axis.r#type() == MeshAxisType::Manual);
+                .filter_map(|axis_name| input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index]));
             for input_axis in preserved_axes {
                 let target_axis = target_mesh.axis_index(input_axis.name()).map(|index| &target_mesh.axes()[index]);
                 if target_axis != Some(input_axis) {
                     let target_axis =
                         target_axis.map_or_else(|| "an undefined axis".to_owned(), |axis| format!("`{axis}`"));
                     return Err(TypeError::invalid(format!(
-                        "`{RESHARD_OPERATION_NAME}` cannot redefine preserved manual mesh axis `{input_axis}` \
-                         as {target_axis}",
+                        "`{}` cannot redefine preserved {} mesh axis `{}` as {}",
+                        RESHARD_OPERATION_NAME,
+                        input_axis.r#type(),
+                        input_axis,
+                        target_axis,
                     )));
                 }
             }
+        }
+
+        // A reshard changes placement only. Reduction state over explicit axes records pending or completed
+        // cross-device reductions, so the target must restate the input's explicit unreduced and reduced axes exactly
+        // (the target can only name explicit axes, as checked above). Dropping or adding them would silently discard
+        // or invent a reduction, which belongs to a reduction or the corresponding collective instead.
+        let explicit_axes = |axes: fn(&Sharding) -> &BTreeSet<String>| match input.sharding() {
+            Some(sharding) => axes(sharding)
+                .iter()
+                .filter(|axis| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Explicit))
+                .collect::<BTreeSet<_>>(),
+            None => BTreeSet::new(),
+        };
+        if self.sharding.unreduced_axes().iter().collect::<BTreeSet<_>>() != explicit_axes(Sharding::unreduced_axes)
+            || self.sharding.reduced_axes().iter().collect::<BTreeSet<_>>() != explicit_axes(Sharding::reduced_axes)
+        {
+            return Err(TypeError::invalid(format!(
+                "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit mesh axes; use a reduction \
+                 (or the corresponding collective) instead",
+            )));
         }
 
         // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
@@ -364,9 +392,10 @@ impl<
 
 /// Reshards the leaves of a [`Parameterized`] receiver to the corresponding target [`Sharding`]s, a tracked transition
 /// over the [`Explicit`](MeshAxisType::Explicit) mesh axes. Each leaf preserves its elements, shape, and data type
-/// while replacing its tracked sharding with the target, extended with its manual variation and reduction facts.
-/// Target partitioning and reduction state use explicit mesh axes; placement over [`Auto`](MeshAxisType::Auto) axes
-/// is constrained through [`ConstrainSharding::constrain_sharding`].
+/// while replacing its tracked sharding with the target, extended with its manual variation and reduction facts. Target
+/// partitioning uses explicit mesh axes, and the target restates the leaf's explicit reduction state unchanged (refer
+/// to [`ReshardOperation`]); placement over [`Auto`](MeshAxisType::Auto) axes is constrained through
+/// [`ConstrainSharding::constrain_sharding`].
 ///
 /// Concrete single-device arrays record the target on their type without changing their payload. Context-carrying
 /// values stage a [`ReshardOperation`], so interpretation over staging and transform values preserves the transition.
@@ -619,8 +648,105 @@ mod tests {
             cases = [{
                 input_types = [varying_input_type],
                 output_types = [input_type
+                    .clone()
                     .with_sharding(extended_target.with_varying_manual_axes(["x"]).unwrap())
                     .unwrap()],
+            }],
+        );
+
+        // Explicit axes that carry reduction state keep their definitions as well, even though the target restates
+        // that state by name, whereas explicit axes that only place dimensions may be redefined.
+        let explicit_mesh = |size: usize| {
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap(),
+                MeshAxis::new("e", 2, MeshAxisType::Explicit).unwrap(),
+            ])
+            .unwrap()
+        };
+        let explicit_unreduced_input_type = input_type
+            .clone()
+            .with_sharding(Sharding::replicated(explicit_mesh(2), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(
+                Sharding::new(explicit_mesh(4), vec![ShardingDimension::sharded(["e"])])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            ),
+            cases = [{
+                input_types = [explicit_unreduced_input_type],
+                error = format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as \
+                     `'x'=4:explicit`",
+                ),
+            }],
+        );
+        let placed_input_type = input_type
+            .clone()
+            .with_sharding(Sharding::new(explicit_mesh(2), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let resized_target = Sharding::new(explicit_mesh(4), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(resized_target.clone()),
+            cases = [{
+                input_types = [placed_input_type],
+                output_types = [input_type.with_sharding(resized_target).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_reshard_type_inference_explicit_reduction_state() {
+        // A reshard changes placement but never reduction state: the target must restate the input's unreduced and
+        // reduced explicit axes exactly, whereas manual reduction state is carried forward without being restated.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [8]);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let placed = Sharding::new(mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let with_sharding = |sharding: Sharding| input_type.clone().with_sharding(sharding).unwrap();
+        let unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["x", "m"]).unwrap());
+        let reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["x"]).unwrap());
+        let error = format!(
+            "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit mesh axes; use a reduction (or the \
+             corresponding collective) instead",
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed.clone().with_unreduced_axes(["x"]).unwrap()),
+            cases = [{
+                input_types = [unreduced_input_type.clone()],
+                output_types = [with_sharding(placed.clone().with_unreduced_axes(["x", "m"]).unwrap())],
+            }, {
+                input_types = [reduced_input_type.clone()],
+                error = error.clone(),
+            }, {
+                input_types = [input_type.clone()],
+                error = error.clone(),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed.clone().with_reduced_axes(["x"]).unwrap()),
+            cases = [{
+                input_types = [reduced_input_type.clone()],
+                output_types = [with_sharding(placed.clone().with_reduced_axes(["x"]).unwrap())],
+            }, {
+                input_types = [unreduced_input_type.clone()],
+                error = error.clone(),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed),
+            cases = [{
+                input_types = [unreduced_input_type],
+                error = error.clone(),
+            }, {
+                input_types = [reduced_input_type],
+                error = error,
             }],
         );
     }
@@ -798,6 +924,46 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shardings, vec![Sharding::replicated(input_sharding.mesh().clone(), 1)]);
+    }
+
+    #[test]
+    fn test_reshard_transposition_explicit_reduction_state() {
+        // The input is unreduced along the explicit axis `x`, which the target restates. The output cotangent is
+        // reduced along `x`, and so is the dual of the input's sharding that the cotangent reshard targets, so
+        // transposition preserves reduction state just like the forward reshard.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input_sharding = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let input = Array::from_elements::<f64>(
+            ArrayType::new_static(DataType::F64, [8]).with_sharding(input_sharding.clone()).unwrap(),
+            &[1.0; 8],
+        )
+        .unwrap();
+        let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["y"])])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let input_cotangent_type = input.r#type().cotangent().unwrap();
+        let (output, pullback) = differentiate_at(input).vjp(|x| x.reshard(&target)).unwrap();
+        assert_eq!(output.r#type().sharding(), Some(&target));
+        let cotangent = pullback
+            .apply(Array::from_elements::<f64>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
+            .unwrap();
+        assert_eq!(cotangent.r#type().as_ref(), &input_cotangent_type);
+        assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
+        let (pullback, _) = pullback.into_transposed_parts().unwrap();
+        let shardings = pullback
+            .instructions()
+            .iter()
+            .map(|instruction| match instruction.operation() {
+                ArrayOperation::Reshard(operation) => operation.sharding().clone(),
+                operation => panic!("unexpected operation `{operation}`"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shardings, vec![input_sharding.cotangent()]);
     }
 
     #[test]

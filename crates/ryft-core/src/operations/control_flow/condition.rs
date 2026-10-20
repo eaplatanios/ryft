@@ -1177,31 +1177,57 @@ where
                 true_partition,
                 false_partition,
                 |builder, edge_type, known_inputs| {
-                    // A non-zeroable edge type (e.g., a first-class dimension, a reference, a token, or an `F8E8M0FNU`
-                    // array) has no typed zero to stand in for the peer branch's edge, so its placeholder forwards a
-                    // known input of the identical type instead. The placeholder is a dead output of the untaken
-                    // branch, so any value of that type preserves the semantics; when no such input exists, the shared
-                    // residual boundary cannot be constructed. Zeroable edges instead use the residual-zero protocol,
-                    // which reads their live extents from the known inputs.
-                    if edge_type.validate_zero().is_err() {
-                        return Ok(known_inputs
-                            .iter()
-                            .copied()
-                            .find(|input| builder.atoms()[input.index()].r#type().as_ref() == edge_type));
-                    }
+                    // The placeholder is a dead output of the untaken branch, so any value of the edge type preserves
+                    // the semantics. Zeroable edges use the residual-zero protocol, which reads their live extents from
+                    // the known inputs. Two kinds of edges have no such zero. A non-zeroable edge type (e.g., a
+                    // first-class dimension, a reference, a token, or an `F8E8M0FNU` array) has no typed zero at all,
+                    // and a family that declares no zero residuals (e.g., homogeneous `ArrayType` operations) builds
+                    // only type-only zeros, which cannot name a reference-position identity such as the `n` of
+                    // `f32[n]`. The runtime values of such an edge's identities must then come from a known input:
+                    // a known input of the identical type is forwarded, or else the family captures the edge from a
+                    // known input that carries the quantity it names (e.g., a `dimension<n>` edge read from a known
+                    // `f32[n]` array). When neither exists, the shared residual boundary cannot be constructed.
                     let placeholder_context = TracingContext::<C::Constant, C::Operation>::new();
                     let sources = known_inputs
                         .iter()
                         .map(|input| placeholder_context.input(builder.atoms()[input.index()].r#type().into_owned()))
                         .collect::<Vec<_>>();
-                    let placeholder = match C::Operation::materialize_zero_from_residual_sources(
-                        &placeholder_context,
-                        MaybeZero::Zero(edge_type.clone()),
-                        &sources,
-                    ) {
-                        Ok(placeholder) => placeholder,
-                        Err(ProgramError::UnsupportedOperation { .. }) => return Ok(None),
-                        Err(error) => return Err(error),
+                    let zero_is_constructible = edge_type.validate_zero().is_ok()
+                        && (!C::Operation::zero_residual_types(edge_type).is_empty()
+                            || edge_type
+                                .identities()
+                                .all(|(position, _)| position != TypeIdentityPosition::Reference));
+                    let placeholder = if zero_is_constructible {
+                        match C::Operation::materialize_zero_from_residual_sources(
+                            &placeholder_context,
+                            MaybeZero::Zero(edge_type.clone()),
+                            &sources,
+                        ) {
+                            Ok(placeholder) => placeholder,
+                            Err(ProgramError::UnsupportedOperation { .. }) => return Ok(None),
+                            Err(error) => return Err(error),
+                        }
+                    } else if let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == edge_type) {
+                        source.clone()
+                    } else {
+                        let mut captured = None;
+                        for source in &sources {
+                            captured =
+                                C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?;
+                            if captured.is_some() {
+                                break;
+                            }
+                        }
+                        let Some(captured) = captured else {
+                            return Ok(None);
+                        };
+                        if captured.r#type().as_ref() != edge_type {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "`{CONDITION_OPERATION_NAME}` residual placeholder has type {} but expected {edge_type}",
+                                captured.r#type().as_ref(),
+                            )));
+                        }
+                        captured
                     };
                     let placeholder_program =
                         placeholder_context.builder().borrow().clone().build::<Vec<C::Constant>, Vec<C::Constant>>(
@@ -2382,6 +2408,7 @@ mod tests {
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::DimensionAddOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
+    use crate::operations::manipulation::conversions::Cast;
     use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
@@ -6567,7 +6594,7 @@ mod tests {
                     %4:dimension<n ∈ [1, 8)>, %5:f32[n] = guard [
                         boundary="partial evaluation",
                         types=[dimension<n ∈ [1, 8)>, f32[n], ref<f32[n]>],
-                        retained=[n],
+                        retained_identities=[n],
                     ] %2 %3 %1
                     () = reference_write %1 %5
                 in ()"#},
@@ -10018,6 +10045,217 @@ mod tests {
             pullback_inputs.extend(residuals);
             assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(expected_gradient).unwrap())]));
         }
+    }
+
+    #[test]
+    fn test_condition_linearization_forwards_symbolic_residual_placeholders() {
+        // Only the `true` branch retains its `f32[n]` input as a residual, so the `false` branch needs a placeholder for
+        // that edge. Homogeneous array operations construct only type-only zeros, which cannot name `n`, so the
+        // placeholder forwards the branch input of the identical type, which carries the runtime value of `n`.
+        type Branch = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, input): (Branch, Branch)| {
+                predicate.condition(input, |input| Ok(input.clone() * input), |input| Ok(input))
+            },
+            (ArrayType::scalar(DataType::Boolean), vector_type),
+        )
+        .unwrap();
+        let linearization = program.into_flat_program().linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[n] .
+                let %2:f32[n], %3:f32[n] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[n] .
+                        let %1:f32[n] = mul %0 %0
+                        in (%1, %0)
+                    },
+                    false={
+                        lambda %0:f32[n] .
+                        in (%0, %0)
+                    },
+                ]
+                in (%2, %0, %3)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:bool[], %2:f32[n] .
+                let %3:f32[n] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f32[n], %1:f32[n] .
+                        let %2:f32[n] = mul %1 %0
+                            %3:f32[n] = mul %1 %0
+                            %4:f32[n] = add %2 %3
+                        in (%4)
+                    },
+                    false={
+                        lambda %0:f32[n], %1:f32[n] .
+                        in (%0)
+                    },
+                ]
+                in (%3)"},
+        );
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:bool[], %2:f32[n] .
+                let %3:f32[n] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f32[n], %1:f32[n] .
+                        let %2:f32[n] = mul %1 %0
+                            %3:f32[n] = mul %1 %0
+                            %4:f32[n] = add %2 %3
+                        in (%4)
+                    },
+                    false={
+                        lambda %0:f32[n], %1:f32[n] .
+                        in (%0)
+                    },
+                ]
+                in (%3)"},
+        );
+
+        // Each extent of `n` selects the runtime branch, and the untaken branch's residual is never consumed.
+        for (predicate, input, expected_value, expected_gradient) in [
+            (true, vec![2f32, 3.0], vec![4f32, 9.0], vec![4f32, 6.0]),
+            (false, vec![2f32, 3.0], vec![2f32, 3.0], vec![1f32, 1.0]),
+            (true, vec![2f32, 3.0, 4.0], vec![4f32, 9.0, 16.0], vec![4f32, 6.0, 8.0]),
+            (false, vec![2f32, 3.0, 4.0], vec![2f32, 3.0, 4.0], vec![1f32, 1.0, 1.0]),
+        ] {
+            let extent = input.len();
+            let mut outputs = linearization
+                .primal()
+                .interpret(vec![Array::scalar(predicate).unwrap(), Array::vector(input).unwrap()])
+                .unwrap();
+            let residuals = outputs.split_off(1);
+            assert_eq!(outputs, vec![Array::vector(expected_value).unwrap()]);
+            let mut pullback_inputs = vec![Array::vector(vec![1f32; extent]).unwrap()];
+            pullback_inputs.extend(residuals);
+            assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![Array::vector(expected_gradient).unwrap()]));
+        }
+    }
+
+    #[test]
+    fn test_composite_condition_linearization_transposes_checked_casts_over_symbolic_inputs() {
+        // The `true` branch narrows `x: f32[n]` to `f32[2]` with a checked cast, while the `false` branch returns `y`.
+        // Linearization retains `x` as the witness of the tangent cast in the `true` branch, and a `dimension<n>` in the
+        // `false` branch, in which `x` is disconnected and its cotangent zero needs the runtime value of `n`. The
+        // placeholder of each edge in the peer branch takes `n` from the known `x`: the `f32[n]` edge is a zero built
+        // from its extent, and the non-zeroable `dimension<n>` edge is read from it directly. Transposing the `false`
+        // branch then constructs the zero cotangent of `x` from the extents retained in its known inputs.
+        type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
+        let pair_type = ArrayType::new_static(DataType::F32, [2]);
+        let cast_type = ArrayIrType::from(pair_type.clone());
+        let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
+            |(predicate, x, y): (Branch, Branch, Branch)| {
+                predicate.condition((x, y), |(x, _)| x.cast(cast_type.clone(), &[]), |(_, y)| Ok(y))
+            },
+            (
+                ArrayIrType::from(ArrayType::scalar(DataType::Boolean)),
+                ArrayIrType::from(vector_type),
+                ArrayIrType::from(pair_type),
+            ),
+        )
+        .unwrap();
+        let linearization = program.into_flat_program().linearize_with_respect_to(&[1, 2]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[n], %2:f32[2] .
+                let %3:f32[2], %4:f32[n], %5:dimension<n ∈ [1, 8)> = condition %0 %1 %2 [
+                    true={
+                        lambda %0:f32[n], %1:f32[2] .
+                        let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                            %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                        in (%2, %0, %3)
+                    },
+                    false={
+                        lambda %0:f32[n], %1:f32[2] .
+                        let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                            %3:f32[n] = zero [type=f32[n]] %2
+                            %4:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                        in (%1, %3, %4)
+                    },
+                ]
+                in (%3, %0, %4, %5)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[2], %2:bool[], %3:f32[n], %4:dimension<n ∈ [1, 8)> .
+                let %5:f32[2] = condition %2 %0 %1 %3 %4 [
+                    true={
+                        lambda %0:f32[n], %1:f32[2], %2:f32[n], %3:dimension<n ∈ [1, 8)> .
+                        let %4:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %2
+                        in (%4)
+                    },
+                    false={
+                        lambda %0:f32[n], %1:f32[2], %2:f32[n], %3:dimension<n ∈ [1, 8)> .
+                        in (%1)
+                    },
+                ]
+                in (%5)"},
+        );
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:bool[], %2:f32[n], %3:dimension<n ∈ [1, 8)> .
+                let %4:f32[n], %5:f32[2] = condition %1 %0 %2 %3 [
+                    true={
+                        lambda %0:f32[2], %1:f32[n], %2:dimension<n ∈ [1, 8)> .
+                        let %3:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
+                            %4:f32[2] = zero [type=f32[2]]
+                        in (%3, %4)
+                    },
+                    false={
+                        lambda %0:f32[2], %1:f32[n], %2:dimension<n ∈ [1, 8)> .
+                        let %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %1
+                            %4:f32[n] = zero [type=f32[n]] %3
+                        in (%4, %0)
+                    },
+                ]
+                in (%4, %5)"},
+        );
+
+        // At `n = 2` either branch differentiates. At `n = 3` the `true` branch rejects its checked cast, while the
+        // `false` branch never evaluates it and returns a zero cotangent with the runtime extent of `x`.
+        let y = array(Array::vector(vec![5f32, 6.0]).unwrap());
+        let cotangent = array(Array::vector(vec![1f32, 2.0]).unwrap());
+        for (predicate, x, expected_value, expected_gradients) in [
+            (true, vec![2f32, 3.0], vec![2f32, 3.0], [vec![1f32, 2.0], vec![0f32, 0.0]]),
+            (false, vec![2f32, 3.0], vec![5f32, 6.0], [vec![0f32, 0.0], vec![1f32, 2.0]]),
+            (false, vec![2f32, 3.0, 4.0], vec![5f32, 6.0], [vec![0f32, 0.0, 0.0], vec![1f32, 2.0]]),
+        ] {
+            let mut outputs = linearization
+                .primal()
+                .interpret(vec![array(Array::scalar(predicate).unwrap()), array(Array::vector(x).unwrap()), y.clone()])
+                .unwrap();
+            let residuals = outputs.split_off(1);
+            assert_eq!(outputs, vec![array(Array::vector(expected_value).unwrap())]);
+            let mut pullback_inputs = vec![cotangent.clone()];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                pullback.interpret(pullback_inputs),
+                Ok(expected_gradients.map(|gradient| array(Array::vector(gradient).unwrap())).to_vec()),
+            );
+        }
+        assert!(matches!(
+            linearization.primal().interpret(vec![
+                array(Array::scalar(true).unwrap()),
+                array(Array::vector(vec![2f32, 3.0, 4.0]).unwrap()),
+                y,
+            ]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
+        ));
     }
 
     #[test]

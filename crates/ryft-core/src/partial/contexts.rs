@@ -3106,7 +3106,7 @@ mod tests {
                 let %2:f32[3, wide] = guard [
                     boundary="partial evaluation",
                     types=[ref<f32[wide]>, f32[narrow, wide]],
-                    retained=[wide],
+                    retained_identities=[wide],
                 ] %0 %1
                 in ()"#},
         );
@@ -3445,7 +3445,11 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {r#"
                 lambda %0:ref<f32[n]>, %1:f32[3], %2:f32[] .
-                let %3:f32[n] = guard [boundary="partial evaluation", types=[ref<f32[n]>, f32[n]], retained=[n]] %0 %1
+                let %3:f32[n] = guard [
+                    boundary="partial evaluation",
+                    types=[ref<f32[n]>, f32[n]],
+                    retained_identities=[n],
+                ] %0 %1
                     %4:f32[] = print [label=known] %2
                 in ()"#},
         );
@@ -3800,7 +3804,7 @@ mod tests {
                 let %2:dimension<a ∈ [1, 8)>, %3:dimension<a ∈ [1, 8)> = guard [
                     boundary="partial evaluation",
                     types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
-                    retained=[a],
+                    retained_identities=[a],
                 ] %0 %1
                 in ()"#},
         );
@@ -3816,7 +3820,7 @@ mod tests {
         context
             .fold_or_residualize(
                 GuardOperation::new("earlier", vec![n.clone().into(), n.clone().into()])
-                    .with_retained(vec![a.to_variable()]),
+                    .with_retained_identities(vec![a.to_variable()]),
                 Vec::new(),
                 &[unknown, second.clone()],
             )
@@ -3835,12 +3839,12 @@ mod tests {
                 let %3:dimension<a ∈ [1, 8)>, %4:dimension<a ∈ [1, 8)> = guard [
                     boundary="earlier",
                     types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
-                    retained=[a],
+                    retained_identities=[a],
                 ] %0 %1
                     %5:dimension<a ∈ [1, 8)>, %6:dimension<a ∈ [1, 8)> = guard [
                         boundary="partial evaluation",
                         types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
-                        retained=[a],
+                        retained_identities=[a],
                     ] %2 %1
                 in ()"#},
         );
@@ -3879,12 +3883,12 @@ mod tests {
                 let %3:dimension<b ∈ [1, 8)>, %4:dimension<b ∈ [1, 8)> = guard [
                     boundary="partial evaluation",
                     types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
-                    retained=[b],
+                    retained_identities=[b],
                 ] %1 %2
                     %5:dimension<b ∈ [1, 8)>, %6:dimension<b ∈ [1, 8)>, %7:dimension<b ∈ [1, 8)> = guard [
                         boundary="partial evaluation",
                         types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
-                        retained=[b],
+                        retained_identities=[b],
                     ] %1 %4 %0
                 in (%7)"#},
         );

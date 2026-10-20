@@ -1807,7 +1807,7 @@ mod tests {
         let second = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
         let third = builder.add_input(vector(&k));
         let guard = GuardOperation::new("region", vec![vector(&n), vector(&n), vector(&n)])
-            .with_retained(vec![m.to_variable()]);
+            .with_retained_identities(vec![m.to_variable()]);
         let outputs = builder.add_instruction(guard, Vec::new(), vec![first, second, third], None).unwrap().to_vec();
         assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
         assert_eq!(builder.atoms()[outputs[2].index()].r#type().as_ref(), &vector(&m));
@@ -1854,7 +1854,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(vector(&k));
-        let guard = GuardOperation::new("region", vec![vector(&n), vector(&n)]).with_retained(vec![m.to_variable()]);
+        let guard =
+            GuardOperation::new("region", vec![vector(&n), vector(&n)]).with_retained_identities(vec![m.to_variable()]);
         let outputs = builder.add_instruction(guard, Vec::new(), vec![first, second], None).unwrap().to_vec();
         assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
         let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), outputs, None).unwrap()[0];
@@ -2002,11 +2003,11 @@ mod tests {
                 .collect();
             let guard: XlaOperation = if composite {
                 GuardOperation::<ArrayIrType>::new("region", vec![vector(&declared).into(), vector(&declared).into()])
-                    .with_retained(vec![retained.to_variable()])
+                    .with_retained_identities(vec![retained.to_variable()])
                     .into()
             } else {
                 GuardOperation::<ArrayType>::new("region", vec![vector(&declared), vector(&declared)])
-                    .with_retained(vec![retained.to_variable()])
+                    .with_retained_identities(vec![retained.to_variable()])
                     .into()
             };
             let guarded = builder.add_instruction(guard, Vec::new(), reads, None).unwrap().to_vec();

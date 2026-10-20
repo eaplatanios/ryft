@@ -258,7 +258,9 @@ impl LowerableOperation for CastOperation<ArrayIrType> {
 }
 
 /// Lowers the same complete cast contract for native and composite type families. Witness producers are explicit
-/// dependencies even for unchecked casts; an assertion token is added only when this cast emits its own check.
+/// dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered like an
+/// assertion, so its dependency barrier consumes the current assertion token whether or not it emits a check of its
+/// own (it emits none when the actual input types prove its relationship), whereas an unchecked cast never does.
 fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
     operation: &CastOperation<T>,
     lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
@@ -396,7 +398,9 @@ pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_typ
 /// axis to another identity with another physical bound, pads or slices it and restores its runtime size (refer to
 /// [`lower_refined_region_input`]). Neither conversion checks runtime extents. Checked casts and guards validate the
 /// relationship first; unchecked casts from transforms carry a proof of the relationship and dependencies on the values
-/// that justify it.
+/// that justify it. Both conversions operate on the static physical buffer of the whole value, so a conversion of any
+/// axis is rejected when either type has an unbounded dynamic axis, whereas a value whose tensor type does not change
+/// is returned unchanged even when it has unbounded axes.
 pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
@@ -405,15 +409,29 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    if let (ArrayIrType::Array(input), ArrayIrType::Array(output)) = (input_type, output_type)
-        && input.shape().dimensions().iter().zip(output.shape().dimensions()).any(|(input, output)| {
-            input.bounds().upper() != output.bounds().upper()
-                && (input.bounds().upper().is_none() || output.bounds().upper().is_none())
-        })
-    {
-        return Err(LoweringError::UnsupportedOp {
-            op: "cast shape conversion with changing unbounded dimensions requires finite physical bounds".to_owned(),
+    // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
+    // bound for every dynamic axis of both types, including axes that this conversion leaves unchanged.
+    if let (ArrayIrType::Array(input), ArrayIrType::Array(output)) = (input_type, output_type) {
+        let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions());
+        let changed_axis = dimension_pairs.clone().position(|pair| match pair {
+            (Dimension::Static(_), Dimension::Static(_)) => false,
+            (Dimension::Dynamic(input), Dimension::Dynamic(output)) => {
+                input.bounds().upper() != output.bounds().upper()
+            }
+            _ => true,
         });
+        let unbounded_dimension = dimension_pairs
+            .enumerate()
+            .flat_map(|(axis, (input, output))| [(axis, input), (axis, output)])
+            .find(|(_, dimension)| matches!(dimension, Dimension::Dynamic(variable) if variable.bounds().upper().is_none()));
+        if let (Some(changed_axis), Some((axis, dimension))) = (changed_axis, unbounded_dimension) {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!(
+                    "shape conversion along axis {changed_axis} requires finite physical bounds, but axis {axis} has \
+                     unbounded dimension `{dimension}`",
+                ),
+            });
+        }
     }
     let intermediate_type = match (input_type, output_type) {
         (ArrayIrType::Array(input), ArrayIrType::Array(output)) if input.rank() == output.rank() => {
@@ -1187,6 +1205,7 @@ mod tests {
         // The forward-mode derivative narrows the bounded dynamic tangent with a `cast`, which slices its physical
         // buffer to the static extent.
         let jvp = program.jvp().unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/converts_jvp.txt", jvp.to_string()).unwrap();
         assert!(jvp.to_string().contains("cast"), "{jvp}");
         let tangents =
             [MixedValue::Array(vec![1.0, 1.0], vec![2]), MixedValue::Array(vec![10.0, 20.0, 0.0, 0.0], vec![4])];
@@ -1203,6 +1222,7 @@ mod tests {
         // The pullback widens the static cotangent back to the bounded dynamic input with a `cast` that the residual
         // primal input witnesses, which pads its physical buffer and restores the logical extent.
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/converts_pullback.txt", pullback.to_string()).unwrap();
         assert!(pullback.to_string().contains("cast"), "{pullback}");
         assert_eq!(
             execute_mixed_program(
@@ -1329,6 +1349,7 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_1.txt", &module).unwrap();
         assert!(!module.contains("@ryft.assert"), "{module}");
 
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(); 2]));
@@ -1347,6 +1368,7 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_2.txt", &module).unwrap();
         // The stored repeated-identity signature proves itself, but actual [a, 3] still needs a == 3. Source/output
         // declarations repeat both observations; that one real comparison must not emit duplicate callbacks.
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
@@ -1368,6 +1390,7 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_3.txt", &module).unwrap();
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
 
         let source =
@@ -1383,6 +1406,7 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_4.txt", &module).unwrap();
         // Swapping axes states a == b twice, but requires just one runtime comparison.
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
     }
@@ -1674,27 +1698,53 @@ mod tests {
         use ryft_core::Shape;
         use ryft_mlir::Location;
 
+        // Converting any axis materializes the static physical buffer of the whole value, so it is rejected when the
+        // converted axis or another axis that the conversion leaves unchanged has an unbounded dimension. A cast that
+        // converts no axis returns its input unchanged, even when the input has unbounded dimensions.
         let n = DimensionType::new("n", DimensionBounds::positive(None).unwrap());
-        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let exact = ArrayType::new_static(DataType::F32, [2]);
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let block = context.block(&[(lower_tensor_type(&symbolic, &context, location).unwrap(), location)]);
-        let source = block.argument(0).unwrap().as_ref();
-        let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-            XlaLowerer::new(block.as_ref(), &context, location.as_ref());
-        assert_eq!(
-            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).unwrap().lower(
-                &mut lowerer,
-                &[source],
-                &[symbolic],
-                &[exact],
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
+        let partially_exact =
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
+        let cases = [
+            (
+                unbounded.clone(),
+                ArrayType::new_static(DataType::F32, [2]),
+                Err(LoweringError::UnsupportedOp {
+                    op: "shape conversion along axis 0 requires finite physical bounds, but axis 0 has unbounded \
+                         dimension `n`"
+                        .to_owned(),
+                }),
             ),
-            Err(LoweringError::UnsupportedOp {
-                op: "cast shape conversion with changing unbounded dimensions requires finite physical bounds"
-                    .to_owned(),
-            })
-        );
+            (
+                mixed.clone(),
+                partially_exact,
+                Err(LoweringError::UnsupportedOp {
+                    op: "shape conversion along axis 1 requires finite physical bounds, but axis 0 has unbounded \
+                         dimension `n`"
+                        .to_owned(),
+                }),
+            ),
+            (mixed.clone(), mixed, Ok(())),
+        ];
+        for (input_type, output_type, expected) in cases {
+            let context = MlirContext::new();
+            let location = context.unknown_location();
+            let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
+            let source = block.argument(0).unwrap().as_ref();
+            let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
+                XlaLowerer::new(block.as_ref(), &context, location.as_ref());
+            assert_eq!(
+                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
+                    &mut lowerer,
+                    &[source],
+                    &[input_type],
+                    &[output_type],
+                ),
+                expected.map(|()| vec![source]),
+            );
+        }
     }
 
     #[test]
@@ -2392,6 +2442,7 @@ mod tests {
         let module =
             to_mlir_module_for_program(&program, &[], &[exact, symbolic.clone()], &[symbolic], "main", None, None)
                 .unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/widening_1.txt", &module).unwrap();
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
         assert_eq!(module.matches("@LayoutConstraint").count(), 1, "{module}");
         let client = execution_client();
@@ -2485,6 +2536,7 @@ mod tests {
                 in (%1)"},
         );
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/repeated_1.txt", &module).unwrap();
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
         let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
@@ -2532,6 +2584,7 @@ mod tests {
                 in (%2)"},
         );
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/witness_1.txt", &module).unwrap();
         // Only b == 2 is conditional. Both input arrays already carry the same a and b identities.
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
     }
@@ -2586,6 +2639,7 @@ mod tests {
                 None,
             )
             .unwrap();
+            std::fs::write(format!("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/dimension_witness_{comparisons}.txt"), &module).unwrap();
             assert_eq!(module.matches("@ryft.assert").count(), comparisons, "{module}");
             let input = MixedValue::Array(vec![1.0; 16], vec![4, 4]);
             assert_eq!(
@@ -2787,7 +2841,7 @@ mod tests {
         let input = builder
             .add_instruction(
                 GuardOperation::new("square", vec![relation.clone()])
-                    .with_retained(vec![a.to_variable(), b.to_variable()]),
+                    .with_retained_identities(vec![a.to_variable(), b.to_variable()]),
                 Vec::new(),
                 vec![input],
                 None,
@@ -3090,6 +3144,7 @@ mod tests {
             None,
         )
         .unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/static_witnesses_1.txt", &module).unwrap();
         assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 3], vec![3])];
@@ -3117,7 +3172,7 @@ mod tests {
         let input = builder
             .add_instruction(
                 GuardOperation::new("square", vec![relation.clone()])
-                    .with_retained(vec![a.to_variable(), b.to_variable()]),
+                    .with_retained_identities(vec![a.to_variable(), b.to_variable()]),
                 Vec::new(),
                 vec![input],
                 None,
@@ -3134,5 +3189,206 @@ mod tests {
         assert_eq!(execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]), Ok(Vec::new()));
         let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_cast_layout_after_bound_change() {
+        use std::sync::OnceLock;
+
+        use ryft_core::{CustomCallOperation, Layout, TiledLayout};
+        use ryft_pjrt::extensions::ffi::{
+            FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
+            XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+        };
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+
+        const TARGET: &str = "ryft.test.physical_f64_copy";
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        /// Copies the physical storage of the single `f64` operand, in memory order, into the rank-1 `f64` result.
+        unsafe extern "C" fn handler(raw: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: XLA provides a valid call frame, operand buffer, and result allocation for this invocation, and
+            // the program below declares a result with as many elements as its operand.
+            unsafe {
+                let Ok(frame) = FfiCallFrame::from_c_api(raw) else { return std::ptr::null_mut() };
+                if frame.register_metadata(FfiTypeId::default()) || frame.stage() != FfiExecutionStage::Execution {
+                    return std::ptr::null_mut();
+                }
+                let Ok(api) = frame.api() else { return std::ptr::null_mut() };
+                let (Ok(FfiInput::Buffer { buffer: input }), Ok(FfiOutput::Buffer { buffer: output })) =
+                    (frame.input(0), frame.output(0))
+                else {
+                    return FfiError::invalid_argument("expected one operand and one result buffer").to_c_api(api);
+                };
+                let length = output.dimensions().iter().product::<i64>() as usize;
+                std::ptr::copy_nonoverlapping(input.data() as *const f64, output.data() as *mut f64, length);
+                std::ptr::null_mut()
+            }
+        }
+
+        // The first cast constrains the physical buffer to its new column-major layout. The second cast keeps that
+        // layout but narrows the bounded dynamic axis, which slices a new buffer that it does not constrain again.
+        // Layouts are only observable where a value crosses a boundary (executable inputs and outputs, and custom-call
+        // operands and results), and every such boundary states the layout of its own declared type. XLA rejects
+        // bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only a static
+        // result of such a cast can be observed, and its consumer still receives the declared column-major storage.
+        let client = load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
+        let laid_out = source.clone().with_layout(layout.clone());
+        let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout);
+        let copied = ArrayType::new_static(DataType::F64, [6]);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(source.clone().into());
+        let value = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::unchecked(laid_out.clone().into(), vec![source.clone().into()]).unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let value = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::unchecked(narrowed.into(), vec![laid_out.into()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(CustomCallOperation::new(TARGET, vec![copied.clone()]), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(&program, &[], &[source], &[copied], "main", None, None).unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/layout_after_bound_change.txt", &module).unwrap();
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![4, 3])],
+                &[2],
+            ),
+            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![6])]),
+        );
+    }
+
+    #[test]
+    fn test_lower_cast_rejects_bound_manual_output_placement() {
+        use ryft_core::{
+            Cast, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TracedShardMap, Typed, trace_shard_map,
+        };
+
+        use crate::XlaDomain;
+        use crate::operations::sharding::shard_map::to_mlir_module as to_mlir_module_for_shard_map;
+
+        // A body value that does not vary along the bound manual axis `x` preserves no definition of it, so a cast may
+        // name a mesh that redefines `x` as explicit. Sharding a local dimension over `x` would request a placement
+        // that only the region boundary owns, and lowering rejects it instead of stripping `x` from the constraint.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |input| {
+                let local_type = input.r#type().into_owned();
+                let explicit_type = local_type
+                    .clone()
+                    .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+                    .unwrap();
+                input.cast(explicit_type, &[]).unwrap().cast(local_type, &[]).unwrap()
+            },
+            ArrayType::new_static(DataType::F64, [4]),
+            mesh,
+            replicated.clone(),
+            replicated,
+        )
+        .unwrap();
+        assert!(matches!(
+            to_mlir_module_for_shard_map(&traced, "main"),
+            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
+        ));
+    }
+
+    #[test]
+    fn test_cast_changes_explicit_placement() {
+        use ryft_core::{LogicalMesh, MeshAxis, ShardingDimension};
+
+        let explicit_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let resized_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let extended_auto_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let unsharded = ArrayType::new_static(DataType::F64, [4, 4]);
+        let placed = |mesh: &LogicalMesh, first: ShardingDimension| {
+            unsharded
+                .clone()
+                .with_sharding(Sharding::new(mesh.clone(), vec![first, ShardingDimension::replicated()]).unwrap())
+                .unwrap()
+        };
+        let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
+        let replicated = ShardingDimension::replicated;
+
+        // An output without a sharding stays untracked, whatever the input placement.
+        assert!(!cast_changes_explicit_placement(&unsharded, &unsharded));
+        assert!(!cast_changes_explicit_placement(&placed(&explicit_mesh, sharded(&["x"])), &unsharded));
+
+        // An unsharded input acquires a tracked placement only when the output mesh has explicit axes.
+        assert!(cast_changes_explicit_placement(&unsharded, &placed(&explicit_mesh, replicated())));
+        assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, sharded(&["a"]))));
+
+        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts.
+        assert!(!cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["x", "a"])),
+            &placed(&explicit_mesh, sharded(&["x", "a"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["a"])),
+            &placed(&explicit_mesh, sharded(&["x", "a"])),
+        ));
+
+        // A mesh change requests one whenever either mesh has explicit axes, but never between auto-only meshes.
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["a"])),
+            &placed(&resized_mesh, sharded(&["a"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["a"])),
+            &placed(&auto_mesh, sharded(&["a"])),
+        ));
+        assert!(!cast_changes_explicit_placement(
+            &placed(&auto_mesh, sharded(&["a"])),
+            &placed(&extended_auto_mesh, sharded(&["a"])),
+        ));
     }
 }

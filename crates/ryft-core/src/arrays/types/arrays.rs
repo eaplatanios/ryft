@@ -4,6 +4,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::sharding::ShardingError;
 use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
@@ -21,8 +22,9 @@ use crate::operations::collectives::PARALLEL_VARY_OPERATION_NAME;
 use crate::parameters::Parameter;
 use crate::programs::types::type_signature_pairs;
 use crate::programs::{
-    NoReferent, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityClass, TypeIdentityPosition,
-    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDirectDispatch, type_identities_needing_runtime_checks,
+    NoReferent, ProgramError, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityClass,
+    TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDirectDispatch,
+    type_identities_needing_runtime_checks,
 };
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
@@ -427,6 +429,37 @@ impl ArrayType {
                 "`{operation_name}` inputs must have matching varying manual axes; insert \
                  `{PARALLEL_VARY_OPERATION_NAME}` on the inputs that lack an axis, as `align_manual_variation` does",
             )));
+        }
+        Ok(())
+    }
+
+    /// Validates this array type's explicit [`Layout`], if any, against its [`Shape`] using the storage addressing
+    /// rules of [`ArrayAddressing`] (e.g., a strided or tiled layout must have the array's rank, and strides may not
+    /// alias elements). Dynamic extents are checked at their known lower bounds, because a symbolic type does not
+    /// know its runtime extents. Larger runtime extents can still expose additional stride aliasing or a storage size
+    /// overflow, which interpretation validates against the resolved extents. Operations whose output types request
+    /// a layout (e.g., [`BroadcastOperation`](crate::BroadcastOperation) and [`CastOperation`](crate::CastOperation))
+    /// call this function during type inference, so that a malformed request fails there rather than when the output
+    /// is materialized or lowered.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] describing the first layout or storage requirement that the type violates.
+    pub fn validate_layout(&self) -> Result<(), TypeError> {
+        if self.layout.is_some() {
+            let dimensions = self
+                .shape
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    Dimension::Static(extent) => Dimension::Static(*extent),
+                    Dimension::Dynamic(variable) => Dimension::Static(variable.bounds().lower()),
+                })
+                .collect::<Vec<_>>();
+            ArrayAddressing::new(self.clone().with_shape(Shape::new(dimensions))).map_err(|error| match error {
+                ProgramError::Type(error) => error,
+                error => TypeError::invalid(error.to_string()),
+            })?;
         }
         Ok(())
     }
@@ -1503,6 +1536,43 @@ mod tests {
             Err(TypeError::invalid(
                 "`add` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
                  an axis, as `align_manual_variation` does",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_array_type_validate_layout() {
+        // Unspecified layouts and layouts that address the shape without aliasing are valid.
+        let plain = ArrayType::new_static(F32, [3]);
+        assert_eq!(plain.validate_layout(), Ok(()));
+        assert_eq!(plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8]))).validate_layout(), Ok(()));
+        let tiled = Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])]));
+        assert_eq!(ArrayType::new_static(F32, [4]).with_layout(tiled).validate_layout(), Ok(()));
+
+        // Layouts must match the array rank and must not alias elements.
+        assert_eq!(
+            plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 4]))).validate_layout(),
+            Err(TypeError::invalid("strided layout rank 2 does not match array rank 1")),
+        );
+        assert_eq!(
+            ArrayType::new_static(F32, [2, 3])
+                .with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])))
+                .validate_layout(),
+            Err(TypeError::invalid(
+                "strided layout stride 4 on axis 1 is smaller than the 8-byte span occupied by more minor axes and \
+                 may alias array elements",
+            )),
+        );
+
+        // Dynamic extents are checked at their lower bounds.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(5)).unwrap());
+        assert_eq!(
+            ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+                .with_layout(Layout::Strided(StridedLayout::new(vec![2])))
+                .validate_layout(),
+            Err(TypeError::invalid(
+                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and \
+                 may alias array elements",
             )),
         );
     }

@@ -1006,15 +1006,18 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 
 /// [`Operation`] that returns its first input at a different type representation (e.g., `f32[n]` as `f32[2]`). The
 /// input and output describe the same value, with equal extents on corresponding axes. Arrays require equal element
-/// types, rank and memory space. Layout may change, and so may placement over [`MeshAxisType::Explicit`] mesh axes
-/// under the rules of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation.
-/// Placement over [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs
-/// to backend compilers (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter
-/// only changes through manual collectives, and so are manual variation and reduction state. Further inputs act as
-/// _witnesses_, meaning values whose types make output identities available to the instruction (e.g., a value of type
-/// `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses carry no derivatives. Every output identity must occur in an
-/// input declaration, and the output type may not define an identity. First-class dimension types define their
-/// names, so casts of dimension values can only target static types.
+/// types, rank and memory space. Layout may change, as long as the requested layout addresses the output shape (refer
+/// to [`ArrayType::validate_layout`]), and so may placement over [`MeshAxisType::Explicit`] mesh axes under the rules
+/// of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation. Placement over
+/// [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs to backend
+/// compilers (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter only changes
+/// through manual collectives, and so are manual variation and reduction state. Every mesh axis that carries such
+/// preserved state keeps its definition (i.e., its size and type) in the output mesh, including an explicit axis that
+/// carries reduction state; only explicit axes referenced solely by dimension placement may be redefined or dropped.
+/// Further inputs act as _witnesses_, meaning values whose types make output identities available to the instruction
+/// (e.g., a value of type `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses carry no derivatives. Every output
+/// identity must occur in an input declaration, and the output type may not define an identity. First-class dimension
+/// types define their names, so casts of dimension values can only target static types.
 ///
 /// The complete [input declarations](Self::input_types) preserve nominal bindings during concrete execution. Source,
 /// output and witness declarations share their dimension identities: widening `f32[2]` to `f32[n]` next to a witness
@@ -1048,7 +1051,9 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 /// Batching lifts the declared types by the mapped axis and binds the cast over the packed values. A proven one-input
 /// identity keeps its carrier unchanged, including any bounded ragged axes. Every other cast over a bounded ragged
 /// carrier is rejected, because the carrier's per-item extents live outside the packed types that the lifted cast
-/// relates.
+/// relates. For the same reason, the composite [`ArrayIrType`] policy rejects every other cast with a mapped
+/// first-class dimension input (i.e., a source or witness holding one extent per batch item), since a lifted
+/// dimension type cannot state per-item extents.
 ///
 /// Raw transposition rejects conditional checked casts whose check needs an unavailable linear primal value or witness,
 /// including cases whose shapes could be checked using known witnesses, because preserving assertion order requires
@@ -1152,12 +1157,16 @@ impl<T: Type> CastOperation<T> {
     }
 
     /// Validates the family-independent part of the cast contract against the supplied `input_types` (i.e., the value
-    /// followed by its witnesses) and returns the output identities that live inputs carry, which the inferred output
-    /// preserves. The supplied types must match the declaration in count and be admitted by it, no input or output
-    /// may be a reference type, the output may not define a type identity, and every output identity must be carried
-    /// by a declared input. [`CastType::infer_cast_output_type`] implementations call this first and then validate
-    /// and infer the family-specific relationship; the built-in families additionally resolve preserved identities
-    /// and solve the dimension relationships.
+    /// followed by its witnesses) and returns the candidate identities that the inferred output may preserve: every
+    /// output identity that some supplied type carries. The supplied types must match the declaration in count and be
+    /// admitted by it, no input or output may be a reference type, the output may not define a type identity, and
+    /// every output identity must be carried by a declared input. A candidate is not necessarily preserved, because a
+    /// supplied type can carry the same identity in an unrelated role (e.g., a supplied `dimension<n>` witnessing a
+    /// declared `dimension<m>`). Family inference must therefore keep a candidate only when the correspondence class
+    /// of the declared identity reaches that same supplied identity, and resolve the other output identities through
+    /// their own classes. [`CastType::infer_cast_output_type`] implementations call this first and then validate and
+    /// infer the family-specific relationship; the built-in families filter the candidates in this way and solve the
+    /// dimension relationships.
     ///
     /// # Errors
     ///
@@ -1841,9 +1850,11 @@ impl CastType for ArrayIrType {
                     }
 
                     // The checks above compare axis names only, but the size and type of a mesh axis are semantic.
-                    // Every auto or manual axis whose placement, manual variation, or reduction state the output
-                    // carries forward must therefore keep its definition, whereas the output mesh may still add or
-                    // drop other axes (e.g., to request an explicit redistribution).
+                    // Every auto or manual axis whose placement the output carries forward, and every axis of any
+                    // type that carries manual variation or reduction state, must therefore keep its definition. An
+                    // explicit axis is exempt only when it is referenced solely by dimension placement, which may
+                    // change. The output mesh may still add or drop other axes (e.g., to request an explicit
+                    // redistribution).
                     if let Some(input_sharding) = input.sharding() {
                         let input_mesh = input_sharding.mesh();
                         let output_mesh = output_sharding.mesh();
@@ -1854,13 +1865,13 @@ impl CastType for ArrayIrType {
                                 ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
                                 ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
                             })
+                            .filter(|axis_name| input_mesh.axis_type(axis_name) != Some(MeshAxisType::Explicit))
                             .chain(input_sharding.varying_manual_axes())
                             .chain(input_sharding.unreduced_axes())
                             .chain(input_sharding.reduced_axes())
                             .filter_map(|axis_name| {
                                 input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index])
-                            })
-                            .filter(|axis| axis.r#type() != MeshAxisType::Explicit);
+                            });
                         for input_axis in preserved_axes {
                             let output_axis =
                                 output_mesh.axis_index(input_axis.name()).map(|index| &output_mesh.axes()[index]);
@@ -1878,6 +1889,12 @@ impl CastType for ArrayIrType {
                         }
                     }
                 }
+
+                // A requested layout must address the output shape, so that a malformed request fails here rather than
+                // only when interpretation materializes the output or a backend lowers it.
+                output.validate_layout().map_err(|error| {
+                    TypeError::invalid(format!("`{CAST_OPERATION_NAME}` output layout is invalid: {error}"))
+                })?;
             }
             (Self::Dimension(input), Self::Dimension(output)) => {
                 if matches!((input.extent(), output.extent()), (Some(input), Some(output)) if input != output) {
@@ -4347,6 +4364,37 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_type_inference_repeated_identity() {
+        // An identity repeated within one type relates every occurrence to its corresponding output axis: narrowing
+        // `f32[n, n]` to `f32[n, 2]` requires `n = 2`, which symbolic inputs leave to a runtime check, exact inputs
+        // prove, and contradicting exact inputs reject.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let square =
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), n.simplified_dimension()]));
+        let output = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
+        let exact = ArrayType::new_static(DataType::F32, [2, 2]);
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation = constructor(output.clone(), vec![square.clone()]).unwrap();
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&square)),
+                Ok((output.clone(), None)),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&exact)),
+                Ok((exact.clone(), Some(exact.clone()))),
+            );
+            assert_eq!(
+                operation.infer_output_types(&[ArrayType::new_static(DataType::F32, [2, 3])], &[]),
+                Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 2,
+                    actual: 3,
+                })),
+            );
+        }
+    }
+
+    #[test]
     fn test_cast_type_inference_layout_and_sharding() {
         // Changing the layout or the explicit placement preserves logical values, so each kind of transition (adding,
         // changing, and dropping either annotation, or both at once) infers the requested output, in both modes and
@@ -4405,6 +4453,50 @@ mod tests {
         check_operation_type_inference!(
             operation = CastOperation::unchecked(plain.clone(), vec![tiled.clone()]).unwrap(),
             cases = [{ input_types = [tiled], output_types = [plain] }],
+        );
+    }
+
+    #[test]
+    fn test_cast_type_inference_output_layout_validation() {
+        // The requested layout must address the output shape, so a malformed request is rejected during type inference
+        // rather than only when interpretation materializes the output or a backend lowers it.
+        let plain = ArrayType::new_static(DataType::F32, [2, 3]);
+        let tiled = plain.clone().with_layout(Layout::Tiled(TiledLayout::new(
+            vec![1, 0],
+            vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
+        )));
+        let rank_mismatch = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let overlapping = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![1, 1])));
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let infer = |output: &ArrayType| {
+                constructor(output.clone(), vec![plain.clone()])
+                    .unwrap()
+                    .infer_output_types(std::slice::from_ref(&plain), &[])
+            };
+            assert_eq!(infer(&tiled), Ok(vec![tiled.clone()]));
+            assert_eq!(
+                infer(&rank_mismatch),
+                Err(TypeError::invalid(
+                    "`cast` output layout is invalid: strided layout rank 1 does not match array rank 2",
+                )),
+            );
+            assert_eq!(
+                infer(&overlapping),
+                Err(TypeError::invalid(
+                    "`cast` output layout is invalid: strided layout stride 1 on axis 0 is smaller than the 4-byte \
+                     span occupied by more minor axes and may alias array elements",
+                )),
+            );
+        }
+
+        // The composite universe applies the same rule to its array members.
+        assert_eq!(
+            CastOperation::<ArrayIrType>::checked(rank_mismatch.into(), vec![plain.clone().into()])
+                .unwrap()
+                .infer_output_types(&[plain.into()], &[]),
+            Err(TypeError::invalid(
+                "`cast` output layout is invalid: strided layout rank 1 does not match array rank 2",
+            )),
         );
     }
 
@@ -4548,7 +4640,8 @@ mod tests {
     fn test_cast_type_inference_mesh_axis_definitions() {
         // Auto and manual axes that the output carries forward keep their mesh axis definitions (size and type), even
         // when only their names are compared for placement and manual variation, whereas the output mesh may still add
-        // or drop unrelated axes.
+        // or drop unrelated axes. Axes that carry reduction state keep their definitions even when they are explicit,
+        // whereas explicit axes referenced only by dimension placement may be redefined.
         let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
             LogicalMesh::new(
                 axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap()).collect(),
@@ -4569,9 +4662,20 @@ mod tests {
                 )
                 .unwrap()
         };
+        let unreduced = |mesh: LogicalMesh| {
+            ArrayType::new_static(DataType::F32, [8])
+                .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+                .unwrap()
+        };
+        let reduced = |mesh: LogicalMesh| {
+            ArrayType::new_static(DataType::F32, [8])
+                .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+                .unwrap()
+        };
         let sharded = ShardingDimension::sharded(["x"]);
         let auto = |size: usize| mesh(&[("x", size, MeshAxisType::Auto)]);
         let manual = |size: usize| mesh(&[("x", size, MeshAxisType::Manual)]);
+        let explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Explicit)]);
         let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Auto), ("y", 2, MeshAxisType::Explicit)]);
         let cases = [
             (
@@ -4594,7 +4698,41 @@ mod tests {
                 )),
             ),
             (placed(auto(2), sharded.clone()), placed(with_explicit(2), sharded.clone()), Ok(())),
-            (placed(with_explicit(2), sharded.clone()), placed(auto(2), sharded), Ok(())),
+            (placed(with_explicit(2), sharded.clone()), placed(auto(2), sharded.clone()), Ok(())),
+            (
+                unreduced(explicit(2)),
+                unreduced(explicit(4)),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=4:explicit`",
+                )),
+            ),
+            (
+                reduced(explicit(2)),
+                reduced(explicit(4)),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=4:explicit`",
+                )),
+            ),
+            (
+                unreduced(explicit(2)),
+                unreduced(manual(2)),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=2:manual`",
+                )),
+            ),
+            (
+                unreduced(explicit(2)),
+                unreduced(auto(2)),
+                Err(TypeError::invalid(
+                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=2:auto`",
+                )),
+            ),
+            (
+                unreduced(explicit(2)),
+                unreduced(mesh(&[("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)])),
+                Ok(()),
+            ),
+            (placed(explicit(2), sharded.clone()), placed(explicit(4), sharded), Ok(())),
         ];
         for (input, output, expected) in cases {
             let expected = expected.map(|()| vec![output.clone()]);
@@ -4709,6 +4847,28 @@ mod tests {
             ArrayIrType::infer_cast_output_type(&operation, &[source.clone().into(), m.into()]),
             Ok((source.clone().into(), Some(source.into()))),
         );
+    }
+
+    #[test]
+    fn test_cast_type_inference_swapped_dimension_witnesses() {
+        // First-class dimension witnesses supplied in the declared order prove the identity cast. Swapping them
+        // does not form a consistent renaming (declared `n` would correspond to both supplied `n` and `m`), so
+        // the relationship needs a runtime check instead of being proven.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [m, n] = ["m", "n"].map(|name| DimensionType::new(name, bounds));
+        let source: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation =
+                constructor(source.clone(), vec![source.clone(), m.clone().into(), n.clone().into()]).unwrap();
+            assert_eq!(
+                ArrayIrType::infer_cast_output_type(&operation, &[source.clone(), m.clone().into(), n.clone().into()]),
+                Ok((source.clone(), Some(source.clone()))),
+            );
+            assert_eq!(
+                ArrayIrType::infer_cast_output_type(&operation, &[source.clone(), n.clone().into(), m.clone().into()]),
+                Ok((source.clone(), None)),
+            );
+        }
     }
 
     #[test]
@@ -5069,6 +5229,45 @@ mod tests {
         // A cast that preserves its declared type accepts rectangular shapes.
         let operation = CastOperation::checked(input.clone(), vec![input]).unwrap();
         assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[rectangular.clone()]), Ok(vec![rectangular]));
+    }
+
+    #[test]
+    fn test_cast_interpretation_repeated_identity() {
+        // Narrowing `f32[n, n]` to `f32[n, 2]` requires `n = 2`. Symbolic values leave it unproven, so interpretation
+        // rejects the cast rather than staging it, whereas concrete values either prove or contradict it.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let square =
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), n.simplified_dimension()]));
+        let output = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
+        let tracing = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let symbolic = tracing.input(square.clone());
+        let eager = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let proven = Array::matrix(2, 2, vec![1f32; 4]).unwrap();
+        let contradicting = Array::matrix(2, 3, vec![1f32; 6]).unwrap();
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let operation = constructor(output.clone(), vec![square.clone()]).unwrap();
+            assert_eq!(
+                operation.interpret(&tracing, &EmptyRegionDriver, std::slice::from_ref(&symbolic)),
+                Err(ProgramError::Concretization {
+                    message: "`cast` cannot check symbolic type relationships during interpretation; \
+                              bind the operation through its context"
+                        .to_owned(),
+                }),
+            );
+            assert_eq!(
+                operation.interpret(&eager, &EmptyRegionDriver, std::slice::from_ref(&proven)),
+                Ok(vec![proven.clone()]),
+            );
+            assert_eq!(
+                operation.interpret(&eager, &EmptyRegionDriver, std::slice::from_ref(&contradicting)),
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 2,
+                    actual: 3,
+                }))),
+            );
+        }
+        assert!(tracing.builder().borrow().instructions().is_empty());
     }
 
     #[test]

@@ -2391,7 +2391,7 @@ mod tests {
         assert_eq!(members, vec![0, 1]);
         assert_eq!(guard.boundary(), "add");
         assert_eq!(guard.declared_types(), &[vector(&n), vector(&n)]);
-        assert_eq!(guard.retained(), &[a.to_variable()]);
+        assert_eq!(guard.retained_identities(), &[a.to_variable()]);
         assert_eq!(guard.infer_output_types(&supplied[1..], &[]), Ok(vec![vector(&a), vector(&a)]));
 
         // Operands arriving at exactly their declared types need no guard.

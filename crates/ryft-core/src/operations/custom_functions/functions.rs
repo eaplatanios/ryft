@@ -1650,12 +1650,17 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     ///
     /// Differentiation replays the rule program instead of differentiating the primal. The replayed rule consists of
     /// ordinary primitive operations, so reverse mode transposes the linear map in `ẋ` that it computes, exactly like
-    /// any other tangent program, and the staged call itself is never transposed. Higher-order differentiation
-    /// differentiates those replayed operations, so every combination of forward and reverse mode applies to the
-    /// resulting derivatives, including differentiation of a pullback with respect to its cotangent seeds and
-    /// transposing a pullback again (which restores the tangent map). The primal is kept separate from the rule for
-    /// efficiency rather than necessity: the rule computes both the outputs and their tangents, so deriving the primal
-    /// from it would make every un-differentiated call pay for tangent computation.
+    /// any other tangent program, and the staged call itself is never transposed. Tangent conversions in the rule must
+    /// therefore be transposable: a rule that converts a tangent to another type representation (e.g., `f32[n]` to
+    /// `f32[2]`) uses [`cast_unchecked`](crate::Cast::cast_unchecked) with witnesses that carry the identities that the
+    /// conversion drops (e.g., the corresponding primal input) and leaves the check to the primal conversion, because a
+    /// checked conversion of a tangent checks a linear value, which reverse mode cannot transpose when no known value
+    /// carries the extents of the resulting cotangent. Higher-order differentiation differentiates those replayed
+    /// operations, so every combination of forward and reverse mode applies to the resulting derivatives, including
+    /// differentiation of a pullback with respect to its cotangent seeds and transposing a pullback again (which
+    /// restores the tangent map). The primal is kept separate from the rule for efficiency rather than necessity: the
+    /// rule computes both the outputs and their tangents, so deriving the primal from it would make every
+    /// un-differentiated call pay for tangent computation.
     ///
     /// # Parameters
     ///
@@ -2356,7 +2361,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArraySliceAxis, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, ShardingDimension,
+        ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, Shape,
+        ShardingDimension,
     };
     use crate::axes::AxisError;
     use crate::batching::{
@@ -2366,6 +2372,7 @@ mod tests {
     use crate::differentiation::{
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, differentiate_at,
     };
+    use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
@@ -2375,7 +2382,7 @@ mod tests {
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
-    use crate::operations::manipulation::conversions::ConvertElementType;
+    use crate::operations::manipulation::conversions::{Cast, ConvertElementType};
     use crate::operations::manipulation::padding::PadOperation;
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
@@ -2389,7 +2396,6 @@ mod tests {
 
     use super::*;
 
-    /// Eager context whose values are arrays.
     /// Eager context whose values are arrays.
     type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
@@ -2982,6 +2988,146 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_with_jvp_tangent_casts() {
+        // The rule narrows `x: f64[n]` to `f64[2]` with a checked cast and converts the tangent to match. Reverse mode
+        // transposes the replayed rule, so the cotangent must widen back to `f64[n]`. An unchecked tangent conversion
+        // that names the primal input as its witness keeps `n` available to that transpose (as the derived rule does),
+        // while a checked tangent conversion leaves a check on a linear value in the tangent program, which cannot be
+        // transposed because no known value carries the extent of the cotangent that it would produce.
+        type Tracer = DomainTracer<ArrayContext>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let static_type = ArrayType::new_static(DataType::F64, [2]);
+        let program = |checked: bool| {
+            let (primal_type, rule_type) = (static_type.clone(), static_type.clone());
+            let function = custom_function(move |x: Tracer| x.cast(primal_type.clone(), &[])?.sin()).with_jvp(
+                move |x: Tracer, tangent: Tracer| {
+                    let y = x.cast(rule_type.clone(), &[])?;
+                    let tangent = match checked {
+                        true => tangent.cast(rule_type.clone(), &[])?,
+                        false => tangent.cast_unchecked(rule_type.clone(), &[x])?,
+                    };
+                    Ok((y.sin()?, y.cos()? * tangent))
+                },
+            );
+            let (_, program) = ArrayContext::trace(|x| function.call(x), symbolic_type.clone()).unwrap();
+            program.into_flat_program()
+        };
+        let x = Array::vector(vec![1.0, 2.0]).unwrap();
+        let tangent = Array::vector(vec![1.0, 0.5]).unwrap();
+        let outputs = Ok(vec![
+            Array::vector(vec![1.0f64.sin(), 2.0f64.sin()]).unwrap(),
+            Array::vector(vec![1.0f64.cos(), 0.5 * 2.0f64.cos()]).unwrap(),
+        ]);
+        let mismatch = Err(ProgramError::Type(TypeError::invalid(
+            "`cast` cannot convert type `f64[3]` to unrelated type `f64[2]`".to_string(),
+        )));
+
+        // Unchecked tangent conversion witnessed by the primal input.
+        let unchecked = program(false);
+        let jvp = unchecked.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[n] .
+                let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %3:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %1 %0
+                    %4:f64[2] = sin %2
+                    %5:f64[2] = cos %2
+                    %6:f64[2] = mul %5 %3
+                in (%4, %6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(jvp.interpret(vec![x.clone(), tangent.clone()]), outputs);
+        let wide = Array::vector(vec![1.0; 3]).unwrap();
+        assert_eq!(jvp.interpret(vec![wide.clone(), wide]), mismatch);
+        let linearization = unchecked.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[n] .
+                let %1:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %2:f64[2] = sin %1
+                    %3:f64[2] = cos %1
+                in (%2, %0, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[n], %2:f64[2] .
+                let %3:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %0 %1
+                    %4:f64[2] = mul %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[n], %2:f64[2] .
+                let %3:f64[2] = mul %2 %0
+                    %4:f64[n] = cast [type=f64[n], inputs=[f64[2], f64[n]]] %3 %1
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let mut pullback_inputs = vec![tangent.clone()];
+        pullback_inputs.extend(linearization.primal().interpret(vec![x.clone()]).unwrap().into_iter().skip(1));
+        assert_eq!(
+            pullback.interpret(pullback_inputs),
+            Ok(vec![Array::vector(vec![1.0f64.cos(), 0.5 * 2.0f64.cos()]).unwrap()]),
+        );
+        check_gradient!(
+            |x| {
+                let output = unchecked.interpret_in_context(&x.domain(), vec![x])?.remove(0);
+                output.reduce(&[0], ReductionKind::Sum)
+            },
+            at = x.clone(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+
+        // Checked tangent conversion: forward mode checks the tangent as well, but reverse mode rejects the check.
+        let checked = program(true);
+        let jvp = checked.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[n] .
+                let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %3:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %1
+                    %4:f64[2] = sin %2
+                    %5:f64[2] = cos %2
+                    %6:f64[2] = mul %5 %3
+                in (%4, %6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(jvp.interpret(vec![x, tangent]), outputs);
+        let linearization = checked.linearize().unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[2] .
+                let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %3:f64[2] = mul %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            linearization.tangent().transpose_with_respect_to(&[0], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "cannot transpose a checked `cast` without the primal value its check needs; \
+                               linearize the program first",
+        ));
+    }
+
+    #[test]
     fn test_custom_function_with_jvp_and_vjp() {
         // With both rule kinds, forward mode uses the JVP rule (which doubles the derivative) and reverse mode uses the
         // reverse-mode rules (which triple it), whatever the order of the configuration calls.
@@ -3560,6 +3706,128 @@ mod tests {
         let mut pullback_inputs = vec![Array::scalar(1.0).unwrap()];
         pullback_inputs.extend(residuals);
         assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![Array::scalar(2.0 * 0.7f64.cos()).unwrap()]));
+    }
+
+    #[test]
+    fn test_custom_function_with_vjp_cotangent_casts() {
+        // The forward rule narrows `x: f64[n]` to `f64[2]` with a checked cast and saves `x` with the derivative, and the
+        // backward rule widens the cotangent back to `f64[n]` with a checked cast that names `x` as its witness. The
+        // staged pullback keeps both checks, the first one before the backward rule, in both orders of batching and
+        // reverse-mode differentiation.
+        type Tracer = DomainTracer<ArrayContext>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let static_type = ArrayType::new_static(DataType::F64, [2]);
+        let forward_type = static_type.clone();
+        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin()).with_vjp(
+            move |x: Tracer| {
+                let y = x.cast(forward_type.clone(), &[])?;
+                Ok((y.sin()?, (x, y.cos()?)))
+            },
+            |(x, cosine): (Tracer, Tracer), cotangent: Tracer| (cosine * cotangent).cast(x.r#type().into_owned(), &[x]),
+        );
+        let (_, vjp) = ArrayContext::trace(
+            |(x, seed): (Tracer, Tracer)| {
+                let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
+                Ok((y, pullback.apply(seed)?))
+            },
+            (symbolic_type.clone(), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        let vjp = vjp.into_flat_program();
+        assert_eq!(
+            vjp.to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[2] .
+                let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %3:f64[2] = sin %2
+                    %4:f64[2] = cos %2
+                    %5:f64[2] = mul %4 %1
+                    %6:f64[n] = cast [type=f64[n], inputs=[f64[2], f64[n]], checked=true] %5 %0
+                in (%3, %6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            vjp.interpret(vec![Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![1.0, 0.5]).unwrap()]),
+            Ok(vec![
+                Array::vector(vec![1.0f64.sin(), 2.0f64.sin()]).unwrap(),
+                Array::vector(vec![1.0f64.cos(), 0.5 * 2.0f64.cos()]).unwrap(),
+            ]),
+        );
+        assert_eq!(
+            vjp.interpret(vec![Array::vector(vec![1.0; 3]).unwrap(), Array::vector(vec![1.0, 0.5]).unwrap()]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `f64[3]` to unrelated type `f64[2]`".to_string(),
+            ))),
+        );
+        check_gradient!(
+            |x| function.call(x)?.reduce(&[0], ReductionKind::Sum),
+            at = Array::vector(vec![1.0, 2.0]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+
+        // Differentiating then batching.
+        let batched_vjp = vjp
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(
+            batched_vjp.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n], %1:f64[3, 2] .
+                let %2:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %0
+                    %3:f64[3, 2] = cos %2
+                    %4:f64[3, 2] = mul %3 %1
+                    %5:f64[3, n] = cast [type=f64[3, n], inputs=[f64[3, 2], f64[3, n]], checked=true] %4 %0
+                    %6:f64[3, 2] = sin %2
+                in (%6, %5)
+            "}
+            .trim_end(),
+        );
+        let elements = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5];
+        let x = Array::matrix(3, 2, elements.to_vec()).unwrap();
+        let seed = Array::matrix(3, 2, vec![1.0; 6]).unwrap();
+        let outputs = Ok(vec![
+            Array::matrix(3, 2, elements.map(f64::sin).to_vec()).unwrap(),
+            Array::matrix(3, 2, elements.map(f64::cos).to_vec()).unwrap(),
+        ]);
+        assert_eq!(batched_vjp.interpret(vec![x.clone(), seed.clone()]), outputs);
+
+        // Batching then differentiating.
+        let batched_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), n.simplified_dimension()]));
+        let (_, vjp_of_batched) = ArrayContext::trace(
+            |(x, seed): (Tracer, Tracer)| {
+                let (y, pullback) = differentiate_at(x)
+                    .vjp(|x| Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), None)?))?;
+                Ok((y, pullback.apply(seed)?))
+            },
+            (batched_type, ArrayType::new_static(DataType::F64, [3, 2])),
+        )
+        .unwrap();
+        let vjp_of_batched = vjp_of_batched.into_flat_program();
+        assert_eq!(
+            vjp_of_batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n], %1:f64[3, 2] .
+                let %2:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %0
+                    %3:f64[3, 2] = sin %2
+                    %4:f64[3, 2] = cos %2
+                    %5:f64[3, 2] = mul %4 %1
+                    %6:f64[3, n] = cast [type=f64[3, n], inputs=[f64[3, 2], f64[3, n]], checked=true] %5 %0
+                in (%3, %6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(vjp_of_batched.interpret(vec![x, seed]), outputs);
     }
 
     #[test]
@@ -4188,6 +4456,142 @@ mod tests {
             ]),
         );
         assert_eq!(counter.read(), Ok(Array::scalar(7.0f32).unwrap()));
+    }
+
+    #[test]
+    fn test_custom_function_with_batching_casts() {
+        // The primal narrows `x: f64[n]` to `f64[2]` with a checked cast before `sin`, while the batching rule applies
+        // `sin` first and then narrows the batched value with a checked cast of its own, so that its program is
+        // recognizable. The rule's check survives batching, differentiation of the batched call (which differentiates
+        // the rule's program), and batching of the derived forward-mode call (which applies the derivative of the
+        // rule).
+        type Tracer = DomainTracer<ArrayContext>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let static_type = ArrayType::new_static(DataType::F64, [2]);
+        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin()).with_batching(
+            |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| {
+                let mut dimensions = x.r#type().shape().dimensions().to_vec();
+                *dimensions.last_mut().unwrap() = Dimension::Static(2);
+                let output_type = x.r#type().into_owned().with_shape(Shape::new(dimensions));
+                Ok((x.sin()?.cast(output_type, &[])?, axis))
+            },
+        );
+        let (_, program) = ArrayContext::trace(|x| function.call(x), symbolic_type).unwrap();
+        let program = program.into_flat_program();
+        let batched = |program: &FlatProgram<ArrayContext>, input_count: usize| {
+            program
+                .batched(
+                    3,
+                    ShardingDimension::Replicated,
+                    &vec![BatchAxis::new(0); input_count],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let elements = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5];
+        let x = Array::matrix(3, 2, elements.to_vec()).unwrap();
+        let tangent = Array::matrix(3, 2, vec![1.0; 6]).unwrap();
+        let wide = Array::matrix(3, 3, vec![1.0; 9]).unwrap();
+        let sine = Array::matrix(3, 2, elements.map(f64::sin).to_vec()).unwrap();
+        let cosine = Array::matrix(3, 2, elements.map(f64::cos).to_vec()).unwrap();
+        let mismatch = Err(ProgramError::Type(TypeError::invalid(
+            "`cast` cannot convert type `f64[3, 3]` to unrelated type `f64[3, 2]`".to_string(),
+        )));
+
+        let batched_program = batched(&program, 1);
+        assert_eq!(
+            batched_program.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n] .
+                let %1:f64[3, 2] = custom_function [
+                    name=\"custom_function\",
+                    batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])],
+                ] %0 [
+                    primal={
+                        lambda %0:f64[3, n] .
+                        let %1:f64[3, n] = sin %0
+                            %2:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(batched_program.interpret(vec![x.clone()]), Ok(vec![sine.clone()]));
+        assert_eq!(batched_program.interpret(vec![wide.clone()]), mismatch);
+
+        // Batching then differentiating.
+        let jvp_of_batched = batched_program.jvp().unwrap();
+        assert_eq!(
+            jvp_of_batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n], %1:f64[3, n] .
+                let %2:f64[3, n] = sin %0
+                    %3:f64[3, n] = cos %0
+                    %4:f64[3, n] = mul %3 %1
+                    %5:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %2
+                    %6:f64[3, n] = cast [type=f64[3, n], inputs=[f64[3, n], f64[3, 2]]] %2 %5
+                    %7:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n], f64[3, n]]] %4 %6
+                in (%5, %7)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(jvp_of_batched.interpret(vec![x.clone(), tangent.clone()]), Ok(vec![sine.clone(), cosine.clone()]),);
+        assert_eq!(jvp_of_batched.interpret(vec![wide.clone(), wide.clone()]), mismatch);
+
+        // Differentiating then batching: the derived forward-mode call keeps the batching rule, whose derivative its
+        // batching applies.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[n] .
+                let %2:f64[2], %3:f64[2] = custom_function [name=\"jvp(custom_function)\"] %0 %1 [
+                    primal={
+                        lambda %0:f64[n], %1:f64[n] .
+                        let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                            %3:f64[n] = cast [type=f64[n], inputs=[f64[n], f64[2]]] %0 %2
+                            %4:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %1 %3
+                            %5:f64[2] = sin %2
+                            %6:f64[2] = cos %2
+                            %7:f64[2] = mul %6 %4
+                        in (%5, %7)
+                    },
+                ]
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        let batched_jvp = batched(&jvp, 2);
+        assert_eq!(
+            batched_jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n], %1:f64[3, n] .
+                let %2:f64[3, 2], %3:f64[3, 2] = custom_function [
+                    name=\"jvp(custom_function)\",
+                    batching=[(extent=3, input_axes=[axis 0, axis 0], output_axes=[axis 0, axis 0])],
+                ] %0 %1 [
+                    primal={
+                        lambda %0:f64[3, n], %1:f64[3, n] .
+                        let %2:f64[3, n] = sin %0
+                            %3:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %2
+                            %4:f64[3, n] = cos %0
+                            %5:f64[3, n] = mul %4 %1
+                            %6:f64[3, n] = cast [type=f64[3, n], inputs=[f64[3, n], f64[3, 2]]] %2 %3
+                            %7:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n], f64[3, n]]] %5 %6
+                        in (%3, %7)
+                    },
+                ]
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(batched_jvp.interpret(vec![x, tangent]), Ok(vec![sine, cosine]));
+        assert_eq!(batched_jvp.interpret(vec![wide.clone(), wide]), mismatch);
     }
 
     #[test]
@@ -5662,5 +6066,220 @@ mod tests {
             ),
             Ok(Array::vector(vec![1.0f64.sin(), 2.0f64.sin()]).unwrap()),
         );
+    }
+
+    #[test]
+    fn test_custom_function_checked_casts() {
+        // A checked cast in the primal of a function without derivative rules keeps its runtime check in every
+        // transform. The derived forward-mode rule converts the tangent behind the primal check and retains the source
+        // `f64[n]` for the extent that the converted tangent no longer carries, so that reverse mode can transpose the
+        // conversion back to `f64[n]` with the retained source as its witness.
+        type Tracer = DomainTracer<ArrayContext>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let static_type = ArrayType::new_static(DataType::F64, [2]);
+        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin());
+        let (_, program) = ArrayContext::trace(|x| function.call(x), symbolic_type).unwrap();
+        let program = program.into_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n] .
+                let %1:f64[2] = custom_function [name=\"custom_function\"] %0 [
+                    primal={
+                        lambda %0:f64[n] .
+                        let %1:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                            %2:f64[2] = sin %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let x = Array::vector(vec![1.0, 2.0]).unwrap();
+        let wide_x = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let mismatch = Err(ProgramError::Type(TypeError::invalid(
+            "`cast` cannot convert type `f64[3]` to unrelated type `f64[2]`".to_string(),
+        )));
+        assert_eq!(
+            program.interpret(vec![x.clone()]),
+            Ok(vec![Array::vector(vec![1.0f64.sin(), 2.0f64.sin()]).unwrap()]),
+        );
+        assert_eq!(program.interpret(vec![wide_x.clone()]), mismatch);
+
+        // Forward mode inlines the primal and re-casts the source behind the primal check before converting the
+        // tangent, so the tangent conversion never runs ahead of the check.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[n] .
+                let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %3:f64[n] = cast [type=f64[n], inputs=[f64[n], f64[2]]] %0 %2
+                    %4:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %1 %3
+                    %5:f64[2] = sin %2
+                    %6:f64[2] = cos %2
+                    %7:f64[2] = mul %6 %4
+                in (%5, %7)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            jvp.interpret(vec![x.clone(), Array::vector(vec![1.0, 0.5]).unwrap()]),
+            Ok(vec![
+                Array::vector(vec![1.0f64.sin(), 2.0f64.sin()]).unwrap(),
+                Array::vector(vec![1.0f64.cos(), 0.5 * 2.0f64.cos()]).unwrap(),
+            ]),
+        );
+        assert_eq!(jvp.interpret(vec![wide_x.clone(), Array::vector(vec![1.0; 3]).unwrap()]), mismatch);
+
+        // Linearization runs the check in the primal program and keeps the source as a residual of the unchecked
+        // tangent conversion, whose transpose widens the cotangent back to `f64[n]` with that residual as its witness.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[n] .
+                let %1:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
+                    %2:f64[2] = sin %1
+                    %3:f64[2] = cos %1
+                in (%2, %0, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:f64[n], %2:f64[2] .
+                let %3:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %0 %1
+                    %4:f64[2] = mul %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[n], %2:f64[2] .
+                let %3:f64[2] = mul %2 %0
+                    %4:f64[n] = cast [type=f64[n], inputs=[f64[2], f64[n]]] %3 %1
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let mut pullback_inputs = vec![Array::vector(vec![1.0, 0.5]).unwrap()];
+        pullback_inputs.extend(linearization.primal().interpret(vec![x.clone()]).unwrap().into_iter().skip(1));
+        assert_eq!(
+            pullback.interpret(pullback_inputs),
+            Ok(vec![Array::vector(vec![1.0f64.cos(), 0.5 * 2.0f64.cos()]).unwrap()]),
+        );
+        assert_eq!(linearization.primal().interpret(vec![wide_x]), mismatch);
+        check_gradient!(
+            |x| {
+                let output = program.interpret_in_context(&x.domain(), vec![x])?.remove(0);
+                output.reduce(&[0], ReductionKind::Sum)
+            },
+            at = x,
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+    }
+
+    #[test]
+    fn test_custom_function_checked_casts_batching() {
+        // Batching lifts the declared cast types by the batch axis and keeps the check, and both orders of batching and
+        // differentiation stage the same checked primal conversion and unchecked tangent conversion.
+        type Tracer = DomainTracer<ArrayContext>;
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let static_type = ArrayType::new_static(DataType::F64, [2]);
+        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin());
+        let (_, program) = ArrayContext::trace(|x| function.call(x), symbolic_type).unwrap();
+        let program = program.into_flat_program();
+        let batched = |program: &FlatProgram<ArrayContext>, input_count: usize| {
+            program
+                .batched(
+                    3,
+                    ShardingDimension::Replicated,
+                    &vec![BatchAxis::new(0); input_count],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let elements = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5];
+        let x = Array::matrix(3, 2, elements.to_vec()).unwrap();
+        let tangent = Array::matrix(3, 2, vec![1.0; 6]).unwrap();
+        let (wide_x, wide_tangent) =
+            (Array::matrix(3, 3, vec![1.0; 9]).unwrap(), Array::matrix(3, 3, vec![1.0; 9]).unwrap());
+        let mismatch = Err(ProgramError::Type(TypeError::invalid(
+            "`cast` cannot convert type `f64[3, 3]` to unrelated type `f64[3, 2]`".to_string(),
+        )));
+        let sine = Array::matrix(3, 2, elements.map(f64::sin).to_vec()).unwrap();
+        let cosine = Array::matrix(3, 2, elements.map(f64::cos).to_vec()).unwrap();
+
+        let batched_program = batched(&program, 1);
+        assert_eq!(
+            batched_program.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n] .
+                let %1:f64[3, 2] = custom_function [
+                    name=\"custom_function\",
+                    batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])],
+                ] %0 [
+                    primal={
+                        lambda %0:f64[3, n] .
+                        let %1:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %0
+                            %2:f64[3, 2] = sin %1
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(batched_program.interpret(vec![x.clone()]), Ok(vec![sine.clone()]));
+        assert_eq!(batched_program.interpret(vec![wide_x.clone()]), mismatch);
+
+        // Batching then differentiating.
+        let jvp_of_batched = batched_program.jvp().unwrap();
+        assert_eq!(
+            jvp_of_batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n], %1:f64[3, n] .
+                let %2:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %0
+                    %3:f64[3, n] = cast [type=f64[3, n], inputs=[f64[3, n], f64[3, 2]]] %0 %2
+                    %4:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n], f64[3, n]]] %1 %3
+                    %5:f64[3, 2] = sin %2
+                    %6:f64[3, 2] = cos %2
+                    %7:f64[3, 2] = mul %6 %4
+                in (%5, %7)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(jvp_of_batched.interpret(vec![x.clone(), tangent.clone()]), Ok(vec![sine.clone(), cosine.clone()]));
+        assert_eq!(jvp_of_batched.interpret(vec![wide_x.clone(), wide_tangent.clone()]), mismatch);
+
+        // Differentiating then batching.
+        let batched_jvp = batched(&program.jvp().unwrap(), 2);
+        assert_eq!(
+            batched_jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[3, n], %1:f64[3, n] .
+                let %2:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n]], checked=true] %0
+                    %3:f64[3, 2] = sin %2
+                    %4:f64[3, 2] = cos %2
+                    %5:f64[3, n] = cast [type=f64[3, n], inputs=[f64[3, n], f64[3, 2]]] %0 %2
+                    %6:f64[3, 2] = cast [type=f64[3, 2], inputs=[f64[3, n], f64[3, n]]] %1 %5
+                    %7:f64[3, 2] = mul %4 %6
+                in (%3, %7)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(batched_jvp.interpret(vec![x, tangent]), Ok(vec![sine, cosine]));
+        assert_eq!(batched_jvp.interpret(vec![wide_x, wide_tangent]), mismatch);
     }
 }
