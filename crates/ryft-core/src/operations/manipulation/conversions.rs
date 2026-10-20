@@ -1787,6 +1787,8 @@ pub trait CastType: Type {
 }
 
 impl CastType for DataType {
+    // This family has no identities, so it keeps the default witness selector, which returns `None`. The unused
+    // `CastOperation<Self>` placeholder reuses the conversion that cast differentiation already requires.
     type IdentityWitnessOperation = CastOperation<Self>;
 
     #[inline]
@@ -1807,6 +1809,8 @@ impl CastType for DataType {
 }
 
 impl CastType for ArrayType {
+    // This universe has no first-class dimension values, so the default `None` selector retains the whole array.
+    // `CastOperation<Self>` is an unused placeholder that reuses cast differentiation's existing conversion bound.
     type IdentityWitnessOperation = CastOperation<Self>;
 
     #[inline]
@@ -1835,6 +1839,8 @@ impl CastType for ArrayType {
 }
 
 impl CastType for DimensionType {
+    // A dimension value already carries its identity, so the default `None` selector retains the value itself.
+    // `CastOperation<Self>` is an unused placeholder that reuses cast differentiation's existing conversion bound.
     type IdentityWitnessOperation = CastOperation<Self>;
 
     #[inline]
@@ -2477,6 +2483,8 @@ mod tests {
     // An independent type family can implement the operation-specific contract without changing `TypeRefinements`.
     // The impl lives at module level because trait impls are never scoped to a function.
     impl CastType for ProjectedMemberType<0> {
+        // This fixture has no identities and keeps the default witness selector, which returns `None`. The unused
+        // `CastOperation<Self>` placeholder reuses the conversion that cast differentiation already requires.
         type IdentityWitnessOperation = CastOperation<Self>;
 
         fn infer_cast_output_type(
