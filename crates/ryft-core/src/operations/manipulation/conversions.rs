@@ -1211,41 +1211,18 @@ impl<T: Type> CastOperation<T> {
         Ok(preserved)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns `value` at `output_type` through an unchecked [`CastOperation`] bound in `context` with the provided
-    /// `witnesses` (at their current types), or `value` itself when it already has that type and there are no
-    /// witnesses. Witness producers remain explicit dependencies even for identity conversions. Transformation rules
-    /// use this to bind into their target context (e.g., the tangent context of a forward-mode rule), and must have
-    /// proven the relationship that the cast states.
-    pub(crate) fn bind_unchecked<C: Context<Type = T, Operation: From<Self>>>(
-        context: &C,
-        value: &C::Value,
-        witnesses: &[C::Value],
-        output_type: T,
-    ) -> Result<C::Value, ProgramError> {
-        if witnesses.is_empty() && value.r#type().as_ref() == &output_type {
-            return Ok(value.clone());
-        }
-        let inputs = std::iter::once(value).chain(witnesses).cloned().collect::<Vec<_>>();
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
-        let mut outputs = context.bind(Self::unchecked(output_type, input_types)?, Vec::new(), &inputs)?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
     /// Binds the tangent of a value whose `primal` was converted into `output` by a cast or by a guard, returning the
     /// `tangent` at the tangent type of `output` through an unchecked cast in the tangent context. The relationship is
     /// proven by the primal conversion, so the tangent cast only needs witnesses for the extents that the output
     /// tangent type no longer carries and, when `needs_ordering` holds, a data dependency on the primal result so that
     /// the tangent stays behind the primal check in a fused forward-mode program. One source-typed value can carry both
     /// a lost name and that dependency: the primal is re-cast at its own type with the output as witness when it
-    /// carries every output identity, and separate witnesses are kept only when the output introduces names that the
-    /// source cannot carry.
+    /// carries every output identity, and separate witnesses are kept only when the output introduces names that
+    /// the source cannot carry.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Differentiation context whose primal side produced `output` and whose tangent side receives
+    ///   - `context`: [`DifferentiationContext`] whose primal side produced `output` and whose tangent side receives
     ///     the converted tangent.
     ///   - `primal`: Primal value that was converted.
     ///   - `output`: Converted primal value, whose tangent type the returned tangent has.
@@ -1265,6 +1242,7 @@ impl<T: Type> CastOperation<T> {
     {
         let tangent_type = output.r#type().tangent()?;
         let mut witnesses = Vec::new();
+
         // Retain source names only when the output tangent will no longer carry them. Static extents and names already
         // present in that tangent need no saved primal value.
         let needs_source = tangent
@@ -1287,12 +1265,73 @@ impl<T: Type> CastOperation<T> {
             };
             witnesses.push(context.primal_to_tangent(source)?);
         }
+
         // In a fused forward-mode program the primal result retains every witness and check producer. A partitioned
         // tangent program runs only after the primal completes and needs residuals only for missing extents.
         if !source_carries_output || (needs_ordering && !needs_source) {
             witnesses.push(context.primal_to_tangent(output.clone())?);
         }
+
         Self::bind_unchecked(context.tangent(), tangent, &witnesses, tangent_type)
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Binds a checked [`CastOperation`] in `context`, capturing the current types of `value` and `witnesses` as its
+    /// declaration. Relationships already proven by those types normalize to unchecked casts before binding, while
+    /// conditional relationships retain their ordered check. Witness producers remain explicit dependencies.
+    fn bind_checked<C: Context<Type = T, Operation: From<Self>>>(
+        context: &C,
+        value: &C::Value,
+        witnesses: &[C::Value],
+        output_type: T,
+    ) -> Result<C::Value, ProgramError>
+    where
+        T: CastType,
+    {
+        let input_types =
+            std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        Self::checked(output_type, input_types.clone())?
+            .normalized(&input_types)
+            .bind(context, value, witnesses)
+    }
+
+    /// Returns `value` at `output_type` through an unchecked [`CastOperation`] bound in `context` with the provided
+    /// `witnesses` (at their current types), or `value` itself when it already has that type and there are no
+    /// witnesses. Witness producers remain explicit dependencies even for identity conversions. Transformation rules
+    /// use this to bind into their target context (e.g., the tangent context of a forward-mode rule), and must have
+    /// proven the relationship that the cast states.
+    fn bind_unchecked<C: Context<Type = T, Operation: From<Self>>>(
+        context: &C,
+        value: &C::Value,
+        witnesses: &[C::Value],
+        output_type: T,
+    ) -> Result<C::Value, ProgramError> {
+        let input_types = std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect();
+        Self::unchecked(output_type, input_types)?.bind(context, value, witnesses)
+    }
+
+    /// Binds this prepared cast in `context`, preserving witnesses and validating an unchecked identity before
+    /// returning its input directly. The context's operation family owns validation, so unchecked transformation
+    /// helpers need no additional type-family bounds.
+    fn bind<C: Context<Type = T, Operation: From<Self>>>(
+        self,
+        context: &C,
+        value: &C::Value,
+        witnesses: &[C::Value],
+    ) -> Result<C::Value, ProgramError> {
+        let input_type = value.r#type();
+        let identity = !self.checked && witnesses.is_empty() && input_type.as_ref() == &self.output_type;
+        let operation = C::Operation::from(self);
+        if identity {
+            // Equal types can still be invalid cast declarations (e.g., a reference or a named dimension output).
+            operation.infer_output_types(std::slice::from_ref(input_type.as_ref()), &[])?;
+            return Ok(value.clone());
+        }
+        let inputs = std::iter::once(value).chain(witnesses).cloned().collect::<Vec<_>>();
+        let mut outputs = context.bind(operation, Vec::new(), &inputs)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 
     /// Validates operation structure before delegating the complete cast contract to its type trait.
@@ -2043,11 +2082,11 @@ impl<
 > Cast<T> for V
 {
     fn cast(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        bind_cast(self, output_type, witnesses, true)
+        CastOperation::bind_checked(&self.domain(), self, witnesses, output_type)
     }
 
     fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
-        bind_cast(self, output_type, witnesses, false)
+        CastOperation::bind_unchecked(&self.domain(), self, witnesses, output_type)
     }
 }
 
@@ -2150,21 +2189,6 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
         }
     }
     Ok(value.clone())
-}
-
-/// Captures the complete input signature and binds a cast through the domain of `value`.
-fn bind_cast<V: Value<Type: CastType, Domain: Context<Operation: From<CastOperation<V::Type>>>>>(
-    value: &V,
-    output_type: V::Type,
-    witnesses: &[V],
-    checked: bool,
-) -> Result<V, ProgramError> {
-    let inputs = std::iter::once(value).chain(witnesses).cloned().collect::<Vec<_>>();
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let operation = CastOperation { input_types: input_types.clone(), output_type, checked }.normalized(&input_types);
-    let mut outputs = value.domain().bind(operation, Vec::new(), &inputs)?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
 }
 
 #[cfg(test)]
@@ -3846,6 +3870,38 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_bind_checked() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+
+        // Proven identities fold, proven witnessed relationships become pure, and conditional narrowing retains its
+        // check. A witnessed identity still records both inputs so that their producers remain dependencies.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                let context = inputs[0].context();
+                let identity = CastOperation::bind_checked(context, &inputs[1], &[], exact.clone())?;
+                assert_eq!(identity, inputs[1]);
+                let witnessed = CastOperation::bind_checked(context, &inputs[1], &inputs[1..], exact.clone())?;
+                let narrowed = CastOperation::bind_checked(context, &inputs[0], &[], exact.clone())?;
+                Ok(vec![witnessed, narrowed])
+            },
+            vec![symbolic, exact.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[2] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[2], f32[2]]] %1 %1
+                    %3:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
+                in (%2, %3)"},
+        );
+        let values = vec![Array::vector(vec![1f32, 2f32]).unwrap(), Array::vector(vec![3f32, 4f32]).unwrap()];
+        assert_eq!(program.interpret(values.clone()), Ok(vec![values[1].clone(), values[0].clone()]));
+    }
+
+    #[test]
     fn test_cast_bind_unchecked() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
@@ -3874,6 +3930,30 @@ mod tests {
                     %3:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %0 %1
                 in (%2, %3)"},
         );
+    }
+
+    #[test]
+    fn test_cast_bind_identity_validates_declaration() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        for checked in [true, false] {
+            let result = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input: Tracer<_>| {
+                    let output_type = input.r#type().into_owned();
+                    if checked {
+                        CastOperation::bind_checked(input.context(), &input, &[], output_type)
+                    } else {
+                        CastOperation::bind_unchecked(input.context(), &input, &[], output_type)
+                    }
+                },
+                ArrayIrType::Dimension(n.clone()),
+            );
+            assert_eq!(
+                result.map(|_| ()),
+                Err(ProgramError::Type(TypeError::invalid(
+                    "`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity",
+                ))),
+            );
+        }
     }
 
     #[test]
