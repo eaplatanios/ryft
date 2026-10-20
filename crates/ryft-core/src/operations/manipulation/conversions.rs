@@ -1073,9 +1073,16 @@ impl<T: Type> CastOperation<T> {
     /// the value followed by its witnesses and must contain the first input. Staged and compiled programs check the
     /// relationship that the cast states at runtime. Refer to the documentation of [`CastOperation`] for more
     /// information.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `input_types` is empty.
     #[inline]
-    pub fn checked(output_type: T, input_types: Vec<T>) -> Self {
-        Self { input_types, output_type, checked: true }
+    pub fn checked(output_type: T, input_types: Vec<T>) -> Result<Self, TypeError> {
+        if input_types.is_empty() {
+            return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
+        }
+        Ok(Self { input_types, output_type, checked: true })
     }
 
     /// Creates a new unchecked [`CastOperation`] that returns its first input at `output_type`. `input_types` declares
@@ -1089,9 +1096,16 @@ impl<T: Type> CastOperation<T> {
     /// relationship does not hold silently computes with the wrong extents (e.g., reading padding as data).
     ///
     /// </div>
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `input_types` is empty.
     #[inline]
-    pub fn unchecked(output_type: T, input_types: Vec<T>) -> Self {
-        Self { input_types, output_type, checked: false }
+    pub fn unchecked(output_type: T, input_types: Vec<T>) -> Result<Self, TypeError> {
+        if input_types.is_empty() {
+            return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
+        }
+        Ok(Self { input_types, output_type, checked: false })
     }
 
     /// Returns the declared types of the value followed by its shape witnesses. These declarations retain the
@@ -1137,26 +1151,22 @@ impl<T: Type> CastOperation<T> {
         self
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Validates the family-independent part of the cast contract against the supplied `input_types` (i.e., the value
     /// followed by its witnesses) and returns the output identities that live inputs carry, which the inferred output
-    /// preserves. The declaration must name a first input, the supplied types must match it in count and be admitted
-    /// by it, no input or output may be a reference type, the output may not define a type identity, and every output
-    /// identity must be carried by a declared input. [`CastType::infer_cast_output_type`] implementations call this
-    /// first and then validate and infer the family-specific relationship; the built-in families additionally resolve
-    /// preserved identities and solve the dimension relationships.
+    /// preserves. The supplied types must match the declaration in count and be admitted by it, no input or output
+    /// may be a reference type, the output may not define a type identity, and every output identity must be carried
+    /// by a declared input. [`CastType::infer_cast_output_type`] implementations call this first and then validate
+    /// and infer the family-specific relationship; the built-in families additionally resolve preserved identities
+    /// and solve the dimension relationships.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] describing the first violated requirement.
     pub fn validate_declaration(&self, input_types: &[T]) -> Result<Vec<T::Identity>, TypeError> {
         check_count!("input", input_types, self.input_types.len(), TypeError);
-        // TODO(eaplatanios): Shouldn't this check be moved to `Self::checked` and `Self::unchecked`?
-        if self.input_types.is_empty() {
-            return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
-        }
 
+        // Witnesses bring names into scope but are still cast inputs (i.e., they cannot bypass the reference
+        // restriction). Inspect supplied types as well as declarations so neither side can hide a reference.
         if let Some(reference) = input_types
             .iter()
             .chain(&self.input_types)
@@ -1168,6 +1178,8 @@ impl<T: Type> CastOperation<T> {
             )));
         }
 
+        // A cast reuses input identities; it cannot introduce a new binding. In particular, a named first-class
+        // dimension defines its name, whereas an array shape only uses its dimension names.
         if self.output_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition) {
             return Err(TypeError::invalid(format!(
                 "`{}` output type `{}` cannot define a type identity",
@@ -1175,10 +1187,15 @@ impl<T: Type> CastOperation<T> {
             )));
         }
 
+        // Validate the complete signature together to reject conflicting refinements of repeated identities across
+        // inputs and witnesses. Admission may leave runtime obligations, so success here does not prove the cast's
+        // relationship. The caller's family-specific inference must still relate the inputs to the requested output.
         T::Refinements::new(&self.input_types, input_types)?;
 
         // Live names are preserved only in the final representation; all input and output constraints still participate
-        // in the complete shape comparison.
+        // in the complete shape comparison. For example, a witness declared as `f32[n]` may arrive as `f32[2]`: the
+        // declaration makes `n` legal in the requested output, but the inferred output must resolve it to `2` rather
+        // than introduce an unbound `n` when no supplied input still carries that name.
         let mut preserved = Vec::new();
         for (_, identity) in self.output_type.identities() {
             let carries = |r#type: &T| r#type.identities().any(|(_, available)| available == identity);
@@ -1193,6 +1210,8 @@ impl<T: Type> CastOperation<T> {
         }
         Ok(preserved)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns `value` at `output_type` through an unchecked [`CastOperation`] bound in `context` with the provided
     /// `witnesses` (at their current types), or `value` itself when it already has that type and there are no
@@ -1210,7 +1229,7 @@ impl<T: Type> CastOperation<T> {
         }
         let inputs = std::iter::once(value).chain(witnesses).cloned().collect::<Vec<_>>();
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
-        let mut outputs = context.bind(Self::unchecked(output_type, input_types), Vec::new(), &inputs)?;
+        let mut outputs = context.bind(Self::unchecked(output_type, input_types)?, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1278,9 +1297,6 @@ impl<T: Type> CastOperation<T> {
 
     /// Validates operation structure before delegating the complete cast contract to its type trait.
     fn validate_structure(&self, input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> Result<(), TypeError> {
-        if self.input_types.is_empty() {
-            return Err(TypeError::invalid(format!("`{CAST_OPERATION_NAME}` requires a declared first input type")));
-        }
         check_count!("input", input_types, self.input_types.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         Ok(())
@@ -3699,9 +3715,19 @@ mod tests {
 
     #[test]
     fn test_cast() {
+        // Both modes require a value to cast, independently of the type family's inference implementation.
+        assert_eq!(
+            CastOperation::checked(DataType::F32, Vec::new()),
+            Err(TypeError::invalid("`cast` requires a declared first input type")),
+        );
+        assert_eq!(
+            CastOperation::unchecked(DataType::F32, Vec::new()),
+            Err(TypeError::invalid("`cast` requires a declared first input type")),
+        );
+
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let operation = CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]);
+        let operation = CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap();
         assert_eq!(operation.name(), CAST_OPERATION_NAME);
         assert_eq!(operation.input_types(), &[symbolic.clone(), symbolic.clone()]);
         assert_eq!(operation.output_type(), &symbolic);
@@ -3709,28 +3735,31 @@ mod tests {
         assert_eq!(operation.effects().classes(), Effects::empty().classes());
         assert_eq!(operation.to_string(), "cast [type=f32[n], inputs=[f32[n], f32[n]]]");
         assert_eq!(
-            CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]).to_string(),
+            CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]).unwrap().to_string(),
             "cast [type=f32[n], inputs=[f32[n]]]",
         );
 
         // A checked cast is ordered like an assertion and renders its mode.
-        let checked = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]);
+        let checked = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap();
         assert!(checked.is_checked());
         assert_eq!(checked.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(checked.to_string(), "cast [type=f32[n], inputs=[f32[n], f32[n]], checked=true]");
         assert_eq!(
-            format!("{:?}", CastOperation::checked(DataType::F32, vec![DataType::F32])),
+            format!("{:?}", CastOperation::checked(DataType::F32, vec![DataType::F32]).unwrap()),
             "CastOperation { input_types: [F32], output_type: F32, checked: true }",
         );
 
         // Equality and hashing follow the declarations and the mode.
-        assert_eq!(operation, CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]));
+        assert_eq!(
+            operation,
+            CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap()
+        );
         assert_ne!(operation, checked);
-        assert_ne!(operation, CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]));
+        assert_ne!(operation, CastOperation::unchecked(symbolic.clone(), vec![symbolic.clone()]).unwrap());
         let operations = HashSet::from([operation.clone(), checked.clone()]);
         assert!(operations.contains(&operation));
         assert!(operations.contains(&checked));
-        assert!(!operations.contains(&CastOperation::unchecked(symbolic.clone(), vec![symbolic])));
+        assert!(!operations.contains(&CastOperation::unchecked(symbolic.clone(), vec![symbolic]).unwrap()));
     }
 
     #[test]
@@ -3743,28 +3772,32 @@ mod tests {
         // Actual types that prove the relationship turn a checked cast into an unchecked one, an unproven narrowing
         // keeps its check, and an unchecked cast is returned unchanged.
         assert_eq!(
-            CastOperation::checked(laid_out.clone(), vec![exact.clone()]).normalized(&[exact.clone()]),
-            CastOperation::unchecked(laid_out, vec![exact.clone()]),
+            CastOperation::checked(laid_out.clone(), vec![exact.clone()]).unwrap().normalized(&[exact.clone()]),
+            CastOperation::unchecked(laid_out, vec![exact.clone()]).unwrap(),
         );
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).normalized(&[exact.clone()]),
-            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap().normalized(&[exact.clone()]),
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).unwrap(),
         );
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).normalized(&[symbolic.clone()]),
-            CastOperation::checked(exact.clone(), vec![symbolic.clone()]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()])
+                .unwrap()
+                .normalized(&[symbolic.clone()]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap(),
         );
         assert_eq!(
-            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).normalized(&[symbolic.clone()]),
-            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]),
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()])
+                .unwrap()
+                .normalized(&[symbolic.clone()]),
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).unwrap(),
         );
 
         // The proof uses the actual types: a declaration admitting weaker actual types still needs its check.
-        let widening = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]);
+        let widening = CastOperation::checked(symbolic.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap();
         assert_eq!(widening.clone().normalized(&[exact.clone(), symbolic]), widening);
 
         // A cast whose declaration the actual types do not admit is returned unchanged for binding to reject.
-        let unrelated = CastOperation::checked(exact.clone(), vec![exact]);
+        let unrelated = CastOperation::checked(exact.clone(), vec![exact]).unwrap();
         assert_eq!(unrelated.clone().normalized(&[ArrayType::new_static(DataType::F32, [3])]), unrelated);
     }
 
@@ -3777,15 +3810,11 @@ mod tests {
         let static_dimension: ArrayIrType = DimensionType::from(Dimension::Static(2)).into();
 
         // The returned identities are the output identities that live inputs still carry.
-        let widening = CastOperation::checked(symbolic.clone(), vec![exact.clone(), n.clone().into()]);
+        let widening = CastOperation::checked(symbolic.clone(), vec![exact.clone(), n.clone().into()]).unwrap();
         assert_eq!(widening.validate_declaration(&[exact.clone(), n.clone().into()]), Ok(vec![n.to_variable()]));
         assert_eq!(widening.validate_declaration(&[exact.clone(), static_dimension]), Ok(Vec::new()));
 
         // Each family-independent requirement is reported in turn.
-        assert_eq!(
-            CastOperation::checked(exact.clone(), Vec::new()).validate_declaration(&[]),
-            Err(TypeError::invalid("`cast` requires a declared first input type")),
-        );
         assert_eq!(
             widening.validate_declaration(&[exact.clone()]),
             Err(TypeError::invalid("expected 2 inputs but got 1")),
@@ -3793,20 +3822,24 @@ mod tests {
         let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         assert_eq!(
             CastOperation::checked(exact.clone(), vec![exact.clone(), reference.clone()])
+                .unwrap()
                 .validate_declaration(&[exact.clone(), reference]),
             Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2]>`")),
         );
         assert_eq!(
-            CastOperation::checked(n.clone().into(), vec![exact.clone()]).validate_declaration(&[exact.clone()]),
+            CastOperation::checked(n.clone().into(), vec![exact.clone()])
+                .unwrap()
+                .validate_declaration(&[exact.clone()]),
             Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
         );
         let wrong: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![exact.clone()]).validate_declaration(&[wrong]),
+            CastOperation::checked(exact.clone(), vec![exact.clone()]).unwrap().validate_declaration(&[wrong]),
             Err(TypeError::invalid("dimension 3 does not refine declared dimension 2")),
         );
         assert_eq!(
             CastOperation::checked(symbolic, vec![exact.clone(), m.clone().into()])
+                .unwrap()
                 .validate_declaration(&[exact, m.into()]),
             Err(TypeError::invalid("`cast` output identity `n` is not carried by a declared input")),
         );
@@ -3851,10 +3884,11 @@ mod tests {
         let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
 
         // Concrete extents prove the relationship and the inferred representation is returned, in both modes.
-        let narrowing = CastOperation::checked(exact.clone(), vec![symbolic.clone()]);
+        let narrowing = CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap();
         assert_eq!(narrowing.infer_interpreted_output_type(&[exact.clone()], &[]), Ok(exact.clone()));
         assert_eq!(
             CastOperation::unchecked(laid_out.clone(), vec![exact.clone()])
+                .unwrap()
                 .infer_interpreted_output_type(&[exact.clone()], &[]),
             Ok(laid_out),
         );
@@ -3868,6 +3902,7 @@ mod tests {
         assert_eq!(narrowing.infer_interpreted_output_type(&[symbolic.clone()], &[]), unproven);
         assert_eq!(
             CastOperation::unchecked(exact.clone(), vec![symbolic.clone()])
+                .unwrap()
                 .infer_interpreted_output_type(&[symbolic], &[]),
             unproven,
         );
@@ -3886,6 +3921,7 @@ mod tests {
         );
         assert_eq!(
             CastOperation::checked(exact.clone(), vec![exact])
+                .unwrap()
                 .infer_interpreted_output_type(&[ArrayType::new_static(DataType::F32, [3])], &[]),
             Err(ProgramError::Type(TypeError::invalid("dimension 3 does not refine declared dimension 2"))),
         );
@@ -3900,7 +3936,7 @@ mod tests {
 
         // The declarations name identities of the surrounding program, so they follow its renamings in both modes,
         // and renaming back restores the original operation.
-        let operation = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()]);
+        let operation = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()]).unwrap();
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(n.to_variable(), m.to_variable()).unwrap();
         let renamed = operation.rename_type_identities(&renaming).unwrap();
@@ -3914,7 +3950,8 @@ mod tests {
         let mixed = CastOperation::unchecked(
             array(vec![Dimension::Static(3), a.simplified_dimension()]),
             vec![array(vec![b.simplified_dimension(), Dimension::Static(3)]), array(vec![a.simplified_dimension()])],
-        );
+        )
+        .unwrap();
         let mut swap = TypeIdentityRenaming::new();
         swap.insert(a.to_variable(), b.to_variable()).unwrap();
         swap.insert(b.to_variable(), a.to_variable()).unwrap();
@@ -3929,6 +3966,7 @@ mod tests {
         widening.insert(n.to_variable(), wide.to_variable()).unwrap();
         assert_eq!(
             CastOperation::<ArrayIrType>::checked(exact.clone().into(), vec![exact.into(), n.into()])
+                .unwrap()
                 .rename_type_identities(&widening),
             Err(TypeError::invalid(
                 "cannot rename dimension variable n with bounds [1, 8) to wide with bounds [1, 16)",
@@ -3947,31 +3985,42 @@ mod tests {
         // relationship, and a witnessed cast do not: witness producers stay explicit dependencies even when the
         // representation is unchanged.
         let folded = Ok(Some(vec![OperationFoldOutput::Input(0)]));
-        assert_eq!(CastOperation::checked(exact.clone(), vec![symbolic.clone()]).fold(&[exact.clone()], &[]), folded);
-        assert_eq!(CastOperation::unchecked(exact.clone(), vec![exact.clone()]).fold(&[exact.clone()], &[]), folded);
-        assert_eq!(CastOperation::checked(laid_out, vec![exact.clone()]).fold(&[exact.clone()], &[]), Ok(None));
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).fold(&[symbolic.clone()], &[]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap().fold(&[exact.clone()], &[]),
+            folded
+        );
+        assert_eq!(
+            CastOperation::unchecked(exact.clone(), vec![exact.clone()]).unwrap().fold(&[exact.clone()], &[]),
+            folded
+        );
+        assert_eq!(
+            CastOperation::checked(laid_out, vec![exact.clone()]).unwrap().fold(&[exact.clone()], &[]),
+            Ok(None)
+        );
+        assert_eq!(
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()])
+                .unwrap()
+                .fold(&[symbolic.clone()], &[]),
             Ok(None),
         );
         assert_eq!(
             CastOperation::checked(exact.clone(), vec![exact.clone(), symbolic.clone()])
+                .unwrap()
                 .fold(&[exact.clone(), symbolic], &[]),
             Ok(None),
         );
 
         // Structural and type errors are reported.
         assert_eq!(
-            CastOperation::checked(exact.clone(), Vec::new()).fold(&[], &[]),
-            Err(TypeError::invalid("`cast` requires a declared first input type")),
-        );
-        assert_eq!(
             CastOperation::checked(exact.clone(), vec![exact.clone()])
+                .unwrap()
                 .fold(&[exact.clone()], &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![exact]).fold(&[ArrayType::new_static(DataType::F32, [3])], &[]),
+            CastOperation::checked(exact.clone(), vec![exact])
+                .unwrap()
+                .fold(&[ArrayType::new_static(DataType::F32, [3])], &[]),
             Err(TypeError::invalid("dimension 3 does not refine declared dimension 2")),
         );
     }
@@ -3988,7 +4037,7 @@ mod tests {
             let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
                 |inputs: Vec<Tracer<_>>| {
                     let witness = inputs[1].cast(symbolic.clone(), &[inputs[0].clone()])?;
-                    constructor(symbolic.clone(), vec![symbolic.clone(); 2]).interpret(
+                    constructor(symbolic.clone(), vec![symbolic.clone(); 2]).unwrap().interpret(
                         inputs[0].context(),
                         &EmptyRegionDriver,
                         &[inputs[0].clone(), witness],
@@ -4026,12 +4075,12 @@ mod tests {
 
         // Narrowing and widening are both admitted, for arrays and for first-class dimensions, and witnesses scope the
         // identities that a widened output type mentions.
-        let narrowing = CastOperation::unchecked(exact(2), vec![symbolic.clone(), symbolic.clone()]);
+        let narrowing = CastOperation::unchecked(exact(2), vec![symbolic.clone(), symbolic.clone()]).unwrap();
         check_operation_type_inference!(
             operation = narrowing.clone(),
             cases = [{ input_types = [symbolic.clone(), symbolic.clone()], output_types = [exact(2)] }],
         );
-        let widening = CastOperation::unchecked(symbolic.clone(), vec![exact(2), symbolic.clone()]);
+        let widening = CastOperation::unchecked(symbolic.clone(), vec![exact(2), symbolic.clone()]).unwrap();
         check_operation_type_inference!(
             operation = widening.clone(),
             cases = [
@@ -4040,7 +4089,7 @@ mod tests {
             ],
         );
         check_operation_type_inference!(
-            operation = CastOperation::unchecked(static_dimension(2), vec![n.clone().into()]),
+            operation = CastOperation::unchecked(static_dimension(2), vec![n.clone().into()]).unwrap(),
             cases = [{ input_types = [n.clone().into()], output_types = [static_dimension(2)] }],
         );
 
@@ -4051,20 +4100,21 @@ mod tests {
             actual: 2,
         }));
         assert_eq!(widening.infer_output_types(&[exact(2), exact(5)], &[]), mismatch);
-        let widening_with_dimension = CastOperation::unchecked(symbolic.clone(), vec![exact(2), n.clone().into()]);
+        let widening_with_dimension =
+            CastOperation::unchecked(symbolic.clone(), vec![exact(2), n.clone().into()]).unwrap();
         assert_eq!(widening_with_dimension.infer_output_types(&[exact(2), static_dimension(5)], &[]), mismatch);
         assert_eq!(narrowing.infer_output_types(&[symbolic.clone(), exact(5)], &[]), mismatch);
 
         // Unrelated types, identity-defining output types, and references are rejected.
         check_operation_type_inference!(
-            operation = CastOperation::unchecked(exact(2), vec![exact(3)]),
+            operation = CastOperation::unchecked(exact(2), vec![exact(3)]).unwrap(),
             cases = [{
                 input_types = [exact(3)],
                 error = "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
             }],
         );
         check_operation_type_inference!(
-            operation = CastOperation::unchecked(n.clone().into(), vec![static_dimension(2)]),
+            operation = CastOperation::unchecked(n.clone().into(), vec![static_dimension(2)]).unwrap(),
             cases = [{
                 input_types = [static_dimension(2)],
                 error = "`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity",
@@ -4072,7 +4122,7 @@ mod tests {
         );
         let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         check_operation_type_inference!(
-            operation = CastOperation::unchecked(reference.clone(), vec![reference.clone()]),
+            operation = CastOperation::unchecked(reference.clone(), vec![reference.clone()]).unwrap(),
             cases = [{
                 input_types = [reference],
                 error = "`cast` does not support reference type `ref<f32[2]>`",
@@ -4081,14 +4131,14 @@ mod tests {
 
         // The same operation infers bare element types in the `DataType` universe, where only identities are related.
         check_operation_type_inference!(
-            operation = CastOperation::checked(DataType::F32, vec![DataType::F32]),
+            operation = CastOperation::checked(DataType::F32, vec![DataType::F32]).unwrap(),
             cases = [
                 { input_types = [DataType::F32], output_types = [DataType::F32] },
                 { input_types = [DataType::F64], error = "type f64 does not refine declared type f32" },
             ],
         );
         check_operation_type_inference!(
-            operation = CastOperation::checked(DataType::F64, vec![DataType::F32]),
+            operation = CastOperation::checked(DataType::F64, vec![DataType::F32]).unwrap(),
             cases = [{
                 input_types = [DataType::F32],
                 error = "`cast` cannot convert type `f32` to unrelated type `f64`",
@@ -4118,7 +4168,7 @@ mod tests {
         let input = array(vec![b.simplified_dimension(), Dimension::Static(3)]);
         let output = array(vec![Dimension::Static(3), a.simplified_dimension()]);
         let witness = array(vec![a.simplified_dimension()]);
-        let operation = CastOperation::unchecked(output.clone(), vec![input.clone(), witness.clone()]);
+        let operation = CastOperation::unchecked(output.clone(), vec![input.clone(), witness.clone()]).unwrap();
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [{ input_types = [input.clone(), witness.clone()], output_types = [output] }],
@@ -4135,7 +4185,7 @@ mod tests {
             operation = CastOperation::unchecked(
                 array(vec![Dimension::Static(4), Dimension::Static(4)]),
                 vec![input.clone(), witness.clone()],
-            ),
+            ).unwrap(),
             cases = [{
                 input_types = [input, witness],
                 error = "`cast` cannot convert type `f32[b, 3]` to unrelated type `f32[4, 4]`",
@@ -4173,13 +4223,14 @@ mod tests {
         ] {
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 assert_eq!(
-                    constructor(output.clone(), vec![input.clone()]).infer_output_types(&[input.clone()], &[]),
+                    constructor(output.clone(), vec![input.clone()]).unwrap().infer_output_types(&[input.clone()], &[]),
                     Ok(vec![output.clone()]),
                 );
             }
             for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
                 assert_eq!(
                     constructor(output.clone().into(), vec![input.clone().into()])
+                        .unwrap()
                         .infer_output_types(&[input.clone().into()], &[]),
                     Ok(vec![output.clone().into()]),
                 );
@@ -4195,11 +4246,11 @@ mod tests {
             .clone()
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         check_operation_type_inference!(
-            operation = CastOperation::checked(tiled.clone(), vec![plain.clone()]),
+            operation = CastOperation::checked(tiled.clone(), vec![plain.clone()]).unwrap(),
             cases = [{ input_types = [plain.clone()], output_types = [tiled.clone()] }],
         );
         check_operation_type_inference!(
-            operation = CastOperation::unchecked(plain.clone(), vec![tiled.clone()]),
+            operation = CastOperation::unchecked(plain.clone(), vec![tiled.clone()]).unwrap(),
             cases = [{ input_types = [tiled], output_types = [plain] }],
         );
     }
@@ -4223,7 +4274,9 @@ mod tests {
         );
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             let infer = |output: &ArrayType, declared: &ArrayType, actual: &ArrayType| {
-                constructor(output.clone(), vec![declared.clone()]).infer_output_types(&[actual.clone()], &[])
+                constructor(output.clone(), vec![declared.clone()])
+                    .unwrap()
+                    .infer_output_types(&[actual.clone()], &[])
             };
             assert_eq!(infer(&varying, &plain, &varying), Err(variation.clone()));
             assert_eq!(infer(&unreduced, &plain, &unreduced), Err(reduction.clone()));
@@ -4239,11 +4292,13 @@ mod tests {
         // The composite universe applies the same rules to its array members.
         assert_eq!(
             CastOperation::<ArrayIrType>::checked(varying.clone().into(), vec![plain.clone().into()])
+                .unwrap()
                 .infer_output_types(&[varying.into()], &[]),
             Err(variation),
         );
         assert_eq!(
             CastOperation::<ArrayIrType>::unchecked(plain.clone().into(), vec![reduced.clone().into()])
+                .unwrap()
                 .infer_output_types(&[reduced.clone().into()], &[]),
             Err(unrelated_cast_types(&reduced, &plain)),
         );
@@ -4294,13 +4349,14 @@ mod tests {
             let expected = expected.map(|()| vec![output.clone()]);
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 assert_eq!(
-                    constructor(output.clone(), vec![input.clone()]).infer_output_types(&[input.clone()], &[]),
+                    constructor(output.clone(), vec![input.clone()]).unwrap().infer_output_types(&[input.clone()], &[]),
                     expected,
                 );
             }
             for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
                 assert_eq!(
                     constructor(output.clone().into(), vec![input.clone().into()])
+                        .unwrap()
                         .infer_output_types(&[input.clone().into()], &[]),
                     expected.clone().map(|types| types.into_iter().map(ArrayIrType::from).collect()),
                 );
@@ -4324,14 +4380,14 @@ mod tests {
                 .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated(); 2]).unwrap())
                 .unwrap();
         check_operation_type_inference!(
-            operation = CastOperation::checked(output.clone(), vec![input.clone(), output.clone()]),
+            operation = CastOperation::checked(output.clone(), vec![input.clone(), output.clone()]).unwrap(),
             cases = [{ input_types = [input.clone(), output.clone()], output_types = [output.clone()] }],
         );
         let disjoint = DimensionType::new("disjoint", DimensionBounds::new(4, Some(8)).unwrap());
         let disjoint =
             ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), disjoint.simplified_dimension()]));
         check_operation_type_inference!(
-            operation = CastOperation::checked(disjoint.clone(), vec![input.clone(), disjoint.clone()]),
+            operation = CastOperation::checked(disjoint.clone(), vec![input.clone(), disjoint.clone()]).unwrap(),
             cases = [{
                 input_types = [input, disjoint],
                 error = "`cast` cannot equate dimensions with disjoint bounds: `c` ∈ [1, 4), `disjoint` ∈ [4, 8)",
@@ -4349,14 +4405,14 @@ mod tests {
         let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
         let output: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
         check_operation_type_inference!(
-            operation = CastOperation::checked(output.clone(), vec![exact.clone(), other.into()]),
+            operation = CastOperation::checked(output.clone(), vec![exact.clone(), other.into()]).unwrap(),
             cases = [{
                 input_types = [exact.clone(), n.clone().into()],
                 error = "`cast` output identity `n` is not carried by a declared input",
             }],
         );
         check_operation_type_inference!(
-            operation = CastOperation::checked(output.clone(), vec![exact.clone(), n.clone().into()]),
+            operation = CastOperation::checked(output.clone(), vec![exact.clone(), n.clone().into()]).unwrap(),
             cases = [{ input_types = [exact.clone(), n.into()], output_types = [output] }],
         );
 
@@ -4366,14 +4422,14 @@ mod tests {
         let symbolic: ArrayIrType =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(fixed.to_variable())])).into();
         check_operation_type_inference!(
-            operation = CastOperation::checked(symbolic.clone(), vec![exact.clone()]),
+            operation = CastOperation::checked(symbolic.clone(), vec![exact.clone()]).unwrap(),
             cases = [{
                 input_types = [symbolic.clone()],
                 error = "`cast` output identity `fixed` is not carried by a declared input",
             }],
         );
         check_operation_type_inference!(
-            operation = CastOperation::checked(symbolic.clone(), vec![symbolic]),
+            operation = CastOperation::checked(symbolic.clone(), vec![symbolic]).unwrap(),
             cases = [{ input_types = [exact.clone()], output_types = [exact] }],
         );
     }
@@ -4389,6 +4445,7 @@ mod tests {
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
                 constructor(target.clone(), vec![source.clone(), n.clone().into()])
+                    .unwrap()
                     .infer_output_types(&[source.clone(), m.clone().into()], &[]),
                 Ok(vec![source.clone()]),
             );
@@ -4403,7 +4460,8 @@ mod tests {
         let [m, n] = ["m", "n"].map(|name| DimensionType::new(name, bounds));
         let source = ArrayType::new(DataType::F32, Shape::new(vec![m.simplified_dimension()]));
         let output = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let operation = CastOperation::<ArrayIrType>::checked(output.into(), vec![source.clone().into(), n.into()]);
+        let operation =
+            CastOperation::<ArrayIrType>::checked(output.into(), vec![source.clone().into(), n.into()]).unwrap();
         assert_eq!(
             ArrayIrType::infer_cast_output_type(&operation, &[source.clone().into(), m.into()]),
             Ok((source.clone().into(), Some(source.into()))),
@@ -4423,11 +4481,12 @@ mod tests {
         let target_sharding = plain.clone().with_sharding(Sharding::replicated(other_mesh, 1)).unwrap();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
-                constructor(target.clone(), vec![plain.clone()]).infer_output_types(&[actual.clone()], &[]),
+                constructor(target.clone(), vec![plain.clone()]).unwrap().infer_output_types(&[actual.clone()], &[]),
                 Ok(vec![target.clone()]),
             );
             assert_eq!(
                 constructor(target_sharding.clone(), vec![plain.clone()])
+                    .unwrap()
                     .infer_output_types(&[actual_sharding.clone()], &[]),
                 Ok(vec![target_sharding.clone()]),
             );
@@ -4441,7 +4500,8 @@ mod tests {
         let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
         let output: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let operation = constructor(output.clone(), vec![exact.clone(), n.clone().into(), other.clone().into()]);
+            let operation =
+                constructor(output.clone(), vec![exact.clone(), n.clone().into(), other.clone().into()]).unwrap();
             // Declared n corresponds to supplied m. The other supplied n has a separate role and cannot supply the
             // output's nominal binding merely because it uses the same identity object as the declaration. Resolve
             // the formal n through its own class to the source's exact extent instead.
@@ -4469,14 +4529,17 @@ mod tests {
             let declarations = vec![source.clone(), n.clone().into()];
             let actual = [source.clone(), m.clone().into()];
             assert_eq!(
-                constructor(exact(2), declarations.clone()).infer_output_types(&actual, &[]),
+                constructor(exact(2), declarations.clone()).unwrap().infer_output_types(&actual, &[]),
                 Err(TypeError::custom(DimensionError::BindingOutOfBounds {
                     variable: "m".to_owned(),
                     value: 2,
                     bounds: m.bounds(),
                 })),
             );
-            assert_eq!(constructor(exact(5), declarations).infer_output_types(&actual, &[]), Ok(vec![exact(5)]));
+            assert_eq!(
+                constructor(exact(5), declarations).unwrap().infer_output_types(&actual, &[]),
+                Ok(vec![exact(5)])
+            );
         }
 
         // Neither witness class is exact. Joining them through the cast still requires a common admitted extent.
@@ -4487,7 +4550,7 @@ mod tests {
         let output: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![other.simplified_dimension()])).into();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             let declarations = vec![source.clone(), n.clone().into(), output.clone(), other.clone().into()];
-            let operation = constructor(output.clone(), declarations);
+            let operation = constructor(output.clone(), declarations).unwrap();
             assert_eq!(
                 operation.infer_output_types(
                     &[source.clone(), lower.clone().into(), output.clone(), upper.clone().into()],
@@ -4524,13 +4587,13 @@ mod tests {
             expected: 5,
             actual: 2,
         })));
-        let widening = CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]);
+        let widening = CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]).unwrap();
         assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2)]), Ok(vec![vector(2)]));
         assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(5)]), mismatch);
-        let checked = CastOperation::checked(symbolic.clone(), vec![exact.clone(), n.clone().into()]);
+        let checked = CastOperation::checked(symbolic.clone(), vec![exact.clone(), n.clone().into()]).unwrap();
         assert_eq!(checked.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2)]), Ok(vec![vector(2)]));
         assert_eq!(checked.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(5)]), mismatch);
-        let narrowing = CastOperation::unchecked(exact.clone(), vec![symbolic]);
+        let narrowing = CastOperation::unchecked(exact.clone(), vec![symbolic]).unwrap();
         assert_eq!(narrowing.interpret(&context, &EmptyRegionDriver, &[vector(2)]), Ok(vec![vector(2)]));
         assert_eq!(
             narrowing.interpret(&context, &EmptyRegionDriver, &[vector(3)]),
@@ -4541,7 +4604,7 @@ mod tests {
 
         // Witnesses declared with a shared identity must agree with each other even when the output is static, so a
         // cast can act as a guard over its witnesses.
-        let guard = CastOperation::checked(exact.clone(), vec![exact.clone(), n.clone().into(), n.into()]);
+        let guard = CastOperation::checked(exact.clone(), vec![exact.clone(), n.clone().into(), n.into()]).unwrap();
         assert_eq!(
             guard.interpret(&context, &EmptyRegionDriver, &[vector(2), dimension(2), dimension(2)]),
             Ok(vec![vector(2)]),
@@ -4558,7 +4621,11 @@ mod tests {
         // A reference cannot be the source of a cast.
         let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap()));
         assert_eq!(
-            CastOperation::unchecked(exact.clone(), vec![exact]).interpret(&context, &EmptyRegionDriver, &[reference]),
+            CastOperation::unchecked(exact.clone(), vec![exact]).unwrap().interpret(
+                &context,
+                &EmptyRegionDriver,
+                &[reference]
+            ),
             Err(ProgramError::Type(TypeError::invalid("`cast` does not support reference type `ref<f32[2]>`"))),
         );
     }
@@ -4583,13 +4650,14 @@ mod tests {
         // Symbolic values carry no concrete extents, so a relationship that needs a runtime check is rejected in both
         // modes rather than staged.
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let widening = constructor(vector.clone(), vec![ArrayType::new_static(DataType::F32, [2]), vector.clone()]);
+            let widening =
+                constructor(vector.clone(), vec![ArrayType::new_static(DataType::F32, [2]), vector.clone()]).unwrap();
             assert_eq!(widening.interpret(&context, &EmptyRegionDriver, &[exact.clone(), witness.clone()]), expected);
         }
 
         // A type-level proof is sufficient when no runtime relationship remains to be checked.
         assert_eq!(
-            CastOperation::checked(matrix.clone(), vec![matrix]).interpret(
+            CastOperation::checked(matrix.clone(), vec![matrix]).unwrap().interpret(
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&value),
@@ -4599,7 +4667,7 @@ mod tests {
 
         // A requested symbolic output is not a second runtime observation. The exact input proves this relation.
         assert_eq!(
-            CastOperation::checked(vector.clone(), vec![vector]).interpret(
+            CastOperation::checked(vector.clone(), vec![vector]).unwrap().interpret(
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&exact),
@@ -4612,14 +4680,14 @@ mod tests {
         let narrowed =
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let symbolic = context.input(ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension()])));
-        let operation = CastOperation::checked(narrowed, vec![symbolic.r#type().into_owned()]);
+        let operation = CastOperation::checked(narrowed, vec![symbolic.r#type().into_owned()]).unwrap();
         assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[symbolic.clone()]), expected);
 
         // Equal bounds do not prove a different nominal output identity, and interpretation must not stage it.
         let fresh = DimensionType::new("fresh", bounds);
         let unrelated = ArrayType::new(DataType::F32, Shape::new(vec![fresh.simplified_dimension()]));
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let operation = constructor(unrelated.clone(), vec![symbolic.r#type().into_owned()]);
+            let operation = constructor(unrelated.clone(), vec![symbolic.r#type().into_owned()]).unwrap();
             assert_eq!(
                 ArrayType::infer_cast_output_type(&operation, &[symbolic.r#type().into_owned()]),
                 Err(TypeError::invalid("`cast` output identity `fresh` is not carried by a declared input")),
@@ -4646,7 +4714,8 @@ mod tests {
         let exact_output = output.clone().with_shape(plain.shape().clone());
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             let operation =
-                constructor(output.clone(), vec![output.clone().with_layout(None).with_sharding(None).unwrap()]);
+                constructor(output.clone(), vec![output.clone().with_layout(None).with_sharding(None).unwrap()])
+                    .unwrap();
             assert_eq!(
                 ArrayType::infer_cast_output_type(&operation, &[plain.clone()]),
                 Ok((exact_output.clone(), Some(exact_output.clone()))),
@@ -4700,7 +4769,7 @@ mod tests {
         // Concrete execution must retain a = 2, b = 3 from the input declaration. It cannot assign those same names
         // new extents from the requested output, even when each axis would separately admit the requested extent.
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let operation = constructor(output.clone(), vec![input.clone()]);
+            let operation = constructor(output.clone(), vec![input.clone()]).unwrap();
             assert_eq!(
                 operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&square)),
                 Ok(vec![square.clone()]),
@@ -4713,7 +4782,7 @@ mod tests {
         }
 
         // A cast that preserves its declared type accepts rectangular shapes.
-        let operation = CastOperation::checked(input.clone(), vec![input]);
+        let operation = CastOperation::checked(input.clone(), vec![input]).unwrap();
         assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[rectangular.clone()]), Ok(vec![rectangular]));
     }
 
@@ -4740,7 +4809,7 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             let interpret = |dimensions: Vec<Dimension>, value: Array, witness_value: Array| {
-                constructor(target(dimensions), vec![source.clone(), witness.clone()]).interpret(
+                constructor(target(dimensions), vec![source.clone(), witness.clone()]).unwrap().interpret(
                     &context,
                     &EmptyRegionDriver,
                     &[value, witness_value],
@@ -4793,10 +4862,15 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let checked = builder
-            .add_instruction(CastOperation::checked(output.clone(), vec![input.clone()]), Vec::new(), vec![value], None)
+            .add_instruction(
+                CastOperation::checked(output.clone(), vec![input.clone()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let unchecked = builder
-            .add_instruction(CastOperation::unchecked(output, vec![input]), Vec::new(), vec![value], None)
+            .add_instruction(CastOperation::unchecked(output, vec![input]).unwrap(), Vec::new(), vec![value], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![checked, unchecked], vec![Placeholder], vec![Placeholder; 2])
@@ -4837,7 +4911,7 @@ mod tests {
             let expected = Array::from_elements(output_type.clone(), &[10u8, 20]).unwrap();
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 assert_eq!(
-                    constructor(output_type.clone(), vec![plain.clone()]).interpret(
+                    constructor(output_type.clone(), vec![plain.clone()]).unwrap().interpret(
                         &EagerContext::<Array, ArrayOperation<Array>>::new(),
                         &EmptyRegionDriver,
                         &[input.clone()],
@@ -4847,7 +4921,7 @@ mod tests {
             }
             for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
                 assert_eq!(
-                    constructor(output_type.clone().into(), vec![plain.clone().into()]).interpret(
+                    constructor(output_type.clone().into(), vec![plain.clone().into()]).unwrap().interpret(
                         &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
                         &EmptyRegionDriver,
                         &[ArrayIrValue::Array(input.clone())],
@@ -4872,7 +4946,7 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
-                constructor(target.clone(), vec![plain.clone()]).interpret(
+                constructor(target.clone(), vec![plain.clone()]).unwrap().interpret(
                     &context,
                     &EmptyRegionDriver,
                     &[Array::from_elements(actual.clone(), &[10u8, 20]).unwrap()],
@@ -4880,7 +4954,7 @@ mod tests {
                 Ok(vec![Array::from_elements(target.clone(), &[10u8, 20]).unwrap()]),
             );
             assert_eq!(
-                constructor(target_sharding.clone(), vec![plain.clone()]).interpret(
+                constructor(target_sharding.clone(), vec![plain.clone()]).unwrap().interpret(
                     &context,
                     &EmptyRegionDriver,
                     &[Array::from_elements(actual_sharding.clone(), &[10u8, 20]).unwrap()],
@@ -4901,7 +4975,7 @@ mod tests {
         let witness = Array::vector(vec![3f32, 4f32]).unwrap();
         for output in [strided, annotated] {
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
-                let operation = constructor(output.clone(), vec![plain.clone(), plain.clone()]);
+                let operation = constructor(output.clone(), vec![plain.clone(), plain.clone()]).unwrap();
                 let result = operation
                     .interpret(
                         &EagerContext::<Array, ArrayOperation<Array>>::new(),
@@ -4925,7 +4999,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         builder
-            .add_instruction(CastOperation::checked(output, vec![input]), Vec::new(), vec![value], None)
+            .add_instruction(CastOperation::checked(output, vec![input]).unwrap(), Vec::new(), vec![value], None)
             .unwrap();
         let condition = builder.add_constant(Array::scalar(false).unwrap());
         builder
@@ -4973,15 +5047,15 @@ mod tests {
         let target: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
         let value = ArrayIrValue::Array(Array::vector(vec![1f32, 2f32]).unwrap());
         let dimension = |extent: usize| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
-        let constructors: [(fn(ArrayIrType, Vec<ArrayIrType>) -> CastOperation<ArrayIrType>, &str); 2] =
-            [(CastOperation::checked, ", checked=true"), (CastOperation::unchecked, "")];
+        let constructors: [(fn(ArrayIrType, Vec<ArrayIrType>) -> Result<CastOperation<ArrayIrType>, TypeError>, &str);
+            2] = [(CastOperation::checked, ", checked=true"), (CastOperation::unchecked, "")];
         for (constructor, mode) in constructors {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let input = builder.add_input(source.clone());
             let witness = builder.add_input(m.clone().into());
             let output = builder
                 .add_instruction(
-                    constructor(target.clone(), vec![source.clone(), n.clone().into()]),
+                    constructor(target.clone(), vec![source.clone(), n.clone().into()]).unwrap(),
                     vec![],
                     vec![input, witness],
                     None,
@@ -5022,7 +5096,8 @@ mod tests {
         let source = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let target = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let operation = CastOperation::<ArrayIrType>::checked(target.clone().into(), vec![declared.into(), m.into()]);
+        let operation =
+            CastOperation::<ArrayIrType>::checked(target.clone().into(), vec![declared.into(), m.into()]).unwrap();
         // The witness's actual n instantiates declared m. It does not bind the source declaration's separate n,
         // whose extent is already 2, so replay must not acquire the witness's nominal identity.
         let (_, replayed) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
@@ -5052,7 +5127,7 @@ mod tests {
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let laid_out = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         check_operation_partial_evaluation!(
-            operation = CastOperation::checked(laid_out.clone(), vec![plain]),
+            operation = CastOperation::checked(laid_out.clone(), vec![plain]).unwrap(),
             inputs = [Array::vector(vec![1f32, 2f32]).unwrap()],
             expected = Array::from_elements(laid_out, &[1f32, 2f32]).unwrap(),
         );
@@ -5064,7 +5139,7 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
         check_operation_partial_evaluation!(
-            operation = CastOperation::checked(exact.clone(), vec![symbolic.clone()]),
+            operation = CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap(),
             cases = [
                 {
                     inputs = [(@known, vector(2))],
@@ -5110,7 +5185,7 @@ mod tests {
         // All-known folding checks before removing the instruction, while unknown inputs keep the complete source
         // declaration in the residual.
         check_operation_partial_evaluation!(
-            operation = CastOperation::checked(output.clone(), vec![input.clone()]),
+            operation = CastOperation::checked(output.clone(), vec![input.clone()]).unwrap(),
             cases = [
                 {
                     inputs = [(@known, square.clone())],
@@ -5127,7 +5202,12 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
-            .add_instruction(CastOperation::checked(output, vec![input.clone()]), Vec::new(), vec![value], None)
+            .add_instruction(
+                CastOperation::checked(output, vec![input.clone()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -5190,7 +5270,7 @@ mod tests {
         // the residual, whereas a known witness proves the relationship for an unknown source, which normalizes the
         // residual cast into an unchecked one.
         check_operation_partial_evaluation!(
-            operation = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()]),
+            operation = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()]).unwrap(),
             cases = [
                 {
                     inputs = [(@known, vector(2)), (@known, vector(2))],
@@ -5305,10 +5385,20 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let checked = builder
-            .add_instruction(CastOperation::checked(output.clone(), vec![input.clone()]), Vec::new(), vec![value], None)
+            .add_instruction(
+                CastOperation::checked(output.clone(), vec![input.clone()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let unchecked = builder
-            .add_instruction(CastOperation::unchecked(output, vec![input.clone()]), Vec::new(), vec![value], None)
+            .add_instruction(
+                CastOperation::unchecked(output, vec![input.clone()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![checked, unchecked], vec![Placeholder], vec![Placeholder; 2])
@@ -5393,7 +5483,7 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F32);
         check_operation_batching!(
             @exact,
-            operation = CastOperation::unchecked(scalar.clone(), vec![scalar]),
+            operation = CastOperation::unchecked(scalar.clone(), vec![scalar]).unwrap(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![1f32, 2f32]).unwrap())],
@@ -5407,8 +5497,11 @@ mod tests {
         let symbolic = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])));
         let exact: ArrayIrType = ArrayType::new_static(DataType::F32, [2]).into();
         for (operation, mode) in [
-            (CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]), ""),
-            (CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]), ", checked=true"),
+            (CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap(), ""),
+            (
+                CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap(),
+                ", checked=true",
+            ),
         ] {
             let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
                 |(extent, mapped, witness)| {
@@ -5454,6 +5547,7 @@ mod tests {
             |(extent, mapped, witness)| {
                 let batching = BatchingContext::new(extent.domain(), extent);
                 let outputs = CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()])
+                    .unwrap()
                     .batch(
                         &batching,
                         &EmptyRegionDriver,
@@ -5497,7 +5591,7 @@ mod tests {
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         check_operation_batching!(
             @exact,
-            operation = CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]),
+            operation = CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap(),
             axis_size = 3,
             cases = [{
                 inputs = [
@@ -5509,7 +5603,7 @@ mod tests {
         );
         check_operation_batching!(
             @exact,
-            operation = CastOperation::unchecked(exact, vec![symbolic.clone(), symbolic]),
+            operation = CastOperation::unchecked(exact, vec![symbolic.clone(), symbolic]).unwrap(),
             axis_size = 3,
             cases = [{
                 inputs = [
@@ -5639,20 +5733,28 @@ mod tests {
             // declaration does not describe the carrier at all, and a narrowing would have to check the per-item
             // extents, which lifting the declarations cannot express, so batching rejects the ragged carrier.
             assert_eq!(
-                constructor(other.clone(), vec![other.clone()]).batch(&context, &EmptyRegionDriver, &[input.clone()]),
+                constructor(other.clone(), vec![other.clone()]).unwrap().batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[input.clone()]
+                ),
                 Err(BatchingError::Type(TypeError::invalid(
                     "type f32[length] does not refine declared type f32[other]"
                 ))),
             );
             assert_eq!(
-                constructor(exact.clone(), vec![logical.clone()]).batch(&context, &EmptyRegionDriver, &[input.clone()]),
+                constructor(exact.clone(), vec![logical.clone()]).unwrap().batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[input.clone()]
+                ),
                 ragged,
             );
             // The witness would require every item to have length 3. Matching source and output declarations must not
             // erase that additional relationship, even though the first input otherwise looks like an identity.
             let witness = ArrayBatch::replicated(Array::vector(vec![1f32; 3]).unwrap());
             assert_eq!(
-                constructor(logical.clone(), vec![logical.clone(), logical.clone()]).batch(
+                constructor(logical.clone(), vec![logical.clone(), logical.clone()]).unwrap().batch(
                     &context,
                     &EmptyRegionDriver,
                     &[input.clone(), witness],
@@ -5675,7 +5777,7 @@ mod tests {
         .unwrap();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
-                constructor(exact.clone().into(), vec![logical.clone().into()]).batch(
+                constructor(exact.clone().into(), vec![logical.clone().into()]).unwrap().batch(
                     &context,
                     &EmptyRegionDriver,
                     std::slice::from_ref(&input),
@@ -5771,7 +5873,7 @@ mod tests {
         let input = ArrayBatch::new(Array::matrix(3, 2, vec![1f32; 6]).unwrap(), BatchAxis::new(0)).unwrap();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             // Lifting may erase layouts, but must still reject an invalid element-type change in the original cast.
-            let operation = constructor(conflicting.clone(), vec![declared.clone()]);
+            let operation = constructor(conflicting.clone(), vec![declared.clone()]).unwrap();
             assert_eq!(
                 operation.batch(&context, &EmptyRegionDriver, &[input.clone()]).map(|_| ()),
                 Err(TypeError::invalid(
@@ -5780,7 +5882,7 @@ mod tests {
                 )
                 .into()),
             );
-            let operation = constructor(plain.clone(), vec![declared.clone()]);
+            let operation = constructor(plain.clone(), vec![declared.clone()]).unwrap();
             assert_eq!(
                 operation.batch(&context, &EmptyRegionDriver, &[]).map(|_| ()),
                 Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into()),
@@ -5815,6 +5917,7 @@ mod tests {
                         witness.clone(),
                     ],
                 )
+                .unwrap()
                 .batch(
                     &batching,
                     &EmptyRegionDriver,
@@ -5885,6 +5988,7 @@ mod tests {
                         per_item.clone().into(),
                         vec![per_item.clone().into(), per_item.clone().into()],
                     )
+                    .unwrap()
                     .batch(
                         &batching,
                         &EmptyRegionDriver,
@@ -5999,6 +6103,7 @@ mod tests {
         for declared in [plain, unannotated] {
             assert_eq!(
                 CastOperation::checked(declared.clone(), vec![declared])
+                    .unwrap()
                     .batch(&context, &EmptyRegionDriver, &[input.clone()])
                     .map(|_| ()),
                 Err(ProgramError::Type(TypeError::invalid(format!(
@@ -6014,7 +6119,7 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 0.0),
-            operation = CastOperation::unchecked(scalar.clone(), vec![scalar.clone(), scalar]),
+            operation = CastOperation::unchecked(scalar.clone(), vec![scalar.clone(), scalar]).unwrap(),
             cases = [{
                 primals = [Array::scalar(2f64).unwrap(), Array::scalar(4f64).unwrap()],
                 tangents = [Array::scalar(3f64).unwrap(), Array::scalar(5f64).unwrap()],
@@ -6083,6 +6188,7 @@ mod tests {
         let witness = context.input(symbolic.clone());
         let witness_tangent = context.input(symbolic.clone());
         let outputs = CastOperation::checked(symbolic.clone(), vec![exact.clone(), symbolic.clone()])
+            .unwrap()
             .jvp(
                 &DifferentiationContext::fused(context.clone()),
                 &EmptyRegionDriver,
@@ -6287,7 +6393,12 @@ mod tests {
                 let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
                 let value = builder.add_input(input.clone());
                 let result = builder
-                    .add_instruction(constructor(output.clone(), vec![plain.clone()]), vec![], vec![value], None)
+                    .add_instruction(
+                        constructor(output.clone(), vec![plain.clone()]).unwrap(),
+                        vec![],
+                        vec![value],
+                        None,
+                    )
                     .unwrap()[0];
                 let program = builder
                     .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder])
@@ -6326,7 +6437,12 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
-            .add_instruction(CastOperation::checked(output.clone(), vec![declared.clone()]), vec![], vec![value], None)
+            .add_instruction(
+                CastOperation::checked(output.clone(), vec![declared.clone()]).unwrap(),
+                vec![],
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -6379,7 +6495,7 @@ mod tests {
         let witness = builder.add_input(declared.clone());
         let result = builder
             .add_instruction(
-                CastOperation::checked(output.clone(), vec![declared.clone(), declared.clone()]),
+                CastOperation::checked(output.clone(), vec![declared.clone(), declared.clone()]).unwrap(),
                 vec![],
                 vec![value, witness],
                 None,
@@ -6436,7 +6552,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![dimension.simplified_dimension()]))
         };
         let exact = |extent| ArrayType::new_static(DataType::F32, [extent]);
-        let operation = CastOperation::unchecked(vector(&a), vec![vector(&b), vector(&b), vector(&a)]);
+        let operation = CastOperation::unchecked(vector(&a), vec![vector(&b), vector(&b), vector(&a)]).unwrap();
         assert_eq!(
             operation.infer_output_types(&[exact(3), exact(3), exact(5)], &[]),
             Err(TypeError::custom(DimensionError::InputDimensionMismatch {
@@ -6505,7 +6621,7 @@ mod tests {
         let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]),
+            operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = exact.clone()))],
                 output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
@@ -6570,7 +6686,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let witness = ArrayType::new_static(DataType::F32, [3]);
-        let operation = CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), witness.clone()]);
+        let operation = CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), witness.clone()]).unwrap();
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         let inputs = [PartialValue::Unknown(symbolic.clone()), PartialValue::Unknown(witness.clone())];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
@@ -6588,7 +6704,7 @@ mod tests {
         // A source whose cotangent is not needed stages nothing, even for a live output cotangent.
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]);
+        let operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]).unwrap();
         let tracing = TracingContext::<Array, ArrayOperation<Array>>::new();
         let cotangent = tracing.input(laid_out);
         let mut context = TranspositionContext::new(tracing.clone());
@@ -6636,7 +6752,7 @@ mod tests {
         let expected_sharded_cotangent = Array::from_elements(sharded_input.clone(), &[1f32, 2f32]).unwrap();
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::checked(output.clone(), vec![plain.clone()]),
+            operation = CastOperation::checked(output.clone(), vec![plain.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = input.clone()))],
                 output_cotangents = [cotangent.clone()],
@@ -6646,7 +6762,7 @@ mod tests {
         );
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::unchecked(output.clone(), vec![plain.clone()]),
+            operation = CastOperation::unchecked(output.clone(), vec![plain.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = input.clone()))],
                 output_cotangents = [cotangent.clone()],
@@ -6656,7 +6772,7 @@ mod tests {
         );
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::checked(sharded_output.clone(), vec![plain.clone()]),
+            operation = CastOperation::checked(sharded_output.clone(), vec![plain.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = sharded_input.clone()))],
                 output_cotangents = [sharded_cotangent.clone()],
@@ -6666,7 +6782,7 @@ mod tests {
         );
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::unchecked(sharded_output.clone(), vec![plain.clone()]),
+            operation = CastOperation::unchecked(sharded_output.clone(), vec![plain.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = sharded_input.clone()))],
                 output_cotangents = [sharded_cotangent.clone()],
@@ -6677,7 +6793,7 @@ mod tests {
         check_operation_transposition!(
             @exact,
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = CastOperation::unchecked(output.clone().into(), vec![ArrayIrType::from(plain.clone())]),
+            operation = CastOperation::unchecked(output.clone().into(), vec![ArrayIrType::from(plain.clone())]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = ArrayIrType::from(input.clone())))],
                 output_cotangents = [ArrayIrValue::Array(cotangent.clone())],
@@ -6688,7 +6804,7 @@ mod tests {
         check_operation_transposition!(
             @exact,
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = CastOperation::checked(sharded_output.clone().into(), vec![ArrayIrType::from(plain.clone())]),
+            operation = CastOperation::checked(sharded_output.clone().into(), vec![ArrayIrType::from(plain.clone())]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = ArrayIrType::from(sharded_input.clone())))],
                 output_cotangents = [ArrayIrValue::Array(sharded_cotangent.clone())],
@@ -6707,7 +6823,12 @@ mod tests {
                 let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
                 let value = builder.add_input(input.clone());
                 let result = builder
-                    .add_instruction(constructor(output.clone(), vec![plain.clone()]), vec![], vec![value], None)
+                    .add_instruction(
+                        constructor(output.clone(), vec![plain.clone()]).unwrap(),
+                        vec![],
+                        vec![value],
+                        None,
+                    )
                     .unwrap()[0];
                 let program = builder
                     .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder])
@@ -6738,7 +6859,12 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(exact.clone());
         let output = builder
-            .add_instruction(CastOperation::checked(layout.clone(), vec![exact.clone()]), vec![], vec![input], None)
+            .add_instruction(
+                CastOperation::checked(layout.clone(), vec![exact.clone()]).unwrap(),
+                vec![],
+                vec![input],
+                None,
+            )
             .unwrap()[0];
         let proven = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -6769,7 +6895,7 @@ mod tests {
             let witness = builder.add_input(symbolic.clone());
             let result = builder
                 .add_instruction(
-                    CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]),
+                    CastOperation::checked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap(),
                     vec![],
                     vec![value, witness],
                     None,
@@ -6791,7 +6917,7 @@ mod tests {
         let value = builder.add_input(exact.clone());
         let known = builder.add_input(symbolic.clone());
         builder
-            .add_instruction(CastOperation::checked(exact.clone(), vec![symbolic]), vec![], vec![known], None)
+            .add_instruction(CastOperation::checked(exact.clone(), vec![symbolic]).unwrap(), vec![], vec![known], None)
             .unwrap();
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
@@ -6826,7 +6952,7 @@ mod tests {
         let witness = builder.add_input(symbolic.clone());
         let result = builder
             .add_instruction(
-                CastOperation::checked(exact, vec![symbolic.clone(), symbolic]),
+                CastOperation::checked(exact, vec![symbolic.clone(), symbolic]).unwrap(),
                 vec![],
                 vec![value, witness],
                 None,
@@ -6849,7 +6975,7 @@ mod tests {
     fn test_cast_transposition_validates_inputs() {
         // The rule validates its input count and the supplied input types before using any accumulator.
         let exact = ArrayType::new_static(DataType::F32, [2]);
-        let operation = CastOperation::unchecked(exact.clone(), vec![exact.clone()]);
+        let operation = CastOperation::unchecked(exact.clone(), vec![exact.clone()]).unwrap();
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         assert_eq!(
             operation.transpose(&mut context, &EmptyRegionDriver, &[], &[MaybeZero::Zero(exact.clone())], &[]),
@@ -6881,7 +7007,7 @@ mod tests {
         let witness = builder.add_input(symbolic.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(symbolic.clone(), vec![exact, symbolic]),
+                CastOperation::checked(symbolic.clone(), vec![exact, symbolic]).unwrap(),
                 vec![],
                 vec![source, witness],
                 None,
@@ -6911,7 +7037,7 @@ mod tests {
         let checking_input = checking_builder.add_input(symbolic.clone());
         checking_builder
             .add_instruction(
-                CastOperation::checked(exact(2), vec![symbolic.clone()]),
+                CastOperation::checked(exact(2), vec![symbolic.clone()]).unwrap(),
                 vec![],
                 vec![checking_input],
                 None,
@@ -6932,7 +7058,7 @@ mod tests {
         let regions = vec![builder.import_program(checking_branch), builder.import_program(identity_branch)];
         builder.add_instruction(ConditionOperation::new(), regions, vec![predicate, known], None).unwrap();
         builder
-            .add_instruction(CastOperation::checked(exact(3), vec![symbolic]), vec![], vec![known], None)
+            .add_instruction(CastOperation::checked(exact(3), vec![symbolic]).unwrap(), vec![], vec![known], None)
             .unwrap();
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![linear], vec![Placeholder; 3], vec![Placeholder])
@@ -7069,7 +7195,7 @@ mod tests {
             operation = CastOperation::unchecked(
                 laid_out.clone(),
                 vec![exact.clone(), ArrayType::new_static(DataType::F32, [3])],
-            ),
+            ).unwrap(),
             cases = [{
                 inputs = [(@linear(type = exact.clone())), (@known, Array::vector(vec![1f32; 3]).unwrap())],
                 output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
@@ -7091,7 +7217,7 @@ mod tests {
         let input = builder.add_input(symbolic.clone());
         let output = builder
             .add_instruction(
-                CastOperation::unchecked(ArrayType::new_static(DataType::F32, [2]), vec![symbolic]),
+                CastOperation::unchecked(ArrayType::new_static(DataType::F32, [2]), vec![symbolic]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -7129,7 +7255,7 @@ mod tests {
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
-                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]),
+                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -7184,20 +7310,25 @@ mod tests {
             .unwrap()[0];
         let widened = builder
             .add_instruction(
-                CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]),
+                CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]).unwrap(),
                 Vec::new(),
                 vec![value, dimension],
                 None,
             )
             .unwrap()[0];
         let narrowed = builder
-            .add_instruction(CastOperation::unchecked(exact.clone(), vec![symbolic]), Vec::new(), vec![widened], None)
+            .add_instruction(
+                CastOperation::unchecked(exact.clone(), vec![symbolic]).unwrap(),
+                Vec::new(),
+                vec![widened],
+                None,
+            )
             .unwrap()[0];
         // The reverse walk materializes a known intermediate when a rule first consumes it, so a later consumer
         // makes the dimension available to the narrowing's transpose, which is not an explicit input of it.
         let witnessed = builder
             .add_instruction(
-                CastOperation::unchecked(exact.clone(), vec![exact.clone(), n.clone().into()]),
+                CastOperation::unchecked(exact.clone(), vec![exact.clone(), n.clone().into()]).unwrap(),
                 Vec::new(),
                 vec![narrowed, dimension],
                 None,
@@ -7262,14 +7393,14 @@ mod tests {
             .unwrap()[0];
         let widened = builder
             .add_instruction(
-                CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]),
+                CastOperation::unchecked(symbolic.clone(), vec![exact.clone(), n.clone().into()]).unwrap(),
                 Vec::new(),
                 vec![value, dimension],
                 None,
             )
             .unwrap()[0];
         let narrowed = builder
-            .add_instruction(CastOperation::unchecked(exact, vec![symbolic]), Vec::new(), vec![widened], None)
+            .add_instruction(CastOperation::unchecked(exact, vec![symbolic]).unwrap(), Vec::new(), vec![widened], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -7314,7 +7445,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
-            .add_instruction(CastOperation::unchecked(output, vec![input]), Vec::new(), vec![value], None)
+            .add_instruction(CastOperation::unchecked(output, vec![input]).unwrap(), Vec::new(), vec![value], None)
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -7354,21 +7485,21 @@ mod tests {
         // An independent type family can implement the operation-specific contract without changing
         // `TypeRefinements` (refer to the module-level fixture).
         check_operation_type_inference!(
-            operation = CastOperation::checked(ProjectedMemberType::<0>, vec![ProjectedMemberType::<0>]),
+            operation = CastOperation::checked(ProjectedMemberType::<0>, vec![ProjectedMemberType::<0>]).unwrap(),
             cases = [{ input_types = [ProjectedMemberType::<0>], output_types = [ProjectedMemberType::<0>] }],
         );
 
         // Bare data types relate only to themselves.
         assert_eq!(
             DataType::infer_cast_output_type(
-                &CastOperation::checked(DataType::F32, vec![DataType::F32]),
+                &CastOperation::checked(DataType::F32, vec![DataType::F32]).unwrap(),
                 &[DataType::F32],
             ),
             Ok((DataType::F32, Some(DataType::F32))),
         );
         assert_eq!(
             DataType::infer_cast_output_type(
-                &CastOperation::checked(DataType::F64, vec![DataType::F32]),
+                &CastOperation::checked(DataType::F64, vec![DataType::F32]).unwrap(),
                 &[DataType::F32],
             ),
             Err(TypeError::invalid("`cast` cannot convert type `f32` to unrelated type `f64`")),
@@ -7383,7 +7514,7 @@ mod tests {
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
                 ArrayType::infer_cast_output_type(
-                    &constructor(array.clone(), vec![array.clone()]),
+                    &constructor(array.clone(), vec![array.clone()]).unwrap(),
                     std::slice::from_ref(&array),
                 ),
                 Ok((array.clone(), Some(array.clone()))),
@@ -7395,13 +7526,13 @@ mod tests {
             ] {
                 assert_eq!(
                     ArrayType::infer_cast_output_type(
-                        &constructor(output.clone(), vec![array.clone()]),
+                        &constructor(output.clone(), vec![array.clone()]).unwrap(),
                         std::slice::from_ref(&array),
                     ),
                     Err(unrelated_cast_types(&array, &output)),
                 );
             }
-            let operation = constructor(symbolic.clone(), vec![exact(2), symbolic.clone()]);
+            let operation = constructor(symbolic.clone(), vec![exact(2), symbolic.clone()]).unwrap();
             assert_eq!(
                 ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(2)]),
                 Ok((exact(2), Some(exact(2)))),
@@ -7422,19 +7553,15 @@ mod tests {
                 ArrayType::infer_cast_output_type(&operation, &[exact(2)]),
                 Err(TypeError::invalid("expected 2 inputs but got 1")),
             );
-            assert_eq!(
-                ArrayType::infer_cast_output_type(&constructor(array.clone(), Vec::new()), &[]),
-                Err(TypeError::invalid("`cast` requires a declared first input type")),
-            );
         }
 
         // Conditional narrowing can be staged, while nominal identity and concrete extents prove the relationship.
-        let narrowing = CastOperation::checked(exact(2), vec![symbolic.clone()]);
+        let narrowing = CastOperation::checked(exact(2), vec![symbolic.clone()]).unwrap();
         assert_eq!(ArrayType::infer_cast_output_type(&narrowing, &[symbolic.clone()]), Ok((exact(2), None)));
         assert_eq!(ArrayType::infer_cast_output_type(&narrowing, &[exact(2)]), Ok((exact(2), Some(exact(2)))));
         assert_eq!(
             ArrayType::infer_cast_output_type(
-                &CastOperation::checked(symbolic.clone(), vec![symbolic.clone()]),
+                &CastOperation::checked(symbolic.clone(), vec![symbolic.clone()]).unwrap(),
                 &[symbolic.clone()],
             ),
             Ok((symbolic.clone(), Some(symbolic.clone()))),
@@ -7451,7 +7578,7 @@ mod tests {
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
                 ArrayType::infer_cast_output_type(
-                    &constructor(annotated.clone(), vec![plain.clone()]),
+                    &constructor(annotated.clone(), vec![plain.clone()]).unwrap(),
                     &[plain.clone()],
                 ),
                 Ok((annotated.clone(), Some(annotated.clone()))),
@@ -7461,7 +7588,7 @@ mod tests {
         // First-class dimensions narrow to static types, which a differently named actual instantiates only within
         // its own bounds, and cannot target identity-defining types.
         let dimension = DimensionType::from(Dimension::Static(2));
-        let static_narrowing = CastOperation::checked(dimension.clone(), vec![n.clone()]);
+        let static_narrowing = CastOperation::checked(dimension.clone(), vec![n.clone()]).unwrap();
         assert_eq!(
             DimensionType::infer_cast_output_type(&static_narrowing, std::slice::from_ref(&n)),
             Ok((dimension.clone(), None)),
@@ -7481,14 +7608,14 @@ mod tests {
         );
         assert_eq!(
             DimensionType::infer_cast_output_type(
-                &CastOperation::checked(DimensionType::from(Dimension::Static(3)), vec![dimension.clone()]),
+                &CastOperation::checked(DimensionType::from(Dimension::Static(3)), vec![dimension.clone()]).unwrap(),
                 std::slice::from_ref(&dimension),
             ),
             Err(unrelated_cast_types(&dimension, &DimensionType::from(Dimension::Static(3)))),
         );
         assert_eq!(
             DimensionType::infer_cast_output_type(
-                &CastOperation::checked(n, vec![dimension.clone()]),
+                &CastOperation::checked(n, vec![dimension.clone()]).unwrap(),
                 &[dimension.clone()],
             ),
             Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
@@ -7497,7 +7624,7 @@ mod tests {
         // The composite universe rejects casts across member kinds and references.
         assert_eq!(
             ArrayIrType::infer_cast_output_type(
-                &CastOperation::checked(ArrayIrType::Dimension(dimension), vec![array.clone().into()]),
+                &CastOperation::checked(ArrayIrType::Dimension(dimension), vec![array.clone().into()]).unwrap(),
                 &[array.clone().into()],
             ),
             Err(TypeError::invalid("`cast` cannot convert type `f32[2, 3]` to unrelated type `dimension<2>`")),
@@ -7505,7 +7632,7 @@ mod tests {
         let reference: ArrayIrType = ReferenceType::new(array.clone()).into();
         assert_eq!(
             ArrayIrType::infer_cast_output_type(
-                &CastOperation::checked(array.clone().into(), vec![array.into(), reference.clone()]),
+                &CastOperation::checked(array.clone().into(), vec![array.into(), reference.clone()]).unwrap(),
                 &[ArrayType::new_static(DataType::F32, [2, 3]).into(), reference],
             ),
             Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
