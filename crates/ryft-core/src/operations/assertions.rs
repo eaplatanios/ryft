@@ -693,7 +693,6 @@ pub trait ArrayAssertionBatchingPolicy<C: Context<Type = ArrayType>, P: ArrayExt
     ) -> Result<C::Value, ProgramError>;
 }
 
-// TODO(eaplatanios): Review this.
 impl<
     C: Context<Type = ArrayType, Value: Reduce, Operation: From<IotaOperation<ArrayType>>>,
     P: ArrayExtentBatchingPolicy<C>,
@@ -737,10 +736,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review this.
-// A projected dynamic batch uses the same first-class extent as its composite parent. That extent and the dimensions
-// derived from it exist only as composite dimension values, so these functions bind their extent computations in the
-// composite parent context and project the resulting arrays back into the array view.
 impl<C, V: Value<Type = ArrayIrType>, P> ArrayAssertionBatchingPolicy<ProjectedContext<C, ArrayType>, P>
     for DynamicArrayExtentBatchingPolicy
 where
@@ -758,6 +753,10 @@ where
     V: ValueProjection<ArrayType, Projected: Select>,
     P: ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>, Extent = C::Value>,
 {
+    // A projected dynamic batch uses the same first-class extent as its composite parent. That extent and the
+    // dimensions derived from it exist only as composite dimension values, so these functions bind their extent
+    // computations in the composite parent context and project the resulting arrays back into the array view.
+
     fn batch_item_indices(
         context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<P>>,
         r#type: &ArrayType,
@@ -825,6 +824,7 @@ where
                 value
             }
         };
+
         let arguments = vec![V::from_projected(observation), zero.remove(0), padded_extent];
         let operation = PadOperation::<ArrayIrType>::new(vec![0], vec![1], vec![0])?
             .with_input_types(&arguments.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
