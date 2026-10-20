@@ -1808,16 +1808,16 @@ mod tests {
                     if native {
                         let ryft_core::ArrayIrType::Array(r#type) = r#type else { unreachable!() };
                         let operation = if checked {
-                            CastOperation::checked(r#type.clone(), vec![r#type; 2])
+                            CastOperation::checked(r#type.clone(), vec![r#type; 2]).unwrap()
                         } else {
-                            CastOperation::unchecked(r#type.clone(), vec![r#type; 2])
+                            CastOperation::unchecked(r#type.clone(), vec![r#type; 2]).unwrap()
                         };
                         ArrayIrOperation::Array(ArrayOperation::Cast(operation))
                     } else {
                         let operation = if checked {
-                            CastOperation::checked(r#type.clone(), vec![r#type; 2])
+                            CastOperation::checked(r#type.clone(), vec![r#type; 2]).unwrap()
                         } else {
-                            CastOperation::unchecked(r#type.clone(), vec![r#type; 2])
+                            CastOperation::unchecked(r#type.clone(), vec![r#type; 2]).unwrap()
                         };
                         ArrayIrOperation::Cast(operation)
                     }

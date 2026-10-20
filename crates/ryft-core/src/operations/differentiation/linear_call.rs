@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    ProgramBatchingOutputAxesPolicy, reject_ragged_carriers,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -240,6 +240,12 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             .into());
         }
         check_count!("input", input_axes, inputs.len(), ProgramError);
+
+        // Both paths below pass only the packed values (and, structurally, their batch axes) into the attached regions,
+        // so carriers with per-item extents are rejected before either path. Otherwise, the regions would compute over
+        // the padding of a bounded ragged axis as if it were live data (e.g., `x + sum(x)` would sum the padding too).
+        reject_ragged_carriers::<C, P>(LINEAR_CALL_OPERATION_NAME, inputs)?;
+
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
 
         // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
@@ -737,10 +743,11 @@ pub(crate) mod tests {
 
     use ryft_macros::Operation;
 
+    use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
-        ShardingDimension,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+        ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -759,8 +766,8 @@ pub(crate) mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef,
-        RegionSlot, ValueProjection,
+        EffectClasses, EmptyRegionDriver, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType,
+        RegionDriver, RegionRef, RegionSlot, ValueProjection,
     };
     use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
     use crate::tracing::TracingContext;
@@ -1152,18 +1159,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_linear_call_operation_batching_specializes_ragged_region_boundaries() -> Result<(), ProgramError> {
-        // A mapped `dimension_from_scalar` gives each batch item its own extent, so the value entering the linear
-        // call is packed at the declared bound while the structurally batched regions retain the logical dynamic
-        // boundary. Batching must specialize both attached regions to the packed input types and restore a ragged
-        // carrier for the call's output.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+    fn test_linear_call_operation_batching_rejects_ragged_carriers() -> Result<(), ProgramError> {
+        // The attached regions receive only packed values, so a carrier with the per-item extents of a bounded ragged
+        // axis is rejected before both the replicated shortcut and structural region batching; otherwise, a region
+        // such as `x + sum(x)` would compute over the padding as if it were live data. An empty driver proves that the
+        // rejection precedes any region transformation.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+        let rejection = BatchingError::UnsupportedOperation {
+            message: "`linear_call` does not support bounded ragged dimension `length` on input 0".to_owned(),
+        };
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let input = ragged_batch(
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1i64, 2]).unwrap()),
+            &length,
+            1,
+        )?;
+        assert_eq!(
+            LinearCallOperation::<ArrayIrType>::new(0)
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .unwrap_err(),
+            rejection,
+        );
+
+        // A mapped `dimension_from_scalar` gives each batch item its own extent, so the value entering the call from
+        // outside its regions is a ragged carrier, which staging rejects in the same way.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let values = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
         let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])).into());
         let output = batch(
             |(value, extent)| {
-                let extent = extent.to_dimension(variable.clone())?;
+                let extent = extent.to_dimension(length.clone())?;
                 let repeated = value.dynamic_broadcast_to(&[extent])?;
                 let mut repeated = LinearCallOperation::stage(
                     repeated.context(),
@@ -1179,48 +1208,8 @@ pub(crate) mod tests {
             (BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
             None,
-        )?;
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, ArrayIrValue<Array>>(
-            vec![output.atom_id()?],
-            vec![Placeholder, Placeholder],
-            Placeholder,
-        )?;
-
-        // Both attached regions were specialized to the packed input types. Every array-member boundary type is
-        // the physical bound-shaped storage, with no logical dynamic dimension remaining.
-        let instruction = program
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.operation().name() == "linear_call")
-            .unwrap();
-        for region in instruction.regions() {
-            let region = program.region_ref(*region).unwrap();
-            for r#type in region.input_types().iter().chain(region.output_types().iter()) {
-                if let ArrayIrType::Array(array_type) = r#type {
-                    assert!(array_type.static_shape().is_some(), "{array_type}");
-                }
-            }
-        }
-
-        // The rebuilt transpose is the identity over the physical cotangent, taking the relayed batch extent first.
-        let transpose = program.region_ref(instruction.regions()[1]).unwrap().to_program();
-        let cotangent = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(
-            transpose.interpret(vec![
-                ArrayIrValue::Dimension(DimensionValue::constant(2)?),
-                ArrayIrValue::Array(cotangent.clone()),
-            ])?,
-            vec![ArrayIrValue::Array(cotangent)],
         );
-
-        // End to end, the masked sums match the per-item logical extents rather than the packed bound.
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
-            ])?,
-            ArrayIrValue::Array(Array::vector(vec![2.0_f32, 9.0]).unwrap()),
-        );
+        assert_eq!(output.err(), Some(rejection));
         Ok(())
     }
 

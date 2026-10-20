@@ -998,7 +998,8 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
-    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Placeholder};
+
+    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Placeholder, TypeError};
 
     use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
@@ -1285,7 +1286,8 @@ mod tests {
         let value = builder.add_input(n.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(DimensionType::from(Dimension::Static(2)).into(), vec![n.into()]),
+                CastOperation::<ArrayIrType>::checked(DimensionType::from(Dimension::Static(2)).into(), vec![n.into()])
+                    .unwrap(),
                 vec![],
                 vec![value],
                 None,
@@ -1316,7 +1318,12 @@ mod tests {
         let value = builder.add_input(input_type.clone());
         // Keep an explicitly checked primitive to exercise backend proof, independently of public normalization.
         let output = builder
-            .add_instruction(CastOperation::checked(output_type, vec![input_type.clone()]), vec![], vec![value], None)
+            .add_instruction(
+                CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
+                vec![],
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1329,7 +1336,12 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let value = builder.add_input(actual);
         let output = builder
-            .add_instruction(CastOperation::checked(declared.clone(), vec![declared]), vec![], vec![value], None)
+            .add_instruction(
+                CastOperation::checked(declared.clone(), vec![declared]).unwrap(),
+                vec![],
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1346,7 +1358,7 @@ mod tests {
         let input = builder.add_input(source.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(ArrayType::new_static(DataType::F32, [2, 3]), vec![source]),
+                CastOperation::checked(ArrayType::new_static(DataType::F32, [2, 3]), vec![source]).unwrap(),
                 vec![],
                 vec![input],
                 None,
@@ -1365,7 +1377,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(source.clone());
         let output = builder
-            .add_instruction(CastOperation::checked(target, vec![source]), vec![], vec![input], None)
+            .add_instruction(CastOperation::checked(target, vec![source]).unwrap(), vec![], vec![input], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1393,7 +1405,7 @@ mod tests {
             let witness = builder.add_input(target.clone().into());
             let output = builder
                 .add_instruction(
-                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]),
+                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
                     vec![],
                     vec![input, witness],
                     None,
@@ -1451,7 +1463,7 @@ mod tests {
             let witness = builder.add_input(target.clone().into());
             let output = builder
                 .add_instruction(
-                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]),
+                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
                     vec![],
                     vec![input, witness],
                     None,
@@ -1545,10 +1557,12 @@ mod tests {
         let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
             XlaLowerer::new(block.as_ref(), &context, location.as_ref());
         let guarded = CastOperation::checked(exact.clone(), vec![symbolic.clone()])
+            .unwrap()
             .lower(&mut lowerer, &[source], &[symbolic], &[exact.clone()])
             .unwrap()[0];
         assert!(lowerer.effect_tokens.ordered_assertion.is_some());
         let unchanged = CastOperation::unchecked(exact.clone(), vec![exact.clone()])
+            .unwrap()
             .lower(&mut lowerer, &[unrelated], &[exact.clone()], &[exact.clone()])
             .unwrap();
         assert_eq!(unchanged, vec![unrelated]);
@@ -1600,7 +1614,7 @@ mod tests {
             message = \"precondition\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token";
         let cases = [
             (
-                CastOperation::checked as fn(ArrayType, Vec<ArrayType>) -> CastOperation<ArrayType>,
+                CastOperation::checked as fn(ArrayType, Vec<ArrayType>) -> Result<CastOperation<ArrayType>, TypeError>,
                 formatdoc! {"
                     module {{
                       func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {{
@@ -1638,7 +1652,7 @@ mod tests {
                 .unwrap();
             let output = builder
                 .add_instruction(
-                    constructor(output_type.clone(), vec![input_type.clone()]),
+                    constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
                     Vec::new(),
                     vec![input],
                     None,
@@ -1670,7 +1684,7 @@ mod tests {
         let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
             XlaLowerer::new(block.as_ref(), &context, location.as_ref());
         assert_eq!(
-            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).lower(
+            CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).unwrap().lower(
                 &mut lowerer,
                 &[source],
                 &[symbolic],
@@ -1749,7 +1763,7 @@ mod tests {
         let value = builder.add_input(input.clone().into());
         let result = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output.clone().into(), vec![declared.clone().into()]),
+                CastOperation::<ArrayIrType>::checked(output.clone().into(), vec![declared.clone().into()]).unwrap(),
                 vec![],
                 vec![value],
                 None,
@@ -1837,7 +1851,12 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
-                .add_instruction(constructor(output_type.clone(), vec![input_type.clone()]), vec![], vec![input], None)
+                .add_instruction(
+                    constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
+                    vec![],
+                    vec![input],
+                    None,
+                )
                 .unwrap()[0];
             let program = builder
                 .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
@@ -1898,7 +1917,7 @@ mod tests {
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
-                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]),
+                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2015,7 +2034,8 @@ mod tests {
                     CastOperation::<ArrayIrType>::unchecked(
                         output_type.clone().into(),
                         vec![input_type.clone().into()],
-                    ),
+                    )
+                    .unwrap(),
                     Vec::new(),
                     vec![input],
                     None,
@@ -2165,7 +2185,7 @@ mod tests {
                 let input = builder.add_input(input_type.clone());
                 let output = builder
                     .add_instruction(
-                        constructor(output_type.clone(), vec![input_type.clone()]),
+                        constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
                         vec![],
                         vec![input],
                         None,
@@ -2221,7 +2241,7 @@ mod tests {
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(output_type.clone(), vec![input_type.clone()]),
+                CastOperation::checked(output_type.clone(), vec![input_type.clone()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2276,7 +2296,12 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
-                .add_instruction(constructor(output_type.clone(), vec![input_type.clone()]), vec![], vec![input], None)
+                .add_instruction(
+                    constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
+                    vec![],
+                    vec![input],
+                    None,
+                )
                 .unwrap()[0];
             let program = builder
                 .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
@@ -2346,7 +2371,8 @@ mod tests {
                 CastOperation::<ArrayIrType>::checked(
                     laid_out.clone().into(),
                     vec![exact.clone().into(), symbolic.clone().into()],
-                ),
+                )
+                .unwrap(),
                 Vec::new(),
                 vec![input, witness],
                 None,
@@ -2354,7 +2380,7 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(symbolic.clone().into(), vec![laid_out.into()]),
+                CastOperation::<ArrayIrType>::unchecked(symbolic.clone().into(), vec![laid_out.into()]).unwrap(),
                 Vec::new(),
                 vec![widened],
                 None,
@@ -2397,7 +2423,7 @@ mod tests {
                 let input = builder.add_input(input_type.clone());
                 let output = builder
                     .add_instruction(
-                        constructor(output_type.clone(), vec![input_type.clone()]),
+                        constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
                         vec![],
                         vec![input],
                         None,
@@ -2442,7 +2468,7 @@ mod tests {
         let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(output_type.clone(), vec![input_type]),
+                CastOperation::checked(output_type.clone(), vec![input_type]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2485,7 +2511,7 @@ mod tests {
         let witness = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(output_type, vec![input_type.clone(), input_type]),
+                CastOperation::checked(output_type, vec![input_type.clone(), input_type]).unwrap(),
                 Vec::new(),
                 vec![value, witness],
                 None,
@@ -2535,7 +2561,8 @@ mod tests {
                     CastOperation::<ArrayIrType>::checked(
                         output_type.clone().into(),
                         vec![input_type.clone().into(), b.clone().into()],
-                    ),
+                    )
+                    .unwrap(),
                     Vec::new(),
                     vec![value, witness],
                     None,
@@ -2621,7 +2648,8 @@ mod tests {
                         CastOperation::<ArrayIrType>::checked(
                             ArrayType::new_static(DataType::F64, [2]).into(),
                             vec![symbolic.clone()],
-                        ),
+                        )
+                        .unwrap(),
                         vec![],
                         vec![value],
                         None,
@@ -2767,7 +2795,7 @@ mod tests {
             .unwrap()[0];
         // Exercise the homogeneous-array rule inside the composite program, including empty dense shapes.
         let output = builder
-            .add_instruction(CastOperation::checked(array.clone(), vec![array]), Vec::new(), vec![input], None)
+            .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -2866,7 +2894,7 @@ mod tests {
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.into()]),
+                    CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.into()]).unwrap(),
                     Vec::new(),
                     vec![input],
                     None,
@@ -2887,7 +2915,7 @@ mod tests {
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into()]),
+                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2919,7 +2947,7 @@ mod tests {
         let input = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(swapped.into(), vec![array.clone().into()]),
+                CastOperation::<ArrayIrType>::checked(swapped.into(), vec![array.clone().into()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2963,7 +2991,7 @@ mod tests {
         let value = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(array.clone().into(), vec![array.into()]),
+                CastOperation::<ArrayIrType>::checked(array.clone().into(), vec![array.into()]).unwrap(),
                 Vec::new(),
                 vec![value],
                 None,
@@ -2997,7 +3025,8 @@ mod tests {
         let witness = builder.add_input(witness_type.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into(), witness_type.into()]),
+                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into(), witness_type.into()])
+                    .unwrap(),
                 Vec::new(),
                 vec![input, witness],
                 None,
@@ -3041,7 +3070,8 @@ mod tests {
                 CastOperation::<ArrayIrType>::checked(
                     output_type.into(),
                     vec![input_type.clone().into(), witness_type.into()],
-                ),
+                )
+                .unwrap(),
                 Vec::new(),
                 vec![input, witness],
                 None,
@@ -3094,7 +3124,7 @@ mod tests {
             )
             .unwrap()[0];
         builder
-            .add_instruction(CastOperation::checked(array.clone(), vec![array]), Vec::new(), vec![input], None)
+            .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
             .unwrap();
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())

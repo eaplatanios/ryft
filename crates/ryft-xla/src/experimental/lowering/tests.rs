@@ -283,8 +283,12 @@ fn test_collect_nested_sharding_mesh() {
     let input_type = test_vector_type(4);
     let output_type = input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
     for operation in [
-        CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.clone().into()]).into(),
-        XlaOperation::Array(ArrayOperation::Cast(CastOperation::checked(output_type, vec![input_type.clone()]))),
+        CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.clone().into()])
+            .unwrap()
+            .into(),
+        XlaOperation::Array(ArrayOperation::Cast(
+            CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
+        )),
     ] {
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());

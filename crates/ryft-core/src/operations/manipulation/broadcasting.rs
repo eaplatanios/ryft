@@ -201,6 +201,16 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
                         )
                     })
                     .collect::<Vec<_>>();
+
+                // Retained extents must keep the dimensions they vary over, which remapping positions cannot change.
+                RaggedAxis::validate_broadcast_extent_dimensions(
+                    inputs[0].ragged_axes(),
+                    &inputs[0].r#type(),
+                    None,
+                    &dimensions,
+                    self.output_axes(),
+                )?;
+
                 let output_type = self.output_type().clone().with_shape(Shape::new(dimensions));
                 let output_value = inputs[0].value().broadcast(output_type, self.output_axes())?;
                 Ok(vec![ArrayBatch::replicated(output_value).with_ragged_axes(ragged_axes)?].into())
@@ -258,6 +268,16 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
                         )
                     })
                     .collect::<Vec<_>>();
+
+                // Retained extents must keep the dimensions they vary over, which remapping positions cannot change.
+                RaggedAxis::validate_broadcast_extent_dimensions(
+                    inputs[0].ragged_axes(),
+                    &inputs[0].r#type(),
+                    Some(batch_axis),
+                    &dimensions,
+                    &output_axes,
+                )?;
+
                 output_type = output_type.with_shape(Shape::new(dimensions));
                 Ok(vec![
                     ArrayBatch::new(
@@ -991,6 +1011,18 @@ where
             }
             let mut outputs = context.parent().bind(self.clone(), Vec::new(), packed_inputs.as_slice())?;
             check_count!("output", outputs, 1, ProgramError);
+
+            // Retained extents must keep the dimensions they vary over, which remapping positions cannot change.
+            // The bound output's packed type is used because eager replay may concretize the output dimensions.
+            let output_dimensions = <&ArrayType>::try_from(outputs[0].r#type().as_ref())?.shape().dimensions().to_vec();
+            RaggedAxis::validate_broadcast_extent_dimensions(
+                input.ragged_axes(),
+                packed_type,
+                None,
+                &output_dimensions,
+                self.output_axes(),
+            )?;
+
             return Ok(vec![ArrayIrBatch::replicated(outputs.remove(0)).with_ragged_axes(ragged_axes)?].into());
         }
 
@@ -1082,6 +1114,21 @@ where
         }
         let mut outputs = context.parent().bind(operation, Vec::new(), lifted_inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
+
+        // Retained extents must keep the dimensions they vary over, which remapping positions cannot change.
+        // The bound output's packed type is used because eager replay may concretize the output dimensions.
+        let input_type = moved_input.value().r#type();
+        let output_dimensions = <&ArrayType>::try_from(outputs[0].r#type().as_ref())?.shape().dimensions().to_vec();
+        let mut packed_output_axes = Vec::with_capacity(self.output_axes().len() + 1);
+        packed_output_axes.push(0);
+        packed_output_axes.extend(self.output_axes().iter().map(|axis| axis + 1));
+        RaggedAxis::validate_broadcast_extent_dimensions(
+            moved_input.ragged_axes(),
+            <&ArrayType>::try_from(input_type.as_ref())?,
+            Some(0),
+            &output_dimensions,
+            &packed_output_axes,
+        )?;
 
         let mut ragged_axes = moved_input
             .ragged_axes()
@@ -2643,6 +2690,68 @@ mod tests {
     }
 
     #[test]
+    fn test_broadcast_batching_ragged_rejects_changed_extent_dimensions() {
+        // Remapping axis positions cannot describe how retained extents depend on a dimension that the broadcast
+        // expands, so expanding a dimension the extents vary over is rejected instead of keeping the singleton extents
+        // under the same ragged identity. Inserting a new axis preserves those dimensions and keeps the extents.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![3.into(), size.clone().into()]));
+
+        // A replicated `[1, size]` carrier whose extents vary over its leading axis.
+        let replicated = ArrayBatch::replicated(Array::matrix(1, 3, vec![10f32, 100.0, 100.0]).unwrap())
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i64]).unwrap(), size.clone(), vec![0])])
+            .unwrap();
+        assert_eq!(
+            BroadcastOperation::new(output_type.clone(), vec![0, 1])
+                .batch(&context, &EmptyRegionDriver, &[replicated])
+                .map(BatchedOutputs::into_parts),
+            Err(BatchingError::UnsupportedOperation {
+                message: "broadcast cannot change extent coordinate 0 of ragged dimension `size` from `1` to `3`"
+                    .to_string(),
+            }),
+        );
+
+        // A mapped carrier whose extents vary over both the batch axis and the per-item leading axis.
+        let extents = Array::matrix(2, 1, vec![1i64, 3]).unwrap();
+        let mapped = ArrayBatch::new(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1, 3]), &[1f32; 6]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), size.clone(), vec![0, 1])])
+        .unwrap();
+        assert_eq!(
+            BroadcastOperation::new(output_type, vec![0, 1])
+                .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&mapped))
+                .map(BatchedOutputs::into_parts),
+            Err(BatchingError::UnsupportedOperation {
+                message: "broadcast cannot change extent coordinate 1 of ragged dimension `size` from `1` to `3`"
+                    .to_string(),
+            }),
+        );
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 1.into(), size.clone().into()]));
+        assert_eq!(
+            BroadcastOperation::new(output_type, vec![1, 2])
+                .batch(&context, &EmptyRegionDriver, &[mapped])
+                .map(BatchedOutputs::into_parts),
+            Ok((
+                vec![
+                    ArrayBatch::new(
+                        Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 1, 3]), &[1f32; 12]).unwrap(),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap()
+                    .with_ragged_axes(vec![RaggedAxis::new(3, extents, size, vec![0, 2])])
+                    .unwrap(),
+                ],
+                Vec::new(),
+            )),
+        );
+    }
+
+    #[test]
     fn test_broadcast_batching_sharding() {
         // Explicit mapped-axis sharding remains attached to the lifted batch dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -4078,6 +4187,57 @@ mod tests {
             outputs[0].unbatched_type(),
             ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![size.into(), 2.into()]))),
         );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_batching_ragged_rejects_changed_extent_dimensions() {
+        // As for explicit broadcasts, expanding a dimension that retained extents vary over is rejected. Only staged
+        // dimensions can name a ragged dimension (eager dimensions carry exact types), so the parent is a trace.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        );
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
+        let three =
+            ArrayIrBatch::replicated(trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())));
+        let dimension = ArrayIrBatch::replicated(trace.input(DimensionType::from(size.clone()).into()));
+
+        // A replicated `[1, size]` carrier whose extents vary over its leading axis.
+        let replicated = ArrayIrBatch::replicated(trace.input(ArrayType::new_static(DataType::F32, [1, 3]).into()))
+            .with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                trace.input(ArrayType::new_static(DataType::I64, [1]).into()),
+                size.clone(),
+                vec![0],
+            )])
+            .unwrap();
+        assert!(matches!(
+            DynamicBroadcastOperation::new(vec![0, 1]).batch(
+                &context,
+                &EmptyRegionDriver,
+                &[replicated, three.clone(), dimension.clone()],
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "broadcast cannot change extent coordinate 0 of ragged dimension `size` from `1` to `3`",
+        ));
+
+        // A mapped carrier whose extents vary over both the batch axis and the per-item leading axis.
+        let mapped =
+            ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 1, 3]).into()), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    2,
+                    trace.input(ArrayType::new_static(DataType::I64, [2, 1]).into()),
+                    size,
+                    vec![0, 1],
+                )])
+                .unwrap();
+        assert!(matches!(
+            DynamicBroadcastOperation::new(vec![0, 1]).batch(&context, &EmptyRegionDriver, &[mapped, three, dimension]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "broadcast cannot change extent coordinate 1 of ragged dimension `size` from `1` to `3`",
+        ));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::exponential::{Exp, Log};
+use crate::operations::extrema::Max;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::reductions::{Reduce, ReductionKind};
@@ -321,7 +322,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>>> Par
 }
 
 impl<
-    C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>, Value: Reduce>,
+    C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>, Value: ZeroLike + Reduce + Max>,
     P: RaggedArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelReduceOperation
 {
@@ -380,6 +381,30 @@ impl<
             self.kind,
             ReductionKind::Mean | ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All,
         );
+
+        // Each surviving extent is aggregated by a maximum over the participants alone, which is only correct when the
+        // extents vary over nothing but the batch axis. Extents that vary over other axes would also need a mask over
+        // those coordinates (i.e., the nested-coordinates limitation of ragged batching), so they are rejected before
+        // anything executes. A replicated input of an idempotent kind passes through unchanged and needs no
+        // aggregation.
+        let input_batch_axis = input.batch_axis_position();
+        if input_batch_axis.is_some() || !idempotent {
+            let nested_ragged_axis = input
+                .ragged_axes()
+                .iter()
+                .find(|ragged_axis| ragged_axis.extent_axes().iter().any(|axis| Some(*axis) != input_batch_axis));
+            if let Some(ragged_axis) = nested_ragged_axis {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{}` does not support bounded ragged dimension `{}`, whose per-item extents vary over axes \
+                         other than the batch axis",
+                        self.name(),
+                        ragged_axis.dimension(),
+                    ),
+                });
+            }
+        }
+
         let input = match input.batch_axis_position() {
             None if idempotent => return Ok(vec![input.clone()].into()),
             None => P::match_axis(context, input, Axis::from(0usize))?,
@@ -399,6 +424,11 @@ impl<
             _ => input,
         };
         let output = input.value().reduce(&[batch_axis], self.kind)?;
+
+        // Extents are nonnegative, so the maximum over no participants is zero rather than the lowest value of the
+        // extents data type that a maximum over an empty axis yields. The maximum is therefore clamped at zero whenever
+        // the mapped extent may be zero.
+        let may_be_empty = P::axis_dimension(context)?.bounds().lower() == 0;
         let ragged_axes = input
             .ragged_axes()
             .iter()
@@ -406,7 +436,8 @@ impl<
                 let extents = match ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis) {
                     None => ragged_axis.extents().clone(),
                     Some(extent_batch_axis) => {
-                        ragged_axis.extents().reduce(&[extent_batch_axis], ReductionKind::Max)?
+                        let extents = ragged_axis.extents().reduce(&[extent_batch_axis], ReductionKind::Max)?;
+                        if may_be_empty { extents.max(&extents.zero_like()?)? } else { extents }
                     }
                 };
                 Ok(RaggedAxis::new(
@@ -1860,6 +1891,68 @@ mod tests {
                     %13:i32[] = reduce [kind=max, axes=[0]] %2
                 in (%12, %13)"
             },
+        );
+    }
+
+    #[test]
+    fn test_parallel_reduce_batching_ragged_rejects_nested_extents() {
+        // The column extents vary over the rows as well as over the batch axis, and a maximum over the participants
+        // alone would mix live extents with those of padded rows, so the reduction is rejected before executing.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(3)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("i".to_string());
+        let input = ArrayBatch::new(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 3]), &[1f32; 12]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![
+            RaggedAxis::new(1, Array::vector(vec![1i64, 2]).unwrap(), rows, vec![0]),
+            RaggedAxis::new(2, Array::matrix(2, 2, vec![1i64, 3, 2, 1]).unwrap(), columns, vec![0, 1]),
+        ])
+        .unwrap();
+        assert_eq!(
+            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|outputs| outputs.into_parts().0),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`parallel_reduce` does not support bounded ragged dimension `columns`, whose per-item \
+                          extents vary over axes other than the batch axis"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_parallel_reduce_batching_ragged_empty_batch() {
+        // Extents are nonnegative, so the aggregate extent of no participants is zero rather than the lowest extent
+        // value that a maximum over an empty axis yields.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()),
+        )
+        .with_axis_name("i".to_string());
+        let input = ragged_array_batch(
+            Array::matrix(0, 3, Vec::<f32>::new()).unwrap(),
+            Array::vector(Vec::<i64>::new()).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|outputs| outputs.into_parts().0),
+            Ok(vec![
+                ArrayBatch::replicated(Array::vector(vec![0f32; 3]).unwrap())
+                    .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(0i64).unwrap(), length, Vec::new())])
+                    .unwrap(),
+            ]),
         );
     }
 

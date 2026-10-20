@@ -7333,7 +7333,7 @@ pub(crate) mod tests {
         let frozen =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
-            .add_instruction(CastOperation::checked(exact, vec![symbolic]), Vec::new(), vec![frozen], None)
+            .add_instruction(CastOperation::checked(exact, vec![symbolic]).unwrap(), Vec::new(), vec![frozen], None)
             .unwrap();
         let program = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
@@ -7384,14 +7384,19 @@ pub(crate) mod tests {
         let first_product = reference_test_mul(&mut builder, linear, read);
         builder
             .add_instruction(
-                CastOperation::checked(first_type.clone(), vec![exact.clone(), first_type]),
+                CastOperation::checked(first_type.clone(), vec![exact.clone(), first_type]).unwrap(),
                 Vec::new(),
                 vec![read, first_known],
                 None,
             )
             .unwrap();
         let later = builder
-            .add_instruction(CastOperation::checked(exact, vec![second_type]), Vec::new(), vec![second_known], None)
+            .add_instruction(
+                CastOperation::checked(exact, vec![second_type]).unwrap(),
+                Vec::new(),
+                vec![second_known],
+                None,
+            )
             .unwrap()[0];
         builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, later], None)
@@ -7479,7 +7484,7 @@ pub(crate) mod tests {
             let value = builder.add_input(symbolic.clone());
             builder
                 .add_instruction(
-                    CastOperation::checked(exact.clone(), vec![symbolic.clone()]),
+                    CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap(),
                     Vec::new(),
                     vec![value],
                     None,

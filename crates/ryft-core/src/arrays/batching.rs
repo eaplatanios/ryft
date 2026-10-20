@@ -30,8 +30,8 @@
 //       linear calls, custom derivative rules, shard maps, jit calls): a sealed region program takes flat values, so
 //       metadata had to be described by a boundary layout type, packed into extra slots, transported, and rebuilt on
 //       both sides, with slot maps in every consumer, an auxiliary-output role on linear calls, and loop and scan
-//       layout fixed points. That implementation was removed too; rematerialize and custom functions reject such
-//       carriers through `reject_ragged_carriers`, and the other boundaries through their own checks.
+//       layout fixed points. That implementation was removed too; rematerialize, linear calls, and custom functions
+//       reject such carriers through `reject_ragged_carriers`, and the other boundaries through their own checks.
 //  Intended design: make a ragged batch a value kind of the composite universe, `ArrayIrType::Ragged(RaggedType)` and
 //  `ArrayIrValue::Ragged(RaggedValue)`. The type stores the padded storage type plus, per ragged dimension, its
 //  identity and the storage axes its extents vary over (its dependency domain); the value holds the storage array plus
@@ -52,11 +52,12 @@
 //  operations, then five proof cases (iteration-varying scan extents, a nested dependency domain, reverse-mode
 //  accumulation with a disconnected zero, an XLA while and jit-call boundary including the eager path, and a masked
 //  reduction with nonzero padding) before the carriers, the cast and guard rule, and the boundaries migrate in that
-//  order. The guard's `reject_ragged_carriers` call goes with the cast and guard rule, and the rematerialize and
-//  custom-function calls go with the boundaries; the helper itself can only be deleted once no homogeneous
-//  (`ArrayType`-universe) ragged carrier, which keeps its `RaggedAxis` view and masking policies and reaches array
-//  rules through the composite projection, can arrive at a sealed boundary on its own. What stays rejected on purpose:
-//  ragged outputs of the public `batch` entry, ragged constants, references, kernel inputs, and shard-map boundaries.
+//  order. The guard's `reject_ragged_carriers` call goes with the cast and guard rule, and the rematerialize,
+//  linear-call, and custom-function calls go with the boundaries; the helper itself can only be deleted once no
+//  homogeneous (`ArrayType`-universe) ragged carrier, which keeps its `RaggedAxis` view and masking policies and
+//  reaches array rules through the composite projection, can arrive at a sealed boundary on its own. What stays
+//  rejected on purpose: ragged outputs of the public `batch` entry, ragged constants, references, kernel inputs, and
+//  shard-map boundaries.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -232,6 +233,62 @@ impl<V> RaggedAxis<V> {
         Some(self)
     }
 
+    /// Validates that broadcasting preserves the dimensions along which retained ragged extents vary. Inserting
+    /// or permuting axes is allowed because the dimensions indexed by the extents keep their sizes and identities.
+    /// Expanding or squeezing an existing extent dimension is rejected: remapping axis positions alone cannot describe
+    /// how the extents depend on the changed dimension, and retaining the ragged identity could make later consumers
+    /// incorrectly assume compatibility with independently supplied extents over that dimension.
+    ///
+    /// The mapped coordinate retains the active transform's identity. Callers provide structurally valid metadata and
+    /// validate the original logical broadcast contract before using physical dimensions here. Ragged coordinates then
+    /// retain their symbolic identities whether the target lists those identities or their unchanged packed bounds.
+    ///
+    /// # Parameters
+    ///
+    ///   - `ragged_axes`: Ragged axes of the broadcast input, whose extent dimensions must be preserved.
+    ///   - `input_type`: Packed type of the broadcast input.
+    ///   - `batch_axis`: Packed position of the input's mapped batch axis, or [`None`] for a replicated input.
+    ///     The mapped coordinate is skipped because it always keeps the transform's identity.
+    ///   - `output_dimensions`: Packed dimensions of the broadcast result.
+    ///   - `output_axes`: Result axis of each input axis, indexed by input axis.
+    pub(crate) fn validate_broadcast_extent_dimensions(
+        ragged_axes: &[Self],
+        input_type: &ArrayType,
+        batch_axis: Option<usize>,
+        output_dimensions: &[Dimension],
+        output_axes: &[usize],
+    ) -> Result<(), BatchingError> {
+        for ragged_axis in ragged_axes {
+            for &axis in ragged_axis.extent_axes() {
+                if Some(axis) == batch_axis {
+                    continue;
+                }
+                let input_dimension = input_type.dimension(axis);
+                let output_dimension =
+                    output_axes.get(axis).and_then(|&axis| output_dimensions.get(axis)).ok_or_else(|| {
+                        BatchingError::InvalidBatchMetadata {
+                            message: format!("broadcast has no output coordinate for ragged extent axis {axis}"),
+                        }
+                    })?;
+                let preserves_ragged_coordinate = ragged_axes.iter().any(|coordinate| {
+                    coordinate.axis() == axis && *output_dimension == Dimension::Dynamic(coordinate.dimension().clone())
+                });
+                if input_dimension != *output_dimension && !preserves_ragged_coordinate {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "broadcast cannot change extent coordinate {} of ragged dimension `{}` from `{}` to `{}`",
+                            axis,
+                            ragged_axis.dimension(),
+                            input_dimension,
+                            output_dimension,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validates every packed-axis position this metadata stores against the packed array it is being attached to:
     /// [`axis`](Self::axis) must name an existing axis of `packed_type` other than the mapped batch axis, and each
     /// entry of [`extent_axes`](Self::extent_axes) must name a distinct existing axis of `packed_type` other than
@@ -290,62 +347,6 @@ impl<V> RaggedAxis<V> {
                         self.axis, extent_axis,
                     ),
                 });
-            }
-        }
-        Ok(())
-    }
-
-    /// Validates that broadcasting preserves the dimensions along which retained ragged extents vary. Inserting
-    /// or permuting axes is allowed because the dimensions indexed by the extents keep their sizes and identities.
-    /// Expanding or squeezing an existing extent dimension is rejected: remapping axis positions alone cannot describe
-    /// how the extents depend on the changed dimension, and retaining the ragged identity could make later consumers
-    /// incorrectly assume compatibility with independently supplied extents over that dimension.
-    ///
-    /// The mapped coordinate retains the active transform's identity. Callers provide structurally valid metadata and
-    /// validate the original logical broadcast contract before using physical dimensions here. Ragged coordinates then
-    /// retain their symbolic identities whether the target lists those identities or their unchanged packed bounds.
-    ///
-    /// # Parameters
-    ///
-    ///   - `ragged_axes`: Ragged axes of the broadcast input, whose extent dimensions must be preserved.
-    ///   - `input_type`: Packed type of the broadcast input.
-    ///   - `batch_axis`: Packed position of the input's mapped batch axis, or [`None`] for a replicated input.
-    ///     The mapped coordinate is skipped because it always keeps the transform's identity.
-    ///   - `output_dimensions`: Packed dimensions of the broadcast result.
-    ///   - `output_axes`: Result axis of each input axis, indexed by input axis.
-    fn validate_broadcast_extent_dimensions(
-        ragged_axes: &[Self],
-        input_type: &ArrayType,
-        batch_axis: Option<usize>,
-        output_dimensions: &[Dimension],
-        output_axes: &[usize],
-    ) -> Result<(), BatchingError> {
-        for ragged_axis in ragged_axes {
-            for &axis in ragged_axis.extent_axes() {
-                if Some(axis) == batch_axis {
-                    continue;
-                }
-                let input_dimension = input_type.dimension(axis);
-                let output_dimension =
-                    output_axes.get(axis).and_then(|&axis| output_dimensions.get(axis)).ok_or_else(|| {
-                        BatchingError::InvalidBatchMetadata {
-                            message: format!("broadcast has no output coordinate for ragged extent axis {axis}"),
-                        }
-                    })?;
-                let preserves_ragged_coordinate = ragged_axes.iter().any(|coordinate| {
-                    coordinate.axis() == axis && *output_dimension == Dimension::Dynamic(coordinate.dimension().clone())
-                });
-                if input_dimension != *output_dimension && !preserves_ragged_coordinate {
-                    return Err(BatchingError::UnsupportedOperation {
-                        message: format!(
-                            "broadcast cannot change extent coordinate {} of ragged dimension `{}` from `{}` to `{}`",
-                            axis,
-                            ragged_axis.dimension(),
-                            input_dimension,
-                            output_dimension,
-                        ),
-                    });
-                }
             }
         }
         Ok(())

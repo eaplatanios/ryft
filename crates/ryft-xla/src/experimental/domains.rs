@@ -1456,10 +1456,17 @@ impl<'c> XlaDomain<'c> {
             // values have exact types, so interpreted inference proves the relationship or rejects it; it never
             // leaves a check to a backend.
             let values = inputs.iter().cloned().map(XlaValue::into_array_ir_value).collect::<Vec<_>>();
-            operation.infer_interpreted_output_type(
-                &values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(),
-                &[],
-            )?;
+            let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+            let (_, interpreted) = ArrayIrType::infer_cast_output_type(operation, &input_types)?;
+            if interpreted.is_none() {
+                return Err(ProgramError::Concretization {
+                    message: format!(
+                        "`{}` cannot check symbolic type relationships during interpretation; \
+                         bind the operation through its context",
+                        operation.name(),
+                    ),
+                });
+            }
             self.validate_eager_placement(&array_inputs)?;
             for input in &array_inputs {
                 input
@@ -11663,7 +11670,8 @@ mod tests {
                         constructor(
                             input.r#type().into_owned().with_layout(layout.clone()).into(),
                             vec![source_type.clone().into()],
-                        ),
+                        )
+                        .unwrap(),
                         vec![],
                         vec![source],
                         None,
@@ -11714,7 +11722,8 @@ mod tests {
                 CastOperation::<ArrayIrType>::checked(
                     source_type.clone().with_layout(layout.clone()).into(),
                     vec![source_type.into()],
-                ),
+                )
+                .unwrap(),
                 vec![],
                 vec![input],
                 None,
@@ -11774,7 +11783,8 @@ mod tests {
                 CastOperation::<ArrayIrType>::unchecked(
                     input_type.clone().with_layout(layout.clone()).into(),
                     vec![input_type.into()],
-                ),
+                )
+                .unwrap(),
                 vec![],
                 vec![input],
                 None,
@@ -13961,9 +13971,9 @@ mod tests {
             assert!(Arc::ptr_eq(&output.xla_domain().effect_scope, &domain.effect_scope));
 
             let operation = if checked {
-                CastOperation::checked(output_type.clone(), vec![output_type.clone()])
+                CastOperation::checked(output_type.clone(), vec![output_type.clone()]).unwrap()
             } else {
-                CastOperation::unchecked(output_type.clone(), vec![output_type.clone()])
+                CastOperation::unchecked(output_type.clone(), vec![output_type.clone()]).unwrap()
             };
             let outputs = selected.bind(operation, Vec::new(), &[value.clone()]).unwrap();
             assert_eq!(outputs, vec![value.clone()]);
@@ -13987,7 +13997,7 @@ mod tests {
         let valid = XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]));
         let invalid = XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let operation = constructor(output_type.clone(), declared_types.clone());
+            let operation = constructor(output_type.clone(), declared_types.clone()).unwrap();
             assert_eq!(
                 domain.bind(operation.clone(), Vec::new(), &[value.clone(), valid.clone()]),
                 Ok(vec![value.clone()]),
@@ -14006,7 +14016,7 @@ mod tests {
             );
             let mismatch = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3)));
             assert_eq!(
-                domain.bind(constructor(mismatch, vec![output_type.clone()]), Vec::new(), &[value.clone()]),
+                domain.bind(constructor(mismatch, vec![output_type.clone()]).unwrap(), Vec::new(), &[value.clone()]),
                 Err(TypeError::invalid("`cast` cannot convert type `dimension<2>` to unrelated type `dimension<3>`")
                     .into()),
             );
@@ -14015,7 +14025,11 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new())
             .unwrap();
         assert_eq!(
-            domain.bind(CastOperation::checked(output_type.clone(), vec![output_type]), vec![region], &[value],),
+            domain.bind(
+                CastOperation::checked(output_type.clone(), vec![output_type]).unwrap(),
+                vec![region],
+                &[value],
+            ),
             Err(ProgramError::MalformedProgram(
                 "operation `cast` declares no region slots but 1 regions were attached".to_owned(),
             )),
@@ -16556,7 +16570,8 @@ mod tests {
                 CastOperation::checked(
                     dimension_type.clone(),
                     vec![dimension_type, input.r#type().into_owned().into()],
-                ),
+                )
+                .unwrap(),
                 Vec::new(),
                 &[dimension, XlaValue::Array(input)],
             ),
