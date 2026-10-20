@@ -4337,7 +4337,9 @@ where
         .filter_map(|(index, (&linear, &kind))| linear.then_some((index + 1, kind)))
         .unzip();
     check_count!("output", outputs, body.output_types().len(), ProgramError);
-    let mut transposed_body = driver.transpose_program(body, &input_indices, &selected_destination_kinds)?;
+    let mut transposed_body = driver
+        .transpose_program(body, &input_indices, &vec![true; input_indices.len()], &selected_destination_kinds)?
+        .into_program();
 
     // A stacked output whose cotangent is a structural zero receives a per-iteration zero slice inside the reversed
     // body instead of a materialized zero stack, whenever that zero needs no runtime dimensions. Zeros that do need
@@ -4713,7 +4715,7 @@ mod tests {
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, DifferentiationTracer, Linearization, LinearizationTracer,
-        ReverseModeDifferentiate, differentiate_at,
+        ReverseModeDifferentiate, TransposedProgram, differentiate_at,
     };
     use crate::interpretation::EagerInterpretationDriver;
     use crate::macros::{check_gradient, check_operation_batching};
@@ -13717,7 +13719,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.transposed_program(&[]).unwrap().to_string(),
+            pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3] .
                 let %3:f64[], %4:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 %2 [
@@ -14521,7 +14523,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.transposed_program(&[]).unwrap().to_string(),
+            pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
                 let %2:f64[] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
@@ -14583,7 +14585,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.output_types(), vec![scalar_type.clone(), stacked_type.clone()]);
         let primal_outputs = linearization
             .primal()
@@ -14790,6 +14792,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, Array::scalar(24.0).unwrap());
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -14915,8 +14918,18 @@ mod tests {
         // Build a fresh outer transpose on both calls so each reaches the nested region's cache. These static
         // tangent types need no residual dimension mappings for zeros; trailing residual inputs remain known.
         let tangent_input_indices = (0..first.tangent().input_ids().len() - first.residual_count()).collect::<Vec<_>>();
-        let pullback = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
-        let repeated = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
+        let pullback = first
+            .tangent()
+            .entry_region_ref()
+            .transpose(&tangent_input_indices, &vec![true; tangent_input_indices.len()], &[])
+            .unwrap()
+            .into_program();
+        let repeated = first
+            .tangent()
+            .entry_region_ref()
+            .transpose(&tangent_input_indices, &vec![true; tangent_input_indices.len()], &[])
+            .unwrap()
+            .into_program();
         assert_eq!(pullback.to_string(), repeated.to_string());
         let tangent_scan = first
             .tangent()
@@ -14934,10 +14947,11 @@ mod tests {
                 .entry_region_ref()
                 .transpose(
                     &(0..uncached.tangent().input_ids().len() - uncached.residual_count()).collect::<Vec<_>>(),
-                    &[],
+                    &vec![true; uncached.tangent().input_ids().len() - uncached.residual_count()],
                     &[],
                 )
                 .unwrap()
+                .program()
                 .to_string(),
         );
     }
@@ -15070,7 +15084,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3, 1] .
                 let %1:f64[3, 3] = scan [carry_count=0, length=3, reverse=false] %0 [
@@ -15096,7 +15110,11 @@ mod tests {
         );
         // Reverse iteration retains slice pairing: the transposed selection writes each seed to its diagonal.
         assert_eq!(
-            linearization.pullback().unwrap().interpret(vec![Array::matrix(3, 1, vec![2.0, 3.0, 4.0]).unwrap()]),
+            linearization
+                .pullback()
+                .unwrap()
+                .program()
+                .interpret(vec![Array::matrix(3, 1, vec![2.0, 3.0, 4.0]).unwrap()]),
             Ok(vec![Array::matrix(3, 3, vec![2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0]).unwrap()]),
         );
     }
@@ -15137,7 +15155,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.transposed_program(&[]).unwrap().to_string(),
+            pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[][sharding={mesh<['x'=1:auto]>, []}], %1:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], \
                  %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
@@ -15447,7 +15465,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.transposed_program(&[]).unwrap().to_string(),
+            pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:ref<f32[]> .
                 let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, length=3, reverse=true] %1 %0 [
@@ -15560,6 +15578,7 @@ mod tests {
             pullback
                 .transposed_program(&[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
                 .unwrap()
+                .program()
                 .to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[3] .
@@ -15614,7 +15633,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.transposed_program(&[]).unwrap().to_string(),
+            pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
                 let %2:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
@@ -15671,7 +15690,7 @@ mod tests {
             .unwrap();
 
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -15783,7 +15802,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3], %2:f64[2, 3] .
                 let %3:f64[3], %4:f64[2, 3] = scan [carry_count=1, length=2, reverse=true] %0 %1 %2 [
@@ -15802,7 +15821,7 @@ mod tests {
         );
         let mut primal_outputs = linearization.primal().interpret(vec![carry, slices]).unwrap();
         let residuals = primal_outputs.split_off(2);
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert!(pullback.output_types().iter().all(|r#type| r#type.identities().next().is_none()));
         let mut pullback_inputs =
             vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()), stacked(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0])];
@@ -15911,7 +15930,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [1, 8)> .
                 let %5:f64[], %6:f64[length] = scan [carry_count=1, length=length, reverse=true] %0 %1 %2 %3 %4 [
@@ -15942,7 +15961,7 @@ mod tests {
             vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![0.0, 0.0, 0.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::scalar(24.0).unwrap()), array(Array::vector(vec![12.0, 8.0, 6.0]).unwrap())]),
         );
     }
@@ -16154,7 +16173,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2], %2:i64[2] .
                 let %3:f64[] = scan [carry_count=1, length=2, reverse=true] %0 %1 %2 [
@@ -16193,7 +16212,7 @@ mod tests {
             vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![0.0, 0.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::scalar(2.0).unwrap())])
         );
     }
@@ -16329,8 +16348,9 @@ mod tests {
                 &self,
                 _region: RegionRef<'_, Array, TestOperation>,
                 _input_indices: &[usize],
+                _instantiate_zeros: &[bool],
                 _destination_kinds: &[CotangentDestinationKind],
-            ) -> Result<Arc<TestProgram>, DifferentiationError> {
+            ) -> Result<TransposedProgram<Array, TestOperation>, DifferentiationError> {
                 panic!("invalid source scans must fail before body transposition")
             }
         }
@@ -16898,7 +16918,7 @@ mod tests {
         // Transposing a scan over a stacked reference threads the stack's cotangent reference through the reversed
         // scan, whose body selects and accumulates into the current row with its own index.
         let program = stacked_reference_program();
-        let pullback = program.linearize().unwrap().pullback().unwrap();
+        let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -16972,7 +16992,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(unrolled.linearize().unwrap().pullback().unwrap().interpret(seeds), Ok(cotangents));
+        assert_eq!(unrolled.linearize().unwrap().pullback().unwrap().program().interpret(seeds), Ok(cotangents));
 
         // With the stack as a differentiated input, a `Reference` destination is the stacked cotangent reference that
         // the reversed scan consumes directly: it holds the cotangent of the final stack contents on entry and the
@@ -17023,8 +17043,8 @@ mod tests {
         let program = stacked_reference_program();
         let discharged =
             program.clone().discharge_references(0).unwrap().into_program_without_external_references().unwrap();
-        let pullback = program.linearize().unwrap().pullback().unwrap();
-        let discharged_pullback = discharged.linearize().unwrap().pullback().unwrap();
+        let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
+        let discharged_pullback = discharged.linearize().unwrap().pullback().unwrap().into_program();
         let seeds = vec![
             TestIrValue::Array(Array::scalar(1.0f32).unwrap()),
             TestIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
@@ -17103,6 +17123,7 @@ mod tests {
             .unwrap()
             .pullback()
             .unwrap()
+            .program()
             .interpret(vec![
                 TestIrValue::Array(Array::scalar(1.0f32).unwrap()),
                 TestIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
@@ -17158,7 +17179,7 @@ mod tests {
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![final_carry], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let pullback = program.linearize().unwrap().pullback().unwrap();
+        let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"

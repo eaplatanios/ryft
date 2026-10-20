@@ -7,7 +7,7 @@ use std::sync::Arc;
 use ryft_macros::Parameter;
 
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
-use crate::differentiation::reverse::TransposableOperation;
+use crate::differentiation::reverse::{TransposableOperation, TransposedProgram};
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
     ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole,
@@ -449,7 +449,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// sub-programs. Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured
     /// factor (e.g., folding a scalar `Mul` against a known input into a multiply-by-a-captured-constant) by folding
     /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `O`
-    /// and transposes it through [`RegionRef::transpose_shared`], including the saved dimension mappings needed for
+    /// and transposes it through [`RegionRef::transpose_shared`], using the retained dimension inputs needed for
     /// disconnected cotangent zeros. The tangent sub-program's inputs are `(ẋ, r)`, so it is transposed with respect
     /// to the leading tangent inputs `ẋ` while the trailing [`residual_count`](Self::residual_count) residual inputs
     /// are held as known parameters. Partition-aware transposition then threads each known residual through to the
@@ -458,10 +458,11 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// operation family `O` and produces the cotangents of the linear tangent inputs only, in the selected input order
     /// used to construct this linearization.
     ///
-    /// Transposition is served from the tangent region's retained transform cache. This function clones the cached
-    /// program to return an owned value; repeated calls reuse the transposition but still clone its program.
+    /// The returned [`TransposedProgram`] contains the shared pullback program and metadata describing each selected
+    /// input cotangent. Structural zeros are instantiated into concrete program outputs. Transposition is served from
+    /// the tangent region's retained transform cache; repeated calls share its program without cloning the program.
     #[inline]
-    pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+    pub fn pullback(&self) -> Result<TransposedProgram<V, O>, DifferentiationError>
     where
         V::Type: DifferentiableType + ReferenceMemberType,
         O: TransposableOperation<V, O>
@@ -489,7 +490,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         // the tangent program consumes at least `residual_count` inputs. The default cotangent destination kinds apply,
         // and so a reference-typed tangent input exposes a cotangent reference input in the pullback (refer to the
         // documentation of `Program::transpose_with_respect_to` for more information).
-        Ok(self.tangent.transpose_with_trailing_residuals_shared(self.residual_count, &[])?.as_ref().clone())
+        self.tangent.transpose_with_trailing_residuals_shared(self.residual_count, &[])
     }
 }
 
@@ -4527,6 +4528,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_linearization_pullback() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let transposed = linearization.pullback().unwrap();
+        let repeated = linearization.pullback().unwrap();
+        assert!(Arc::ptr_eq(transposed.program(), repeated.program()));
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
+                in (%1, %0)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.program().interpret(vec![Array::scalar(3f64).unwrap()]),
+            Ok(vec![Array::scalar(0f64).unwrap(), Array::scalar(3f64).unwrap()]),
+        );
+        assert!(Arc::ptr_eq(&transposed.into_program(), repeated.program()));
+    }
+
+    #[test]
     fn test_pushforward_new() {
         let program = boundary_program(&[DataType::F64, DataType::F32], &[Array::scalar(0.0_f64).unwrap()]);
         let pushforward = pushforward_with_boundary(
@@ -5002,7 +5031,7 @@ pub(crate) mod tests {
                 Array::scalar(0f64).unwrap(),
             ],
         );
-        let backward = reverse.pullback().unwrap();
+        let backward = reverse.pullback().unwrap().into_program();
         assert_eq!(
             backward.interpret(vec![
                 Array::scalar(2f64).unwrap(),
@@ -5054,7 +5083,7 @@ pub(crate) mod tests {
             Ok(vec![Array::vector(vec![8f64, 27.0, 64.0]).unwrap(), Array::vector(vec![2f64, 3.0, 4.0]).unwrap()]),
         );
         assert_eq!(
-            reverse.pullback().unwrap().interpret(vec![
+            reverse.pullback().unwrap().program().interpret(vec![
                 Array::vector(vec![1f64, 1.0, 1.0]).unwrap(),
                 Array::vector(vec![2f64, 3.0, 4.0]).unwrap(),
             ]),
@@ -5079,7 +5108,7 @@ pub(crate) mod tests {
             .unwrap();
 
         // Differentiate the materialized backward program with respect to its saved x, keeping seed 2 fixed.
-        let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap();
+        let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap().into_program();
         assert_eq!(
             backward.entry_region_ref().jvp(&[0]).unwrap().interpret(vec![
                 Array::scalar(2f64).unwrap(),
@@ -6144,7 +6173,7 @@ pub(crate) mod tests {
         let mut pullback_inputs = vec![Array::scalar(1.0_f64).unwrap()];
         pullback_inputs.extend_from_slice(&primal_outputs[1..]);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![Array::scalar(2.0_f64).unwrap(), Array::scalar(3.0_f64).unwrap()])
         );
 
@@ -6837,7 +6866,7 @@ pub(crate) mod tests {
 
         // Transposition keeps the computed negative primal as a residual input. Exactly one negation belongs to
         // the tangent rule; replaying the primal producer would introduce a second negation.
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.instructions().iter().filter(|instruction| instruction.operation().name() == "neg").count(),
             1,

@@ -1623,7 +1623,7 @@ pub(crate) mod tests {
             linearization.primal().instructions().last().unwrap().operation(),
             XlaOperation::DimensionSize(_)
         ));
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let zero = pullback.instructions().last().unwrap();
         assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[ryft_core::AtomId::new(1)]);

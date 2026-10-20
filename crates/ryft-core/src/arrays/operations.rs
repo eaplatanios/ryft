@@ -3059,7 +3059,7 @@ mod tests {
             let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap())];
             pullback_inputs.extend(residuals);
             assert_eq!(
-                linearization.pullback().unwrap().interpret(pullback_inputs),
+                linearization.pullback().unwrap().program().interpret(pullback_inputs),
                 Ok(vec![ArrayIrValue::Array(
                     Array::vector(vec![expected_cotangent, expected_cotangent, expected_cotangent,]).unwrap()
                 )]),
@@ -3099,7 +3099,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())]),
         );
 
@@ -3144,7 +3144,7 @@ mod tests {
             let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(8.0_f64).unwrap())];
             pullback_inputs.extend(residuals);
             assert_eq!(
-                linearization.pullback().unwrap().interpret(pullback_inputs),
+                linearization.pullback().unwrap().program().interpret(pullback_inputs),
                 Ok(vec![ArrayIrValue::Array(Array::vector(expected_cotangent).unwrap())]),
             );
         }

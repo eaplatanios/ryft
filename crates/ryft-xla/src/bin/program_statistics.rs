@@ -200,6 +200,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Statisti
         (),
     )?;
     let (pullback, _residuals) = pullback.into_transposed_parts()?;
+    let pullback = pullback.into_program();
     Ok(pullback.statistics())
 }
 

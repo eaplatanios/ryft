@@ -4369,6 +4369,7 @@ mod tests {
         let context = x.domain();
         let (value, pullback) = context.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x.clone(), ()).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
         // The direct-transpose pullback consumes `[output_cotangents ++ residuals]` and produces the flat input

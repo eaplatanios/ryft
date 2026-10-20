@@ -1278,10 +1278,11 @@ fn test_dot_transposition_prunes_unrequested_pullback_gradient() {
     let (_, pullback) = differentiate_at((left, right))
         .vjp(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())?))
         .unwrap();
-    let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap();
+    let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap().into_program();
     let selected = pullback
         .transposed_program(&[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
-        .unwrap();
+        .unwrap()
+        .into_program();
     // The caller's request reaches the production linearization and reverse sweep. The ignored right gradient
     // removes one whole dot product, rather than merely discarding its result after replay.
     assert_eq!(both.instructions().iter().filter(|instruction| instruction.operation().name() == "dot").count(), 2);

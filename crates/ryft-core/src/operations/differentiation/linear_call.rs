@@ -735,7 +735,6 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use std::rc::Rc;
-    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -751,7 +750,7 @@ pub(crate) mod tests {
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        CotangentDestinationKind, DifferentiationError, TransposableOperation, TranspositionContext,
+        CotangentDestinationKind, DifferentiationError, TransposableOperation, TransposedProgram, TranspositionContext,
         TranspositionDriver,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -1388,9 +1387,9 @@ pub(crate) mod tests {
                 &self,
                 _region: RegionRef<'_, Array, ArrayOperation<Array>>,
                 _input_indices: &[usize],
+                _instantiate_zeros: &[bool],
                 _destination_kinds: &[CotangentDestinationKind],
-            ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError>
-            {
+            ) -> Result<TransposedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
                 unreachable!("linear call transposition swaps regions and never re-enters transposition")
             }
         }

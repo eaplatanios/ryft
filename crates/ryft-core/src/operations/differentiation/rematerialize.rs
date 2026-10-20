@@ -706,7 +706,14 @@ where
             .enumerate()
             .filter_map(|(index, (input, kind))| input.is_unknown().then_some((index, *kind)))
             .unzip();
-        let transposed_body = driver.transpose_program(body, &linear_input_indices, &destination_kinds)?;
+        let transposed_body = driver
+            .transpose_program(
+                body,
+                &linear_input_indices,
+                &vec![true; linear_input_indices.len()],
+                &destination_kinds,
+            )?
+            .into_program();
 
         // A reference output forwards an input root whose state cotangent lives in the cotangent reference of that
         // input, so it has no cotangent input. A structurally zero output cotangent is materialized from the live
@@ -769,7 +776,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -786,7 +792,8 @@ mod tests {
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable,
         NothingSavable, OffloadDotsWithNoBatchDimensions, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-        SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, differentiate_at, rematerialize,
+        SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, TransposedProgram, differentiate_at,
+        rematerialize,
     };
     use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -2453,7 +2460,7 @@ mod tests {
         assert_eq!(primal, vec![Array::scalar(2.0 * 0.5f64.sin()).unwrap(), scale.transfer_to_memory(host).unwrap()]);
         let inputs = vec![Array::scalar(1f64).unwrap(), primal[1].clone()];
         assert_eq!(linearization.tangent().interpret(inputs.clone()), Ok(vec![scale.clone()]));
-        assert_eq!(linearization.pullback().unwrap().interpret(inputs), Ok(vec![scale]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(inputs), Ok(vec![scale]));
     }
 
     #[test]
@@ -2717,7 +2724,7 @@ mod tests {
                     ]
                 in (%10, %11)"},
         );
-        let gradient_of_gradient = gradient.linearize().unwrap().pullback().unwrap();
+        let gradient_of_gradient = gradient.linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             gradient_of_gradient.to_string(),
             indoc! {"
@@ -2753,7 +2760,8 @@ mod tests {
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
-        let gradient_of_jvp = program.into_flat_program().jvp().unwrap().linearize().unwrap().pullback().unwrap();
+        let gradient_of_jvp =
+            program.into_flat_program().jvp().unwrap().linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             gradient_of_jvp.to_string(),
             indoc! {"
@@ -2807,6 +2815,7 @@ mod tests {
         let (batched_pullback, _) = linearization
             .pullback()
             .unwrap()
+            .into_program()
             .batched(
                 2,
                 ShardingDimension::Replicated,
@@ -2851,7 +2860,7 @@ mod tests {
             )
             .unwrap()
             .into_parts();
-        let pullback_of_batched = batched.linearize().unwrap().pullback().unwrap();
+        let pullback_of_batched = batched.linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             pullback_of_batched.to_string(),
             indoc! {"
@@ -3111,7 +3120,7 @@ mod tests {
         assert!((tangent[0].elements::<f64>().unwrap()[0] - expected_tangent).abs() < 1e-12);
         let mut pullback_inputs = vec![Array::scalar(1f64).unwrap()];
         pullback_inputs.extend(primal.into_iter().skip(1));
-        let gradient = linearization.pullback().unwrap().interpret(pullback_inputs).unwrap();
+        let gradient = linearization.pullback().unwrap().program().interpret(pullback_inputs).unwrap();
         assert_eq!(gradient.len(), 2);
         assert!((gradient[0].elements::<f64>().unwrap()[0] - carry_gradient).abs() < 1e-12);
         let row_gradients = gradient[1].elements::<f64>().unwrap();
@@ -3323,7 +3332,7 @@ mod tests {
         // Transposing the tangent program binds the same differentiated call over the transposed body, which recomputes
         // the cosine of the dot product from the saved `x` before using it.
         let linearization = sine_of_dot_program(rematerialize_operation()).linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -3358,7 +3367,7 @@ mod tests {
             .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false, true]));
         let linearization = sine_of_dot_program(operation).linearize().unwrap();
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
                 let %3:f64[3], %4:f64[] = rematerialize [optimization_barrier=[true, false, true], differentiated=true] %0 %1 %2 [
@@ -3411,9 +3420,9 @@ mod tests {
                 &self,
                 _region: RegionRef<'_, Array, ArrayOperation<Array>>,
                 _input_indices: &[usize],
+                _instantiate_zeros: &[bool],
                 _destination_kinds: &[CotangentDestinationKind],
-            ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError>
-            {
+            ) -> Result<TransposedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
                 Err(ProgramError::UnsupportedOperation {
                     message: "a zero linear map never transposes its body".to_string(),
                 }
@@ -3505,7 +3514,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"

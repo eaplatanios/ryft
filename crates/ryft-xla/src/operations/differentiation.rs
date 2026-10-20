@@ -444,7 +444,7 @@ mod tests {
             "#},
         );
         assert_eq!(
-            lower(&gradient.linearize().unwrap().pullback().unwrap()),
+            lower(&gradient.linearize().unwrap().pullback().unwrap().into_program()),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>, %arg3: tensor<f64>) -> tensor<f64> {

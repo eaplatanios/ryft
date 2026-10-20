@@ -213,8 +213,8 @@ pub use rematerialization::{
 pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
     CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,
-    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_mixed_operation,
-    transpose_projected_operation,
+    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    transpose_mixed_operation, transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 pub use zeros::ResidualZeroProvider;

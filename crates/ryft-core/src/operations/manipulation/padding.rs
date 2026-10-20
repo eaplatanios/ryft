@@ -4952,7 +4952,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
 
         let input = ArrayIrValue::Array(
             Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[10.0_f64, 20.0, 30.0]).unwrap(),
@@ -5104,7 +5104,7 @@ mod tests {
         )];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
                 ArrayIrValue::Array(
                     Array::from_elements::<f64>(
@@ -5229,7 +5229,7 @@ mod tests {
         )];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
                 ArrayIrValue::Array(Array::from_elements(concrete_input_type, &[2_f32, 3.]).unwrap()),
                 ArrayIrValue::Array(Array::from_elements(padding_type, &[5_f32]).unwrap()),
@@ -5268,7 +5268,7 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(
                     Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap()
@@ -5289,7 +5289,7 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[7_f32]).unwrap()),
                 ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap()),
@@ -5320,7 +5320,7 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[0_f32]).unwrap()),
                 ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap()),
@@ -5341,7 +5341,7 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(
                     Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[0_f32, 0.]).unwrap()
@@ -5371,7 +5371,7 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[0_f32]).unwrap()),
                 ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap()),
@@ -5392,7 +5392,7 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(
                     Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[0_f32, 0.]).unwrap()
@@ -5416,7 +5416,7 @@ mod tests {
         )
         .linearize()
         .unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -5567,7 +5567,7 @@ mod tests {
             program.instructions()[0].operation().effects().classes(),
             EffectClasses::single(EffectClass::OrderedAssertion),
         );
-        let pullback = program.linearize().unwrap().pullback().unwrap();
+        let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -5636,7 +5636,8 @@ mod tests {
         .linearize()
         .unwrap()
         .pullback()
-        .unwrap();
+        .unwrap()
+        .into_program();
         let inverse_pads = pullback
             .entry_region_ref()
             .instructions_in_closure()
@@ -5838,7 +5839,7 @@ mod tests {
                 ),
         ));
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().output_types(),
+            program.linearize().unwrap().pullback().unwrap().program().output_types(),
             program.input_types()[..2].iter().map(|r#type| r#type.cotangent().unwrap()).collect::<Vec<_>>(),
         );
     }
@@ -6050,7 +6051,7 @@ mod tests {
         // The pullback gathers the input cotangent back out of the written positions and sums the padding positions
         // into the padding value's cotangent; the indices and broadcast extents are ordinary residuals.
         let linearization = program.linearize_with_respect_to(&[0, 1]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"

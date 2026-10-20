@@ -925,7 +925,7 @@ mod tests {
             linearization.primal().instructions().last().unwrap().operation(),
             ArrayIrOperation::DimensionSize(_)
         ));
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let zero = pullback.instructions().last().unwrap();
         assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[AtomId::new(1), AtomId::new(1)]);
@@ -959,7 +959,8 @@ mod tests {
         let transposed = pullback
             .linear_program()
             .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
-            .unwrap();
+            .unwrap()
+            .into_program();
         let zero = transposed.instructions().last().unwrap();
         assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[AtomId::new(1)]);

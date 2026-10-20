@@ -4978,7 +4978,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]).unwrap())]),
         );
     }
@@ -5036,7 +5036,7 @@ mod tests {
             vec![ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[5.0_f64, 7.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(
                 Array::from_elements(concrete_type.clone(), &[5.0_f64, 0.0, 7.0, 0.0]).unwrap()
             )]),
@@ -5821,6 +5821,7 @@ mod tests {
             linearization
                 .pullback()
                 .unwrap()
+                .program()
                 .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0,]).unwrap())]),
             Ok(vec![
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap()),
@@ -5848,7 +5849,7 @@ mod tests {
         let mut cotangents = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         cotangents.extend(outputs);
         assert_eq!(
-            input_only.pullback().unwrap().interpret(cotangents),
+            input_only.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap())]),
         );
 
@@ -5870,7 +5871,7 @@ mod tests {
             update_only.tangent().interpret(tangent_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 6.0, 0.0]).unwrap())]),
         );
-        let pullback = update_only.pullback().unwrap();
+        let pullback = update_only.pullback().unwrap().into_program();
         let mut cotangents = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         cotangents.extend(outputs);
         assert_eq!(
@@ -7292,7 +7293,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:i32[], %2:dimension<extent ∈ [2, 6)> .
                 let %3:f64[extent] = linear_call [residual_count=2] %1 %2 %0 [
@@ -7331,7 +7332,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]).unwrap())]),
         );
     }
@@ -8519,7 +8520,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let primal = linearization
             .primal()
             .interpret(vec![
@@ -8534,7 +8535,7 @@ mod tests {
         // Differentiating the pullback again must retain its paired slice map, including possibly empty source
         // bounds. A generic gather transpose would require a positive lower bound on each destination axis.
         let second = pullback.linearize_with_respect_to(&[0]).unwrap();
-        let forward_again = second.pullback().unwrap();
+        let forward_again = second.pullback().unwrap().into_program();
         let mut second_outputs = second.primal().interpret(arguments.clone()).unwrap();
         let mut second_arguments =
             vec![ArrayIrValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect()).unwrap())];
@@ -9488,7 +9489,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap()),

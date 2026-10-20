@@ -3093,7 +3093,7 @@ mod tests {
         let input = XlaValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
         let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert!(pullback.residuals().is_empty());
-        let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap();
+        let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap().into_program();
         let [seed_type, buffer_type] = <[ArrayIrType; 2]>::try_from(pullback.input_types()).unwrap();
         assert!(matches!(&buffer_type, ArrayIrType::Reference(_)));
         assert_eq!(

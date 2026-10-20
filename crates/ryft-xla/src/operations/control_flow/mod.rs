@@ -552,7 +552,7 @@ mod tests {
         assert!(primal_stablehlo.contains("\"stablehlo.if\""), "{primal_stablehlo}");
         assert!(primal_stablehlo.matches("stablehlo.while").count() >= 2, "{primal_stablehlo}");
 
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let pullback_inputs = pullback
             .input_types()
             .iter()

@@ -2305,8 +2305,22 @@ where
     let branch_destination_kinds =
         branch_input_indices.iter().map(|&index| cotangents.kind(index + 1)).collect::<Vec<_>>();
     let transposed_branches = [
-        driver.transpose_program(true_branch, &branch_input_indices, &branch_destination_kinds)?,
-        driver.transpose_program(driver.region(1)?, &branch_input_indices, &branch_destination_kinds)?,
+        driver
+            .transpose_program(
+                true_branch,
+                &branch_input_indices,
+                &vec![true; branch_input_indices.len()],
+                &branch_destination_kinds,
+            )?
+            .into_program(),
+        driver
+            .transpose_program(
+                driver.region(1)?,
+                &branch_input_indices,
+                &vec![true; branch_input_indices.len()],
+                &branch_destination_kinds,
+            )?
+            .into_program(),
     ];
     let transposed_condition = ConditionOperation::new();
 
@@ -10008,7 +10022,7 @@ mod tests {
                 in (%3)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[extent], %1:bool[], %2:f64[extent] .
                 let %3:f64[extent] = condition %1 %0 %2 [
@@ -10027,7 +10041,7 @@ mod tests {
                 ]
                 in (%3)"},
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         for (predicate, expected_value, expected_gradient) in
             [(true, vec![4.0f64, 9.0, 16.0], vec![4.0f64, 6.0, 8.0]), (false, vec![4.0f64, 6.0, 8.0], vec![2.0f64; 3])]
         {
@@ -10099,7 +10113,7 @@ mod tests {
                 ]
                 in (%3)"},
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -10207,7 +10221,7 @@ mod tests {
                 ]
                 in (%5)"},
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -10739,7 +10753,7 @@ mod tests {
                 in (%3, %4)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:bool[], %3:f32[] .
                 let %4:f32[] = condition %2 %0 %1 %3 [
@@ -10755,7 +10769,7 @@ mod tests {
                 ]
                 in (%4)"},
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
             assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
             assert!(program.effects().classes().is_empty());
@@ -11126,7 +11140,7 @@ mod tests {
                     .transpose(
                         &(0..linearization.tangent().input_ids().len() - linearization.residual_count())
                             .collect::<Vec<_>>(),
-                        &[],
+                        &vec![true; linearization.tangent().input_ids().len() - linearization.residual_count()],
                         &[],
                     )
                     .unwrap();
@@ -11226,8 +11240,18 @@ mod tests {
         // Build a fresh outer transpose on both calls so each reaches the nested region's cache. These static
         // tangent types need no residual dimension mappings for zeros; trailing residual inputs remain known.
         let tangent_input_indices = (0..first.tangent().input_ids().len() - first.residual_count()).collect::<Vec<_>>();
-        let pullback = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
-        let repeated = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
+        let pullback = first
+            .tangent()
+            .entry_region_ref()
+            .transpose(&tangent_input_indices, &vec![true; tangent_input_indices.len()], &[])
+            .unwrap()
+            .into_program();
+        let repeated = first
+            .tangent()
+            .entry_region_ref()
+            .transpose(&tangent_input_indices, &vec![true; tangent_input_indices.len()], &[])
+            .unwrap()
+            .into_program();
         assert_eq!(pullback.to_string(), repeated.to_string());
         let tangent_condition = first
             .tangent()
@@ -11246,10 +11270,11 @@ mod tests {
                 .entry_region_ref()
                 .transpose(
                     &(0..uncached.tangent().input_ids().len() - uncached.residual_count()).collect::<Vec<_>>(),
-                    &[],
+                    &vec![true; uncached.tangent().input_ids().len() - uncached.residual_count()],
                     &[],
                 )
                 .unwrap()
+                .program()
                 .to_string(),
         );
     }
@@ -11357,7 +11382,7 @@ mod tests {
                 in (%4)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[], %2:f64[3] .
                 let %3:f64[3], %4:f64[3] = condition %1 %0 %2 [
@@ -11377,7 +11402,7 @@ mod tests {
         );
         let mut primal_outputs = linearization.primal().interpret(vec![predicate, input, other_input]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert!(pullback.output_types().iter().all(|r#type| r#type.identities().next().is_none()));
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
@@ -11495,7 +11520,7 @@ mod tests {
                 in (%2)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:bool[] .
                 let %2:f64[] = condition %1 %0 [
@@ -11527,7 +11552,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::scalar(2.0).unwrap())]),
         );
     }
@@ -11914,7 +11939,7 @@ mod tests {
                 in (%2)"},
         );
 
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -12003,7 +12028,7 @@ mod tests {
                 in (%8)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[3], %2:f64[3], %3:f64[3], %4:f64[3] .
                 let %5:f64[3] = zero [type=f64[3]]
@@ -12025,7 +12050,7 @@ mod tests {
         let mut pullback_inputs = vec![Array::vector(vec![1.0f64, 1.0, 1.0]).unwrap()];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![Array::vector(vec![0.25f64, 1.0, 1.0]).unwrap()]),
         );
     }
@@ -12087,7 +12112,7 @@ mod tests {
                 in (%8)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[3], %2:f64[3], %3:f64[3], %4:f64[3] .
                 let %5:f64[3] = zero [type=f64[3]]
@@ -12117,7 +12142,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0f64, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::vector(vec![0.25f64, 1.0, 1.0]).unwrap())]),
         );
     }
@@ -13417,7 +13442,7 @@ mod tests {
                 in (%4)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             formatdoc! {"
                 lambda %0:{varying}, %1:{predicate}, %2:{varying} .
                 let %3:{varying} = condition %1 %0 %2 [

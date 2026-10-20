@@ -488,7 +488,7 @@ mod tests {
         );
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 0);
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert!(pullback.input_ids().is_empty());
         assert!(pullback.output_ids().is_empty());
     }

@@ -4737,7 +4737,7 @@ mod tests {
                 indices.clone(),
                 replicated_updates_type.clone(),
             );
-            let pullback = program.linearize().unwrap().pullback().unwrap();
+            let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
             assert_eq!(pullback.output_types(), expected_cotangent_types);
         }
 
@@ -4759,7 +4759,7 @@ mod tests {
                 repeated.clone(),
                 updates_type.clone(),
             );
-            let pullback = program.linearize().unwrap().pullback().unwrap();
+            let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
             assert_eq!(
                 pullback.output_types(),
                 vec![
@@ -4808,7 +4808,7 @@ mod tests {
                 .unwrap();
             let mut seeds = vec![ArrayIrValue::Array(Array::vector(vec![1.0; 4]).unwrap())];
             seeds.extend(primals.split_off(1));
-            linearization.pullback().unwrap().interpret(seeds)
+            linearization.pullback().unwrap().program().interpret(seeds)
         };
         // Minimum: element 1 ties the input (2) with update 0 (2), element 3 takes update 1 (1 < 4).
         let linearization = dynamic_program(ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Min))
@@ -4887,7 +4887,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
                 ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![20.0_f64, 40.0]).unwrap()),
@@ -4924,7 +4924,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -4971,7 +4971,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -5031,7 +5031,7 @@ mod tests {
             (
                 primal_outputs.remove(0),
                 linearization.tangent().interpret(tangent_inputs).unwrap().remove(0),
-                linearization.pullback().unwrap().interpret(pullback_inputs).unwrap(),
+                linearization.pullback().unwrap().program().interpret(pullback_inputs).unwrap(),
             )
         };
 
@@ -5100,7 +5100,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:bool[4], %2:bool[2] .
                 let %3:i32[2, 1] = const [[1], [1]]
@@ -5189,7 +5189,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[2], %2:f64[4] .
                 let %3:f64[4] = mul %2 %0
@@ -5302,7 +5302,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:bool[4], %2:bool[2], %3:f64[4] .
                 let %4:f64[4] = mul %3 %0
@@ -5404,7 +5404,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:bool[4], %2:bool[2], %3:f64[4] .
                 let %4:f64[4] = mul %3 %0
@@ -5509,7 +5509,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -5581,7 +5581,7 @@ mod tests {
             .linearize_with_respect_to(&[1, 3])
             .unwrap();
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[items, 3], %1:i32[items, 1, 1] .
                 let %2:f64[items, 1] = gather [
@@ -5639,7 +5639,7 @@ mod tests {
         let mut pullback_inputs = vec![matrix(2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
                 ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()),
                 ArrayIrValue::Array(Array::matrix(1, 2, vec![3.0_f64, 4.0]).unwrap()),
@@ -5686,7 +5686,7 @@ mod tests {
             (
                 primal_outputs.remove(0),
                 linearization.tangent().interpret(tangent_inputs).unwrap().remove(0),
-                linearization.pullback().unwrap().interpret(pullback_inputs).unwrap(),
+                linearization.pullback().unwrap().program().interpret(pullback_inputs).unwrap(),
             )
         };
 
@@ -5738,7 +5738,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[items, 3], %1:bool[items, 3], %2:bool[items, 1], %3:i32[items, 1, 1], %4:f64[items, 3] .
                 let %5:f64[items, 3] = mul %4 %0
@@ -5856,7 +5856,7 @@ mod tests {
         .linearize()
         .unwrap();
         assert_eq!(
-            linearization.pullback().unwrap().output_types(),
+            linearization.pullback().unwrap().program().output_types(),
             vec![
                 ArrayIrType::Array(nonempty_type.cotangent().unwrap()),
                 ArrayIrType::Array(updates_type.cotangent().unwrap()),
@@ -5957,7 +5957,7 @@ mod tests {
                 Array::from_elements(input_type.tangent().unwrap(), &[1.0_f64, 7.0, 3.0, 10.0]).unwrap(),
             )]),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.output_types(), expected_cotangent_types);
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
@@ -5994,7 +5994,7 @@ mod tests {
                 Array::from_elements(input_type.tangent().unwrap(), &[1.0_f64, 30.0, 3.0, 104.0]).unwrap(),
             )])
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.output_types(), expected_cotangent_types);
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
@@ -6020,7 +6020,7 @@ mod tests {
         let mut tangent_inputs = vec![input_tangent.clone(), updates_tangent];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![input_tangent]));
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.output_types(), expected_cotangent_types);
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
@@ -6367,7 +6367,7 @@ mod tests {
         let mut cotangents = vec![seed.clone()];
         cotangents.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 3.0, 4.0]).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![0.0_f64, 2.0, 0.0]).unwrap()),
@@ -6381,7 +6381,7 @@ mod tests {
         let mut cotangents = vec![seed];
         cotangents.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 3.0, 4.0]).unwrap()),])
         );
     }

@@ -3302,7 +3302,7 @@ mod tests {
                     )
                     .unwrap();
                 let linearization = program.linearize().unwrap();
-                let pullback = linearization.pullback().unwrap();
+                let pullback = linearization.pullback().unwrap().into_program();
 
                 for rows in [4usize, 2] {
                     let values = (0..rows * 2).map(|index| index as f64).collect::<Vec<_>>();

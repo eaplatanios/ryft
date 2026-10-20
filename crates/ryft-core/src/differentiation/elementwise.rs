@@ -1140,6 +1140,7 @@ mod tests {
                 .linear_program()
                 .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
                 .unwrap()
+                .program()
                 .to_string()
                 .contains("reshard")
         );
@@ -1194,7 +1195,7 @@ mod tests {
             .unwrap();
 
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let bias_values = vec![0.5, -0.25];
         for rows in [4usize, 2] {
             let values = (0..rows * 2).map(|index| index as f64 * 0.1).collect::<Vec<_>>();
@@ -1269,7 +1270,7 @@ mod tests {
             .unwrap();
 
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let scale_values = vec![1.5, -0.5];
         for rows in [3usize, 1] {
             let values = (0..rows * 2).map(|index| index as f64 * 0.25 + 1.0).collect::<Vec<_>>();

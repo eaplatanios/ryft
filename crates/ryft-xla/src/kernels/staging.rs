@@ -1832,7 +1832,7 @@ pub(crate) mod tests {
         let (_, pullback) = context
             .vjp(|input, ()| program.interpret_in_context(input.context(), vec![input.clone()]), input, ())
             .unwrap();
-        let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap();
+        let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap().into_program();
         assert_eq!(execute_derivative(&backward, &[2.0]), vec![6.0]);
     }
 

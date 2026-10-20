@@ -3264,7 +3264,7 @@ mod tests {
 
         // The pullback retains the slicing inside its linear-call region, rather than inlining it at the entry.
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[left + right], %1:dimension<left + right ∈ [2, 10)>, %2:dimension<left ∈ [1, 5)>, \
                     %3:dimension<right ∈ [1, 6)> .
@@ -3308,7 +3308,7 @@ mod tests {
         )];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
                 ArrayIrValue::Array(
                     Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[7.0_f32, 8.0]).unwrap()
@@ -3524,7 +3524,7 @@ mod tests {
         );
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(input_type.clone()); 2]);
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().output_types(),
+            program.linearize().unwrap().pullback().unwrap().program().output_types(),
             vec![ArrayIrType::Array(input_type); 2]
         );
         let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]).with_layout(layout);
@@ -3608,7 +3608,7 @@ mod tests {
         // The output carries the second input's placement, but the first cotangent must recover absent sharding.
         assert_eq!(pullback.interpret(vec![cotangent.clone()]), Ok(vec![first.clone(), second.clone()]));
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.output_types(), expected_types);
         let mut outputs = linearization.primal().interpret(vec![first.clone(), second.clone()]).unwrap();
         let residuals = outputs.split_off(1);
@@ -3825,7 +3825,7 @@ mod tests {
                                extents can be retained as residuals"),
         ));
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().output_types(),
+            program.linearize().unwrap().pullback().unwrap().program().output_types(),
             program.input_types()[..2].iter().map(|r#type| r#type.cotangent().unwrap()).collect::<Vec<_>>(),
         );
     }

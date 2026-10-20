@@ -1132,6 +1132,125 @@ where
     }
 }
 
+/// Boundary representation of one selected input's cotangent in a [`TransposedProgram`], specified there in the same
+/// order as the input indices supplied to transposition. This metadata contains no types, so retained transform
+/// artifacts can share it independently of the type universe's thread-safety and lifetime requirements.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TransposedProgramCotangent {
+    /// One value is returned at the next output position of the transposed program. This also represents the identity
+    /// output of a reference-primal destination whose kind is [`CotangentDestinationKind::Reference`].
+    Output,
+
+    /// The cotangent is structurally zero and the transposed program has no output for this slot.
+    Zero,
+
+    /// The destination is ignored or stores a non-reference input's cotangent in a reference, so no output is returned.
+    Absent,
+}
+
+/// Shared transposed [`Program`] together with the representation of each selected input's cotangent. The program's
+/// outputs contain exactly the [`TransposedProgramCotangent::Output`] slots, in selection order. Structural zeros and
+/// absent destinations consume no output. Region transpose rules use this metadata to reconstruct their complete
+/// cotangent boundary without staging zeros merely to discover and discard them later.
+#[derive(Clone, Debug)]
+pub struct TransposedProgram<V: Value, O: Operation<Type = V::Type>> {
+    /// Refer to the docstring of [`Self::program`] for information on this field.
+    program: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+
+    /// Refer to the docstring of [`Self::cotangents`] for information on this field.
+    cotangents: Arc<[TransposedProgramCotangent]>,
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> TransposedProgram<V, O> {
+    /// Creates a new [`TransposedProgram`] from a shared flat program and metadata in selected-input order. Custom
+    /// [`TranspositionDriver`] implementations use this when providing a transposition they constructed themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when the number of output slots differs from the program output count.
+    pub fn new(
+        program: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+        cotangents: Vec<TransposedProgramCotangent>,
+    ) -> Result<Self, ProgramError> {
+        let expected = cotangents.iter().filter(|&&slot| slot == TransposedProgramCotangent::Output).count();
+        let actual = program.output_ids().len();
+        if actual != expected {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "transposed cotangent metadata requires {expected} outputs but the program returns {actual}"
+                ),
+            });
+        }
+        Ok(Self { program, cotangents: cotangents.into() })
+    }
+
+    /// Returns the shared underlying [`Program`], whose outputs correspond to the metadata's output slots.
+    pub fn program(&self) -> &Arc<Program<V, O, Vec<V>, Vec<V>>> {
+        &self.program
+    }
+
+    /// Returns the representation of every selected input cotangent, in selection order.
+    pub fn cotangents(&self) -> &[TransposedProgramCotangent] {
+        &self.cotangents
+    }
+
+    /// Consumes this [`TransposedProgram`] and returns its shared executable program. Use [`Self::program`] for
+    /// borrowed inspection or execution; this extraction is for callers transferring ownership of the program
+    /// (e.g., for when attaching a callee or recovering an owned [`Program`]).
+    pub fn into_program(self) -> Arc<Program<V, O, Vec<V>, Vec<V>>> {
+        self.program
+    }
+
+    /// Assembles selected input cotangents from the executable program's `outputs`, using `cotangent_types` in
+    /// selected-input order. An output slot consumes one value, a zero slot becomes [`MaybeZero::Zero`] of its supplied
+    /// type, and an absent slot becomes [`None`]. Callers recover the types from the source region's selected inputs;
+    /// the retained metadata deliberately carries no types. This function also accepts values produced by binding an
+    /// operation that invokes the program, such as a Just-In-Time-compiled call or a control flow operation, and so
+    /// assembly is independent of how the executable program is invoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when either count disagrees with the metadata. Types for structural
+    /// zero slots come from the caller; returned values keep their interpreted types, which may refine symbolic source
+    /// types to concrete extents.
+    pub fn assemble_cotangents<Output: Typed<Type = V::Type>>(
+        &self,
+        cotangent_types: &[V::Type],
+        outputs: impl IntoIterator<Item = Output>,
+    ) -> Result<Vec<Option<MaybeZero<Output>>>, ProgramError> {
+        if cotangent_types.len() != self.cotangents.len() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "transposed cotangent metadata has {} slots but received {} cotangent types",
+                    self.cotangents.len(),
+                    cotangent_types.len(),
+                ),
+            });
+        }
+        let outputs = outputs.into_iter().collect::<Vec<_>>();
+        if outputs.len() != self.program.output_ids().len() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "transposed program returns {} outputs but received {} cotangent values",
+                    self.program.output_ids().len(),
+                    outputs.len(),
+                ),
+            });
+        }
+        let mut outputs = outputs.into_iter();
+        Ok(self
+            .cotangents
+            .iter()
+            .zip(cotangent_types)
+            .map(|(slot, r#type)| match slot {
+                TransposedProgramCotangent::Output => Some(MaybeZero::Value(outputs.next().unwrap())),
+                TransposedProgramCotangent::Zero => Some(MaybeZero::Zero(r#type.clone())),
+                TransposedProgramCotangent::Absent => None,
+            })
+            .collect())
+    }
+}
+
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
 /// packaged as a reusable callable. This is the reverse-mode dual of [`Pushforward`], whose callable applies the
 /// un-transposed map `ẋ ↦ (∂f/∂x)(x) · ẋ` instead. It retains the linear pushforward [`Program`] `(ẋ, r) ↦ ẏ` together
@@ -1279,7 +1398,7 @@ impl<
     pub fn transposed_program(
         &self,
         destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Arc<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, DifferentiationError>
+    ) -> Result<TransposedProgram<C::Constant, C::Operation>, DifferentiationError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -1339,10 +1458,7 @@ impl<
     #[inline]
     pub fn into_transposed_parts(
         self,
-    ) -> Result<
-        (Arc<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, Vec<C::Value>),
-        DifferentiationError,
-    >
+    ) -> Result<(TransposedProgram<C::Constant, C::Operation>, Vec<C::Value>), DifferentiationError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -1718,7 +1834,8 @@ impl<
             }
         }
         program_inputs.extend(self.residuals.iter().cloned());
-        let mut program_input_cotangents = program.interpret_in_context(&self.context, program_inputs)?.into_iter();
+        let mut program_input_cotangents =
+            program.program().interpret_in_context(&self.context, program_inputs)?.into_iter();
 
         // Reconstruct the public input boundary. Non-reference `Return` leaves consume one result or materialize their
         // typed zero. Non-reference `Reference`/`Ignore` leaves consume nothing. Reference-primal `Reference` leaves
@@ -1792,12 +1909,10 @@ impl<
 /// and this trait adds access to the current source instruction and transposition recursion.
 pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> {
     /// Transposes `region` with respect to `input_indices`, re-entering the active transposition machinery, and returns
-    /// a shared handle to the transposed standalone [`Program`]. The result is shared rather than owned because rules
-    /// commonly re-attach the transposed program as a callee. An [`Arc`] lets a caching driver serve one artifact for a
-    /// callee that several programs share instead of re-transposing it per program, and it lets repeated attachments of
-    /// one artifact intern by [`Arc`] identity. The built-in recursive driver therefore serves the region's retained
-    /// transposition through the cached counterpart of [`RegionRef::transpose`], while a custom driver that retains
-    /// nothing simply transposes the region uncached and wraps the result in [`Arc::new`].
+    /// its shared standalone [`Program`] and cotangent metadata. Rules commonly reattach the program as a callee, so
+    /// sharing its [`Arc`] lets repeated attachments intern by identity. The built-in recursive driver serves the
+    /// region's retained transposition through [`RegionRef::transpose_shared`]. A custom driver can instead use
+    /// [`RegionRef::transpose`] or construct its own result through [`TransposedProgram::new`].
     ///
     /// # Parameters
     ///
@@ -1805,6 +1920,9 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     ///   - `input_indices`: Unique indices of the region inputs to transpose with respect to, in the desired cotangent
     ///     order. Each index must be in range. Unselected inputs are known parameters of the linear map. An empty slice
     ///     selects no inputs. This is the same selection convention as [`RegionRef::transpose`].
+    ///   - `instantiate_zeros`: One flag per selected input, or empty to preserve every structural zero. A `true` flag
+    ///     requires a disconnected returned cotangent to be materialized based on the region's available extent
+    ///     sources.
     ///   - `destination_kinds`: One [`CotangentDestinationKind`] per selected input, in `input_indices` order, or empty
     ///     to select the default kinds (i.e., [`Return`](CotangentDestinationKind::Return) for non-reference inputs and
     ///     [`Reference`](CotangentDestinationKind::Reference) for reference inputs). For example, indices `[2, 0]` with
@@ -1814,8 +1932,9 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
         &self,
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
+        instantiate_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError>;
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError>;
 
     /// Returns the source scope for this rule invocation that consists of its containing [`Region`], [`InstructionId`],
     /// and [`Instruction`]. Reference rules use this scope to resolve input positions to primal values and reference
@@ -1835,8 +1954,9 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for Empty
         &self,
         _region: RegionRef<'_, V, O>,
         _input_indices: &[usize],
+        _instantiate_zeros: &[bool],
         _destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot transpose a program".to_string()).into())
     }
 }
@@ -1905,9 +2025,10 @@ where
         &self,
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
+        instantiate_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
-        region.transpose_shared(input_indices, &[], destination_kinds)
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
+        region.transpose_shared(input_indices, instantiate_zeros, destination_kinds)
     }
 
     #[inline]
@@ -2162,17 +2283,19 @@ where
     /// `input_indices`, using `destination_kinds` to select how their cotangents cross the pullback boundary. Refer
     /// to [`Program::transpose_with_respect_to`] for the resulting program's boundary contract.
     ///
-    /// This function constructs an owned program without using the region's transform cache. Use
-    /// [`Self::transpose_shared`] to reuse a retained program across calls or attach it to another program.
+    /// This function constructs a fresh shared program and its cotangent metadata without using the region's transform
+    /// cache. Use [`Self::transpose_shared`] to reuse a retained result across calls. Unlike the dense boundary of
+    /// [`Program::transpose_with_respect_to`], a disconnected returned cotangent is represented by
+    /// [`TransposedProgramCotangent::Zero`] and consumes no program output unless its instantiation flag is true.
     ///
     /// # Parameters
     ///
     ///   - `input_indices`: Selected linear input indices, in requested cotangent order. Each index must be in range
     ///     and appear at most once. An empty slice selects no inputs.
-    ///   - `zero_residual_input_indices`: Per-selected-input residual indices supplying runtime dimensions for
-    ///     disconnected cotangent zeros, or empty when no mappings are needed. For example, a dynamically shaped
-    ///     input can need a residual dimension to construct its zero gradient. Linearization appends these dimension
-    ///     residuals to its tangent program. A nonempty slice must have one entry per selected input.
+    ///   - `instantiate_zeros`: One flag per selected input, or empty to preserve every structural zero. A `true` flag
+    ///     materializes a disconnected returned cotangent using known inputs and output-cotangent seeds that supply
+    ///     its extents. A `false` flag records a structural zero without a program output. Flags do not affect ignored
+    ///     destinations, reference destinations, or cotangents that already have values.
     ///   - `destination_kinds`: One kind per selected input, or empty to use `Return` for non-reference inputs and
     ///     `Reference` for reference inputs. Non-reference inputs also accept `Reference` and `Ignore`; reference
     ///     inputs accept `Reference` and `Ignore` but cannot return their state cotangent as a value.
@@ -2180,13 +2303,13 @@ where
     pub fn transpose(
         &self,
         input_indices: &[usize],
-        zero_residual_input_indices: &[Vec<usize>],
+        instantiate_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         self.transpose_impl(&TranspositionTransformArguments::new(
             *self,
             input_indices,
-            zero_residual_input_indices,
+            instantiate_zeros,
             destination_kinds,
         )?)
     }
@@ -2198,28 +2321,29 @@ where
     /// Content-preserving copies of one sealed region share one artifact per argument list. This avoids repeating
     /// transposition for a shared callee and lets consumers intern repeated attachments by [`Arc`] identity.
     /// Destination kinds are resolved to their defaults before cache lookup, so an explicit selection equal to the
-    /// defaults shares the default artifact. Input order and zero residual mappings remain part of the cache key.
+    /// defaults shares the default artifact. Input order and the normalized instantiation mask remain part of the
+    /// cache key. An empty mask shares the artifact of an explicit all-`false` mask.
     ///
     /// Recursive transposition of the region and argument list currently in flight on this thread is served without
     /// the cache, using the same implementation as [`Self::transpose`].
     pub fn transpose_shared(
         &self,
         input_indices: &[usize],
-        zero_residual_input_indices: &[Vec<usize>],
+        instantiate_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         let arguments =
-            TranspositionTransformArguments::new(*self, input_indices, zero_residual_input_indices, destination_kinds)?;
+            TranspositionTransformArguments::new(*self, input_indices, instantiate_zeros, destination_kinds)?;
         let artifact =
             (*self).transform::<TranspositionTransform, _, DifferentiationError>(arguments, |region, arguments| {
                 let program = region.transpose_impl(arguments)?;
-                Ok(TransformArtifact::new(vec![Arc::new(program)], ()))
+                Ok(TransformArtifact::new(vec![program.program], program.cotangents.to_vec()))
             })?;
-        let (programs, ()) = artifact.into_parts();
+        let (programs, cotangents) = artifact.into_parts();
         let mut programs = programs.into_iter();
         let program = programs.next().unwrap();
         assert!(programs.next().is_none(), "transposition transform retained more than one program");
-        Ok(program)
+        Ok(TransposedProgram::new(program, cotangents)?)
     }
 
     /// Constructs the pullback for validated input indices and resolved destination kinds. Both public entry points
@@ -2227,9 +2351,9 @@ where
     fn transpose_impl(
         &self,
         arguments: &TranspositionTransformArguments,
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         let input_indices = arguments.input_indices.as_slice();
-        let zero_residual_input_indices = arguments.zero_residual_input_indices.as_slice();
+        let instantiate_zeros = arguments.instantiate_zeros.as_slice();
         let destination_kinds = arguments.destination_kinds.as_slice();
 
         // Index the validated selection and its destination kinds by program input for linearity propagation and
@@ -2633,6 +2757,7 @@ where
             })
             .collect::<Result<Vec<_>, DifferentiationError>>()?;
         let mut cotangent_inputs = Vec::new();
+        let mut output_cotangent_inputs = Vec::new();
         for output in self.output_ids().iter().copied() {
             let output_atom = self.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
             let output_type = output_atom.r#type();
@@ -2642,6 +2767,7 @@ where
             let cotangent_type = output_type.cotangent()?;
             let has_cotangent = !cotangent_type.is_zero_space();
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
+            output_cotangent_inputs.push(cotangent_input);
             if has_cotangent && *linear.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? {
                 cotangent_inputs.push((output, cotangent_input));
             }
@@ -3056,88 +3182,54 @@ where
             })?;
         }
 
-        // The pullback outputs are the accumulated cotangents of the selected inputs, emitted directly in
-        // `input_indices` order. Known inputs receive no cotangent output. A reference input transposed with the
-        // `Reference` kind returns its caller-owned cotangent reference by identity (so that structured rules can
-        // thread it positionally as a carry), one transposed with the `Ignore` kind returns nothing, and a disconnected
-        // non-reference selected input is materialized through the operation family's canonical zero representation,
-        // using any mapped residual inputs needed to provide runtime dimensions that its cotangent type does not
-        // contain.
+        // Record one slot per selected input. Only concrete output slots cross the executable boundary; a structural
+        // zero remains metadata unless this caller explicitly needs a value at that boundary. Known sources take
+        // precedence so an existing dimension residual can be reused without querying a seed. Seeds supplement those
+        // sources only at this boundary; transpose rules keep their own source protocol.
+        let cotangent_sources =
+            output_cotangent_inputs.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(input_indices.len());
+        let mut cotangents = Vec::with_capacity(input_indices.len());
         for (output_index, &index) in input_indices.iter().enumerate() {
             let input = self.input_ids()[index];
             let input_atom = self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
             let input_type = input_atom.r#type();
             if input_type.is_reference() {
-                match destination_kinds[output_index] {
-                    CotangentDestinationKind::Reference => {
-                        let root = ReferenceRoot::RegionInput { region: self.id(), input_index: index };
-                        let reference = context.cotangent_accumulator_reference(root).ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "linear reference input {index} lost its cotangent destination accumulator",
-                            ))
-                        })?;
-                        outputs.push(reference.atom_id()?);
-                    }
-                    CotangentDestinationKind::Ignore | CotangentDestinationKind::Return => {}
+                if destination_kinds[output_index] == CotangentDestinationKind::Reference {
+                    let root = ReferenceRoot::RegionInput { region: self.id(), input_index: index };
+                    let reference = context.cotangent_accumulator_reference(root).ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "linear reference input {index} lost its cotangent destination accumulator",
+                        ))
+                    })?;
+                    outputs.push(reference.atom_id()?);
+                    cotangents.push(TransposedProgramCotangent::Output);
+                } else {
+                    cotangents.push(TransposedProgramCotangent::Absent);
                 }
                 continue;
             }
 
             if destination_kinds[output_index] != CotangentDestinationKind::Return {
+                cotangents.push(TransposedProgramCotangent::Absent);
                 continue;
             }
 
             match context.take_cotangents(std::slice::from_ref(&atom_accumulators[input.index()]))?.remove(0) {
-                MaybeZero::Value(adjoint) => outputs.push(adjoint.atom_id()?),
-                MaybeZero::Zero(_) => {
-                    let cotangent_type = input_type.cotangent()?;
-
-                    // A caller that maps no residuals to this input leaves the zero's runtime dimensions to the
-                    // boundary form of the residual protocol, which gathers them from the retained known values
-                    // and cotangents of this region. This is the case for nested branch and body regions, whose
-                    // transposition drivers forward no residual mappings, but whose known inputs carry the residuals
-                    // that their own linearization captured (e.g., a `dimension<n>` for a disconnected `f32[n]`).
-                    if zero_residual_input_indices.get(output_index).is_none_or(Vec::is_empty)
-                        && !O::zero_residual_types(&cotangent_type).is_empty()
-                    {
-                        let zero = O::materialize_zero_from_residual_sources(
-                            &*context,
-                            MaybeZero::Zero(cotangent_type),
-                            context.dimension_sources(),
-                        )?;
-                        outputs.push(zero.atom_id()?);
-                        continue;
-                    }
-
-                    let mut builder_borrow = builder.borrow_mut();
-
-                    // These indices name source-program inputs, but zero construction occurs in the pullback
-                    // builder. Resolve them through `known_map`: dimension residuals are known primal quantities,
-                    // never linear inputs whose cotangents the pullback should compute.
-                    let residuals = zero_residual_input_indices
-                        .get(output_index)
-                        .into_iter()
-                        .flatten()
-                        .map(|&residual_index| {
-                            let residual =
-                                *self.input_ids().get(residual_index).ok_or_else(|| ProgramError::InvalidArgument {
-                                    message: format!(
-                                        "transposition zero-residual input index {residual_index} is out of range \
-                                         for a program with {input_count} input(s)",
-                                    ),
-                                })?;
-                            known_map.get(residual.index()).copied().flatten().ok_or_else(|| {
-                                ProgramError::MalformedProgram(
-                                    "transposition zero residual is not a known pullback input".to_string(),
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>, ProgramError>>()?;
-                    let (operation, zero_inputs) =
-                        O::zero_operation_with_residuals(cotangent_type, residuals.as_slice())?;
-                    outputs.push(builder_borrow.add_instruction(operation, Vec::new(), zero_inputs, None)?[0]);
+                MaybeZero::Value(adjoint) => {
+                    outputs.push(adjoint.atom_id()?);
+                    cotangents.push(TransposedProgramCotangent::Output);
                 }
+                MaybeZero::Zero(r#type) if instantiate_zeros[output_index] => {
+                    let zero = O::materialize_zero_from_residual_sources(
+                        &*context,
+                        MaybeZero::Zero(r#type),
+                        context.dimension_sources().chain(&cotangent_sources),
+                    )?;
+                    outputs.push(zero.atom_id()?);
+                    cotangents.push(TransposedProgramCotangent::Output);
+                }
+                MaybeZero::Zero(_) => cotangents.push(TransposedProgramCotangent::Zero),
             }
         }
 
@@ -3160,6 +3252,7 @@ where
 
         // Release the context and the staged tracers it retains so the cloned `builder` handle can be unwrapped.
         // Accumulator handles retain only the separate context identity token, so they do not keep the builder alive.
+        drop(cotangent_sources);
         drop(context);
 
         // Build a flat pullback boundary: output cotangents, supplied destination buffers, then known input values.
@@ -3171,13 +3264,15 @@ where
             Ok(builder) => builder.into_inner(),
             Err(_) => return Err(ProgramError::EscapedProgramBuilder.into()),
         };
-
         let pullback = builder.build(
             outputs,
             vec![Placeholder; pullback_input_count],
             vec![Placeholder; pullback_output_count],
         )?;
-        Ok(pullback.without_unobserved_local_references(&replayed_allocations)?)
+        Ok(TransposedProgram::new(
+            Arc::new(pullback.without_unobserved_local_references(&replayed_allocations)?),
+            cotangents,
+        )?)
     }
 
     /// Classifies every atom of this region, and every reference root allocated by its instructions, as linear (i.e.,
@@ -3302,9 +3397,12 @@ where
     /// Refer to [`Program::transpose_with_respect_to`] for more information.
     #[inline]
     pub fn transpose(&self) -> Result<Program<V, O, Output, Input>, DifferentiationError> {
-        Ok(self
-            .entry_region_ref()
-            .transpose(&(0..self.input_ids().len()).collect::<Vec<_>>(), &[], &[])?
+        let transposed = self.entry_region_ref().transpose(
+            &(0..self.input_ids().len()).collect::<Vec<_>>(),
+            &vec![true; self.input_ids().len()],
+            &[],
+        )?;
+        Ok(Arc::unwrap_or_clone(transposed.into_program())
             .restructured(self.output_structure().clone(), self.input_structure().clone())?)
     }
 
@@ -3327,12 +3425,10 @@ where
     /// the gradient entry points: the holomorphic ones return the complex derivative `∂f/∂z`, and the plain ones return
     /// `2 · ∂f/∂z̄` for ℂ → ℝ functions.
     ///
-    /// Disconnected primal inputs are emitted as [`ZeroOperation`](crate::ZeroOperation)s, which the value type's
-    /// [`Zero`] implementation evaluates at interpretation time. This applies uniformly to linear programs whose values
-    /// are [`Tracer`]s from an outer trace. Interpreting such a pullback [`ZeroOperation`](crate::ZeroOperation) over
-    /// outer-trace [`Tracer`]s stages a typed zero into the surrounding tracing context, so that backends whose traced
-    /// constants are abstract metadata do not need to materialize a runtime value just to transpose an enclosing traced
-    /// program.
+    /// Disconnected primal input cotangents are materialized through [`ResidualZeroProvider`] using the runtime extent
+    /// sources available to the transposed program. Static types use a nullary [`ZeroOperation`](crate::ZeroOperation);
+    /// symbolic types require sources that supply their extents. Interpreting the resulting program over outer-trace
+    /// [`Tracer`]s stages those zero-producing operations into the surrounding trace.
     ///
     /// `input_indices` selects the inputs to transpose with respect to, while the remaining inputs are held as constant
     /// parameters of the linear map. The program must be linear in the selected inputs, but it can depend arbitrarily
@@ -3454,7 +3550,11 @@ where
         input_indices: &[usize],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
-        self.entry_region_ref().transpose(input_indices, &[], destination_kinds)
+        Ok(Arc::unwrap_or_clone(
+            self.entry_region_ref()
+                .transpose(input_indices, &vec![true; input_indices.len()], destination_kinds)?
+                .into_program(),
+        ))
     }
 
     /// Transposes this compact linearization [`Program`] using the entry region's retained transform cache. Its
@@ -3462,14 +3562,14 @@ where
     /// destinations are selected by `destination_kinds` as in [`Self::transpose_with_respect_to`]. Repeated calls
     /// with the same arguments share the resulting program.
     ///
-    /// Linearization reserves the final residual positions for dimensions needed to construct disconnected cotangent
-    /// zeros, in tangent-input order. This function recovers those mappings before transposition as selecting only the
-    /// leading tangent inputs would not supply enough information to construct dynamically shaped zeros.
+    /// All selected cotangents are instantiated. Forward linearization retains the runtime dimensions needed for
+    /// disconnected zeros as ordinary trailing residuals, and source-based materialization finds them among the known
+    /// inputs without partitioning that suffix by selected input.
     pub(crate) fn transpose_with_trailing_residuals_shared(
         &self,
         residual_count: usize,
         destination_kinds: &[CotangentDestinationKind],
-    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
+    ) -> Result<TransposedProgram<V, O>, DifferentiationError> {
         let tangent_input_count = self.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "linearization program consumes {} inputs which is fewer than its {} residuals",
@@ -3478,46 +3578,11 @@ where
             ))
         })?;
 
-        // Linearization appends the dimensions needed for disconnected cotangent zeros after its other residuals.
-        // Recover each tangent input's share of that suffix from liveness and the zero provider's declared residuals,
-        // preserving their input order without storing parallel metadata.
-        let live_sets = self.live_sets();
-        let zero_residual_counts = self
-            .input_ids()
-            .iter()
-            .copied()
-            .take(tangent_input_count)
-            .map(|input| {
-                if live_sets.atoms()[input.index()] {
-                    0
-                } else {
-                    O::zero_residual_types(self.atoms()[input.index()].r#type().as_ref()).len()
-                }
-            })
-            .collect::<Vec<_>>();
-        let zero_residual_count = zero_residual_counts.iter().sum::<usize>();
-        if zero_residual_count > residual_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "linearization program declares {residual_count} residuals but disconnected cotangent zeros require \
-                 {zero_residual_count}",
-            ))
-            .into());
-        }
-
-        // Partial-evaluation residuals precede the dimensions reserved for zeros. Partition that final suffix
-        // into contiguous per-input ranges in the same order used by linearization.
-        let mut next_zero_residual = self.input_ids().len() - zero_residual_count;
-        let zero_residual_input_indices = zero_residual_counts
-            .into_iter()
-            .map(|count| {
-                let indices = (next_zero_residual..next_zero_residual + count).collect::<Vec<_>>();
-                next_zero_residual += count;
-                indices
-            })
-            .collect::<Vec<_>>();
+        // Forward linearization still retains zero-extent residuals. The source-based materializer resolves them
+        // from known inputs without reconstructing a per-selected-input partition of the residual suffix.
         self.entry_region_ref().transpose_shared(
             &(0..tangent_input_count).collect::<Vec<_>>(),
-            &zero_residual_input_indices,
+            &vec![true; tangent_input_count],
             destination_kinds,
         )
     }
@@ -4001,7 +4066,7 @@ struct TranspositionTransform;
 
 impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for TranspositionTransform {
     type Arguments = TranspositionTransformArguments;
-    type Artifact = TransformArtifact<V, O, ()>;
+    type Artifact = TransformArtifact<V, O, Vec<TransposedProgramCotangent>>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 8;
 }
@@ -4012,31 +4077,29 @@ struct TranspositionTransformArguments {
     /// Selected linear input indices, in requested output order.
     input_indices: Vec<usize>,
 
-    /// Per-selected-input residual indices supplying runtime dimensions for disconnected cotangent zeros.
-    zero_residual_input_indices: Vec<Vec<usize>>,
+    /// Whether each selected input needs a concrete zero at the executable boundary.
+    instantiate_zeros: Vec<bool>,
 
     /// Resolved cotangent [`CotangentDestinationKind`] of every selected input, aligned with `input_indices`.
     destination_kinds: Vec<CotangentDestinationKind>,
 }
 
 impl TranspositionTransformArguments {
-    /// Creates a new [`TranspositionTransformArguments`] instance by validating the selected inputs and mapping counts
-    /// and resolving default [`CotangentDestinationKind`]s before cache lookup. Input order and zero residual mappings
-    /// are preserved because they determine the pullback boundary and the runtime dimensions used to construct
-    /// disconnected cotangent zeros.
+    /// Creates a new [`TranspositionTransformArguments`] instance by validating the selected inputs and mask counts
+    /// and resolving default destination kinds and zero-instantiation flags before cache lookup. Input order and the
+    /// normalized mask determine the executable output boundary and the structural cotangent metadata.
     fn new<V: Value, O: Operation<Type = V::Type>>(
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
-        zero_residual_input_indices: &[Vec<usize>],
+        instantiate_zeros: &[bool],
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<Self, DifferentiationError> {
-        // Each supplied mapping identifies residual inputs needed to construct one selected input's zero cotangent.
-        // Validate the outer count here; an empty slice means no mappings were supplied.
-        if !zero_residual_input_indices.is_empty() && zero_residual_input_indices.len() != input_indices.len() {
+        // A nonempty mask follows selected-input order; empty means that no zero is instantiated.
+        if !instantiate_zeros.is_empty() && instantiate_zeros.len() != input_indices.len() {
             return Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "transposition received {} zero-residual mappings for {} selected inputs",
-                    zero_residual_input_indices.len(),
+                    "transposition received {} zero-instantiation flags for {} selected inputs",
+                    instantiate_zeros.len(),
                     input_indices.len(),
                 ),
             }
@@ -4103,11 +4166,15 @@ impl TranspositionTransformArguments {
             })
             .collect::<Result<Vec<_>, DifferentiationError>>()?;
 
-        // Retain the selection order and residual mappings alongside the normalized kinds. Together they identify
-        // the requested pullback in the transform cache, including how disconnected zeros obtain runtime dimensions.
+        // Normalize an empty instantiation mask to all false, just as default destination kinds are made explicit.
+        // Preserve selection order as both the program boundary and metadata follow it.
         Ok(Self {
             input_indices: input_indices.to_vec(),
-            zero_residual_input_indices: zero_residual_input_indices.to_vec(),
+            instantiate_zeros: if instantiate_zeros.is_empty() {
+                vec![false; input_indices.len()]
+            } else {
+                instantiate_zeros.to_vec()
+            },
             destination_kinds,
         })
     }
@@ -5312,6 +5379,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_transposed_program_new() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        let transposed = TransposedProgram::new(
+            program.clone(),
+            vec![
+                TransposedProgramCotangent::Zero,
+                TransposedProgramCotangent::Output,
+                TransposedProgramCotangent::Absent,
+            ],
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(transposed.program(), &program));
+        assert_eq!(
+            transposed.cotangents(),
+            &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output, TransposedProgramCotangent::Absent],
+        );
+        assert!(Arc::ptr_eq(transposed.clone().program(), &program));
+        assert!(Arc::ptr_eq(&transposed.into_program(), &program));
+        assert!(matches!(
+            TransposedProgram::new(program.clone(), vec![TransposedProgramCotangent::Zero]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposed cotangent metadata requires 0 outputs but the program returns 1",
+        ));
+        assert!(matches!(
+            TransposedProgram::new(program, vec![TransposedProgramCotangent::Output; 2]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposed cotangent metadata requires 2 outputs but the program returns 1",
+        ));
+    }
+
+    #[test]
+    fn test_transposed_program_assemble_cotangents() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        let transposed = TransposedProgram::new(
+            program,
+            vec![
+                TransposedProgramCotangent::Zero,
+                TransposedProgramCotangent::Output,
+                TransposedProgramCotangent::Absent,
+            ],
+        )
+        .unwrap();
+        let zero_type = ArrayType::scalar(DataType::Zero);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let types = [zero_type.clone(), scalar_type.clone(), scalar_type.clone()];
+        assert_eq!(
+            transposed.assemble_cotangents(&types, [Array::scalar(3f64).unwrap()]),
+            Ok(vec![Some(MaybeZero::Zero(zero_type)), Some(MaybeZero::Value(Array::scalar(3f64).unwrap())), None,]),
+        );
+        assert!(matches!(
+            transposed.assemble_cotangents(&types[..2], [Array::scalar(3f64).unwrap()]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposed cotangent metadata has 3 slots but received 2 cotangent types",
+        ));
+        assert!(matches!(
+            transposed.assemble_cotangents(&types, Vec::<Array>::new()),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposed program returns 1 outputs but received 0 cotangent values",
+        ));
+        assert!(matches!(
+            transposed.assemble_cotangents(&types, [Array::scalar(3f64).unwrap(), Array::scalar(4f64).unwrap()]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposed program returns 1 outputs but received 2 cotangent values",
+        ));
+    }
+
+    #[test]
     fn test_pullback_linear_program() {
         let (_, pullback) = differentiate_at(Array::scalar(1.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(pullback.linear_program().input_types().len(), 1 + pullback.residuals().len());
@@ -5321,11 +5463,11 @@ pub(crate) mod tests {
     #[test]
     fn test_pullback_transposed_program() {
         let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
-        let transposed = pullback.transposed_program(&[]).unwrap();
+        let transposed = pullback.transposed_program(&[]).unwrap().into_program();
         let mut inputs = vec![Array::scalar(3.0).unwrap()];
         inputs.extend_from_slice(pullback.residuals());
         assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0).unwrap()]));
-        assert!(Arc::ptr_eq(&transposed, &pullback.transposed_program(&[]).unwrap()));
+        assert!(Arc::ptr_eq(&transposed, &pullback.transposed_program(&[]).unwrap().into_program()));
     }
 
     #[test]
@@ -5334,10 +5476,12 @@ pub(crate) mod tests {
             .differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()))
             .vjp(|(left, right)| Ok(left * right))
             .unwrap();
-        let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap();
+        let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap().into_program();
         let selected = pullback
             .transposed_program(&[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
-            .unwrap();
+            .unwrap()
+            .into_program();
+
         // Destination selection prunes the unrequested derivative computation before replay.
         assert_eq!(both.instructions().iter().filter(|instruction| instruction.operation().name() == "mul").count(), 2);
         assert_eq!(
@@ -5374,6 +5518,7 @@ pub(crate) mod tests {
     fn test_pullback_into_transposed_parts() {
         let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         let (transposed, residuals) = pullback.into_transposed_parts().unwrap();
+        let transposed = transposed.into_program();
         assert_eq!(transposed.input_types().len(), 1 + residuals.len());
         let mut inputs = vec![Array::scalar(3.0).unwrap()];
         inputs.extend(residuals);
@@ -5762,16 +5907,19 @@ pub(crate) mod tests {
         assert_eq!(other.read(), Ok(Array::scalar(4.0_f32).unwrap()));
         let referenced = pullback
             .transposed_program(&[CotangentDestinationKind::Reference, CotangentDestinationKind::Return])
-            .unwrap();
+            .unwrap()
+            .into_program();
         assert!(Arc::ptr_eq(
             &pullback
                 .transposed_program(&[CotangentDestinationKind::Reference, CotangentDestinationKind::Return])
-                .unwrap(),
+                .unwrap()
+                .into_program(),
             &referenced,
         ));
         let ignored = pullback
             .transposed_program(&[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
-            .unwrap();
+            .unwrap()
+            .into_program();
         assert!(!Arc::ptr_eq(&referenced, &ignored));
         assert_eq!(referenced.input_types().len(), ignored.input_types().len() + 1);
     }
@@ -5822,28 +5970,37 @@ pub(crate) mod tests {
         let driver = RecursiveTranspositionDriver::new(region, 0).unwrap();
 
         // Sparse selections preserve the requested order and share the region's cached specialization.
-        let transposed = driver.transpose_program(region, &[2, 0], &[]).unwrap();
+        let transposed = driver.transpose_program(region, &[2, 0], &[true, true], &[]).unwrap().into_program();
         assert_eq!(transposed.output_ids(), &[transposed.input_ids()[1], transposed.input_ids()[0]]);
-        assert!(Arc::ptr_eq(&transposed, &region.transpose_shared(&[2, 0], &[], &[]).unwrap()));
+        assert!(Arc::ptr_eq(
+            &transposed,
+            &region.transpose_shared(&[2, 0], &[true, true], &[]).unwrap().into_program()
+        ));
 
         // Destination kinds follow the selection order, rather than the original input positions.
         let ignored = driver
-            .transpose_program(region, &[2, 0], &[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
-            .unwrap();
+            .transpose_program(
+                region,
+                &[2, 0],
+                &[true, true],
+                &[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore],
+            )
+            .unwrap()
+            .into_program();
         assert_eq!(ignored.output_ids(), &[ignored.input_ids()[1]]);
-        assert!(driver.transpose_program(region, &[], &[]).unwrap().output_ids().is_empty());
+        assert!(driver.transpose_program(region, &[], &[], &[]).unwrap().program().output_ids().is_empty());
         assert!(matches!(
-            driver.transpose_program(region, &[3], &[]),
+            driver.transpose_program(region, &[3], &[true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 3 is out of range for a program with 3 input(s)",
         ));
         assert!(matches!(
-            driver.transpose_program(region, &[0, 0], &[]),
+            driver.transpose_program(region, &[0, 0], &[true, true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 0 appears more than once",
         ));
         assert!(matches!(
-            driver.transpose_program(region, &[2, 0], &[CotangentDestinationKind::Return]),
+            driver.transpose_program(region, &[2, 0], &[true, true], &[CotangentDestinationKind::Return]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition received 1 destination kinds for 2 selected inputs",
         ));
@@ -5857,15 +6014,225 @@ pub(crate) mod tests {
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let region = program.entry_region_ref();
 
-        let transposed = region.transpose(&[0], &[], &[]).unwrap();
+        let transposed = region.transpose(&[0], &[true], &[]).unwrap().into_program();
         assert_eq!(transposed.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(transposed.output_ids(), transposed.input_ids());
         assert!(transposed.instructions().is_empty());
 
         // An empty selection requests no cotangents, rather than selecting every input.
-        let transposed = region.transpose(&[], &[], &[]).unwrap();
+        let transposed = region.transpose(&[], &[], &[]).unwrap().into_program();
         assert!(transposed.output_ids().is_empty());
         assert!(transposed.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_region_transpose_preserves_structural_zeros() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let live = builder.add_input(scalar_type.clone().into());
+        builder.add_input(scalar_type.clone().into());
+        builder.add_input(dynamic_type.clone().into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![live],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let transposed = program
+            .entry_region_ref()
+            .transpose(
+                &[2, 0, 1],
+                &[],
+                &[CotangentDestinationKind::Return, CotangentDestinationKind::Return, CotangentDestinationKind::Ignore],
+            )
+            .unwrap();
+        assert_eq!(
+            transposed.cotangents(),
+            &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output, TransposedProgramCotangent::Absent],
+        );
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end()
+        );
+        assert_eq!(
+            transposed.assemble_cotangents(
+                &[dynamic_type.into(), scalar_type.clone().into(), scalar_type.into()],
+                [ArrayIrValue::Array(Array::scalar(3f64).unwrap())],
+            ),
+            Ok(vec![
+                Some(MaybeZero::Zero(program.input_types()[2].cotangent().unwrap())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(3f64).unwrap()))),
+                None,
+            ]),
+        );
+        assert!(matches!(
+            program.entry_region_ref().transpose(&[2, 0, 1], &[true, false, false], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "cannot materialize a zero of type f64[extent] because no value in scope supplies the \
+                    runtime extent dimension<extent ∈ [2, 8)> that its residual 0 names",
+        ));
+    }
+
+    #[test]
+    fn test_region_transpose_instantiates_zero_from_known_dimension() {
+        use crate::arrays::{DimensionType, DimensionValue};
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dimension_type = DimensionType::from(extent.clone());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(dynamic_type.clone().into());
+        let live = builder.add_input(dynamic_type.into());
+        builder.add_input(dimension_type.clone().into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![live],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        // A retained dimension wins over the live seed's array, avoiding an unnecessary dimension_size read.
+        let transposed = program.entry_region_ref().transpose(&[0, 1], &[true, false], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                    lambda %0:f64[extent], %1:dimension<extent ∈ [2, 8)> .
+                    let %2:f64[extent] = zero [type=f64[extent]] %1
+                    in (%2, %0)
+                "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.program().interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![3f64, 4.0, 5.0]).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap()),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![0f64; 3]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3f64, 4.0, 5.0]).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_region_transpose_instantiates_zero_from_output_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(dynamic_type.clone().into());
+        let live = builder.add_input(dynamic_type.into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![live],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[0, 1], &[true, false], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                    lambda %0:f64[extent] .
+                    let %1:dimension<extent ∈ [2, 8)> = dimension_size [axis=0] %0
+                        %2:f64[extent] = zero [type=f64[extent]] %1
+                    in (%2, %0)
+                "}
+            .trim_end(),
+        );
+        let outputs = transposed
+            .program()
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![2f64, 3.0, 4.0]).unwrap())])
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![0f64; 3]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![2f64, 3.0, 4.0]).unwrap()),
+            ]
+        );
+        // Interpreted values refine the source's symbolic extent to 3; assembly must preserve their concrete types.
+        assert_eq!(
+            transposed.assemble_cotangents(&program.input_types(), outputs.clone()),
+            Ok(outputs.into_iter().map(|value| Some(MaybeZero::Value(value))).collect::<Vec<_>>()),
+        );
+    }
+
+    #[test]
+    fn test_region_transpose_instantiates_homogeneous_zero_from_output_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into()]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(r#type.clone());
+        let live = builder.add_input(r#type);
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[0, 1], &[true, false], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+            lambda %0:f64[extent] .
+            let %1:f64[extent] = zero_like %0
+            in (%1, %0)
+        "}
+            .trim_end()
+        );
+        assert_eq!(
+            transposed.program().interpret(vec![Array::vector(vec![2f64, 3.0, 4.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![0f64; 3]).unwrap(), Array::vector(vec![2f64, 3.0, 4.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_region_transpose_shared_specializes_by_zero_instantiation() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let live = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let structural = region.transpose_shared(&[0, 1], &[], &[]).unwrap();
+        let explicit = region.transpose_shared(&[0, 1], &[false, false], &[]).unwrap();
+        let instantiated = region.transpose_shared(&[0, 1], &[true, false], &[]).unwrap();
+        let repeated = region.transpose_shared(&[0, 1], &[true, false], &[]).unwrap();
+        assert!(Arc::ptr_eq(structural.program(), explicit.program()));
+        assert!(Arc::ptr_eq(instantiated.program(), repeated.program()));
+        assert!(!Arc::ptr_eq(structural.program(), instantiated.program()));
+        assert_eq!(structural.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(instantiated.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        assert_eq!(
+            structural.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end()
+        );
+        assert_eq!(
+            instantiated.program().to_string(),
+            indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = zero [type=f64[]]
+                    in (%1, %0)
+                "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            region.transpose_shared(&[0, 1], &[true], &[]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "transposition received 1 zero-instantiation flags for 2 selected inputs",
+        ));
     }
 
     #[test]
@@ -5919,19 +6286,19 @@ pub(crate) mod tests {
         let region = program.entry_region_ref();
 
         assert!(matches!(
-            region.transpose(&[1], &[], &[]),
+            region.transpose(&[1], &[true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 1 is out of range for a program with 1 input(s)",
         ));
         assert!(matches!(
-            region.transpose(&[0, 0], &[], &[]),
+            region.transpose(&[0, 0], &[true, true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 0 appears more than once",
         ));
         assert!(matches!(
-            region.transpose(&[0], &[Vec::new(), Vec::new()], &[]),
+            region.transpose(&[0], &[false, false], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "transposition received 2 zero-residual mappings for 1 selected inputs",
+                if message == "transposition received 2 zero-instantiation flags for 1 selected inputs",
         ));
     }
 
@@ -5952,7 +6319,7 @@ pub(crate) mod tests {
 
         // The originating builder and program are gone. The imported payload still dispatches its named rule with
         // the coefficient as a known runtime input; no callback lifetime or stored backward region is involved.
-        let returned = region.transpose(&[1], &[], &[CotangentDestinationKind::Return]).unwrap();
+        let returned = region.transpose(&[1], &[true], &[CotangentDestinationKind::Return]).unwrap().into_program();
         assert_eq!(returned.input_types(), vec![ArrayType::scalar(DataType::F64); 2]);
         assert_eq!(returned.instructions().len(), 1);
         assert!(matches!(returned.instructions()[0].operation(), TestLinearOperation::ScaleLinear));
@@ -5961,7 +6328,7 @@ pub(crate) mod tests {
 
         // Demand is chosen only after importing the same source rule. Ignoring its linear input emits no rule work
         // and does not manufacture a scratch reference. This fixture does not model nonlinear VJP registration.
-        let ignored = region.transpose(&[1], &[], &[CotangentDestinationKind::Ignore]).unwrap();
+        let ignored = region.transpose(&[1], &[true], &[CotangentDestinationKind::Ignore]).unwrap().into_program();
         assert!(ignored.instructions().is_empty());
         assert!(ignored.output_ids().is_empty());
     }
@@ -5982,9 +6349,9 @@ pub(crate) mod tests {
 
         // Every argument of the shared entry point takes part in the key, so a different selection of linear inputs
         // produces its own transposed program rather than reusing the first one.
-        let both = callee.entry_region_ref().transpose_shared(&[0, 1], &[], &[]).unwrap();
-        let reversed = callee.entry_region_ref().transpose_shared(&[1, 0], &[], &[]).unwrap();
-        let leading = callee.entry_region_ref().transpose_shared(&[0], &[], &[]).unwrap();
+        let both = callee.entry_region_ref().transpose_shared(&[0, 1], &[true, true], &[]).unwrap().into_program();
+        let reversed = callee.entry_region_ref().transpose_shared(&[1, 0], &[true, true], &[]).unwrap().into_program();
+        let leading = callee.entry_region_ref().transpose_shared(&[0], &[true], &[]).unwrap().into_program();
         assert!(!Arc::ptr_eq(&both, &reversed));
         assert!(!Arc::ptr_eq(&both, &leading));
         assert_eq!(both.to_string(), callee.transpose_with_respect_to(&[0, 1], &[]).unwrap().to_string());
@@ -5992,16 +6359,53 @@ pub(crate) mod tests {
 
         // The same argument list reuses one artifact, including through an independently built program that interned
         // the callee, because importing a region carries its retained transforms along with its contents.
-        assert!(Arc::ptr_eq(&callee.entry_region_ref().transpose_shared(&[0, 1], &[], &[]).unwrap(), &both));
+        assert!(Arc::ptr_eq(
+            &callee.entry_region_ref().transpose_shared(&[0, 1], &[true, true], &[]).unwrap().into_program(),
+            &both
+        ));
         let mut outer_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let interned = outer_builder.intern_callee(&callee, None).unwrap();
         let interned = RegionRef::new(&outer_builder.regions, interned).unwrap();
-        assert!(Arc::ptr_eq(&interned.transpose_shared(&[0, 1], &[], &[]).unwrap(), &both));
+        assert!(Arc::ptr_eq(&interned.transpose_shared(&[0, 1], &[true, true], &[]).unwrap().into_program(), &both));
 
-        // The zero-residual mappings change the transposed program too, so they separate entries as well.
-        let residualized = interned.transpose_shared(&[0, 1], &[Vec::new(), Vec::new()], &[]).unwrap();
+        // The zero-instantiation flags change the transposed program too, so they separate entries as well.
+        let residualized = interned.transpose_shared(&[0, 1], &[false, false], &[]).unwrap().into_program();
         assert!(!Arc::ptr_eq(&residualized, &both));
         assert_eq!(residualized.to_string(), both.to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_transpose_shared_debug_recheck_detects_corrupted_cached_metadata() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let live = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let correct = region.transpose(&[0, 1], &[], &[]).unwrap();
+        assert_eq!(correct.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+
+        // The executable program is identical; only the classification of its omitted slot is corrupted.
+        region.insert_transform_artifact_for_testing::<TranspositionTransform, _>(
+            TranspositionTransformArguments {
+                input_indices: vec![0, 1],
+                instantiate_zeros: vec![false; 2],
+                destination_kinds: vec![CotangentDestinationKind::Return; 2],
+            },
+            TransformArtifact::new(
+                vec![correct.into_program()],
+                vec![TransposedProgramCotangent::Absent, TransposedProgramCotangent::Output],
+            ),
+        );
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| region.transpose_shared(&[0, 1], &[], &[])))
+                .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}");
+        assert!(message.contains("cached metadata: [Absent, Output]"), "{message}");
+        assert!(message.contains("derived metadata: [Zero, Output]"), "{message}");
     }
 
     #[test]
@@ -6013,19 +6417,19 @@ pub(crate) mod tests {
         let region = program.entry_region_ref();
 
         assert!(matches!(
-            region.transpose_shared(&[1], &[], &[]),
+            region.transpose_shared(&[1], &[true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 1 is out of range for a program with 1 input(s)",
         ));
         assert!(matches!(
-            region.transpose_shared(&[0, 0], &[], &[]),
+            region.transpose_shared(&[0, 0], &[true, true], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 0 appears more than once",
         ));
         assert!(matches!(
-            region.transpose_shared(&[0], &[Vec::new(), Vec::new()], &[]),
+            region.transpose_shared(&[0], &[false, false], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "transposition received 2 zero-residual mappings for 1 selected inputs",
+                if message == "transposition received 2 zero-instantiation flags for 1 selected inputs",
         ));
     }
 
@@ -6052,15 +6456,15 @@ pub(crate) mod tests {
         program.entry_region_ref().insert_transform_artifact_for_testing::<TranspositionTransform, _>(
             TranspositionTransformArguments {
                 input_indices: vec![0, 1],
-                zero_residual_input_indices: Vec::new(),
+                instantiate_zeros: vec![true; 2],
                 destination_kinds: vec![CotangentDestinationKind::Return; 2],
             },
-            TransformArtifact::new(vec![unrelated], ()),
+            TransformArtifact::new(vec![unrelated], vec![TransposedProgramCotangent::Output; 2]),
         );
 
         // The recheck runs on the hit and reports the contract violation rather than serving the wrong pullback.
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.entry_region_ref().transpose_shared(&[0, 1], &[], &[])
+            program.entry_region_ref().transpose_shared(&[0, 1], &[true, true], &[])
         }))
         .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
@@ -6089,21 +6493,38 @@ pub(crate) mod tests {
 
         // The default mask and its explicit spelling share one retained artifact, while the `Ignore` variant at the
         // reference leaf is a distinct artifact with a different boundary.
-        let default = region.transpose_shared(&[0, 1], &[], &[]).unwrap();
+        let default = region.transpose_shared(&[0, 1], &[true, true], &[]).unwrap();
+        assert_eq!(default.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        let default = default.into_program();
         let explicit = region
-            .transpose_shared(&[0, 1], &[], &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return])
-            .unwrap();
+            .transpose_shared(
+                &[0, 1],
+                &[true, true],
+                &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return],
+            )
+            .unwrap()
+            .into_program();
         let ignored = region
-            .transpose_shared(&[0, 1], &[], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
-            .unwrap();
+            .transpose_shared(
+                &[0, 1],
+                &[true, true],
+                &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return],
+            )
+            .unwrap()
+            .into_program();
         assert!(Arc::ptr_eq(&default, &explicit));
         assert!(!Arc::ptr_eq(&default, &ignored));
         assert_eq!(default.input_types().len(), 2);
         assert_eq!(ignored.input_types().len(), 1);
         assert!(Arc::ptr_eq(
             &region
-                .transpose_shared(&[0, 1], &[], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return],)
-                .unwrap(),
+                .transpose_shared(
+                    &[0, 1],
+                    &[true, true],
+                    &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return],
+                )
+                .unwrap()
+                .into_program(),
             &ignored,
         ));
     }
@@ -7950,7 +8371,7 @@ pub(crate) mod tests {
             .unwrap();
         let linearization = program.linearize().unwrap();
         let primal = linearization.primal().interpret(vec![reference_test_scalar(3.0)]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let discharged = program
             .discharge_references(0)
             .unwrap()
@@ -7959,7 +8380,8 @@ pub(crate) mod tests {
             .linearize()
             .unwrap()
             .pullback()
-            .unwrap();
+            .unwrap()
+            .into_program();
         for seed in [2.0, 5.0, 2.0] {
             let mut inputs = vec![reference_test_scalar(seed)];
             inputs.extend_from_slice(&primal[1..]);
@@ -8005,7 +8427,7 @@ pub(crate) mod tests {
         let mut pullback_inputs = vec![ReferenceTestValue::Array(Array::scalar(5.0_f32).unwrap())];
         pullback_inputs.extend_from_slice(&primal_outputs[1..]);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ReferenceTestValue::Array(Array::vector(vec![5.0_f32, 5.0, 5.0]).unwrap())]),
         );
     }

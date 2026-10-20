@@ -3587,7 +3587,7 @@ mod tests {
             },
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)> .
                 let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
@@ -3629,7 +3629,7 @@ mod tests {
         let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap());
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![cotangent]));
         let zero_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
         let zero_array = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![zero_array.clone(), zero_extent]).unwrap();
@@ -3637,7 +3637,7 @@ mod tests {
         let zero_cotangent = zero_array.clone();
         let mut pullback_inputs = vec![zero_cotangent.clone()];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![zero_cotangent]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![zero_cotangent]));
     }
 
     #[test]
@@ -3731,7 +3731,7 @@ mod tests {
             },
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[extent], %1:dimension<extent ∈ [1, 9)> .
                 let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
@@ -3766,7 +3766,7 @@ mod tests {
         let mut pullback_inputs = vec![cotangent];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap())]),
         );
 
@@ -3813,7 +3813,7 @@ mod tests {
             },
         );
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().to_string(),
+            program.linearize().unwrap().pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[2, 3] .
                 let %1:dimension<2> = const 2
@@ -3871,7 +3871,7 @@ mod tests {
             vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
         )
         .unwrap();
-        let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap();
+        let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"

@@ -84,10 +84,11 @@ pub use differentiation::{
     SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
     SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
     SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, TransposableOperation,
-    TranspositionContext, TranspositionDriver, UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture,
-    WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
-    jvp_for_transpose_projected_operation, jvp_projected_operation, rematerialize, saved_residuals,
-    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
+    TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture,
+    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_for_transpose_projected_operation,
+    jvp_projected_operation, rematerialize, saved_residuals, transpose_mixed_operation, transpose_projected_operation,
+    unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{

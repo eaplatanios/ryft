@@ -825,6 +825,7 @@ mod tests {
             .vjp(|x| x.constrain_sharding(&constraint))
             .unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let shardings = pullback
             .instructions()
             .iter()

@@ -6191,7 +6191,7 @@ mod tests {
             .unwrap()
             .linearize()
             .unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
             assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
             assert!(program.effects().classes().is_empty());
@@ -9001,6 +9001,7 @@ mod tests {
             .linear_program()
             .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
             .unwrap()
+            .program()
             .to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
@@ -9032,6 +9033,7 @@ mod tests {
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         assert_eq!(output.to_f64s(), vec![8.0]);
 
         // The pullback contains the transposed (reversed) linear scan and no while loop, and every cotangent seed
@@ -9097,6 +9099,7 @@ mod tests {
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         assert_eq!(output.to_f64s(), vec![256.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
@@ -9454,7 +9457,7 @@ mod tests {
         // Reverse mode transposes the tangent scan, including its varying `condition` guard. At `x = 2` with limit
         // `10`, the loop squares twice, so `f(x) = x⁴` with value `16` and gradient `4 x³ = 32`.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -9897,7 +9900,7 @@ mod tests {
         let mut primal_outputs = linearization.primal().interpret(vec![counter, vector]).unwrap();
         assert_eq!(primal_outputs[1], array(Array::vector(vec![4.0, 8.0, 12.0]).unwrap()));
         let residuals = primal_outputs.split_off(2);
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert!(pullback.output_types().iter().all(|r#type| r#type.identities().next().is_none()));
         let mut pullback_inputs =
             vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
@@ -9950,7 +9953,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::scalar(8.0).unwrap())]),
         );
     }
@@ -10013,7 +10016,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
         );
     }
@@ -10106,7 +10109,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
         );
     }
@@ -10204,7 +10207,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]),
         );
     }
@@ -10306,7 +10309,7 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![array(Array::scalar(2.0).unwrap())])
         );
     }

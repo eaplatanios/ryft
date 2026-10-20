@@ -1001,6 +1001,7 @@ mod tests {
             .vjp(|x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()), Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -1027,6 +1028,7 @@ mod tests {
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -1055,6 +1057,7 @@ mod tests {
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -1095,6 +1098,7 @@ mod tests {
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,

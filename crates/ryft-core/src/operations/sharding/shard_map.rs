@@ -4789,7 +4789,9 @@ where
     } else {
         body
     };
-    let mut transposed_program = driver.transpose_program(body, &input_indices, &selected_destination_kinds)?;
+    let mut transposed_program = driver
+        .transpose_program(body, &input_indices, &vec![true; input_indices.len()], &selected_destination_kinds)?
+        .into_program();
     let nonzero_seed_count = zero_output_cotangents.iter().filter(|zero| !**zero).count();
     let shard_map = operation.shard_map();
 
@@ -5188,7 +5190,10 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingLevelExtent, batch};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationRule, Linearization, NothingSavable, differentiate_at, rematerialize};
+    use crate::differentiation::{
+        DifferentiationRule, Linearization, NothingSavable, TransposedProgram, TransposedProgramCotangent,
+        differentiate_at, rematerialize,
+    };
     use crate::operations::arithmetic::{MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::axis_index::{AxisIndex, AxisIndexOperation};
     use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
@@ -5262,11 +5267,28 @@ mod tests {
     impl TranspositionDriver<TestValue, TestOperation> for TestTranspositionDriver {
         fn transpose_program(
             &self,
-            _region: RegionRef<'_, TestValue, TestOperation>,
-            _input_indices: &[usize],
-            _destination_kinds: &[CotangentDestinationKind],
-        ) -> Result<Arc<TestProgram>, DifferentiationError> {
-            Ok(Arc::new(self.transposed.clone()))
+            region: RegionRef<'_, TestValue, TestOperation>,
+            input_indices: &[usize],
+            _instantiate_zeros: &[bool],
+            destination_kinds: &[CotangentDestinationKind],
+        ) -> Result<TransposedProgram<TestValue, TestOperation>, DifferentiationError> {
+            let input_types = region.input_types();
+            let cotangents = input_indices
+                .iter()
+                .enumerate()
+                .map(|(index, &input_index)| {
+                    match destination_kinds.get(index).copied().unwrap_or(CotangentDestinationKind::Return) {
+                        CotangentDestinationKind::Return => TransposedProgramCotangent::Output,
+                        CotangentDestinationKind::Reference if input_types[input_index].is_reference() => {
+                            TransposedProgramCotangent::Output
+                        }
+                        CotangentDestinationKind::Reference | CotangentDestinationKind::Ignore => {
+                            TransposedProgramCotangent::Absent
+                        }
+                    }
+                })
+                .collect();
+            Ok(TransposedProgram::new(Arc::new(self.transposed.clone()), cotangents)?)
         }
     }
 
@@ -6060,7 +6082,7 @@ mod tests {
             .entry_region_ref()
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
             .unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let mut outputs = linearization.primal().interpret(vec![input]).unwrap();
         let residuals = outputs.split_off(outputs.len() - linearization.residual_count());
         let arrays = |values: Vec<TestValue>| {
@@ -13510,7 +13532,7 @@ mod tests {
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
             .unwrap();
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             formatdoc! {"
                 lambda %0:{scalar}, %1:{scalar} .
                 let %2:{scalar} = shard_map [
@@ -13719,7 +13741,7 @@ mod tests {
                     in (%1, %2, %3)"},
             );
             assert_eq!(
-                linearization.pullback().unwrap().to_string(),
+                linearization.pullback().unwrap().program().to_string(),
                 formatdoc! {"
                     lambda %0:{scalar}, %1:{scalar}, %2:{scalar} .
                     let %3:{scalar} = shard_map [
@@ -13807,7 +13829,7 @@ mod tests {
                 in (%1, %0, %2, %3)"},
         );
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             formatdoc! {"
                 lambda %0:{global}, %1:f32[4], %2:{global}, %3:{global} .
                 let %4:{global} = shard_map [
@@ -13894,7 +13916,7 @@ mod tests {
         let scalar_sharding = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
         let scalar = format!("f32[][sharding={scalar_sharding}]");
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             formatdoc! {"
                 lambda %0:{global}, %1:{global}, %2:{global} .
                 let %3:{global} = shard_map [
@@ -14875,7 +14897,7 @@ mod tests {
         let local_seed = "f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
         let local_index = "u64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             formatdoc! {"
                 lambda %0:{seed}, %1:{index} .
                 let %2:f32[3, 1] = zero [type=f32[3, 1]]
@@ -14927,7 +14949,7 @@ mod tests {
             };
             let mut inputs = vec![TestValue::Array(Array::from_elements(seed_type, &[3.0f32, 7.0]).unwrap())];
             inputs.extend(residuals);
-            arrays_f64(linearization.pullback().unwrap().interpret(inputs).unwrap())
+            arrays_f64(linearization.pullback().unwrap().program().interpret(inputs).unwrap())
         };
         assert_eq!(pullback(&mapped), vec![vec![3.0, 7.0, 0.0]]);
         assert_eq!(pullback(&mapped), pullback(&unmapped));
@@ -14959,7 +14981,7 @@ mod tests {
             .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
             .unwrap();
         assert_eq!(
-            linearization.pullback().unwrap().to_string(),
+            linearization.pullback().unwrap().program().to_string(),
             formatdoc! {"
                 lambda %0:f32[2], %1:{replicated} .
                 let %2:f32[2] = zero [type=f32[2]]

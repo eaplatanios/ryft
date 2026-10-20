@@ -961,6 +961,7 @@ mod tests {
         assert_eq!(cotangent.r#type().as_ref(), &input_cotangent_type);
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let shardings = pullback
             .instructions()
             .iter()
@@ -1001,6 +1002,7 @@ mod tests {
         assert_eq!(cotangent.r#type().as_ref(), &input_cotangent_type);
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let shardings = pullback
             .instructions()
             .iter()

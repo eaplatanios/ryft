@@ -690,6 +690,7 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F64, [2]).with_memory(PINNED_HOST), &[5.0f64, 7.0])
                 .unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         assert_eq!(
             pullback.interpret(vec![cotangent]),
             Ok(vec![Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[5.0f64, 7.0]).unwrap()]),

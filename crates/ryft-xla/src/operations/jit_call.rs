@@ -1172,7 +1172,9 @@ pub fn transpose_primal_jit_call<
         .enumerate()
         .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
         .unzip();
-    let transposed_callee = driver.transpose_program(callee, &input_indices, &destination_kinds)?;
+    let transposed_callee = driver
+        .transpose_program(callee, &input_indices, &vec![true; input_indices.len()], &destination_kinds)?
+        .into_program();
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `jit_call` over the transposed callee on `[outputs..., cotangent_references..., known_input_values...]`. Its
@@ -1321,8 +1323,8 @@ mod tests {
         ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
         RegionDataFlow, RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualCandidate,
         ResidualDecision, ResidualPolicy, ResidualPolicyReference, ResidualRejection, Shape, Sharding,
-        ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer, TracingContext, TranspositionDriver,
-        TypeError, Typed, Value, ZeroOperation,
+        ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer, TracingContext, TransposedProgram,
+        TransposedProgramCotangent, TranspositionDriver, TypeError, Typed, Value, ZeroOperation,
     };
 
     use crate::experimental::lowering::tests::{
@@ -1359,11 +1361,28 @@ mod tests {
     impl TranspositionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
         fn transpose_program(
             &self,
-            _region: RegionRef<'_, XlaConstant, XlaOperation>,
-            _input_indices: &[usize],
-            _destination_kinds: &[CotangentDestinationKind],
-        ) -> Result<Arc<XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>>, DifferentiationError> {
-            Ok(Arc::new(self.transposed.clone()))
+            region: RegionRef<'_, XlaConstant, XlaOperation>,
+            input_indices: &[usize],
+            _instantiate_zeros: &[bool],
+            destination_kinds: &[CotangentDestinationKind],
+        ) -> Result<TransposedProgram<XlaConstant, XlaOperation>, DifferentiationError> {
+            let input_types = region.input_types();
+            let cotangents = input_indices
+                .iter()
+                .enumerate()
+                .map(|(index, &input_index)| {
+                    match destination_kinds.get(index).copied().unwrap_or(CotangentDestinationKind::Return) {
+                        CotangentDestinationKind::Return => TransposedProgramCotangent::Output,
+                        CotangentDestinationKind::Reference if input_types[input_index].is_reference() => {
+                            TransposedProgramCotangent::Output
+                        }
+                        CotangentDestinationKind::Reference | CotangentDestinationKind::Ignore => {
+                            TransposedProgramCotangent::Absent
+                        }
+                    }
+                })
+                .collect();
+            Ok(TransposedProgram::new(Arc::new(self.transposed.clone()), cotangents)?)
         }
     }
 
@@ -3540,7 +3559,8 @@ mod tests {
             let tangent_inputs = std::iter::once(direction.clone()).chain(primal.clone()).collect();
             let tangent = execute_f32_program(&client, linearization.tangent(), tangent_inputs);
             let pullback_inputs = std::iter::once(cotangent.clone()).chain(primal).collect();
-            let pullback = execute_f32_program(&client, &linearization.pullback().unwrap(), pullback_inputs);
+            let pullback =
+                execute_f32_program(&client, &linearization.pullback().unwrap().into_program(), pullback_inputs);
             vec![value, tangent[0].clone(), pullback[0].clone()]
         };
         let actual = evaluate(&linearization);

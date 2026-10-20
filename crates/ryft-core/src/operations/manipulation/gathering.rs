@@ -4141,7 +4141,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0, 5.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 0.0, 5.0]).unwrap())]),
         );
 
@@ -4164,7 +4164,7 @@ mod tests {
         let mut cotangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1_f64, 1., 1.]).unwrap())];
         cotangent_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangent_inputs),
+            linearization.pullback().unwrap().program().interpret(cotangent_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0_f64, 1.]).unwrap())]),
         );
         let explicitly_filling =
@@ -4185,7 +4185,7 @@ mod tests {
         let mut cotangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1_f64, 1., 1.]).unwrap())];
         cotangent_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangent_inputs),
+            linearization.pullback().unwrap().program().interpret(cotangent_inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0_f64, 1.]).unwrap())]),
         );
     }
@@ -4269,7 +4269,12 @@ mod tests {
             .unwrap(),
         );
 
-        let pullback = placed_take_program(placed_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
+        let pullback = placed_take_program(placed_type.clone(), &mesh)
+            .linearize()
+            .unwrap()
+            .pullback()
+            .unwrap()
+            .into_program();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(placed_type.cotangent().unwrap())]);
         assert_eq!(
             pullback.interpret(vec![cotangent.clone()]),
@@ -4296,7 +4301,12 @@ mod tests {
         );
 
         let sharded_type = placed_type.with_sharding(sharded.clone()).unwrap();
-        let pullback = placed_take_program(sharded_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
+        let pullback = placed_take_program(sharded_type.clone(), &mesh)
+            .linearize()
+            .unwrap()
+            .pullback()
+            .unwrap()
+            .into_program();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(sharded_type.cotangent().unwrap())]);
         assert_eq!(
             pullback.interpret(vec![cotangent.clone()]),
@@ -4323,7 +4333,12 @@ mod tests {
             .trim_end(),
         );
 
-        let pullback = placed_take_program(dynamic_placed_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
+        let pullback = placed_take_program(dynamic_placed_type.clone(), &mesh)
+            .linearize()
+            .unwrap()
+            .pullback()
+            .unwrap()
+            .into_program();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(dynamic_placed_type.cotangent().unwrap())]);
         let ArrayIrType::Dimension(extent_type) = &pullback.input_types()[1] else {
             panic!("expected a retained input extent");
@@ -4377,8 +4392,12 @@ mod tests {
         );
 
         let dynamic_sharded_type = dynamic_placed_type.with_sharding(sharded).unwrap();
-        let pullback =
-            placed_take_program(dynamic_sharded_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
+        let pullback = placed_take_program(dynamic_sharded_type.clone(), &mesh)
+            .linearize()
+            .unwrap()
+            .pullback()
+            .unwrap()
+            .into_program();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(dynamic_sharded_type.cotangent().unwrap())]);
         let ArrayIrType::Dimension(extent_type) = &pullback.input_types()[1] else {
             panic!("expected a retained input extent");
@@ -4490,7 +4509,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"

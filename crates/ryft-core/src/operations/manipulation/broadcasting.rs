@@ -4560,7 +4560,7 @@ mod tests {
         assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![tangent.clone()]));
         let mut pullback_inputs = vec![tangent.clone()];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![tangent]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![tangent]));
     }
 
     #[test]
@@ -4627,7 +4627,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
         let concrete_type =
             ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
@@ -4671,7 +4671,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
         let mut primal_outputs = linearization
             .primal()
@@ -4722,7 +4722,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
         let mut primal_outputs = linearization
             .primal()
@@ -4772,7 +4772,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
         let mut primal_outputs = linearization
             .primal()
@@ -4908,7 +4908,7 @@ mod tests {
                 ),
         ));
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().output_types(),
+            program.linearize().unwrap().pullback().unwrap().program().output_types(),
             vec![input_type.cotangent().unwrap()],
         );
     }

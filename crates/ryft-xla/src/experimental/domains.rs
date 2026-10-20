@@ -7040,7 +7040,7 @@ mod tests {
         .into_inner();
         let program = staged.source_program().program().clone();
         let linearization = program.linearize_with_respect_to(&[2]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         // Reuse one symbolic source graph at distinct concrete extents, including negative index normalization.
         let execute = |values: &[f64]| {
             let input_types = vec![
@@ -7979,7 +7979,7 @@ mod tests {
         let residuals = primal_outputs.split_off(primal_outputs.len() - emulated.residual_count());
         let mut pullback_inputs = emulated_values(&output_types, &seed_bytes);
         pullback_inputs.extend(residuals);
-        let emulated_cotangents = emulated.pullback().unwrap().interpret(pullback_inputs).unwrap();
+        let emulated_cotangents = emulated.pullback().unwrap().program().interpret(pullback_inputs).unwrap();
 
         // XLA compiles each map into one manual computation and executes it on the devices of `client`.
         let devices = client.addressable_devices().unwrap();
@@ -8004,7 +8004,7 @@ mod tests {
         let residuals = primal_outputs.split_off(primal_outputs.len() - xla.residual_count());
         let mut pullback_inputs = xla_values(&output_types, &seed_bytes);
         pullback_inputs.extend(residuals);
-        let cotangents = execute(&xla.pullback().unwrap(), pullback_inputs)
+        let cotangents = execute(&xla.pullback().unwrap().into_program(), pullback_inputs)
             .iter()
             .map(|cotangent| {
                 let bytes = materialize_dense_array_bytes(cotangent).unwrap();
@@ -9630,7 +9630,7 @@ mod tests {
                 program
             };
             let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-            let pullback = linearization.pullback().unwrap();
+            let pullback = linearization.pullback().unwrap().into_program();
             let sizes: &[usize] = if allows_empty_rows { &[0, 4, 5] } else { &[4, 5] };
             for &size in sizes {
                 let index_count = if dynamic_query { size - 2 } else { index_count };
@@ -9899,7 +9899,7 @@ mod tests {
         assert!(rendered.contains("slice_sizes=[0, 1]"));
         assert!(rendered.contains("batching=[(0, 0)]"));
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let all_indices = [1_i32, 3, 0, 2, 3];
         for size in [0_usize, 4, 5] {
             let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
@@ -10104,7 +10104,7 @@ mod tests {
             .trim_end(),
         );
         let linearization = program.linearize_with_respect_to(&[0, 2]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -10152,7 +10152,7 @@ mod tests {
             .trim_end(),
         );
         let linearization = program.linearize_with_respect_to(&[0, 2]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert!(pullback.to_string().contains("slice_sizes=[0, 1]"));
         let all_min_updates = [-1_f64, 100., -1., 100., -1.];
         for size in [0_usize, 4, 5] {
@@ -10301,7 +10301,7 @@ mod tests {
         // Only the operand cotangent: the update accumulator is unneeded, so the transpose zeroes the updated window
         // of the cotangent without slicing it.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -10351,7 +10351,7 @@ mod tests {
         // out of the cotangent without materializing a zero update. The retained operand extent and the zero operand
         // tangent belong to the original forward region, which materializes the missing operand tangent.
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -10705,7 +10705,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let inputs = vec![context.input(input_type.clone().into()), context.input(size_type.clone().into())];
         let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
@@ -10786,7 +10786,7 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let inputs = vec![
             context.input(input_type.clone().into()),

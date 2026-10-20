@@ -2873,7 +2873,7 @@ mod tests {
     use crate::differentiation::forward::JvpPartitionTransform;
     use crate::differentiation::{
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, ForwardModeDifferentiate,
-        ReverseModeDifferentiate, TranspositionDriver, differentiate_at,
+        ReverseModeDifferentiate, TransposedProgram, TranspositionDriver, differentiate_at,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -3497,8 +3497,9 @@ mod tests {
             &self,
             _region: RegionRef<'_, Array, ArrayOperation<Array>>,
             _input_indices: &[usize],
+            _instantiate_zeros: &[bool],
             _destination_kinds: &[CotangentDestinationKind],
-        ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError> {
+        ) -> Result<TransposedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "test driver does not transpose nested regions".to_string(),
             }
@@ -4969,7 +4970,7 @@ mod tests {
         let mut cotangents = vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())];
         cotangents.extend(primal_outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]),
         );
     }
@@ -5347,7 +5348,7 @@ mod tests {
         let mut cotangents = vec![Array::scalar(1.0).unwrap()];
         cotangents.extend(outputs);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![Array::scalar(3.0 * 2.0f64.cos()).unwrap()]),
         );
     }
@@ -5808,7 +5809,7 @@ mod tests {
         let mut cotangents = vec![Array::vector(vec![7.0, 11.0]).unwrap()];
         cotangents.extend(outputs);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(cotangents),
+            linearization.pullback().unwrap().program().interpret(cotangents),
             Ok(vec![Array::vector(vec![35.0, 55.0]).unwrap(), Array::scalar(47.0).unwrap()]),
         );
     }
@@ -7525,7 +7526,7 @@ mod tests {
         inputs.extend(outputs.split_off(1));
         assert_eq!(outputs, vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(inputs),
+            linearization.pullback().unwrap().program().interpret(inputs),
             Ok(vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
         );
     }

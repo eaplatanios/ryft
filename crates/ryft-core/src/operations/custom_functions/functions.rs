@@ -3704,6 +3704,7 @@ mod tests {
         );
         let (_, pullback) = differentiate_at(Array::scalar(0.7).unwrap()).vjp(|x| function.call(x)).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let mut pullback_inputs = vec![Array::scalar(1.0).unwrap()];
         pullback_inputs.extend(residuals);
         assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![Array::scalar(2.0 * 0.7f64.cos()).unwrap()]));
@@ -3966,7 +3967,7 @@ mod tests {
         let second = ArrayReference::new(Array::scalar(20.0f32).unwrap());
         let seed = ArrayIrValue::Array(Array::scalar(3.0f32).unwrap());
         let destinations = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Reference];
-        let retained = pullback.transposed_program(&destinations).unwrap();
+        let retained = pullback.transposed_program(&destinations).unwrap().into_program();
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(seed.clone()),
@@ -3988,7 +3989,7 @@ mod tests {
         );
         assert_eq!(second.read(), Ok(Array::scalar(29.0f32).unwrap()));
         assert_eq!(first.read(), Ok(Array::scalar(19.0f32).unwrap()));
-        assert!(Arc::ptr_eq(&retained, &pullback.transposed_program(&destinations).unwrap()));
+        assert!(Arc::ptr_eq(&retained, &pullback.transposed_program(&destinations).unwrap().into_program()));
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(seed),

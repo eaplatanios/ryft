@@ -225,6 +225,7 @@ mod tests {
             .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), Array::scalar(2.0).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
+        let pullback = pullback.into_program();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(), 1, "{stablehlo}");
         assert!(stablehlo.contains("_xla_buffer_placement = \"device\""), "{stablehlo}");

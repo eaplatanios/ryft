@@ -1173,6 +1173,7 @@ fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
         )
         .unwrap();
     let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
+    let pullback = pullback.into_program();
 
     let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
     println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");

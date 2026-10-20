@@ -501,7 +501,8 @@ where
     // Verify that the derived program exposes that input contract before constructing the packed cotangents.
     // The reverse Jacobian materializes returned cotangents only, so it takes the reference-free, all-`Return`
     // transposition of the retained linear program.
-    let (program, residuals) = pullback.into_transposed_parts()?;
+    let (transposed, residuals) = pullback.into_transposed_parts()?;
+    let program = transposed.into_program();
     let program_input_types = program.input_types();
     let cotangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(

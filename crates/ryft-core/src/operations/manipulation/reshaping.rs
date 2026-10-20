@@ -2341,7 +2341,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let pullback = linearization.pullback().unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -4282,7 +4282,7 @@ mod tests {
         let mut pullback_inputs = vec![tangents.clone()];
         pullback_inputs.extend(residuals.clone());
         assert_eq!(pullback.interpret(pullback_inputs.clone()), Ok(vec![tangents.clone()]));
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![tangents]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![tangents]));
 
         // An input permutation is applied before the forward reshape and undone after the inverse reshape, so the
         // cotangent returns in the original input order.
@@ -4347,7 +4347,7 @@ mod tests {
         assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![permuted_tangents.clone()]));
         let mut pullback_inputs = vec![permuted_tangents];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![tangents]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![tangents]));
     }
 
     #[test]
@@ -4464,7 +4464,10 @@ mod tests {
         pullback_inputs.extend(residuals);
         let expected_cotangent = ArrayIrValue::Array(Array::matrix(3, 4, tangent_values).unwrap());
         assert_eq!(pullback.interpret(pullback_inputs.clone()), Ok(vec![expected_cotangent.clone()]));
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![expected_cotangent]));
+        assert_eq!(
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
+            Ok(vec![expected_cotangent])
+        );
     }
 
     #[test]
@@ -4589,7 +4592,7 @@ mod tests {
             vec![ArrayIrValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect()).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect(),).unwrap())]),
         );
     }
@@ -4796,7 +4799,7 @@ mod tests {
         let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(cotangent_values.clone()).unwrap())];
         pullback_inputs.extend(residuals.clone());
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, cotangent_values).unwrap())]),
         );
 
@@ -4879,7 +4882,7 @@ mod tests {
             vec![ArrayIrValue::Array(Array::matrix(3, 3, (18..27).map(|value| value as f64).collect()).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
+            linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![ArrayIrValue::Array(
                 Array::matrix(3, 3, vec![18.0, 21.0, 24.0, 19.0, 22.0, 25.0, 20.0, 23.0, 26.0],).unwrap()
             )]),
@@ -4930,7 +4933,10 @@ mod tests {
 
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.tangent().output_types(), vec![input_type.tangent().unwrap().into()]);
-        assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().unwrap().into()]);
+        assert_eq!(
+            linearization.pullback().unwrap().program().output_types(),
+            vec![input_type.cotangent().unwrap().into()]
+        );
         let concrete_type = input_type.clone().with_shape([3, 4]);
         let primal = ArrayIrValue::Array(
             Array::from_elements::<f64>(concrete_type.clone(), &(0..12).map(|value| value as f64).collect::<Vec<_>>())
@@ -4948,7 +4954,7 @@ mod tests {
         );
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![cotangent]));
 
         // The inverse restores metadata that the forward reshape removed or introduced. In particular, replicated
         // bridge sharding must not escape into the cotangent of an originally unsharded input.
@@ -4979,7 +4985,10 @@ mod tests {
                 )
                 .unwrap();
             let linearization = program.linearize().unwrap();
-            assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().unwrap().into()]);
+            assert_eq!(
+                linearization.pullback().unwrap().program().output_types(),
+                vec![input_type.cotangent().unwrap().into()]
+            );
             let concrete_type = input_type.clone().with_shape([3, 4]);
             let primal_values = (0..12).map(|value| value as f64).collect::<Vec<_>>();
             let primal =
@@ -4999,7 +5008,7 @@ mod tests {
                 vec![ArrayIrValue::Array(Array::from_elements::<f64>(output_type, &cotangent_values).unwrap())];
             pullback_inputs.extend(residuals);
             assert_eq!(
-                linearization.pullback().unwrap().interpret(pullback_inputs),
+                linearization.pullback().unwrap().program().interpret(pullback_inputs),
                 Ok(vec![ArrayIrValue::Array(Array::from_elements::<f64>(concrete_type, &cotangent_values).unwrap())]),
             );
         }
@@ -5100,7 +5109,7 @@ mod tests {
                 ),
         ));
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().output_types(),
+            program.linearize().unwrap().pullback().unwrap().program().output_types(),
             vec![input_type.cotangent().unwrap()],
         );
     }
@@ -5133,7 +5142,7 @@ mod tests {
                 ),
         ));
         assert_eq!(
-            program.linearize().unwrap().pullback().unwrap().output_types(),
+            program.linearize().unwrap().pullback().unwrap().program().output_types(),
             vec![input_type.cotangent().unwrap()],
         );
     }
