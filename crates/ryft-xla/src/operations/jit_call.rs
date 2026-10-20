@@ -1172,9 +1172,7 @@ pub fn transpose_primal_jit_call<
         .enumerate()
         .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
         .unzip();
-    let transposed_callee = driver
-        .transpose_program(callee, &input_indices, &vec![true; input_indices.len()], &destination_kinds)?
-        .into_program();
+    let transposed_callee = driver.transpose_program(callee, &input_indices, &[], &destination_kinds)?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `jit_call` over the transposed callee on `[outputs..., cotangent_references..., known_input_values...]`. Its
@@ -1197,33 +1195,30 @@ pub fn transpose_primal_jit_call<
     // lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
     // through fresh-root contexts.
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0));
-    let input_cotangents =
-        context.bind(transposed_call, CalleeRegionDriver::new(&[transposed_callee]), operands.as_slice())?;
-    let output_count = (0..inputs.len())
-        .filter(|&index| operand_linear[index] && cotangents.returns_cotangent(index))
-        .count();
-    check_count!("output", input_cotangents, output_count, ProgramError);
-
-    // Reassemble one cotangent per operand: the known operands carry structural zeros, while the linear input tangents
-    // receive the transposed call's outputs in callee-input order. A live reference tangent's output is its cotangent
-    // reference, whose contents were accumulated in place, and a dead one has no output, so every reference operand
-    // receives a structural zero.
-    let mut input_cotangents = input_cotangents.into_iter();
-    operand_linear
+    let input_cotangents = context.bind(
+        transposed_call,
+        CalleeRegionDriver::new(&[transposed_callee.program().clone()]),
+        operands.as_slice(),
+    )?;
+    let cotangent_types = input_indices
         .iter()
-        .zip(inputs)
-        .enumerate()
-        .map(|(index, (&linear, input))| match cotangents.kind(index) {
-            CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(input_cotangents.next().unwrap())),
-            CotangentDestinationKind::Reference => {
-                if cotangents.is_reference_input(index) {
-                    input_cotangents.next();
+        .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut input_cotangents = transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
+
+    // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
+    // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
+    // a value cotangent to the enclosing context.
+    inputs
+        .iter()
+        .map(|input| {
+            let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
+            if !input.r#type().is_reference() {
+                if let Some(cotangent) = cotangent {
+                    return Ok(cotangent);
                 }
-                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
             }
-            CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
-                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
-            }
+            input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
         })
         .collect()
 }
@@ -2907,6 +2902,53 @@ mod tests {
         assert!(matches!(instruction.operation(), XlaOperation::Zero(_)));
         assert_eq!(instruction.inputs(), &[ryft_core::AtomId::new(0)]);
         assert_eq!(zero.atom_id().unwrap(), instruction.outputs()[0]);
+    }
+
+    #[test]
+    fn test_jit_call_transpose_omits_disconnected_symbolic_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut callee_builder = CompositeXlaProgramBuilder::new();
+        callee_builder.add_input(dynamic_type.clone().into());
+        let live = callee_builder.add_input(scalar_type.clone().into());
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let disconnected = builder.add_input(dynamic_type.into());
+        let live = builder.add_input(scalar_type.into());
+        let callee = builder.import_region(callee.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![disconnected, live],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+            lambda %0:f32[] .
+            let %1:f32[] = jit_call %0 [
+                callee={
+                    lambda %0:f32[] .
+                    in (%0)
+                },
+            ]
+            in (%1)
+        "}
+            .trim_end()
+        );
     }
 
     #[test]

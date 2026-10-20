@@ -5921,7 +5921,7 @@ mod tests {
 
         let (output, pullback) = differentiate_at(Array::scalar(3.5).unwrap()).vjp(function).unwrap();
         assert_eq!(output, Array::scalar(-0.5).unwrap());
-        assert_eq!(pullback.apply(Array::scalar(2.0).unwrap()), Ok(Array::scalar(2.0).unwrap()));
+        assert_eq!(pullback.apply(Array::scalar(2.0).unwrap()), Ok(MaybeZero::Value(Array::scalar(2.0).unwrap())));
     }
 
     #[test]
@@ -9006,7 +9006,7 @@ mod tests {
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
         assert!(!rendered_pullback.contains("while"), "{rendered_pullback}");
-        let cotangent = pullback.apply(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()).unwrap();
+        let cotangent = pullback.apply_materialized(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()).unwrap();
         assert_eq!(cotangent.to_f64s(), vec![8.0, 2.0, 1.0]);
     }
 

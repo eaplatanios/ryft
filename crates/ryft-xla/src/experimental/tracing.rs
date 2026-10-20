@@ -1480,7 +1480,7 @@ mod tests {
                                 .into_value())
                             })
                             .unwrap();
-                        let seeded_gradients = pullback.apply(inputs[1].clone().into_value()).unwrap();
+                        let seeded_gradients = pullback.apply_materialized(inputs[1].clone().into_value()).unwrap();
                         let (_, directional_derivative) = inputs[0]
                             .clone()
                             .into_value()
@@ -1722,7 +1722,7 @@ mod tests {
                             .into_value())
                         })
                         .unwrap();
-                    let gradient = pullback.apply(inputs[2].clone().into_value()).unwrap();
+                    let gradient = pullback.apply_materialized(inputs[2].clone().into_value()).unwrap();
                     let maxima = shard_map(
                         |input: XlaArrayTracer| {
                             let maximum = input.parallel_reduce(ReductionKind::Max, "x").unwrap();
@@ -2059,7 +2059,7 @@ mod tests {
                     .differentiate_at(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))
                     .vjp(|inputs| function.call(inputs))
                     .unwrap();
-                let gradient = pullback.apply(inputs[3].clone()).unwrap();
+                let gradient = pullback.apply_materialized(inputs[3].clone()).unwrap();
                 // The query component of the full VJP is the partial derivative with respect to the query;
                 // making key/value cotangents available does not change this component.
                 Ok(vec![output, gradient.query])

@@ -1322,7 +1322,7 @@ where
                 )?;
                 let output = ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from)?;
                 let seed = ProjectedContext::<_, ArrayType>::new(context).gradient_seed(&output, false)?.into_value();
-                let gradients = pullback.apply(seed)?;
+                let gradients = pullback.apply_materialized(seed)?;
                 let gradients = gradients
                     .into_iter()
                     .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
@@ -5486,6 +5486,42 @@ mod tests {
 
         assert_eq!(read_f32_array(&client, &primal_output), vec![5.0]);
         assert_eq!(read_f32_array(&client, &tangent_output), vec![4.0]);
+    }
+
+    #[test]
+    fn test_gradient_method_materializes_disconnected_symbolic_input() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaSession::new(&client).domain();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
+            compile(|(_, live)| live, (dynamic_type, scalar_type.clone()), &engine, mesh.clone()).unwrap();
+        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compiled.gradient(&engine).unwrap();
+        let concrete_type = ArrayType::new(DataType::F32, Shape::new(vec![3.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let disconnected = XlaArray::from_host_buffer(
+            &engine,
+            concrete_type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&[2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let live =
+            XlaArray::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+        let (zero, one) = engine.interpret(&gradient.executable_function(), (disconnected, live)).unwrap();
+        assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &one), vec![1.0]);
     }
 
     #[test]

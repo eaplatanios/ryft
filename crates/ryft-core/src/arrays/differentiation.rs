@@ -950,9 +950,13 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dynamic = context.input(dynamic_type.clone().into());
         let scalar = context.input(scalar_type.clone().into());
-        let primals = vec![dynamic, scalar];
-        let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), primals.clone(), ()).unwrap();
+        let (_, pullback) = context
+            .vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic.clone(), scalar], ())
+            .unwrap();
         assert!(pullback.residuals().is_empty());
+
+        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as an extent source.
+        assert_eq!(pullback.extent_sources(), &[Some(dynamic), None]);
         let transposed = pullback.transposed_program(&[]).unwrap();
         assert!(transposed.program().instructions().is_empty());
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
@@ -960,7 +964,7 @@ mod tests {
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
         assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type.cotangent().unwrap().into()));
         assert!(context.builder().borrow().instructions().is_empty());
-        let materialized = pullback.materialize_cotangents(cotangents, &primals).unwrap();
+        let materialized = pullback.materialize_cotangents(cotangents).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -991,14 +995,18 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let dynamic = context.input(dynamic_type.clone());
         let scalar = context.input(scalar_type.clone());
-        let primals = vec![dynamic, scalar];
-        let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), primals.clone(), ()).unwrap();
+        let (_, pullback) = context
+            .vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic.clone(), scalar], ())
+            .unwrap();
         assert!(pullback.residuals().is_empty());
+
+        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as an extent source.
+        assert_eq!(pullback.extent_sources(), &[Some(dynamic), None]);
         let cotangent = context.input(scalar_type);
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
         assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type));
         assert!(context.builder().borrow().instructions().is_empty());
-        let materialized = pullback.materialize_cotangents(cotangents, &primals).unwrap();
+        let materialized = pullback.materialize_cotangents(cotangents).unwrap();
         let program = context
             .builder()
             .borrow()

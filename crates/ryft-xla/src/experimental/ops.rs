@@ -975,8 +975,8 @@ pub(crate) mod tests {
         ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
-        StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation, TypeError,
-        TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
+        StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent,
+        TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
     };
 
     use crate::XlaArray;
@@ -1600,7 +1600,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_xla_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
+    fn test_xla_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1615,18 +1615,20 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        // The XLA operation family preserves the core transform contract: only the runtime extent crosses the
-        // residual boundary, and the mixed zero consumes it when the disconnected cotangent is materialized.
+        // A disconnected cotangent remains structural and spends no extent residual or executable output.
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 1);
-        assert!(matches!(
-            linearization.primal().instructions().last().unwrap().operation(),
-            XlaOperation::DimensionSize(_)
-        ));
-        let pullback = linearization.pullback().unwrap().into_program();
-        let zero = pullback.instructions().last().unwrap();
-        assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
-        assert_eq!(zero.inputs(), &[ryft_core::AtomId::new(1)]);
+        assert_eq!(linearization.residual_count(), 0);
+        assert!(linearization.primal().instructions().is_empty());
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+            lambda %0:f64[] .
+            in (%0)
+        "}
+            .trim_end()
+        );
     }
 
     #[test]

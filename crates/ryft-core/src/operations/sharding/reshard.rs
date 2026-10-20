@@ -956,7 +956,7 @@ mod tests {
         let input_cotangent_type = input.r#type().cotangent().unwrap();
         let (output, pullback) = differentiate_at(input).vjp(|x| x.reshard(&target)).unwrap();
         let cotangent = pullback
-            .apply(Array::from_elements::<f64>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
+            .apply_materialized(Array::from_elements::<f64>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
             .unwrap();
         assert_eq!(cotangent.r#type().as_ref(), &input_cotangent_type);
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
@@ -997,7 +997,7 @@ mod tests {
         let (output, pullback) = differentiate_at(input).vjp(|x| x.reshard(&target)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&target));
         let cotangent = pullback
-            .apply(Array::from_elements::<f64>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
+            .apply_materialized(Array::from_elements::<f64>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
             .unwrap();
         assert_eq!(cotangent.r#type().as_ref(), &input_cotangent_type);
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
@@ -1027,7 +1027,7 @@ mod tests {
         .unwrap();
         let (output, pullback) = differentiate_at(input.clone()).vjp(|x| x.reshard(&target)).unwrap();
         let cotangent = pullback
-            .apply(Array::from_elements::<f32>(output.r#type().cotangent().unwrap(), &[1.0; 2]).unwrap())
+            .apply_materialized(Array::from_elements::<f32>(output.r#type().cotangent().unwrap(), &[1.0; 2]).unwrap())
             .unwrap();
         assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent().unwrap());
         assert_eq!(cotangent.to_f64s(), vec![1.0; 2]);

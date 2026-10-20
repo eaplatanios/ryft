@@ -17,9 +17,15 @@ use crate::programs::types::Typed;
 /// corresponding derivative is zero *by construction* (e.g., a disconnected input, a severed tangent, an unused output,
 /// etc.), and is not a runtime value that happens to contain zeros. Differentiation rules branch on the variant to skip
 /// work entirely. A rule that sees a zero tangent or cotangent emits no operations for it, and "zero-ness" propagates
-/// transitively through rules without ever inspecting a program or materializing a buffer. A zero is _materialized_
-/// into a real value only at boundaries where one is structurally required (e.g., a nested sub-program input, a
-/// program output, or an eagerly returned tangent), which is also where its carried [`Type`](crate::Type) is consumed.
+/// transitively through rules without ever inspecting a program or materializing a buffer.
+///
+/// A structural zero becomes a value at the consumer that owns a source for its runtime extents. Callable pullbacks
+/// preserve structural zeros across their output boundary and retain the primal inputs that supply symbolic extents,
+/// from which [`Pullback::materialize_cotangents`](crate::Pullback::materialize_cotangents) and scalar-gradient entry
+/// points materialize them. A nested region materializes a zero inside itself when its boundary requires a value,
+/// such as a scan carry or a condition branch paired with a nonzero branch. The
+/// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol constructs the value from the consumer's available
+/// sources without threading extra program residuals solely for a disconnected cotangent.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum MaybeZero<V: Typed> {
     /// Structural zero of the carried [`Type`](crate::Type) (i.e., no value exists and nothing has been staged or

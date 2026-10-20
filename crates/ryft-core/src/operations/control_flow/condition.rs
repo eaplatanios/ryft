@@ -10158,14 +10158,9 @@ mod tests {
     #[test]
     fn test_composite_condition_linearization_transposes_checked_casts_over_symbolic_inputs() {
         // The `true` branch narrows `x: f32[n]` to `f32[2]` with a checked cast, while the `false` branch returns `y`.
-        // Linearization retains a `dimension<n>` read from `x` as the witness of the tangent cast in the `true` branch,
-        // and another one in the `false` branch, in which `x` is disconnected and its cotangent zero needs the runtime
-        // value of `n`. The placeholder of each edge in the peer branch is that non-zeroable `dimension<n>`, read from
-        // the known `x` directly. Transposing the `true` branch converts the cotangent back to `f32[n]` with its
-        // retained extent. Transposing the `false` branch gathers dimension sources from its known inputs in input
-        // order, so it constructs the zero cotangent of `x` from the first edge that carries `n` (i.e., the `true`
-        // branch's witness slot, `%1`), and its own edge (`%2`) is a dead residual. This is sound because both edges
-        // carry the same identity and the zero only reads its extent.
+        // Linearization retains one dimension<n> witness for the true branch's tangent cast. The false branch
+        // supplies that witness's placeholder by reading x. Its disconnected x needs no separate residual. Condition
+        // transposition still materializes branch outputs in this phase, using the shared witness for its zero.
         type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
@@ -10187,59 +10182,57 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[n], %2:f32[2] .
-                let %3:f32[2], %4:dimension<n ∈ [1, 8)>, %5:dimension<n ∈ [1, 8)> = condition %0 %1 %2 [
+                let %3:f32[2], %4:dimension<n ∈ [1, 8)> = condition %0 %1 %2 [
                     true={
                         lambda %0:f32[n], %1:f32[2] .
                         let %2:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %0
                             %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                            %4:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                        in (%2, %3, %4)
+                        in (%2, %3)
                     },
                     false={
                         lambda %0:f32[n], %1:f32[2] .
                         let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                            %3:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                        in (%1, %2, %3)
+                        in (%1, %2)
                     },
                 ]
-                in (%3, %0, %4, %5)"},
+                in (%3, %0, %4)"},
         );
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-                lambda %0:f32[n], %1:f32[2], %2:bool[], %3:dimension<n ∈ [1, 8)>, %4:dimension<n ∈ [1, 8)> .
-                let %5:f32[2] = condition %2 %0 %1 %3 %4 [
+                lambda %0:f32[n], %1:f32[2], %2:bool[], %3:dimension<n ∈ [1, 8)> .
+                let %4:f32[2] = condition %2 %0 %1 %3 [
                     true={
-                        lambda %0:f32[n], %1:f32[2], %2:dimension<n ∈ [1, 8)>, %3:dimension<n ∈ [1, 8)> .
-                        let %4:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %0 %2
-                        in (%4)
+                        lambda %0:f32[n], %1:f32[2], %2:dimension<n ∈ [1, 8)> .
+                        let %3:f32[2] = cast [type=f32[2], inputs=[f32[n], dimension<n ∈ [1, 8)>]] %0 %2
+                        in (%3)
                     },
                     false={
-                        lambda %0:f32[n], %1:f32[2], %2:dimension<n ∈ [1, 8)>, %3:dimension<n ∈ [1, 8)> .
+                        lambda %0:f32[n], %1:f32[2], %2:dimension<n ∈ [1, 8)> .
                         in (%1)
                     },
                 ]
-                in (%5)"},
+                in (%4)"},
         );
         let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f32[2], %1:bool[], %2:dimension<n ∈ [1, 8)>, %3:dimension<n ∈ [1, 8)> .
-                let %4:f32[n], %5:f32[2] = condition %1 %0 %2 %3 [
+                lambda %0:f32[2], %1:bool[], %2:dimension<n ∈ [1, 8)> .
+                let %3:f32[n], %4:f32[2] = condition %1 %0 %2 [
                     true={
-                        lambda %0:f32[2], %1:dimension<n ∈ [1, 8)>, %2:dimension<n ∈ [1, 8)> .
-                        let %3:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %1
-                            %4:f32[2] = zero [type=f32[2]]
-                        in (%3, %4)
+                        lambda %0:f32[2], %1:dimension<n ∈ [1, 8)> .
+                        let %2:f32[n] = cast [type=f32[n], inputs=[f32[2], dimension<n ∈ [1, 8)>]] %0 %1
+                            %3:f32[2] = zero [type=f32[2]]
+                        in (%2, %3)
                     },
                     false={
-                        lambda %0:f32[2], %1:dimension<n ∈ [1, 8)>, %2:dimension<n ∈ [1, 8)> .
-                        let %3:f32[n] = zero [type=f32[n]] %1
-                        in (%3, %0)
+                        lambda %0:f32[2], %1:dimension<n ∈ [1, 8)> .
+                        let %2:f32[n] = zero [type=f32[n]] %1
+                        in (%2, %0)
                     },
                 ]
-                in (%4, %5)"},
+                in (%3, %4)"},
         );
 
         // At `n = 2` either branch differentiates. At `n = 3` the `true` branch rejects its checked cast, while the
@@ -11034,8 +11027,8 @@ mod tests {
             .unwrap();
         let cotangents = pullback.apply(Array::scalar(5.0).unwrap()).unwrap();
         assert_eq!(output.to_f64s(), vec![8.0]);
-        assert!(cotangents.0.storage_bytes().is_empty());
-        assert_eq!(cotangents.1.to_f64s(), vec![10.0]);
+        assert!(cotangents.0.is_zero());
+        assert_eq!(cotangents.1.as_value().unwrap().to_f64s(), vec![10.0]);
 
         let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
@@ -11056,8 +11049,8 @@ mod tests {
             .unwrap();
         let cotangents = pullback.apply(Array::scalar(5.0).unwrap()).unwrap();
         assert_eq!(output.to_f64s(), vec![12.0]);
-        assert!(cotangents.0.storage_bytes().is_empty());
-        assert_eq!(cotangents.1.to_f64s(), vec![15.0]);
+        assert!(cotangents.0.is_zero());
+        assert_eq!(cotangents.1.as_value().unwrap().to_f64s(), vec![15.0]);
     }
 
     /// Gate measurement for extending the per-[`Region`](crate::Region) transform cache to the `condition`

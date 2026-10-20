@@ -2085,6 +2085,7 @@ mod tests {
     use crate::differentiation::differentiate_at;
     use crate::operations::references::{ReferenceFreeze, ReferenceNew};
     use crate::partial::PartialValue;
+    use crate::programs::MaybeZero;
     use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
@@ -2523,7 +2524,7 @@ mod tests {
         assert_eq!(value, Array::vector(vec![30_f64, 10., 30.]).unwrap());
         assert_eq!(
             pullback.apply(Array::vector(vec![2_f64, 3., 5.]).unwrap()),
-            Ok(Array::vector(vec![3_f64, 0., 7.]).unwrap()),
+            Ok(MaybeZero::Value(Array::vector(vec![3_f64, 0., 7.]).unwrap())),
         );
     }
 

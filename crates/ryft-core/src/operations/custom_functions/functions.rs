@@ -3268,7 +3268,7 @@ mod tests {
             differentiate_at(Array::vector(vec![1.0f64, 2.0]).unwrap()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(
             pullback.apply(Array::vector(vec![1.0f64, 1.0]).unwrap()),
-            Ok(Array::vector(vec![1.0f64.cos(), 2.0f64.cos()]).unwrap()),
+            Ok(MaybeZero::Value(Array::vector(vec![1.0f64.cos(), 2.0f64.cos()]).unwrap())),
         );
 
         // Residual structures are recorded by their flat residual types, so two specializations whose residuals have
@@ -3311,7 +3311,7 @@ mod tests {
         let input = ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0]).unwrap());
         let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64, 4.0]).unwrap());
         let (_, pullback) = differentiate_at(input).vjp(|x| function.call(x)).unwrap();
-        assert_eq!(pullback.apply(seed.clone()), Ok(seed));
+        assert_eq!(pullback.apply(seed.clone()), Ok(MaybeZero::Value(seed)));
     }
 
     #[test]
@@ -3417,7 +3417,7 @@ mod tests {
                 CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             ),
-            Ok((None, Some(ArrayIrValue::Array(Array::scalar(0.5f32.cos() * 2.0).unwrap())))),
+            Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(0.5f32.cos() * 2.0).unwrap()))))),
         );
         assert_eq!(stash.read(), Ok(Array::scalar(2.0f32).unwrap()));
 
@@ -3427,7 +3427,7 @@ mod tests {
                 CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             ),
-            Ok((None, Some(ArrayIrValue::Array(Array::scalar(0.5f32.cos() * 3.0).unwrap())))),
+            Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(0.5f32.cos() * 3.0).unwrap()))))),
         );
         assert_eq!(stash.read(), Ok(Array::scalar(3.0f32).unwrap()));
 
@@ -3731,7 +3731,7 @@ mod tests {
         let (_, vjp) = ArrayContext::trace(
             |(x, seed): (Tracer, Tracer)| {
                 let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
-                Ok((y, pullback.apply(seed)?))
+                Ok((y, pullback.apply_materialized(seed)?))
             },
             (symbolic_type.clone(), ArrayType::new_static(DataType::F64, [2])),
         )
@@ -3810,7 +3810,7 @@ mod tests {
             |(x, seed): (Tracer, Tracer)| {
                 let (y, pullback) = differentiate_at(x)
                     .vjp(|x| Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), None)?))?;
-                Ok((y, pullback.apply(seed)?))
+                Ok((y, pullback.apply_materialized(seed)?))
             },
             (batched_type, ArrayType::new_static(DataType::F64, [3, 2])),
         )
@@ -3852,11 +3852,11 @@ mod tests {
         assert_eq!(cosine, Array::scalar(0.5f64.cos()).unwrap());
         assert_eq!(
             pullback.apply((Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap())),
-            Ok(Array::scalar(2.0 * 0.5f64.cos()).unwrap()),
+            Ok(MaybeZero::Value(Array::scalar(2.0 * 0.5f64.cos()).unwrap())),
         );
         assert_eq!(
             pullback.apply((Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap())),
-            Ok(Array::scalar(3.0 * 0.5f64.sin()).unwrap()),
+            Ok(MaybeZero::Value(Array::scalar(3.0 * 0.5f64.sin()).unwrap())),
         );
     }
 
@@ -3932,7 +3932,7 @@ mod tests {
             .with_vjp(|token| Ok((token.clone(), token)), |_residual, cotangent| Ok(cotangent));
         let (value, pullback) = differentiate_at(token.clone()).vjp(|token| function.call(token)).unwrap();
         assert_eq!(value, token);
-        assert_eq!(pullback.apply(zero.clone()), Ok(zero));
+        assert_eq!(pullback.apply(zero.clone()), Ok(MaybeZero::Zero(zero.r#type().into_owned())));
     }
 
     #[test]
@@ -3995,7 +3995,7 @@ mod tests {
                 CotangentSeed::Value(seed),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             ),
-            Ok((None, Some(ArrayIrValue::Array(Array::scalar(9.0f32).unwrap())))),
+            Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(9.0f32).unwrap()))))),
         );
 
         // A numerical zero is still a live seed. Dropping every returned gradient must not erase the stash write.
@@ -4065,7 +4065,7 @@ mod tests {
         let input = ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0]).unwrap());
         let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64, 4.0]).unwrap());
         let (_, pullback) = differentiate_at(input).vjp(|x| function.call(x)).unwrap();
-        assert_eq!(pullback.apply(seed.clone()), Ok(seed));
+        assert_eq!(pullback.apply(seed.clone()), Ok(MaybeZero::Value(seed)));
     }
 
     #[test]
@@ -4134,7 +4134,7 @@ mod tests {
                     CotangentDestination::Return
                 ),
             ),
-            Ok((None, Some(vector([0.0, 5.0, 0.0, 0.0])))),
+            Ok((None, Some(MaybeZero::Value(vector([0.0, 5.0, 0.0, 0.0]))))),
         );
         assert_eq!(buffer.read(), Ok(Array::vector(vec![1.0f64, 6.0, 1.0, 1.0]).unwrap()));
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
@@ -4148,12 +4148,12 @@ mod tests {
                     CotangentDestination::Return
                 ),
             ),
-            Ok((None, Some(vector([0.0, 5.0, 0.0, 0.0])))),
+            Ok((None, Some(MaybeZero::Value(vector([0.0, 5.0, 0.0, 0.0]))))),
         );
         assert_eq!(buffer.read(), Ok(Array::vector(vec![1.0f64, 11.0, 1.0, 1.0]).unwrap()));
         assert_eq!(
             pullback.apply_with_destinations(seed(), (CotangentDestination::Ignore, CotangentDestination::Return)),
-            Ok((None, Some(vector([0.0, 5.0, 0.0, 0.0])))),
+            Ok((None, Some(MaybeZero::Value(vector([0.0, 5.0, 0.0, 0.0]))))),
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 2);
 
@@ -4191,7 +4191,7 @@ mod tests {
         let input = ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0]).unwrap());
         let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64, 4.0]).unwrap());
         let (_, pullback) = differentiate_at(input).vjp(|x| function.call(x)).unwrap();
-        assert_eq!(pullback.apply(seed.clone()), Ok(seed));
+        assert_eq!(pullback.apply(seed.clone()), Ok(MaybeZero::Value(seed)));
     }
 
     #[test]

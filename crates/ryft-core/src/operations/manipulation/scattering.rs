@@ -4399,7 +4399,7 @@ mod tests {
                         &ScatterOptions::new().with_unique_indices(true),
                     )
                 })?;
-                pullback.apply(seed)
+                pullback.apply_materialized(seed)
             })
             .unwrap();
         assert_eq!(gradient, Array::vector(vec![6.0_f64]).unwrap());

@@ -2258,19 +2258,14 @@ where
                 let cotangents = backward.interpret_in_context(&**context, backward_inputs)?;
                 check_count!("output", cotangents, self.input_tangent_types.len(), ProgramError);
 
-                // Leading inputs are known and contribute nothing. Preserve symbolic zeros reported by the backward
-                // program when their types suffice to reconstruct them. A dynamic zero must retain the already
-                // materialized value as its extent inputs live in this carrier's leading graph and may otherwise
-                // disappear before the outer pullback constructs its disconnected-input zeros.
+                // Leading inputs are known and contribute nothing. Preserve structural zeros reported by the
+                // backward program, including zeros whose runtime extents belong to the caller's primal inputs.
                 return inputs[self.leading_input_count..]
                     .iter()
                     .zip(cotangents)
                     .zip(output_is_zero)
                     .zip(&accumulators[self.leading_input_count..])
-                    .filter(|(((input, cotangent), is_zero), _)| {
-                        input.is_unknown()
-                            && (!is_zero || !O::zero_residual_types(cotangent.r#type().as_ref()).is_empty())
-                    })
+                    .filter(|(((input, _), is_zero), _)| input.is_unknown() && !is_zero)
                     .try_for_each(|(((_, cotangent), _), accumulator)| {
                         accumulator.accumulate(context, MaybeZero::Value(cotangent))
                     });
@@ -2873,7 +2868,7 @@ mod tests {
     use crate::differentiation::forward::JvpPartitionTransform;
     use crate::differentiation::{
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, ForwardModeDifferentiate,
-        ReverseModeDifferentiate, TransposedProgram, TranspositionDriver, differentiate_at,
+        ReverseModeDifferentiate, TransposedProgram, TransposedProgramCotangent, TranspositionDriver, differentiate_at,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -3628,7 +3623,7 @@ mod tests {
             x,
             (),
         )?;
-        Ok((outputs, pullback.apply(vec![seed])?))
+        Ok((outputs, pullback.apply_materialized(vec![seed])?))
     }
 
     /// Batches `program` over a batch axis of size `extent` with the provided input batch axes.
@@ -5614,7 +5609,10 @@ mod tests {
         assert_eq!(value, Array::vector(vec![7.0, 7.0, 7.0]).unwrap());
         assert_eq!(
             pullback.apply(Array::vector(vec![1.0, 2.0, 4.0]).unwrap()),
-            Ok((Array::vector(vec![0.0, 0.0, 0.0]).unwrap(), Array::scalar(28.0).unwrap())),
+            Ok((
+                MaybeZero::Zero(ArrayType::new_static(DataType::F64, [3])),
+                MaybeZero::Value(Array::scalar(28.0).unwrap())
+            )),
         );
     }
 
@@ -6247,7 +6245,7 @@ mod tests {
                         .bind(ArrayOperation::CustomFunction(operation.clone()), regions.clone(), &[x.clone()])?
                         .remove(0))
                 })
-                .and_then(|(value, pullback)| Ok((value, pullback.apply(Array::scalar(1f64).unwrap())?)));
+                .and_then(|(value, pullback)| Ok((value, pullback.apply_materialized(Array::scalar(1f64).unwrap())?)));
             match gradient {
                 Ok(gradient) => {
                     assert_eq!(result, Ok((Array::scalar(x.sin()).unwrap(), Array::scalar(gradient).unwrap())));
@@ -6446,7 +6444,7 @@ mod tests {
                     CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())),
                     (CotangentDestination::Ignore, CotangentDestination::Return),
                 ),
-                Ok((None, Some(ArrayIrValue::Array(Array::scalar(6.0f32).unwrap())))),
+                Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()))))),
             );
             assert_eq!(counter.read(), Ok(Array::scalar(application as f32).unwrap()));
         }
@@ -6597,7 +6595,7 @@ mod tests {
                         Ok(y.context().bind(operation, regions, &[y.clone()])?.remove(0))
                     })
                     .unwrap();
-                pullback.apply(seed)
+                pullback.apply_materialized(seed)
             })
             .unwrap();
         assert_eq!(cotangent, Array::scalar(2.0 * 0.7f64.cos() * 3.0).unwrap());
@@ -7480,14 +7478,14 @@ mod tests {
                 CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             ),
-            Ok((None, Some(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())))),
+            Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()))))),
         );
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             ),
-            Ok((None, Some(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap())))),
+            Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()))))),
         );
         assert_eq!(counter.read(), Ok(Array::scalar(3.0f32).unwrap()));
     }
@@ -7669,7 +7667,7 @@ mod tests {
                         .bind(operation, vec![member_cube_program(&scalar_type)], &[input.clone()])?
                         .remove(0))
                 })
-                .and_then(|(value, pullback)| Ok((value, pullback.apply(Array::scalar(1f64).unwrap())?)));
+                .and_then(|(value, pullback)| Ok((value, pullback.apply_materialized(Array::scalar(1f64).unwrap())?)));
             match gradient {
                 Ok(gradient) => assert_eq!(
                     result,
@@ -8020,7 +8018,7 @@ mod tests {
             vjp(&definition),
             Ok((
                 ArrayIrValue::Array(Array::scalar(4.0f32).unwrap()),
-                Some(ArrayIrValue::Array(Array::scalar(6.0f32).unwrap())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()))),
             )),
         );
 
@@ -9006,6 +9004,52 @@ mod tests {
             rule_context.take_cotangents(&accumulators).unwrap()
         };
         assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
+    }
+
+    #[test]
+    fn test_custom_function_transpose_transposition_dynamic_structural_zero() {
+        // An attached backward region returns a canonical zero built from its retained dimension. Its dynamic type
+        // does not require accumulating the zero as a live value or returning it across the transposed boundary.
+        type IrValue = ArrayIrValue<Array>;
+        type IrOperation = ArrayIrOperation<Array>;
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent_type.simplified_dimension()]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut backward = ProgramBuilder::<IrValue, IrOperation>::new();
+        let extent = backward.add_input(extent_type.clone().into());
+        backward.add_input(scalar_type.clone().into());
+        let zero = backward
+            .add_instruction(ZeroOperation::new(input_type.clone()), Vec::new(), vec![extent], None)
+            .unwrap()[0];
+        let backward = backward
+            .build::<Vec<IrValue>, Vec<IrValue>>(vec![zero], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<IrValue, IrOperation>::new();
+        let extent = builder.add_input(extent_type.into());
+        let tangent = builder.add_input(input_type.clone().into());
+        let backward = builder.import_program(backward);
+        let carrier = CustomFunctionTransposeOperation::<IrValue, IrOperation>::from_backward_region(
+            1,
+            vec![input_type.clone().into()],
+            vec![scalar_type.clone().into()],
+        );
+        let output = builder.add_instruction(carrier, vec![backward], vec![extent, tangent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<IrValue>, Vec<IrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:dimension<extent ∈ [1, 8)> .
+                let %2:f32[extent] = zero [type=f32[extent]] %1
+                in ()"},
+        );
+        assert_eq!(
+            transposed.assemble_cotangents(&[input_type.clone().into()], Vec::<IrValue>::new()),
+            Ok(vec![Some(MaybeZero::Zero(ArrayIrType::Array(input_type)))]),
+        );
     }
 
     #[test]

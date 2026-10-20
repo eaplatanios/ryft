@@ -2368,7 +2368,7 @@ fn test_downstream_reference_universe_vjp_through_the_public_boundary() {
                 CotangentDestination::Return
             ),
         ),
-        Ok((None, Some(RegisterValue::Register(12)))),
+        Ok((None, Some(MaybeZero::Value(RegisterValue::Register(12))))),
     );
     assert_eq!(destination.read(), Ok(RegisterValue::Register(12)));
 
@@ -2378,7 +2378,7 @@ fn test_downstream_reference_universe_vjp_through_the_public_boundary() {
             CotangentSeed::Value(RegisterValue::Register(2)),
             (CotangentDestination::Ignore, CotangentDestination::Return),
         ),
-        Ok((None, Some(RegisterValue::Register(2)))),
+        Ok((None, Some(MaybeZero::Value(RegisterValue::Register(2))))),
     );
 }
 
@@ -2396,7 +2396,7 @@ fn test_downstream_reference_universe_vjp_with_a_local_allocation() {
         })
         .unwrap();
     assert_eq!(value, RegisterValue::Register(3));
-    assert_eq!(pullback.apply(RegisterValue::Register(7)), Ok(RegisterValue::Register(7)));
+    assert_eq!(pullback.apply(RegisterValue::Register(7)), Ok(MaybeZero::Value(RegisterValue::Register(7))));
 }
 
 #[test]
@@ -2716,7 +2716,11 @@ fn test_downstream_folded_dynamic_view_vjp() {
                 CotangentDestination::Return,
             ),
         ),
-        Ok((None, Some(RegisterValue::Register(1)), Some(RegisterValue::Register(0)))),
+        Ok((
+            None,
+            Some(MaybeZero::Value(RegisterValue::Register(1))),
+            Some(MaybeZero::Zero(RegisterIrType::Register(RegisterType))),
+        )),
     );
     assert_eq!(destination.read(), Ok(RegisterValue::Register(8)));
 }

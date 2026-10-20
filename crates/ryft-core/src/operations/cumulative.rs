@@ -3184,11 +3184,14 @@ mod tests {
         let (_, pullback) = differentiate_at(input.clone())
             .vjp(|input| associative_scan(&input, 0, false, &|left, right| left.add(right)))
             .unwrap();
-        assert_eq!(pullback.apply(cotangent.clone()), Ok(Array::vector(vec![15.0, 14.0, 12.0, 9.0, 5.0]).unwrap()));
+        assert_eq!(
+            pullback.apply_materialized(cotangent.clone()),
+            Ok(Array::vector(vec![15.0, 14.0, 12.0, 9.0, 5.0]).unwrap())
+        );
         let (_, pullback) = differentiate_at(input)
             .vjp(|input| associative_scan(&input, 0, true, &|left, right| left.add(right)))
             .unwrap();
-        assert_eq!(pullback.apply(cotangent), Ok(Array::vector(vec![1.0, 3.0, 6.0, 10.0, 15.0]).unwrap()));
+        assert_eq!(pullback.apply_materialized(cotangent), Ok(Array::vector(vec![1.0, 3.0, 6.0, 10.0, 15.0]).unwrap()));
 
         // A running product is non-linear, so its pullback goes through the transposed linearization, which, for a unit
         // cotangent, accumulates each prefix product divided by the factor it is differentiated with respect to.
@@ -3197,7 +3200,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap());
         assert_eq!(
-            pullback.apply(Array::vector(vec![1.0; 4]).unwrap()),
+            pullback.apply_materialized(Array::vector(vec![1.0; 4]).unwrap()),
             Ok(Array::vector(vec![33.0, 16.0, 10.0, 6.0]).unwrap()),
         );
     }

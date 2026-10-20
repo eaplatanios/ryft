@@ -7182,7 +7182,7 @@ mod tests {
                     let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                     value.dynamic_slice(&[start], &[1])
                 })?;
-                pullback.apply(seed)
+                pullback.apply_materialized(seed)
             },
             input.clone(),
             BatchAxis::new(0),
@@ -7207,7 +7207,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             pullback.apply(Array::matrix(2, 1, vec![2.0_f32, 2.0]).unwrap()),
-            Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0]).unwrap()),
+            Ok(MaybeZero::Value(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0]).unwrap())),
         );
     }
 
@@ -7222,7 +7222,7 @@ mod tests {
                     let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                     (value.clone() * value).dynamic_slice(&[start], &[1])
                 })?;
-                pullback.apply(seed)
+                pullback.apply_materialized(seed)
             })
             .unwrap();
         assert_eq!(gradient, Array::vector(vec![0.0_f32, 10.0, 0.0]).unwrap());
@@ -7235,12 +7235,12 @@ mod tests {
                     let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                     (value.clone() * value).dynamic_slice(&[start], &[1])
                 })?;
-                pullback.apply(seed)
+                pullback.apply_materialized(seed)
             })
             .unwrap();
         assert_eq!(
             pullback.apply(Array::vector(vec![1.0_f32; 3]).unwrap()),
-            Ok(Array::vector(vec![0.0_f32, 2.0, 0.0]).unwrap()),
+            Ok(MaybeZero::Value(Array::vector(vec![0.0_f32, 2.0, 0.0]).unwrap())),
         );
     }
 
@@ -7548,7 +7548,7 @@ mod tests {
         let result = batch(
             |(value, destination)| {
                 let seed = value.context().lift(ArrayIrValue::Array(Array::vector(vec![2.0_f32]).unwrap()))?;
-                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                let (_, pullback) = differentiate_at(value.clone()).vjp(|value| {
                     let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32).unwrap()))?;
                     Ok(value
                         .context()
@@ -7607,7 +7607,7 @@ mod tests {
                         &[selected.clone(), selected.clone()],
                     )?
                     .remove(0);
-                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                let (_, pullback) = differentiate_at(value.clone()).vjp(|value| {
                     let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32).unwrap()))?;
                     Ok(value
                         .context()
@@ -7631,7 +7631,7 @@ mod tests {
         // outer pullback must differentiate the emitted buffer read/update/write operations as well.
         assert_eq!(
             pullback.apply(ArrayIrValue::Array(Array::vector(vec![1.0_f32; 3]).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 10.0, 0.0]).unwrap())),
+            Ok(MaybeZero::Value(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 10.0, 0.0]).unwrap()))),
         );
     }
 

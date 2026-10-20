@@ -1292,7 +1292,7 @@ fn test_dot_transposition_prunes_unrequested_pullback_gradient() {
             CotangentSeed::Value(Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]).unwrap()),
             (CotangentDestination::Return, CotangentDestination::Ignore),
         ),
-        Ok((Some(Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]).unwrap()), None))
+        Ok((Some(MaybeZero::Value(Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]).unwrap())), None))
     );
 }
 

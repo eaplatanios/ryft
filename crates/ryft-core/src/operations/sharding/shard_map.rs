@@ -184,7 +184,7 @@ use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -4726,10 +4726,10 @@ struct TransposedShardMap<V: Value, O> {
 /// reference outputs with [`Program::with_outputs`], which keeps the whole input boundary and every instruction with
 /// observable effects or deferred work. Zero output cotangents therefore never enter the transposed body, and the
 /// transposition engine propagates their absence symbolically: an input that only those outputs depend on (e.g.,
-/// through `neg` or `add`) is disconnected from the projected body, so the transposed program produces its cotangent as
-/// a canonical `zero`, which is then a structural zero like any other. This is the analogue of JAX's
-/// `_shard_map_transpose`, which runs the body's backward pass on symbolic zero output cotangents. A projected body is
-/// a fresh program, so its transposition does not share the body region's retained transform cache.
+/// through `neg` or `add`) is disconnected from the projected body, so transposition records its cotangent as a
+/// structural zero in the result metadata and omits its output without constructing a zero. This is the analogue of
+/// JAX's `_shard_map_transpose`, which runs the body's backward pass on symbolic zero output cotangents. A projected
+/// body is a fresh program, so its transposition does not share the body region's retained transform cache.
 ///
 /// # Parameters
 ///
@@ -4789,40 +4789,14 @@ where
     } else {
         body
     };
-    let mut transposed_program = driver
-        .transpose_program(body, &input_indices, &vec![true; input_indices.len()], &selected_destination_kinds)?
-        .into_program();
+    let transposed = driver.transpose_program(body, &input_indices, &[], &selected_destination_kinds)?;
+    let mut zero_input_cotangents = vec![false; input_linearity.len()];
+    for (&index, slot) in input_indices.iter().zip(transposed.cotangents()) {
+        zero_input_cotangents[index] = *slot == TransposedProgramCotangent::Zero;
+    }
+    let mut transposed_program = transposed.into_program();
     let nonzero_seed_count = zero_output_cotangents.iter().filter(|zero| !**zero).count();
     let shard_map = operation.shard_map();
-
-    // The transposed program returns one output per linear input with a `Return` destination or with a `Reference`
-    // destination of a reference input, in input order. A `Return` cotangent that it produces as a structural zero
-    // (i.e., through a zero-producing instruction or as a zero constant) is not an output of the transposed boundary,
-    // so the caller receives it as a symbolic zero rather than as materialized global zeros, as JAX's
-    // `_shard_map_transpose` binds the transposed map over its nonzero input cotangents only (`left_specs_nz`).
-    let region = transposed_program.entry_region_ref();
-    let mut transposed_outputs = region.output_ids().iter();
-    let zero_input_cotangents = (0..input_linearity.len())
-        .map(|index| {
-            let has_output = input_linearity[index]
-                && (destination_kinds[index] == CotangentDestinationKind::Return
-                    || (destination_kinds[index] == CotangentDestinationKind::Reference
-                        && operation.input_types[index].is_reference()));
-            if !has_output {
-                return false;
-            }
-            let output = *transposed_outputs.next().unwrap();
-            destination_kinds[index] == CotangentDestinationKind::Return
-                && (region.atoms()[output.index()].as_constant().is_some_and(Value::is_zero)
-                    || region.instructions().iter().any(|instruction| {
-                        instruction
-                            .outputs()
-                            .iter()
-                            .position(|candidate| *candidate == output)
-                            .is_some_and(|output_index| instruction.operation().is_zero(output_index))
-                    }))
-        })
-        .collect::<Vec<_>>();
 
     // The replicated destinations of inputs that the body does not mutate accumulate locally: each device accumulates
     // its contribution into fresh local state, and only the enclosing map updates the caller's destination once.
@@ -4830,7 +4804,7 @@ where
     // already aggregate the contributions: an invariant primal read passed through `parallel_vary` transposes to the
     // mesh-form sum `parallel_reduce`, so the boundary performs no reduction and no output-seed normalization of its
     // own.
-    if local_accumulators.contains(&true) || zero_input_cotangents.contains(&true) {
+    if local_accumulators.contains(&true) {
         let mut builder = ProgramBuilder::new();
         let local_destinations = destination_kinds
             .iter()
@@ -4881,6 +4855,7 @@ where
                 None
             };
             if !linear
+                || zero_input_cotangents[index]
                 || destination_kinds[index] == CotangentDestinationKind::Ignore
                 || (destination_kinds[index] == CotangentDestinationKind::Reference
                     && !operation.input_types[index].is_reference()
@@ -4898,10 +4873,6 @@ where
             } else {
                 outputs.next().unwrap()
             };
-            // A structurally zero cotangent is dropped, and simplification removes the zero that produced it.
-            if zero_input_cotangents[index] {
-                continue;
-            }
             if local_accumulators[index] {
                 let freeze = ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new();
                 output = builder.add_instruction(freeze, Vec::new(), vec![output], None)?[0];
@@ -4909,7 +4880,6 @@ where
             rebuilt_outputs.push(output);
         }
         let output_count = rebuilt_outputs.len();
-        // Simplification drops the zeros that produced the dropped structurally zero cotangents.
         transposed_program = Arc::new(
             builder
                 .build(rebuilt_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
@@ -5251,7 +5221,7 @@ mod tests {
         source: TestProgram,
 
         /// Predetermined transposed program returned by the recursive request.
-        transposed: TestProgram,
+        transposed: TransposedProgram<TestValue, TestOperation>,
     }
 
     impl RegionDriver<TestValue, TestOperation> for TestTranspositionDriver {
@@ -5267,28 +5237,12 @@ mod tests {
     impl TranspositionDriver<TestValue, TestOperation> for TestTranspositionDriver {
         fn transpose_program(
             &self,
-            region: RegionRef<'_, TestValue, TestOperation>,
-            input_indices: &[usize],
+            _region: RegionRef<'_, TestValue, TestOperation>,
+            _input_indices: &[usize],
             _materialize_zeros: &[bool],
-            destination_kinds: &[CotangentDestinationKind],
+            _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<TransposedProgram<TestValue, TestOperation>, DifferentiationError> {
-            let input_types = region.input_types();
-            let cotangents = input_indices
-                .iter()
-                .enumerate()
-                .map(|(index, &input_index)| {
-                    match destination_kinds.get(index).copied().unwrap_or(CotangentDestinationKind::Return) {
-                        CotangentDestinationKind::Return => TransposedProgramCotangent::Output,
-                        CotangentDestinationKind::Reference if input_types[input_index].is_reference() => {
-                            TransposedProgramCotangent::Output
-                        }
-                        CotangentDestinationKind::Reference | CotangentDestinationKind::Ignore => {
-                            TransposedProgramCotangent::Absent
-                        }
-                    }
-                })
-                .collect();
-            Ok(TransposedProgram::new(Arc::new(self.transposed.clone()), cotangents)?)
+            Ok(self.transposed.clone())
         }
     }
 
@@ -15100,7 +15054,11 @@ mod tests {
         let cotangent_type = tangent_type.cotangent().unwrap();
         let driver = TestTranspositionDriver {
             source: identity_body(tangent_type.clone()),
-            transposed: identity_body(cotangent_type.clone()),
+            transposed: TransposedProgram::new(
+                Arc::new(identity_body(cotangent_type.clone())),
+                vec![TransposedProgramCotangent::Output],
+            )
+            .unwrap(),
         };
         let shard_map =
             ShardMap::new(manual_mesh(), vec![tangent_sharding.clone()], vec![tangent_sharding], Vec::new()).unwrap();
@@ -15940,7 +15898,11 @@ mod tests {
         let cotangent_type = tangent_type.cotangent().unwrap();
         let driver = TestTranspositionDriver {
             source: identity_body(tangent_type.clone()),
-            transposed: identity_body(cotangent_type.clone()),
+            transposed: TransposedProgram::new(
+                Arc::new(identity_body(cotangent_type.clone())),
+                vec![TransposedProgramCotangent::Output],
+            )
+            .unwrap(),
         };
         let shard_map =
             ShardMap::new(manual_mesh(), vec![tangent_sharding.clone()], vec![tangent_sharding], Vec::new()).unwrap();
@@ -15977,7 +15939,14 @@ mod tests {
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
-        let driver = TestTranspositionDriver { source, transposed: identity_body(local_type) };
+        let driver = TestTranspositionDriver {
+            source,
+            transposed: TransposedProgram::new(
+                Arc::new(identity_body(local_type)),
+                vec![TransposedProgramCotangent::Output],
+            )
+            .unwrap(),
+        };
         let operation = ShardMapOperation::from_boundary(
             shard_map,
             vec![global_type.clone()],
@@ -16057,7 +16026,14 @@ mod tests {
                 )
                 .unwrap()
         };
-        let driver = TestTranspositionDriver { source, transposed: identity_body(value_type.clone()) };
+        let driver = TestTranspositionDriver {
+            source,
+            transposed: TransposedProgram::new(
+                Arc::new(identity_body(value_type.clone())),
+                vec![TransposedProgramCotangent::Output],
+            )
+            .unwrap(),
+        };
         let shard_map =
             ShardMap::new(manual_mesh(), vec![sharding.clone()], vec![sharding.clone(), sharding], Vec::new()).unwrap();
         let operation = ShardMapOperation::from_boundary(
@@ -16173,8 +16149,8 @@ mod tests {
     fn test_shard_map_transposition_returns_input_cotangents_of_zero_output_cotangents_as_structural_zeros() {
         // The body `(x, w) -> (x, w + w)` receives a structurally zero cotangent for its first output, so it is
         // transposed projected onto its second output, from which `x` is disconnected. The transposed body therefore
-        // produces the cotangent of `x` as a canonical `zero`, which is returned as a structural zero outside the map
-        // instead of crossing the transposed boundary as materialized zeros.
+        // records the cotangent of `x` as a structural zero in its metadata, without creating a zero instruction or
+        // returning a value for it across the transposed boundary.
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let global_type = f32_vector_type(2).with_sharding(replicated.clone()).unwrap();
         let shard_map =
@@ -16192,21 +16168,20 @@ mod tests {
         let transposed = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let cotangent = builder.add_input(local_type.clone().into());
-            let zero = builder
-                .add_instruction(
-                    ArrayOperation::Zero(ZeroOperation::new(local_type.clone())),
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                )
-                .unwrap()[0];
             let sum =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![cotangent, cotangent], None).unwrap()[0];
             builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![zero, sum], vec![Placeholder], vec![Placeholder; 2])
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![sum], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let driver = TestTranspositionDriver { source, transposed };
+        let driver = TestTranspositionDriver {
+            source,
+            transposed: TransposedProgram::new(
+                Arc::new(transposed),
+                vec![TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output],
+            )
+            .unwrap(),
+        };
         let operation = ShardMapOperation::from_boundary(
             shard_map,
             vec![global_type.clone(), global_type.clone()],
@@ -16264,10 +16239,9 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_transposition_returns_zero_constant_input_cotangents_as_structural_zeros() {
-        // A transposed body that returns a zero constant as an input cotangent (rather than the output of a
-        // zero-producing instruction) produces a structural zero as well, so the cotangent is returned as a symbolic
-        // zero, and the transposed map, which is then left without outputs and effects, is not staged.
+    fn test_shard_map_transposition_returns_omitted_input_cotangents_as_structural_zeros() {
+        // A transposed body with a structural-zero cotangent in its metadata returns no value for that input. The
+        // map has no outputs or effects and is not staged, without constructing a zero inside the body.
         let sharded = sharded_along_x();
         let global_type = f32_vector_type(4).with_sharding(sharded.clone()).unwrap();
         let shard_map = ShardMap::new(manual_mesh(), vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
@@ -16275,13 +16249,12 @@ mod tests {
         let transposed = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             builder.add_input(local_type.clone().into());
-            let zero = Array::from_elements(local_type.clone(), &[0f32; 2]).unwrap();
-            let zero = builder.add_constant(TestValue::Array(zero));
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![zero], vec![Placeholder], vec![Placeholder])
-                .unwrap()
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(vec![], vec![Placeholder], vec![]).unwrap()
         };
-        let driver = TestTranspositionDriver { source: identity_body(local_type), transposed };
+        let driver = TestTranspositionDriver {
+            source: identity_body(local_type),
+            transposed: TransposedProgram::new(Arc::new(transposed), vec![TransposedProgramCotangent::Zero]).unwrap(),
+        };
         let operation =
             ShardMapOperation::from_boundary(shard_map, vec![global_type.clone()], vec![global_type.clone()]);
         let mut context = TestContext::new();
@@ -16304,7 +16277,8 @@ mod tests {
         // The outer program uses only the second output of the map `(x, w) -> (neg(x), w + w)`, so the cotangent of the
         // first output is a structural zero. The body is transposed projected onto its second output, from which `x`
         // is disconnected, so the transposed map takes and returns only the cotangents of `w` and the cotangent of `x`
-        // is a structural zero, which the outer pullback materializes as a global `zero` at its boundary.
+        // is a structural zero. The raw program transpose API explicitly requests dense outputs and materializes
+        // that cotangent as a global zero after the map.
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let input_type = f32_vector_type(2);
         let body = {
@@ -16537,7 +16511,10 @@ mod tests {
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![cotangent], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let driver = TestTranspositionDriver { source, transposed };
+        let driver = TestTranspositionDriver {
+            source,
+            transposed: TransposedProgram::new(Arc::new(transposed), vec![TransposedProgramCotangent::Output]).unwrap(),
+        };
         let operation = ShardMapOperation::from_boundary(
             shard_map,
             vec![global_type.clone(), global_type.clone()],

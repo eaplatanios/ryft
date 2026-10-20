@@ -2665,8 +2665,8 @@ mod tests {
             .unwrap();
         let cotangent = ComplexNumber::new(0.5f64, 3.0);
         let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent]).unwrap()).unwrap();
-        assert_eq!(left_cotangent, Array::vector(vec![cotangent * right]).unwrap());
-        assert_eq!(right_cotangent, Array::vector(vec![cotangent * left]).unwrap());
+        assert_eq!(left_cotangent, MaybeZero::Value(Array::vector(vec![cotangent * right]).unwrap()));
+        assert_eq!(right_cotangent, MaybeZero::Value(Array::vector(vec![cotangent * left]).unwrap()));
     }
 
     #[test]

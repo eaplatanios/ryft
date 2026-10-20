@@ -713,18 +713,14 @@ where
         let input_cotangents = context.bind(swapped, vec![transpose_program, forward_program], &transpose_inputs)?;
         check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
 
-        // Residual inputs are known and contribute nothing. Preserve symbolic zeros reported by the stored backward
-        // program when their types suffice to reconstruct them. A dynamic zero must retain the already materialized
-        // value as its extent inputs live in this call's residual graph and may otherwise disappear before the outer
-        // pullback constructs its disconnected-input zeros.
+        // Residual inputs are known and contribute nothing. Preserve structural zeros reported by the stored
+        // backward program, including zeros whose runtime extents belong to the caller's primal inputs.
         linear_inputs
             .iter()
             .zip(input_cotangents)
             .zip(output_is_zero)
             .zip(&accumulators[self.residual_count..])
-            .filter(|(((input, cotangent), is_zero), _)| {
-                input.is_unknown() && (!is_zero || !O::zero_residual_types(cotangent.r#type().as_ref()).is_empty())
-            })
+            .filter(|(((input, _), is_zero), _)| input.is_unknown() && !is_zero)
             .try_for_each(|(((_, cotangent), _), accumulator)| {
                 accumulator.accumulate(context, MaybeZero::Value(cotangent))
             })?;
@@ -750,8 +746,8 @@ pub(crate) mod tests {
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        CotangentDestinationKind, DifferentiationError, TransposableOperation, TransposedProgram, TranspositionContext,
-        TranspositionDriver,
+        CotangentDestinationKind, DifferentiationError, TransposableOperation, TransposedProgram,
+        TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndexOperation;
@@ -1487,7 +1483,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_linear_call_operation_transposition_preserves_dynamic_zero_extents() {
+    fn test_linear_call_operation_transposition_preserves_dynamic_structural_zeros() {
         let dimension = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
         let dimension_type = DimensionType::from(dimension.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
@@ -1506,8 +1502,9 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        // The zero input cotangent is independent of the seed, but its runtime extent still belongs to the call's
-        // retained inputs. Converting this result to a symbolic zero would drop that required dependency.
+        // The stored backward region constructs a zero with its retained extent. Transposition recognizes that
+        // output as structural and omits its returned value. The opaque call retains its existing deferred-work
+        // policy, so its regions and explicit residual remain staged even with no returned cotangent.
         let mut transpose_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = transpose_builder.add_input(dimension_type.clone().into());
         transpose_builder.add_input(scalar_type.clone().into());
@@ -1551,6 +1548,28 @@ pub(crate) mod tests {
             ]),
             Ok(vec![Array::scalar(0_f32).unwrap().into()]),
         );
+        let omitted = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        assert_eq!(omitted.cotangents(), &[TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            omitted.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:dimension<size ∈ [0, 4)> .
+                let %2:f32[size] = linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<size ∈ [0, 4)>, %1:f32[] .
+                        let %2:f32[size] = zero [type=f32[size]] %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<size ∈ [0, 4)>, %1:f32[size] .
+                        let %2:f32[] = zero [type=f32[]]
+                        in (%2)
+                    },
+                ]
+                in ()"},
+        );
+
+        // The raw program API explicitly requests a dense result and can use the retained extent to construct it.
         let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
         for extent in [0, 2] {
             assert_eq!(

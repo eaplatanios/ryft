@@ -706,14 +706,7 @@ where
             .enumerate()
             .filter_map(|(index, (input, kind))| input.is_unknown().then_some((index, *kind)))
             .unzip();
-        let transposed_body = driver
-            .transpose_program(
-                body,
-                &linear_input_indices,
-                &vec![true; linear_input_indices.len()],
-                &destination_kinds,
-            )?
-            .into_program();
+        let transposed_body = driver.transpose_program(body, &linear_input_indices, &[], &destination_kinds)?;
 
         // A reference output forwards an input root whose state cotangent lives in the cotangent reference of that
         // input, so it has no cotangent input. A structurally zero output cotangent is materialized from the live
@@ -742,32 +735,28 @@ where
                 )
                 .collect()
         });
-        let input_cotangents =
-            context.bind(O::from(operation), CalleeRegionDriver::new(&[transposed_body]), call_inputs.as_slice())?;
-        let returned_cotangent_count =
-            linear_input_indices.iter().filter(|&&index| cotangents.returns_cotangent(index)).count();
-        check_count!("output", input_cotangents, returned_cotangent_count, ProgramError);
+        let input_cotangents = context.bind(
+            O::from(operation),
+            CalleeRegionDriver::new(&[transposed_body.program().clone()]),
+            call_inputs.as_slice(),
+        )?;
+        let cotangent_types = linear_input_indices
+            .iter()
+            .map(|&index| inputs[index].r#type().cotangent())
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_cotangents = transposed_body.assemble_cotangents(&cotangent_types, input_cotangents)?;
 
-        // Linear inputs that return a cotangent receive the outputs of the transposed call in input order. The
-        // cotangent reference of a reference input was accumulated into in place and is returned by identity, and
-        // every other input receives a structural zero.
-        let mut input_cotangents = input_cotangents.into_iter();
-        for (index, (input, accumulator)) in inputs.iter().zip(accumulators).enumerate() {
-            let cotangent = match cotangents.kind(index) {
-                CotangentDestinationKind::Return if input.is_unknown() => {
-                    MaybeZero::Value(input_cotangents.next().unwrap())
-                }
-                CotangentDestinationKind::Reference => {
-                    if cotangents.is_reference_input(index) {
-                        input_cotangents.next();
-                    }
-                    MaybeZero::Zero(input.r#type().cotangent()?)
-                }
-                CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
-                    MaybeZero::Zero(input.r#type().cotangent()?)
-                }
+        // Only returned cotangents contribute values. Disconnected inputs remain structural zeros; reference
+        // destinations were accumulated into in place by the transposed body and contribute nothing further.
+        for ((&index, cotangent), cotangent_type) in
+            linear_input_indices.iter().zip(input_cotangents).zip(cotangent_types)
+        {
+            let cotangent = if cotangents.kind(index) == CotangentDestinationKind::Return {
+                cotangent.unwrap()
+            } else {
+                MaybeZero::Zero(cotangent_type)
             };
-            accumulator.accumulate(context, cotangent)?;
+            accumulators[index].accumulate(context, cotangent)?;
         }
         Ok(())
     }
@@ -784,7 +773,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::captures::{CaptureReference, ClosedProgram};
@@ -792,8 +781,8 @@ mod tests {
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable,
         NothingSavable, OffloadDotsWithNoBatchDimensions, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-        SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, TransposedProgram, differentiate_at,
-        rematerialize,
+        SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, TransposedProgram,
+        TransposedProgramCotangent, differentiate_at, rematerialize,
     };
     use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -894,7 +883,7 @@ mod tests {
         let function = rematerialize(tagged_sine_of_dot).with_policy(policy);
         let x = Array::vector(vec![0.1f64, 0.2, 0.3]).unwrap();
         let (value, pullback) = differentiate_at(x).vjp(|x| function.call(x)).unwrap();
-        let gradient = pullback.apply(Array::scalar(1.0f64).unwrap()).unwrap();
+        let gradient = pullback.apply_materialized(Array::scalar(1.0f64).unwrap()).unwrap();
         (value, gradient, pullback.residuals().to_vec())
     }
 
@@ -1708,7 +1697,7 @@ mod tests {
             .unwrap();
         assert_eq!(value, expected);
         assert_eq!(
-            pullback.apply(vec![Array::scalar(7f64).unwrap(), Array::scalar(11f64).unwrap()]),
+            pullback.apply_materialized(vec![Array::scalar(7f64).unwrap(), Array::scalar(11f64).unwrap()]),
             Ok(vec![Array::scalar(29.0 * 0.5f64.cos()).unwrap(), Array::scalar(11.0 * 0.5f64.sin()).unwrap()]),
         );
     }
@@ -3008,13 +2997,13 @@ mod tests {
             .vjp(|inputs| program.interpret_in_context(&inputs[0].domain(), inputs))
             .unwrap();
         assert_eq!(value, expected_value);
-        assert_eq!(pullback.apply(cotangent.clone()), Ok(expected_gradient.clone()));
+        assert_eq!(pullback.apply_materialized(cotangent.clone()), Ok(expected_gradient.clone()));
         let function =
             rematerialize(|inputs: Vec<TestTracer>| program.interpret_in_context(&inputs[0].domain(), inputs))
                 .with_policy(EverythingSavable);
         let (value, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs)).unwrap();
         assert_eq!(value, expected_value);
-        assert_eq!(pullback.apply(cotangent), Ok(expected_gradient));
+        assert_eq!(pullback.apply_materialized(cotangent), Ok(expected_gradient));
         let inputs = [Array::scalar(2f64).unwrap(), Array::scalar(7f64).unwrap()];
         assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(NothingSavable));
         assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(EverythingSavable));
@@ -3322,7 +3311,7 @@ mod tests {
                 CotangentSeed::Value(scalar(1.0)),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             ),
-            Ok((None, Some(scalar(13.0)))),
+            Ok((None, Some(MaybeZero::Value(scalar(13.0))))),
         );
         assert_eq!(reference.read(), Ok(Array::scalar(5.0f32).unwrap()));
     }
@@ -3392,6 +3381,50 @@ mod tests {
                     },
                 ]
                 in (%3, %4)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_transposition_disconnected_symbolic_input() {
+        // The body returns only its scalar input. Its symbolic array input requires no zero constructor or extent
+        // residual in the pullback, while the live scalar cotangent still crosses the rematerialization boundary.
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.simplified_dimension()]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        body.add_input(input_type.clone());
+        let value = body.add_input(scalar_type.clone());
+        let body = body.build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let value = builder.add_input(scalar_type.clone());
+        let body = builder.import_program(body);
+        let output =
+            builder.add_instruction(rematerialize_operation(), vec![body], vec![input, value], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = rematerialize [differentiated=true] %0 [
+                    body={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
+        let seed = Array::scalar(7.0f32).unwrap();
+        let outputs = pullback.program().interpret(vec![seed.clone()]).unwrap();
+        assert_eq!(
+            pullback.assemble_cotangents(&[input_type, scalar_type], outputs),
+            Ok(vec![Some(MaybeZero::Zero(program.input_types()[0].clone())), Some(MaybeZero::Value(seed))]),
         );
     }
 
@@ -3552,7 +3585,7 @@ mod tests {
             .vjp(|x| Ok(program.interpret_in_context(&x.domain(), vec![x])?.remove(0)))
             .unwrap();
         assert_eq!(value, scalar(12.0));
-        assert_eq!(pullback.apply(scalar(1.0)), Ok(scalar(16.0)));
-        assert_eq!(pullback.apply(scalar(1.0)), Ok(scalar(16.0)));
+        assert_eq!(pullback.apply(scalar(1.0)), Ok(MaybeZero::Value(scalar(16.0))));
+        assert_eq!(pullback.apply(scalar(1.0)), Ok(MaybeZero::Value(scalar(16.0))));
     }
 }

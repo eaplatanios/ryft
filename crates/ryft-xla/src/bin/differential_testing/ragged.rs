@@ -199,7 +199,7 @@ impl RaggedCase {
                                 .into_value())
                         },
                     )?;
-                let cotangents = pullback.apply(inputs[6].clone().into_value())?;
+                let cotangents = pullback.apply_materialized(inputs[6].clone().into_value())?;
                 Ok(vec![
                     ValueProjection::<ArrayType>::into_projected(primal)?,
                     ValueProjection::<ArrayType>::into_projected(cotangents[0].clone())?,

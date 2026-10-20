@@ -3268,7 +3268,7 @@ mod tests {
         let (_, pullback) = differentiate_at(Array::vector(vec![f64::INFINITY, 0.0]).unwrap())
             .vjp(|input| input.reduce_log_sum_exp(&[0]))
             .unwrap();
-        let elements = pullback.apply(Array::scalar(1.0f64).unwrap()).unwrap().elements::<f64>().unwrap();
+        let elements = pullback.apply_materialized(Array::scalar(1.0f64).unwrap()).unwrap().elements::<f64>().unwrap();
         assert!(elements[0].is_nan());
         assert_eq!(elements[1], 0.0);
     }

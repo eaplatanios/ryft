@@ -4715,7 +4715,7 @@ mod tests {
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, DifferentiationTracer, Linearization, LinearizationTracer,
-        ReverseModeDifferentiate, TransposedProgram, differentiate_at,
+        ReverseModeDifferentiate, TransposedProgram, TransposedProgramCotangent, differentiate_at,
     };
     use crate::interpretation::EagerInterpretationDriver;
     use crate::macros::{check_gradient, check_operation_batching};
@@ -13319,7 +13319,10 @@ mod tests {
         assert_eq!(final_carry, Array::scalar(24.0).unwrap());
         assert_eq!(
             pullback.apply(Array::scalar(1.0).unwrap()),
-            Ok((Array::scalar(24.0).unwrap(), Array::vector(vec![12.0, 8.0, 6.0]).unwrap())),
+            Ok((
+                MaybeZero::Value(Array::scalar(24.0).unwrap()),
+                MaybeZero::Value(Array::vector(vec![12.0, 8.0, 6.0]).unwrap())
+            )),
         );
 
         // Finite differences independently check the derivatives through every slice of the nonlinear recurrence.
@@ -13739,7 +13742,10 @@ mod tests {
         assert_eq!(final_carry, Array::scalar(120.0).unwrap());
         assert_eq!(
             pullback.apply(Array::scalar(1.0).unwrap()),
-            Ok((Array::scalar(60.0).unwrap(), Array::vector(vec![40.0, 30.0, 24.0]).unwrap())),
+            Ok((
+                MaybeZero::Value(Array::scalar(60.0).unwrap()),
+                MaybeZero::Value(Array::vector(vec![40.0, 30.0, 24.0]).unwrap())
+            )),
         );
     }
 
@@ -13893,7 +13899,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(final_carry, Array::scalar(2.0).unwrap());
-        assert_eq!(pullback.apply(Array::scalar(5.0).unwrap()), Ok((Array::scalar(5.0).unwrap(), empty)));
+        assert_eq!(
+            pullback.apply(Array::scalar(5.0).unwrap()),
+            Ok((MaybeZero::Value(Array::scalar(5.0).unwrap()), MaybeZero::Value(empty)))
+        );
     }
 
     #[test]
@@ -14484,9 +14493,9 @@ mod tests {
         assert_eq!(
             pullback.apply(Array::scalar(1.0).unwrap()),
             Ok((
-                Array::scalar(1.0).unwrap(),
-                Array::scalar(24.0).unwrap(),
-                Array::vector(vec![4.0, 4.0, 4.0]).unwrap()
+                MaybeZero::Value(Array::scalar(1.0).unwrap()),
+                MaybeZero::Value(Array::scalar(24.0).unwrap()),
+                MaybeZero::Value(Array::vector(vec![4.0, 4.0, 4.0]).unwrap())
             )),
         );
     }
@@ -14538,7 +14547,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(output.to_f64s(), vec![e.exp()]);
-        let cotangent = pullback.apply(Array::scalar(1.0f64).unwrap()).unwrap().to_f64s()[0];
+        let cotangent = pullback.apply(Array::scalar(1.0f64).unwrap()).unwrap().as_value().unwrap().to_f64s()[0];
         assert!((cotangent - e * e.exp()).abs() < 1e-9, "{cotangent}");
     }
 
@@ -14678,9 +14687,9 @@ mod tests {
         assert_eq!(
             pullback.apply((Array::scalar(1.0).unwrap(), Array::vector(vec![0.0, 0.0, 0.0]).unwrap())),
             Ok((
-                Array::scalar(24.0).unwrap(),
-                Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap(),
-                Array::vector(vec![12.0, 8.0, 6.0]).unwrap(),
+                MaybeZero::Value(Array::scalar(24.0).unwrap()),
+                MaybeZero::Zero(ArrayType::scalar(DataType::Zero)),
+                MaybeZero::Value(Array::vector(vec![12.0, 8.0, 6.0]).unwrap()),
             )),
         );
     }
@@ -15181,9 +15190,9 @@ mod tests {
         let seed = Array::from_elements::<f64>(carry_type.cotangent().unwrap(), &[1.0]).unwrap();
         let (initial_cotangent, values_cotangent) = pullback.apply(seed).unwrap();
         assert_eq!(initial_cotangent.r#type().as_ref(), &carry_type.cotangent().unwrap());
-        assert_eq!(initial_cotangent.to_f64s(), vec![24.0]);
+        assert_eq!(initial_cotangent.as_value().unwrap().to_f64s(), vec![24.0]);
         assert_eq!(values_cotangent.r#type().as_ref(), &stack_type.cotangent().unwrap());
-        assert_eq!(values_cotangent.to_f64s(), vec![12.0, 8.0, 6.0]);
+        assert_eq!(values_cotangent.as_value().unwrap().to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
     // Differentiation threads primal and tangent reference carries independently, preserving each running state while
@@ -15493,7 +15502,7 @@ mod tests {
                     CotangentDestination::Return,
                 ),
             ),
-            Ok((None, Some(TestIrValue::Array(Array::vector(vec![3.0f32, 2.0, 1.0]).unwrap())))),
+            Ok((None, Some(MaybeZero::Value(TestIrValue::Array(Array::vector(vec![3.0f32, 2.0, 1.0]).unwrap()))))),
         );
         assert_eq!(destination.read(), Ok(Array::scalar(3.0f32).unwrap()));
     }
@@ -15602,7 +15611,7 @@ mod tests {
         assert_eq!(final_carry, TestIrValue::Array(Array::scalar(88.0f32).unwrap()));
         assert_eq!(
             pullback.apply_with_destinations(seed(), (CotangentDestination::Return, CotangentDestination::Ignore)),
-            Ok((Some(TestIrValue::Array(Array::scalar(342.0f32).unwrap())), None)),
+            Ok((Some(MaybeZero::Value(TestIrValue::Array(Array::scalar(342.0f32).unwrap()))), None)),
         );
 
         // A captured stack that is only read carries no tangent, so the derivative of the final carry is the product
@@ -15650,7 +15659,7 @@ mod tests {
         assert_eq!(final_carry, TestIrValue::Array(Array::scalar(6.0f32).unwrap()));
         assert_eq!(
             pullback.apply(TestIrValue::Array(Array::scalar(1.0f32).unwrap())),
-            Ok(TestIrValue::Array(Array::scalar(6.0f32).unwrap()))
+            Ok(MaybeZero::Value(TestIrValue::Array(Array::scalar(6.0f32).unwrap())))
         );
     }
 
@@ -17024,7 +17033,7 @@ mod tests {
                     CotangentDestination::Reference(TestIrValue::Reference(destination.clone()))
                 ),
             ),
-            Ok((Some(TestIrValue::Array(Array::scalar(15.0f32).unwrap())), None)),
+            Ok((Some(MaybeZero::Value(TestIrValue::Array(Array::scalar(15.0f32).unwrap()))), None)),
         );
         assert_eq!(destination.read(), Ok(Array::vector(vec![8.0f32, 4.0, 2.0]).unwrap()));
         assert_eq!(
@@ -17032,7 +17041,7 @@ mod tests {
                 CotangentSeed::Value(TestIrValue::Array(Array::scalar(1.0f32).unwrap())),
                 (CotangentDestination::Return, CotangentDestination::Ignore),
             ),
-            Ok((Some(TestIrValue::Array(Array::scalar(8.0f32).unwrap())), None)),
+            Ok((Some(MaybeZero::Value(TestIrValue::Array(Array::scalar(8.0f32).unwrap()))), None)),
         );
     }
 
@@ -17131,7 +17140,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             discharged_cotangents,
-            vec![carry_cotangent.unwrap(), TestIrValue::Array(destination.read().unwrap())],
+            vec![carry_cotangent.unwrap().as_value().unwrap().clone(), TestIrValue::Array(destination.read().unwrap())],
         );
         assert_eq!(
             discharged_cotangents,
@@ -17179,7 +17188,9 @@ mod tests {
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![final_carry], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let pullback = program.linearize().unwrap().pullback().unwrap().into_program();
+        let transposed = program.linearize().unwrap().pullback().unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero]);
+        let pullback = transposed.program();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -17191,15 +17202,11 @@ mod tests {
                         in (%2)
                     },
                 ]
-                    %2:f32[3] = zero [type=f32[3]]
-                in (%1, %2)"},
+                in (%1)"},
         );
         assert_eq!(
             pullback.interpret(vec![TestIrValue::Array(Array::scalar(1.0f32).unwrap())]),
-            Ok(vec![
-                TestIrValue::Array(Array::scalar(8.0f32).unwrap()),
-                TestIrValue::Array(Array::vector(vec![0.0f32, 0.0, 0.0]).unwrap()),
-            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar(8.0f32).unwrap()),]),
         );
     }
 

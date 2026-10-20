@@ -3133,7 +3133,7 @@ mod tests {
         assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0f32, 0.0)).unwrap());
         assert_eq!(
             pullback.apply(Array::scalar(ComplexNumber::new(3.0f32, -7.0)).unwrap()).unwrap(),
-            Array::scalar(3.0f32).unwrap(),
+            MaybeZero::Value(Array::scalar(3.0f32).unwrap()),
         );
 
         // Pulling back through complex-to-real conversion inserts a zero imaginary cotangent.
@@ -3143,7 +3143,7 @@ mod tests {
         assert_eq!(primal, Array::scalar(2.0f32).unwrap());
         assert_eq!(
             pullback.apply(Array::scalar(3.0f32).unwrap()).unwrap(),
-            Array::scalar(ComplexNumber::new(3.0f32, 0.0)).unwrap(),
+            MaybeZero::Value(Array::scalar(ComplexNumber::new(3.0f32, 0.0)).unwrap()),
         );
     }
 

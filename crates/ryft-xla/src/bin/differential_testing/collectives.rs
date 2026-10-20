@@ -215,11 +215,11 @@ impl CollectiveCase {
                 ])
             }
             "vjp" => {
-                let (primal, pullback) =
-                    input.clone().into_value().domain().differentiate_at(input.into_value()).vjp(|input| {
-                        let input = ValueProjection::<ArrayType>::into_projected(input)?;
-                        Ok(self.apply(input)?.into_value())
-                    })?;
+                let primal_input = input.into_value();
+                let (primal, pullback) = primal_input.domain().differentiate_at(primal_input).vjp(|input| {
+                    let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                    Ok(self.apply(input)?.into_value())
+                })?;
                 let primal = ValueProjection::<ArrayType>::into_projected(primal)?;
                 // A reduction's primal boundary is invariant on the addressed mesh axis. Its replicated outputs
                 // contribute all participant seeds to that invariant cotangent before entering the local pullback.
@@ -235,7 +235,7 @@ impl CollectiveCase {
                 } else {
                     seed
                 };
-                let cotangent = pullback.apply(seed.into_value())?;
+                let cotangent = pullback.apply_materialized(seed.into_value())?;
                 Ok(vec![primal, ValueProjection::<ArrayType>::into_projected(cotangent)?])
             }
             transform => panic!("unknown manifest transform `{transform}`"),

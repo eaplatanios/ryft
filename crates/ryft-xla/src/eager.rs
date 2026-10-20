@@ -4821,7 +4821,7 @@ mod tests {
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
         let cotangent = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let input_cotangent = pullback.apply(vec![cotangent]).unwrap();
+        let input_cotangent = pullback.apply_materialized(vec![cotangent]).unwrap();
         assert_eq!(read_f32s(&input_cotangent), vec![2.0, 8.0, 18.0]);
     }
 
