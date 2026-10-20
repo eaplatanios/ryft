@@ -1967,25 +1967,34 @@ impl CastType for ArrayIrType {
             .filter_map(Dimension::variable)
             .cloned()
             .collect::<Vec<_>>();
+        // The output observes the first actual input, so a symbolic output dimension must name a supplied identity of
+        // the declared output identity's own correspondence class. Another supplied identity that merely shares the
+        // declared name (e.g., a supplied `dimension<b>` witnessing a declared `dimension<a>`) belongs to a different
+        // class and cannot represent it.
         let dimensions: Vec<_> = output
             .iter()
             .map(|dimension| {
                 let refined = refinements.refine_declared_dimension(dimension, &preserved_identities);
-                if let Dimension::Dynamic(variable) = &refined
-                    && !actual_identities.contains(variable)
-                {
-                    let represented = refinements.retype_actual_dimension(dimension, &refined, &actual_identities);
-                    if let Dimension::Dynamic(variable) = &represented
-                        && !actual_identities.contains(variable)
-                    {
-                        return Err(TypeError::invalid(format!(
+                let Dimension::Dynamic(variable) = &refined else {
+                    return Ok(refined);
+                };
+                let corresponding = refinements
+                    .identity_classes()
+                    .find(|class| class.declared().contains(variable))
+                    .map(|class| class.actual())
+                    .unwrap_or_default();
+                if corresponding.contains(variable) {
+                    return Ok(refined);
+                }
+                let represented = refinements.retype_actual_dimension(dimension, &refined, &actual_identities);
+                match &represented {
+                    Dimension::Dynamic(variable) if !corresponding.contains(variable) => {
+                        Err(TypeError::invalid(format!(
                             "`{CAST_OPERATION_NAME}` output identity `{variable}` has no compatible \
                              supplied input identity",
-                        )));
+                        )))
                     }
-                    Ok(represented)
-                } else {
-                    Ok(refined)
+                    _ => Ok(represented),
                 }
             })
             .collect::<Result<_, _>>()?;
@@ -2079,15 +2088,19 @@ pub trait Cast<T = <Self as Capability>::Universe>: Capability + Sized {
     fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError>;
 }
 
+// TODO(eaplatanios): Review up to here.
+
 impl<
     T: CastType,
     V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<CastOperation<T>>>>,
 > Cast<T> for V
 {
+    #[inline]
     fn cast(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
         CastOperation::bind_checked(&self.domain(), self, witnesses, output_type)
     }
 
+    #[inline]
     fn cast_unchecked(&self, output_type: T, witnesses: &[Self]) -> Result<Self, ProgramError> {
         CastOperation::bind_unchecked(&self.domain(), self, witnesses, output_type)
     }
@@ -2124,11 +2137,12 @@ fn cast_array(
     witnesses: &[Array],
     checked: bool,
 ) -> Result<Array, ProgramError> {
-    let input_types =
-        std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let output_type = CastOperation { input_types: input_types.clone(), output_type, checked }
-        .infer_interpreted_output_type(&input_types, &[])?;
+    let inputs = std::iter::once(value).chain(witnesses);
+    let input_types = inputs.map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let operation = CastOperation { input_types: input_types.clone(), output_type, checked };
+    let output_type = operation.infer_interpreted_output_type(&input_types, &[])?;
     let input_type = value.r#type();
+
     // Materialized arrays retain exact shapes after declared names have been resolved to their known extents.
     // All other representation fields follow the request, including dense default storage for an unspecified layout.
     let representation = output_type.with_shape(input_type.shape().clone());
@@ -2144,9 +2158,10 @@ fn cast_array(
     }
 }
 
-/// Casts through the array member's execution context, or validates a concrete dimension cast. Rejects reference
-/// witnesses before omitting concrete dimension witnesses, whose exact types carry no identities. Array members may
-/// themselves be tracers, so their symbolic relationships must not be checked as if they were concrete values.
+/// Casts the provided [`ArrayIrValue`] through its execution context, or validates a concrete dimension cast. Rejects
+/// reference witnesses before omitting concrete dimension witnesses, whose exact types carry no identities. Array
+/// members may themselves be tracers, so their symbolic relationships must not be checked as if they were concrete
+/// values.
 fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayType>>(
     value: &ArrayIrValue<A>,
     output_type: ArrayIrType,
@@ -2160,7 +2175,8 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
                 ArrayIrValue::Array(value) => Some(Ok(value.clone())),
                 ArrayIrValue::Dimension(_) => None,
                 ArrayIrValue::Reference(_) => Some(Err(TypeError::invalid(format!(
-                    "`{CAST_OPERATION_NAME}` does not support reference type `{}`",
+                    "`{}` does not support reference type `{}`",
+                    CAST_OPERATION_NAME,
                     witness.r#type(),
                 )))),
             })
@@ -2171,8 +2187,9 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
             value.cast_unchecked(output_type.clone(), &witnesses)?
         }));
     }
-    let input_types =
-        std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+
+    let inputs = std::iter::once(value).chain(witnesses);
+    let input_types = inputs.map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     let operation = CastOperation { input_types: input_types.clone(), output_type, checked };
     operation.infer_interpreted_output_type(&input_types, &[])?;
     for witness in witnesses {
@@ -2185,12 +2202,13 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
         {
             return Err(ProgramError::Concretization {
                 message: format!(
-                    "host dimension `{CAST_OPERATION_NAME}` cannot retain an array witness producer; bind the \
-                     cast through a composite context",
+                    "host dimension `{CAST_OPERATION_NAME}` cannot retain an array witness producer; \
+                     bind the cast through a composite context",
                 ),
             });
         }
     }
+
     Ok(value.clone())
 }
 
@@ -4624,6 +4642,48 @@ mod tests {
                 Ok(vec![output.clone()]),
             );
         }
+    }
+
+    #[test]
+    fn test_cast_type_inference_scoped_output_identity() {
+        // Declared `b` corresponds to supplied `s`, whereas the supplied `b` witnesses the declared `a`. The output must
+        // name the supplied identity of declared `b`'s own class even though a supplied identity shares its name;
+        // otherwise the staged program would relate the source to the unrelated `a` witness.
+        let bounds = DimensionBounds::new(0, Some(4)).unwrap();
+        let [a, b, s] = ["a", "b", "s"].map(|name| DimensionType::new(name, bounds));
+        let vector = |dimension: &DimensionType| {
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension.simplified_dimension()])))
+        };
+        let operation =
+            CastOperation::checked(vector(&b), vec![vector(&s), a.clone().into(), b.clone().into()]).unwrap();
+        let actual = vec![vector(&s), b.clone().into(), s.clone().into()];
+        assert_eq!(ArrayIrType::infer_cast_output_type(&operation, &actual), Ok((vector(&s), Some(vector(&s)))));
+
+        // These values satisfy the declared relationship (`s = b = 1` and `a = 3`), so the staged program does too.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = actual.into_iter().map(|r#type| builder.add_input(r#type)).collect();
+        let output = builder.add_instruction(operation, vec![], inputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[s], %1:dimension<b ∈ [0, 4)>, %2:dimension<s ∈ [0, 4)> .
+                let %3:f32[s] = cast [
+                    type=f32[b],
+                    inputs=[f32[s], dimension<a ∈ [0, 4)>, dimension<b ∈ [0, 4)>],
+                    checked=true,
+                ] %0 %1 %2
+                in (%3)"},
+        );
+        let value = ArrayIrValue::Array(Array::vector(vec![1f32]).unwrap());
+        let dimension = |extent: usize| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
+        assert_eq!(program.interpret(vec![value.clone(), dimension(3), dimension(1)]), Ok(vec![value]));
     }
 
     #[test]
