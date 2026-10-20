@@ -1003,8 +1003,8 @@ impl<Input, ContextState>
     /// The returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
     /// arguments and reconstructs the structured input cotangents as [`MaybeZero`] leaves. Disconnected inputs
     /// return structural zeros without retaining extent residuals. Callers that need concrete values can use
-    /// [`Pullback::apply_materialized`], which constructs them from the primal inputs that the pullback retains as
-    /// extent sources.
+    /// [`Pullback::apply_materialized`], which constructs them from the primal inputs that the pullback retains
+    /// as zero sources.
     ///
     /// # Parameters
     ///
@@ -1046,7 +1046,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// validates complex input and output types but cannot prove the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
     ///
-    /// Structural-zero gradients become concrete values using the corresponding primal inputs as extent sources.
+    /// Structural-zero gradients become concrete values using the corresponding primal inputs as zero sources.
     /// Reference inputs return ordinary gradients with respect to their initial contents. The primal runs once,
     /// preserving mutations, and each invocation uses fresh zero cotangent references that are frozen before return.
     /// Refer to the module's [reference gradient contract](self#gradients-of-reference-inputs) for an example and to
@@ -1753,7 +1753,7 @@ impl<Input, Capture, ContextState>
     /// may remain among the residuals closed over by the [`Pullback`], but callers provide only output cotangents and
     /// receive [`MaybeZero`] cotangents only for `x`; no capture cotangent tree is constructed. Disconnected leaves
     /// remain structural zeros. [`Pullback::apply_materialized`] constructs concrete cotangents from the primal inputs
-    /// that the pullback retains as extent sources.
+    /// that the pullback retains as zero sources.
     ///
     /// The active primal tree, not the capture tree, must contain at least one leaf.
     ///

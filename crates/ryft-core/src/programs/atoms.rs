@@ -20,10 +20,11 @@ use crate::programs::types::Typed;
 /// transitively through rules without ever inspecting a program or materializing a buffer.
 ///
 /// A structural zero becomes a value at the consumer that owns a source for its runtime extents. Callable pullbacks
-/// preserve structural zeros across their output boundary and retain the primal inputs that supply symbolic extents,
-/// from which [`Pullback::materialize_cotangents`](crate::Pullback::materialize_cotangents) and scalar-gradient entry
-/// points materialize them. A nested region materializes a zero inside itself when its boundary requires a value,
-/// such as a scan carry or a condition branch paired with a nonzero branch. The
+/// preserve structural zeros across their output boundary and retain, as zero sources, the primal inputs whose zeros
+/// cannot be constructed from their types alone.
+/// [`Pullback::materialize_cotangents`](crate::Pullback::materialize_cotangents) and scalar-gradient entry points
+/// materialize them from those sources. A nested region materializes a zero inside itself when its boundary requires
+/// a value, such as a scan carry or a condition branch paired with a nonzero branch. The
 /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol constructs the value from the consumer's available
 /// sources without threading extra program residuals solely for a disconnected cotangent.
 #[derive(Clone, Debug, PartialEq, Parameter)]

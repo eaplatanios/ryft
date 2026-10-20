@@ -56,10 +56,11 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// Homogeneous array families with `From<ZeroOperation<ArrayType>>` and `From<ZeroLikeOperation<ArrayType>>`
 /// conversions declare and capture no residuals. They construct a type-only zero when the type needs no runtime extent
 /// source; boundary materialization of a symbolic zero instead binds [`ZeroLikeOperation`](crate::ZeroLikeOperation)
-/// on the first source with exactly the requested type. Unexpected residuals are rejected rather than silently ignored.
-/// Eligible [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket implementation that captures
-/// runtime dimensions and assembles zeros with explicit extent inputs. This includes both the core composite family
-/// and its XLA backend counterpart; neither needs its own residual-protocol implementation.
+/// on the first source with exactly the requested type, so [`Self::requires_zero_source`] reports symbolic types even
+/// though they declare no residuals. Unexpected residuals are rejected rather than silently ignored. Eligible
+/// [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket implementation that captures runtime
+/// dimensions and assembles zeros with explicit extent inputs. This includes both the core composite family and its
+/// XLA backend counterpart; neither needs its own residual-protocol implementation.
 ///
 /// Other type universes opt in explicitly. An input-free family can use an empty implementation when it already
 /// implements `OperationProvider<T, ZeroOperation<T>>`; a family requiring residuals overrides declaration, capture,
@@ -79,6 +80,16 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
     #[inline]
     fn zero_residual_types(_type: &T) -> Vec<T> {
         Vec::new()
+    }
+
+    /// Returns whether a zero of `r#type` can only be materialized from a value source (i.e., whether
+    /// [`Self::materialize_zero_from_residual_sources`] needs a source value for a structural zero of this type rather
+    /// than constructing it from the type alone). Consumers use this predicate to decide which values to retain for a
+    /// later materialization. The default answers whether the type declares zero residuals. Families that read runtime
+    /// quantities from sources without declaring residuals override it.
+    #[inline]
+    fn requires_zero_source(r#type: &T) -> bool {
+        !Self::zero_residual_types(r#type).is_empty()
     }
 
     /// Stages instructions into `builder` that read the residual values declared by [`Self::zero_residual_types`] from

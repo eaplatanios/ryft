@@ -955,8 +955,8 @@ mod tests {
             .unwrap();
         assert!(pullback.residuals().is_empty());
 
-        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as an extent source.
-        assert_eq!(pullback.extent_sources(), &[Some(dynamic), None]);
+        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as a zero source.
+        assert_eq!(pullback.zero_sources(), &[Some(dynamic), None]);
         let transposed = pullback.transposed_program(&[]).unwrap();
         assert!(transposed.program().instructions().is_empty());
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
@@ -1000,8 +1000,8 @@ mod tests {
             .unwrap();
         assert!(pullback.residuals().is_empty());
 
-        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as an extent source.
-        assert_eq!(pullback.extent_sources(), &[Some(dynamic), None]);
+        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as a zero source.
+        assert_eq!(pullback.zero_sources(), &[Some(dynamic), None]);
         let cotangent = context.input(scalar_type);
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
         assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type));
