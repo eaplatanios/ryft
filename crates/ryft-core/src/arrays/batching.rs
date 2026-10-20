@@ -299,8 +299,8 @@ impl<V> RaggedAxis<V> {
     /// same value is later remapped as its array flows through axis moves, broadcasts, and reductions, so validity
     /// must be re-established against each carrier it is attached to. The attachment points (i.e.,
     /// [`ArrayBatch::with_ragged_axes`] and [`ArrayIrBatch::with_ragged_axes`]) are therefore the callers, and they
-    /// additionally own the cross-entry uniqueness check and the semantic (extent-value) claims this method cannot
-    /// verify.
+    /// additionally own the cross-entry uniqueness check, the extents storage check of
+    /// [`validate_extents_type`](Self::validate_extents_type), and the semantic claims neither method can verify.
     ///
     /// # Parameters
     ///
@@ -348,6 +348,46 @@ impl<V> RaggedAxis<V> {
                     ),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Validates that the [`extents`](Self::extents) storage holds one entry for every packed coordinate it indexes:
+    /// its rank must equal the number of [`extent_axes`](Self::extent_axes), and each of its dimensions must be
+    /// compatible with the packed dimension that the corresponding extent axis names. Two static dimensions are
+    /// compatible when they are equal, a static dimension and a symbolic one when the static extent lies within the
+    /// symbolic bounds, and two symbolic dimensions always, because producers may carry renamed identities for the
+    /// same extent. Compact storage (e.g., one shared extent standing in for every batch item) is not a supported
+    /// representation, so rules that index the extents per item never read past their storage. A replicated carrier
+    /// whose extents do not vary over any packed axis stores them as a scalar with no extent axes.
+    ///
+    /// Like [`validate_axis_mapping`](Self::validate_axis_mapping), this is a property of the metadata and its carrier
+    /// together, and it must run after that function has validated the extent axes against `packed_type`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `extents_type`: Type of the [`extents`](Self::extents) value.
+    ///   - `packed_type`: Type of the packed array this metadata is being attached to.
+    fn validate_extents_type(&self, extents_type: &ArrayType, packed_type: &ArrayType) -> Result<(), BatchingError> {
+        let extents_dimensions = extents_type.shape().dimensions();
+        let packed_dimensions = packed_type.shape().dimensions();
+        let is_compatible = extents_dimensions.len() == self.extent_axes.len()
+            && extents_dimensions.iter().zip(&self.extent_axes).all(|(extents_dimension, &extent_axis)| {
+                match (extents_dimension, &packed_dimensions[extent_axis]) {
+                    (Dimension::Static(extent), Dimension::Static(packed_extent)) => extent == packed_extent,
+                    (Dimension::Static(extent), Dimension::Dynamic(variable))
+                    | (Dimension::Dynamic(variable), Dimension::Static(extent)) => variable.bounds().contains(*extent),
+                    (Dimension::Dynamic(_), Dimension::Dynamic(_)) => true,
+                }
+            });
+        if !is_compatible {
+            return Err(BatchingError::InvalidBatchMetadata {
+                message: format!(
+                    "ragged axis {} has extents of type `{}`, which do not hold one extent for every coordinate of \
+                     extent axes {:?} in packed array type `{}`",
+                    self.axis, extents_type, self.extent_axes, packed_type,
+                ),
+            });
         }
         Ok(())
     }
@@ -487,13 +527,15 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     /// Structural requirements are validated here. Every ragged axis must uniquely name an ordinary packed axis of
     /// the value (positions index the packed type), must not name the mapped batch axis, every recorded extent-axis
-    /// mapping must name a distinct packed axis, and the logical per-item type must derive cleanly. However, the
-    /// semantic content of each [`RaggedAxis`] is a claim that this method cannot verify and that downstream consumers
-    /// (e.g., masked reductions and boundary restoration) treat as truth: the [`extents`](RaggedAxis::extents) value
-    /// must hold the axis's true per-item logical extents (each within the dynamic [`DimensionVariable`]'s declared
-    /// bounds and never exceeding the packed physical bound) and [`extent_axes`](RaggedAxis::extent_axes) must map the
-    /// extent array's axes onto the packed batch axes they index. Violating those invariants makes physical padding
-    /// observable in results or masks live data away.
+    /// mapping must name a distinct packed axis, the [`extents`](RaggedAxis::extents) storage must hold one entry for
+    /// every packed coordinate those extent axes index (i.e., its rank must equal the number of extent axes and each
+    /// of its dimensions must be compatible with the packed dimension it indexes), and the logical per-item type must
+    /// derive cleanly. However, the semantic content of each [`RaggedAxis`] is a claim that this method cannot verify
+    /// and that downstream consumers (e.g., masked reductions and boundary restoration) treat as truth: the extents
+    /// value must hold the axis's true per-item logical extents (each within the dynamic [`DimensionVariable`]'s
+    /// declared bounds and never exceeding the packed physical bound) and [`extent_axes`](RaggedAxis::extent_axes)
+    /// must map the extent array's axes onto the packed batch axes they index. Violating those invariants makes
+    /// physical padding observable in results or masks live data away.
     pub fn with_ragged_axes(mut self, ragged_axes: Vec<RaggedAxis<V>>) -> Result<Self, BatchingError> {
         let value_type = self.value.r#type();
         let packed_type = value_type.as_ref();
@@ -509,6 +551,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
                 });
             }
             ragged_axis.validate_axis_mapping(packed_type, batch_axis, batch_axis_position)?;
+            ragged_axis.validate_extents_type(ragged_axis.extents.r#type().as_ref(), packed_type)?;
         }
 
         // Deriving the per-item type once here is what lets `Self::unbatched_type` be infallible. The packed value
@@ -1122,8 +1165,9 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     ///
     /// The following structural requirements are validated exactly in the same way as [`ArrayBatch::with_ragged_axes`]:
     /// every ragged axis must uniquely name an ordinary packed axis of the value other than the mapped batch axis,
-    /// every recorded extent axis mapping must name a distinct packed axis, and the per-item type must derive cleanly.
-    /// Refer to that function's documentation for the semantic claims each [`RaggedAxis`] carries.
+    /// every recorded extent axis mapping must name a distinct packed axis, the extents must be an array value holding
+    /// one entry for every packed coordinate those extent axes index, and the per-item type must derive cleanly. Refer
+    /// to that function's documentation for the semantic claims each [`RaggedAxis`] carries.
     pub fn with_ragged_axes(self, ragged_axes: Vec<RaggedAxis<V>>) -> Result<Self, BatchingError> {
         match self.member {
             ArrayIrBatchMember::Array { .. } => {
@@ -1166,6 +1210,17 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                             });
                         }
                         ragged_axis.validate_axis_mapping(packed_type, batch_axis, position)?;
+                        let extents_type = ragged_axis.extents().r#type();
+                        let extents_type = <&ArrayType>::try_from(extents_type.as_ref()).map_err(|_| {
+                            BatchingError::InvalidBatchMetadata {
+                                message: format!(
+                                    "ragged axis {} has extents of non-array type `{}`",
+                                    ragged_axis.axis(),
+                                    extents_type,
+                                ),
+                            }
+                        })?;
+                        ragged_axis.validate_extents_type(extents_type, packed_type)?;
                     }
                     packed_type.unbatched_type_and_axis(batch_axis, ragged_axes.as_slice())?.1
                 }
@@ -4733,8 +4788,8 @@ pub(crate) mod tests {
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionSize, DimensionToScalar,
-        DimensionToScalarOperation, DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation, NegOperation,
-        OneLike, ParallelReduceOperation, Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        DimensionToScalarOperation, DynamicBroadcast, DynamicReshapeOperation, NegOperation, OneLike,
+        ParallelReduceOperation, Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
         ReferenceNewOperation, ReferenceReadOperation, ReshardOperation, Slice, ZeroOperation,
     };
     use crate::parameters::Placeholder;
@@ -4939,6 +4994,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_ragged_axis_validate_extents_type() {
+        // The extents hold one entry for every packed coordinate that their extent axes index. The metadata is generic
+        // in its extents, so these cases use the extents types themselves as the extents.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(8)).unwrap());
+        let unit = DimensionVariable::new("unit", DimensionBounds::new(1, Some(2)).unwrap());
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 3]);
+        let symbolic_packed_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]));
+        let validate = |extents: Vec<Dimension>, extent_axes: Vec<usize>, packed_type: &ArrayType| {
+            let ragged_axis =
+                RaggedAxis::new(1, ArrayType::new(DataType::I64, Shape::new(extents)), length.clone(), extent_axes);
+            ragged_axis.validate_extents_type(ragged_axis.extents(), packed_type)
+        };
+
+        // Full storage is accepted: static dimensions are equal, a static dimension lies within the bounds of a
+        // symbolic one (in either direction), and two symbolic dimensions are compatible even when their identities
+        // differ, because producers may carry renamed identities. A replicated carrier whose extents vary over no
+        // packed axis stores them as a scalar.
+        assert_eq!(validate(vec![Dimension::Static(3)], vec![0], &packed_type), Ok(()));
+        assert_eq!(validate(vec![Dimension::Dynamic(length.clone())], vec![0], &packed_type), Ok(()));
+        assert_eq!(validate(vec![Dimension::Static(5)], vec![0], &symbolic_packed_type), Ok(()));
+        assert_eq!(validate(vec![Dimension::Dynamic(length.clone())], vec![0], &symbolic_packed_type), Ok(()));
+        assert_eq!(validate(vec![], vec![], &packed_type), Ok(()));
+
+        // Compact storage is rejected, whether its single entry is static or symbolic with unit bounds, and so are
+        // a static extent outside the bounds of a symbolic packed dimension and a rank that differs from the number of
+        // extent axes.
+        assert!(matches!(
+            validate(vec![Dimension::Static(1)], vec![0], &packed_type),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message
+                    == "ragged axis 1 has extents of type `i64[1]`, which do not hold one extent for every coordinate \
+                        of extent axes [0] in packed array type `f32[3, 3]`",
+        ));
+        assert!(matches!(
+            validate(vec![Dimension::Dynamic(unit)], vec![0], &packed_type),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message
+                    == "ragged axis 1 has extents of type `i64[unit]`, which do not hold one extent for every \
+                        coordinate of extent axes [0] in packed array type `f32[3, 3]`",
+        ));
+        assert!(matches!(
+            validate(vec![Dimension::Static(9)], vec![0], &symbolic_packed_type),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message
+                    == "ragged axis 1 has extents of type `i64[9]`, which do not hold one extent for every coordinate \
+                        of extent axes [0] in packed array type `f32[items, 3]`",
+        ));
+        assert!(matches!(
+            validate(vec![], vec![0], &packed_type),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message
+                    == "ragged axis 1 has extents of type `i64[]`, which do not hold one extent for every coordinate \
+                        of extent axes [0] in packed array type `f32[3, 3]`",
+        ));
+        assert!(matches!(
+            validate(vec![Dimension::Static(3), Dimension::Static(3)], vec![0], &packed_type),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message
+                    == "ragged axis 1 has extents of type `i64[3, 3]`, which do not hold one extent for every \
+                        coordinate of extent axes [0] in packed array type `f32[3, 3]`",
+        ));
+    }
+
+    #[test]
     fn test_ragged_mask_identity_from_reduction_kind() {
         // Every reduction kind except a mean has an identity that padding can take without changing the result.
         for (kind, identity) in [
@@ -5058,6 +5179,30 @@ pub(crate) mod tests {
             Err(BatchingError::InvalidBatchMetadata {
                 message: "ragged axis 0 is invalid for packed array type f64[2, 3] with batch axis axis 0".to_string(),
             }),
+        );
+
+        // Installation also validates the extents storage (see `test_ragged_axis_validate_extents_type`): one shared
+        // extent cannot stand in for three batch items, whereas a replicated carrier stores its extents as a scalar.
+        let three_items = Array::matrix(3, 3, vec![1.0; 9]).unwrap();
+        assert_eq!(
+            ArrayBatch::new(three_items.clone(), Some(0)).unwrap().with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                Array::vector(vec![2.0]).unwrap(),
+                variable.clone(),
+                vec![0],
+            )]),
+            Err(BatchingError::InvalidBatchMetadata {
+                message: "ragged axis 1 has extents of type `f64[1]`, which do not hold one extent for every \
+                          coordinate of extent axes [0] in packed array type `f64[3, 3]`"
+                    .to_string(),
+            }),
+        );
+        let replicated_ragged_axis = RaggedAxis::new(1, Array::scalar(2.0).unwrap(), variable, vec![]);
+        assert_eq!(
+            ArrayBatch::replicated(three_items)
+                .with_ragged_axes(vec![replicated_ragged_axis.clone()])
+                .map(|batch| batch.ragged_axes().to_vec()),
+            Ok(vec![replicated_ragged_axis]),
         );
     }
 
@@ -5498,6 +5643,47 @@ pub(crate) mod tests {
                 message: "ragged axis 1 extent axis 0 maps to packed axis 2, which is out of bounds for packed array \
                           type f32[2, 3]"
                     .to_string(),
+            }),
+        );
+
+        // The extents must be an array holding one extent for every packed coordinate they index. Staged extents
+        // may be symbolic, and a symbolic dimension is compatible with a static packed one within its bounds, so
+        // `i64[items]` covers three items while `i64[unit]` with `unit` in `[1, 2)` is compact storage.
+        let trace = ArrayIrTraceContext::new();
+        let staged_packed = trace.input(ArrayType::new_static(DataType::F32, [3, 3]).into());
+        let symbolic_extents = |name: &str, bounds: DimensionBounds| {
+            let variable = DimensionVariable::new(name, bounds);
+            trace.input(ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Dynamic(variable)])).into())
+        };
+        let items_extents = symbolic_extents("items", DimensionBounds::new(0, Some(8)).unwrap());
+        let unit_extents = symbolic_extents("unit", DimensionBounds::new(1, Some(2)).unwrap());
+        let staged_ragged_axis = RaggedAxis::new(1, items_extents, variable.clone(), vec![0]);
+        assert_eq!(
+            ArrayIrBatch::new(staged_packed.clone(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![staged_ragged_axis.clone()])
+                .map(|batch| batch.ragged_axes().to_vec()),
+            Ok(vec![staged_ragged_axis]),
+        );
+        assert_eq!(
+            ArrayIrBatch::new(staged_packed.clone(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, unit_extents, variable.clone(), vec![0]),]),
+            Err(BatchingError::InvalidBatchMetadata {
+                message: "ragged axis 1 has extents of type `i64[unit]`, which do not hold one extent for every \
+                          coordinate of extent axes [0] in packed array type `f32[3, 3]`"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            ArrayIrBatch::new(staged_packed, BatchAxis::new(0)).unwrap().with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
+                variable.clone(),
+                vec![],
+            )]),
+            Err(BatchingError::InvalidBatchMetadata {
+                message: "ragged axis 1 has extents of non-array type `dimension<3>`".to_string(),
             }),
         );
 
@@ -10679,15 +10865,6 @@ pub(crate) mod tests {
                 let repeated = value.dynamic_broadcast_to(&[extent])?;
                 let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
                 let squared = repeated.clone() * repeated;
-                let squared = squared.into_value();
-                let mut squared = LinearCallOperation::stage(
-                    squared.context(),
-                    Vec::new(),
-                    vec![squared.clone()],
-                    |_, inputs| Ok(inputs.to_vec()),
-                    |_, cotangents| Ok(cotangents.to_vec()),
-                )?;
-                let squared = ValueProjection::<ArrayType>::into_projected(squared.remove(0))?;
                 Ok(squared.reduce(&[0], ReductionKind::Sum)?.into_value())
             },
             (
@@ -10725,15 +10902,6 @@ pub(crate) mod tests {
                 let repeated = value.dynamic_broadcast_to(&[extent])?;
                 let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
                 let squared = repeated.clone() * repeated;
-                let squared = squared.into_value();
-                let mut squared = LinearCallOperation::stage(
-                    squared.context(),
-                    Vec::new(),
-                    vec![squared.clone()],
-                    |_, inputs| Ok(inputs.to_vec()),
-                    |_, cotangents| Ok(cotangents.to_vec()),
-                )?;
-                let squared = ValueProjection::<ArrayType>::into_projected(squared.remove(0))?;
                 Ok(squared.reduce(&[0], ReductionKind::Sum)?.into_value())
             },
             (values, extents),

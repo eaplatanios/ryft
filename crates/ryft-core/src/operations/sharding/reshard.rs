@@ -130,6 +130,33 @@ impl Operation for ReshardOperation {
         // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
         // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
         let input_sharding = input.sharding();
+
+        // The preserved manual axes are carried onto the target by name, but the size and type of a mesh axis are
+        // semantic. The target mesh must therefore define every one of them identically, whereas it may still add
+        // or drop other axes.
+        if let Some(input_sharding) = input_sharding {
+            let input_mesh = input_sharding.mesh();
+            let target_mesh = self.sharding.mesh();
+            let preserved_axes = input_sharding
+                .varying_manual_axes()
+                .iter()
+                .chain(input_sharding.unreduced_axes())
+                .chain(input_sharding.reduced_axes())
+                .filter_map(|axis_name| input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index]))
+                .filter(|axis| axis.r#type() == MeshAxisType::Manual);
+            for input_axis in preserved_axes {
+                let target_axis = target_mesh.axis_index(input_axis.name()).map(|index| &target_mesh.axes()[index]);
+                if target_axis != Some(input_axis) {
+                    let target_axis =
+                        target_axis.map_or_else(|| "an undefined axis".to_owned(), |axis| format!("`{axis}`"));
+                    return Err(TypeError::invalid(format!(
+                        "`{RESHARD_OPERATION_NAME}` cannot redefine preserved manual mesh axis `{input_axis}` \
+                         as {target_axis}",
+                    )));
+                }
+            }
+        }
+
         let manual_unreduced = input_sharding
             .into_iter()
             .flat_map(|sharding| {
