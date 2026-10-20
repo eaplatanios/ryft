@@ -113,7 +113,7 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
-use crate::operations::manipulation::conversions::{CastOperation, ConvertElementType};
+use crate::operations::manipulation::conversions::{CastOperation, CastType, ConvertElementType};
 
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
@@ -1845,8 +1845,6 @@ impl<T: Type> Operation for GuardOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onward.
-
 impl<C: Context<Type: ReferenceMemberType, Operation: From<GuardOperation<C::Type>>>, P: ReferenceDischargePolicy<C>>
     ReferenceDischargeableOperation<C, P> for GuardOperation<C::Type>
 {
@@ -1909,11 +1907,11 @@ impl<C: Domain> InterpretableOperation<C> for GuardOperation<C::Type> {
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         // Interpreted values carry their concrete extents in their types, so deriving refinements from these types
-        // performs the complete runtime check, with the same diagnostics as program or region input validation, and the
-        // narrowed outputs are the non-reference inputs themselves. Interpreted types can still be symbolic (e.g.,
+        // performs the complete runtime check, with the same diagnostics as program or region input validation, and
+        // the narrowed outputs are the non-reference inputs themselves. Interpreted types can still be symbolic (e.g.,
         // tracers interpreted through a program), in which case a relationship the types do not prove has no
-        // interpretation here, exactly as for `cast`: such a guard must be bound through its context, whose rules stage
-        // the check.
+        // interpretation here, exactly as for `cast`: such a guard must be bound through its context, whose
+        // rules stage the check.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(&input_types, &driver.regions().map(|region| region.interface()).collect::<Vec<_>>())?;
         let refinements =
@@ -1921,8 +1919,8 @@ impl<C: Domain> InterpretableOperation<C> for GuardOperation<C::Type> {
         if !refinements.identities_needing_runtime_checks().is_empty() {
             return Err(ProgramError::Concretization {
                 message: format!(
-                    "`{GUARD_OPERATION_NAME}` cannot check symbolic type relationships during interpretation; bind the \
-                     operation through its context"
+                    "`{GUARD_OPERATION_NAME}` cannot check symbolic type relationships during interpretation; \
+                     bind the operation through its context",
                 ),
             });
         }
@@ -1976,9 +1974,11 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>, P: BatchingPolicy<C>>
             &self.declared_types,
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
+
         // Bounded ragged carriers and mapped dimensions keep per-item extents outside their packed types, which the
         // lifted declarations cannot relate. Reject them before freshening makes their identities look unrelated.
         reject_ragged_carriers::<C, P>(GUARD_OPERATION_NAME, inputs)?;
+
         // The inserted batch dimension belongs to the surrounding program. Freshen the guard-local names together
         // before inserting it, so reusing a nominal identity across those scopes cannot create an extra equality.
         let mut renaming = TypeIdentityRenaming::new();
@@ -1987,6 +1987,7 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>, P: BatchingPolicy<C>>
                 renaming.insert(identity.clone(), identity.fresh())?;
             }
         }
+
         let declared_types = self
             .declared_types
             .iter()
@@ -1997,6 +1998,7 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>, P: BatchingPolicy<C>>
             })
             .collect::<Result<Vec<_>, _>>()?;
         let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
+
         let outputs = context.parent().bind(Self { declared_types, ..self.clone() }, Vec::new(), &values)?;
         let inputs = self
             .declared_types
@@ -2006,6 +2008,7 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>, P: BatchingPolicy<C>>
             .map(|(_, input)| input)
             .collect::<Vec<_>>();
         check_count!("output", outputs, inputs.len(), ProgramError);
+
         Ok(outputs
             .into_iter()
             .zip(inputs)
@@ -2015,9 +2018,9 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>, P: BatchingPolicy<C>>
     }
 }
 
-impl<C: Context<Type = T>, T: DifferentiableType> DifferentiableOperation<C> for GuardOperation<T>
+impl<C: Context<Type = T>, T: DifferentiableType + CastType> DifferentiableOperation<C> for GuardOperation<T>
 where
-    C::Operation: From<GuardOperation<T>> + From<CastOperation<T>>,
+    C::Operation: From<GuardOperation<T>> + From<CastOperation<T>> + From<T::IdentityWitnessOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2025,13 +2028,14 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Tangents use the checked output's representation through the shared tangent cast of `CastOperation`,
-        // which saves input extents only for names lost from that representation. Every fused tangent retains the
-        // guard's data dependency: even a proven guard orders its outputs after preceding standalone assertions.
-        // Partitioned tangents run after the primal completes and therefore retain only the extents they need.
+        // Tangents use the checked output's representation through the shared tangent cast of `CastOperation`, which
+        // witnesses only the identities lost from (or introduced by) that representation, each by a scalar read of its
+        // extent where the family has one (e.g., `dimension_size` for `ArrayIrType`) and by the whole value otherwise.
+        // Every fused tangent retains the guard's data dependency: even a proven guard orders its outputs after
+        // preceding standalone assertions. Partitioned tangents run after the primal completes and therefore
+        // retain only the identity witnesses they need.
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let outputs = context.primal().bind(self.clone(), Vec::new(), &primals)?;
-        let needs_ordering = !P::PRIMAL_COMPLETES_BEFORE_TANGENT;
         let members = self
             .declared_types
             .iter()
@@ -2045,8 +2049,13 @@ where
             .map(|(output, (_, input))| match input.tangent() {
                 MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(output),
                 MaybeZero::Value(tangent) => {
-                    let tangent =
-                        CastOperation::bind_tangent(context, input.primal(), &output, tangent, needs_ordering)?;
+                    let tangent = CastOperation::bind_tangent(
+                        context,
+                        input.primal(),
+                        &output,
+                        tangent,
+                        !P::PRIMAL_COMPLETES_BEFORE_TANGENT,
+                    )?;
                     DifferentiationDual::new(output, tangent)
                 }
             })
@@ -4850,6 +4859,7 @@ mod tests {
         // Guards and casts only lift their declarations through `BatchingPolicy::batched_type`, so these generic bodies
         // must compile without an array extent policy, assertion preparation, or numerical diagnostic capabilities.
         // Concrete built-in contexts alone would hide accidentally stronger bounds.
+
         fn static_policy<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>>()
         where
             C::Operation: From<GuardOperation<ArrayType>> + From<CastOperation<ArrayType>>,
@@ -4860,6 +4870,7 @@ mod tests {
             let _ =
                 <CastOperation<ArrayType> as BatchableOperation<C, ArrayBatchingPolicy<P>>>::batch::<EmptyRegionDriver>;
         }
+
         fn mixed_policy<C: Context<Type = ArrayIrType>>()
         where
             C::Operation: From<GuardOperation<ArrayIrType>> + From<CastOperation<ArrayIrType>>,
@@ -4871,6 +4882,7 @@ mod tests {
                 EmptyRegionDriver,
             >;
         }
+
         fn projected_policy<C: Context<Type = ArrayIrType> + DomainProjection<ArrayType>>()
         where
             C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -4889,6 +4901,7 @@ mod tests {
                 ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
             >>::batch::<EmptyRegionDriver>;
         }
+
         static_policy::<EagerContext<Array, ArrayOperation<Array>>, StaticArrayExtentBatchingPolicy>();
         mixed_policy::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>();
         projected_policy::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>();
@@ -5355,8 +5368,8 @@ mod tests {
 
     #[test]
     fn test_guard_differentiation_with_renamed_identities() {
-        // `[f32[a], f32[b]]` entering `[f32[p], f32[p]]` relates `a` and `b` without an exact extent, and a guard that
-        // retains `a` gives both outputs the type `f32[a]`. The renamed tangent is converted by a `cast` whose
+        // `[f32[a], f32[b]]` entering `[f32[p], f32[p]]` relates `a` and `b` without an exact extent, and a guard
+        // that retains `a` gives both outputs the type `f32[a]`. The renamed tangent is converted by a `cast` whose
         // witnesses are the primal input and output, so that its transpose can
         // rename the cotangent back to `f32[b]`.
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
