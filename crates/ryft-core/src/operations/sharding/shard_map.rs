@@ -8092,7 +8092,8 @@ mod tests {
         assert_eq!(
             program.interpret(vec![a(3.0), x]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type `f32[2][sharding={varying}]`",
+                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type \
+                 `f32[2][sharding={varying}]`",
             )))),
         );
     }
@@ -10991,8 +10992,8 @@ mod tests {
     #[test]
     fn test_shard_map_batching_of_bodies_with_casts() {
         // Mapped batching batches the body structurally, which lifts the declared types of its casts by the batch
-        // dimension: a checked cast keeps its check for every device and batch item, and the witness of an identity cast
-        // stays unbatched when its input is replicated.
+        // dimension: a checked cast keeps its check for every device and batch item, and the witness of an identity
+        // cast stays unbatched when its input is replicated.
         let mesh = manual_mesh();
         let (replicated, sharded) = (Sharding::replicated(mesh.clone(), 0), sharded_along_x());
         let batched_sharded =
@@ -11033,7 +11034,8 @@ mod tests {
         assert_eq!(
             program.interpret(vec![a(3.0), x]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type `f32[2][sharding={varying}]`",
+                "`cast` cannot convert type `f32[3][sharding={varying}]` to unrelated type \
+                 `f32[2][sharding={varying}]`",
             )))),
         );
         let batched_program = batched(&program, &[BatchAxis::replicated(), BatchAxis::new(0)]);

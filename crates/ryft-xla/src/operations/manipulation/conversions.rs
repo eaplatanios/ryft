@@ -423,7 +423,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
         let unbounded_dimension = dimension_pairs
             .enumerate()
             .flat_map(|(axis, (input, output))| [(axis, input), (axis, output)])
-            .find(|(_, dimension)| matches!(dimension, Dimension::Dynamic(variable) if variable.bounds().upper().is_none()));
+            .find(|(_, dimension)| dimension.bounds().upper().is_none());
         if let (Some(changed_axis), Some((axis, dimension))) = (changed_axis, unbounded_dimension) {
             return Err(LoweringError::UnsupportedOp {
                 op: format!(
@@ -1166,81 +1166,9 @@ mod tests {
             "#},
         );
     }
-    #[test]
-    fn test_lower_cast_converts_bounded_dynamic_values() {
-        use ryft_core::{AddOperation, Shape};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
-        let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let first = builder.add_input(exact);
-        let second = builder.add_input(symbolic.clone());
-        let narrowed = builder
-            .add_instruction(
-                GuardOperation::new("region", vec![symbolic.clone(), symbolic]),
-                Vec::new(),
-                vec![first, second],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), narrowed, None).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let client = execution_client();
-        let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]),
-            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2])]),
-        );
-        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
-
-        // The forward-mode derivative narrows the bounded dynamic tangent with a `cast`, which slices its physical
-        // buffer to the static extent.
-        let jvp = program.jvp().unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/converts_jvp.txt", jvp.to_string()).unwrap();
-        assert!(jvp.to_string().contains("cast"), "{jvp}");
-        let tangents =
-            [MixedValue::Array(vec![1.0, 1.0], vec![2]), MixedValue::Array(vec![10.0, 20.0, 0.0, 0.0], vec![4])];
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &jvp,
-                &[inputs[0].clone(), inputs[1].clone(), tangents[0].clone(), tangents[1].clone()],
-                &[2, 2],
-            ),
-            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Array(vec![11.0, 21.0], vec![2])]),
-        );
-
-        // The pullback widens the static cotangent back to the bounded dynamic input with a `cast` that the residual
-        // primal input witnesses, which pads its physical buffer and restores the logical extent.
-        let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/converts_pullback.txt", pullback.to_string()).unwrap();
-        assert!(pullback.to_string().contains("cast"), "{pullback}");
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &pullback,
-                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), inputs[1].clone()],
-                &[2],
-            ),
-            Ok(vec![
-                MixedValue::Array(vec![1.0, 2.0], vec![2]),
-                MixedValue::Array(vec![1.0, 2.0], vec![2]),
-                MixedValue::Dimension(2),
-            ]),
-        );
-    }
 
     #[test]
-    fn test_lower_checked_cast() {
+    fn test_lower_cast() {
         use ryft_core::{Add, Cast, Shape, Tracer, TracingContext};
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
@@ -1297,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_checked_cast_dimension() {
+    fn test_lower_cast_dimension() {
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::tests::execution_client;
 
@@ -1326,240 +1254,28 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_omits_proven_relationship_checks() {
-        use ryft_core::{Layout, Shape, TiledLayout};
-
-        let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let mut builder = XlaProgramBuilder::new();
-        let value = builder.add_input(input_type.clone());
-        // Keep an explicitly checked primitive to exercise backend proof, independently of public normalization.
-        let output = builder
-            .add_instruction(
-                CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
-                vec![],
-                vec![value],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_1.txt", &module).unwrap();
-        assert!(!module.contains("@ryft.assert"), "{module}");
-
-        let declared = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(); 2]));
-        let actual = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
-        let value = builder.add_input(actual);
-        let output = builder
-            .add_instruction(
-                CastOperation::checked(declared.clone(), vec![declared]).unwrap(),
-                vec![],
-                vec![value],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_2.txt", &module).unwrap();
-        // The stored repeated-identity signature proves itself, but actual [a, 3] still needs a == 3. Source/output
-        // declarations repeat both observations; that one real comparison must not emit duplicate callbacks.
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-
-        let fixed = DimensionType::new("fixed", DimensionBounds::new(2, Some(3)).unwrap());
-        let source =
-            ArrayType::new(DataType::F32, Shape::new(vec![fixed.dimension().clone(), b.simplified_dimension()]));
-        let mut builder = XlaProgramBuilder::new();
-        let input = builder.add_input(source.clone());
-        let output = builder
-            .add_instruction(
-                CastOperation::checked(ArrayType::new_static(DataType::F32, [2, 3]), vec![source]).unwrap(),
-                vec![],
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_3.txt", &module).unwrap();
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-
-        let source =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let target =
-            ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let mut builder = XlaProgramBuilder::new();
-        let input = builder.add_input(source.clone());
-        let output = builder
-            .add_instruction(CastOperation::checked(target, vec![source]).unwrap(), vec![], vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/relationship_4.txt", &module).unwrap();
-        // Swapping axes states a == b twice, but requires just one runtime comparison.
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-    }
-
-    #[test]
-    fn test_lower_cast_different_bounds() {
-        use ryft_core::Shape;
+    fn test_lower_unchecked_cast_with_witness() {
+        use ryft_core::{Cast, Shape, TracingContext};
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::tests::execution_client;
 
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
-        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
-        let client = execution_client();
-        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(source.clone().into());
-            let witness = builder.add_input(target.clone().into());
-            let output = builder
-                .add_instruction(
-                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
-                    vec![],
-                    vec![input, witness],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            assert_eq!(
-                execute_mixed_program(
-                    &client,
-                    &program,
-                    &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7]),],
-                    &[2, 2]
-                ),
-                Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)])
-            );
-            if program.instructions()[0]
-                .operation()
-                .effects()
-                .classes()
-                .contains(ryft_core::EffectClass::OrderedAssertion)
-            {
-                let error = execute_mixed_program(
-                    &client,
-                    &program,
-                    &[MixedValue::Array(vec![1.0; 4], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7])],
-                    &[2, 3],
-                )
-                .unwrap_err()
-                .to_string();
-                assert!(error.contains("in `cast`"), "{error}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_cast_different_bounds_narrowing_bound() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        // Moving a dynamic axis to an identity with a smaller physical bound slices the physical buffer from the
-        // source bound to the target bound and restores the runtime extent, which the witness shares. Only the checked
-        // cast verifies that the extents agree.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
-        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
-        let client = execution_client();
-        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(source.clone().into());
-            let witness = builder.add_input(target.clone().into());
-            let output = builder
-                .add_instruction(
-                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
-                    vec![],
-                    vec![input, witness],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            let checked = program.instructions()[0]
-                .operation()
-                .effects()
-                .classes()
-                .contains(ryft_core::EffectClass::OrderedAssertion);
-            if !checked {
-                assert_eq!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &[source.clone(), target.clone()],
-                        &[target.clone()],
-                        "main",
-                        None,
-                        None,
-                    )
-                    .unwrap(),
-                    // The witness is a dependency of the unchecked cast, so both inputs pass through one barrier. The
-                    // negative high padding slices the physical buffer from the source bound to the target bound.
-                    indoc! {"
-                        module {
-                          func.func @main(%arg0: tensor<7xf64>, %arg1: tensor<4xf64>, %arg2: tensor<i32>, \
-                              %arg3: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>) {
-                            %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : \
-                                (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
-                            %1 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : \
-                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                            %2:2 = stablehlo.optimization_barrier %0, %1 : \
-                                tensor<?xf64, #stablehlo.bounds<7>>, tensor<?xf64, #stablehlo.bounds<4>>
-                            %3 = stablehlo.get_dimension_size %2#0, dim = 0 : \
-                                (tensor<?xf64, #stablehlo.bounds<7>>) -> tensor<i32>
-                            %c = stablehlo.constant dense<7> : tensor<i32>
-                            %4 = stablehlo.set_dimension_size %2#0, %c, dim = 0 : \
-                                (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
-                            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                            %5 = stablehlo.pad %4, %cst, low = [0], high = [-3], interior = [0] : \
-                                (tensor<7xf64>, tensor<f64>) -> tensor<4xf64>
-                            %6 = stablehlo.set_dimension_size %5, %3, dim = 0 : \
-                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                            %7 = stablehlo.get_dimension_size %6, dim = 0 : \
-                                (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
-                            %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
-                            return %6, %8 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>
-                          }
-                        }
-                    "},
-                );
-            }
-            let inputs = [
-                MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0], vec![7]),
-                MixedValue::Array(vec![0.0; 4], vec![4]),
-            ];
-            assert_eq!(
-                execute_mixed_program(&client, &program, &inputs, &[3, 3]),
-                Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]),
-            );
-            let result = execute_mixed_program(&client, &program, &inputs, &[3, 2]);
-            if checked {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains("in `cast`"), "{error}");
-            } else {
-                assert_eq!(result, Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]));
-            }
-        }
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |(value, witness)| value.cast_unchecked(symbolic.clone(), &[witness]),
+            (ArrayIrType::from(ArrayType::new_static(DataType::F64, [2])), symbolic.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            execute_mixed_program(
+                &execution_client(),
+                &program.to_flat_program(),
+                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]),],
+                &[2]
+            ),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)]),
+        );
     }
 
     #[test]
@@ -1694,56 +1410,142 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_unbounded_shape() {
-        use ryft_core::Shape;
-        use ryft_mlir::Location;
+    fn test_lower_checked_cast_region_checks() {
+        use ryft_core::{ConditionOperation, ScanOperation, Shape, WhileOperation};
 
-        // Converting any axis materializes the static physical buffer of the whole value, so it is rejected when the
-        // converted axis or another axis that the conversion leaves unchanged has an unbounded dimension. A cast that
-        // converts no axis returns its input unchanged, even when the input has unbounded dimensions.
-        let n = DimensionType::new("n", DimensionBounds::positive(None).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
-        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
-        let partially_exact =
-            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
-        let cases = [
-            (
-                unbounded.clone(),
-                ArrayType::new_static(DataType::F32, [2]),
-                Err(LoweringError::UnsupportedOp {
-                    op: "shape conversion along axis 0 requires finite physical bounds, but axis 0 has unbounded \
-                         dimension `n`"
-                        .to_owned(),
-                }),
-            ),
-            (
-                mixed.clone(),
-                partially_exact,
-                Err(LoweringError::UnsupportedOp {
-                    op: "shape conversion along axis 1 requires finite physical bounds, but axis 0 has unbounded \
-                         dimension `n`"
-                        .to_owned(),
-                }),
-            ),
-            (mixed.clone(), mixed, Ok(())),
-        ];
-        for (input_type, output_type, expected) in cases {
-            let context = MlirContext::new();
-            let location = context.unknown_location();
-            let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
-                XlaLowerer::new(block.as_ref(), &context, location.as_ref());
-            assert_eq!(
-                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
-                    &mut lowerer,
-                    &[source],
-                    &[input_type],
-                    &[output_type],
-                ),
-                expected.map(|()| vec![source]),
-            );
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::operations::jit_call::JitCallOperation;
+        use crate::tests::execution_client;
+
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let body = |index, checked| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            if index {
+                builder.add_input(ArrayType::scalar(DataType::I64).into());
+            }
+            let value = builder.add_input(symbolic.clone());
+            if checked {
+                builder
+                    .add_instruction(
+                        CastOperation::<ArrayIrType>::checked(
+                            ArrayType::new_static(DataType::F64, [2]).into(),
+                            vec![symbolic.clone()],
+                        )
+                        .unwrap(),
+                        vec![],
+                        vec![value],
+                        None,
+                    )
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![value],
+                    vec![Placeholder; if index { 2 } else { 1 }],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let client = execution_client();
+        // Exercise repeated calls, selected and unselected branches, zero-trip loops, a rolled scan and a fully
+        // unrolled scan. The checked cast's unused result must never make its precondition disappear.
+        for wrapper in 0..5 {
+            for entered in [false, true] {
+                if wrapper == 0 && !entered {
+                    continue;
+                }
+                let mut builder = CompositeXlaProgramBuilder::new();
+                let input = builder.add_input(symbolic.clone());
+                let region = builder.import_program(body(wrapper >= 3, true));
+                let output = match wrapper {
+                    0 => {
+                        for _ in 0..2 {
+                            builder
+                                .add_instruction(
+                                    XlaOperation::JitCall(JitCallOperation::new(0)),
+                                    vec![region],
+                                    vec![input],
+                                    None,
+                                )
+                                .unwrap();
+                        }
+                        input
+                    }
+                    1 => {
+                        let other = builder.import_program(body(false, false));
+                        let predicate = builder.add_constant(XlaConstant::Boolean(entered));
+                        builder
+                            .add_instruction(
+                                XlaOperation::Condition(ConditionOperation::new()),
+                                vec![region, other],
+                                vec![predicate, input],
+                                None,
+                            )
+                            .unwrap()[0]
+                    }
+                    2 => {
+                        let mut condition = CompositeXlaProgramBuilder::new();
+                        condition.add_input(symbolic.clone());
+                        let predicate = condition.add_constant(XlaConstant::Boolean(entered));
+                        let condition = condition
+                            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                                vec![predicate],
+                                vec![Placeholder],
+                                vec![Placeholder],
+                            )
+                            .unwrap();
+                        let condition = builder.import_program(condition);
+                        builder
+                            .add_instruction(
+                                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
+                                vec![condition, region],
+                                vec![input],
+                                None,
+                            )
+                            .unwrap()[0]
+                    }
+                    _ => builder
+                        .add_instruction(
+                            XlaOperation::Scan(
+                                ScanOperation::new(1, Dimension::Static(if entered { 2 } else { 0 }))
+                                    .with_unroll(if wrapper == 4 { 3 } else { 1 })
+                                    .unwrap(),
+                            ),
+                            vec![region],
+                            vec![input],
+                            None,
+                        )
+                        .unwrap()[0],
+                };
+                let program = builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .unwrap();
+                for extent in [2, 3] {
+                    let result = execute_mixed_program(
+                        &client,
+                        &program,
+                        &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
+                        &[extent],
+                    );
+                    if entered && extent == 3 {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+                    } else {
+                        assert_eq!(
+                            result,
+                            Ok(vec![
+                                MixedValue::Array(
+                                    (1..=extent).map(|value| value as f64).collect(),
+                                    vec![extent as u64]
+                                ),
+                                MixedValue::Dimension(extent as i64),
+                            ]),
+                            "wrapper={wrapper}, entered={entered}, extent={extent}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1853,7 +1655,10 @@ mod tests {
         );
         let wrong = MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]);
         let error = execute_mixed_program(&client, &jvp, &[wrong.clone(), wrong], &[3, 3]).unwrap_err().to_string();
-        assert!(error.contains("in `cast`"), "{error}");
+        assert!(
+            error.contains("input dimension `n` must have the declared extent in `cast`; expected=2, actual=3"),
+            "{error}"
+        );
 
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
@@ -1869,6 +1674,1343 @@ mod tests {
         assert_eq!(
             execute_mixed_program(&client, &pullback, &[MixedValue::Array(vec![5.0, 6.0], vec![2]), primal], &[2],),
             Ok(vec![MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+        );
+    }
+
+    #[test]
+    fn test_lower_cast_converts_bounded_dynamic_values() {
+        use ryft_core::{AddOperation, Shape};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let first = builder.add_input(exact);
+        let second = builder.add_input(symbolic.clone());
+        let narrowed = builder
+            .add_instruction(
+                GuardOperation::new("region", vec![symbolic.clone(), symbolic]),
+                Vec::new(),
+                vec![first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), narrowed, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[2]),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2])]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
+
+        // The forward-mode derivative retains the guard on the primal inputs and converts each tangent to the type of
+        // its guarded primal with a `cast` that the primals witness. The bounded dynamic tangent is narrowed to the
+        // static extent, which slices its physical buffer.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[n], %2:f64[2], %3:f64[n] .
+                let %4:f64[2], %5:f64[2] = guard [boundary=\"region\", declared_types=[f64[n], f64[n]]] %0 %1
+                    %6:f64[2] = cast [type=f64[2], inputs=[f64[2], f64[2]]] %2 %4
+                    %7:f64[n] = cast [type=f64[n], inputs=[f64[n], f64[2]]] %1 %5
+                    %8:f64[2] = cast [type=f64[2], inputs=[f64[n], f64[n]]] %3 %7
+                    %9:f64[2] = add %4 %5
+                    %10:f64[2] = add %6 %8
+                in (%9, %10)"},
+        );
+        let tangents =
+            [MixedValue::Array(vec![1.0, 1.0], vec![2]), MixedValue::Array(vec![10.0, 20.0, 0.0, 0.0], vec![4])];
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &jvp,
+                &[inputs[0].clone(), inputs[1].clone(), tangents[0].clone(), tangents[1].clone()],
+                &[2, 2],
+            ),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Array(vec![11.0, 21.0], vec![2])]),
+        );
+
+        // The pullback widens the static cotangent back to the bounded dynamic input with a `cast` that the residual
+        // primal input witnesses, which pads its physical buffer and restores the logical extent.
+        let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[n] .
+                let %2:f64[n] = cast [type=f64[n], inputs=[f64[2], f64[n]]] %0 %1
+                in (%0, %2)"},
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &pullback,
+                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), inputs[1].clone()],
+                &[2],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                MixedValue::Dimension(2),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_lower_guarded_cast() {
+        use ryft_core::{
+            BatchAxis, BatchedProgram, Layout, ProgramBatchingOutputAxesPolicy, Shape, ShardingDimension, TiledLayout,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
+        // A declared physical layout disappears when batching inserts an axis. The guard and cast must validate
+        // the source declaration before lifting instead of requiring that layout on reconstructed per-item types.
+        let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]))
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
+        let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(array.clone().into());
+        let input = builder
+            .add_instruction(
+                GuardOperation::new("square", vec![relation.clone()])
+                    .with_retained_identities(vec![a.to_variable(), b.to_variable()]),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        // Exercise the homogeneous-array rule inside the composite program, including empty dense shapes.
+        let output = builder
+            .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
+            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0)]),
+        );
+        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+
+        // Differentiation retains the checked primal relation even when the tangent already has the output type.
+        let differentiated = program.jvp().unwrap();
+        let inputs = [input.clone(), input];
+        assert_eq!(
+            execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]),
+            Ok(vec![
+                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
+                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+            ]),
+        );
+        let error = execute_mixed_program(&client, &differentiated, &inputs, &[2, 3, 2, 3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+
+        // Batching adds a separate leading dimension to the guard and cast. The two item axes must still
+        // agree, including when the mapped extent is zero and there are no elements to inspect.
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionType::new("batch", DimensionBounds::non_negative(Some(4)).unwrap()),
+                ShardingDimension::replicated(),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let inputs = [MixedValue::Dimension(2), MixedValue::Array(vec![1f64; 48], vec![3, 4, 4])];
+        assert_eq!(
+            execute_mixed_program(&client, &batched, &inputs, &[2, 2, 2]),
+            Ok(vec![
+                MixedValue::Dimension(2),
+                MixedValue::Array(vec![1f64; 8], vec![2, 2, 2]),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+            ]),
+        );
+        let error = execute_mixed_program(&client, &batched, &inputs, &[2, 2, 3]).unwrap_err().to_string();
+        assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
+        let inputs = [MixedValue::Dimension(0), inputs[1].clone()];
+        let error = execute_mixed_program(&client, &batched, &inputs, &[0, 2, 3]).unwrap_err().to_string();
+        assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_guarded_cast_discarded_output() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
+        let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(array.clone().into());
+        let input = builder
+            .add_instruction(
+                GuardOperation::new("square", vec![relation.clone()])
+                    .with_retained_identities(vec![a.to_variable(), b.to_variable()]),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let client = execution_client();
+        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
+        assert_eq!(execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]), Ok(Vec::new()));
+        let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_cast_omits_proven_relationship_checks() {
+        use ryft_core::{Layout, Shape, TiledLayout};
+
+        let bounds = DimensionBounds::positive(Some(5)).unwrap();
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let mut builder = XlaProgramBuilder::new();
+        let value = builder.add_input(input_type.clone());
+        // Keep an explicitly checked primitive to exercise backend proof, independently of public normalization.
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
+                vec![],
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                      tensor<?x?xf32, #stablehlo.bounds<4, 4>> {
+                    %c = stablehlo.constant dense<4> : tensor<i32>
+                    %0 = stablehlo.set_dimension_size %arg0, %c, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
+                        tensor<i32>) -> tensor<4x?xf32, #stablehlo.bounds<?, 4>>
+                    %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                    %1 = stablehlo.set_dimension_size %0, %c_0, dim = 1 : (tensor<4x?xf32, #stablehlo.bounds<?, 4>>, \
+                        tensor<i32>) -> tensor<4x4xf32>
+                    %2 = stablehlo.custom_call @LayoutConstraint(%1) {operand_layouts = \
+                        [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : \
+                        (tensor<4x4xf32>) -> tensor<4x4xf32>
+                    %3 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %4 = stablehlo.set_dimension_size %2, %3, dim = 0 : (tensor<4x4xf32>, tensor<i32>) -> \
+                        tensor<?x4xf32, #stablehlo.bounds<4, ?>>
+                    %5 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %6 = stablehlo.set_dimension_size %4, %5, dim = 1 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                    return %6 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                  }
+                }
+            "},
+        );
+
+        let declared = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(); 2]));
+        let actual = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let value = builder.add_input(actual);
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(declared.clone(), vec![declared]).unwrap(),
+                vec![],
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        // The stored repeated-identity signature proves itself, but actual [a, 3] still needs a == 3. Source/output
+        // declarations repeat both observations; that one real comparison must not emit duplicate callbacks.
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> \
+                      tensor<?x?xf32, #stablehlo.bounds<4, 4>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %2 = stablehlo.compare EQ, %c, %1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %3 = stablehlo.after_all  : !stablehlo.token
+                    %4 = stablehlo.custom_call @ryft.assert(%2, %1, %c, %3) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `a` must have one extent in `cast`\"}, \
+                        has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> \
+                        !stablehlo.token
+                    %5:2 = stablehlo.optimization_barrier %arg0, %4 : tensor<?x3xf32, #stablehlo.bounds<4, ?>>, \
+                        !stablehlo.token
+                    %6 = stablehlo.get_dimension_size %5#0, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %c_0 = stablehlo.constant dense<3> : tensor<i32>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %5#0, %c_1, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<4x3xf32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %8 = stablehlo.pad %7, %cst, low = [0, 0], high = [0, 1], interior = [0, 0] : (tensor<4x3xf32>, \
+                        tensor<f32>) -> tensor<4x4xf32>
+                    %9 = stablehlo.set_dimension_size %8, %6, dim = 0 : (tensor<4x4xf32>, tensor<i32>) -> \
+                        tensor<?x4xf32, #stablehlo.bounds<4, ?>>
+                    %10 = stablehlo.set_dimension_size %9, %c_0, dim = 1 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                    return %10 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                  }
+                }
+            "},
+        );
+
+        let fixed = DimensionType::new("fixed", DimensionBounds::new(2, Some(3)).unwrap());
+        let source =
+            ArrayType::new(DataType::F32, Shape::new(vec![fixed.dimension().clone(), b.simplified_dimension()]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(source.clone());
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(ArrayType::new_static(DataType::F32, [2, 3]), vec![source]).unwrap(),
+                vec![],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?x?xf32, #stablehlo.bounds<2, 4>>) -> tensor<2x3xf32> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x?xf32, #stablehlo.bounds<2, 4>>) -> \
+                        tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %2 = stablehlo.compare EQ, %1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %3 = stablehlo.after_all  : !stablehlo.token
+                    %4 = stablehlo.custom_call @ryft.assert(%2, %c, %1, %3) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
+                        `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) \
+                        -> !stablehlo.token
+                    %5:2 = stablehlo.optimization_barrier %arg0, %4 : tensor<?x?xf32, #stablehlo.bounds<2, 4>>, \
+                        !stablehlo.token
+                    %c_0 = stablehlo.constant dense<2> : tensor<i32>
+                    %6 = stablehlo.set_dimension_size %5#0, %c_0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<2, 4>>, \
+                        tensor<i32>) -> tensor<2x?xf32, #stablehlo.bounds<?, 4>>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %6, %c_1, dim = 1 : (tensor<2x?xf32, #stablehlo.bounds<?, 4>>, \
+                        tensor<i32>) -> tensor<2x4xf32>
+                    %8 = stablehlo.slice %7 [0:2, 0:3] : (tensor<2x4xf32>) -> tensor<2x3xf32>
+                    return %8 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+
+        let source =
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let target =
+            ArrayType::new(DataType::F32, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(source.clone());
+        let output = builder
+            .add_instruction(CastOperation::checked(target, vec![source]).unwrap(), vec![], vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        // Swapping axes states a == b twice, but requires just one runtime comparison.
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                      tensor<?x?xf32, #stablehlo.bounds<4, 4>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %2 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                    %4 = stablehlo.compare EQ, %3, %1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %5 = stablehlo.after_all  : !stablehlo.token
+                    %6 = stablehlo.custom_call @ryft.assert(%4, %1, %3, %5) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `a` must have one extent in `cast`\"}, \
+                        has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> \
+                        !stablehlo.token
+                    %7:2 = stablehlo.optimization_barrier %arg0, %6 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
+                        !stablehlo.token
+                    return %7#0 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_lower_cast_omits_proven_witness_checks() {
+        use ryft_core::Shape;
+
+        let bounds = DimensionBounds::positive(Some(5)).unwrap();
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let value = builder.add_input(input_type.clone());
+        let witness = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(output_type, vec![input_type.clone(), input_type]).unwrap(),
+                Vec::new(),
+                vec![value, witness],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[a, b], %1:f32[a, b] .
+                let %2:f32[a, 2] = cast [type=f32[a, 2], inputs=[f32[a, b], f32[a, b]], checked=true] %0 %1
+                in (%2)"},
+        );
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        // Only b == 2 is conditional. Both input arrays already carry the same a and b identities.
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?x?xf32, #stablehlo.bounds<4, 4>>, %arg1: \
+                      tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<2> : tensor<i64>
+                    %2 = stablehlo.compare EQ, %1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %3 = stablehlo.after_all  : !stablehlo.token
+                    %4 = stablehlo.custom_call @ryft.assert(%2, %c, %1, %3) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
+                        `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) \
+                        -> !stablehlo.token
+                    %5:3 = stablehlo.optimization_barrier %arg0, %arg1, %4 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
+                        tensor<?x?xf32, #stablehlo.bounds<4, 4>>, !stablehlo.token
+                    %6 = stablehlo.get_dimension_size %5#0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %5#0, %c_0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
+                        tensor<i32>) -> tensor<4x?xf32, #stablehlo.bounds<?, 4>>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                    %8 = stablehlo.set_dimension_size %7, %c_1, dim = 1 : (tensor<4x?xf32, #stablehlo.bounds<?, 4>>, \
+                        tensor<i32>) -> tensor<4x4xf32>
+                    %9 = stablehlo.slice %8 [0:4, 0:2] : (tensor<4x4xf32>) -> tensor<4x2xf32>
+                    %10 = stablehlo.set_dimension_size %9, %6, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> \
+                        tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    return %10 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_lower_cast_repeated_static_check() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(); 2]));
+        let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(output_type.clone(), vec![input_type]).unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n, n] .
+                let %1:f64[2, 2] = cast [type=f64[2, 2], inputs=[f64[n, n]], checked=true] %0
+                in (%1)"},
+        );
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> tensor<2x2xf64> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> \
+                        tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<2> : tensor<i64>
+                    %2 = stablehlo.compare EQ, %1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %3 = stablehlo.after_all  : !stablehlo.token
+                    %4 = stablehlo.custom_call @ryft.assert(%2, %c, %1, %3) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `n` must have the declared extent in \
+                        `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) \
+                        -> !stablehlo.token
+                    %5:2 = stablehlo.optimization_barrier %arg0, %4 : tensor<?x?xf64, #stablehlo.bounds<4, 4>>, \
+                        !stablehlo.token
+                    %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                    %6 = stablehlo.set_dimension_size %5#0, %c_0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, \
+                        tensor<i32>) -> tensor<4x?xf64, #stablehlo.bounds<?, 4>>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %6, %c_1, dim = 1 : (tensor<4x?xf64, #stablehlo.bounds<?, 4>>, \
+                        tensor<i32>) -> tensor<4x4xf64>
+                    %8 = stablehlo.slice %7 [0:2, 0:2] : (tensor<4x4xf64>) -> tensor<2x2xf64>
+                    return %8 : tensor<2x2xf64>
+                  }
+                }
+            "},
+        );
+        let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
+            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2])]),
+        );
+        let error = execute_mixed_program(&client, &program, &[input], &[3, 3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `n` must have the declared extent in `cast`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_cast_dimension_witness_checks() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let bounds = DimensionBounds::positive(Some(5)).unwrap();
+        let [a, b, c] = ["a", "b", "c"].map(|name| DimensionType::new(name, bounds));
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
+        let client = execution_client();
+        // An array axis and a first-class dimension can share an actual identity, so a witness of the identity `b`
+        // needs no comparison beyond the declared extent of `b`. Equal non-singleton bounds on an independent identity
+        // prove nothing, so a witness of `c` retains its own comparison and fails for extent 3.
+        let cases = [
+            (
+                b.clone(),
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<i64>, %arg1: tensor<4x4xf64>, %arg2: tensor<i32>, %arg3: \
+                          tensor<i32>) -> (tensor<?x2xf64, #stablehlo.bounds<4, ?>>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg1, %arg2, dim = 0 : (tensor<4x4xf64>, tensor<i32>) -> \
+                            tensor<?x4xf64, #stablehlo.bounds<4, ?>>
+                        %1 = stablehlo.set_dimension_size %0, %arg3, dim = 1 : \
+                            (tensor<?x4xf64, #stablehlo.bounds<4, ?>>, tensor<i32>) -> \
+                            tensor<?x?xf64, #stablehlo.bounds<4, 4>>
+                        %2 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> \
+                            tensor<i32>
+                        %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                        %c = stablehlo.constant dense<2> : tensor<i64>
+                        %4 = stablehlo.compare EQ, %3, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                        %5 = stablehlo.after_all  : !stablehlo.token
+                        %6 = stablehlo.custom_call @ryft.assert(%4, %c, %3, %5) {api_version = 4 : i32, backend_config \
+                            = {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                            label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
+                            `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, \
+                            !stablehlo.token) -> !stablehlo.token
+                        %7:3 = stablehlo.optimization_barrier %1, %arg0, %6 : \
+                            tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<i64>, !stablehlo.token
+                        %8 = stablehlo.get_dimension_size %7#0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) \
+                            -> tensor<i32>
+                        %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                        %9 = stablehlo.set_dimension_size %7#0, %c_0, dim = 0 : \
+                            (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<i32>) -> \
+                            tensor<4x?xf64, #stablehlo.bounds<?, 4>>
+                        %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                        %10 = stablehlo.set_dimension_size %9, %c_1, dim = 1 : \
+                            (tensor<4x?xf64, #stablehlo.bounds<?, 4>>, tensor<i32>) -> tensor<4x4xf64>
+                        %11 = stablehlo.slice %10 [0:4, 0:2] : (tensor<4x4xf64>) -> tensor<4x2xf64>
+                        %12 = stablehlo.set_dimension_size %11, %8, dim = 0 : (tensor<4x2xf64>, tensor<i32>) -> \
+                            tensor<?x2xf64, #stablehlo.bounds<4, ?>>
+                        %13 = stablehlo.get_dimension_size %12, dim = 0 : (tensor<?x2xf64, #stablehlo.bounds<4, ?>>) \
+                            -> tensor<i32>
+                        %14 = stablehlo.convert %13 : (tensor<i32>) -> tensor<i64>
+                        return %12, %14 : tensor<?x2xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
+                      }
+                    }
+                "},
+            ),
+            (
+                c,
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<i64>, %arg1: tensor<4x4xf64>, %arg2: tensor<i32>, %arg3: \
+                          tensor<i32>) -> (tensor<?x2xf64, #stablehlo.bounds<4, ?>>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg1, %arg2, dim = 0 : (tensor<4x4xf64>, tensor<i32>) -> \
+                            tensor<?x4xf64, #stablehlo.bounds<4, ?>>
+                        %1 = stablehlo.set_dimension_size %0, %arg3, dim = 1 : \
+                            (tensor<?x4xf64, #stablehlo.bounds<4, ?>>, tensor<i32>) -> \
+                            tensor<?x?xf64, #stablehlo.bounds<4, 4>>
+                        %2 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> \
+                            tensor<i32>
+                        %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                        %c = stablehlo.constant dense<2> : tensor<i64>
+                        %4 = stablehlo.compare EQ, %3, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                        %5 = stablehlo.after_all  : !stablehlo.token
+                        %6 = stablehlo.custom_call @ryft.assert(%4, %c, %3, %5) {api_version = 4 : i32, backend_config \
+                            = {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                            label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
+                            `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, \
+                            !stablehlo.token) -> !stablehlo.token
+                        %7 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> \
+                            tensor<i32>
+                        %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                        %9 = stablehlo.compare EQ, %arg0, %8, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                        %10 = stablehlo.custom_call @ryft.assert(%9, %8, %arg0, %6) {api_version = 4 : i32, \
+                            backend_config = {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \
+                            \"actual\", label_count = \"2\", message = \"input dimension `b` must have one extent in \
+                            `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, \
+                            !stablehlo.token) -> !stablehlo.token
+                        %11:3 = stablehlo.optimization_barrier %1, %arg0, %10 : \
+                            tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<i64>, !stablehlo.token
+                        %12 = stablehlo.get_dimension_size %11#0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) \
+                            -> tensor<i32>
+                        %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                        %13 = stablehlo.set_dimension_size %11#0, %c_0, dim = 0 : \
+                            (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<i32>) -> \
+                            tensor<4x?xf64, #stablehlo.bounds<?, 4>>
+                        %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                        %14 = stablehlo.set_dimension_size %13, %c_1, dim = 1 : \
+                            (tensor<4x?xf64, #stablehlo.bounds<?, 4>>, tensor<i32>) -> tensor<4x4xf64>
+                        %15 = stablehlo.slice %14 [0:4, 0:2] : (tensor<4x4xf64>) -> tensor<4x2xf64>
+                        %16 = stablehlo.set_dimension_size %15, %12, dim = 0 : (tensor<4x2xf64>, tensor<i32>) -> \
+                            tensor<?x2xf64, #stablehlo.bounds<4, ?>>
+                        %17 = stablehlo.get_dimension_size %16, dim = 0 : (tensor<?x2xf64, #stablehlo.bounds<4, ?>>) \
+                            -> tensor<i32>
+                        %18 = stablehlo.convert %17 : (tensor<i32>) -> tensor<i64>
+                        return %16, %18 : tensor<?x2xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
+                      }
+                    }
+                "},
+            ),
+        ];
+        for (witness_type, expected_module) in cases {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let witness = builder.add_input(witness_type.clone().into());
+            let value = builder.add_input(input_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    CastOperation::<ArrayIrType>::checked(
+                        output_type.clone().into(),
+                        vec![input_type.clone().into(), b.clone().into()],
+                    )
+                    .unwrap(),
+                    Vec::new(),
+                    vec![value, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let expected = formatdoc! {"
+            lambda %0:{witness_type}, %1:f64[a, b] .
+            let %2:f64[a, 2] = cast [type=f64[a, 2], inputs=[f64[a, b], dimension<b ∈ [1, 5)>], checked=true] %1 %0
+            in (%2)"};
+            assert_eq!(program.to_string(), expected);
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![ArrayType::scalar(DataType::I64), input_type.clone()],
+                &vec![output_type.clone()],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(module, expected_module);
+            let input = MixedValue::Array(vec![1.0; 16], vec![4, 4]);
+            assert_eq!(
+                execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), input.clone()], &[2, 2]),
+                Ok(vec![MixedValue::Array(vec![1.0; 4], vec![2, 2]), MixedValue::Dimension(2)]),
+            );
+            if witness_type != b {
+                let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3), input], &[2, 2])
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("input dimension `b` must have one extent in `cast`"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_checked_cast_ambient_identities() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let bounds = DimensionBounds::positive(Some(5)).unwrap();
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
+        let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
+        let swapped =
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(array.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(swapped.into(), vec![array.clone().into()]).unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
+            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)]),
+        );
+        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must have one extent in `cast`"), "{error}");
+
+        // The primal of a differentiated cast retains that same source declaration. Tangent casts reverse neither
+        // the ambient assignments nor their dependence on the checked primal output.
+        let differentiated = program.jvp().unwrap();
+        assert_eq!(
+            execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]),
+            Ok(vec![
+                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
+                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+            ]),
+        );
+        let error = execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 3, 2, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must have one extent in `cast`"), "{error}");
+
+        // Keeping the original source and output types accepts rectangular shapes.
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let value = builder.add_input(array.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(array.clone().into(), vec![array.into()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[input], &[2, 3]),
+            Ok(vec![MixedValue::Array(vec![1f64; 6], vec![2, 3]), MixedValue::Dimension(2), MixedValue::Dimension(3)]),
+        );
+    }
+
+    #[test]
+    fn test_lower_checked_cast_mixed_dimensions() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let bounds = DimensionBounds::positive(Some(5)).unwrap();
+        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]));
+        let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension()]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let witness = builder.add_input(witness_type.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into(), witness_type.into()])
+                    .unwrap(),
+                Vec::new(),
+                vec![input, witness],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 4], vec![4])];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[3, 3]),
+            Ok(vec![MixedValue::Array(vec![1f64; 9], vec![3, 3]), MixedValue::Dimension(3)]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[4, 3]).unwrap_err().to_string();
+        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+        let error = execute_mixed_program(&client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
+        assert!(error.contains("must have one extent in `cast`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_checked_cast_static_witnesses() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // A static witness establishes ambient b = 3 before type inference compares the source and target dimensions.
+        // The symbolic input still needs its runtime check, before conversion slices its physical bound to 3.
+        let bounds = DimensionBounds::positive(Some(5)).unwrap();
+        let b = DimensionType::new("b", bounds);
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
+        let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
+        let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension()]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let witness = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(
+                    output_type.into(),
+                    vec![input_type.clone().into(), witness_type.into()],
+                )
+                .unwrap(),
+                Vec::new(),
+                vec![input, witness],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[input_type, ArrayType::new_static(DataType::F64, [3])],
+            &[ArrayType::new_static(DataType::F64, [3, 3])],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4x3xf64>, %arg1: tensor<3xf64>, %arg2: tensor<i32>) -> tensor<3x3xf64> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4x3xf64>, tensor<i32>) -> \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %3 = stablehlo.compare EQ, %2, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %4 = stablehlo.after_all  : !stablehlo.token
+                    %5 = stablehlo.custom_call @ryft.assert(%3, %c, %2, %4) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
+                        `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) \
+                        -> !stablehlo.token
+                    %6:3 = stablehlo.optimization_barrier %0, %arg1, %5 : tensor<?x3xf64, #stablehlo.bounds<4, ?>>, \
+                        tensor<3xf64>, !stablehlo.token
+                    %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %6#0, %c_0, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<4x3xf64>
+                    %8 = stablehlo.slice %7 [0:3, 0:3] : (tensor<4x3xf64>) -> tensor<3x3xf64>
+                    return %8 : tensor<3x3xf64>
+                  }
+                }
+            "},
+        );
+        let client = execution_client();
+        let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 3], vec![3])];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[3]),
+            Ok(vec![MixedValue::Array(vec![1f64; 9], vec![3, 3])]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[4]).unwrap_err().to_string();
+        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_cast_output_layout_dynamic() {
+        use ryft_core::{Layout, TiledLayout};
+
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("n", Some(5)), 3.into()]));
+        let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(
+                    constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
+                    vec![],
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(
+                to_mlir_module_for_plain_program(&program, "main").unwrap(),
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<?x3xf64, #stablehlo.bounds<4, ?>>) \
+                          -> tensor<?x3xf64, #stablehlo.bounds<4, ?>> {
+                        %c = stablehlo.constant dense<4> : tensor<i32>
+                        %0 = stablehlo.set_dimension_size %arg0, %c, dim = 0 : \
+                            (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x3xf64>
+                        %1 = stablehlo.custom_call @LayoutConstraint(%0) {\
+                            operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
+                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x3xf64>) -> tensor<4x3xf64>
+                        %2 = stablehlo.get_dimension_size %arg0, dim = 0 : \
+                            (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                        %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : \
+                            (tensor<4x3xf64>, tensor<i32>) -> tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                        return %3 : tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                      }
+                    }
+                "},
+            );
+            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+            assert_eq!(
+                crate::to_mlir_module_for_program(
+                    &program,
+                    &[],
+                    &vec![input_type.clone()],
+                    &vec![output_type.clone()],
+                    "main",
+                    None,
+                    None,
+                ),
+                Err(LoweringError::UnsupportedOp {
+                    op: "non-row-major bounded-dynamic output layout `tiled{0,1}`".to_string(),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_cast_widening_with_output_layout() {
+        use ryft_core::{Layout, Shape, TiledLayout};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // Widening a static axis to a bounded dynamic one pads the physical buffer to the bound, and the requested
+        // layout constrains that whole physical buffer before the runtime extent is restored on the constrained value.
+        // A second cast drops the layout again so that the executable boundary stays row-major.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let exact = ArrayType::new_static(DataType::F64, [2, 3]);
+        let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
+        let laid_out = symbolic.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(exact.clone().into());
+        let witness = builder.add_input(symbolic.clone().into());
+        let widened = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(
+                    laid_out.clone().into(),
+                    vec![exact.clone().into(), symbolic.clone().into()],
+                )
+                .unwrap(),
+                Vec::new(),
+                vec![input, witness],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::unchecked(symbolic.clone().into(), vec![laid_out.into()]).unwrap(),
+                Vec::new(),
+                vec![widened],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let module =
+            to_mlir_module_for_program(&program, &[], &[exact, symbolic.clone()], &[symbolic], "main", None, None)
+                .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf64>, %arg1: tensor<4x3xf64>, %arg2: tensor<i32>) -> \
+                      (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg1, %arg2, dim = 0 : (tensor<4x3xf64>, tensor<i32>) -> \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %c = stablehlo.constant dense<2> : tensor<i64>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.compare EQ, %2, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %4 = stablehlo.after_all  : !stablehlo.token
+                    %5 = stablehlo.custom_call @ryft.assert(%3, %c, %2, %4) {api_version = 4 : i32, backend_config = \
+                        {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
+                        label_count = \"2\", message = \"input dimension `n` must have one extent in `cast`\"}, \
+                        has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> \
+                        !stablehlo.token
+                    %6:3 = stablehlo.optimization_barrier %arg0, %0, %5 : tensor<2x3xf64>, \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>, !stablehlo.token
+                    %c_0 = stablehlo.constant dense<2> : tensor<i32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %7 = stablehlo.pad %6#0, %cst, low = [0, 0], high = [2, 0], interior = [0, 0] : (tensor<2x3xf64>, \
+                        tensor<f64>) -> tensor<4x3xf64>
+                    %8 = stablehlo.set_dimension_size %7, %c_0, dim = 0 : (tensor<4x3xf64>, tensor<i32>) -> \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                    %9 = stablehlo.set_dimension_size %8, %c_1, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<4x3xf64>
+                    %10 = stablehlo.custom_call @LayoutConstraint(%9) {operand_layouts = \
+                        [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : \
+                        (tensor<4x3xf64>) -> tensor<4x3xf64>
+                    %11 = stablehlo.get_dimension_size %8, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %12 = stablehlo.set_dimension_size %10, %11, dim = 0 : (tensor<4x3xf64>, tensor<i32>) -> \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %13 = stablehlo.get_dimension_size %12, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %14 = stablehlo.convert %13 : (tensor<i32>) -> tensor<i64>
+                    return %12, %14 : tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
+                  }
+                }
+            "},
+        );
+        let client = execution_client();
+        let inputs = [
+            MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]),
+            MixedValue::Array(vec![0.0; 12], vec![4, 3]),
+        ];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[2]),
+            Ok(vec![MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]), MixedValue::Dimension(2)]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `n` must have one extent in `cast`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_cast_layout_after_bound_change() {
+        use std::sync::OnceLock;
+
+        use ryft_core::{CustomCallOperation, Layout, TiledLayout};
+        use ryft_pjrt::extensions::ffi::{
+            FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
+            XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+        };
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+
+        const TARGET: &str = "ryft.test.physical_f64_copy";
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        /// Copies the physical storage of the single `f64` operand, in memory order, into the rank-1 `f64` result.
+        unsafe extern "C" fn handler(raw: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: XLA provides a valid call frame, operand buffer, and result allocation for this invocation, and
+            // the program below declares a result with as many elements as its operand.
+            unsafe {
+                let Ok(frame) = FfiCallFrame::from_c_api(raw) else { return std::ptr::null_mut() };
+                if frame.register_metadata(FfiTypeId::default()) || frame.stage() != FfiExecutionStage::Execution {
+                    return std::ptr::null_mut();
+                }
+                let Ok(api) = frame.api() else { return std::ptr::null_mut() };
+                let (Ok(FfiInput::Buffer { buffer: input }), Ok(FfiOutput::Buffer { buffer: output })) =
+                    (frame.input(0), frame.output(0))
+                else {
+                    return FfiError::invalid_argument("expected one operand and one result buffer").to_c_api(api);
+                };
+                let length = output.dimensions().iter().product::<i64>() as usize;
+                std::ptr::copy_nonoverlapping(input.data() as *const f64, output.data() as *mut f64, length);
+                std::ptr::null_mut()
+            }
+        }
+
+        // The first cast constrains the physical buffer to its new column-major layout. The second cast keeps that
+        // layout but narrows the bounded dynamic axis, which slices a new buffer that it does not constrain again.
+        // Layouts are only observable where a value crosses a boundary (executable inputs and outputs, and custom-call
+        // operands and results), and every such boundary states the layout of its own declared type. XLA rejects
+        // bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only a static
+        // result of such a cast can be observed, and its consumer still receives the declared column-major storage.
+        let client = load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
+        let laid_out = source.clone().with_layout(layout.clone());
+        let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout);
+        let copied = ArrayType::new_static(DataType::F64, [6]);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(source.clone().into());
+        let value = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::unchecked(laid_out.clone().into(), vec![source.clone().into()]).unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let value = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::unchecked(narrowed.into(), vec![laid_out.into()]).unwrap(),
+                Vec::new(),
+                vec![value],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(CustomCallOperation::new(TARGET, vec![copied.clone()]), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(&program, &[], &[source], &[copied], "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4x3xf64>, %arg1: tensor<i32>) -> tensor<6xf64> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4x3xf64>, tensor<i32>) -> \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %c = stablehlo.constant dense<4> : tensor<i32>
+                    %1 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<4x3xf64>
+                    %2 = stablehlo.custom_call @LayoutConstraint(%1) {operand_layouts = \
+                        [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : \
+                        (tensor<4x3xf64>) -> tensor<4x3xf64>
+                    %3 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %4 = stablehlo.set_dimension_size %2, %3, dim = 0 : (tensor<4x3xf64>, tensor<i32>) -> \
+                        tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                    %5 = stablehlo.set_dimension_size %4, %c_0, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<4x3xf64>
+                    %6 = stablehlo.slice %5 [0:2, 0:3] : (tensor<4x3xf64>) -> tensor<2x3xf64>
+                    %7 = stablehlo.custom_call @ryft.test.physical_f64_copy(%6) {api_version = 4 : i32, backend_config \
+                        = {}, operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = \
+                        [dense<0> : tensor<1xindex>]} : (tensor<2x3xf64>) -> tensor<6xf64>
+                    return %7 : tensor<6xf64>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![4, 3])],
+                &[2],
+            ),
+            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![6])]),
+        );
+    }
+
+    #[test]
+    fn test_lower_cast_output_layout_unsupported() {
+        use ryft_core::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
+
+        let input_type = ArrayType::new_static(DataType::F64, [2]);
+        for (layout, kind) in [
+            (Layout::Strided(StridedLayout::new(vec![8])), "strided"),
+            (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
+        ] {
+            let output_type = input_type.clone().with_layout(layout.clone());
+            let expected = Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") });
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                let mut builder = XlaProgramBuilder::new();
+                let input = builder.add_input(input_type.clone());
+                let output = builder
+                    .add_instruction(
+                        constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
+                        vec![],
+                        vec![input],
+                        None,
+                    )
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                        vec![output],
+                        vec![Placeholder],
+                        vec![Placeholder],
+                    )
+                    .unwrap();
+                assert_eq!(to_mlir_module_for_plain_program(&program, "main"), expected);
+                let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+                assert_eq!(
+                    to_mlir_module_for_program(
+                        &program,
+                        &[],
+                        &vec![input_type.clone()],
+                        &vec![output_type.clone()],
+                        "main",
+                        None,
+                        None,
+                    ),
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_checked_cast_layout_and_sharding() {
+        use ryft_core::{
+            Layout, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, TiledLayout, Typed,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let contiguous = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let replicated = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
+            .unwrap();
+
+        // Different specified representations are admitted before lowering materializes the requested output.
+        for (input_type, output_type) in [(contiguous, strided), (sharded, replicated)] {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.into()]).unwrap(),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            assert_eq!(builder.atoms()[output.index()].r#type().as_ref(), &ArrayIrType::from(output_type));
+        }
+
+        // Independent layout and sharding declarations can describe the same value, without a representation change.
+        let plain = ArrayType::new_static(DataType::F64, [2]);
+        let input_type = plain.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_type = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
+            .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into()]).unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0], vec![2])], &[],),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2])]),
         );
     }
 
@@ -1943,6 +3085,204 @@ mod tests {
                 "},
             );
         }
+    }
+
+    #[test]
+    fn test_lower_cast_preserved_placement() {
+        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
+
+        // Carrying an existing sharding forward requests no redistribution: a cast that only changes the layout emits
+        // no constraint, whereas a changed explicit placement emits the complete output sharding, including the
+        // preserved auto placement, like `reshard`. Explicit axes may only change minor to the auto axis `a`, whose
+        // shards would otherwise hold other blocks of the array. The plain-program entry point declares the mesh of
+        // every sharded atom, so the mesh declaration below does not depend on the cast.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let placed = |dimensions: Vec<ShardingDimension>| {
+            ArrayType::new_static(DataType::F64, [4, 4])
+                .with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap())
+                .unwrap()
+        };
+        let input_type = placed(vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]);
+        let cases = [
+            (
+                input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
+                indoc! {"
+                    module {
+                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
+                      func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
+                        %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
+                            operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
+                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf64>) -> tensor<4x4xf64>
+                        return %0 : tensor<4x4xf64>
+                      }
+                    }
+                "},
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<4x4xf64>) -> (tensor<4x4xf64> {mhlo.layout_mode = \"{0,1}\"}) {
+                        %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
+                            operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
+                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf64>) -> tensor<4x4xf64>
+                        return %0 : tensor<4x4xf64>
+                      }
+                    }
+                "},
+            ),
+            (
+                placed(vec![ShardingDimension::sharded(["a", "x"]), ShardingDimension::replicated()]),
+                indoc! {"
+                    module {
+                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
+                      func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\"}, {}]> : tensor<4x4xf64>
+                        return %0 : tensor<4x4xf64>
+                      }
+                    }
+                "},
+                indoc! {"
+                    module {
+                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
+                      func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", \"x\"}, {}]> : tensor<4x4xf64>
+                        return %0 : tensor<4x4xf64>
+                      }
+                    }
+                "},
+            ),
+        ];
+        for (output_type, expected, expected_executable) in cases {
+            assert!(!cast_changes_explicit_placement(&input_type, &input_type));
+            assert_eq!(
+                cast_changes_explicit_placement(&input_type, &output_type),
+                output_type.sharding() != input_type.sharding(),
+            );
+            for constructor in [CastOperation::checked, CastOperation::unchecked] {
+                let mut builder = XlaProgramBuilder::new();
+                let input = builder.add_input(input_type.clone());
+                let output = builder
+                    .add_instruction(
+                        constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
+                        vec![],
+                        vec![input],
+                        None,
+                    )
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                        vec![output],
+                        vec![Placeholder],
+                        vec![Placeholder],
+                    )
+                    .unwrap();
+                assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+                // The executable entry point declares meshes only for casts that emit a constraint; the input's
+                // own placement is declared through the executable signature instead.
+                let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+                assert_eq!(
+                    to_mlir_module_for_program(
+                        &program,
+                        &[],
+                        &vec![input_type.clone()],
+                        &vec![output_type.clone()],
+                        "main",
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    expected_executable,
+                );
+            }
+        }
+
+        // An explicit axis major to `a` changes which block of the array each auto shard holds.
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        assert!(matches!(
+            builder.add_instruction(
+                CastOperation::unchecked(
+                    placed(vec![ShardingDimension::sharded(["x", "a"]), ShardingDimension::replicated()]),
+                    vec![input_type],
+                )
+                .unwrap(),
+                vec![],
+                vec![input],
+                None,
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`cast` cannot change the mesh axes up to the last auto or manual mesh axis of \
+                    dimension 0; only explicit mesh axes minor to every auto and manual axis may change",
+        ));
+    }
+
+    #[test]
+    fn test_lower_cast_preserved_placement_executes() {
+        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
+
+        use crate::ToPjrt;
+
+        // Carrying the auto and explicit placement forward emits no constraint, so every device keeps its own shard
+        // and only the physical layout of the result changes.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(sharding.clone()).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let output_type = input_type.clone().with_layout(layout.clone());
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                CastOperation::checked(output_type.clone(), vec![input_type.clone()]).unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .into_unprojected::<XlaConstant, XlaOperation>()
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[input_type],
+            &[output_type],
+            "main",
+            Some(std::slice::from_ref(&sharding)),
+            Some(std::slice::from_ref(&sharding)),
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
+                  func.func @main(%arg0: tensor<4x4xf64> \
+                      {sdy.sharding = #sdy.sharding<@mesh, [{\"a\"}, {}], replicated={\"x\"}>}) \
+                      -> (tensor<4x4xf64> {mhlo.layout_mode = \"{0,1}\", \
+                      sdy.sharding = #sdy.sharding<@mesh, [{\"a\"}, {}], replicated={\"x\"}>}) {
+                    %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
+                        operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
+                        result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf64>) -> tensor<4x4xf64>
+                    return %0 : tensor<4x4xf64>
+                  }
+                }
+            "},
+        );
+        // Devices are ordered along the mesh axes, so the device at `(x, a)` holds rows `2a..2a + 2` whatever `x` is.
+        let shards = [0, 1, 0, 1].map(|a| (8 * a + 1..=8 * a + 8).map(f64::from).collect::<Vec<_>>());
+        let outputs = execute_sharded_module(&module, &shards, &[2, 4]).unwrap();
+        let expected = shards.iter().map(|shard| (shard.clone(), layout.to_pjrt().unwrap())).collect::<Vec<_>>();
+        assert_eq!(outputs, expected);
     }
 
     #[test]
@@ -2159,1140 +3499,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_preserved_placement() {
-        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
-
-        // Carrying an existing sharding forward requests no redistribution: a cast that only changes the layout emits
-        // no constraint, whereas a changed explicit placement emits the complete output sharding, including the
-        // preserved auto placement, like `reshard`. The plain-program entry point declares the mesh of every sharded
-        // atom, so the mesh declaration below does not depend on the cast.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let placed = |dimensions: Vec<ShardingDimension>| {
-            ArrayType::new_static(DataType::F64, [4, 4])
-                .with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap())
-                .unwrap()
-        };
-        let input_type = placed(vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]);
-        let cases = [
-            (
-                input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
-                indoc! {"
-                    module {
-                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
-                      func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
-                            operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
-                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf64>) -> tensor<4x4xf64>
-                        return %0 : tensor<4x4xf64>
-                      }
-                    }
-                "},
-                indoc! {"
-                    module {
-                      func.func @main(%arg0: tensor<4x4xf64>) -> (tensor<4x4xf64> {mhlo.layout_mode = \"{0,1}\"}) {
-                        %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
-                            operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
-                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf64>) -> tensor<4x4xf64>
-                        return %0 : tensor<4x4xf64>
-                      }
-                    }
-                "},
-            ),
-            (
-                placed(vec![ShardingDimension::sharded(["x", "a"]), ShardingDimension::replicated()]),
-                indoc! {"
-                    module {
-                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
-                      func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\", \"a\"}, {}]> : tensor<4x4xf64>
-                        return %0 : tensor<4x4xf64>
-                      }
-                    }
-                "},
-                indoc! {"
-                    module {
-                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
-                      func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\", \"a\"}, {}]> : tensor<4x4xf64>
-                        return %0 : tensor<4x4xf64>
-                      }
-                    }
-                "},
-            ),
-        ];
-        for (output_type, expected, expected_executable) in cases {
-            assert!(!cast_changes_explicit_placement(&input_type, &input_type));
-            assert_eq!(
-                cast_changes_explicit_placement(&input_type, &output_type),
-                output_type.sharding() != input_type.sharding(),
-            );
-            for constructor in [CastOperation::checked, CastOperation::unchecked] {
-                let mut builder = XlaProgramBuilder::new();
-                let input = builder.add_input(input_type.clone());
-                let output = builder
-                    .add_instruction(
-                        constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
-                        vec![],
-                        vec![input],
-                        None,
-                    )
-                    .unwrap()[0];
-                let program = builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                        vec![output],
-                        vec![Placeholder],
-                        vec![Placeholder],
-                    )
-                    .unwrap();
-                assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
-                // The executable entry point declares meshes only for casts that emit a constraint; the input's
-                // own placement is declared through the executable signature instead.
-                let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
-                assert_eq!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &vec![input_type.clone()],
-                        &vec![output_type.clone()],
-                        "main",
-                        None,
-                        None,
-                    )
-                    .unwrap(),
-                    expected_executable,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_cast_preserved_placement_executes() {
-        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
-
-        use crate::ToPjrt;
-
-        // Carrying the auto and explicit placement forward emits no constraint, so every device keeps its own shard
-        // and only the physical layout of the result changes.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(sharding.clone()).unwrap();
-        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let output_type = input_type.clone().with_layout(layout.clone());
-        let mut builder = XlaProgramBuilder::new();
-        let input = builder.add_input(input_type.clone());
-        let output = builder
-            .add_instruction(
-                CastOperation::checked(output_type.clone(), vec![input_type.clone()]).unwrap(),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .into_unprojected::<XlaConstant, XlaOperation>()
-            .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type],
-            &[output_type],
-            "main",
-            Some(std::slice::from_ref(&sharding)),
-            Some(std::slice::from_ref(&sharding)),
-        )
-        .unwrap();
-        assert_eq!(
-            module,
-            indoc! {"
-                module {
-                  sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
-                  func.func @main(%arg0: tensor<4x4xf64> \
-                      {sdy.sharding = #sdy.sharding<@mesh, [{\"a\"}, {}], replicated={\"x\"}>}) \
-                      -> (tensor<4x4xf64> {mhlo.layout_mode = \"{0,1}\", \
-                      sdy.sharding = #sdy.sharding<@mesh, [{\"a\"}, {}], replicated={\"x\"}>}) {
-                    %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
-                        operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
-                        result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf64>) -> tensor<4x4xf64>
-                    return %0 : tensor<4x4xf64>
-                  }
-                }
-            "},
-        );
-        // Devices are ordered along the mesh axes, so the device at `(x, a)` holds rows `2a..2a + 2` whatever `x` is.
-        let shards = [0, 1, 0, 1].map(|a| (8 * a + 1..=8 * a + 8).map(f64::from).collect::<Vec<_>>());
-        let outputs = execute_sharded_module(&module, &shards, &[2, 4]).unwrap();
-        let expected = shards.iter().map(|shard| (shard.clone(), layout.to_pjrt().unwrap())).collect::<Vec<_>>();
-        assert_eq!(outputs, expected);
-    }
-
-    #[test]
-    fn test_lower_cast_output_layout_dynamic() {
-        use ryft_core::{Layout, TiledLayout};
-
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("n", Some(5)), 3.into()]));
-        let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            let mut builder = XlaProgramBuilder::new();
-            let input = builder.add_input(input_type.clone());
-            let output = builder
-                .add_instruction(
-                    constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
-                    vec![],
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap();
-            assert_eq!(
-                to_mlir_module_for_plain_program(&program, "main").unwrap(),
-                indoc! {"
-                    module {
-                      func.func @main(%arg0: tensor<?x3xf64, #stablehlo.bounds<4, ?>>) \
-                          -> tensor<?x3xf64, #stablehlo.bounds<4, ?>> {
-                        %c = stablehlo.constant dense<4> : tensor<i32>
-                        %0 = stablehlo.set_dimension_size %arg0, %c, dim = 0 : \
-                            (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x3xf64>
-                        %1 = stablehlo.custom_call @LayoutConstraint(%0) {\
-                            operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
-                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x3xf64>) -> tensor<4x3xf64>
-                        %2 = stablehlo.get_dimension_size %arg0, dim = 0 : \
-                            (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                        %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : \
-                            (tensor<4x3xf64>, tensor<i32>) -> tensor<?x3xf64, #stablehlo.bounds<4, ?>>
-                        return %3 : tensor<?x3xf64, #stablehlo.bounds<4, ?>>
-                      }
-                    }
-                "},
-            );
-            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
-            assert_eq!(
-                crate::to_mlir_module_for_program(
-                    &program,
-                    &[],
-                    &vec![input_type.clone()],
-                    &vec![output_type.clone()],
-                    "main",
-                    None,
-                    None,
-                ),
-                Err(LoweringError::UnsupportedOp {
-                    op: "non-row-major bounded-dynamic output layout `tiled{0,1}`".to_string(),
-                }),
-            );
-        }
-    }
-
-    #[test]
-    fn test_lower_cast_widening_with_output_layout() {
-        use ryft_core::{Layout, Shape, TiledLayout};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        // Widening a static axis to a bounded dynamic one pads the physical buffer to the bound, and the requested
-        // layout constrains that whole physical buffer before the runtime extent is restored on the constrained value.
-        // A second cast drops the layout again so that the executable boundary stays row-major.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let exact = ArrayType::new_static(DataType::F64, [2, 3]);
-        let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
-        let laid_out = symbolic.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(exact.clone().into());
-        let witness = builder.add_input(symbolic.clone().into());
-        let widened = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::checked(
-                    laid_out.clone().into(),
-                    vec![exact.clone().into(), symbolic.clone().into()],
-                )
-                .unwrap(),
-                Vec::new(),
-                vec![input, witness],
-                None,
-            )
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(symbolic.clone().into(), vec![laid_out.into()]).unwrap(),
-                Vec::new(),
-                vec![widened],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let module =
-            to_mlir_module_for_program(&program, &[], &[exact, symbolic.clone()], &[symbolic], "main", None, None)
-                .unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/widening_1.txt", &module).unwrap();
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-        assert_eq!(module.matches("@LayoutConstraint").count(), 1, "{module}");
-        let client = execution_client();
-        let inputs = [
-            MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]),
-            MixedValue::Array(vec![0.0; 12], vec![4, 3]),
-        ];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]),
-            Ok(vec![MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]), MixedValue::Dimension(2)]),
-        );
-        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `n` must have one extent in `cast`"), "{error}");
-    }
-
-    #[test]
-    fn test_lower_cast_output_layout_unsupported() {
-        use ryft_core::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
-
-        let input_type = ArrayType::new_static(DataType::F64, [2]);
-        for (layout, kind) in [
-            (Layout::Strided(StridedLayout::new(vec![8])), "strided"),
-            (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
-        ] {
-            let output_type = input_type.clone().with_layout(layout.clone());
-            let expected = Err(LoweringError::UnsupportedOp { op: format!("{kind} output layout `{layout}`") });
-            for constructor in [CastOperation::checked, CastOperation::unchecked] {
-                let mut builder = XlaProgramBuilder::new();
-                let input = builder.add_input(input_type.clone());
-                let output = builder
-                    .add_instruction(
-                        constructor(output_type.clone(), vec![input_type.clone()]).unwrap(),
-                        vec![],
-                        vec![input],
-                        None,
-                    )
-                    .unwrap()[0];
-                let program = builder
-                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                        vec![output],
-                        vec![Placeholder],
-                        vec![Placeholder],
-                    )
-                    .unwrap();
-                assert_eq!(to_mlir_module_for_plain_program(&program, "main"), expected);
-                let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
-                assert_eq!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &vec![input_type.clone()],
-                        &vec![output_type.clone()],
-                        "main",
-                        None,
-                        None,
-                    ),
-                    expected,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_cast_repeated_static_check() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(); 2]));
-        let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
-        let mut builder = XlaProgramBuilder::new();
-        let input = builder.add_input(input_type.clone());
-        let output = builder
-            .add_instruction(
-                CastOperation::checked(output_type.clone(), vec![input_type]).unwrap(),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[n, n] .
-                let %1:f64[2, 2] = cast [type=f64[2, 2], inputs=[f64[n, n]], checked=true] %0
-                in (%1)"},
-        );
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/repeated_1.txt", &module).unwrap();
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-        let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
-        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2])]),
-        );
-        assert!(execute_mixed_program(&client, &program, &[input], &[3, 3]).is_err());
-    }
-
-    #[test]
-    fn test_lower_cast_omits_proven_witness_checks() {
-        use ryft_core::Shape;
-
-        let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
-        let mut builder = XlaProgramBuilder::new();
-        let value = builder.add_input(input_type.clone());
-        let witness = builder.add_input(input_type.clone());
-        let output = builder
-            .add_instruction(
-                CastOperation::checked(output_type, vec![input_type.clone(), input_type]).unwrap(),
-                Vec::new(),
-                vec![value, witness],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[a, b], %1:f32[a, b] .
-                let %2:f32[a, 2] = cast [type=f32[a, 2], inputs=[f32[a, b], f32[a, b]], checked=true] %0 %1
-                in (%2)"},
-        );
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/witness_1.txt", &module).unwrap();
-        // Only b == 2 is conditional. Both input arrays already carry the same a and b identities.
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-    }
-
-    #[test]
-    fn test_lower_cast_dimension_witness_checks() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b, c] = ["a", "b", "c"].map(|name| DimensionType::new(name, bounds));
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
-        let client = execution_client();
-        // An array axis and a first-class dimension can share an actual identity. Equal non-singleton bounds on an
-        // independent identity prove nothing, so that witness must retain its comparison and fail for extent 3.
-        for (witness_type, comparisons) in [(b.clone(), 1), (c, 2)] {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            let witness = builder.add_input(witness_type.clone().into());
-            let value = builder.add_input(input_type.clone().into());
-            let output = builder
-                .add_instruction(
-                    CastOperation::<ArrayIrType>::checked(
-                        output_type.clone().into(),
-                        vec![input_type.clone().into(), b.clone().into()],
-                    )
-                    .unwrap(),
-                    Vec::new(),
-                    vec![value, witness],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            let expected = formatdoc! {"
-            lambda %0:{witness_type}, %1:f64[a, b] .
-            let %2:f64[a, 2] = cast [type=f64[a, 2], inputs=[f64[a, b], dimension<b ∈ [1, 5)>], checked=true] %1 %0
-            in (%2)"};
-            assert_eq!(program.to_string(), expected);
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![ArrayType::scalar(DataType::I64), input_type.clone()],
-                &vec![output_type.clone()],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
-            std::fs::write(format!("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/dimension_witness_{comparisons}.txt"), &module).unwrap();
-            assert_eq!(module.matches("@ryft.assert").count(), comparisons, "{module}");
-            let input = MixedValue::Array(vec![1.0; 16], vec![4, 4]);
-            assert_eq!(
-                execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), input.clone()], &[2, 2]),
-                Ok(vec![MixedValue::Array(vec![1.0; 4], vec![2, 2]), MixedValue::Dimension(2)]),
-            );
-            if comparisons == 2 {
-                let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3), input], &[2, 2])
-                    .unwrap_err()
-                    .to_string();
-                assert!(error.contains("input dimension `b` must have one extent in `cast`"), "{error}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_unchecked_cast_with_witness() {
-        use ryft_core::{Cast, Shape, TracingContext};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
-        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
-            |(value, witness)| value.cast_unchecked(symbolic.clone(), &[witness]),
-            (ArrayIrType::from(ArrayType::new_static(DataType::F64, [2])), symbolic.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            execute_mixed_program(
-                &execution_client(),
-                &program.to_flat_program(),
-                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]),],
-                &[2]
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)]),
-        );
-    }
-
-    #[test]
-    fn test_lower_checked_cast_region_checks() {
-        use ryft_core::{ConditionOperation, ScanOperation, Shape, WhileOperation};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::operations::jit_call::JitCallOperation;
-        use crate::tests::execution_client;
-
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
-        let body = |index, checked| {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            if index {
-                builder.add_input(ArrayType::scalar(DataType::I64).into());
-            }
-            let value = builder.add_input(symbolic.clone());
-            if checked {
-                builder
-                    .add_instruction(
-                        CastOperation::<ArrayIrType>::checked(
-                            ArrayType::new_static(DataType::F64, [2]).into(),
-                            vec![symbolic.clone()],
-                        )
-                        .unwrap(),
-                        vec![],
-                        vec![value],
-                        None,
-                    )
-                    .unwrap();
-            }
-            builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                    vec![value],
-                    vec![Placeholder; if index { 2 } else { 1 }],
-                    vec![Placeholder],
-                )
-                .unwrap()
-        };
-        let client = execution_client();
-        // Exercise repeated calls, selected and unselected branches, zero-trip loops, a rolled scan and a fully
-        // unrolled scan. The checked cast's unused result must never make its precondition disappear.
-        for wrapper in 0..5 {
-            for entered in [false, true] {
-                if wrapper == 0 && !entered {
-                    continue;
-                }
-                let mut builder = CompositeXlaProgramBuilder::new();
-                let input = builder.add_input(symbolic.clone());
-                let region = builder.import_program(body(wrapper >= 3, true));
-                let output = match wrapper {
-                    0 => {
-                        for _ in 0..2 {
-                            builder
-                                .add_instruction(
-                                    XlaOperation::JitCall(JitCallOperation::new(0)),
-                                    vec![region],
-                                    vec![input],
-                                    None,
-                                )
-                                .unwrap();
-                        }
-                        input
-                    }
-                    1 => {
-                        let other = builder.import_program(body(false, false));
-                        let predicate = builder.add_constant(XlaConstant::Boolean(entered));
-                        builder
-                            .add_instruction(
-                                XlaOperation::Condition(ConditionOperation::new()),
-                                vec![region, other],
-                                vec![predicate, input],
-                                None,
-                            )
-                            .unwrap()[0]
-                    }
-                    2 => {
-                        let mut condition = CompositeXlaProgramBuilder::new();
-                        condition.add_input(symbolic.clone());
-                        let predicate = condition.add_constant(XlaConstant::Boolean(entered));
-                        let condition = condition
-                            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                                vec![predicate],
-                                vec![Placeholder],
-                                vec![Placeholder],
-                            )
-                            .unwrap();
-                        let condition = builder.import_program(condition);
-                        builder
-                            .add_instruction(
-                                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
-                                vec![condition, region],
-                                vec![input],
-                                None,
-                            )
-                            .unwrap()[0]
-                    }
-                    _ => builder
-                        .add_instruction(
-                            XlaOperation::Scan(
-                                ScanOperation::new(1, Dimension::Static(if entered { 2 } else { 0 }))
-                                    .with_unroll(if wrapper == 4 { 3 } else { 1 })
-                                    .unwrap(),
-                            ),
-                            vec![region],
-                            vec![input],
-                            None,
-                        )
-                        .unwrap()[0],
-                };
-                let program = builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                    .unwrap();
-                for extent in [2, 3] {
-                    let result = execute_mixed_program(
-                        &client,
-                        &program,
-                        &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
-                        &[extent],
-                    );
-                    if entered && extent == 3 {
-                        let error = result.unwrap_err().to_string();
-                        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
-                    } else {
-                        assert_eq!(
-                            result,
-                            Ok(vec![
-                                MixedValue::Array(
-                                    (1..=extent).map(|value| value as f64).collect(),
-                                    vec![extent as u64]
-                                ),
-                                MixedValue::Dimension(extent as i64),
-                            ]),
-                            "wrapper={wrapper}, entered={entered}, extent={extent}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_guarded_cast() {
-        use ryft_core::{
-            BatchAxis, BatchedProgram, Layout, ProgramBatchingOutputAxesPolicy, Shape, ShardingDimension, TiledLayout,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
-        let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
-        // A declared physical layout disappears when batching inserts an axis. The guard and cast must validate
-        // the source declaration before lifting instead of requiring that layout on reconstructed per-item types.
-        let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]))
-            .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
-        let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(array.clone().into());
-        let input = builder
-            .add_instruction(
-                GuardOperation::new("square", vec![relation.clone()])
-                    .with_retained_identities(vec![a.to_variable(), b.to_variable()]),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        // Exercise the homogeneous-array rule inside the composite program, including empty dense shapes.
-        let output = builder
-            .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let client = execution_client();
-        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
-        assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)]),
-        );
-        assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0)]),
-        );
-        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
-        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 3])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
-
-        // Differentiation retains the checked primal relation even when the tangent already has the output type.
-        let differentiated = program.jvp().unwrap();
-        let inputs = [input.clone(), input];
-        assert_eq!(
-            execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]),
-            Ok(vec![
-                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
-                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-            ]),
-        );
-        let error = execute_mixed_program(&client, &differentiated, &inputs, &[2, 3, 2, 3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
-
-        // Batching adds a separate leading dimension to the guard and cast. The two item axes must still
-        // agree, including when the mapped extent is zero and there are no elements to inspect.
-        let batched = program
-            .batched_with_threaded_extent(
-                DimensionType::new("batch", DimensionBounds::non_negative(Some(4)).unwrap()),
-                ShardingDimension::replicated(),
-                &[BatchAxis::new(0)],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        let inputs = [MixedValue::Dimension(2), MixedValue::Array(vec![1f64; 48], vec![3, 4, 4])];
-        assert_eq!(
-            execute_mixed_program(&client, &batched, &inputs, &[2, 2, 2]),
-            Ok(vec![
-                MixedValue::Dimension(2),
-                MixedValue::Array(vec![1f64; 8], vec![2, 2, 2]),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-            ]),
-        );
-        let error = execute_mixed_program(&client, &batched, &inputs, &[2, 2, 3]).unwrap_err().to_string();
-        assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
-        let inputs = [MixedValue::Dimension(0), inputs[1].clone()];
-        let error = execute_mixed_program(&client, &batched, &inputs, &[0, 2, 3]).unwrap_err().to_string();
-        assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
-    }
-
-    #[test]
-    fn test_lower_checked_cast_layout_and_sharding() {
-        use ryft_core::{
-            Layout, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, TiledLayout,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let plain = ArrayType::new_static(DataType::F32, [2]);
-        let contiguous = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
-        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded = plain
-            .clone()
-            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        let replicated = plain
-            .clone()
-            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
-            .unwrap();
-
-        // Different specified representations are admitted before lowering materializes the requested output.
-        for (input_type, output_type) in [(contiguous, strided), (sharded, replicated)] {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(input_type.clone().into());
-            let output = builder
-                .add_instruction(
-                    CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.into()]).unwrap(),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap();
-            assert_eq!(output.len(), 1);
-        }
-
-        // Independent layout and sharding declarations can describe the same value, without a representation change.
-        let plain = ArrayType::new_static(DataType::F64, [2]);
-        let input_type = plain.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])));
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let output_type = plain
-            .clone()
-            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
-            .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(input_type.clone().into());
-        let output = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into()]).unwrap(),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let client = execution_client();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0], vec![2])], &[],),
-            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2])]),
-        );
-    }
-
-    #[test]
-    fn test_lower_checked_cast_ambient_identities() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
-        let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let swapped =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(array.clone().into());
-        let output = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::checked(swapped.into(), vec![array.clone().into()]).unwrap(),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let client = execution_client();
-        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
-        assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]),
-            Ok(vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)]),
-        );
-        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must have one extent in `cast`"), "{error}");
-
-        // The primal of a differentiated cast retains that same source declaration. Tangent casts reverse neither
-        // the ambient assignments nor their dependence on the checked primal output.
-        let differentiated = program.jvp().unwrap();
-        assert_eq!(
-            execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]),
-            Ok(vec![
-                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
-                MixedValue::Array(vec![1f64; 4], vec![2, 2]),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-                MixedValue::Dimension(2),
-            ]),
-        );
-        let error = execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 3, 2, 3])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must have one extent in `cast`"), "{error}");
-
-        // Keeping the original source and output types accepts rectangular shapes.
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let value = builder.add_input(array.clone().into());
-        let output = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::checked(array.clone().into(), vec![array.into()]).unwrap(),
-                Vec::new(),
-                vec![value],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            execute_mixed_program(&client, &program, &[input], &[2, 3]),
-            Ok(vec![MixedValue::Array(vec![1f64; 6], vec![2, 3]), MixedValue::Dimension(2), MixedValue::Dimension(3)]),
-        );
-    }
-
-    #[test]
-    fn test_lower_checked_cast_mixed_dimensions() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]));
-        let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(input_type.clone().into());
-        let witness = builder.add_input(witness_type.clone().into());
-        let output = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into(), witness_type.into()])
-                    .unwrap(),
-                Vec::new(),
-                vec![input, witness],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let client = execution_client();
-        let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 4], vec![4])];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[3, 3]),
-            Ok(vec![MixedValue::Array(vec![1f64; 9], vec![3, 3]), MixedValue::Dimension(3)]),
-        );
-        let error = execute_mixed_program(&client, &program, &inputs, &[4, 3]).unwrap_err().to_string();
-        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
-        let error = execute_mixed_program(&client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
-        assert!(error.contains("must have one extent in `cast`"), "{error}");
-    }
-
-    #[test]
-    fn test_lower_checked_cast_static_witnesses() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        // A static witness establishes ambient b = 3 before type inference compares the source and target dimensions.
-        // The symbolic input still needs its runtime check, before conversion slices its physical bound to 3.
-        let bounds = DimensionBounds::positive(Some(5)).unwrap();
-        let b = DimensionType::new("b", bounds);
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
-        let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
-        let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(input_type.clone().into());
-        let witness = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
-        let output = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::checked(
-                    output_type.into(),
-                    vec![input_type.clone().into(), witness_type.into()],
-                )
-                .unwrap(),
-                Vec::new(),
-                vec![input, witness],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type, ArrayType::new_static(DataType::F64, [3])],
-            &[ArrayType::new_static(DataType::F64, [3, 3])],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/static_witnesses_1.txt", &module).unwrap();
-        assert_eq!(module.matches("@ryft.assert").count(), 1, "{module}");
-        let client = execution_client();
-        let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 3], vec![3])];
-        assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[3]),
-            Ok(vec![MixedValue::Array(vec![1f64; 9], vec![3, 3])]),
-        );
-        let error = execute_mixed_program(&client, &program, &inputs, &[4]).unwrap_err().to_string();
-        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
-    }
-
-    #[test]
-    fn test_lower_guarded_cast_discarded_output() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
-        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
-        let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
-        let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
-        let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(array.clone().into());
-        let input = builder
-            .add_instruction(
-                GuardOperation::new("square", vec![relation.clone()])
-                    .with_retained_identities(vec![a.to_variable(), b.to_variable()]),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        builder
-            .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
-            .unwrap();
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
-            .unwrap();
-        let client = execution_client();
-        let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
-        assert_eq!(execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]), Ok(Vec::new()));
-        let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
-    }
-
-    #[test]
-    fn test_lower_cast_layout_after_bound_change() {
-        use std::sync::OnceLock;
-
-        use ryft_core::{CustomCallOperation, Layout, TiledLayout};
-        use ryft_pjrt::extensions::ffi::{
-            FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
-            XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
-        };
-        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-
-        const TARGET: &str = "ryft.test.physical_f64_copy";
-        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
-
-        /// Copies the physical storage of the single `f64` operand, in memory order, into the rank-1 `f64` result.
-        unsafe extern "C" fn handler(raw: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
-            // SAFETY: XLA provides a valid call frame, operand buffer, and result allocation for this invocation, and
-            // the program below declares a result with as many elements as its operand.
-            unsafe {
-                let Ok(frame) = FfiCallFrame::from_c_api(raw) else { return std::ptr::null_mut() };
-                if frame.register_metadata(FfiTypeId::default()) || frame.stage() != FfiExecutionStage::Execution {
-                    return std::ptr::null_mut();
-                }
-                let Ok(api) = frame.api() else { return std::ptr::null_mut() };
-                let (Ok(FfiInput::Buffer { buffer: input }), Ok(FfiOutput::Buffer { buffer: output })) =
-                    (frame.input(0), frame.output(0))
-                else {
-                    return FfiError::invalid_argument("expected one operand and one result buffer").to_c_api(api);
-                };
-                let length = output.dimensions().iter().product::<i64>() as usize;
-                std::ptr::copy_nonoverlapping(input.data() as *const f64, output.data() as *mut f64, length);
-                std::ptr::null_mut()
-            }
-        }
-
-        // The first cast constrains the physical buffer to its new column-major layout. The second cast keeps that
-        // layout but narrows the bounded dynamic axis, which slices a new buffer that it does not constrain again.
-        // Layouts are only observable where a value crosses a boundary (executable inputs and outputs, and custom-call
-        // operands and results), and every such boundary states the layout of its own declared type. XLA rejects
-        // bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only a static
-        // result of such a cast can be observed, and its consumer still receives the declared column-major storage.
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        REGISTRATION
-            .get_or_init(|| {
-                client.register_ffi_handler(
-                    TARGET,
-                    client.platform_name()?.into_owned(),
-                    FfiHandler::from(handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )
-            })
-            .clone()
-            .unwrap();
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
-        let laid_out = source.clone().with_layout(layout.clone());
-        let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout);
-        let copied = ArrayType::new_static(DataType::F64, [6]);
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(source.clone().into());
-        let value = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(laid_out.clone().into(), vec![source.clone().into()]).unwrap(),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let value = builder
-            .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(narrowed.into(), vec![laid_out.into()]).unwrap(),
-                Vec::new(),
-                vec![value],
-                None,
-            )
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(CustomCallOperation::new(TARGET, vec![copied.clone()]), Vec::new(), vec![value], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_program(&program, &[], &[source], &[copied], "main", None, None).unwrap();
-        std::fs::write("/private/tmp/claude-501/-Users-eaplatanios-Development-Repositories-ryft-1/16f4a8a6-5def-45fa-88f5-0b02429cd832/scratchpad/groupG3/dumps/layout_after_bound_change.txt", &module).unwrap();
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &program,
-                &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![4, 3])],
-                &[2],
-            ),
-            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![6])]),
-        );
-    }
-
-    #[test]
     fn test_lower_cast_rejects_bound_manual_output_placement() {
         use ryft_core::{
             Cast, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TracedShardMap, Typed, trace_shard_map,
@@ -3312,7 +3518,9 @@ mod tests {
                 let local_type = input.r#type().into_owned();
                 let explicit_type = local_type
                     .clone()
-                    .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+                    .with_sharding(
+                        Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+                    )
                     .unwrap();
                 input.cast(explicit_type, &[]).unwrap().cast(local_type, &[]).unwrap()
             },
@@ -3335,11 +3543,13 @@ mod tests {
 
         let explicit_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
         let resized_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
@@ -3367,14 +3577,20 @@ mod tests {
         assert!(cast_changes_explicit_placement(&unsharded, &placed(&explicit_mesh, replicated())));
         assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, sharded(&["a"]))));
 
-        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts.
+        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts. Type
+        // inference only admits changes to the explicit axes minor to every auto and manual axis of a dimension, so
+        // every admitted change of the placement within one mesh is such a conflict.
         assert!(!cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["x", "a"])),
-            &placed(&explicit_mesh, sharded(&["x", "a"])),
+            &placed(&explicit_mesh, sharded(&["a", "x"])),
+            &placed(&explicit_mesh, sharded(&["a", "x"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["a", "x"])),
+            &placed(&explicit_mesh, sharded(&["a", "y"])),
         ));
         assert!(cast_changes_explicit_placement(
             &placed(&explicit_mesh, sharded(&["a"])),
-            &placed(&explicit_mesh, sharded(&["x", "a"])),
+            &placed(&explicit_mesh, sharded(&["a", "x"])),
         ));
 
         // A mesh change requests one whenever either mesh has explicit axes, but never between auto-only meshes.
@@ -3390,5 +3606,216 @@ mod tests {
             &placed(&auto_mesh, sharded(&["a"])),
             &placed(&extended_auto_mesh, sharded(&["a"])),
         ));
+    }
+
+    #[test]
+    fn test_lower_cast_different_bounds() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
+        let client = execution_client();
+        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(source.clone().into());
+            let witness = builder.add_input(target.clone().into());
+            let output = builder
+                .add_instruction(
+                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
+                    vec![],
+                    vec![input, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &program,
+                    &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7]),],
+                    &[2, 2]
+                ),
+                Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)])
+            );
+            if program.instructions()[0]
+                .operation()
+                .effects()
+                .classes()
+                .contains(ryft_core::EffectClass::OrderedAssertion)
+            {
+                let error = execute_mixed_program(
+                    &client,
+                    &program,
+                    &[MixedValue::Array(vec![1.0; 4], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7])],
+                    &[2, 3],
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("input dimension `m` must have one extent in `cast`; expected=2, actual=3"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_cast_different_bounds_narrowing_bound() {
+        use ryft_core::Shape;
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // Moving a dynamic axis to an identity with a smaller physical bound slices the physical buffer from the
+        // source bound to the target bound and restores the runtime extent, which the witness shares. Only the checked
+        // cast verifies that the extents agree.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
+        let client = execution_client();
+        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(source.clone().into());
+            let witness = builder.add_input(target.clone().into());
+            let output = builder
+                .add_instruction(
+                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
+                    vec![],
+                    vec![input, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let checked = program.instructions()[0]
+                .operation()
+                .effects()
+                .classes()
+                .contains(ryft_core::EffectClass::OrderedAssertion);
+            if !checked {
+                assert_eq!(
+                    to_mlir_module_for_program(
+                        &program,
+                        &[],
+                        &[source.clone(), target.clone()],
+                        &[target.clone()],
+                        "main",
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    // The witness is a dependency of the unchecked cast, so both inputs pass through one barrier. The
+                    // negative high padding slices the physical buffer from the source bound to the target bound.
+                    indoc! {"
+                        module {
+                          func.func @main(%arg0: tensor<7xf64>, %arg1: tensor<4xf64>, %arg2: tensor<i32>, \
+                              %arg3: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>) {
+                            %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : \
+                                (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
+                            %1 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : \
+                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                            %2:2 = stablehlo.optimization_barrier %0, %1 : \
+                                tensor<?xf64, #stablehlo.bounds<7>>, tensor<?xf64, #stablehlo.bounds<4>>
+                            %3 = stablehlo.get_dimension_size %2#0, dim = 0 : \
+                                (tensor<?xf64, #stablehlo.bounds<7>>) -> tensor<i32>
+                            %c = stablehlo.constant dense<7> : tensor<i32>
+                            %4 = stablehlo.set_dimension_size %2#0, %c, dim = 0 : \
+                                (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                            %5 = stablehlo.pad %4, %cst, low = [0], high = [-3], interior = [0] : \
+                                (tensor<7xf64>, tensor<f64>) -> tensor<4xf64>
+                            %6 = stablehlo.set_dimension_size %5, %3, dim = 0 : \
+                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                            %7 = stablehlo.get_dimension_size %6, dim = 0 : \
+                                (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                            %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                            return %6, %8 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>
+                          }
+                        }
+                    "},
+                );
+            }
+            let inputs = [
+                MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0], vec![7]),
+                MixedValue::Array(vec![0.0; 4], vec![4]),
+            ];
+            assert_eq!(
+                execute_mixed_program(&client, &program, &inputs, &[3, 3]),
+                Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]),
+            );
+            let result = execute_mixed_program(&client, &program, &inputs, &[3, 2]);
+            if checked {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("input dimension `m` must have one extent in `cast`; expected=3, actual=2"),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(result, Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_cast_unbounded_shape() {
+        use ryft_core::Shape;
+        use ryft_mlir::Location;
+
+        // Converting any axis materializes the static physical buffer of the whole value, so it is rejected when the
+        // converted axis or another axis that the conversion leaves unchanged has an unbounded dimension. A cast that
+        // converts no axis returns its input unchanged, even when the input has unbounded dimensions.
+        let n = DimensionType::new("n", DimensionBounds::positive(None).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
+        let partially_exact =
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
+        let cases = [
+            (
+                unbounded.clone(),
+                ArrayType::new_static(DataType::F32, [2]),
+                Err(LoweringError::UnsupportedOp {
+                    op: "shape conversion along axis 0 requires finite physical bounds, but axis 0 has unbounded \
+                         dimension `n`"
+                        .to_owned(),
+                }),
+            ),
+            (
+                mixed.clone(),
+                partially_exact,
+                Err(LoweringError::UnsupportedOp {
+                    op: "shape conversion along axis 1 requires finite physical bounds, but axis 0 has unbounded \
+                         dimension `n`"
+                        .to_owned(),
+                }),
+            ),
+            (mixed.clone(), mixed, Ok(())),
+        ];
+        for (input_type, output_type, expected) in cases {
+            let context = MlirContext::new();
+            let location = context.unknown_location();
+            let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
+            let source = block.argument(0).unwrap().as_ref();
+            let mut lowerer: XlaLowerer<'_, '_, '_, XlaOperation> =
+                XlaLowerer::new(block.as_ref(), &context, location.as_ref());
+            assert_eq!(
+                CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
+                    &mut lowerer,
+                    &[source],
+                    &[input_type],
+                    &[output_type],
+                ),
+                expected.map(|()| vec![source]),
+            );
+        }
     }
 }

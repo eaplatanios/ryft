@@ -32,15 +32,18 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// [`Operation`] that reshards its input to a target [`Sharding`]. This operation is the Ryft analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html). The array's elements, shape, and data
 /// type are unchanged, and the output type carries the target sharding in place of the input's, extended with the
-/// manual variation and manual reduction state of its input. A reshard changes placement but never reduction state:
-/// the target must restate the input's unreduced and reduced [`MeshAxisType::Explicit`] mesh axes exactly, since
-/// changing them requires a reduction or the corresponding collective. The target mesh must also define every mesh
-/// axis that carries manual variation or reduction state with the same size and type, explicit axes included, whereas
-/// it may add or drop other axes. Each Ryft type carries its own mesh, so without this check a target could silently
-/// redefine such an axis (e.g., JAX's `reshard` does not validate reduction state). The target may only name explicit
-/// mesh axes. Placement over [`MeshAxisType::Auto`] axes belongs to backend compilers and can be constrained using
-/// [`ConstrainShardingOperation`]s while transitions over [`MeshAxisType::Manual`] axes require their corresponding
-/// collectives. Refer to the documentation of [`Reshard`] for more information.
+/// manual variation and manual reduction state of its input. The target replaces the input's dimension placement,
+/// including placement over [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes. A manual axis places a dimension
+/// only outside the regions that bind it, since such a region turns that placement into manual variation (refer to
+/// [`Sharding::local_sharding`]), so replacing it is an ordinary redistribution that backends stage for the output
+/// type. A reshard changes placement but never reduction state: the target must restate the input's unreduced and
+/// reduced [`MeshAxisType::Explicit`] mesh axes exactly, since changing them requires a reduction or the corresponding
+/// collective. The target mesh must also define every mesh axis that carries manual variation or reduction state with
+/// the same size and type, explicit axes included, whereas it may add or drop other axes. Each Ryft type carries its
+/// own mesh, so without this check a target could silently redefine such an axis (e.g., JAX's `reshard` does not
+/// validate reduction state). The target may only name explicit mesh axes. Placement over auto axes belongs to backend
+/// compilers and can be constrained using [`ConstrainShardingOperation`]s while transitions over manual axes require
+/// their corresponding collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
 /// sharding into the target at the new batch axis. Differentiation reshards the tangent to the same target, and
@@ -747,6 +750,36 @@ mod tests {
             }, {
                 input_types = [reduced_input_type],
                 error = error,
+            }],
+        );
+    }
+
+    #[test]
+    fn test_reshard_type_inference_free_axis_placement() {
+        // A manual axis places a dimension only outside the regions that bind it, so the target replaces that
+        // placement like any other (e.g., when transposition returns a `shard_map` input cotangent to its caller's
+        // placement), and the backend stages the redistribution for the output type.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let placed = |axes: &[&str]| {
+            ArrayType::new_static(DataType::F32, [8])
+                .with_sharding(
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(axes.iter().copied())]).unwrap(),
+                )
+                .unwrap()
+        };
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed(&["y"]).sharding().unwrap().clone()),
+            cases = [{
+                input_types = [placed(&["m", "x"])],
+                output_types = [placed(&["y"])],
+            }, {
+                input_types = [placed(&["x", "m"])],
+                output_types = [placed(&["y"])],
             }],
         );
     }
