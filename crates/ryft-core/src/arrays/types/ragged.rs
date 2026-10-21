@@ -493,22 +493,23 @@ impl Display for RaggedType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Type for RaggedType {
     type Identity = DimensionVariable;
     type Refinements = RaggedTypeRefinements;
 
+    #[inline]
     fn validate_identity_scope<Types: IntoIterator<Item: Borrow<Self>>>(types: Types) -> Result<(), TypeError> {
         ArrayIrType::validate_identity_scope(
             types.into_iter().map(|r#type| ArrayIrType::Ragged(r#type.borrow().clone())),
         )
     }
 
+    #[inline]
     fn validate_zero(&self) -> Result<(), TypeError> {
         Err(TypeError::invalid("zero construction for first-class ragged types is not supported yet"))
     }
 
+    #[inline]
     fn validate_one(&self) -> Result<(), TypeError> {
         Err(TypeError::invalid("one construction for first-class ragged types is not supported yet"))
     }
@@ -531,14 +532,16 @@ impl Type for RaggedType {
             })
     }
 
-    fn derive_identity_renaming<'o, D, A>(
+    fn derive_identity_renaming<
+        'o,
+        D: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
+    >(
         declared: D,
         actual: A,
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
     where
         Self: 'o,
-        D: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
-        A: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
     {
         let declared = declared.into_iter().cloned().map(ArrayIrType::Ragged).collect::<Vec<_>>();
         let actual = actual.into_iter().cloned().map(ArrayIrType::Ragged).collect::<Vec<_>>();
@@ -567,19 +570,23 @@ impl Type for RaggedType {
         )
     }
 
+    #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         self == other
     }
 
+    #[inline]
     fn is_refined_by(&self, other: &Self) -> bool {
         self.payload.storage_type.is_refined_by(other.storage_type())
             && Self::indexed_refinement_facts(self, other, DimensionComparison::Refinement).is_ok()
     }
 
+    #[inline]
     fn is_scalar(&self) -> bool {
         false
     }
 
+    #[inline]
     fn is_complex(&self) -> bool {
         match self.payload.value_kind {
             RaggedValueKind::Array => self.payload.storage_type.is_complex(),
@@ -591,10 +598,12 @@ impl Type for RaggedType {
 impl ReferenceMemberType for RaggedType {
     type Referent = NoReferent;
 
+    #[inline]
     fn referent(&self) -> Option<&NoReferent> {
         None
     }
 
+    #[inline]
     fn as_referent(&self) -> Option<&NoReferent> {
         None
     }
@@ -611,6 +620,8 @@ impl From<ReferenceType<NoReferent>> for RaggedType {
         match *r#type.referent() {}
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Complete-signature refinements for [`RaggedType`], delegating to the same scalar/indexed separation used by the
 /// composite [`ArrayIrType`] universe.
