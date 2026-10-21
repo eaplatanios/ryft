@@ -77,6 +77,22 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// inspect or retain runtime value payloads.
     type Refinements: TypeRefinements<Self>;
 
+    /// Validates that nominal identity occurrences in one region scope have consistent family-specific meanings.
+    /// Region sealing calls this on all atom types before deriving the closed identity signature. For example, an
+    /// identity describing an indexed family of extents cannot also describe an unrelated scalar extent in that
+    /// scope. This validates type structure only; it neither inspects values nor establishes runtime equalities.
+    /// Families whose identity occurrences need no additional consistency checks keep the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when occurrences assign incompatible meanings or ambiguous coordinate domains to an
+    /// identity. The default performs no iteration or allocation.
+    #[inline]
+    fn validate_identity_scope<Types: IntoIterator<Item: Borrow<Self>>>(types: Types) -> Result<(), TypeError> {
+        let _ = types;
+        Ok(())
+    }
+
     /// Validates that this type admits a zero value, independently of its shape or runtime allocation. Constructor
     /// inference uses this before staging. The default accepts the type, but families with restrictions override it
     /// so even empty values follow the same representability rules as non-empty values.
