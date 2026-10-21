@@ -621,17 +621,16 @@ impl From<ReferenceType<NoReferent>> for RaggedType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Complete-signature refinements for [`RaggedType`], delegating to the same scalar/indexed separation used by the
-/// composite [`ArrayIrType`] universe.
+/// [`TypeRefinements`] for one complete [`RaggedType`] signature, delegating to the same scalar/indexed separation
+/// used by the composite [`ArrayIrType`] universe.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RaggedTypeRefinements {
-    /// Shared composite refinement owner.
+    /// Underlying [`ArrayIrTypeRefinements`].
     composite: ArrayIrTypeRefinements,
 }
 
 impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
+    #[inline]
     fn new<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
@@ -647,6 +646,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         })
     }
 
+    #[inline]
     fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
@@ -662,6 +662,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         })
     }
 
+    #[inline]
     fn identity_classes<'o>(&'o self) -> impl Iterator<Item = TypeIdentityClass<'o, DimensionVariable>>
     where
         DimensionVariable: 'o,
@@ -669,10 +670,12 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         self.composite.identity_classes()
     }
 
+    #[inline]
     fn identities_needing_runtime_checks(&self) -> &[DimensionVariable] {
         self.composite.identities_needing_runtime_checks()
     }
 
+    #[inline]
     fn validate_refinement<D: IntoIterator, A: IntoIterator>(
         &self,
         declared: D,
@@ -692,6 +695,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         )
     }
 
+    #[inline]
     fn refine_declared(
         &self,
         r#type: &RaggedType,
@@ -705,6 +709,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         Ok(refined)
     }
 
+    #[inline]
     fn refine_actual(
         &self,
         r#type: &RaggedType,
@@ -718,6 +723,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         Ok(refined)
     }
 
+    #[inline]
     fn retype_actual(
         &self,
         declared: &RaggedType,
@@ -733,6 +739,8 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         Ok(refined)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
