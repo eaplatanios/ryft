@@ -646,6 +646,11 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// captured reference) follows its [`Constant`](PartialValueMaterialization::Constant) materialization and embeds
     /// inline like every other constant, so it is never reported by [`PartialEvaluation::known_reference_inputs`].
     ///
+    /// Emission uses [`ProgramBuilder::add_instruction_or_fold`] so producer-aware aggregate relationships share the
+    /// staging canonicalization. A pure field projection may recover an existing known feeder without splitting the
+    /// aggregate's knownness. Projections of constructors with pending validation remain unknown and dependent on
+    /// that constructor, including when one original field was known.
+    ///
     /// Note that emitting an ordered operation records that later ordered effects must remain residual too. This also
     /// applies to rules that emit residual work directly (e.g., the residual half of a partitioned boundary), so those
     /// rules preserve the same execution order as the default partial evaluation rule.
@@ -749,20 +754,62 @@ impl<C: Context> PartialEvaluationContext<C> {
             let mut builder = self.builder.borrow_mut();
             regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
         };
-        let output_atoms = self
-            .builder
-            .borrow_mut()
-            .add_instruction(operation, region_ids, input_atoms, Some(self.provenance.current()))?
-            .to_vec();
+        let previous_atom_count = self.builder.borrow().atoms().len();
+        let output_atoms = self.builder.borrow_mut().add_instruction_or_fold(
+            operation,
+            region_ids,
+            input_atoms,
+            Some(self.provenance.current()),
+        )?;
 
-        let builder = self.builder.borrow();
-        Ok(output_atoms
+        output_atoms
             .into_iter()
             .map(|atom| {
-                let r#type = builder.atoms()[atom.index()].r#type().into_owned();
-                PartialEvaluationValue::variable(r#type, atom)
+                if atom.index() < previous_atom_count {
+                    if let Some(index) = inputs.iter().position(|input| match input.materialization() {
+                        PartialValueMaterialization::Variable { residual_atom } => residual_atom == atom,
+                        PartialValueMaterialization::Input { residual_atom }
+                        | PartialValueMaterialization::Constant { residual_atom } => residual_atom == Some(atom),
+                        PartialValueMaterialization::Undecided => false,
+                    }) {
+                        return Ok(inputs[index].clone());
+                    }
+
+                    // A pure aggregate can expose an already materialized known field while another field stays
+                    // unknown. Reuse its existing feeder atom without a second known-value cache or a new input.
+                    let known = {
+                        let builder = self.builder.borrow();
+                        builder.input_ids().iter().position(|input| *input == atom).and_then(|index| {
+                            match &self.inputs.borrow()[index] {
+                                PartialEvaluationInput::Known(value) => Some(value.clone()),
+                                PartialEvaluationInput::Unknown(_) => None,
+                            }
+                        })
+                    };
+
+                    if let Some(known) = known {
+                        let value = PartialEvaluationValue::known_input(known);
+                        value.materialization.set(PartialValueMaterialization::Input { residual_atom: Some(atom) });
+                        return Ok(value);
+                    }
+                }
+
+                let (r#type, constant) = {
+                    let builder = self.builder.borrow();
+                    let value = &builder.atoms()[atom.index()];
+                    (value.r#type().into_owned(), value.as_constant().cloned())
+                };
+
+                match constant {
+                    Some(constant) => {
+                        let value = PartialEvaluationValue::known_constant(self.parent.lift(constant)?);
+                        value.materialization.set(PartialValueMaterialization::Constant { residual_atom: Some(atom) });
+                        Ok(value)
+                    }
+                    None => Ok(PartialEvaluationValue::variable(r#type, atom)),
+                }
             })
-            .collect())
+            .collect()
     }
 
     /// Replays the provided [`Program`] through this context using the provided `inputs` bound to its input
@@ -1940,6 +1987,7 @@ mod tests {
         PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
         PartialValueMaterialization,
     };
+    use crate::programs::builders::tests::AggregateTestOperation;
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, InstructionId, Operation, ProgramBuilder,
         ProgramError, Provenance, ProvenanceScope, ReferenceError, ReferenceIdentity, ReferenceType, RegionInterface,
@@ -2741,6 +2789,93 @@ mod tests {
         );
         assert!(first[0].is_unknown() && second[0].is_unknown());
         assert_eq!(context.inputs.borrow().len(), 3);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_aggregate_known_field() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, AggregateTestOperation>::new());
+        let known = PartialEvaluationValue::known_input(Array::scalar(-1f64).unwrap());
+        let unknown = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
+        let pair = context
+            .residualize(AggregateTestOperation::Pair, Vec::new(), &[known.clone(), unknown.clone()])
+            .unwrap()[0]
+            .clone();
+        assert!(pair.is_unknown());
+        let first =
+            context.residualize(AggregateTestOperation::First, Vec::new(), std::slice::from_ref(&pair)).unwrap()[0]
+                .clone();
+        let second = context
+            .residualize(AggregateTestOperation::Second, Vec::new(), std::slice::from_ref(&pair))
+            .unwrap()[0]
+            .clone();
+        assert_eq!(first.as_known(), known.as_known());
+        assert_eq!(first.materialization(), known.materialization());
+        assert!(second.is_unknown());
+        assert_eq!(second.materialization(), unknown.materialization());
+        let reconstructed = context
+            .residualize(AggregateTestOperation::Pair, Vec::new(), &[first.clone(), second.clone()])
+            .unwrap()[0]
+            .clone();
+        assert_eq!(reconstructed.materialization(), pair.materialization());
+        let evaluation = context.into_evaluation(vec![pair, first, second, reconstructed]).unwrap();
+        assert_eq!(
+            evaluation.inputs(),
+            &[PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(-1f64).unwrap()),]
+        );
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+            lambda %0:f64[], %1:f64[] .
+            let %2:f64[2] = pair %1 %0
+            in (%2, %0, %2)"}
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(2f64).unwrap()]),
+            Ok(vec![
+                Array::vector(vec![-1f64, 2.0]).unwrap(),
+                Array::scalar(-1f64).unwrap(),
+                Array::scalar(2f64).unwrap(),
+                Array::vector(vec![-1f64, 2.0]).unwrap(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_aggregate_pending_validation() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, AggregateTestOperation>::new());
+        let known = PartialEvaluationValue::known_input(Array::scalar(-1f64).unwrap());
+        let unknown = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
+        let pair =
+            context.residualize(AggregateTestOperation::CheckedPair, Vec::new(), &[known, unknown]).unwrap()[0].clone();
+        let first = context
+            .residualize(AggregateTestOperation::CheckedFirst, Vec::new(), std::slice::from_ref(&pair))
+            .unwrap()[0]
+            .clone();
+        let second = context
+            .residualize(AggregateTestOperation::CheckedSecond, Vec::new(), std::slice::from_ref(&pair))
+            .unwrap()[0]
+            .clone();
+        assert!(pair.is_unknown());
+        assert!(first.is_unknown());
+        assert!(second.is_unknown());
+        let reconstructed = context
+            .residualize(AggregateTestOperation::WitnessedPair, Vec::new(), &[first.clone(), second, pair.clone()])
+            .unwrap()[0]
+            .clone();
+        assert_eq!(reconstructed.materialization(), pair.materialization());
+        let evaluation = context.into_evaluation(vec![reconstructed, first]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+            lambda %0:f64[], %1:f64[] .
+            let %2:f64[2] = checked_pair %1 %0
+                %3:f64[] = checked_first %2
+            in (%2, %3)"}
+        );
+        assert!(matches!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(2f64).unwrap()]),
+            Err(ProgramError::InvalidArgument { message }) if message == "first pair field must be nonnegative",
+        ));
     }
 
     #[test]

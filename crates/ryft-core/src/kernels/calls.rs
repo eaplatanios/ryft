@@ -948,6 +948,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 Atom::Constant(ArrayIrValue::Reference(_)) => {
                     return Err(TypeError::invalid("reference constants have no persistent kernel semantic identity"));
                 }
+                Atom::Constant(ArrayIrValue::Ragged(_)) => {
+                    return Err(TypeError::invalid("ragged constants have no persistent kernel semantic identity"));
+                }
             }
         }
         Self::semantic_field(key, "end atoms");
@@ -1196,6 +1199,13 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::LinearCall(_) => {}
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
+            ArrayIrOperation::RaggedNew(_)
+            | ArrayIrOperation::RaggedStorage(_)
+            | ArrayIrOperation::RaggedExtents(_) => {
+                return Err(TypeError::invalid(
+                    "first-class ragged operations have no kernel semantic descriptor encoding",
+                ));
+            }
             ArrayIrOperation::CustomFunction(operation) if operation.rules().is_some() => {
                 return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
             }

@@ -31,10 +31,10 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    Effects, ErasedOperation, InputRegionProvenance, Operation, OperationBoundaryPruning, OperationPayloadProjection,
-    OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
-    TypeIdentityRenaming,
+    Effects, ErasedOperation, InputRegionProvenance, Operation, OperationAggregate, OperationBoundaryPruning,
+    OperationPayloadProjection, OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type,
+    TypeError, TypeIdentityRenaming,
 };
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
@@ -248,6 +248,21 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
         }
     }
 
+    fn type_identity_definitions(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
+        match self {
+            Self::Portable(operation) => operation.type_identity_definitions(),
+            Self::Call(operation) => operation.type_identity_definitions(),
+            Self::Scratch(operation) => operation.type_identity_definitions(),
+            Self::TileLoad(operation) => operation.type_identity_definitions(),
+            Self::AsyncCopy(operation) => operation.type_identity_definitions(),
+            Self::Wait(operation) => operation.type_identity_definitions(),
+            Self::MaskedLoad(operation) => operation.type_identity_definitions(),
+            Self::MaskedStore(operation) => operation.type_identity_definitions(),
+            Self::MaskedSwap(operation) => operation.type_identity_definitions(),
+            Self::Extension(operation) => operation.type_identity_definitions(),
+        }
+    }
+
     fn region_slots(&self) -> &'static [RegionSlot] {
         match self {
             Self::Portable(operation) => operation.region_slots(),
@@ -316,6 +331,21 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
             Self::MaskedStore(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::MaskedSwap(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Extension(operation) => operation.infer_output_types(input_types, region_interfaces),
+        }
+    }
+
+    fn aggregate(&self, input_types: &[ArrayIrType]) -> Result<Option<OperationAggregate>, TypeError> {
+        match self {
+            Self::Portable(operation) => operation.aggregate(input_types),
+            Self::Call(operation) => operation.aggregate(input_types),
+            Self::Scratch(operation) => operation.aggregate(input_types),
+            Self::TileLoad(operation) => operation.aggregate(input_types),
+            Self::AsyncCopy(operation) => operation.aggregate(input_types),
+            Self::Wait(operation) => operation.aggregate(input_types),
+            Self::MaskedLoad(operation) => operation.aggregate(input_types),
+            Self::MaskedStore(operation) => operation.aggregate(input_types),
+            Self::MaskedSwap(operation) => operation.aggregate(input_types),
+            Self::Extension(operation) => operation.aggregate(input_types),
         }
     }
 
@@ -829,12 +859,19 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType};
+    use crate::arrays::{
+        ArrayIrValue, ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionVariable, RaggedDimension,
+        RaggedType, RaggedValueKind,
+    };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, ScanOperation, TagOperation};
-    use crate::programs::{EmptyRegionDriver, ReferenceType};
+    use crate::operations::{
+        AddOperation, RaggedNewOperation, ReferenceRead, ReferenceSwap, ScanOperation, TagOperation,
+    };
+    use crate::parameters::Placeholder;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -845,6 +882,49 @@ mod tests {
         assert_eq!(operation.name(), "add");
         assert_eq!(operation.to_string(), "add");
         assert_eq!(operation.region_slots(), &[]);
+    }
+
+    #[test]
+    fn test_kernel_operation_aggregate_and_identity_forwarding() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let payload = ArrayIrOperation::<Array>::RaggedNew(RaggedNewOperation::new(r#type.clone()));
+        let input_types = vec![r#type.storage_type().clone().into(), r#type.extent_types()[0].clone().into()];
+        for operation in [KernelOperation::Portable(payload.clone()), KernelOperation::Extension(payload)] {
+            assert_eq!(operation.type_identity_definitions().as_ref(), std::slice::from_ref(&rows));
+            assert_eq!(
+                operation.aggregate(&input_types),
+                Ok(Some(OperationAggregate::Construct {
+                    family: TypeId::of::<RaggedNewOperation>(),
+                    fields: 0..2,
+                    identity_source: None,
+                })),
+            );
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<ArrayIrOperation<Array>>>::new();
+            let fields = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect();
+            let outputs = builder.add_instruction(operation, Vec::new(), fields, None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    outputs,
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(program.type_identity_signature().internal_identities(), std::slice::from_ref(&rows));
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[2, 3], %1:i64[2] .
+                    let %2:ragged<f32[2, 3]; 1:rows over [0]> = ragged_new \
+                        [output_type=ragged<f32[2, 3]; 1:rows over [0]>] %0 %1
+                    in (%2)"},
+            );
+        }
     }
 
     #[test]

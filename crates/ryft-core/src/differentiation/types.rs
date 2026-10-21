@@ -157,6 +157,10 @@ impl DifferentiableType for ArrayIrType {
             Self::Array(r#type) => r#type.is_zero_space(),
             Self::Dimension(_) => true,
             Self::Reference(r#type) => r#type.is_zero_space(),
+            Self::Ragged(_) => {
+                // Until differential representations are defined, retain this value rather than erasing it as a zero.
+                false
+            }
         }
     }
 
@@ -171,6 +175,10 @@ impl DifferentiableType for ArrayIrType {
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
             Self::Reference(r#type) => Ok(Self::Reference(r#type.tangent()?)),
+            Self::Ragged(_) => Err(ProgramError::UnsupportedOperation {
+                message: "tangents of first-class ragged values are not yet supported".to_owned(),
+            }
+            .into()),
         }
     }
 
@@ -184,6 +192,10 @@ impl DifferentiableType for ArrayIrType {
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
             Self::Reference(r#type) => Ok(Self::Reference(r#type.cotangent()?)),
+            Self::Ragged(_) => Err(ProgramError::UnsupportedOperation {
+                message: "cotangents of first-class ragged values are not yet supported".to_owned(),
+            }
+            .into()),
         }
     }
 }
@@ -847,9 +859,9 @@ mod tests {
 
     use crate::arrays::DataType::*;
     use crate::arrays::{
-        Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f6e2m3fn,
-        f8e8m0fnu,
+        Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
+        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedType, RaggedValueKind, Shape, Sharding,
+        ShardingDimension, StridedLayout, f6e2m3fn, f8e8m0fnu,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
@@ -1013,6 +1025,29 @@ mod tests {
         assert!(!zero_reference.is_zero_space());
         assert_eq!(non_differentiable.tangent(), Ok(zero_reference.clone()));
         assert_eq!(non_differentiable.cotangent(), Ok(zero_reference));
+    }
+
+    #[test]
+    fn test_array_ir_type_differential_representations_reject_first_class_ragged() {
+        let r#type = ArrayIrType::Ragged(
+            RaggedType::new(
+                ArrayType::new_static(I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert!(!r#type.is_zero_space());
+        assert!(matches!(
+            r#type.tangent(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "tangents of first-class ragged values are not yet supported",
+        ));
+        assert!(matches!(
+            r#type.cotangent(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "cotangents of first-class ragged values are not yet supported",
+        ));
     }
 
     #[test]

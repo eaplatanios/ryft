@@ -83,6 +83,45 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// scope. This validates type structure only; it neither inspects values nor establishes runtime equalities.
     /// Families whose identity occurrences need no additional consistency checks keep the default.
     ///
+    /// # Example
+    ///
+    /// In the [`ArrayIrType`](crate::ArrayIrType) family, an ordinary array shape `f32[n]` uses `n` for one integer
+    /// extent shared by the array. A ragged array with two rows can instead use `n` for its indexed row lengths, such
+    /// as `[2, 4]`. These have different meanings: the first is one scalar `n`, while the second is a family `n[row]`.
+    ///
+    /// Each type below is valid by itself. Putting them in the same scope is rejected because they reuse the same
+    /// [`DimensionVariable`](crate::DimensionVariable) for both meanings. Reusing only the diagnostic name `n` for
+    /// two independent variables would not cause this conflict.
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     ArrayIrType, ArrayType, DataType, DimensionBounds, DimensionVariable, RaggedDimension, RaggedType,
+    /// #     RaggedValueKind, Shape, Type, TypeError,
+    /// # };
+    /// let n = DimensionVariable::new("n", DimensionBounds::non_negative(Some(5)).unwrap());
+    /// let dense: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into()])).into();
+    /// let ragged: ArrayIrType = RaggedType::new(
+    ///     ArrayType::new_static(DataType::F32, [2, 4]),
+    ///     RaggedValueKind::Array,
+    ///     vec![RaggedDimension::new(1, n, vec![0])],
+    /// )
+    /// .unwrap()
+    /// .into();
+    ///
+    /// assert_eq!(ArrayIrType::validate_identity_scope([&dense]), Ok(()));
+    /// assert_eq!(ArrayIrType::validate_identity_scope([&ragged, &ragged]), Ok(()));
+    /// assert_eq!(
+    ///     ArrayIrType::validate_identity_scope([&dense, &ragged]),
+    ///     Err(TypeError::invalid(
+    ///         "dimension identity `n` is used as both a scalar extent and indexed ragged extents",
+    ///     )),
+    /// );
+    /// ```
+    ///
+    /// Repeated indexed occurrences must also have compatible, unambiguous coordinate axes. For example, using `n`
+    /// for lengths indexed by two rows in one type and three rows in another is rejected. Accepting compatible types
+    /// does not compare their stored lengths; checked producers must still establish equality at live coordinates.
+    ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] when occurrences assign incompatible meanings or ambiguous coordinate domains to an
