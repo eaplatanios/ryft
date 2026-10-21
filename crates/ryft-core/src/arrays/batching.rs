@@ -36,8 +36,10 @@
 //       reject such carriers through `reject_ragged_carriers`, and the other boundaries through their own checks.
 //  Intended design: make a ragged batch a value kind of the composite universe, `ArrayIrType::Ragged(RaggedType)` and
 //  `ArrayIrValue::Ragged(RaggedValue)`. The type stores the padded storage type plus, per ragged dimension, its
-//  identity and the storage axes its extents vary over (its dependency domain); the value holds the storage array plus
-//  one extents value per ragged dimension, itself ragged when its domain contains a ragged axis. A batched dimension
+//  identity and the storage axes its extents vary over (its extent axes); the value holds the storage array plus one
+//  dense extents payload per ragged dimension, covering the full shape over its extent axes at the declared bounds. An
+//  extent axis that is itself a ragged axis derives its live coordinates from that axis's sibling descriptor.
+//  Descriptors are ordered by storage axis and may only depend on earlier ragged axes. A batched dimension
 //  is the same kind with a dimension item whose storage is the extents payload. Three operations inspect the
 //  representation (`ragged_new`, `ragged_storage`, `ragged_extents`); transport operations (control flow, calls,
 //  casts, guards, derivatives) carry the value opaquely with type-level rules; compute operations reject it and are
@@ -47,11 +49,12 @@
 //  under a `(Ragged, Ragged)` add provider; structural zeros rebuild from extents retained as zero residuals;
 //  dimension items are zero-space. Boundaries then carry one value per carrier, and the backend needs one shared
 //  logical-to-physical mapping (storage followed by extents) at every region, call, and eager boundary, which must be
-//  proven on a while loop and a jit call before any transport code is counted as deleted. Decisions still open:
-//  whether storage is always at the declared bound, and whether extents are ever materialized over a full batch shape
-//  (the default answer to both is no).
+//  proven on a while loop and a jit call before any transport code is counted as deleted. Storage at a ragged axis
+//  has exactly the dimension's maximum admitted extent (its exclusive upper bound minus one, limited to the backend
+//  width); only a cast or guard changing that bound adapts storage. Extents payloads cover the complete shape over
+//  their extent axes; compact payloads and per-carrier capacities are deliberately excluded from this representation.
 //  Order of work: an inventory of every ragged branch in the batching rules, a spike of the kind and the three
-//  operations, then five proof cases (iteration-varying scan extents, a nested dependency domain, reverse-mode
+//  operations, then five proof cases (iteration-varying scan extents, a nested ragged extent axis, reverse-mode
 //  accumulation with a disconnected zero, an XLA while and jit-call boundary including the eager path, and a masked
 //  reduction with nonzero padding) before the carriers, the cast and guard rule, and the boundaries migrate in that
 //  order. The guard's `reject_ragged_carriers` call goes with the cast and guard rule, and the rematerialize,
@@ -74,7 +77,10 @@ use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::elements::ArrayElement;
 use crate::arrays::sharding::{Sharding, ShardingDimension, ShardingError};
-use crate::arrays::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::{
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, RaggedDimension, RaggedType,
+    RaggedValueKind, Shape,
+};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
@@ -90,14 +96,16 @@ use crate::operations::{
     AndOperation, Assert, Broadcast, BroadcastOperation, Compare, CompareOperation, ComparisonDirection,
     ConstantOperation, ConvertElementType, DimensionConstant, DimensionSize, DimensionSizeOperation, DynamicBroadcast,
     DynamicBroadcastOperation, DynamicIota, ElementwiseOperation, Gather, GatherDimensionNumbers, GatherOptions,
-    GuardOperation, Iota, IotaOperation, ManualVariationAlignment, ReductionKind, SelectOperation, TransferToMemory,
-    Transpose, TransposeOperation, ZeroLikeOperation,
+    GuardOperation, Iota, IotaOperation, ManualVariationAlignment, RaggedExtentsOperation, RaggedNewOperation,
+    RaggedStorageOperation, ReductionKind, SelectOperation, TransferToMemory, Transpose, TransposeOperation,
+    ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    Operation, OperationProjection, OperationProvider, Program, ProgramError, ProjectedValue, ProvenanceScope,
-    ReferenceType, Region, RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type,
-    TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
+    ErasedOperation, Operation, OperationPayloadProjection, OperationProjection, OperationProvider, Program,
+    ProgramError, ProjectedValue, ProvenanceScope, ReferenceType, Region, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Transform, TransformArtifact, Type, TypeError, Typed, Value, ValueDirectDispatch,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -924,8 +932,9 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     }
 
     /// Merges the ragged axes of elementwise inputs after validating that broadcasting preserves every extent
-    /// coordinate's domain. Callers validate the primitive's logical contract before passing packed output dimensions
-    /// here. Right-aligned coordinate positions may then be compared independently of extent-array storage order.
+    /// coordinate's dimension. Callers validate the primitive's logical contract before passing packed output
+    /// dimensions here. Right-aligned coordinate positions may then be compared independently of extent-array
+    /// storage order.
     ///
     /// # Parameters
     ///
@@ -1035,7 +1044,8 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
 /// the batch is constructed, is what makes meaningless combinations unrepresentable: only an array member can carry
 /// ragged axes, only a mapped first-class dimension carries a per-item [`DimensionType`], and a reference carries
 /// neither. The kind always agrees with the type of the packed value because the constructors are the only way to build
-/// a batch and derive it from that type.
+/// a batch and derive it from that type. A first-class ragged member retains its validated per-item representation;
+/// the array policy explicitly decomposes array values into storage and indexed extents when projecting a rule.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 enum ArrayIrBatchMember<V> {
     /// Packed array, batched along an axis of the array itself. Refer to the documentation of
@@ -1056,6 +1066,10 @@ enum ArrayIrBatchMember<V> {
     /// an axis of that array, and whose per-item type is the recorded [`DimensionType`]. Refer to the documentation of
     /// [`ArrayIrBatch::mapped_dimension_type`] for more information.
     MappedDimension(DimensionType),
+
+    /// First-class representation with its per-item type cached after removing the ordinary mapped batch axis.
+    /// Extents stay in the packed value; this metadata only makes per-item type queries infallible.
+    Ragged(RaggedType),
 }
 
 impl<V> ArrayIrBatchMember<V> {
@@ -1068,17 +1082,18 @@ impl<V> ArrayIrBatchMember<V> {
             ArrayIrType::Array(_) => Self::Array { ragged_axes: Vec::new() },
             ArrayIrType::Reference(_) => Self::Reference,
             ArrayIrType::Dimension(_) => Self::Dimension,
+            ArrayIrType::Ragged(r#type) => Self::Ragged(r#type.clone()),
         }
     }
 }
 
 /// Value with [`ArrayIrType`] type that represents a _packed_ batch of array IR values. [`ArrayIrBatch`] is the
 /// batching representation for Ryft's batching/vectorization transform over the array IR value universe, whose members
-/// are arrays, first-class dimensions, and references, and it is the counterpart of [`ArrayBatch`] for that universe.
-/// Like [`ArrayBatch`], it pairs a packed value with a [`BatchAxis`] that marks which of its dimensions indexes the
-/// batch items, and a value is either _batched_ or _replicated_ (i.e., shared unchanged across every batch item). It
-/// differs from [`ArrayBatch`] in that the packed value is not always an array, so the mapped axis and the per-item
-/// type depend on the member kind:
+/// are arrays, first-class dimensions, references, and ragged values, and it is the counterpart of [`ArrayBatch`] for
+/// that universe. Like [`ArrayBatch`], it pairs a packed value with a [`BatchAxis`] that marks which of its dimensions
+/// indexes the batch items, and a value is either _batched_ or _replicated_ (i.e., shared unchanged across every batch
+/// item). It differs from [`ArrayBatch`] in that the packed value is not always an array, so the mapped axis and the
+/// per-item type depend on the member kind:
 ///
 ///   - An **array** member behaves exactly like an [`ArrayBatch`]: the batch axis is an axis of the packed array, and
 ///     bounded [`RaggedAxis`] metadata restores a dynamic [`Dimension`] in the per-item type wherever the packed array
@@ -1136,6 +1151,11 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     ///   - `value`: Packed value, whose own [`ArrayIrType`] determines the member kind.
     ///   - `batch_axis`: Possibly-negative [`BatchAxis`], normalized against the rank the member kind batches over
     ///     before it is stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns the member-specific validation error for an invalid batch axis. A first-class ragged member's mapped
+    /// batch axis must be ordinary: a ragged storage axis cannot itself supply a uniform batch extent.
     #[inline]
     pub fn new<A: Into<BatchAxis>>(value: V, batch_axis: A) -> Result<Self, BatchingError> {
         let member = ArrayIrBatchMember::from_type(value.r#type().as_ref());
@@ -1143,8 +1163,9 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     }
 
     /// Creates a new [`ArrayIrBatch`] that replicates the provided value across the batch, deriving the member kind
-    /// from the value's type exactly like [`Self::new`] does. A replicated axis cannot fail any member kind's
-    /// validation, so this constructor is infallible and implements [`BatchingPolicy::replicated`].
+    /// from the value's type exactly like [`Self::new`] does. This constructor is infallible and implements
+    /// [`BatchingPolicy::replicated`]. A first-class ragged value keeps its complete representation and
+    /// per-item type; its explicit projection into an array rule is owned by the composite policy.
     #[inline]
     pub fn replicated(value: V) -> Self {
         let member = ArrayIrBatchMember::from_type(value.r#type().as_ref());
@@ -1195,12 +1216,14 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
             ArrayIrBatchMember::Array { .. } => {
                 Self::from_member(self.value, self.batch_axis, ArrayIrBatchMember::Array { ragged_axes })
             }
-            ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => Err(BatchingError::InvalidBatchMetadata {
-                message: format!(
-                    "ragged axes require an array member but the batched value has type {}",
-                    self.value.r#type(),
-                ),
-            }),
+            ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension | ArrayIrBatchMember::Ragged(_) => {
+                Err(BatchingError::InvalidBatchMetadata {
+                    message: format!(
+                        "ragged axes require an array member but the batched value has type {}",
+                        self.value.r#type(),
+                    ),
+                })
+            }
             ArrayIrBatchMember::MappedDimension(r#type) => {
                 Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: self.batch_axis })
             }
@@ -1212,12 +1235,12 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     /// dimension and the restored dynamic dimensions of every ragged axis. This is the single validation boundary
     /// behind every fallible constructor (the value, axis, and member are immutable afterwards, which is what lets
     /// [`Self::unbatched_type`] be infallible).
-    fn from_member(value: V, batch_axis: BatchAxis, member: ArrayIrBatchMember<V>) -> Result<Self, BatchingError> {
+    fn from_member(value: V, batch_axis: BatchAxis, mut member: ArrayIrBatchMember<V>) -> Result<Self, BatchingError> {
         let batch_axis = {
             let value_type = value.r#type();
             match &member {
-                // The three derived kinds come from `ArrayIrBatchMember::from_type` over this same type, so their
-                // projections cannot fail. A mapped dimension is requested by the caller instead and must be checked.
+                // The three supported derived kinds come from `ArrayIrBatchMember::from_type` over this same type,
+                // so their projections cannot fail. A mapped dimension is requested by the caller and must be checked.
                 ArrayIrBatchMember::Array { ragged_axes } => {
                     let packed_type = <&ArrayType>::try_from(value_type.as_ref()).unwrap();
                     let (batch_axis, position) = packed_type.normalize_batch_axis(batch_axis)?;
@@ -1276,6 +1299,42 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                     }
                     batch_axis
                 }
+                ArrayIrBatchMember::Ragged(_) => {
+                    let packed = <&RaggedType>::try_from(value_type.as_ref()).unwrap();
+                    let (axis, position) = packed.storage_type().normalize_batch_axis(batch_axis)?;
+                    let per_item = if let Some(position) = position {
+                        if packed.ragged_dimensions().iter().any(|dimension| dimension.axis() == position) {
+                            return Err(BatchingError::InvalidBatchMetadata {
+                                message: format!("mapped batch axis {position} is a ragged storage axis"),
+                            });
+                        }
+                        let descriptors = packed
+                            .ragged_dimensions()
+                            .iter()
+                            .map(|dimension| {
+                                RaggedDimension::new(
+                                    dimension.axis() - usize::from(dimension.axis() > position),
+                                    dimension.dimension().clone(),
+                                    dimension
+                                        .extent_axes()
+                                        .iter()
+                                        .filter(|&&axis| axis != position)
+                                        .map(|&axis| axis - usize::from(axis > position))
+                                        .collect(),
+                                )
+                            })
+                            .collect();
+                        RaggedType::new(
+                            packed.storage_type().unbatched(axis)?,
+                            packed.value_kind().clone(),
+                            descriptors,
+                        )?
+                    } else {
+                        packed.clone()
+                    };
+                    member = ArrayIrBatchMember::Ragged(per_item);
+                    axis
+                }
             }
         };
         Ok(Self { value, batch_axis, member })
@@ -1308,6 +1367,9 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                 <&ReferenceType<ArrayType>>::try_from(value_type.as_ref()).unwrap().referent().rank()
             }
             ArrayIrBatchMember::Dimension => return None,
+            ArrayIrBatchMember::Ragged(_) => {
+                <&RaggedType>::try_from(value_type.as_ref()).unwrap().storage_type().rank()
+            }
         };
 
         // The constructors normalize the mapped axis against this same rank, so the normalization cannot fail here.
@@ -1323,7 +1385,10 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     #[inline]
     pub fn mapped_dimension_type(&self) -> Option<&DimensionType> {
         match &self.member {
-            ArrayIrBatchMember::Array { .. } | ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => None,
+            ArrayIrBatchMember::Array { .. }
+            | ArrayIrBatchMember::Reference
+            | ArrayIrBatchMember::Dimension
+            | ArrayIrBatchMember::Ragged(_) => None,
             ArrayIrBatchMember::MappedDimension(r#type) => Some(r#type),
         }
     }
@@ -1340,14 +1405,16 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     /// per-item type where the packed array stores a finite physical bound. Refer to the documentation of
     /// [`with_ragged_axes`](Self::with_ragged_axes) for the structural requirements and the semantic claims they carry.
     /// Reference members carry none, and a mapped first-class dimension stores its per-item extents directly in
-    /// [`value`](Self::value) and therefore does not duplicate them here.
+    /// [`value`](Self::value) and therefore does not duplicate them here. An opaque first-class ragged value likewise
+    /// keeps its descriptors in its own representation; the policy projection exposes them to homogeneous rules.
     #[inline]
     pub fn ragged_axes(&self) -> &[RaggedAxis<V>] {
         match &self.member {
             ArrayIrBatchMember::Array { ragged_axes } => ragged_axes.as_slice(),
-            ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension | ArrayIrBatchMember::MappedDimension(_) => {
-                &[]
-            }
+            ArrayIrBatchMember::Reference
+            | ArrayIrBatchMember::Dimension
+            | ArrayIrBatchMember::MappedDimension(_)
+            | ArrayIrBatchMember::Ragged(_) => &[],
         }
     }
 
@@ -1371,9 +1438,10 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     pub(crate) fn into_value_and_ragged_axes(self) -> (V, Vec<RaggedAxis<V>>) {
         let ragged_axes = match self.member {
             ArrayIrBatchMember::Array { ragged_axes } => ragged_axes,
-            ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension | ArrayIrBatchMember::MappedDimension(_) => {
-                Vec::new()
-            }
+            ArrayIrBatchMember::Reference
+            | ArrayIrBatchMember::Dimension
+            | ArrayIrBatchMember::MappedDimension(_)
+            | ArrayIrBatchMember::Ragged(_) => Vec::new(),
         };
         (self.value, ragged_axes)
     }
@@ -1399,6 +1467,7 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                 ReferenceType::new(referent.unbatched(self.batch_axis).unwrap()).into()
             }
             ArrayIrBatchMember::Dimension => value_type.into_owned(),
+            ArrayIrBatchMember::Ragged(r#type) => r#type.clone().into(),
             ArrayIrBatchMember::MappedDimension(r#type) => r#type.clone().into(),
         }
     }
@@ -1412,22 +1481,29 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         let r#type = match &self.member {
             ArrayIrBatchMember::Dimension if self.batch_axis.is_replicated() => return Ok(()),
             ArrayIrBatchMember::MappedDimension(r#type) => r#type.clone(),
-            ArrayIrBatchMember::Array { .. } | ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => {
-                <&DimensionType>::try_from(value_type.as_ref())?.clone()
-            }
+            ArrayIrBatchMember::Array { .. }
+            | ArrayIrBatchMember::Reference
+            | ArrayIrBatchMember::Dimension
+            | ArrayIrBatchMember::Ragged(_) => <&DimensionType>::try_from(value_type.as_ref())?.clone(),
         };
         Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: self.batch_axis })
     }
 
-    /// Rejects the `inputs` of `operation` if any of them carries a bounded ragged axis. Only array members carry
-    /// ragged axes. Refer to [`ArrayBatch::reject_ragged_inputs`] for more information.
+    /// Rejects the `inputs` of `operation` if any of them is a first-class ragged value or carries a bounded ragged
+    /// axis. Only array members carry separate ragged axes. Refer to [`ArrayBatch::reject_ragged_inputs`] for more
+    /// information.
     ///
     /// # Errors
     ///
-    /// Returns [`BatchingError::UnsupportedOperation`] for the first input that carries a ragged axis, naming
-    /// `operation`, the dimension variable of that input's first ragged axis, and the input's position.
-    #[inline]
+    /// Returns [`BatchingError::UnsupportedOperation`] naming `operation` and the input's position. A first-class
+    /// ragged value is rejected before inspecting separate metadata; otherwise the diagnostic also names the dimension
+    /// variable of the first ragged axis.
     pub fn reject_ragged_inputs<O: Operation>(operation: &O, inputs: &[Self]) -> Result<(), BatchingError> {
+        if let Some(index) = inputs.iter().position(|input| matches!(input.member, ArrayIrBatchMember::Ragged(_))) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("`{}` does not support first-class ragged input {}", operation.name(), index),
+            });
+        }
         match inputs
             .iter()
             .enumerate()
@@ -1443,6 +1519,19 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                 ),
             }),
         }
+    }
+
+    /// Enumerates indexed dimensions from either the legacy carrier metadata or a first-class representation.
+    fn indexed_dimensions(&self) -> impl Iterator<Item = &DimensionVariable> {
+        let representation = match &self.member {
+            ArrayIrBatchMember::Ragged(r#type) => Some(r#type),
+            _ => None,
+        };
+        self.ragged_axes().iter().map(RaggedAxis::dimension).chain(
+            representation
+                .into_iter()
+                .flat_map(|r#type| r#type.ragged_dimensions().iter().map(RaggedDimension::dimension)),
+        )
     }
 }
 
@@ -2810,6 +2899,12 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
         input: &Self::Batch,
         declared: &ArrayIrType,
     ) -> Result<ArrayIrType, BatchingError> {
+        if matches!(declared, ArrayIrType::Ragged(_)) || matches!(input.member, ArrayIrBatchMember::Ragged(_)) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "first-class ragged batching is not yet supported".to_owned(),
+            });
+        }
+
         // A bounded ragged carrier keeps its per-item extents outside its packed type, whether it is mapped or
         // replicated, so no lifted declaration can relate them. Reject it before the replicated shortcut, which would
         // otherwise let an operation read the padded storage as data, exactly as `ArrayBatch::batched_declaration`
@@ -2874,12 +2969,11 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
         // records, and so the operation is rejected while naming the exact dimension that was lost.
         inputs
             .iter()
-            .flat_map(ArrayIrBatch::ragged_axes)
-            .map(RaggedAxis::dimension)
+            .flat_map(ArrayIrBatch::indexed_dimensions)
             .find(|&dimension| {
                 !evidence.contains(dimension)
                     && !outputs.iter().any(|output| {
-                        output.ragged_axes().iter().any(|axis| axis.dimension() == dimension)
+                        output.indexed_dimensions().any(|output_dimension| output_dimension == dimension)
                             || (output.mapped_dimension_extents().is_some()
                                 && matches!(
                                     output.unbatched_type(),
@@ -2933,7 +3027,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicyProjection<C, ArrayType> for 
 where
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: OperationProjection<ArrayType>,
+    C::Operation: OperationProjection<ArrayType> + OperationPayloadProjection,
     ProjectedContext<C, ArrayType>: Context<
             Type = ArrayType,
             Value = <C::Value as ValueProjection<ArrayType>>::Projected,
@@ -2944,8 +3038,72 @@ where
     type Projected = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
 
     fn project_batch(
+        context: &C,
         batch: &Self::Batch,
     ) -> Result<<Self::Projected as BatchingPolicy<ProjectedContext<C, ArrayType>>>::Batch, BatchingError> {
+        if let ArrayIrType::Ragged(r#type) = batch.value().r#type().as_ref() {
+            if !matches!(r#type.value_kind(), RaggedValueKind::Array) {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "dimension-item ragged values cannot project into numerical array batching".to_owned(),
+                });
+            }
+
+            // Existing homogeneous masks have no sibling-occurrence environment. Reject that case until their
+            // migration, rather than interpreting inactive nested extent entries as live lengths.
+            if r#type.ragged_dimensions().iter().any(|dimension| {
+                dimension
+                    .extent_axes()
+                    .iter()
+                    .any(|axis| r#type.ragged_dimensions().iter().any(|ancestor| ancestor.axis() == *axis))
+            }) {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "nested ragged extent axes are not yet supported by homogeneous array batching".to_owned(),
+                });
+            }
+
+            // Validate the opaque representation before exposing fields to a rule. Full consumption of the indexed
+            // axes must retain these checks too; lifting a dense result alone cannot establish that dependency.
+            let storage =
+                bind_ragged_representation_operation(context, RaggedStorageOperation, &[batch.value().clone()])?;
+            let mut fields = vec![storage];
+            for dimension in r#type.ragged_dimensions() {
+                fields.push(bind_ragged_representation_operation(
+                    context,
+                    RaggedExtentsOperation::new(dimension.axis()),
+                    &[batch.value().clone()],
+                )?);
+            }
+            fields.push(batch.value().clone());
+            let checked = bind_ragged_representation_operation(
+                context,
+                RaggedNewOperation::with_identity_source(r#type.clone()),
+                &fields,
+            )?;
+            let value = C::Value::into_projected(bind_ragged_representation_operation(
+                context,
+                RaggedStorageOperation,
+                std::slice::from_ref(&checked),
+            )?)?;
+            let ragged_axes = r#type
+                .ragged_dimensions()
+                .iter()
+                .map(|dimension| {
+                    let extents = bind_ragged_representation_operation(
+                        context,
+                        RaggedExtentsOperation::new(dimension.axis()),
+                        std::slice::from_ref(&checked),
+                    )?;
+                    Ok(RaggedAxis::new(
+                        dimension.axis(),
+                        C::Value::into_projected(extents)?,
+                        dimension.dimension().clone(),
+                        dimension.extent_axes().to_vec(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, BatchingError>>()?;
+            return ArrayBatch::new(value, batch.batch_axis())?.with_ragged_axes(ragged_axes);
+        }
+
         let value = C::Value::into_projected(batch.value().clone())?;
         let ragged_axes = batch
             .ragged_axes()
@@ -2964,8 +3122,66 @@ where
     }
 
     fn lift_batch(
+        context: &C,
         batch: &<Self::Projected as BatchingPolicy<ProjectedContext<C, ArrayType>>>::Batch,
+        inputs: &[Self::Batch],
     ) -> Result<Self::Batch, BatchingError> {
+        if inputs.iter().any(|input| matches!(input.member, ArrayIrBatchMember::Ragged(_))) {
+            if inputs
+                .iter()
+                .any(|input| !input.ragged_axes().is_empty() || input.mapped_dimension_type().is_some())
+            {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "mixing first-class ragged values with legacy ragged carriers is not yet supported"
+                        .to_owned(),
+                });
+            }
+
+            let storage = C::Value::from_projected(batch.value().clone());
+            if batch.ragged_axes().is_empty() {
+                return ArrayIrBatch::new(storage, batch.batch_axis());
+            }
+            let descriptors = batch
+                .ragged_axes()
+                .iter()
+                .map(|axis| RaggedDimension::new(axis.axis(), axis.dimension().clone(), axis.extent_axes().to_vec()))
+                .collect();
+            let output = RaggedType::new(batch.value().r#type().into_owned(), RaggedValueKind::Array, descriptors)?;
+
+            // Payload order belongs to `RaggedType`, not to a rule's incidental metadata order.
+            let mut fields = vec![storage];
+            for dimension in output.ragged_dimensions() {
+                let axis = batch.ragged_axes().iter().find(|axis| axis.axis() == dimension.axis()).unwrap();
+                fields.push(C::Value::from_projected(axis.extents().clone()));
+            }
+
+            let source = inputs
+                .iter()
+                .find(|input| match &input.member {
+                    ArrayIrBatchMember::Ragged(r#type) => output.ragged_dimensions().iter().all(|dimension| {
+                        r#type
+                            .ragged_dimensions()
+                            .iter()
+                            .any(|candidate| candidate.dimension() == dimension.dimension())
+                    }),
+                    _ => false,
+                })
+                .ok_or_else(|| BatchingError::UnsupportedOperation {
+                    message:
+                        "ragged reconstruction requiring several independent identity sources is not yet supported"
+                            .to_owned(),
+                })?;
+            fields.push(source.value().clone());
+
+            let value = bind_ragged_representation_operation(
+                context,
+                RaggedNewOperation::with_identity_source(output),
+                &fields,
+            )?;
+
+            return ArrayIrBatch::new(value, batch.batch_axis());
+        }
+
         let ragged_axes = batch
             .ragged_axes()
             .iter()
@@ -3150,6 +3366,12 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<Self::Batch>,
     ) -> Result<Vec<Self::Batch>, BatchingError> {
+        if inputs.iter().any(|batch| matches!(batch.member, ArrayIrBatchMember::Ragged(_))) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "first-class ragged region batching is not yet supported".to_owned(),
+            });
+        }
+
         // Regions are replayed through the checked constant and operation boundaries.
         let region_mappings = RegionReplayMappings::new();
         region.interpret_with(
@@ -3566,6 +3788,11 @@ where
                         return Ok(batch);
                     }
                     ArrayIrType::Dimension(_) => return Ok(batch),
+                    ArrayIrType::Ragged(_) => {
+                        return Err(BatchingError::UnsupportedOperation {
+                            message: "first-class ragged batching is not yet supported".to_owned(),
+                        });
+                    }
                 };
                 let Some(normalized_type) =
                     normalized_batch_axis_type(array_type, position, batching_context.axis_sharding())?
@@ -3599,6 +3826,12 @@ where
         output: Self::Batch,
         output_batch_axis: BatchAxis,
     ) -> Result<C::Value, BatchingError> {
+        if matches!(output.member, ArrayIrBatchMember::Ragged(_)) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "a first-class ragged value cannot cross the batching transform output boundary".to_owned(),
+            });
+        }
+
         if let ArrayIrType::Reference(r#type) = output.value().r#type().as_ref() {
             // A reference output carries the batch axis of the root it forwards or of its allocation. That axis is
             // fixed by the referent, so the request must already agree with it (a replicated request for a replicated
@@ -3776,7 +4009,7 @@ impl<
 
         // Validate logical shapes after restoring the mapped dimension's manual variation. Packed capacities alone
         // can broadcast incompatible per-item dimensions, such as a capacity-one ragged axis with a dense size-three
-        // axis. Merge the original coordinate domains before broadcasts expand singleton axes and erase their identity.
+        // axis. Merge the original extent coordinates before broadcasts expand singleton axes and erase their identity.
         if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             for r#type in Operation::infer_output_types(self, &unbatched_types, &[])? {
                 let mut dimensions = r#type.shape().dimensions().to_vec();
@@ -4791,6 +5024,27 @@ fn broadcast_replicated_array<V: Clone + DimensionSize + DynamicBroadcast>(
     Ok((value, output_axes))
 }
 
+/// Binds one representation primitive through the family's existing optional payload projection. Dense projection
+/// needs no representation variants; a family missing one reports unsupported only when a raw ragged value uses it.
+fn bind_ragged_representation_operation<
+    C: Context<Type = ArrayIrType, Operation: OperationPayloadProjection>,
+    O: 'static + Operation<Type = ArrayIrType>,
+>(
+    context: &C,
+    operation: O,
+    inputs: &[C::Value],
+) -> Result<C::Value, BatchingError> {
+    let name = operation.name();
+    let operation = C::Operation::from_payload(ErasedOperation::new(operation)).map_err(|_| {
+        BatchingError::UnsupportedOperation {
+            message: format!("operation family cannot represent `{name}` required by first-class ragged batching"),
+        }
+    })?;
+    let mut outputs = context.bind(operation, vec![], inputs)?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::borrow::Cow;
@@ -4810,6 +5064,7 @@ pub(crate) mod tests {
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
     use crate::arrays::types::memories::Memory;
+    use crate::arrays::types::ragged::{RaggedDimension, RaggedType, RaggedValueKind};
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy,
@@ -4826,7 +5081,8 @@ pub(crate) mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope, ReferenceType,
+        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance,
+        ProvenanceScope, ReferenceType,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{TestArrayContext, TestArrayOperation};
@@ -4968,7 +5224,8 @@ pub(crate) mod tests {
                     .to_owned(),
             }),
         );
-        // Inserting and permuting axes preserve the original coordinate domain.
+
+        // Inserting and permuting axes preserve the original extent coordinates.
         assert_eq!(
             RaggedAxis::validate_broadcast_extent_dimensions(
                 &axes,
@@ -5605,6 +5862,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_array_ir_batch_new_first_class_ragged() {
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            Vec::new(),
+        )
+        .unwrap();
+        let trace = ArrayIrTraceContext::new();
+        let value = trace.input(ArrayIrType::Ragged(r#type));
+        let batch = ArrayIrBatch::new(value, BatchAxis::new(-1)).unwrap();
+        assert_eq!(batch.batch_axis_position(), Some(0));
+        assert_eq!(
+            batch.unbatched_type(),
+            RaggedType::new(
+                ArrayType::scalar(DataType::I64),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap()
+            .into()
+        );
+    }
+
+    #[test]
     fn test_array_ir_batch_replicated() {
         // `replicated` derives the member kind from the value's type, so every kind reports itself exactly as the
         // checked constructor would: no ragged axes, no mapped dimension, and the packed type as the per-item type.
@@ -5631,6 +5912,280 @@ pub(crate) mod tests {
         assert_eq!(dimension.mapped_dimension_type(), None);
         assert_eq!(dimension.ragged_axes(), &[]);
         assert_eq!(dimension.unbatched_type(), dimension.value().r#type().into_owned());
+    }
+
+    #[test]
+    fn test_array_ir_batch_replicated_first_class_ragged() {
+        let r#type = ArrayIrType::Ragged(
+            RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let trace = ArrayIrTraceContext::new();
+        let batch = ArrayIrBatch::replicated(trace.input(r#type.clone()));
+        assert_eq!(batch.batch_axis_position(), None);
+        assert_eq!(batch.unbatched_type(), r#type);
+        assert!(matches!(
+            ArrayIrBatch::reject_ragged_inputs(&NegOperation::<ArrayType>::new(), std::slice::from_ref(&batch)),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`neg` does not support first-class ragged input 0",
+        ));
+        assert_eq!(
+            <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrTraceContext>>::validate_operation_outputs(
+                "tag",
+                std::slice::from_ref(&batch),
+                std::slice::from_ref(&batch),
+                &Vec::new(),
+            ),
+            Ok(()),
+        );
+        let context =
+            BatchingContext::new(trace.clone(), trace.input(DimensionType::from(Dimension::Static(2)).into()));
+        assert!(matches!(
+            <ArrayIrBatchingPolicy as BatchingEntrypointPolicy<ArrayIrTraceContext>>::materialize_output(
+                &context, batch, BatchAxis::replicated(),
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "a first-class ragged value cannot cross the batching transform output boundary",
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_project_batch_first_class_ragged() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )?;
+        let (_, program) = ArrayIrTraceContext::trace(
+            |value: Tracer<ArrayIrTraceContext>| {
+                let context = value.domain();
+                let source = ArrayIrBatch::new(value, BatchAxis::new(-2))?;
+                let projected = <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::project_batch(
+                    &context, &source,
+                )?;
+                assert_eq!(projected.batch_axis(), BatchAxis::new(0));
+                assert_eq!(projected.ragged_axes().len(), 1);
+                assert_eq!(projected.ragged_axes()[0].axis(), 1);
+                assert_eq!(projected.ragged_axes()[0].extent_axes(), &[0]);
+                let lifted = <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::lift_batch(
+                    &context,
+                    &projected,
+                    &[source],
+                )?;
+                Ok(lifted.into_value())
+            },
+            ArrayIrType::Ragged(r#type.clone()),
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:ragged<f32[2, 3]; 1:rows over [0]> .
+            let %1:f32[2, 3] = ragged_storage %0
+                %2:i64[2] = ragged_extents [axis=1] %0
+                %3:ragged<f32[2, 3]; 1:rows over [0]> = ragged_new \
+                    [output_type=ragged<f32[2, 3]; 1:rows over [0]>, identity_source=true] %1 %2 %0
+                %4:f32[2, 3] = ragged_storage %3
+                %5:i64[2] = ragged_extents [axis=1] %3
+                %6:ragged<f32[2, 3]; 1:rows over [0]> = ragged_new \
+                    [output_type=ragged<f32[2, 3]; 1:rows over [0]>, identity_source=true] %4 %5 %0
+            in (%6)"}
+        );
+        let storage = Array::matrix(2, 3, vec![1_f32, 2., 99., 3., 4., 5.])?;
+        let source = ArrayIrValue::Ragged(crate::RaggedValue::new(
+            r#type.clone(),
+            storage.clone(),
+            vec![Array::vector(vec![2_i64, 3])?],
+        )?);
+        assert_eq!(program.interpret(source.clone()), Ok(source));
+
+        // The source carries structure, not a numeric proof. Its malformed live payload is still rejected.
+        let invalid =
+            ArrayIrValue::Ragged(crate::RaggedValue::new(r#type, storage, vec![Array::vector(vec![999_i64, 3])?])?);
+        assert!(program.interpret(invalid).unwrap_err().downcast_custom::<crate::AssertionError>().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_project_batch_rejects_dimension_item() {
+        let trace = ArrayIrTraceContext::new();
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(Dimension::Static(3).into()),
+            vec![],
+        )
+        .unwrap();
+        let source = ArrayIrBatch::replicated(trace.input(r#type.into()));
+        assert!(matches!(
+            <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::project_batch(&trace, &source),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "dimension-item ragged values cannot project into numerical array batching",
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_validate_operation_outputs_first_class_ragged() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let trace = ArrayIrTraceContext::new();
+        let source = ArrayIrBatch::replicated(trace.input(r#type.into()));
+        assert!(matches!(
+            <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrTraceContext>>::validate_operation_outputs(
+                "lose", &[source.clone()], &[], &Vec::new(),
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "operation `lose` neither preserves nor consumes bounded ragged dimension `rows`",
+        ));
+        assert_eq!(
+            <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrTraceContext>>::validate_operation_outputs(
+                "consume",
+                &[source],
+                &[],
+                &vec![rows],
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_lift_batch_first_class_origin() -> Result<(), BatchingError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let storage = Array::matrix(2, 3, vec![1_f32, 2., 99., 3., 4., 5.])?;
+        let extents = Array::vector(vec![2_i64, 3])?;
+        let r#type = RaggedType::new(
+            storage.r#type().into_owned(),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )?;
+        let value = ArrayIrValue::Ragged(crate::RaggedValue::new(r#type, storage.clone(), vec![extents.clone()])?);
+        let raw = ArrayIrBatch::new(value.clone(), BatchAxis::new(0))?;
+        let dense = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_f32)?));
+        let context = ArrayIrEagerContext::new();
+        let projected =
+            <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::project_batch(&context, &raw)?;
+        for inputs in [vec![raw.clone(), dense.clone()], vec![dense, raw.clone()]] {
+            let output = <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::lift_batch(
+                &context, &projected, &inputs,
+            )?;
+            assert_eq!(output.value(), &value);
+            assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        }
+        // A rule that deliberately consumes every indexed axis returns the ordinary output encoding.
+        let consumed = ArrayBatch::new(projected.value().clone(), projected.batch_axis())?;
+        let output = <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::lift_batch(
+            &context,
+            &consumed,
+            &[raw.clone()],
+        )?;
+        assert_eq!(output.value(), &ArrayIrValue::Array(storage.clone()));
+        assert_eq!(
+            <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::validate_operation_outputs(
+                "consume",
+                &[raw.clone()],
+                &[output],
+                &vec![rows.clone()],
+            ),
+            Ok(())
+        );
+        let legacy = ArrayIrBatch::new(ArrayIrValue::Array(storage), BatchAxis::new(0))?
+            .with_ragged_axes(vec![RaggedAxis::new(1, ArrayIrValue::Array(extents), rows, vec![0])])?;
+        assert!(matches!(
+            <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::lift_batch(
+                &context, &projected, &[raw, legacy],
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "mixing first-class ragged values with legacy ragged carriers is not yet supported",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batch_new_rejects_ragged_mapped_axis() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let trace = ArrayIrTraceContext::new();
+        assert!(matches!(
+            ArrayIrBatch::new(trace.input(r#type.into()), BatchAxis::new(-1)),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message == "mapped batch axis 1 is a ragged storage axis",
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_projection_without_representation_variants() -> Result<(), BatchingError> {
+        #[derive(Clone, Debug, ryft_macros::Operation)]
+        #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(ArrayType))]
+        enum DenseOnlyOperation {
+            #[ryft(projected(ArrayType))]
+            Array(crate::ArrayOperation<Array>),
+        }
+        let parent = TracingContext::<ArrayIrValue<Array>, DenseOnlyOperation>::new();
+        let value = parent.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let source = ArrayIrBatch::new(value.clone(), BatchAxis::new(0))?;
+        let projected =
+            <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::project_batch(&parent, &source)?;
+        let output = <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::lift_batch(
+            &parent,
+            &projected,
+            &[source],
+        )?;
+        assert_eq!(output.value(), &value);
+        assert!(parent.builder().borrow().instructions().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_projection_preserves_checks_after_consumption() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )?;
+        let (_, program) = ArrayIrTraceContext::trace(
+            |value: Tracer<ArrayIrTraceContext>| {
+                let context = value.domain();
+                let raw = ArrayIrBatch::new(value, BatchAxis::new(0))?;
+                let projected =
+                    <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::project_batch(&context, &raw)?;
+                let reduced = projected.value().reduce_sum(&[1], None)?;
+                let reduced = ArrayBatch::new(reduced, BatchAxis::new(0))?;
+                let output = <ArrayIrBatchingPolicy as BatchingPolicyProjection<_, ArrayType>>::lift_batch(
+                    &context,
+                    &reduced,
+                    &[raw],
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::Ragged(r#type.clone()),
+        )?;
+        assert_eq!(program.output_types(), vec![ArrayType::new_static(DataType::F32, [2]).into()]);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["ragged_storage", "ragged_extents", "ragged_new", "ragged_storage", "ragged_extents", "reduce"]
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let invalid = ArrayIrValue::Ragged(crate::RaggedValue::new(
+            r#type,
+            Array::matrix(2, 3, vec![1_f32; 6])?,
+            vec![Array::vector(vec![999_i64, 3])?],
+        )?);
+        assert!(program.interpret(invalid).unwrap_err().downcast_custom::<crate::AssertionError>().is_some());
+        Ok(())
     }
 
     #[test]
@@ -7961,6 +8516,7 @@ pub(crate) mod tests {
     fn test_array_ir_batching_policy_project_batch_and_lift_batch() {
         // Projecting a composite array carrier onto the homogeneous array view keeps the axis and the ragged metadata
         // while unwrapping every value (including the ragged extents) into the array member, and lifting reverses it.
+        let parent = ArrayIrEagerContext::new();
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::vector(vec![1_i32, 3]).unwrap();
         let matrix = Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap();
@@ -7969,7 +8525,7 @@ pub(crate) mod tests {
                 .unwrap();
         let projected =
             <ArrayIrBatchingPolicy as BatchingPolicyProjection<ArrayIrEagerContext, ArrayType>>::project_batch(
-                &composite,
+                &parent, &composite,
             )
             .unwrap();
         assert_eq!(
@@ -7980,7 +8536,11 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            <ArrayIrBatchingPolicy as BatchingPolicyProjection<ArrayIrEagerContext, ArrayType>>::lift_batch(&projected),
+            <ArrayIrBatchingPolicy as BatchingPolicyProjection<ArrayIrEagerContext, ArrayType>>::lift_batch(
+                &parent,
+                &projected,
+                std::slice::from_ref(&composite),
+            ),
             Ok(composite),
         );
 
@@ -7989,7 +8549,7 @@ pub(crate) mod tests {
             ArrayIrBatch::replicated(ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap()));
         assert_eq!(
             <ArrayIrBatchingPolicy as BatchingPolicyProjection<ArrayIrEagerContext, ArrayType>>::project_batch(
-                &dimension
+                &parent, &dimension,
             ),
             Err(BatchingError::Type(TypeError::Invalid {
                 message: "expected array type but got dimension type".to_string(),
@@ -9791,7 +10351,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_elementwise_operation_batch_ragged_coordinate_domains() -> Result<(), BatchingError> {
+    fn test_elementwise_operation_batch_ragged_extent_coordinates() -> Result<(), BatchingError> {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let context = BatchingContext::new(TestArrayContext::new(), 2);
         let left = ArrayBatch::replicated(Array::matrix(1, 3, vec![10f32, 100.0, 100.0]).unwrap())
@@ -9805,7 +10365,7 @@ pub(crate) mod tests {
                     vec![0],
                 )])?;
 
-        // The same dimension can have independent extents over different coordinate domains. Expanding the singleton
+        // The same dimension can have independent extents over different extent coordinates. Expanding the singleton
         // row does not prove that its extent agrees with every row of the other input, in either input order.
         let expected = Err(BatchingError::UnsupportedOperation {
             message: "broadcast cannot change extent coordinate 0 of ragged dimension `length` from `1` to `3`"
@@ -9815,7 +10375,7 @@ pub(crate) mod tests {
         assert_eq!(AddOperation::new().batch(&context, &EmptyRegionDriver, &[right, left.clone()]), expected);
 
         // A dense input cannot authorize losing a coordinate either: accepting this first broadcast would make a
-        // later add with `right` incorrectly trust the expanded coordinate domain. Reject both input orders.
+        // later add with `right` incorrectly trust the expanded extent coordinates. Reject both input orders.
         let dense = ArrayBatch::replicated(Array::matrix(3, 1, vec![1f32, 2.0, 3.0]).unwrap());
         assert_eq!(AddOperation::new().batch(&context, &EmptyRegionDriver, &[left.clone(), dense.clone()]), expected);
         assert_eq!(AddOperation::new().batch(&context, &EmptyRegionDriver, &[dense, left.clone()]), expected);
