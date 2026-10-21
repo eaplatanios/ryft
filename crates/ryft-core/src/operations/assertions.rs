@@ -1421,8 +1421,8 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///
 /// Operation families construct guards through [`OperationProvider`]. Families with an ordinary
 /// `From<GuardOperation<T>>` conversion receive a blanket provider implementation. Other families reject guard requests
-/// with [`unsupported_family_error`](Self::unsupported_error) through a provider that `#[derive(Operation)]`
-/// generates for a derived family without a native guard variant and that
+/// with [`unsupported_error`](Self::unsupported_error) through a provider that `#[derive(Operation)]` generates for a
+/// derived family without a native guard variant and that
 /// [`impl_guardless_operation!`](crate::impl_guardless_operation) generates for handwritten families. A family can
 /// also implement the provider explicitly to accept only the requests it can represent. No guard-specific derive
 /// attribute is needed.
@@ -1499,8 +1499,8 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///      after its rule has transformed the request and the inputs.
 ///   7. Errors keep their variants. Interpreting a relationship that symbolic types leave unproven fails with
 ///      [`ProgramError::Concretization`], and a family or carrier that cannot represent the check fails with an
-///      explicit unsupported-operation error (e.g., [`unsupported_family_error`](Self::unsupported_error)).
-///      An unsupported check never counts as success.
+///      explicit unsupported-operation error (e.g., [`unsupported_error`](Self::unsupported_error)). An unsupported
+///      check never counts as success.
 ///   8. Enforcement runs under the ambient [`Provenance`](crate::Provenance) of the replay that requested the guard.
 ///
 /// # Example

@@ -17,7 +17,7 @@ use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -2177,17 +2177,18 @@ where
 ///   2. Transposes each branch through the driver's region-transposition request, marking the branch tangent inputs
 ///      linear and the residual inputs known. Each transposed branch maps
 ///      `[branch_tangent_output_cotangents..., branch_cotangent_references..., residuals...]` to
-///      `[branch_tangent_input_cotangents...]`, where only the branch inputs with a `Reference` cotangent destination
-///      own a cotangent reference slot; because both branches shared the joined signature, their transposes share it
-///      too and form a well-typed condition.
+///      `[nonzero_branch_tangent_input_cotangents...]`, where only branch inputs with a `Reference` cotangent destination
+///      own a cotangent reference slot. Both branches first omit structural-zero outputs. Any zero opposite a peer's
+///      value output is then materialized inside its branch, giving the transposed branches matching signatures while
+///      cotangents that are zero in both branches remain absent from their output boundaries.
 ///   3. Re-stages a primal [`ConditionOperation`] selecting between the two transposed branches by the same known
 ///      predicate, over `[predicate, outputs..., cotangent_references..., residuals...]`, where `outputs` holds the
 ///      cotangents of the non-reference condition outputs. Its outputs are the branch-tangent input cotangents.
 ///
-/// The returned cotangents place those branch-tangent cotangents at the linear-input positions and a structural
-/// [`MaybeZero::Zero`] at the predicate and residual positions, which carry no cotangent. The branch recursion happens
-/// through the instruction-scoped driver in the same operation family, so it introduces no recursive
-/// [`TransposableOperation`] obligation on `O`.
+/// The returned cotangents place those branch-tangent cotangents at the linear-input positions, preserving cotangents
+/// that are zero in both branches as [`MaybeZero::Zero`]. The predicate and residual positions also carry structural
+/// zeros. The branch recursion happens through the instruction-scoped driver in the same operation family, so it
+/// introduces no recursive [`TransposableOperation`] obligation on `O`.
 ///
 /// # Parameters
 ///
@@ -2275,16 +2276,62 @@ where
         .map(read_known)
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Transpose each branch with the branch tangents marked linear and the residual inputs marked known, through each
+    // branch region's retained transform cache so that a branch shared by several programs is transposed once per
+    // selection of linear inputs. A live reference-typed branch tangent is transposed with a `Reference` destination
+    // and a dead one with an `Ignore` destination, so each transposed branch maps
+    // `[branch_output_cotangents..., branch_cotangent_references..., residuals...]` to
+    // `[branch_tangent_cotangents...]`, where a live reference tangent's cotangent is its cotangent reference itself
+    // and a dead reference tangent has no cotangent slot at all.
+    let branch_destination_kinds =
+        branch_input_indices.iter().map(|&index| cotangents.kind(index + 1)).collect::<Vec<_>>();
+    let source_branches = [true_branch, driver.region(1)?];
+    let mut transposed_branches = [
+        driver.transpose_program(source_branches[0], &branch_input_indices, &[], &branch_destination_kinds)?,
+        driver.transpose_program(source_branches[1], &branch_input_indices, &[], &branch_destination_kinds)?,
+    ];
+    for branch in &transposed_branches {
+        if branch.cotangents().len() != branch_input_indices.len() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "condition branch transposition returned {} cotangent slots for {} selected inputs",
+                    branch.cotangents().len(),
+                    branch_input_indices.len(),
+                ),
+            });
+        }
+    }
+
+    // Branch outputs must agree, but a cotangent disconnected in both branches has no value to return. First omit
+    // every structural zero, then materialize only the one-sided zeros that need to match a peer's value output.
+    let materialize_zeros = [0, 1].map(|index| {
+        transposed_branches[index]
+            .cotangents()
+            .iter()
+            .zip(transposed_branches[1 - index].cotangents())
+            .map(|(slot, peer)| {
+                *slot == TransposedProgramCotangent::Zero && *peer == TransposedProgramCotangent::Output
+            })
+            .collect::<Vec<_>>()
+    });
+
     // Devices whose predicates differ take different branches, so the cotangent of a linear input differs across them.
     // An input that does not vary over the predicate's manual axes would need that cotangent summed across devices
     // inside the branches, with collectives that devices reach differently, so such a condition is not transposed.
-    // Staging the condition through `condition` varies its inputs before the branches instead.
+    // Staging the condition through `condition` varies its inputs before the branches instead. A cotangent that is
+    // structural zero in both branches crosses no value boundary, so its input needs no such variation. Reference
+    // destinations still carry branch-local state effects and retain the check even when they produce no value.
     let predicate_type = predicate.r#type().into_owned();
-    for index in branch_input_indices.iter().map(|&index| index + 1) {
+    for (position, index) in branch_input_indices.iter().map(|&index| index + 1).enumerate() {
         let input_type = inputs[index].r#type();
-        if !matches!(cotangents.kind(index), CotangentDestinationKind::Ignore)
-            && input_type.cotangent()?.validate_condition_output(&predicate_type).is_err()
-        {
+        let crosses_boundary = match cotangents.kind(index) {
+            CotangentDestinationKind::Return => transposed_branches
+                .iter()
+                .any(|branch| branch.cotangents()[position] == TransposedProgramCotangent::Output),
+            CotangentDestinationKind::Reference => true,
+            CotangentDestinationKind::Ignore => false,
+        };
+        if crosses_boundary && input_type.cotangent()?.validate_condition_output(&predicate_type).is_err() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "`{CONDITION_OPERATION_NAME}` transposition cannot produce the cotangent of input {index} of type \
@@ -2295,33 +2342,17 @@ where
         }
     }
 
-    // Transpose each branch with the branch tangents marked linear and the residual inputs marked known, through each
-    // branch region's retained transform cache so that a branch shared by several programs is transposed once per
-    // selection of linear inputs. A live reference-typed branch tangent is transposed with a `Reference` destination
-    // and a dead one with an `Ignore` destination, so each transposed branch maps
-    // `[branch_output_cotangents..., branch_cotangent_references..., residuals...]` to
-    // `[branch_tangent_cotangents...]`, where a live reference tangent's cotangent is its cotangent reference itself
-    // and a dead reference tangent has no cotangent slot at all.
-    let branch_destination_kinds =
-        branch_input_indices.iter().map(|&index| cotangents.kind(index + 1)).collect::<Vec<_>>();
-    let transposed_branches = [
-        driver
-            .transpose_program(
-                true_branch,
+    for (index, materialize) in materialize_zeros.iter().enumerate() {
+        if materialize.contains(&true) {
+            transposed_branches[index] = driver.transpose_program(
+                source_branches[index],
                 &branch_input_indices,
-                &vec![true; branch_input_indices.len()],
+                materialize,
                 &branch_destination_kinds,
-            )?
-            .into_program(),
-        driver
-            .transpose_program(
-                driver.region(1)?,
-                &branch_input_indices,
-                &vec![true; branch_input_indices.len()],
-                &branch_destination_kinds,
-            )?
-            .into_program(),
-    ];
+            )?;
+        }
+    }
+
     let transposed_condition = ConditionOperation::new();
 
     // Stage the transposed condition over `[predicate, outputs..., cotangent_references..., residuals...]`. Its
@@ -2352,36 +2383,27 @@ where
     // by `Arc` identity instead of copying it again.
     let branch_cotangents = context.bind(
         O::from(transposed_condition),
-        CalleeRegionDriver::new(&transposed_branches),
+        CalleeRegionDriver::new(&[transposed_branches[0].program().clone(), transposed_branches[1].program().clone()]),
         transposed_inputs.as_slice(),
     )?;
-    let output_count = branch_input_indices.iter().filter(|&&index| cotangents.returns_cotangent(index + 1)).count();
-    check_count!("output", branch_cotangents, output_count, ProgramError);
-
-    // Reassemble one cotangent per input: the predicate and residuals carry structural zeros, while the branch tangents
-    // receive the transposed condition's outputs in order. A live reference tangent's output is its cotangent
-    // reference, whose contents were accumulated in place, and a dead reference tangent has no output, so every
-    // reference input receives a structural zero.
-    let mut branch_cotangents = branch_cotangents.into_iter();
-    input_linear
+    let branch_cotangent_types = branch_input_indices
         .iter()
-        .zip(inputs)
-        .enumerate()
-        .map(|(index, (&linear, input))| -> Result<_, ProgramError> {
-            match cotangents.kind(index) {
-                CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(branch_cotangents.next().unwrap())),
-                CotangentDestinationKind::Reference => {
-                    if linear && cotangents.is_reference_input(index) {
-                        branch_cotangents.next();
-                    }
-                    Ok(MaybeZero::Zero(input.r#type().cotangent()?))
-                }
-                CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
-                    Ok(MaybeZero::Zero(input.r#type().cotangent()?))
-                }
-            }
-        })
-        .collect()
+        .map(|&index| inputs[index + 1].r#type().cotangent())
+        .collect::<Result<Vec<_>, _>>()?;
+    let branch_cotangents = transposed_branches[0].assemble_cotangents(&branch_cotangent_types, branch_cotangents)?;
+
+    // Predicate and residual inputs contribute nothing. Returned branch cotangents preserve both-zero slots as
+    // structural zeros; reference destinations have already accumulated in place and need no further contribution.
+    let mut input_cotangents = inputs
+        .iter()
+        .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    for (&index, cotangent) in branch_input_indices.iter().zip(branch_cotangents) {
+        if cotangents.kind(index + 1) == CotangentDestinationKind::Return {
+            input_cotangents[index + 1] = cotangent.unwrap();
+        }
+    }
+    Ok(input_cotangents)
 }
 
 #[cfg(test)]
@@ -12229,6 +12251,262 @@ mod tests {
                 Array::scalar(5.0f64).unwrap(),
             ]),
             Ok(vec![Array::scalar(30.0f64).unwrap(), Array::scalar(12.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_condition_transposition_omits_cotangents_disconnected_in_both_branches() {
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.simplified_dimension()]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let branch = |negate| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            builder.add_input(array_type.clone());
+            let value = builder.add_input(scalar_type.clone());
+            let output = if negate {
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![value], None).unwrap()[0]
+            } else {
+                value
+            };
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let ignored = builder.add_input(array_type.clone());
+        let value = builder.add_input(scalar_type.clone());
+        let branches = vec![builder.import_program(branch(false)), builder.import_program(branch(true))];
+        let output = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, ignored, value], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1, 2], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:bool[] .
+                let %2:f32[] = condition %1 %0 [
+                    true={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        let %1:f32[] = neg %0
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+        for (predicate, expected) in [(true, 3.0f32), (false, -3.0f32)] {
+            let outputs = transposed
+                .program()
+                .interpret(vec![Array::scalar(3.0f32).unwrap(), Array::scalar(predicate).unwrap()])
+                .unwrap();
+            assert_eq!(
+                transposed.assemble_cotangents(&[array_type.clone(), scalar_type.clone()], outputs),
+                Ok(vec![
+                    Some(MaybeZero::Zero(array_type.clone())),
+                    Some(MaybeZero::Value(Array::scalar(expected).unwrap())),
+                ]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_transposition_materializes_one_sided_zeros() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let branch = |selected: usize| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let values = [builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![values[selected]], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let first = builder.add_input(scalar_type.clone());
+        let second = builder.add_input(scalar_type.clone());
+        let branches = vec![builder.import_program(branch(0)), builder.import_program(branch(1))];
+        let output = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, first, second], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1, 2], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:bool[] .
+                let %2:f32[], %3:f32[] = condition %1 %0 [
+                    true={
+                        lambda %0:f32[] .
+                        let %1:f32[] = zero [type=f32[]]
+                        in (%0, %1)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        let %1:f32[] = zero [type=f32[]]
+                        in (%1, %0)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            transposed.program().interpret(vec![Array::scalar(5.0f32).unwrap(), Array::scalar(true).unwrap()]),
+            Ok(vec![Array::scalar(5.0f32).unwrap(), Array::scalar(0.0f32).unwrap()]),
+        );
+        assert_eq!(
+            transposed.program().interpret(vec![Array::scalar(5.0f32).unwrap(), Array::scalar(false).unwrap()]),
+            Ok(vec![Array::scalar(0.0f32).unwrap(), Array::scalar(5.0f32).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_condition_linearization_materializes_one_sided_symbolic_cast_zeros() {
+        type Branch = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.simplified_dimension()]));
+        let pair_type = ArrayType::new_static(DataType::F32, [2]);
+        let cast_type = pair_type.clone();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, x, y): (Branch, Branch, Branch)| {
+                predicate.condition((x, y), |(x, _)| x.cast(cast_type.clone(), &[]), |(_, y)| Ok(y))
+            },
+            (ArrayType::scalar(DataType::Boolean), vector_type, pair_type),
+        )
+        .unwrap();
+        let linearization = program.into_flat_program().linearize_with_respect_to(&[1, 2]).unwrap();
+        assert_eq!(linearization.residual_count(), 2);
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Output; 2]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:bool[], %2:f32[extent] .
+                let %3:f32[extent], %4:f32[2] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f32[2], %1:f32[extent] .
+                        let %2:f32[extent] = cast [type=f32[extent], inputs=[f32[2], f32[extent]]] %0 %1
+                            %3:f32[2] = zero [type=f32[2]]
+                        in (%2, %3)
+                    },
+                    false={
+                        lambda %0:f32[2], %1:f32[extent] .
+                        let %2:f32[extent] = zero_like %1
+                        in (%2, %0)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+        for (predicate, x, expected) in [
+            (true, vec![2.0f32, 3.0], [vec![1.0f32, 2.0], vec![0.0f32, 0.0]]),
+            (false, vec![2.0f32, 3.0, 4.0], [vec![0.0f32, 0.0, 0.0], vec![1.0f32, 2.0]]),
+        ] {
+            let mut outputs = linearization
+                .primal()
+                .interpret(vec![
+                    Array::scalar(predicate).unwrap(),
+                    Array::vector(x).unwrap(),
+                    Array::vector(vec![5.0f32, 6.0]).unwrap(),
+                ])
+                .unwrap();
+            let mut inputs = vec![Array::vector(vec![1.0f32, 2.0]).unwrap()];
+            inputs.extend(outputs.split_off(1));
+            assert_eq!(
+                pullback.program().interpret(inputs),
+                Ok(expected.map(|values| Array::vector(values).unwrap()).to_vec()),
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_differentiation_disconnected_input_higher_order() {
+        // The ignored vector is selected by the inner gradient but disconnected in both branches. The live scalar's
+        // gradient still differentiates through the selected nonlinear branch in the enclosing forward pass.
+        for (input, expected_gradient, expected_tangent) in [(2.0f64, 4.0f64, 6.0f64), (-2.0f64, 12.0f64, -36.0f64)] {
+            let (gradient, tangent) = differentiate_at(Array::scalar(input).unwrap())
+                .jvp(Array::scalar(3.0f64).unwrap(), |input| {
+                    let ignored = input.context().lift(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap())?;
+                    let (_, gradient) = differentiate_at((ignored, input)).gradient(|(ignored, input)| {
+                        let zero = input.context().lift(Array::scalar(0.0f64).unwrap())?;
+                        let predicate = input
+                            .context()
+                            .bind(
+                                CompareOperation::new(ComparisonDirection::GreaterThan),
+                                Vec::new(),
+                                &[input.clone(), zero],
+                            )?
+                            .remove(0);
+                        predicate.condition(
+                            (ignored, input),
+                            |(_, value)| Ok(value.clone() * value),
+                            |(_, value)| Ok(value.clone() * value.clone() * value),
+                        )
+                    })?;
+                    Ok(gradient)
+                })
+                .unwrap();
+            assert_eq!(gradient, Array::scalar(expected_gradient).unwrap());
+            assert_eq!(tangent, Array::scalar(expected_tangent).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_condition_transposition_allows_disconnected_invariant_inputs_under_varying_predicates() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(varying_sharding.clone()).unwrap();
+        let invariant_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
+        let branch = |negate| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            builder.add_input(invariant_type.clone());
+            let value = builder.add_input(varying_type.clone());
+            let output = if negate {
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![value], None).unwrap()[0]
+            } else {
+                value
+            };
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(predicate_type.clone());
+        let ignored = builder.add_input(invariant_type.clone());
+        let value = builder.add_input(varying_type.clone());
+        let branches = vec![builder.import_program(branch(false)), builder.import_program(branch(true))];
+        let output = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, ignored, value], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1, 2], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            transposed.program().to_string(),
+            formatdoc! {"
+                lambda %0:{varying_type}, %1:{predicate_type} .
+                let %2:{varying_type} = condition %1 %0 [
+                    true={{
+                        lambda %0:{varying_type} .
+                        in (%0)
+                    }},
+                    false={{
+                        lambda %0:{varying_type} .
+                        let %1:{varying_type} = neg %0
+                        in (%1)
+                    }},
+                ]
+                in (%2)"},
         );
     }
 

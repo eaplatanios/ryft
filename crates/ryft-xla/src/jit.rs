@@ -1857,17 +1857,18 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
-        ComparisonDirection, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative,
-        CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
-        DimensionBounds, DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers,
-        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
-        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
-        Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, Reshard, ScanOperation, Select, Shape, ShardMap, ShardMapOperation, Sharding,
-        ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed,
-        Value, ValueProjection, WhileOperation, ZeroLike, differentiate_at,
+        ComparisonDirection, Condition, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind,
+        Cumulative, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
+        Dimension, DimensionBounds, DimensionSizeOperation, DimensionVariable, Div, DomainTracer, DomainTracingContext,
+        Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate,
+        Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
+        ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
+        ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
+        Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, StopGradient,
+        StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
+        ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -5522,6 +5523,120 @@ mod tests {
         let (zero, one) = engine.interpret(&gradient.executable_function(), (disconnected, live)).unwrap();
         assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32_array(&client, &one), vec![1.0]);
+    }
+
+    #[test]
+    fn test_gradient_method_materializes_disconnected_condition_input() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaSession::new(&client).domain();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+            |(dead, live)| {
+                let predicate = live.compare(&live, ComparisonDirection::Equal).unwrap();
+                predicate
+                    .condition((dead, live), |(_, live)| Ok(live.clone() * live), |(_, live)| Ok(live))
+                    .unwrap()
+            },
+            (dynamic_type, scalar_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compiled.gradient(&engine).unwrap();
+        let concrete_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let dead = XlaArray::from_host_buffer(
+            &engine,
+            concrete_type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&[2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let live =
+            XlaArray::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+        let (zero, derivative) = engine.interpret(&gradient.executable_function(), (dead, live)).unwrap();
+        assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &derivative), vec![14.0]);
+    }
+
+    #[test]
+    fn test_gradient_method_materializes_disconnected_scanned_input() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaSession::new(&client).domain();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let slice_type = scalar_type.clone();
+        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body.add_input(scalar_type.clone().into());
+        body.add_input(slice_type.into());
+        let doubled = body
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+            .unwrap()[0];
+        let body = Arc::new(
+            body.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap(),
+        );
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+            |(elements, initial)| {
+                let size = DimensionSizeOperation::new(elements.r#type().as_ref(), 0).unwrap();
+                let elements = elements.into_value();
+                let context = elements.context().clone();
+                let length =
+                    context.bind(XlaOperation::DimensionSize(size), Vec::new(), &[elements.clone()]).unwrap().remove(0);
+                let inputs = vec![initial.into_value(), elements, length];
+                let outputs = context
+                    .bind(
+                        XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(extent.clone()))),
+                        CalleeRegionDriver::new(std::slice::from_ref(&body)),
+                        &inputs,
+                    )
+                    .unwrap();
+                ValueProjection::<ArrayType>::into_projected(outputs.into_iter().next().unwrap()).unwrap()
+            },
+            (stacked_type, scalar_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compiled.gradient(&engine).unwrap();
+        let concrete_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let elements = XlaArray::from_host_buffer(
+            &engine,
+            concrete_type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice(),
+        )
+        .unwrap();
+        let initial =
+            XlaArray::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+        let (zero, derivative) = engine.interpret(&gradient.executable_function(), (elements, initial)).unwrap();
+        assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
+        assert_eq!(read_f32_array(&client, &derivative), vec![8.0]);
     }
 
     #[test]
