@@ -4189,7 +4189,9 @@ struct TranspositionTransformArguments {
 impl TranspositionTransformArguments {
     /// Creates a new [`TranspositionTransformArguments`] instance by validating the selected inputs and mask counts
     /// and resolving default destination kinds and zero-materialization flags before cache lookup. Input order and the
-    /// normalized mask determine the executable output boundary and the structural cotangent metadata.
+    /// normalized mask determine the executable output boundary and the structural cotangent metadata. A flag only
+    /// takes effect for a non-reference input whose cotangent is returned, so it is cleared for every other slot and
+    /// arguments that differ only in such ineffective flags share a cache entry.
     fn new<V: Value, O: Operation<Type = V::Type>>(
         region: RegionRef<'_, V, O>,
         input_indices: &[usize],
@@ -4225,7 +4227,7 @@ impl TranspositionTransformArguments {
         // determines the order of cotangents at the pullback boundary and must be preserved.
         let input_count = region.input_ids().len();
         let mut selected_inputs = vec![false; input_count];
-        let destination_kinds = input_indices
+        let (destination_kinds, materialize_zeros) = input_indices
             .iter()
             .enumerate()
             .map(|(position, &index)| {
@@ -4255,30 +4257,27 @@ impl TranspositionTransformArguments {
 
                 // Reference-state cotangents must use reference storage or be ignored; they cannot be returned
                 // as value cotangents. Non-reference inputs support all destination kinds.
-                match kind {
-                    CotangentDestinationKind::Return if is_reference => Err(ProgramError::InvalidArgument {
+                if kind == CotangentDestinationKind::Return && is_reference {
+                    return Err(ProgramError::InvalidArgument {
                         message: format!(
                             "linear reference input {index} of type {input_type} cannot return its cotangent as a \
                              value; transpose it with a `Reference` or `Ignore` cotangent destination",
                         ),
                     }
-                    .into()),
-                    kind => Ok(kind),
+                    .into());
                 }
-            })
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
 
-        // Normalize an empty instantiation mask to all false, just as default destination kinds are made explicit.
+                // Normalize an empty instantiation mask to all false, just as default destination kinds are made
+                // explicit. Only a returned cotangent can become a materialized zero: ignored and buffered cotangents
+                // never cross the executable boundary as values, so their flags are cleared.
+                let materialize = kind == CotangentDestinationKind::Return
+                    && materialize_zeros.get(position).copied().unwrap_or(false);
+                Ok((kind, materialize))
+            })
+            .collect::<Result<(Vec<_>, Vec<_>), DifferentiationError>>()?;
+
         // Preserve selection order as both the program boundary and metadata follow it.
-        Ok(Self {
-            input_indices: input_indices.to_vec(),
-            materialize_zeros: if materialize_zeros.is_empty() {
-                vec![false; input_indices.len()]
-            } else {
-                materialize_zeros.to_vec()
-            },
-            destination_kinds,
-        })
+        Ok(Self { input_indices: input_indices.to_vec(), materialize_zeros, destination_kinds })
     }
 }
 
