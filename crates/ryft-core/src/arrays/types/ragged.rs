@@ -116,21 +116,21 @@ struct RaggedTypePayload {
 /// Every ragged storage axis has exactly its dimension's maximum admitted extent (e.g., an exclusive upper bound of `8`
 /// requires storage extent `7`, including when the maximum admitted extent is zero). Other axes retain their ordinary
 /// [`Dimension`]s. The [`logical_shape`](Self::logical_shape) replaces each padded axis by the variable of its
-/// [`RaggedDimension`] without removing dependency-domain axes. The [`RaggedDimension`] entries are canonicalized in
-/// storage-axis order. A domain may name an earlier ragged axis, whose sibling [`RaggedDimension`] determines which
-/// payload entries are live; self and later ragged dependencies are rejected. Domain order itself is preserved because
-/// it determines payload layout.
+/// [`RaggedDimension`] without removing extent axes. The [`RaggedDimension`] entries are canonicalized in storage-axis
+/// order. An extent axis may name an earlier ragged axis, whose sibling [`RaggedDimension`] determines which payload
+/// entries are live; self and later ragged dependencies are rejected. Extent-axis order itself is preserved because it
+/// determines payload layout.
 ///
-/// Extents have [`DIMENSION_DATA_TYPE`], full domain shape, the storage memory space, and projected sharding. Their
-/// layouts are unspecified. This structural description does not establish numerical extent bounds; the checked
-/// [`RaggedNew`](crate::RaggedNew) boundary establishes them. Reconstruction may omit checks only when an actual
-/// checked producer proves the exact field relationships.
+/// Extents have [`DIMENSION_DATA_TYPE`], the full shape over their extent axes, the storage memory space, and projected
+/// sharding. Their layouts are unspecified. This structural description does not establish numerical extent bounds; the
+/// checked [`RaggedNew`](crate::RaggedNew) boundary establishes them. Reconstruction may omit checks only when an
+/// actual checked producer proves the exact field relationships.
 ///
 /// [`RaggedDimension`] entries of array values reference their indexed identities. A dimension value defines its
-/// represented identity, independently of any [`RaggedDimension`] entries describing its domain. Indexed identities
-/// cannot also describe ordinary scalar dimensions in one identity scope (i.e., a storage capacity never proves a
-/// scalar logical extent). Ragged values do not implicitly project to [`ArrayType`], admit constants or references,
-/// or support zero/one construction yet.
+/// represented identity, independently of any [`RaggedDimension`] entries describing its extent coordinates. Indexed
+/// identities cannot also describe ordinary scalar dimensions in one identity scope (i.e., a storage capacity never
+/// proves a scalar logical extent). Ragged values do not implicitly project to [`ArrayType`], admit constants or
+/// references, or support zero/one construction yet.
 ///
 /// # Example
 ///
@@ -173,7 +173,7 @@ impl RaggedType {
     ///
     /// Returns [`TypeError`] for an array value with no ragged dimensions, non-integer dimension storage, invalid or
     /// duplicate axes, unbounded ragged dimensions, storage outside the declared maximum extent, cyclic or out-of-order
-    /// ragged domain dependencies, or a projected sharding that cannot be represented.
+    /// ragged extent-axis dependencies, or a projected sharding that cannot be represented.
     pub fn new(
         storage_type: ArrayType,
         value_kind: RaggedValueKind,
@@ -235,7 +235,7 @@ impl RaggedType {
             for (extent_axis_index, axis) in descriptor.extent_axes.iter().copied().enumerate() {
                 if axis >= storage_type.rank() {
                     return Err(TypeError::invalid(format!(
-                        "ragged axis {} domain axis {} is out of bounds for rank-{} storage",
+                        "ragged axis {} extent axis {} is out of bounds for rank-{} storage",
                         descriptor.axis,
                         axis,
                         storage_type.rank(),
@@ -244,7 +244,7 @@ impl RaggedType {
 
                 if descriptor.extent_axes[..extent_axis_index].contains(&axis) {
                     return Err(TypeError::invalid(format!(
-                        "ragged axis {} repeats domain axis {}",
+                        "ragged axis {} repeats extent axis {}",
                         descriptor.axis, axis,
                     )));
                 }
@@ -444,7 +444,7 @@ impl RaggedType {
         let mut facts = Vec::new();
         for (declared, actual) in declared.payload.ragged_dimensions.iter().zip(&actual.payload.ragged_dimensions) {
             if declared.axis != actual.axis || declared.extent_axes != actual.extent_axes {
-                return Err(TypeError::invalid("ragged types have different occurrence axes or dependency domains"));
+                return Err(TypeError::invalid("ragged types have different occurrence axes or extent axes"));
             }
             if !declared.dimension.bounds().contains_bounds(actual.dimension.bounds())
                 || (comparison == DimensionComparison::Refinement && declared.dimension != actual.dimension)
@@ -669,18 +669,16 @@ impl From<ReferenceType<NoReferent>> for RaggedType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Accumulator that validates one identity scope containing [`RaggedType`]s, possibly alongside members whose
 /// identities are all scalar extents (e.g., the arrays and first-class dimensions of a composite universe). Callers
 /// record each member's scalar extent identities with [`Self::record_scalar`] and then, for a ragged member, its
 /// indexed identities with [`Self::record_ragged`], in member order.
 ///
-/// An identity cannot describe both a scalar extent and indexed ragged extents, because a padded storage capacity never
-/// proves a scalar logical extent. Occurrences of one indexed identity must also index compatible logical coordinate
-/// domains. Reusing the same storage axes within one carrier is itself an explicit coordinate correspondence. Separate
-/// carriers, or different axes of one carrier, correspond only through their coordinate dimensions, which must then be
-/// unique so that equal physical positions alone never establish a correspondence.
+/// An identity cannot describe both a scalar extent and indexed ragged extents, because a padded storage capacity
+/// never proves a scalar logical extent. Occurrences of one indexed identity must also be indexed by compatible extent
+/// coordinates. Reusing the same storage axes within one carrier is itself an explicit coordinate correspondence.
+/// Separate carriers, or different axes of one carrier, correspond only through their coordinate dimensions, which must
+/// then be unique so that equal physical positions alone never establish a correspondence.
 #[derive(Debug, Default)]
 pub(crate) struct RaggedIdentityScope {
     /// Recorded scalar extent identities, in first-occurrence order.
@@ -714,22 +712,23 @@ impl RaggedIdentityScope {
     ///
     /// # Errors
     ///
-    /// Returns [`TypeError`] if an indexed identity was already recorded as a scalar extent, or if its coordinate
-    /// domain is ambiguous or incompatible with that of an earlier occurrence.
+    /// Returns [`TypeError`] if an indexed identity was already recorded as a scalar extent, or if its extent
+    /// coordinates are ambiguous or incompatible with those of an earlier occurrence.
     pub(crate) fn record_ragged(&mut self, index: usize, r#type: &RaggedType) -> Result<(), TypeError> {
-        for (identity, domain) in r#type.indexed_identities() {
+        for (identity, extent_axes) in r#type.indexed_identities() {
             if self.scalar_identities.contains(identity) {
                 return Err(TypeError::invalid(format!(
                     "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents",
                 )));
             }
-            let coordinates = domain.iter().map(|axis| r#type.logical_shape().dimension(*axis)).collect::<Vec<_>>();
+            let coordinates =
+                extent_axes.iter().map(|axis| r#type.logical_shape().dimension(*axis)).collect::<Vec<_>>();
             if let Some((_, previous, previous_index, previous_axes)) =
                 self.indexed_identities.iter().find(|(candidate, ..)| candidate == identity)
             {
                 // Reusing an explicit axis correspondence within one carrier is proof. Separate carriers need
                 // unique nominal/static coordinate dimensions; equal physical positions alone are insufficient.
-                if *previous_index != index || previous_axes != &domain {
+                if *previous_index != index || previous_axes != &extent_axes {
                     if previous
                         .iter()
                         .enumerate()
@@ -740,49 +739,51 @@ impl RaggedIdentityScope {
                             .any(|(position, coordinate)| coordinates[..position].contains(coordinate))
                     {
                         return Err(TypeError::invalid(format!(
-                            "indexed dimension `{identity}` has ambiguous repeated domain coordinates"
+                            "indexed dimension `{identity}` has ambiguous repeated extent coordinates",
                         )));
                     }
                     if coordinates.len() != previous.len()
                         || coordinates.iter().any(|coordinate| !previous.contains(coordinate))
                     {
                         return Err(TypeError::invalid(format!(
-                            "indexed dimension `{identity}` has incompatible dependency domains"
+                            "indexed dimension `{identity}` is indexed by incompatible extent coordinates",
                         )));
                     }
                 }
             } else {
-                self.indexed_identities.push((identity.clone(), coordinates, index, domain));
+                self.indexed_identities.push((identity.clone(), coordinates, index, extent_axes));
             }
         }
         Ok(())
     }
 }
 
-/// Indexed identity scope of [`RaggedType`] refinements. Identities referenced by [`RaggedDimension`] entries and
-/// those defined by dimension-item values (i.e., those reported by [`RaggedType::indexed_identities`]) form indexed
-/// classes, deliberately isolated from scalar extent facts, together with their logical coordinate domains.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Indexed identity scope of [`RaggedType`] refinements. Identities referenced by [`RaggedDimension`] entries and those
+/// defined by dimension-item values (i.e., those reported by [`RaggedType::indexed_identities`]) form indexed classes,
+/// deliberately isolated from scalar extent facts, together with their extent coordinates.
 ///
 /// This type owns every ragged-specific part of a refinement but not the scalar scope. Ragged storage shapes contribute
 /// ordinary scalar facts to an [`ArrayTypeRefinements`] scope owned by the caller: [`RaggedTypeRefinements`] uses one
 /// for the storage types of a ragged signature, while a composite universe may share one across all of its member
-/// kinds. Functions that relate both scopes take that scalar scope as a parameter, so callers must always pass the same
-/// scope that they used for construction.
+/// kinds. Functions that relate both scopes take that scalar scope as a parameter, so callers must always pass
+/// the same scope that they used for construction.
 ///
 /// Exact indexed facts may refine dimension items, but they never erase [`RaggedDimension`] entries or change storage
 /// bounds. Repeated indexed payloads retain runtime-check obligations even when their nominal types agree, and a
-/// scalar/indexed alias or an ambiguous coordinate correspondence is rejected before either environment can supply an
-/// invalid substitution.
+/// scalar/indexed alias or an ambiguous coordinate correspondence is rejected before either environment can supply
+/// an invalid substitution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RaggedDimensionRefinements {
     /// Indexed identity correspondences, deliberately isolated from scalar extent facts.
     indexed: DimensionRefinements,
 
     /// Declared indexed identities and their logical coordinate dimensions, in first-occurrence order.
-    declared_domains: Vec<(DimensionVariable, Vec<Dimension>)>,
+    declared_extent_coordinates: Vec<(DimensionVariable, Vec<Dimension>)>,
 
     /// Actual indexed identities and their logical coordinate dimensions, in first-occurrence order.
-    actual_domains: Vec<(DimensionVariable, Vec<Dimension>)>,
+    actual_extent_coordinates: Vec<(DimensionVariable, Vec<Dimension>)>,
 
     /// Mixed-scope first-observation order as `(indexed, class_index)` pairs, where `class_index` refers to the indexed
     /// classes or to the caller's scalar classes. Scopes without indexed identities use the ordinary scalar order
@@ -792,7 +793,7 @@ pub(crate) struct RaggedDimensionRefinements {
 
 impl RaggedDimensionRefinements {
     /// Builds the indexed scope of matched declared and actual [`RaggedType`] pairs using
-    /// [`DimensionComparison::LocalDeclarations`] facts, and records their coordinate domains. The pairs must belong to
+    /// [`DimensionComparison::LocalDeclarations`] facts, and records their extent coordinates. The pairs must belong to
     /// signatures whose identity scopes have already been validated. The mixed-scope class order starts empty; record
     /// it with [`Self::with_identity_class_order`].
     pub(crate) fn from_local_declarations<'o>(
@@ -804,8 +805,8 @@ impl RaggedDimensionRefinements {
         }))?;
         Ok(Self {
             indexed,
-            declared_domains: Self::domains(pairs.clone().map(|(declared, _)| declared)),
-            actual_domains: Self::domains(pairs.map(|(_, actual)| actual)),
+            declared_extent_coordinates: Self::extent_coordinates(pairs.clone().map(|(declared, _)| declared)),
+            actual_extent_coordinates: Self::extent_coordinates(pairs.map(|(_, actual)| actual)),
             identity_class_order: Vec::new(),
         })
     }
@@ -819,7 +820,7 @@ impl RaggedDimensionRefinements {
         scalar: &ArrayTypeRefinements,
         facts: impl IntoIterator<Item = (bool, Result<DimensionRefinementFact<'o>, TypeError>)>,
     ) -> Result<Self, TypeError> {
-        if self.declared_domains.is_empty() && self.actual_domains.is_empty() {
+        if self.declared_extent_coordinates.is_empty() && self.actual_extent_coordinates.is_empty() {
             return Ok(self);
         }
         let mut identity_class_order = Vec::new();
@@ -941,8 +942,9 @@ impl RaggedDimensionRefinements {
     ///
     /// Returns [`TypeError`] if `identity` is an indexed identity of that scope.
     pub(crate) fn validate_scalar(&self, identity: &DimensionVariable, declared_scope: bool) -> Result<(), TypeError> {
-        let domains = if declared_scope { &self.declared_domains } else { &self.actual_domains };
-        if domains.iter().any(|(indexed, _)| indexed == identity) {
+        let extent_coordinates =
+            if declared_scope { &self.declared_extent_coordinates } else { &self.actual_extent_coordinates };
+        if extent_coordinates.iter().any(|(indexed, _)| indexed == identity) {
             return Err(TypeError::invalid(format!(
                 "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents"
             )));
@@ -951,22 +953,23 @@ impl RaggedDimensionRefinements {
     }
 
     /// Validates the indexed identities of one ragged member of an output signature against the scalar classes of
-    /// `scalar` and the coordinate domains of the input signature, both in the selected scope. Coordinate dimensions
+    /// `scalar` and the extent coordinates of the input signature, both in the selected scope. Coordinate dimensions
     /// are compared after applying the scalar scope's exact facts.
     ///
     /// # Errors
     ///
-    /// Returns [`TypeError`] if an indexed identity is a scalar identity of that scope, or if its coordinate domain is
-    /// incompatible with, or ambiguous relative to, the recorded input domain.
+    /// Returns [`TypeError`] if an indexed identity is a scalar identity of that scope, or if its extent coordinates
+    /// are incompatible with, or ambiguous relative to, the recorded input extent coordinates.
     pub(crate) fn validate_ragged(
         &self,
         r#type: &RaggedType,
         scalar: &ArrayTypeRefinements,
         declared_scope: bool,
     ) -> Result<(), TypeError> {
-        let domains = if declared_scope { &self.declared_domains } else { &self.actual_domains };
+        let extent_coordinates =
+            if declared_scope { &self.declared_extent_coordinates } else { &self.actual_extent_coordinates };
         let scalar_classes = scalar.dimension_refinements();
-        for (identity, domain) in r#type.indexed_identities() {
+        for (identity, extent_axes) in r#type.indexed_identities() {
             if scalar_classes.identity_classes().any(|class| {
                 if declared_scope { class.declared().contains(identity) } else { class.actual().contains(identity) }
             }) {
@@ -974,7 +977,7 @@ impl RaggedDimensionRefinements {
                     "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents"
                 )));
             }
-            if let Some((_, previous)) = domains.iter().find(|(candidate, _)| candidate == identity) {
+            if let Some((_, previous)) = extent_coordinates.iter().find(|(candidate, _)| candidate == identity) {
                 let refine = |dimension: &Dimension| {
                     if declared_scope {
                         scalar_classes.refine_declared_dimension(dimension, &[])
@@ -983,18 +986,20 @@ impl RaggedDimensionRefinements {
                     }
                 };
                 let previous = previous.iter().map(refine).collect::<Vec<_>>();
-                let coordinates =
-                    domain.into_iter().map(|axis| refine(&r#type.logical_shape().dimension(axis))).collect::<Vec<_>>();
+                let coordinates = extent_axes
+                    .into_iter()
+                    .map(|axis| refine(&r#type.logical_shape().dimension(axis)))
+                    .collect::<Vec<_>>();
                 if previous.len() != coordinates.len()
                     || previous.iter().any(|coordinate| !coordinates.contains(coordinate))
                 {
                     return Err(TypeError::invalid(format!(
-                        "indexed dimension `{identity}` has incompatible dependency domains"
+                        "indexed dimension `{identity}` is indexed by incompatible extent coordinates"
                     )));
                 }
                 if previous.iter().enumerate().any(|(index, coordinate)| previous[..index].contains(coordinate)) {
                     return Err(TypeError::invalid(format!(
-                        "indexed dimension `{identity}` has ambiguous repeated domain coordinates"
+                        "indexed dimension `{identity}` has ambiguous repeated extent coordinates"
                     )));
                 }
             }
@@ -1116,28 +1121,31 @@ impl RaggedDimensionRefinements {
         )
     }
 
-    /// Records the indexed domains of one already validated signature without retaining value or storage payloads.
-    fn domains<'o>(types: impl IntoIterator<Item = &'o RaggedType>) -> Vec<(DimensionVariable, Vec<Dimension>)> {
-        let mut domains = Vec::new();
+    /// Records the extent coordinates of the indexed identities of one already validated signature, without retaining
+    /// value or storage payloads.
+    fn extent_coordinates<'o>(
+        types: impl IntoIterator<Item = &'o RaggedType>,
+    ) -> Vec<(DimensionVariable, Vec<Dimension>)> {
+        let mut extent_coordinates = Vec::new();
         for r#type in types {
-            for (identity, domain) in r#type.indexed_identities() {
-                if !domains.iter().any(|(candidate, _)| candidate == identity) {
-                    domains.push((
+            for (identity, extent_axes) in r#type.indexed_identities() {
+                if !extent_coordinates.iter().any(|(candidate, _)| candidate == identity) {
+                    extent_coordinates.push((
                         identity.clone(),
-                        domain.into_iter().map(|axis| r#type.logical_shape().dimension(axis)).collect(),
+                        extent_axes.into_iter().map(|axis| r#type.logical_shape().dimension(axis)).collect(),
                     ));
                 }
             }
         }
-        domains
+        extent_coordinates
     }
 }
 
 /// [`TypeRefinements`] for one complete [`RaggedType`] signature. Storage types follow the [`ArrayTypeRefinements`]
 /// rules in one scalar scope shared by every member, so ordinary storage-shape identities relate across members exactly
 /// like array axes. Identities referenced by [`RaggedDimension`] entries and those defined by dimension-item values
-/// form separate indexed classes with retained logical coordinate domains, and an identity used in both interpretations
-/// is rejected. The classes are reported in mixed first-observation order across both scopes.
+/// form separate indexed classes with retained extent coordinates, and an identity used in both interpretations is
+/// rejected. The classes are reported in mixed first-observation order across both scopes.
 ///
 /// Exact indexed facts may refine dimension items but do not erase [`RaggedDimension`] entries or change storage
 /// bounds. Repeated indexed payloads retain runtime-check obligations even when their nominal types agree, because the
@@ -1404,7 +1412,7 @@ mod tests {
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(1, rows.clone(), vec![2])]
             ),
-            Err(TypeError::invalid("ragged axis 1 domain axis 2 is out of bounds for rank-2 storage"))
+            Err(TypeError::invalid("ragged axis 1 extent axis 2 is out of bounds for rank-2 storage"))
         );
         assert_eq!(
             RaggedType::new(
@@ -1412,7 +1420,7 @@ mod tests {
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(1, rows.clone(), vec![0, 0])]
             ),
-            Err(TypeError::invalid("ragged axis 1 repeats domain axis 0"))
+            Err(TypeError::invalid("ragged axis 1 repeats extent axis 0"))
         );
         assert_eq!(
             RaggedType::new(
@@ -1654,7 +1662,7 @@ mod tests {
             Err(error)
         );
 
-        // Separate carriers must index compatible coordinate domains through unique coordinate dimensions.
+        // Occurrences in separate carriers need compatible extent coordinates without repeated dimensions.
         let different = RaggedType::new(
             ArrayType::new_static(DataType::F32, [3, 4]),
             RaggedValueKind::Array,
@@ -1663,7 +1671,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             RaggedType::validate_identity_scope([&indexed, &different]),
-            Err(TypeError::invalid("indexed dimension `rows` has incompatible dependency domains"))
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates"))
         );
         let ambiguous = RaggedType::new(
             ArrayType::new_static(DataType::F32, [2, 2, 4]),
@@ -1673,7 +1681,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             RaggedType::validate_identity_scope([&ambiguous, &ambiguous]),
-            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated domain coordinates"))
+            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated extent coordinates"))
         );
     }
 
@@ -1922,7 +1930,7 @@ mod tests {
         let scalar_refinements = RaggedTypeRefinements::new([&scalar], [&scalar]).unwrap();
         assert_eq!(scalar_refinements.validate_refinement([&indexed], [&indexed], &closed), Err(error));
 
-        // Output occurrences must index the coordinate domains of the corresponding inputs.
+        // Output occurrences must have the extent coordinates of the corresponding inputs.
         let different = RaggedType::new(
             ArrayType::new_static(DataType::F32, [3, 4]),
             RaggedValueKind::Array,
@@ -1931,7 +1939,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             indexed_refinements.validate_refinement([&different], [&different], &closed),
-            Err(TypeError::invalid("indexed dimension `rows` has incompatible dependency domains"))
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates"))
         );
     }
 
