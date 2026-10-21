@@ -545,6 +545,7 @@ mod tests {
                 ArrayIrType::Array(r#type) => r#type.clone(),
                 ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
                 ArrayIrType::Reference(_) => panic!("this fixture has no reference residuals"),
+                ArrayIrType::Ragged(_) => panic!("this fixture has no ragged residuals"),
             })
             .collect::<Vec<_>>();
         let primal_stablehlo =
@@ -560,6 +561,7 @@ mod tests {
                 ArrayIrType::Array(r#type) => r#type.clone(),
                 ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
                 ArrayIrType::Reference(_) => panic!("this fixture has no reference residuals"),
+                ArrayIrType::Ragged(_) => panic!("this fixture has no ragged residuals"),
             })
             .collect::<Vec<_>>();
         let pullback_outputs = vec![scalar_f32, vector_f32];

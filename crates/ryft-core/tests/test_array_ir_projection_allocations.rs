@@ -1,13 +1,14 @@
 //! Allocation regression tests for reference arrays and projecting members out of [`ArrayIrValue`].
 //!
 //! The reference [`Array`] backend shares its immutable physical byte storage, so cloning an array must not copy or
-//! allocate storage proportional to its payload. Projecting either member of [`ArrayIrValue`] — an array or a
-//! first-class runtime dimension — must add no allocation at all. These tests use a counting global allocator to pin
+//! allocate storage proportional to its payload. Projecting ordinary arrays, first-class runtime dimensions, or
+//! ragged aggregates out of [`ArrayIrValue`] must add no allocation at all. These tests use a counting allocator to pin
 //! those contracts. This dedicated integration-test binary isolates its allocator and serialized measurement state
 //! from unrelated tests, including the separate kernel-allocation regression tests.
 
 use ryft_core::{
-    Array, ArrayIrValue, ArrayType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, ValueProjection,
+    Array, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+    DimensionVariable, RaggedDimension, RaggedType, RaggedValue, RaggedValueKind, Type, Typed, ValueProjection,
 };
 
 include!("support/allocation_measurement.rs");
@@ -21,6 +22,19 @@ fn stored_array() -> ArrayIrValue<Array> {
 fn stored_dimension() -> ArrayIrValue<Array> {
     let variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
     ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(variable), 4).unwrap())
+}
+
+/// Constructs a ragged aggregate outside the measured interval.
+fn stored_ragged_value() -> ArrayIrValue<Array> {
+    let storage = Array::matrix(2, 3, vec![1.0f32; 6]).unwrap();
+    let dimension = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(4)).unwrap());
+    let r#type = RaggedType::new(
+        storage.r#type().into_owned(),
+        RaggedValueKind::Array,
+        vec![RaggedDimension::new(1, dimension, vec![0])],
+    )
+    .unwrap();
+    RaggedValue::new(r#type, storage, vec![Array::vector(vec![1i64, 3]).unwrap()]).unwrap().into()
 }
 
 #[test]
@@ -89,4 +103,46 @@ fn test_borrowed_and_consuming_dimension_ir_projection_does_not_allocate() {
         <ArrayIrValue<Array> as ValueProjection<DimensionType>>::into_projected(stored).unwrap()
     });
     assert_eq!(consuming, AllocationStatistics::default());
+}
+
+#[test]
+fn test_borrowed_and_consuming_ragged_ir_projection_does_not_allocate() {
+    let borrowed = measure_allocations(stored_ragged_value, |stored| {
+        for _ in 0..1_000 {
+            let value = ValueProjection::<RaggedType>::projected(black_box(&stored)).unwrap();
+            black_box((value.storage().storage_bytes().as_ptr(), value.extents()[0].storage_bytes().as_ptr()));
+        }
+    });
+    assert_eq!(borrowed, AllocationStatistics::default());
+    let consuming = measure_allocations(stored_ragged_value, |stored| {
+        ValueProjection::<RaggedType>::into_projected(stored).unwrap()
+    });
+    assert_eq!(consuming, AllocationStatistics::default());
+}
+
+#[test]
+fn test_ragged_ir_clone_shares_storage_and_extent_metadata() {
+    let statistics = measure_allocations(stored_ragged_value, |stored| {
+        let cloned = black_box(&stored).clone();
+        let original = ValueProjection::<RaggedType>::projected(&stored).unwrap();
+        let projected = ValueProjection::<RaggedType>::projected(&cloned).unwrap();
+        assert_eq!(original.storage().storage_bytes().as_ptr(), projected.storage().storage_bytes().as_ptr());
+        assert_eq!(original.extents().as_ptr(), projected.extents().as_ptr());
+        cloned
+    });
+    assert_eq!(statistics, AllocationStatistics::default());
+}
+
+#[test]
+fn test_static_array_ir_identity_renaming_does_not_allocate() {
+    let statistics = measure_allocations(
+        || {
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3])),
+                ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3))),
+            ]
+        },
+        |types| ArrayIrType::derive_identity_renaming(black_box(&types), black_box(&types)).unwrap(),
+    );
+    assert_eq!(statistics, AllocationStatistics::default());
 }

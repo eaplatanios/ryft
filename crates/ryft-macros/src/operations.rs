@@ -894,6 +894,20 @@ impl OperationEnum {
         let operation_self_type = &self.self_type;
         let (impl_generics, _, where_clause) = self.operation_generics.split_for_impl();
         let name_arms = self.operation_forwarding_arms(quote!(name), quote!());
+        let type_identity_definition_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            let definitions = match &variant.class {
+                OperationVariantClass::MixedMember { .. } => quote! {
+                    <#payload_type as #ryft::MemberOperation<#primary_type>>::parent_type_identity_definitions(#receiver)
+                },
+                OperationVariantClass::CompositeNative | OperationVariantClass::ProjectedMember { .. } => quote! {
+                    <#payload_type as #ryft::Operation>::type_identity_definitions(#receiver)
+                },
+            };
+            quote! { Self::#variant_ident(operation) => { #definitions }, }
+        });
         let infer_output_type_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -1092,6 +1106,10 @@ impl OperationEnum {
 
                 fn name(&self) -> &'static str {
                     match self { #(#name_arms)* }
+                }
+
+                fn type_identity_definitions(&self) -> ::std::borrow::Cow<'_, [<#primary_type as #ryft::Type>::Identity]> {
+                    match self { #(#type_identity_definition_arms)* }
                 }
 
                 fn region_slots(&self) -> &'static [#ryft::RegionSlot] {
@@ -3460,6 +3478,10 @@ mod tests {
         // rule under its member policy, whereas a structural member binds its payload once under the outer policy's
         // replicated projection and therefore requires neither a member policy nor a member batching rule.
         assert!(generated.contains("infer_projected_operation_output_types(operation,input_types,region_interfaces,)"));
+        assert!(generated.contains("<ArrayOperation<A>asryft::Operation>::type_identity_definitions(operation)"));
+        assert!(generated.contains(
+            "<ParallelAllGatherOperationasryft::MemberOperation<ArrayIrType>>::parent_type_identity_definitions(operation)",
+        ));
         assert!(
             generated.contains("Self::Array(operation)=>{ryft::batch_projected_operation(context,operation,inputs)}")
         );

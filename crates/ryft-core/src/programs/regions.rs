@@ -196,14 +196,17 @@ impl<V: Typed + Parameter, O> Region<V, O> {
     /// Derives this [`Region`]'s closed [`TypeIdentitySignature`]. A definition-position constant establishes one
     /// immutable internal identity. A result definition whose [`TypeIdentity`](crate::TypeIdentity) occurs on an
     /// instruction input forwards that available identity, while any other result definition establishes one fresh
-    /// internal identity. Every result reference must either forward an instruction input identity or refer to a
-    /// definition-position occurrence on a sibling result.
+    /// internal identity. An operation can also establish identities through its supplemental
+    /// [`Operation::type_identity_definitions`]. Every result reference must either forward
+    /// an instruction input identity or refer to an identity established by this instruction.
     pub(crate) fn type_identity_signature(
         &self,
     ) -> Result<TypeIdentitySignature<<V::Type as Type>::Identity>, TypeError>
     where
         O: Operation<Type = V::Type>,
     {
+        V::Type::validate_identity_scope(self.atoms.iter().map(Typed::r#type))?;
+
         // Region inputs establish the identities that are available at entry. Preserve first-occurrence order and
         // record each identity once even when several input types refer to the same dynamic quantity. Note that the
         // complete ordered signature is also the dominance environment while walking the region. Every identity
@@ -279,14 +282,57 @@ impl<V: Typed + Parameter, O> Region<V, O> {
                 })
             })?;
 
-            // Process explicit definition-position occurrences first. A definition also present on an input forwards
-            // that identity. Every other definition establishes one fresh internal identity, which must not have been
-            // established earlier or repeated by another result of the same instruction.
+            // Supplemental definitions establish reference-only output identities, without changing their type's
+            // occurrence roles. Validate the declaration before using it to extend the dominance environment.
+            let supplemental = instruction.operation().type_identity_definitions();
+            for (index, identity) in supplemental.iter().enumerate() {
+                if supplemental[..index].contains(identity) {
+                    return Err(TypeError::invalid(format!(
+                        "operation `{}` declares type identity {} more than once",
+                        instruction.operation().name(),
+                        identity,
+                    )));
+                }
+
+                let mut referenced = false;
+                for output in instruction.outputs() {
+                    for (position, output_identity) in self.atoms[output.index()].r#type().identities() {
+                        if output_identity == identity {
+                            if position == TypeIdentityPosition::Definition {
+                                return Err(TypeError::invalid(format!(
+                                    "operation `{}` declares type identity {} which already \
+                                     has an output definition position",
+                                    instruction.operation().name(),
+                                    identity,
+                                )));
+                            }
+                            referenced = true;
+                        }
+                    }
+                }
+
+                if !referenced {
+                    return Err(TypeError::invalid(format!(
+                        "operation `{}` declares type identity {} which does not occur on an output",
+                        instruction.operation().name(),
+                        identity,
+                    )));
+                }
+            }
+
+            // Process ordinary and supplemental definitions in output-occurrence order. A definition also present on
+            // an input forwards that identity. Repeated reference occurrences share their one supplemental declaration;
+            // repeated definition positions retain the existing duplicate-definition error.
             let mut defined_identities = Vec::new();
             instruction.outputs().iter().try_for_each(|output| {
                 let r#type = self.atoms[output.index()].r#type();
                 r#type.identities().try_for_each(|(position, identity)| {
-                    if position != TypeIdentityPosition::Definition || input_identities.contains(identity) {
+                    let supplemental_definition =
+                        position == TypeIdentityPosition::Reference && supplemental.contains(identity);
+                    if (position != TypeIdentityPosition::Definition && !supplemental_definition)
+                        || input_identities.contains(identity)
+                        || (supplemental_definition && defined_identities.contains(identity))
+                    {
                         return Ok(());
                     }
                     if identities.contains(identity) || defined_identities.contains(identity) {
@@ -2511,13 +2557,15 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
-    use ryft_macros::Parameter;
+
+    use ryft_macros::{Operation, Parameter};
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable,
         Shape,
     };
     use crate::contexts::EagerContext;
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{ReferenceNewOperation, ReferenceReadOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -2760,6 +2808,31 @@ pub(crate) mod tests {
                 .chain(self.references.iter().map(|identity| (TypeIdentityPosition::Reference, identity)))
         }
 
+        fn derive_identity_renaming<
+            'o,
+            D: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
+            A: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
+        >(
+            declared: D,
+            actual: A,
+        ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+        where
+            Self: 'o,
+        {
+            let mut renaming = TypeIdentityRenaming::new();
+            for (declared, actual) in crate::programs::types::type_signature_pairs(declared, actual)? {
+                if declared.definitions.len() != actual.definitions.len()
+                    || declared.references.len() != actual.references.len()
+                {
+                    return Err(TypeError::invalid("structural identity occurrence counts differ"));
+                }
+                for ((_, declared), (_, actual)) in declared.identities().zip(actual.identities()) {
+                    renaming.insert(declared.clone(), actual.clone())?;
+                }
+            }
+            Ok(renaming)
+        }
+
         fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
             Ok(Self {
                 definitions: self.definitions.iter().map(|identity| renaming.rename(identity)).collect(),
@@ -2826,6 +2899,82 @@ pub(crate) mod tests {
         ) -> Result<Vec<StructuralType>, TypeError> {
             Ok(input_types.to_vec())
         }
+    }
+
+    /// Non-array constructor whose reference-only output identities are established by its own contract.
+    #[derive(Clone)]
+    pub(crate) struct SupplementalIdentityOperation {
+        /// Supplemental definitions, kept separate so malformed declarations can be tested.
+        pub(crate) definitions: Vec<StructuralIdentity>,
+
+        /// Complete declared output types.
+        pub(crate) outputs: Vec<StructuralType>,
+    }
+
+    impl Operation for SupplementalIdentityOperation {
+        type Type = StructuralType;
+
+        fn name(&self) -> &'static str {
+            "supplemental_identity"
+        }
+
+        fn type_identity_definitions(&self) -> Cow<'_, [StructuralIdentity]> {
+            Cow::Borrowed(&self.definitions)
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[StructuralType],
+            _region_interfaces: &[RegionInterface<StructuralType>],
+        ) -> Result<Vec<StructuralType>, TypeError> {
+            Ok(self.outputs.clone())
+        }
+
+        fn rename_type_identities(
+            &self,
+            renaming: &TypeIdentityRenaming<StructuralIdentity>,
+        ) -> Result<Self, TypeError> {
+            Ok(Self {
+                definitions: self.definitions.iter().map(|identity| renaming.rename(identity)).collect(),
+                outputs: self
+                    .outputs
+                    .iter()
+                    .map(|r#type| r#type.rename_identities(renaming))
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+    }
+
+    impl_guardless_operation!(SupplementalIdentityOperation);
+
+    /// Derived family that forwards the supplemental identity declaration of its non-array payload.
+    #[derive(Clone, Operation)]
+    #[ryft(type(StructuralType), constant(StructuralType))]
+    enum SupplementalIdentityFamily {
+        Constructor(SupplementalIdentityOperation),
+    }
+
+    /// Builds a one-instruction region for supplemental definition contract tests.
+    fn supplemental_identity_region(
+        inputs: Vec<StructuralType>,
+        definitions: Vec<StructuralIdentity>,
+        outputs: Vec<StructuralType>,
+        consumed: Vec<usize>,
+    ) -> Region<StructuralType, SupplementalIdentityOperation> {
+        let input_count = inputs.len();
+        let output_ids = (input_count..input_count + outputs.len()).map(AtomId::new).collect::<Vec<_>>();
+        let atoms = inputs.into_iter().chain(outputs.iter().cloned()).map(Atom::Variable).collect();
+        Region::new(
+            atoms,
+            (0..input_count).map(AtomId::new).collect(),
+            output_ids.clone(),
+            vec![Instruction::new(
+                SupplementalIdentityOperation { definitions, outputs },
+                consumed.into_iter().map(AtomId::new).collect(),
+                output_ids,
+                Vec::new(),
+            )],
+        )
     }
 
     /// Builds one structurally valid-enough region arena for direct closure testing.
@@ -3006,6 +3155,122 @@ pub(crate) mod tests {
         ];
         let arena = RegionArena::from_regions(regions).unwrap();
         (arena, [shared, first, second, root])
+    }
+
+    #[test]
+    fn test_region_type_identity_signature_supplemental_definitions() {
+        let first = StructuralIdentity::new("first");
+        let second = StructuralIdentity::new("second");
+        let ordinary = StructuralIdentity::new("ordinary");
+        let outputs = vec![
+            StructuralType::reference(first.clone()),
+            StructuralType::definition(ordinary.clone()),
+            StructuralType::new(Vec::new(), vec![second.clone(), first.clone()]),
+        ];
+
+        // Declarations authorize definitions; positional output order determines the published signature.
+        let region =
+            supplemental_identity_region(Vec::new(), vec![second.clone(), first.clone()], outputs.clone(), Vec::new());
+        let signature = region.type_identity_signature().unwrap();
+        assert_eq!(signature.input_identities(), &[]);
+        assert_eq!(signature.internal_identities(), &[first.clone(), ordinary, second.clone()]);
+        let forwarded = supplemental_identity_region(
+            vec![StructuralType::reference(first.clone())],
+            vec![first.clone()],
+            vec![StructuralType::reference(first.clone())],
+            vec![0],
+        );
+        let signature = forwarded.type_identity_signature().unwrap();
+        assert_eq!(signature.input_identities(), &[first.clone()]);
+        assert_eq!(signature.internal_identities(), &[]);
+
+        let operation = SupplementalIdentityOperation { definitions: vec![first.clone(), second.clone()], outputs };
+        let boxed = Box::new(operation.clone());
+        assert_eq!(boxed.type_identity_definitions().as_ref(), &[first.clone(), second.clone()]);
+        let family = SupplementalIdentityFamily::Constructor(operation);
+        assert_eq!(family.type_identity_definitions().as_ref(), &[first, second]);
+    }
+
+    #[test]
+    fn test_region_type_identity_signature_rejects_invalid_supplemental_definitions() {
+        let identity = StructuralIdentity::new("identity");
+        let reference = StructuralType::reference(identity.clone());
+        for (definitions, outputs, expected) in [
+            (
+                Vec::new(),
+                vec![reference.clone()],
+                "operation `supplemental_identity` output type references identity identity \
+                 without consuming or defining it",
+            ),
+            (
+                vec![identity.clone(), identity.clone()],
+                vec![reference.clone()],
+                "operation `supplemental_identity` declares type identity identity more than once",
+            ),
+            (
+                vec![identity.clone()],
+                Vec::new(),
+                "operation `supplemental_identity` declares type identity identity which does not occur on an output",
+            ),
+            (
+                vec![identity.clone()],
+                vec![StructuralType::definition(identity.clone())],
+                "operation `supplemental_identity` declares type identity identity \
+                 which already has an output definition position",
+            ),
+        ] {
+            let region = supplemental_identity_region(Vec::new(), definitions, outputs, Vec::new());
+            assert_eq!(region.type_identity_signature(), Err(TypeError::invalid(expected)));
+        }
+        let unconsumed = supplemental_identity_region(
+            vec![reference.clone()],
+            vec![identity.clone()],
+            vec![reference.clone()],
+            Vec::new(),
+        );
+        assert_eq!(
+            unconsumed.type_identity_signature(),
+            Err(TypeError::invalid(
+                "operation `supplemental_identity` output defines identity identity more than once in this region",
+            )),
+        );
+        let mut use_before_definition =
+            supplemental_identity_region(Vec::new(), vec![identity], vec![reference], Vec::new());
+        use_before_definition.instructions[0].inputs.push(AtomId::new(0));
+        assert_eq!(
+            use_before_definition.type_identity_signature(),
+            Err(TypeError::invalid(
+                "operation `supplemental_identity` input type references identity identity before its definition",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_region_type_identity_signature_supplemental_definitions_are_freshened_on_splice() {
+        let identity = StructuralIdentity::new("local");
+        let operation = SupplementalIdentityOperation {
+            definitions: vec![identity.clone()],
+            outputs: vec![StructuralType::reference(identity.clone())],
+        };
+        let mut source = ProgramBuilder::<StructuralType, SupplementalIdentityOperation>::new();
+        let outputs = source.add_instruction(operation, Vec::new(), Vec::new(), None).unwrap().to_vec();
+        let source = source
+            .build::<Vec<StructuralType>, Vec<StructuralType>>(outputs, Vec::new(), vec![Placeholder])
+            .unwrap();
+        let mut destination = ProgramBuilder::new();
+        let mut outputs = destination.splice_program(&source, &[]).unwrap();
+        outputs.extend(destination.splice_program(&source, &[]).unwrap());
+        let program = destination
+            .build::<Vec<StructuralType>, Vec<StructuralType>>(outputs, Vec::new(), vec![Placeholder; 2])
+            .unwrap();
+        let identities = program.type_identity_signature().internal_identities();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1]);
+        assert_ne!(&identities[0], &identity);
+        assert_ne!(&identities[1], &identity);
+        for (instruction, identity) in program.instructions().iter().zip(identities) {
+            assert_eq!(instruction.operation().type_identity_definitions().as_ref(), std::slice::from_ref(identity));
+        }
     }
 
     #[test]

@@ -230,6 +230,9 @@ impl Lowering {
                     ArrayIrValue::Reference(_) => {
                         return Err(unsupported("constant", "captured references are unsupported"));
                     }
+                    ArrayIrValue::Ragged(_) => {
+                        return Err(unsupported("constant", "ragged values are not supported in cuTile kernels"));
+                    }
                 }));
             }
         }
@@ -259,6 +262,16 @@ impl Lowering {
                 .collect::<Vec<_>>();
             let expression = |index: usize| inputs[index].expression().map(str::to_owned);
             let results = match instruction.operation() {
+                KernelOperation::Portable(
+                    operation @ (ArrayIrOperation::RaggedNew(_)
+                    | ArrayIrOperation::RaggedStorage(_)
+                    | ArrayIrOperation::RaggedExtents(_)),
+                ) => {
+                    return Err(unsupported(
+                        operation.name(),
+                        "first-class ragged operations are not supported in cuTile kernels",
+                    ));
+                }
                 KernelOperation::Portable(ArrayIrOperation::Array(operation)) => {
                     let input_types = types
                         .iter()

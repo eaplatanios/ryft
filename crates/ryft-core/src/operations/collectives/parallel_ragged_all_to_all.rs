@@ -49,9 +49,10 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError,
-    ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch,
-    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationPayloadProjection, OperationProjection,
+    OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueDomainDispatch, ValueProjection, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1507,8 +1508,8 @@ impl<C: Domain<Type = ArrayIrType, Value: ValueProjection<ArrayType, Projected =
     }
 }
 
-impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
-    for ParallelRaggedAllToAllOperation
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType, Operation: OperationPayloadProjection>>
+    MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelRaggedAllToAllOperation
 where
     ParallelRaggedAllToAllOperation:
         BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,

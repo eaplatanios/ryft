@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::lowering::signature::XlaExecutableSignature;
-use super::lowering::{contains_unresolved_references, contains_unresolved_state};
+use super::lowering::{LoweringError, contains_unresolved_references, contains_unresolved_state};
 use super::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::tracing::TraceError;
 use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
@@ -1299,10 +1299,12 @@ impl<'c> XlaDomain<'c> {
             XlaOperation::ReferenceFreeze(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
             _ => return None,
         };
-        Some(
+        Some(outputs.and_then(|outputs| {
             outputs
-                .map(|outputs| outputs.into_iter().map(|output| XlaValue::from_array_ir_value(output, self)).collect()),
-        )
+                .into_iter()
+                .map(|output| XlaValue::from_array_ir_value(output, self).map_err(ProgramError::from))
+                .collect()
+        }))
     }
 
     /// Uploads a replicated scalar with the provided host `bytes` and `data_type`, placed through [`Self::eager_mesh`].
@@ -1342,6 +1344,17 @@ impl<'c> XlaDomain<'c> {
         driver: D,
         inputs: &[XlaValue<'c>],
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
+        if matches!(
+            operation,
+            XlaOperation::RaggedNew(_) | XlaOperation::RaggedStorage(_) | XlaOperation::RaggedExtents(_)
+        ) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` requires grouped ragged XLA execution, which is not yet supported",
+                    operation.name()
+                ),
+            });
+        }
         if let Some(outputs) = self.eager_reference_bind(&operation, inputs) {
             return outputs;
         }
@@ -1473,7 +1486,7 @@ impl<'c> XlaDomain<'c> {
                     .block_until_ready()
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
             }
-            return Ok(vec![XlaValue::from_array_ir_value(values[0].clone(), self)]);
+            return Ok(vec![XlaValue::from_array_ir_value(values[0].clone(), self)?]);
         }
 
         // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
@@ -3931,6 +3944,15 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
                         ),
                     });
                 }
+                ArrayIrType::Ragged(_) => {
+                    return Err(XlaDomainError::InvalidCompilationOptions {
+                        reason: format!(
+                            "input-bound bucketing only supports array inputs, but input {input_index} has ragged \
+                             type `{}`",
+                            r#type,
+                        ),
+                    });
+                }
             };
             let dimensions = array_type
                 .shape()
@@ -5563,6 +5585,7 @@ fn has_only_static_array_types(program: &FlatXlaProgram) -> bool {
             // firing first: a dynamically shaped referent counts as dynamic so that partitioner selection and its
             // guards stay correct even for programs whose only dynamic type is a reference referent.
             ArrayIrType::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
+            ArrayIrType::Ragged(_) => false,
         })
     })
 }
@@ -5794,6 +5817,9 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
 
     match operation {
         XlaOperation::Array(operation) => array_data_dependent_padding_discipline(operation),
+        XlaOperation::RaggedNew(_) | XlaOperation::RaggedStorage(_) | XlaOperation::RaggedExtents(_) => {
+            Unsupported { reason: "first-class ragged operations require grouped XLA lowering" }
+        }
         XlaOperation::RngBitGenerator(_) => Unsupported {
             reason: "random generation advances state according to physical rather than logical element count",
         },
@@ -5862,6 +5888,13 @@ fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<D
 fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), XlaDomainError> {
     let mut variables = HashSet::new();
     for region in program.regions() {
+        // This existing verification walk also protects transport-only and unused ragged atoms: one-value replay
+        // cannot preserve their storage and extents until the grouped backend representation is implemented.
+        for atom in region.atoms() {
+            if let ArrayIrType::Ragged(r#type) = atom.r#type().as_ref() {
+                return Err(TraceError::from(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() }).into());
+            }
+        }
         for instruction in region.instructions() {
             if let XlaOperation::DimensionFromScalar(operation) = instruction.operation() {
                 // A static output defines no identity and is checked against its extent.
@@ -12988,6 +13021,83 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert_eq!(error, "`dynamic_slice` limit 4 exceeds input axis 0 extent 2");
+    }
+
+    #[test]
+    fn test_validate_data_dependent_compilation_rejects_ragged_atoms() {
+        use ryft_core::{RaggedType, RaggedValueKind};
+
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        builder.add_input(ArrayIrType::Ragged(r#type.clone()));
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:ragged<i64[2]; item=dimension<3>> .
+            in ()
+        "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            validate_data_dependent_compilation(&program),
+            Err(XlaDomainError::Lowering(TraceError::Lowering(LoweringError::UnsupportedRaggedType {
+                r#type: actual,
+            }))) if actual == r#type,
+        ));
+    }
+
+    #[test]
+    fn test_xla_domain_rejects_ragged_construction_before_execution() {
+        use ryft_core::{RaggedNewOperation, RaggedType, RaggedValueKind};
+
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(Dimension::Static(3).into()),
+            Vec::new(),
+        )
+        .unwrap();
+        let operation = RaggedNewOperation::new(r#type.clone());
+        let mut builder = XlaProgramBuilder::new();
+        let storage = builder.add_input(r#type.storage_type().clone().into());
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![storage], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(output, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i64[2] .
+                let %1:ragged<i64[2]; item=dimension<3>> = ragged_new \
+                    [output_type=ragged<i64[2]; item=dimension<3>>] %0
+                in (%1)"},
+        );
+        assert!(matches!(
+            validate_data_dependent_compilation(&program),
+            Err(XlaDomainError::Lowering(TraceError::Lowering(LoweringError::UnsupportedRaggedType {
+                r#type: actual,
+            }))) if actual == r#type,
+        ));
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let storage =
+            XlaArray::from_host_buffer(&domain, r#type.storage_type().clone(), mesh, values_to_bytes(&[3_i64, 3]))
+                .unwrap();
+        assert!(matches!(
+            domain.bind(operation, Vec::new(), &[XlaValue::Array(storage)]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`ragged_new` requires grouped ragged XLA execution, which is not yet supported",
+        ));
+        assert_eq!(domain.cache_size(), 0);
     }
 
     #[test]

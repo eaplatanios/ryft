@@ -346,11 +346,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         Ok(self.push_instruction(operation, regions, inputs, provenance, output_types))
     }
 
-    /// Folds a validated operation to existing inputs or program constants when [`Operation::fold`] proves equivalence,
-    /// or records it through the same checked construction path as [`Self::add_instruction`]. Input producers remain
-    /// unchanged, and a singleton output becomes a new constant atom of the inferred output type. Unlike raw
-    /// instruction construction, returned outputs can alias existing atoms and carry refined types. Region-carrying
-    /// applications remain explicit so their already imported bodies retain a reachable owner.
+    /// Folds a validated operation to existing inputs or constants when [`Operation::fold`] proves equivalence, or
+    /// records it through the same checked construction path as [`Self::add_instruction`]. Input producers remain
+    /// unchanged. A singleton output becomes a new constant atom of the inferred output type. Unlike raw instruction
+    /// construction, returned outputs can alias existing atoms and carry refined types. Region-carrying applications
+    /// remain explicit so their already imported bodies retain a reachable owner.
     pub fn add_instruction_or_fold<P: Into<O>>(
         &mut self,
         operation: P,

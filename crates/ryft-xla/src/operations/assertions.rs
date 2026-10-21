@@ -1541,13 +1541,14 @@ impl LowerableOperation for AssertOperation<ArrayIrType> {
             &input_types
                 .iter()
                 .map(|input| match input {
-                    ArrayIrType::Array(array) => array.clone(),
-                    ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
+                    ArrayIrType::Array(array) => Ok(array.clone()),
+                    ArrayIrType::Dimension(_) => Ok(ArrayType::scalar(DataType::I64)),
                     ArrayIrType::Reference(_) => {
                         unreachable!("assertion validation rejects reference observations")
                     }
+                    ArrayIrType::Ragged(r#type) => Err(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() }),
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, _>>()?,
             input_values,
             effect_tokens,
             block,

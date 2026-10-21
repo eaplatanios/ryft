@@ -577,6 +577,11 @@ fn stage_body<Extension: KernelExtension + Into<XlaKernelExtension>>(
                                 "kernel body cannot capture a literal reference".to_owned(),
                             ));
                         }
+                        Atom::Constant(ArrayIrValue::Ragged(_)) => {
+                            return Err(ProgramError::MalformedProgram(
+                                "kernel body cannot capture a ragged value".to_owned(),
+                            ));
+                        }
                     })
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;

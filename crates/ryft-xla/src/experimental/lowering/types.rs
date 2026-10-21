@@ -779,6 +779,7 @@ pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
         ArrayIrType::Array(r#type) => lower_tensor_type(r#type, context, location),
         ArrayIrType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
         ArrayIrType::Reference(_) => Err(LoweringError::UnresolvedReference { construct: r#type.to_string() }),
+        ArrayIrType::Ragged(r#type) => Err(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() }),
     }
 }
 

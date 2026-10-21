@@ -315,6 +315,10 @@ trait Operation: Clone {
 
     fn name(&self) -> &'static str;
 
+    fn type_identity_definitions(&self) -> std::borrow::Cow<'_, [<Self::Type as Type>::Identity]> {
+        std::borrow::Cow::Borrowed(&[])
+    }
+
     fn region_slots(&self) -> &'static [RegionSlot] {
         &[]
     }
@@ -1242,6 +1246,10 @@ struct PrintOperation;
 impl Operation for PrintOperation {
     type Type = DataType;
 
+    fn type_identity_definitions(&self) -> std::borrow::Cow<'_, [NoIdentity]> {
+        std::borrow::Cow::Owned(vec![NoIdentity])
+    }
+
     fn name(&self) -> &'static str {
         "print"
     }
@@ -1758,6 +1766,9 @@ fn test_data_operation() {
 fn test_operation_generates_operation_forwarding() {
     let add = DataOperation::<ScalarFactor>::from(AddOperation);
     let print = DataOperation::<ScalarFactor>::from(PrintOperation);
+
+    assert_eq!(add.type_identity_definitions().len(), 0);
+    assert_eq!(print.type_identity_definitions().len(), 1);
 
     assert_eq!(add.effects().into_owned(), Effects::Pure);
     assert_eq!(print.effects().into_owned(), Effects::Read);

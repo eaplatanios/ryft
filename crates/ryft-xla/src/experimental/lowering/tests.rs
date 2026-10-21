@@ -6,8 +6,8 @@ use ryft_core::{
     AddOperation, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos, Differentiate, Dimension,
     DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext,
     EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike, Placeholder, Program, ProgramBuilder,
-    ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, Sin, TracedShardMap,
-    Transpose, ZeroLike, trace_shard_map,
+    ProvenanceScope, RaggedValueKind, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, Sin,
+    TracedShardMap, Transpose, ZeroLike, trace_shard_map,
 };
 use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -117,6 +117,7 @@ pub(crate) fn execute_mixed_program(
         ArrayIrType::Array(r#type) => r#type.clone(),
         ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
         ArrayIrType::Reference(_) => panic!("reshape execution fixtures have no reference values"),
+        ArrayIrType::Ragged(_) => panic!("mixed execution fixtures have no first-class ragged values"),
     };
     let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
     let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
@@ -330,6 +331,64 @@ fn test_composite_lowering_rejects_unresolved_reference_type() {
         lower_array_ir_type(&reference_type, &context, location),
         Err(LoweringError::UnresolvedReference { construct }) if construct == reference_type.to_string(),
     ));
+}
+
+#[test]
+fn test_composite_lowering_rejects_ragged_type() {
+    let context = MlirContext::new();
+    let r#type = RaggedType::new(
+        ArrayType::new_static(DataType::I64, [2]),
+        RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+        Vec::new(),
+    )
+    .unwrap();
+    let error =
+        lower_array_ir_type(&ArrayIrType::Ragged(r#type.clone()), &context, context.unknown_location()).unwrap_err();
+    assert_eq!(error, LoweringError::UnsupportedRaggedType { r#type });
+    assert_eq!(
+        error.to_string(),
+        "ragged type `ragged<i64[2]; item=dimension<3>>` is not supported during XLA lowering",
+    );
+}
+
+#[test]
+fn test_collect_nested_sharding_mesh_rejects_ragged_atoms() {
+    let r#type = RaggedType::new(
+        ArrayType::new_static(DataType::I64, [2]),
+        RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+        Vec::new(),
+    )
+    .unwrap();
+    // Both a pass-through input and an unused input must reject before one-value replay can discard extents.
+    for (returns_input, expected) in [
+        (
+            true,
+            indoc! {"
+            lambda %0:ragged<i64[2]; item=dimension<3>> .
+            in (%0)
+        "},
+        ),
+        (
+            false,
+            indoc! {"
+            lambda %0:ragged<i64[2]; item=dimension<3>> .
+            in ()
+        "},
+        ),
+    ] {
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Ragged(r#type.clone()));
+        let outputs = if returns_input { vec![input] } else { Vec::new() };
+        let output_structure = vec![Placeholder; outputs.len()];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], output_structure)
+            .unwrap();
+        assert_eq!(program.to_string(), expected.trim_end());
+        assert_eq!(
+            collect_nested_sharding_mesh(&program, None),
+            Err(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() }),
+        );
+    }
 }
 
 #[test]

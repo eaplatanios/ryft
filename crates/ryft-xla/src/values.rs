@@ -260,12 +260,17 @@ impl<'c> XlaValue<'c> {
     }
 
     /// Converts a session-free [`ArrayIrValue`] over XLA arrays into an [`XlaValue`], binding dimension and reference
-    /// members to `domain`. Array members keep their own domain.
-    pub(crate) fn from_array_ir_value(value: ArrayIrValue<XlaArray<'c>>, domain: &XlaDomain<'c>) -> Self {
+    /// members to `domain`. Array members keep their own domain. Ragged values are rejected until XLA has a grouped
+    /// representation that preserves their storage and extents together.
+    pub(crate) fn from_array_ir_value(
+        value: ArrayIrValue<XlaArray<'c>>,
+        domain: &XlaDomain<'c>,
+    ) -> Result<Self, TypeError> {
         match value {
-            ArrayIrValue::Array(value) => Self::Array(value),
-            ArrayIrValue::Dimension(value) => Self::Dimension(XlaDimension::new(value, domain.clone())),
-            ArrayIrValue::Reference(value) => Self::Reference(XlaReference::new(value, domain.clone())),
+            ArrayIrValue::Array(value) => Ok(Self::Array(value)),
+            ArrayIrValue::Dimension(value) => Ok(Self::Dimension(XlaDimension::new(value, domain.clone()))),
+            ArrayIrValue::Reference(value) => Ok(Self::Reference(XlaReference::new(value, domain.clone()))),
+            ArrayIrValue::Ragged(_) => Err(TypeError::invalid("ragged values are not supported in the XLA domain")),
         }
     }
 
@@ -480,7 +485,7 @@ impl WhilePredicate for XlaValue<'_> {
             .clone()
             .into_array_ir_value()
             .mask_select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
-        Ok(Self::from_array_ir_value(output, on_true.xla_domain()))
+        Ok(Self::from_array_ir_value(output, on_true.xla_domain())?)
     }
 }
 
@@ -545,12 +550,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, Assert, BatchAxis, Compare, ComparisonDirection,
-        Concretizable, Context, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds, DimensionOperation,
-        DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation, DimensionValue,
-        DimensionVariable, Gather, GatherMode, LogicalMesh, MeshAxis, MeshAxisType, OneOperation, OperationProvider,
-        ParallelPermute, Placeholder, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew,
-        ReferenceRead, ReferenceSwap, ReferenceWrite, Shape, Sharding, Sort, SortDirection, Typed, WhileOperation,
-        WhilePredicate, ZeroOperation, batch, differentiate_at,
+        Concretizable, Context, ConvertElementType, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
+        DimensionOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
+        DimensionValue, DimensionVariable, Gather, GatherMode, LogicalMesh, MeshAxis, MeshAxisType, OneOperation,
+        OperationProvider, ParallelPermute, Placeholder, RaggedType, RaggedValue, RaggedValueKind, Reduce,
+        ReductionKind, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite,
+        Shape, Sharding, Sort, SortDirection, Typed, WhileOperation, WhilePredicate, ZeroOperation, batch,
+        differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -766,11 +772,30 @@ mod tests {
             [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle),],
         );
         let other_domain = XlaSession::new(&client).domain();
-        let restored = converted.map(|value| XlaValue::from_array_ir_value(value, &other_domain));
+        let restored = converted.map(|value| XlaValue::from_array_ir_value(value, &other_domain).unwrap());
         assert_eq!(restored, values);
         assert!(same_session(restored[0].xla_domain(), &domain));
         assert!(same_session(restored[1].xla_domain(), &other_domain));
         assert!(same_session(restored[2].xla_domain(), &other_domain));
+    }
+
+    #[test]
+    fn test_xla_value_from_array_ir_value_rejects_ragged_values() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = mesh_on(&client, 0);
+        let storage = array(&domain, &mesh, DataType::I64, &[3i64, 3], &[2]);
+        let r#type = RaggedType::new(
+            storage.r#type().into_owned(),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            Vec::new(),
+        )
+        .unwrap();
+        let ragged = ArrayIrValue::Ragged(RaggedValue::new(r#type, storage, Vec::new()).unwrap());
+        assert_eq!(
+            XlaValue::from_array_ir_value(ragged, &domain),
+            Err(TypeError::invalid("ragged values are not supported in the XLA domain")),
+        );
     }
 
     #[test]

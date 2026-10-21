@@ -502,6 +502,24 @@ pub trait Operation: Clone {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
+    /// Returns supplemental output [`TypeIdentity`](crate::TypeIdentity) definitions established by this operation.
+    /// This is for constructors whose outputs reference newly established identities without representing those
+    /// identities as separate definition-position values. The operation owns the checks and runtime semantics that
+    /// establish each declared identity; a declaration alone supplies no numerical validation.
+    ///
+    /// Each identity must occur in a reference position on an output, must not also occur in a definition position
+    /// on any output, and must appear only once in this declaration. An identity carried by an instruction input is
+    /// forwarded. Otherwise, it must be fresh in the region, even when an earlier instruction established the same
+    /// identity without this instruction consuming it. Region sealing validates these rules and records definitions
+    /// in output-occurrence order. Ordinary output definition positions retain their existing contract unchanged.
+    ///
+    /// These identities are operation metadata and must follow [`Self::rename_type_identities`]. The default declares
+    /// no supplemental definitions and allocates nothing.
+    #[inline]
+    fn type_identity_definitions(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
+        Cow::Borrowed(&[])
+    }
+
     /// Returns declarations for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in operation-defined
     /// order. Each [`RegionSlot`] supplies the stable name used by diagnostics and rendering together with the
     /// [`RegionRole`] that determines whether the region may execute during ordinary interpretation. The declared
@@ -1044,6 +1062,11 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
+    fn type_identity_definitions(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
+        self.as_ref().type_identity_definitions()
+    }
+
+    #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         self.as_ref().region_slots()
     }
@@ -1357,6 +1380,56 @@ impl<O: Default + Operation> OperationProvider<O::Type> for O {
 /// provenance, structural zero classification, effects, and rendering remain properties of the native payload and are
 /// delegated directly by the enclosing operation family.
 pub trait MemberOperation<U: Type>: Operation {
+    /// Declares supplemental output identities in parent universe `U`, following
+    /// [`Operation::type_identity_definitions`]. A mixed boundary can use a different identity vocabulary than its
+    /// native payload, so declarations require this explicit parent-universe adapter. The default declares none.
+    ///
+    /// Use this when the instruction's `U`-typed outputs reference an identity that no input carries and that the
+    /// native payload cannot name, because in its own universe the same output is an ordinary value. Identities that
+    /// an input already carries are forwarded by region sealing and must not be declared here; a mixed array
+    /// constructor whose outputs only reference the identities of its first-class dimension inputs therefore keeps the
+    /// default. The declared identities are operation metadata and must follow [`Self::rename_parent_type_identities`].
+    ///
+    /// # Examples
+    ///
+    /// A custom call keeps its native array payload, whose output in the homogeneous array universe is padded storage
+    /// such as `f32[batch, 8]`. Under a ragged contract with a fresh output binding, the same call produces a ragged
+    /// value in the mixed universe whose descriptor references the binding's dimension `length`. That identity is
+    /// established by the call (its live extents come from another output of the same call), so the member declares
+    /// it in the parent universe while its native [`Operation::type_identity_definitions`] stays empty:
+    ///
+    /// ```rust,ignore
+    /// impl MemberOperation<ArrayIrType> for CustomCallOperation {
+    ///     fn parent_type_identity_definitions(&self) -> Cow<'_, [DimensionVariable]> {
+    ///         // One declaration per fresh ragged output dimension, in output order; a dimension that an input
+    ///         // binding preserves is forwarded from that input and is not declared.
+    ///         let Some(contract) = self.ragged_contract() else {
+    ///             return Cow::Borrowed(&[]);
+    ///         };
+    ///         Cow::Owned(
+    ///             contract
+    ///                 .output_bindings()
+    ///                 .iter()
+    ///                 .filter_map(|binding| match binding {
+    ///                     CustomCallRaggedOutputBinding::Fresh { dimension, .. } => Some(dimension.clone()),
+    ///                     CustomCallRaggedOutputBinding::Preserved { .. } => None,
+    ///                     CustomCallRaggedOutputBinding::Consumed => None,
+    ///                 })
+    ///                 .collect(),
+    ///         )
+    ///     }
+    ///
+    ///     // ...
+    /// }
+    /// ```
+    ///
+    /// Region sealing then records `length` as defined by this instruction, in output-occurrence order,
+    /// and rejects a later instruction that declares it again without consuming it.
+    #[inline]
+    fn parent_type_identity_definitions(&self) -> Cow<'_, [U::Identity]> {
+        Cow::Borrowed(&[])
+    }
+
     /// Validates the attached-[`Region`](crate::Region) interfaces of this payload's instruction in parent universe
     /// `U`, using [`Operation::validate_region_interfaces`] semantics. The default implementation only checks the
     /// number of attached regions.

@@ -22,12 +22,13 @@ use ryft_core::{
     OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
     Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
-    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
+    RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation, RealOperation, ReduceOperation,
+    ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation, ReshapeOperation,
+    ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation, SortOperation,
+    SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
     TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming, Typed,
     UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
     XorOperation, ZeroLikeOperation, ZeroOperation,
@@ -459,6 +460,15 @@ where
     /// Converts a first-class dimension into scalar array data.
     DimensionToScalar(DimensionToScalarOperation),
 
+    /// Checked first-class ragged construction, retained for staging until grouped execution is implemented.
+    RaggedNew(RaggedNewOperation),
+
+    /// Explicit ragged storage projection, retained for staging until grouped execution is implemented.
+    RaggedStorage(RaggedStorageOperation),
+
+    /// Explicit ragged extent projection, retained for staging until grouped execution is implemented.
+    RaggedExtents(RaggedExtentsOperation),
+
     /// Reshapes an array using explicit dimension operands.
     Reshape(DynamicReshapeOperation),
 
@@ -675,6 +685,9 @@ where
             ArrayIrOperation::ReferenceFreeze(operation) => Self::ReferenceFreeze(operation),
             ArrayIrOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
             ArrayIrOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
+            ArrayIrOperation::RaggedNew(operation) => Self::RaggedNew(operation),
+            ArrayIrOperation::RaggedStorage(operation) => Self::RaggedStorage(operation),
+            ArrayIrOperation::RaggedExtents(operation) => Self::RaggedExtents(operation),
             ArrayIrOperation::Reshape(operation) => Self::Reshape(operation),
             ArrayIrOperation::Broadcast(operation) => Self::Broadcast(operation),
             ArrayIrOperation::Concatenate(operation) => Self::Concatenate(operation),
@@ -970,7 +983,8 @@ pub(crate) mod tests {
         Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ErasedOperation,
         ExternalReferenceBinding, MaybeZero, Memory, MulOperation, Operation, OperationPayloadProjection,
-        OperationProvider, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
+        OperationProvider, PartialValue, Placeholder, ProgramBuilder, ProgramError, RaggedExtentsOperation,
+        RaggedNewOperation, RaggedStorageOperation, RaggedType, RaggedValueKind, ReferenceAccessOperation,
         ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
         ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
@@ -1252,6 +1266,27 @@ pub(crate) mod tests {
         let freeze: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::ReferenceFreeze(ReferenceFreezeOperation::new()).into();
         assert!(matches!(&freeze, XlaOperation::ReferenceFreeze(_)));
+    }
+
+    #[test]
+    fn test_core_ragged_operations_promote_to_xla_ragged_operations() {
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(Dimension::Static(3).into()),
+            Vec::new(),
+        )
+        .unwrap();
+        let construct: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::RaggedNew(RaggedNewOperation::new(r#type.clone())).into();
+        assert!(matches!(&construct, XlaOperation::RaggedNew(operation) if operation.output_type() == &r#type));
+
+        let storage: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::RaggedStorage(RaggedStorageOperation).into();
+        assert!(matches!(&storage, XlaOperation::RaggedStorage(_)));
+
+        let extents: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::RaggedExtents(RaggedExtentsOperation::new(-1)).into();
+        assert!(matches!(&extents, XlaOperation::RaggedExtents(operation) if operation.axis() == (-1).into()));
     }
 
     #[test]
