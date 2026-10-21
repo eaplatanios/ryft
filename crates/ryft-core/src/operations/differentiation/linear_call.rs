@@ -664,12 +664,18 @@ where
         }
 
         // Classify each transpose-region output as structurally zero by inspecting its producing instruction in the
-        // source region, so zero cotangents stay symbolic instead of accumulating. Outputs with no producing
-        // instruction (forwarded region inputs and constants) conservatively classify as nonzero.
+        // source region, so zero cotangents stay symbolic instead of accumulating. An output that forwards an output
+        // cotangent input is zero exactly when that cotangent is a structural zero, which this call materializes below
+        // only because the transposed call needs a value. Outputs that forward a residual or a constant conservatively
+        // classify as non-zero.
+        let cotangent_input_ids = &transpose.input_ids()[self.residual_count..];
         let output_is_zero = transpose
             .output_ids()
             .iter()
             .map(|output| {
+                if let Some(cotangent_index) = cotangent_input_ids.iter().position(|input| input == output) {
+                    return outputs[cotangent_index].is_zero();
+                }
                 transpose
                     .instructions()
                     .iter()

@@ -313,30 +313,31 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
     /// Position of the omitted zero in the complete public differential boundary.
     index: usize,
 
-    /// Tangent or cotangent type of the omitted zero.
+    /// Output tangent type of the omitted zero.
     r#type: T,
 
     /// Range of captured residuals consumed to materialize the omitted zero.
     residual_range: Range<usize>,
 }
 
-/// Residual values supplying runtime dimensions used to reconstruct the zero-space leaves omitted from one compact
-/// derivative boundary.
+/// Residual values supplying runtime dimensions used to reconstruct the zero-space output tangents omitted from the
+/// compact tangent program of a [`Pushforward`](crate::Pushforward).
 ///
-/// Let a flattened primal boundary have leaf types `T₁, …, Tₙ`, and let `D(Tᵢ)` denote the corresponding tangent or
-/// cotangent type. When `D(Tᵢ)` is a _zero space_, it contains exactly one value, `0ᵢ`, so the executable derivative
-/// [`Program`](crate::Program) omits that leaf entirely. That is because carrying a Single Static Assignment (SSA)
-/// input or output for a value that cannot vary would add IR and ABI overhead without conveying information. A public
-/// [`Pushforward`](crate::Pushforward) or [`Pullback`](crate::Pullback) must still reconstruct `0ᵢ` when it rebuilds
-/// the complete user-facing boundary.
+/// Let a flattened primal output boundary have leaf types `T₁, …, Tₙ`, and let `D(Tᵢ)` denote the corresponding
+/// tangent type. When `D(Tᵢ)` is a _zero space_, it contains exactly one value, `0ᵢ`, so the executable tangent
+/// [`Program`](crate::Program) omits that output entirely. That is because carrying a Single Static Assignment (SSA)
+/// output for a value that cannot vary would add IR and ABI overhead without conveying information. A pushforward must
+/// still return `0ᵢ` as a concrete value when it rebuilds its complete user-facing output tangent boundary. Pullbacks
+/// do not use this type: they return input cotangents of zero-space types as structural zeros, which the consumer that
+/// owns an extent source materializes.
 ///
-/// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the cotangent of a primal
-/// `u64[n]` array has type `zero[n]` which records the identity and bounds of `n`, but not its runtime extent. While
-/// the primal value is available, linearization therefore captures the runtime values declared by
+/// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the tangent of a primal
+/// `u64[n]` output has type `zero[n]` which records the identity and bounds of `n`, but not its runtime extent. While
+/// the primal output is available, linearization therefore captures the runtime values declared by
 /// [`ResidualZeroProvider::zero_residual_types`] (e.g., the concrete value of `n`). This type stores the flattened
-/// concatenation of those captured values in primal-leaf order together with a sparse reconstruction plan for the
+/// concatenation of those captured values in output-leaf order together with a sparse reconstruction plan for the
 /// zero-space leaves. [`Self::rebuild`] replays that plan to materialize each omitted `0ᵢ` and interleave it with the
-/// live derivative values produced by the compact program.
+/// live output tangents produced by the compact program.
 ///
 /// These are **boundary reconstruction residuals**, not ordinary executable-program residuals. They are retained beside
 /// the reusable derivative callable and are consumed only while restoring its public boundary. They never become
@@ -411,15 +412,15 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         Ok(Self { residuals, boundary_size: primal_types.len(), zero_leaves })
     }
 
-    /// Rebuilds the complete differential boundary described by this instance, interleaving materialized zero-space
-    /// leaves with the compact derivative program's `live_values`. The boundary size, zero-leaf positions, differential
-    /// types, and residual partitions were fixed and validated by [`Self::capture`]. Reconstruction consequently needs
-    /// only the context in which to bind each zero and the live values produced by the compact derivative program.
+    /// Rebuilds the complete output tangent boundary described by this instance, interleaving materialized zero-space
+    /// leaves with the compact tangent program's `live_values`. The boundary size, zero-leaf positions, tangent types,
+    /// and residual partitions were fixed and validated by [`Self::capture`]. Reconstruction consequently needs only
+    /// the context in which to bind each zero and the live values produced by the compact tangent program.
     ///
     /// # Parameters
     ///
     ///   - `context`: Context in which residual-backed zero operations are bound.
-    ///   - `live_values`: Differential values for every nonzero-space boundary leaf, in boundary order.
+    ///   - `live_values`: Output tangents for every nonzero-space boundary leaf, in boundary order.
     ///
     /// # Errors
     ///
@@ -434,75 +435,30 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         live_values: I,
     ) -> Result<Vec<C::Value>, ProgramError> {
         let mut live_values = live_values.into_iter();
-        let values = self.rebuild_with(context, &[], |_, zero| match zero {
-            Some(zero) => Ok(zero),
-            None => live_values.next().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "{OUTPUT_TANGENT_BOUNDARY} omitted a nonzero differential value",
-                ))
-            }),
-        })?;
+        let mut zero_leaves = self.zero_leaves.iter().peekable();
+        let mut values = Vec::with_capacity(self.boundary_size);
+        for index in 0..self.boundary_size {
+            let value = match zero_leaves.next_if(|leaf| leaf.index == index) {
+                Some(zero_leaf) => {
+                    let residuals = self.residuals.get(zero_leaf.residual_range.clone()).unwrap();
+                    let (operation, zero_inputs) =
+                        C::Operation::zero_operation_with_residuals(zero_leaf.r#type.clone(), residuals)?;
+                    let mut outputs = context.bind(operation, Vec::new(), zero_inputs.as_slice())?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    outputs.remove(0)
+                }
+                None => live_values.next().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "{OUTPUT_TANGENT_BOUNDARY} omitted a nonzero differential value",
+                    ))
+                })?,
+            };
+            values.push(value);
+        }
         if live_values.next().is_some() {
             return Err(ProgramError::MalformedProgram(format!(
                 "{OUTPUT_TANGENT_BOUNDARY} produced too many nonzero differential values",
             )));
-        }
-        Ok(values)
-    }
-
-    /// Rebuilds the complete differential boundary described by this instance using `reconstruct` to handle each leaf
-    /// in boundary order. The callback receives the leaf index and a materialized zero for a zero-space leaf, or
-    /// [`None`] for a nonzero-space leaf. Zero types and runtime dimensions come from [`Self::capture`], and so
-    /// reconstruction does not read the primal values.
-    ///
-    /// Unlike [`Self::rebuild`], the `reconstruct` callback decides whether a non-zero-space leaf consumes a program
-    /// output and what value to return for it. A consumer can skip an inactive output without consuming a compact
-    /// program result. The returned vector contains one callback result per boundary leaf. Any check for unused
-    /// program outputs remains the caller's responsibility.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Context in which residual-backed zero operations are bound.
-    ///   - `materialize_zeros`: Whether each boundary leaf needs its zero materialized. An empty slice enables every
-    ///     leaf. Otherwise, its length must match the boundary. Disabled zero leaves pass `None` to `reconstruct`.
-    ///   - `reconstruct`: Function called once per leaf, in increasing index order, after materializing its zero if
-    ///     needed. Its result becomes the corresponding element of the returned vector.
-    ///
-    /// # Errors
-    ///
-    /// Propagates zero-materialization and callback errors unchanged, stopping before processing subsequent leaves.
-    pub(crate) fn rebuild_with<
-        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
-        R,
-        F: FnMut(usize, Option<V>) -> Result<R, ProgramError>,
-    >(
-        &self,
-        context: &C,
-        materialize_zeros: &[bool],
-        mut reconstruct: F,
-    ) -> Result<Vec<R>, ProgramError> {
-        if !materialize_zeros.is_empty() {
-            check_count!("input", materialize_zeros, self.boundary_size, ProgramError);
-        }
-        let mut zero_leaves = self.zero_leaves.iter().peekable();
-        let mut values = Vec::with_capacity(self.boundary_size);
-        for index in 0..self.boundary_size {
-            let zero = if zero_leaves.peek().is_some_and(|leaf| leaf.index == index) {
-                let zero_leaf = zero_leaves.next().unwrap();
-                if !materialize_zeros.get(index).copied().unwrap_or(true) {
-                    values.push(reconstruct(index, None)?);
-                    continue;
-                }
-                let residuals = self.residuals.get(zero_leaf.residual_range.clone()).unwrap();
-                let (operation, zero_inputs) =
-                    C::Operation::zero_operation_with_residuals(zero_leaf.r#type.clone(), residuals)?;
-                let mut outputs = context.bind(operation, Vec::new(), zero_inputs.as_slice())?;
-                check_count!("output", outputs, 1, ProgramError);
-                Some(outputs.remove(0))
-            } else {
-                None
-            };
-            values.push(reconstruct(index, zero)?);
         }
         Ok(values)
     }
@@ -732,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_space_boundary_reconstruction_rebuild_with() {
+    fn test_zero_space_boundary_reconstruction_rebuild() {
         // The boundary interleaves live leaves (`f64`) with zero-space leaves (`bool` and `i32`).
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal_types = vec![
@@ -746,44 +702,23 @@ mod tests {
             ZeroSpaceBoundaryReconstruction::capture(&context, primal_values.as_slice(), primal_types.as_slice())
                 .unwrap();
 
-        // Each callback receives its original boundary index and only zero-space leaves carry a materialized value.
-        let leaves = reconstruction
-            .rebuild_with(&context, &[], |index, zero| Ok((index, zero.map(|zero| zero.r#type().into_owned()))))
-            .unwrap();
+        // Live values fill the nonzero-space leaves in order, and each zero-space leaf keeps its boundary index
+        // with a freshly materialized zero of its tangent type.
+        let live_values =
+            [context.input(ArrayType::scalar(DataType::F64)), context.input(ArrayType::scalar(DataType::F64))];
+        let leaves = reconstruction.rebuild(&context, live_values.clone()).unwrap();
         assert_eq!(
-            leaves,
+            leaves.iter().map(|leaf| leaf.r#type().into_owned()).collect::<Vec<_>>(),
             vec![
-                (0, None),
-                (1, Some(ArrayType::scalar(DataType::Boolean).cotangent().unwrap())),
-                (2, None),
-                (3, Some(ArrayType::scalar(DataType::I32).cotangent().unwrap())),
+                ArrayType::scalar(DataType::F64),
+                ArrayType::scalar(DataType::Boolean).tangent().unwrap(),
+                ArrayType::scalar(DataType::F64),
+                ArrayType::scalar(DataType::I32).tangent().unwrap(),
             ],
         );
+        assert_eq!(leaves[0].atom_id(), live_values[0].atom_id());
+        assert_eq!(leaves[2].atom_id(), live_values[1].atom_id());
         assert_eq!(context.builder().borrow().instructions().len(), 2);
-
-        // Ignored zero-space leaves retain their positions without staging zero constructors.
-        let instruction_count = context.builder().borrow().instructions().len();
-        let ignored = reconstruction
-            .rebuild_with(&context, &[true, false, true, false], |index, zero| {
-                Ok((index, zero.map(|zero| zero.r#type().into_owned())))
-            })
-            .unwrap();
-        assert_eq!(ignored, vec![(0, None), (1, None), (2, None), (3, None)]);
-        assert_eq!(context.builder().borrow().instructions().len(), instruction_count);
-
-        // A callback error stops traversal immediately and retains the caller's diagnostic.
-        let mut visited = Vec::new();
-        assert!(matches!(
-            reconstruction.rebuild_with(&context, &[], |index, _| {
-                visited.push(index);
-                if index == 1 {
-                    return Err(ProgramError::InvalidArgument { message: "invalid reconstruction leaf".to_string() });
-                }
-                Ok(())
-            }),
-            Err(ProgramError::InvalidArgument { message }) if message == "invalid reconstruction leaf",
-        ));
-        assert_eq!(visited, vec![0, 1]);
     }
 
     #[test]

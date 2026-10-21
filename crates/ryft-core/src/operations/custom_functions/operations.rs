@@ -2213,12 +2213,18 @@ where
                 }
 
                 // Classify each backward-region output as structurally zero by inspecting its producing instruction,
-                // so zero cotangents stay symbolic instead of accumulating. Outputs with no producing instruction
-                // (forwarded region inputs and constants) conservatively classify as nonzero.
+                // so zero cotangents stay symbolic instead of accumulating. An output that forwards a seed input is
+                // zero exactly when that seed is a structural zero, which this carrier materializes below only because
+                // the backward region needs a value. Outputs that forward a leading input or a constant conservatively
+                // classify as non-zero.
+                let seed_input_ids = &backward.input_ids()[self.leading_input_count - seed_extent_count..];
                 let output_is_zero = backward
                     .output_ids()
                     .iter()
                     .map(|output| {
+                        if let Some(seed_index) = seed_input_ids.iter().position(|input| input == output) {
+                            return outputs[seed_index].is_zero();
+                        }
                         backward
                             .instructions()
                             .iter()

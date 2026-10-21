@@ -29,6 +29,11 @@ impl<O> ResidualZeroProvider<ArrayType> for O
 where
     O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ZeroLikeOperation<ArrayType>>,
 {
+    #[inline]
+    fn requires_zero_source(r#type: &ArrayType) -> bool {
+        r#type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
+    }
+
     fn materialize_zero_from_residual_sources<
         'v,
         C: Context<Type = ArrayType, Value: 'v, Operation = O> + Zero<C::Value>,
@@ -43,7 +48,7 @@ where
             MaybeZero::Zero(r#type) => r#type,
         };
 
-        if !r#type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
+        if !Self::requires_zero_source(&r#type) {
             return context.zero(&r#type);
         }
 
@@ -570,6 +575,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_array_operation_requires_zero_source() {
+        // Static zeros come from their types. A symbolic extent is defined only by a value of exactly that type.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        assert!(!ArrayOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::F32, [2])));
+        assert!(!ArrayOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::Zero, [2])));
+        assert!(ArrayOperation::<Array>::requires_zero_source(&symbolic_type));
+    }
+
+    #[test]
     fn test_array_operation_materialize_zero_from_residual_sources() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![2.into()]));
@@ -711,6 +726,16 @@ mod tests {
             ArrayIrOperation::<Array>::zero_residual_types(&DimensionType::from(columns).into(),),
             Vec::<ArrayIrType>::new(),
         );
+    }
+
+    #[test]
+    fn test_array_ir_operation_requires_zero_source() {
+        // Static zeros come from their types. A symbolic extent is read from a source as a first-class dimension.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        assert!(!ArrayIrOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::F32, [2]).into()));
+        assert!(!ArrayIrOperation::<Array>::requires_zero_source(&ArrayType::new_static(DataType::Zero, [2]).into()));
+        assert!(ArrayIrOperation::<Array>::requires_zero_source(&symbolic_type.into()));
     }
 
     #[test]
@@ -950,13 +975,9 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dynamic = context.input(dynamic_type.clone().into());
         let scalar = context.input(scalar_type.clone().into());
-        let (_, pullback) = context
-            .vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic.clone(), scalar], ())
-            .unwrap();
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
         assert!(pullback.residuals().is_empty());
-
-        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as a zero source.
-        assert_eq!(pullback.zero_sources(), &[Some(dynamic), None]);
         let transposed = pullback.transposed_program(&[]).unwrap();
         assert!(transposed.program().instructions().is_empty());
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
@@ -995,13 +1016,9 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let dynamic = context.input(dynamic_type.clone());
         let scalar = context.input(scalar_type.clone());
-        let (_, pullback) = context
-            .vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic.clone(), scalar], ())
-            .unwrap();
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
         assert!(pullback.residuals().is_empty());
-
-        // Only the symbolic input whose zero cotangent needs a runtime extent is retained as a zero source.
-        assert_eq!(pullback.zero_sources(), &[Some(dynamic), None]);
         let cotangent = context.input(scalar_type);
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
         assert_eq!(cotangents[0], MaybeZero::Zero(dynamic_type));

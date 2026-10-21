@@ -523,9 +523,11 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// interpreting it.
     residuals: Vec<C::Value>,
 
-    /// Reconstruction plan used by [`apply`](Self::apply) to restore zero-space output tangents omitted from
-    /// [`program`](Self::program).
-    tangent_reconstruction: ZeroSpaceBoundaryReconstruction<C::Value>,
+    /// Reconstruction plan used by [`apply`](Self::apply) to restore zero-space output tangents
+    /// omitted from [`program`](Self::program). It is [`None`] for a pushforward linearized with
+    /// [`DifferentiationRule::JvpForTranspose`], which is converted into a [`Pullback`](crate::Pullback) and
+    /// never applied, so that linearization captures no runtime dimensions solely to rebuild output tangents.
+    tangent_reconstruction: Option<ZeroSpaceBoundaryReconstruction<C::Value>>,
 
     /// Complete public primal input boundary. The executable pushforward omits inputs whose derived tangent type is a
     /// zero differential space.
@@ -578,7 +580,7 @@ impl<
     ///   - `residuals`: Primal values `r` captured at the linearization point, in the same order as the program's
     ///     trailing inputs.
     ///   - `tangent_reconstruction`: Reconstruction plan for zero-space output tangents rebuilt by
-    ///     [`apply`](Self::apply).
+    ///     [`apply`](Self::apply), or [`None`] for a pushforward that is only transposed and never applied.
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
     ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
@@ -591,7 +593,7 @@ impl<
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
-        tangent_reconstruction: ZeroSpaceBoundaryReconstruction<C::Value>,
+        tangent_reconstruction: Option<ZeroSpaceBoundaryReconstruction<C::Value>>,
         primal_input_types: Vec<C::Type>,
         primal_output_types: Vec<C::Type>,
         primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
@@ -786,7 +788,12 @@ impl<
 
         // Reconstruct the complete flattened public output boundary. Consume one program result for each non-zero
         // tangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
-        let outputs = self.tangent_reconstruction.rebuild(&self.context, tangent_outputs)?;
+        let Some(tangent_reconstruction) = &self.tangent_reconstruction else {
+            return Err(ProgramError::MalformedProgram(
+                "a pushforward linearized for transposition cannot be applied".to_string(),
+            ));
+        };
+        let outputs = tangent_reconstruction.rebuild(&self.context, tangent_outputs)?;
 
         // Restore the closure's original structured output shape after rebuilding every flattened tangent leaf.
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
@@ -3091,7 +3098,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 /// a [`Pushforward`] containing the saved residuals and derivative program. Shares boundary validation, partial
 /// evaluation, extent retention, and reference-lifetime handling with public linearization. When the rule is
 /// [`DifferentiationRule::JvpForTranspose`], the derivative program need only support transposition and must not be
-/// assumed executable as a pushforward.
+/// assumed executable as a pushforward. The returned pushforward then also omits the reconstruction of its zero-space
+/// output tangents (and the runtime dimensions that it would read), so it can only be converted into a pullback.
 #[allow(clippy::type_complexity)]
 pub(crate) fn linearize_for_rule<
     C: Context<Type: DifferentiableType>,
@@ -3241,8 +3249,15 @@ where
         primal_outputs.push(primal);
         tangent_outputs.push(tangent);
     }
-    let tangent_reconstruction =
-        ZeroSpaceBoundaryReconstruction::capture(context, primal_outputs.as_slice(), output_types.as_slice())?;
+
+    // Only an applied pushforward rebuilds zero-space output tangents. A pullback converts the pushforward and returns
+    // input cotangents instead, so transposition captures no runtime dimensions for the output tangents.
+    let tangent_reconstruction = match rule {
+        DifferentiationRule::Jvp => {
+            Some(ZeroSpaceBoundaryReconstruction::capture(context, primal_outputs.as_slice(), output_types.as_slice())?)
+        }
+        DifferentiationRule::JvpForTranspose => None,
+    };
     let output = Output::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
     // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
@@ -4288,7 +4303,7 @@ pub(crate) mod tests {
             context,
             program,
             residuals,
-            reconstruction,
+            Some(reconstruction),
             input_types,
             output_types,
             references,
