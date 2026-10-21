@@ -99,9 +99,9 @@ struct LogicalMeshKey {
     axes: Vec<MeshAxis>,
 }
 
-/// Interned immutable data for a [`LogicalMesh`].
+/// Interned immutable payload of a [`LogicalMesh`].
 #[derive(Debug, PartialEq, Eq)]
-struct LogicalMeshData {
+struct LogicalMeshPayload {
     /// Named and sized axes that define this logical mesh topology.
     axes: Vec<MeshAxis>,
 
@@ -111,8 +111,8 @@ struct LogicalMeshData {
 
 /// Returns all interned [`LogicalMesh`] instances.
 #[inline]
-fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<LogicalMeshData>>> {
-    static INTERNER: OnceLock<Mutex<HashMap<LogicalMeshKey, Weak<LogicalMeshData>>>> = OnceLock::new();
+fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<LogicalMeshPayload>>> {
+    static INTERNER: OnceLock<Mutex<HashMap<LogicalMeshKey, Weak<LogicalMeshPayload>>>> = OnceLock::new();
     INTERNER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -122,7 +122,7 @@ fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<Logi
 /// (e.g., [Shardy](https://openxla.org/shardy) MLIR attributes), but it does not carry any device-specific information.
 /// Note that equivalent meshes are interned within the process and so repeated constructions share immutable storage.
 #[derive(Clone, PartialEq, Eq)]
-pub struct LogicalMesh(Arc<LogicalMeshData>);
+pub struct LogicalMesh(Arc<LogicalMeshPayload>);
 
 impl LogicalMesh {
     /// Creates a new [`LogicalMesh`].
@@ -140,13 +140,13 @@ impl LogicalMesh {
                 if let Some(mesh) = occupied.get().upgrade() {
                     Ok(Self(mesh))
                 } else {
-                    let mesh = Arc::new(LogicalMeshData { axes: occupied.key().axes.clone(), axis_indices });
+                    let mesh = Arc::new(LogicalMeshPayload { axes: occupied.key().axes.clone(), axis_indices });
                     occupied.insert(Arc::downgrade(&mesh));
                     Ok(Self(mesh))
                 }
             }
             Entry::Vacant(vacant) => {
-                let mesh = Arc::new(LogicalMeshData { axes: vacant.key().axes.clone(), axis_indices });
+                let mesh = Arc::new(LogicalMeshPayload { axes: vacant.key().axes.clone(), axis_indices });
                 vacant.insert(Arc::downgrade(&mesh));
                 Ok(Self(mesh))
             }
