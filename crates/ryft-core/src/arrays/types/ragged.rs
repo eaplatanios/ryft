@@ -758,8 +758,6 @@ impl RaggedIdentityScope {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Indexed identity scope of [`RaggedType`] refinements. Identities referenced by [`RaggedDimension`] entries and those
 /// defined by dimension-item values (i.e., those reported by [`RaggedType::indexed_identities`]) form indexed classes,
 /// deliberately isolated from scalar extent facts, together with their extent coordinates.
@@ -813,8 +811,8 @@ impl RaggedDimensionRefinements {
 
     /// Records the first-observation order of the scalar classes of `scalar` and of the indexed classes of this scope,
     /// returning the updated scope. `facts` yields the complete signature's [`DimensionComparison::LocalDeclarations`]
-    /// facts in pair order, each tagged with whether it is an indexed fact (`true`) or a scalar fact (`false`). Scopes
-    /// without indexed identities keep the ordinary scalar order and do not consume `facts`.
+    /// facts in pair order, each tagged with whether it is an indexed fact (i.e., `true`) or a scalar fact (i.e.,
+    /// `false`). Scopes without indexed identities keep the ordinary scalar order and do not consume `facts`.
     pub(crate) fn with_identity_class_order<'o>(
         mut self,
         scalar: &ArrayTypeRefinements,
@@ -863,8 +861,8 @@ impl RaggedDimensionRefinements {
         error.into_iter().map(Err).chain(facts.into_iter().map(Ok))
     }
 
-    /// Returns the connected [`TypeIdentityClass`]es of the scalar scope `scalar` and of this indexed scope, in their
-    /// mixed first-observation order.
+    /// Returns the connected [`TypeIdentityClass`]es of the scalar scope `scalar` and of this indexed scope,
+    /// in their mixed first-observation order.
     pub(crate) fn identity_classes<'o>(
         &'o self,
         scalar: &'o ArrayTypeRefinements,
@@ -934,6 +932,8 @@ impl RaggedDimensionRefinements {
         }
         ordered
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates one scalar extent identity of an output signature against the indexed identities of the input
     /// signature in the selected scope.
