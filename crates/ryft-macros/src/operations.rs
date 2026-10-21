@@ -2153,7 +2153,7 @@ impl OperationEnum {
 
     /// Generates the [`OperationProvider`](ryft_core::OperationProvider) implementation that rejects every
     /// [`GuardOperation`](ryft_core::GuardOperation) request of the enum's primary type with
-    /// [`GuardOperation::unsupported_family_error`](ryft_core::GuardOperation::unsupported_family_error), or returns
+    /// [`GuardOperation::unsupported_error`](ryft_core::GuardOperation::unsupported_error), or returns
     /// [`None`] when a variant stores a native guard (refer to [`OperationVariant::is_native_guard`]). Every
     /// [`Context`](ryft_core::Context) requires its operation family to provide guard requests, so a family that stores
     /// no guard needs this provider to be used as a context's family at all. A family that stores a native guard
@@ -2184,7 +2184,7 @@ impl OperationEnum {
                     request: #ryft::GuardOperation<#primary_type>,
                     _input_types: &[&#primary_type],
                 ) -> ::std::result::Result<Self, #ryft::ProgramError> {
-                    ::std::result::Result::Err(request.unsupported_family_error())
+                    ::std::result::Result::Err(request.unsupported_error())
                 }
             }
         })
@@ -3809,7 +3809,7 @@ mod tests {
                     request: ryft::GuardOperation<ArrayType>,
                     _input_types: &[&ArrayType],
                 ) -> ::std::result::Result<Self, ryft::ProgramError> {
-                    ::std::result::Result::Err(request.unsupported_family_error())
+                    ::std::result::Result::Err(request.unsupported_error())
                 }
             }
         };
@@ -3873,7 +3873,7 @@ mod tests {
                     request: ryft::GuardOperation<ArrayIrType>,
                     _input_types: &[&ArrayIrType],
                 ) -> ::std::result::Result<Self, ryft::ProgramError> {
-                    ::std::result::Result::Err(request.unsupported_family_error())
+                    ::std::result::Result::Err(request.unsupported_error())
                 }
             }
         };

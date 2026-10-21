@@ -459,9 +459,9 @@ impl ErasedOperation {
 struct GuardOperation<T: Type>(PhantomData<T>);
 
 impl<T: Type> GuardOperation<T> {
-    /// Stand-in for `ryft_core::GuardOperation::unsupported_family_error`, which the rejecting guard provider that the
+    /// Stand-in for `ryft_core::GuardOperation::unsupported_error`, which the rejecting guard provider that the
     /// derive generates for a family without a native guard variant returns.
-    fn unsupported_family_error(&self) -> ProgramError {
+    fn unsupported_error(&self) -> ProgramError {
         ProgramError
     }
 }
