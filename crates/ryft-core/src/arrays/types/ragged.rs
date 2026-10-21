@@ -1769,7 +1769,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             RaggedType::indexed_refinement_facts(&declared, &longer, DimensionComparison::LocalDeclarations),
-            Err(TypeError::Invalid { message }) if message == "ragged types have different numbers of ragged dimensions",
+            Err(TypeError::Invalid { message })
+                if message == "ragged types have different numbers of ragged dimensions",
         ));
         let transposed = RaggedType::new(
             ArrayType::new_static(DataType::F32, [4, 2]),
