@@ -8,16 +8,19 @@ use crate::arrays::types::dimensions::{
     AsDimensionType, Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionType,
     DimensionTypeRefinements, DimensionVariable,
 };
+use crate::arrays::types::ragged::{
+    RaggedDimension, RaggedDimensionRefinements, RaggedIdentityScope, RaggedType, RaggedValueKind,
+};
 use crate::parameters::Parameter;
-use crate::programs::types::type_signature_pairs;
+use crate::programs::types::{derive_signature_identity_renaming, type_signature_pairs};
 use crate::programs::{
     ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming,
     TypeRefinements, type_identities_needing_runtime_checks,
 };
 
 /// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays,
-/// first-class runtime dimensions, or [`Reference`](crate::Reference)s to arrays. It is the type-level counterpart of
-/// [`ArrayIrValue`](crate::ArrayIrValue), with one member per value kind.
+/// first-class runtime dimensions, [`RaggedType`] aggregates, or [`Reference`](crate::Reference)s to arrays. It is the
+/// type-level counterpart of [`ArrayIrValue`](crate::ArrayIrValue), with one member per value kind.
 ///
 /// The sum is a storage boundary rather than the contract ordinary primitives are written against. Array-only
 /// [`Operation`](crate::Operation)s and transform rules keep consuming [`ArrayType`], dimension-only operations keep
@@ -27,11 +30,14 @@ use crate::programs::{
 /// implementations project it back out with a checked kind diagnostic. The same bridge backs the value-level
 /// [`ValueProjection`](crate::ValueProjection) implementations.
 ///
-/// All three members can carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a
-/// complete signature. An [`ArrayType`] member and the referent of a [`ReferenceType`] member _reference_ the variables
-/// named by their dynamic axes, while a [`DimensionType`] member _defines_ its variable.
-/// [`Type::derive_identity_renaming`] therefore checks a variable repeated across member kinds for consistency, exactly
-/// as it does within one member kind.
+/// All members can carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a complete
+/// signature. An [`ArrayType`] member and the referent of a [`ReferenceType`] member _reference_ the variables named by
+/// their dynamic axes, while a [`DimensionType`] member _defines_ its variable. [`Type::derive_identity_renaming`]
+/// therefore checks a variable repeated across member kinds for consistency, exactly as it does within one member kind.
+/// [`RaggedDimension`] entries reference indexed identities, and dimension-item aggregates define their indexed item
+/// identity. Indexed identities are kept separate from ordinary scalar extent facts; using one variable in both
+/// interpretations in a region is rejected. Repeated indexed occurrences require runtime equality checks, even
+/// when their nominal types match, because the type does not inspect their independent extent payloads.
 ///
 /// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values, the
 /// three supported provenance categories, the single checked data-to-dimension gateway, and how those contracts enable
@@ -41,6 +47,7 @@ pub enum ArrayIrType {
     Array(ArrayType),
     Dimension(DimensionType),
     Reference(ReferenceType<ArrayType>),
+    Ragged(RaggedType),
 }
 
 impl ArrayIrType {
@@ -53,6 +60,7 @@ impl ArrayIrType {
             Self::Array(r#type) => r#type.shape().dimensions(),
             Self::Dimension(r#type) => std::slice::from_ref(r#type.dimension()),
             Self::Reference(r#type) => r#type.referent().shape().dimensions(),
+            Self::Ragged(r#type) => r#type.logical_shape().dimensions(),
         }
     }
 
@@ -80,7 +88,30 @@ impl ArrayIrType {
             Self::Array(_) => "array",
             Self::Dimension(_) => "dimension",
             Self::Reference(_) => "reference",
+            Self::Ragged(_) => "ragged",
         }
+    }
+
+    /// Returns identities that represent individual integer extents, including ordinary array dimensions and
+    /// first-class scalar dimensions. Here, scalar describes the extent, not the array's rank: `f32[n, m]` contributes
+    /// both `n` and `m`. For ragged values, ordinary storage-shape dimensions still contribute scalar identities, while
+    /// indexed length families referenced by [`RaggedDimension`] entries or carried by [`RaggedValueKind::Dimension`]
+    /// are excluded. [`Type::identities`] includes both categories, together with their definition/reference roles.
+    fn scalar_extent_identities(&self) -> impl Iterator<Item = &DimensionVariable> {
+        let array = match self {
+            Self::Array(r#type) => Some(r#type),
+            Self::Reference(r#type) => Some(r#type.referent()),
+            Self::Ragged(r#type) => Some(r#type.storage_type()),
+            Self::Dimension(_) => None,
+        };
+        let dimension = match self {
+            Self::Dimension(r#type) => r#type.variable(),
+            Self::Array(_) | Self::Reference(_) | Self::Ragged(_) => None,
+        };
+        array
+            .into_iter()
+            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity))
+            .chain(dimension)
     }
 }
 
@@ -91,6 +122,7 @@ impl Display for ArrayIrType {
             Self::Array(r#type) => Display::fmt(r#type, formatter),
             Self::Dimension(r#type) => Display::fmt(r#type, formatter),
             Self::Reference(r#type) => Display::fmt(r#type, formatter),
+            Self::Ragged(r#type) => Display::fmt(r#type, formatter),
         }
     }
 }
@@ -113,6 +145,13 @@ impl From<ReferenceType<ArrayType>> for ArrayIrType {
     #[inline]
     fn from(r#type: ReferenceType<ArrayType>) -> Self {
         Self::Reference(r#type)
+    }
+}
+
+impl From<RaggedType> for ArrayIrType {
+    #[inline]
+    fn from(r#type: RaggedType) -> Self {
+        Self::Ragged(r#type)
     }
 }
 
@@ -152,9 +191,36 @@ impl<'t> TryFrom<&'t ArrayIrType> for &'t ReferenceType<ArrayType> {
     }
 }
 
+impl<'o> TryFrom<&'o ArrayIrType> for &'o RaggedType {
+    type Error = TypeError;
+
+    #[inline]
+    fn try_from(r#type: &'o ArrayIrType) -> Result<Self, Self::Error> {
+        match r#type {
+            ArrayIrType::Ragged(r#type) => Ok(r#type),
+            other => Err(TypeError::invalid(format!("expected ragged type but got {} type", other.kind_name()))),
+        }
+    }
+}
+
 impl Type for ArrayIrType {
     type Identity = DimensionVariable;
     type Refinements = ArrayIrTypeRefinements;
+
+    fn validate_identity_scope<Types: IntoIterator<Item: Borrow<Self>>>(types: Types) -> Result<(), TypeError> {
+        // Every member kind contributes scalar extent identities; ragged members then add their indexed identities.
+        let mut scope = RaggedIdentityScope::default();
+        for (index, r#type) in types.into_iter().enumerate() {
+            let r#type = r#type.borrow();
+            for identity in r#type.scalar_extent_identities() {
+                scope.record_scalar(identity)?;
+            }
+            if let Self::Ragged(r#type) = r#type {
+                scope.record_ragged(index, r#type)?;
+            }
+        }
+        Ok(())
+    }
 
     fn validate_zero(&self) -> Result<(), TypeError> {
         match self {
@@ -165,6 +231,7 @@ impl Type for ArrayIrType {
                  no zero value, so tangent and cotangent references are allocated by the differentiation rules",
                 r#type,
             ))),
+            Self::Ragged(r#type) => r#type.validate_zero(),
         }
     }
 
@@ -177,43 +244,75 @@ impl Type for ArrayIrType {
                  no one value, so tangent and cotangent references are allocated by the differentiation rules",
                 r#type,
             ))),
+            Self::Ragged(r#type) => r#type.validate_one(),
         }
     }
 
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-        let array = match self {
-            Self::Array(r#type) => Some(r#type),
-            Self::Dimension(_) | Self::Reference(_) => None,
-        };
-        let dimension = match self {
-            Self::Array(_) | Self::Reference(_) => None,
-            Self::Dimension(r#type) => Some(r#type),
-        };
-        let reference = match self {
-            Self::Array(_) | Self::Dimension(_) => None,
-            Self::Reference(r#type) => Some(r#type),
-        };
-        array
-            .into_iter()
-            .flat_map(ArrayType::identities)
-            .chain(dimension.into_iter().flat_map(DimensionType::identities))
-            .chain(reference.into_iter().flat_map(ReferenceType::identities))
+        let (storage, descriptors, definition): (&[Dimension], &[RaggedDimension], Option<&DimensionVariable>) =
+            match self {
+                Self::Array(r#type) => (r#type.shape().dimensions(), &[], None),
+                Self::Dimension(r#type) => (&[], &[], r#type.variable()),
+                Self::Reference(r#type) => (r#type.referent().shape().dimensions(), &[], None),
+                Self::Ragged(r#type) => (
+                    r#type.storage_type().shape().dimensions(),
+                    r#type.ragged_dimensions(),
+                    match r#type.value_kind() {
+                        RaggedValueKind::Array => None,
+                        RaggedValueKind::Dimension(dimension) => dimension.variable(),
+                    },
+                ),
+            };
+        let mut storage = storage.iter();
+        let mut descriptors = descriptors.iter();
+        let mut definition = definition;
+        std::iter::from_fn(move || {
+            // Exhaust storage references before descriptor references, then emit the optional definition once.
+            if let Some(identity) = storage.find_map(Dimension::variable) {
+                Some((TypeIdentityPosition::Reference, identity))
+            } else if let Some(descriptor) = descriptors.next() {
+                Some((TypeIdentityPosition::Reference, descriptor.dimension()))
+            } else {
+                definition.take().map(|identity| (TypeIdentityPosition::Definition, identity))
+            }
+        })
     }
 
-    fn derive_identity_renaming<'o, D, A>(
+    fn derive_identity_renaming<
+        'o,
+        D: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
+    >(
         declared: D,
         actual: A,
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
     where
         Self: 'o,
-        D: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
-        A: IntoIterator<Item = &'o Self, IntoIter: ExactSizeIterator>,
     {
-        DimensionRefinements::derive_identity_renaming(type_signature_pairs(declared, actual)?.flat_map(
-            |(declared, actual)| {
-                ArrayIrTypeRefinements::refinement_facts(declared, actual, DimensionComparison::IdentityRenaming)
+        let ragged = |r#type: &&'o Self| match *r#type {
+            Self::Ragged(r#type) => Some(r#type),
+            Self::Array(_) | Self::Dimension(_) | Self::Reference(_) => None,
+        };
+        derive_signature_identity_renaming(
+            declared,
+            actual,
+            |declared, actual| {
+                ArrayIrTypeRefinements::refinement_facts(declared, actual, DimensionComparison::IdentityRenaming).chain(
+                    ArrayIrTypeRefinements::indexed_refinement_facts(
+                        declared,
+                        actual,
+                        DimensionComparison::IdentityRenaming,
+                    ),
+                )
             },
-        ))
+            |declared, actual| {
+                Self::validate_identity_scope(declared.iter().copied())?;
+                Self::validate_identity_scope(actual.iter().copied())?;
+                RaggedType::validate_unrepeated_indexed_identities(declared.iter().filter_map(ragged))?;
+                RaggedType::validate_unrepeated_indexed_identities(actual.iter().filter_map(ragged))
+            },
+            DimensionRefinements::derive_identity_renaming,
+        )
     }
 
     #[inline]
@@ -222,6 +321,7 @@ impl Type for ArrayIrType {
             Self::Array(r#type) => Ok(Self::Array(r#type.rename_identities(renaming)?)),
             Self::Dimension(r#type) => Ok(Self::Dimension(r#type.rename_identities(renaming)?)),
             Self::Reference(r#type) => Ok(Self::Reference(r#type.rename_identities(renaming)?)),
+            Self::Ragged(r#type) => Ok(Self::Ragged(r#type.rename_identities(renaming)?)),
         }
     }
 
@@ -231,6 +331,7 @@ impl Type for ArrayIrType {
             (Self::Array(left), Self::Array(right)) => left.is_compatible_with(right),
             (Self::Dimension(left), Self::Dimension(right)) => left.is_compatible_with(right),
             (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+            (Self::Ragged(left), Self::Ragged(right)) => left.is_compatible_with(right),
             _ => false,
         }
     }
@@ -241,6 +342,7 @@ impl Type for ArrayIrType {
             (Self::Array(left), Self::Array(right)) => left.is_refined_by(right),
             (Self::Dimension(left), Self::Dimension(right)) => left.is_refined_by(right),
             (Self::Reference(left), Self::Reference(right)) => left.is_refined_by(right),
+            (Self::Ragged(left), Self::Ragged(right)) => left.is_refined_by(right),
             _ => false,
         }
     }
@@ -250,7 +352,7 @@ impl Type for ArrayIrType {
         match self {
             Self::Array(r#type) => r#type.is_scalar(),
             Self::Dimension(r#type) => r#type.is_scalar(),
-            Self::Reference(_) => false,
+            Self::Reference(_) | Self::Ragged(_) => false,
         }
     }
 
@@ -260,6 +362,7 @@ impl Type for ArrayIrType {
             Self::Array(r#type) => r#type.is_complex(),
             Self::Dimension(r#type) => r#type.is_complex(),
             Self::Reference(_) => false,
+            Self::Ragged(r#type) => r#type.is_complex(),
         }
     }
 
@@ -290,7 +393,7 @@ impl ReferenceMemberType for ArrayIrType {
     fn referent(&self) -> Option<&ArrayType> {
         match self {
             Self::Reference(r#type) => Some(r#type.referent()),
-            Self::Array(_) | Self::Dimension(_) => None,
+            Self::Array(_) | Self::Dimension(_) | Self::Ragged(_) => None,
         }
     }
 
@@ -298,7 +401,7 @@ impl ReferenceMemberType for ArrayIrType {
     fn as_referent(&self) -> Option<&ArrayType> {
         match self {
             Self::Array(r#type) => Some(r#type),
-            Self::Dimension(_) | Self::Reference(_) => None,
+            Self::Dimension(_) | Self::Reference(_) | Self::Ragged(_) => None,
         }
     }
 }
@@ -310,12 +413,26 @@ impl ReferenceMemberType for ArrayIrType {
 /// sharing exact facts across those links; ordinary nominal input admission still restricts array axes. A dimension
 /// member with singleton bounds contributes its exact extent. Wider dimension bounds supply no concrete fact; their
 /// declared variable belongs to the boundary's closed identity set (refer to the documentation of
-/// [`TypeIdentitySignature`](crate::TypeIdentitySignature) for more information), which lets
-/// output validation record its first concrete extent and reject inconsistent later extents.
+/// [`TypeIdentitySignature`](crate::TypeIdentitySignature) for more information), which lets output
+/// validation record its first concrete extent and reject inconsistent later extents.
+///
+/// Ragged members follow the same indexed rules as [`RaggedTypeRefinements`](crate::RaggedTypeRefinements), whose
+/// ragged-owned indexed scope this type composes. The only difference is that ragged storage contributes ordinary
+/// scalar shape facts to the scalar scope shared with every other member kind, so a storage axis and an array axis or
+/// first-class dimension with the same identity must agree. Identities referenced by [`RaggedDimension`] entries and
+/// those defined by dimension-item aggregates form separate indexed classes with retained extent coordinates, and the
+/// classes of both scopes are reported in mixed first-observation order. Exact indexed facts may refine dimension items
+/// but do not erase [`RaggedDimension`] entries or change storage bounds. Repeated indexed payloads retain
+/// runtime-check obligations even when their nominal types agree, and a scalar/indexed alias or ambiguous
+/// coordinate correspondence is rejected before either environment can supply an invalid substitution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayIrTypeRefinements {
-    /// [`ArrayTypeRefinements`] shared by array members and reference referents across the complete signature.
+    /// [`ArrayTypeRefinements`] shared by array members, reference referents, first-class dimensions, and ragged
+    /// storage across the complete signature.
     arrays: ArrayTypeRefinements,
+
+    /// Indexed identity scope of ragged members, deliberately isolated from scalar array and dimension facts.
+    ragged: RaggedDimensionRefinements,
 }
 
 impl ArrayIrTypeRefinements {
@@ -339,6 +456,9 @@ impl ArrayIrTypeRefinements {
             (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) => {
                 (Some((declared.referent(), actual.referent())), None, None)
             }
+            (ArrayIrType::Ragged(declared), ArrayIrType::Ragged(actual)) => {
+                (Some((declared.storage_type(), actual.storage_type())), None, None)
+            }
             // Keep cross-kind arms keyed on the declared variant so new members require an explicit policy.
             (ArrayIrType::Array(_), actual) => (
                 None,
@@ -354,6 +474,11 @@ impl ArrayIrTypeRefinements {
                 None,
                 None,
                 Some(TypeError::invalid(format!("expected reference type but got {} type", actual.kind_name()))),
+            ),
+            (ArrayIrType::Ragged(_), actual) => (
+                None,
+                None,
+                Some(TypeError::invalid(format!("expected ragged type but got {} type", actual.kind_name()))),
             ),
         };
         error
@@ -372,6 +497,42 @@ impl ArrayIrTypeRefinements {
                 DimensionTypeRefinements::refinement_facts(declared, actual, comparison)
             }))
     }
+
+    /// Returns indexed occurrence and item facts of a ragged member pair, separately from its scalar storage facts.
+    /// Other member pairs have no indexed facts.
+    fn indexed_refinement_facts<'o>(
+        declared: &'o ArrayIrType,
+        actual: &'o ArrayIrType,
+        comparison: DimensionComparison,
+    ) -> impl Iterator<Item = Result<DimensionRefinementFact<'o>, TypeError>> {
+        let ragged = match (declared, actual) {
+            (ArrayIrType::Ragged(declared), ArrayIrType::Ragged(actual)) => Some((declared, actual)),
+            (ArrayIrType::Array(_), _)
+            | (ArrayIrType::Dimension(_), _)
+            | (ArrayIrType::Reference(_), _)
+            | (ArrayIrType::Ragged(_), _) => None,
+        };
+        ragged.into_iter().flat_map(move |(declared, actual)| {
+            RaggedDimensionRefinements::refinement_facts(declared, actual, comparison)
+        })
+    }
+
+    /// Checks an output signature against the scalar/indexed interpretation and extent coordinates of its inputs.
+    fn validate_indexed_scope<'o>(
+        &self,
+        types: impl IntoIterator<Item = &'o ArrayIrType>,
+        declared_scope: bool,
+    ) -> Result<(), TypeError> {
+        for r#type in types {
+            for identity in r#type.scalar_extent_identities() {
+                self.ragged.validate_scalar(identity, declared_scope)?;
+            }
+            if let ArrayIrType::Ragged(r#type) = r#type {
+                self.ragged.validate_ragged(r#type, &self.arrays, declared_scope)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
@@ -388,6 +549,11 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
         let actual = actual.into_iter().collect::<Vec<_>>();
         type_signature_pairs(declared.iter(), actual.iter())?.try_for_each(|(declared, actual)| {
             Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::Refinement)
+                .chain(Self::indexed_refinement_facts(
+                    declared.borrow(),
+                    actual.borrow(),
+                    DimensionComparison::Refinement,
+                ))
                 .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
         })?;
         Self::from_local_declarations(declared, actual)
@@ -402,14 +568,47 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
     {
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
-        let refinements = DimensionRefinements::from_refinement_facts(
-            type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?.flat_map(
-                |(declared, actual)| Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations),
-            ),
-        )?;
+        let pairs = type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?;
+
+        ArrayIrType::validate_identity_scope(declared.iter().map(Borrow::borrow))?;
+        ArrayIrType::validate_identity_scope(actual.iter().map(Borrow::borrow))?;
+
+        let refinements = DimensionRefinements::from_refinement_facts(pairs.clone().flat_map(|(declared, actual)| {
+            Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+        }))?;
+
+        // Ragged storage facts belong to the shared scalar scope above; the ragged--wned scope adds the indexed facts.
+        let ragged =
+            RaggedDimensionRefinements::from_local_declarations(pairs.clone().filter_map(|pair| match pair {
+                (ArrayIrType::Ragged(declared), ArrayIrType::Ragged(actual)) => Some((declared, actual)),
+                _ => None,
+            }))?;
+
         let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
-        let unproven = type_identities_needing_runtime_checks::<ArrayIrType, _>(&declared, &actual)?;
-        Ok(Self { arrays: ArrayTypeRefinements::from(refinements.with_identities_needing_runtime_checks(unproven)) })
+        let identities_needing_runtime_checks = ragged.merge_identities_needing_runtime_checks(
+            type_identities_needing_runtime_checks::<ArrayIrType, _>(&declared, &actual)?,
+            declared.iter().flat_map(|r#type| r#type.borrow().identities().map(|(_, identity)| identity)),
+            actual.iter().flatten().filter_map(|r#type| match r#type {
+                ArrayIrType::Ragged(r#type) => Some(r#type),
+                ArrayIrType::Array(_) | ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+            }),
+        );
+
+        let arrays = ArrayTypeRefinements::from(
+            refinements.with_identities_needing_runtime_checks(identities_needing_runtime_checks),
+        );
+        let ragged = ragged.with_identity_class_order(
+            &arrays,
+            pairs.flat_map(|(declared, actual)| {
+                Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+                    .map(|fact| (false, fact))
+                    .chain(
+                        Self::indexed_refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+                            .map(|fact| (true, fact)),
+                    )
+            }),
+        )?;
+        Ok(Self { arrays, ragged })
     }
 
     #[inline]
@@ -417,7 +616,7 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
     where
         <ArrayIrType as Type>::Identity: 'o,
     {
-        self.arrays.identity_classes()
+        self.ragged.identity_classes(&self.arrays)
     }
 
     #[inline]
@@ -439,15 +638,32 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
     {
         // Output validation uses declared-scope facts and never records actual-scope facts or correspondences.
         let mut refinements = self.arrays.dimension_refinements().clone();
-        type_signature_pairs(declared, actual)?.try_for_each(|(declared, actual)| {
-            Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::Refinement).try_for_each(
+        let mut ragged = self.ragged.clone();
+        let declared = declared.into_iter().collect::<Vec<_>>();
+        let actual = actual.into_iter().collect::<Vec<_>>();
+        let mut pairs = type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?;
+        ArrayIrType::validate_identity_scope(declared.iter().map(Borrow::borrow))?;
+        ArrayIrType::validate_identity_scope(actual.iter().map(Borrow::borrow))?;
+        self.validate_indexed_scope(declared.iter().map(Borrow::borrow), true)?;
+        self.validate_indexed_scope(actual.iter().map(Borrow::borrow), false)?;
+        pairs.try_for_each(|(declared, actual)| {
+            Self::refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(
                 |refinement_fact| match refinement_fact? {
                     DimensionRefinementFact::Declared(variable, extent) => {
                         refinements.validate_declared_extent(variable, extent, closed_identities)
                     }
                     DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
                 },
-            )
+            )?;
+            match (declared, actual) {
+                (ArrayIrType::Ragged(declared), ArrayIrType::Ragged(actual)) => {
+                    ragged.validate_declared_extents(declared, actual, closed_identities)
+                }
+                (ArrayIrType::Array(_), _)
+                | (ArrayIrType::Dimension(_), _)
+                | (ArrayIrType::Reference(_), _)
+                | (ArrayIrType::Ragged(_), _) => Ok(()),
+            }
         })
     }
 
@@ -470,6 +686,9 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
             ArrayIrType::Reference(r#type) => ArrayIrType::Reference(ReferenceType::new(
                 self.arrays.refine_declared(r#type.referent(), preserved_identities)?,
             )),
+            ArrayIrType::Ragged(r#type) => {
+                ArrayIrType::Ragged(self.ragged.refine_declared_type(r#type, &self.arrays, preserved_identities)?)
+            }
         })
     }
 
@@ -488,6 +707,9 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
             ArrayIrType::Reference(r#type) => ArrayIrType::Reference(ReferenceType::new(
                 self.arrays.refine_actual(r#type.referent(), preserved_identities)?,
             )),
+            ArrayIrType::Ragged(r#type) => {
+                ArrayIrType::Ragged(self.ragged.refine_actual_type(r#type, &self.arrays, preserved_identities)?)
+            }
         })
     }
 
@@ -515,6 +737,9 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
                     preferred_identities,
                 )?))
             }
+            (ArrayIrType::Ragged(declared), ArrayIrType::Ragged(actual)) => {
+                ArrayIrType::Ragged(self.ragged.retype_actual(declared, actual, &self.arrays, preferred_identities)?)
+            }
             _ => return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}"))),
         })
     }
@@ -522,10 +747,19 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::Array;
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::ragged::RaggedValue;
     use crate::arrays::types::data::DataType::F32;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionError, Shape};
+    use crate::arrays::types::ragged::RaggedDimension;
+    use crate::operations::DIMENSION_DATA_TYPE;
+    use crate::parameters::Placeholder;
+    use crate::programs::{Operation, ProgramBuilder, ProgramError, RegionInterface, Typed};
 
     use super::*;
 
@@ -783,6 +1017,275 @@ mod tests {
         assert_eq!(
             ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3))).dimensions(),
             &[Dimension::Static(3)],
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_ragged_projection() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let ragged = RaggedType::new(
+            ArrayType::new_static(F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let r#type = ArrayIrType::from(ragged.clone());
+        assert_eq!(<&RaggedType>::try_from(&r#type), Ok(&ragged));
+        assert_eq!(r#type.dimensions(), &[Dimension::Static(2), rows.into()]);
+        assert_eq!(r#type.to_string(), "ragged<f32[2, 3]; 1:rows over [0]>");
+        assert_eq!(r#type.as_array_type(), Err(TypeError::invalid("expected array type but got ragged type")));
+        assert_eq!(r#type.as_dimension_type(), Err(TypeError::invalid("expected dimension type but got ragged type")));
+        assert_eq!(
+            <&RaggedType>::try_from(&ArrayIrType::Array(ArrayType::scalar(F32))),
+            Err(TypeError::invalid("expected ragged type but got array type"))
+        );
+        assert_eq!(r#type.referent(), None);
+        assert_eq!(r#type.as_referent(), None);
+        assert!(!r#type.is_reference());
+        assert!(!r#type.is_scalar());
+        assert!(!r#type.is_complex());
+        assert_eq!(
+            r#type.validate_zero(),
+            Err(TypeError::invalid("zero construction for first-class ragged types is not supported yet"))
+        );
+        assert_eq!(
+            r#type.validate_one(),
+            Err(TypeError::invalid("one construction for first-class ragged types is not supported yet"))
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_validate_identity_scope() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let ragged: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        assert_eq!(ArrayIrType::validate_identity_scope([&ragged, &ragged]), Ok(()));
+        let scalar = ArrayIrType::Dimension(rows.clone().into());
+        let error =
+            TypeError::invalid("dimension identity `rows` is used as both a scalar extent and indexed ragged extents");
+        assert_eq!(ArrayIrType::validate_identity_scope([&scalar, &ragged]), Err(error.clone()));
+        assert_eq!(ArrayIrType::validate_identity_scope([&ragged, &scalar]), Err(error.clone()));
+
+        // Sealing a real region runs the same complete-scope validation before publishing the program.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(scalar);
+        let input = builder.add_input(ragged);
+        assert_eq!(
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![input],
+                    vec![Placeholder; 2],
+                    vec![Placeholder]
+                )
+                .unwrap_err(),
+            ProgramError::Type(error)
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_validate_identity_scope_extent_coordinates() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let first: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 3, 5]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0, 2])],
+        )
+        .unwrap()
+        .into();
+        let permuted: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [5, 2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows.clone(), vec![0, 1])],
+        )
+        .unwrap()
+        .into();
+        assert_eq!(ArrayIrType::validate_identity_scope([&first, &permuted]), Ok(()));
+        let different: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [4, 3, 5]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0, 2])],
+        )
+        .unwrap()
+        .into();
+        assert_eq!(
+            ArrayIrType::validate_identity_scope([&first, &different]),
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates"))
+        );
+        let ambiguous: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows.clone(), vec![0, 1])],
+        )
+        .unwrap()
+        .into();
+        assert_eq!(
+            ArrayIrType::validate_identity_scope([&ambiguous, &ambiguous]),
+            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated extent coordinates"))
+        );
+
+        // Repeated occurrences may reuse an explicit correspondence within the same carrier.
+        let repeated = RaggedType::new(
+            ArrayType::new_static(F32, [2, 2, 3, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows.clone(), vec![0, 1]), RaggedDimension::new(3, rows, vec![0, 1])],
+        )
+        .unwrap();
+        assert_eq!(ArrayIrType::validate_identity_scope([ArrayIrType::Ragged(repeated)]), Ok(()));
+    }
+
+    #[test]
+    fn test_array_ir_type_derive_identity_renaming_ragged() {
+        let bounds = DimensionBounds::non_negative(Some(4)).unwrap();
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let declared: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 3, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, first.clone(), vec![0]), RaggedDimension::new(2, second.clone(), vec![0, 1])],
+        )
+        .unwrap()
+        .into();
+        let actual: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 3, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, second.clone(), vec![0]), RaggedDimension::new(2, first.clone(), vec![0, 1])],
+        )
+        .unwrap()
+        .into();
+        let renaming = ArrayIrType::derive_identity_renaming([&declared], [&actual]).unwrap();
+        assert_eq!(renaming.rename(&first), second);
+        assert_eq!(renaming.rename(&second), first);
+        assert_eq!(declared.rename_identities(&renaming), Ok(actual));
+    }
+
+    #[test]
+    fn test_array_ir_type_ragged_program_rejects_unproved_payload_equality() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let ragged = RaggedType::new(
+            ArrayType::new_static(F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let first = builder.add_input(ragged.clone().into());
+        builder.add_input(ragged.clone().into());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![first],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:ragged<f32[2, 3]; 1:rows over [0]>, %1:ragged<f32[2, 3]; 1:rows over [0]> .
+            in (%0)
+        "}
+            .trim_end()
+        );
+        let first = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                ragged.clone(),
+                Array::from_elements(ragged.storage_type().clone(), &[1f32, 2., 0., 3., 4., 0.]).unwrap(),
+                vec![Array::from_elements(ArrayType::new_static(DIMENSION_DATA_TYPE, [2]), &[1i64, 2]).unwrap()],
+            )
+            .unwrap(),
+        );
+        let second = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                ragged.clone(),
+                Array::from_elements(ragged.storage_type().clone(), &[1f32, 2., 0., 3., 4., 0.]).unwrap(),
+                vec![Array::from_elements(ArrayType::new_static(DIMENSION_DATA_TYPE, [2]), &[2i64, 1]).unwrap()],
+            )
+            .unwrap(),
+        );
+        let refinements = ArrayIrTypeRefinements::new(
+            [ArrayIrType::Ragged(ragged.clone()), ArrayIrType::Ragged(ragged.clone())],
+            [first.r#type().into_owned(), second.r#type().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(refinements.identities_needing_runtime_checks(), &[rows]);
+        let declared = [ArrayIrType::Ragged(ragged.clone()), ArrayIrType::Ragged(ragged.clone())];
+        let actual = [ArrayIrType::Ragged(ragged)];
+        let count_error = TypeError::invalid("declared type count 2 does not match actual type count 1");
+        assert_eq!(ArrayIrType::derive_identity_renaming(&declared, &actual), Err(count_error.clone()));
+        assert_eq!(ArrayIrTypeRefinements::from_local_declarations(&declared, &actual), Err(count_error));
+        assert_eq!(program.interpret(vec![first, second]), Err(ProgramError::Concretization { message: "`guard` cannot check symbolic type relationships during interpretation; bind the operation through its context".to_owned() }));
+    }
+
+    #[test]
+    fn test_array_ir_type_ragged_program_imports_fresh_local_identities() {
+        /// Type-only producer of a fresh indexed family, used to test generic local-identity replay before packing
+        /// operations are introduced. The complete output type carries all of its semantic metadata.
+        #[derive(Clone)]
+        struct IndexedProducer(RaggedType);
+
+        impl Operation for IndexedProducer {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "test_indexed_producer"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(vec![self.0.clone().into()])
+            }
+
+            fn rename_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<DimensionVariable>,
+            ) -> Result<Self, TypeError> {
+                Ok(Self(self.0.rename_identities(renaming)?))
+            }
+        }
+
+        let dimension = DimensionType::new("local", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(dimension.clone()),
+            vec![],
+        )
+        .unwrap();
+        let mut source = ProgramBuilder::<ArrayIrValue<Array>, IndexedProducer>::new();
+        let output = source.add_instruction(IndexedProducer(r#type), Vec::new(), Vec::new(), None).unwrap()[0];
+        let source = source
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![output], vec![], vec![Placeholder])
+            .unwrap();
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, IndexedProducer>::new();
+        let first = destination.splice_program(&source, &[]).unwrap()[0];
+        let second = destination.splice_program(&source, &[]).unwrap()[0];
+        let program = destination
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![first, second],
+                vec![],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let identities = program.type_identity_signature().internal_identities();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1]);
+        assert_ne!(&identities[0], dimension.variable().unwrap());
+        assert_ne!(&identities[1], dimension.variable().unwrap());
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda  .
+            let %0:ragged<i64[2]; item=dimension<local ∈ [0, 8)>> = test_indexed_producer
+                %1:ragged<i64[2]; item=dimension<local ∈ [0, 8)>> = test_indexed_producer
+            in (%0, %1)
+        "}
+            .trim_end()
         );
     }
 
@@ -1093,6 +1596,28 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_type_refinements_identity_classes_mixed_observation_order() {
+        let indexed = DimensionVariable::new("indexed", DimensionBounds::non_negative(Some(5)).unwrap());
+        let scalar = DimensionVariable::new("scalar", indexed.bounds());
+        let ragged: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, indexed.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        let dimension = ArrayIrType::Dimension(scalar.clone().into());
+        let refinements = ArrayIrTypeRefinements::new([&ragged, &dimension], [&ragged, &dimension]).unwrap();
+        assert_eq!(
+            refinements.identity_classes().collect::<Vec<_>>(),
+            vec![
+                TypeIdentityClass::new(std::slice::from_ref(&indexed), std::slice::from_ref(&indexed), false),
+                TypeIdentityClass::new(std::slice::from_ref(&scalar), std::slice::from_ref(&scalar), false)
+            ]
+        );
+    }
+
+    #[test]
     fn test_array_ir_type_refinements_validate_refinement() {
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
         let [n, m, p] = ["n", "m", "p"].map(|name| DimensionVariable::new(name, bounds));
@@ -1310,6 +1835,113 @@ mod tests {
         assert_eq!(
             refinements.retype_actual(&declared[1], &wide.into(), &retained),
             Ok(ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3)))),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_refinements_retype_actual_ragged_indexed_representatives() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [declared_identity, first_identity, second_identity] =
+            ["declared", "first", "second"].map(|name| DimensionVariable::new(name, bounds));
+        let declared: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, declared_identity.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        let first: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, first_identity.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        let second: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, second_identity.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        let refinements =
+            ArrayIrTypeRefinements::from_local_declarations([&declared, &declared], [&first, &second]).unwrap();
+        assert_eq!(refinements.identities_needing_runtime_checks(), &[declared_identity]);
+        assert_eq!(refinements.retype_actual(&declared, &second, &[first_identity]), Ok(first));
+        assert_eq!(refinements.retype_actual(&declared, &second, &[]), Ok(second));
+    }
+
+    #[test]
+    fn test_array_ir_type_refinements_preserve_ragged_storage_under_exact_indexed_facts() {
+        let identity = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let descriptor = RaggedDimension::new(1, identity.clone(), vec![0]);
+        let array: ArrayIrType =
+            RaggedType::new(ArrayType::new_static(F32, [2, 4]), RaggedValueKind::Array, vec![descriptor])
+                .unwrap()
+                .into();
+        let dimension: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(identity.clone().into()),
+            vec![],
+        )
+        .unwrap()
+        .into();
+        let exact: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(Dimension::Static(3).into()),
+            vec![],
+        )
+        .unwrap()
+        .into();
+        let refinements =
+            ArrayIrTypeRefinements::from_local_declarations([&array, &dimension], [&array, &exact]).unwrap();
+        assert_eq!(refinements.refine_declared(&array, &[]), Ok(array.clone()));
+        assert_eq!(refinements.refine_actual(&array, &[]), Ok(array.clone()));
+        assert_eq!(refinements.retype_actual(&array, &array, &[]), Ok(array));
+        assert_eq!(refinements.refine_declared(&dimension, &[]), Ok(exact));
+        assert_eq!(
+            refinements.refine_declared(&ArrayIrType::Dimension(identity.clone().into()), &[]),
+            Ok(ArrayIrType::Dimension(identity.into()))
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_refinements_validate_refinement_ragged_scope() {
+        let identity = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let array: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, identity.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        let refinements = ArrayIrTypeRefinements::new([&array], [&array]).unwrap();
+        let scalar: ArrayIrType = DimensionType::from(identity.clone()).into();
+        let error =
+            TypeError::invalid("dimension identity `rows` is used as both a scalar extent and indexed ragged extents");
+        assert_eq!(
+            refinements.validate_refinement([&scalar], [&scalar], std::slice::from_ref(&identity)),
+            Err(error.clone())
+        );
+        let scalar_refinements = ArrayIrTypeRefinements::new([&scalar], [&scalar]).unwrap();
+        assert_eq!(
+            scalar_refinements.validate_refinement([&array], [&array], std::slice::from_ref(&identity)),
+            Err(error)
+        );
+        let different_extent_coordinates: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(F32, [3, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, identity.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        assert_eq!(
+            refinements.validate_refinement(
+                [&different_extent_coordinates],
+                [&different_extent_coordinates],
+                &[identity],
+            ),
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates"))
         );
     }
 
