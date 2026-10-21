@@ -886,8 +886,8 @@ impl RaggedDimensionRefinements {
         })
     }
 
-    /// Returns `unproven` extended with the declared indexed identities related to a repeated actual indexed
-    /// identity, ordered by first occurrence in `declared_identities`.
+    /// Returns `identities_needing_runtime_checks` extended with the declared indexed identities related to a
+    /// repeated actual indexed identity, ordered by first occurrence in `declared_identities`.
     ///
     /// Distinct declarations can enter through one repeated actual indexed family. Its payload equality is no stronger
     /// a type-level proof than repeating a declared indexed family, so every related declared identity keeps its
@@ -895,13 +895,13 @@ impl RaggedDimensionRefinements {
     ///
     /// # Parameters
     ///
-    ///   - `unproven`: Declared identities whose relationships the supplied types do not prove, as computed by
-    ///     [`type_identities_needing_runtime_checks`] for the complete signature.
+    ///   - `identities_needing_runtime_checks`: Declared identities whose relationships the supplied types do not
+    ///     prove, as computed by [`type_identities_needing_runtime_checks`] for the complete signature.
     ///   - `declared_identities`: Every identity of the declared signature, in signature order, with repetitions.
     ///   - `actual`: The ragged members of the actual signature, in signature order.
     pub(crate) fn merge_identities_needing_runtime_checks<'o>(
         &self,
-        mut unproven: Vec<DimensionVariable>,
+        mut identities_needing_runtime_checks: Vec<DimensionVariable>,
         declared_identities: impl IntoIterator<Item = &'o DimensionVariable>,
         actual: impl IntoIterator<Item = &'o RaggedType>,
     ) -> Vec<DimensionVariable> {
@@ -918,22 +918,20 @@ impl RaggedDimensionRefinements {
         for class in self.indexed.identity_classes() {
             if class.actual().iter().any(|identity| repeated.contains(&identity)) {
                 for identity in class.declared() {
-                    if !unproven.contains(identity) {
-                        unproven.push(identity.clone());
+                    if !identities_needing_runtime_checks.contains(identity) {
+                        identities_needing_runtime_checks.push(identity.clone());
                     }
                 }
             }
         }
         let mut ordered = Vec::new();
         for identity in declared_identities {
-            if unproven.contains(identity) && !ordered.contains(identity) {
+            if identities_needing_runtime_checks.contains(identity) && !ordered.contains(identity) {
                 ordered.push(identity.clone());
             }
         }
         ordered
     }
-
-    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates one scalar extent identity of an output signature against the indexed identities of the input
     /// signature in the selected scope.
@@ -946,7 +944,7 @@ impl RaggedDimensionRefinements {
             if declared_scope { &self.declared_extent_coordinates } else { &self.actual_extent_coordinates };
         if extent_coordinates.iter().any(|(indexed, _)| indexed == identity) {
             return Err(TypeError::invalid(format!(
-                "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents"
+                "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents",
             )));
         }
         Ok(())
@@ -974,7 +972,7 @@ impl RaggedDimensionRefinements {
                 if declared_scope { class.declared().contains(identity) } else { class.actual().contains(identity) }
             }) {
                 return Err(TypeError::invalid(format!(
-                    "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents"
+                    "dimension identity `{identity}` is used as both a scalar extent and indexed ragged extents",
                 )));
             }
             if let Some((_, previous)) = extent_coordinates.iter().find(|(candidate, _)| candidate == identity) {
@@ -994,12 +992,12 @@ impl RaggedDimensionRefinements {
                     || previous.iter().any(|coordinate| !coordinates.contains(coordinate))
                 {
                     return Err(TypeError::invalid(format!(
-                        "indexed dimension `{identity}` is indexed by incompatible extent coordinates"
+                        "indexed dimension `{identity}` is indexed by incompatible extent coordinates",
                     )));
                 }
                 if previous.iter().enumerate().any(|(index, coordinate)| previous[..index].contains(coordinate)) {
                     return Err(TypeError::invalid(format!(
-                        "indexed dimension `{identity}` has ambiguous repeated extent coordinates"
+                        "indexed dimension `{identity}` has ambiguous repeated extent coordinates",
                     )));
                 }
             }
@@ -1026,7 +1024,7 @@ impl RaggedDimensionRefinements {
 
     /// Applies declared-scope facts to a declared [`RaggedType`], refining its storage with the scalar scope `scalar`
     /// and its dimension item with the indexed scope, as described by [`TypeRefinements::refine_declared`].
-    pub(crate) fn refine_declared(
+    pub(crate) fn refine_declared_type(
         &self,
         r#type: &RaggedType,
         scalar: &ArrayTypeRefinements,
@@ -1038,6 +1036,7 @@ impl RaggedDimensionRefinements {
                 self.indexed.refine_declared_dimension(dimension.dimension(), preserved_identities),
             )),
         };
+
         // An indexed exact fact does not remove a descriptor or its extent dependencies. Storage remains
         // at the declared bound; changing that representation requires an explicit cast, not refinement.
         RaggedType::new(
@@ -1049,7 +1048,7 @@ impl RaggedDimensionRefinements {
 
     /// Applies actual-scope facts to a supplied [`RaggedType`], refining its storage with the scalar scope `scalar`
     /// and its dimension item with the indexed scope, as described by [`TypeRefinements::refine_actual`].
-    pub(crate) fn refine_actual(
+    pub(crate) fn refine_actual_type(
         &self,
         r#type: &RaggedType,
         scalar: &ArrayTypeRefinements,
@@ -1061,6 +1060,7 @@ impl RaggedDimensionRefinements {
                 self.indexed.refine_actual_dimension(dimension.dimension(), preserved_identities),
             )),
         };
+
         // As on the declared side, exact indexed extents retain their padded descriptor representation.
         RaggedType::new(
             scalar.refine_actual(r#type.storage_type(), preserved_identities)?,
@@ -1089,12 +1089,14 @@ impl RaggedDimensionRefinements {
                     preferred_identities,
                 )))
             }
+
             // The comparison above already rejects mismatched value kinds with this diagnostic.
             (RaggedValueKind::Array, RaggedValueKind::Dimension(_))
             | (RaggedValueKind::Dimension(_), RaggedValueKind::Array) => {
                 return Err(TypeError::invalid("ragged types have different value kinds"));
             }
         };
+
         let ragged_dimensions = declared
             .ragged_dimensions()
             .iter()
@@ -1105,6 +1107,7 @@ impl RaggedDimensionRefinements {
                     &actual.dimension().clone().into(),
                     preferred_identities,
                 );
+
                 // A static fact cannot discard a live payload or adapt padded storage. Dynamic selections
                 // preserve nominal relationships; construction below rejects incompatible storage bounds.
                 let dimension = match selected {
@@ -1114,6 +1117,7 @@ impl RaggedDimensionRefinements {
                 RaggedDimension::new(actual.axis(), dimension, actual.extent_axes().to_vec())
             })
             .collect();
+
         RaggedType::new(
             scalar.retype_actual(declared.storage_type(), actual.storage_type(), preferred_identities)?,
             value_kind,
@@ -1121,8 +1125,8 @@ impl RaggedDimensionRefinements {
         )
     }
 
-    /// Records the extent coordinates of the indexed identities of one already validated signature, without retaining
-    /// value or storage payloads.
+    /// Records the extent coordinates of the indexed identities of one already validated signature,
+    /// without retaining value or storage payloads.
     fn extent_coordinates<'o>(
         types: impl IntoIterator<Item = &'o RaggedType>,
     ) -> Vec<(DimensionVariable, Vec<Dimension>)> {
@@ -1205,12 +1209,14 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         }))?;
         let ragged = RaggedDimensionRefinements::from_local_declarations(pairs.clone())?;
         let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
-        let unproven = ragged.merge_identities_needing_runtime_checks(
+        let identities_needing_runtime_checks = ragged.merge_identities_needing_runtime_checks(
             type_identities_needing_runtime_checks::<RaggedType, _>(&declared, &actual)?,
             declared.iter().flat_map(|r#type| r#type.borrow().identities().map(|(_, identity)| identity)),
             actual.iter().flatten().copied(),
         );
-        let storage = ArrayTypeRefinements::from(storage.with_identities_needing_runtime_checks(unproven));
+        let storage = ArrayTypeRefinements::from(
+            storage.with_identities_needing_runtime_checks(identities_needing_runtime_checks),
+        );
         let ragged = ragged.with_identity_class_order(
             &storage,
             pairs.flat_map(|(declared, actual)| {
@@ -1296,7 +1302,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         r#type: &RaggedType,
         preserved_identities: &[DimensionVariable],
     ) -> Result<RaggedType, TypeError> {
-        self.ragged.refine_declared(r#type, &self.storage, preserved_identities)
+        self.ragged.refine_declared_type(r#type, &self.storage, preserved_identities)
     }
 
     #[inline]
@@ -1305,7 +1311,7 @@ impl TypeRefinements<RaggedType> for RaggedTypeRefinements {
         r#type: &RaggedType,
         preserved_identities: &[DimensionVariable],
     ) -> Result<RaggedType, TypeError> {
-        self.ragged.refine_actual(r#type, &self.storage, preserved_identities)
+        self.ragged.refine_actual_type(r#type, &self.storage, preserved_identities)
     }
 
     #[inline]
