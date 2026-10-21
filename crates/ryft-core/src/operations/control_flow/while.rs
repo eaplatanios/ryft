@@ -1053,6 +1053,9 @@ where
                     driver.align_batch_axis(context, input, Axis::from(0))
                 }
                 ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Ok(input),
+                ArrayIrType::Ragged(_) => Err(BatchingError::UnsupportedOperation {
+                    message: "first-class ragged while batching is not yet supported".to_owned(),
+                }),
                 ArrayIrType::Dimension(_) => {
                     input.validate_replicated_dimension()?;
                     Ok(input)
@@ -1136,7 +1139,7 @@ where
                 .zip(inputs.iter())
                 .map(|(axis, input)| match input.unbatched_type() {
                     ArrayIrType::Array(_) => BatchAxis::new(0),
-                    ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => *axis,
+                    ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => *axis,
                 })
                 .collect::<Vec<_>>();
             if masked_state_axes != state_axes || batched_condition.output_axes()[0] != BatchAxis::new(0) {
@@ -1163,7 +1166,7 @@ where
             let predicate_type = condition_region.output_types()[0].clone();
             let predicate_rank = match predicate_type {
                 ArrayIrType::Array(predicate) => predicate.rank(),
-                ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => 0,
+                ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => 0,
             };
             if predicate_rank > 0
                 && state_axes.iter().zip(inputs).any(|(axis, input)| {
@@ -1370,6 +1373,11 @@ impl WhileType for ArrayType {
 
 impl WhileType for ArrayIrType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
+        if let Some(r#type) = state_types.iter().find(|r#type| matches!(r#type, Self::Ragged(_))) {
+            return Err(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` does not support first-class ragged state `{type}`",
+            )));
+        }
         let Self::Array(predicate) = condition_output else {
             return Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got {condition_output}"
@@ -1382,7 +1390,7 @@ impl WhileType for ArrayIrType {
             predicate,
             state_types.iter().filter_map(|state_type| match state_type {
                 Self::Array(state_type) => Some(state_type),
-                Self::Dimension(_) | Self::Reference(_) => None,
+                Self::Dimension(_) | Self::Reference(_) | Self::Ragged(_) => None,
             }),
         )?;
         // A reference's referent changes with every iteration that writes it, so it follows the same variation rule
@@ -1392,7 +1400,7 @@ impl WhileType for ArrayIrType {
             state_types.iter().filter_map(|state_type| match state_type {
                 Self::Array(state_type) => Some(state_type),
                 Self::Reference(state_type) => Some(state_type.referent()),
-                Self::Dimension(_) => None,
+                Self::Dimension(_) | Self::Ragged(_) => None,
             }),
         )?;
         // Reference operations are effectful, and a batched predicate masks carries per batch item after the body ran
@@ -1945,6 +1953,7 @@ impl WhileResidualStackType for ArrayIrType {
     fn array_type(&self) -> Result<&ArrayType, TypeError> {
         match self {
             Self::Array(r#type) => Ok(r#type),
+            Self::Ragged(_) => Err(TypeError::invalid("first-class ragged bounded-while state is not yet supported")),
             Self::Dimension(r#type) => {
                 Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got `{type}`")))
             }
@@ -1960,6 +1969,7 @@ impl WhileResidualStackType for ArrayIrType {
             Self::Array(r#type) => Some(r#type),
             Self::Dimension(_) => None,
             Self::Reference(_) => None,
+            Self::Ragged(_) => None,
         }
     }
 }
@@ -3195,12 +3205,20 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
             Self::Reference(value) => Err(ProgramError::Concretization {
                 message: format!("cannot use reference `{value}` as a `while` predicate"),
             }),
+            Self::Ragged(_) => Err(ProgramError::Concretization {
+                message: "cannot use a first-class ragged value as a `while` predicate".to_owned(),
+            }),
         }
     }
 
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let predicate = match self {
             Self::Array(predicate) => predicate,
+            Self::Ragged(_) => {
+                return Err(ProgramError::Concretization {
+                    message: "cannot use a first-class ragged value as a `while` predicate".to_owned(),
+                });
+            }
             Self::Dimension(value) => {
                 return Err(ProgramError::Concretization {
                     message: format!("cannot use first-class dimension `{value}` as a `while` predicate"),
@@ -3213,6 +3231,9 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
             }
         };
         match (on_true, on_false) {
+            (Self::Ragged(_), _) | (_, Self::Ragged(_)) => Err(ProgramError::UnsupportedOperation {
+                message: "first-class ragged while state selection is not yet supported".to_owned(),
+            }),
             (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.mask_select(on_true, on_false)?)),
             (Self::Dimension(on_true), Self::Dimension(on_false)) => {
                 // Selecting between equal dimension carries (e.g., the loop-invariant mapped extent that structural
@@ -3284,7 +3305,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        MeshAxis, MeshAxisType, RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::batch;
@@ -3959,6 +3980,25 @@ mod tests {
             Ok(context.bind(WhileOperation::new(), regions.to_vec(), &[state])?.remove(0))
         });
         assert!(matches!(result, Err(DifferentiationError::Program(error)) if error == expected));
+    }
+
+    #[test]
+    fn test_while_type_validate_while_condition_output_rejects_first_class_ragged() {
+        let state = ArrayIrType::Ragged(
+            RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            ArrayIrType::validate_while_condition_output(
+                &ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
+                std::slice::from_ref(&state),
+            ),
+            Err(TypeError::invalid(format!("`while` does not support first-class ragged state `{state}`",))),
+        );
     }
 
     #[test]

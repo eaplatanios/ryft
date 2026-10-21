@@ -177,7 +177,7 @@ impl ConcatenateOperation<ArrayIrType> {
                 ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
                 ))),
-                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
                 ))),
             };
@@ -445,7 +445,7 @@ where
                     "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
                 ))
                 .into()),
-                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
                 ))
                 .into()),
@@ -626,7 +626,7 @@ impl_differentiable_operation! {
                          extent",
                     ))
                     .into()),
-                    ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
                         "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
                     ))
                     .into()),
@@ -800,7 +800,7 @@ impl_differentiable_operation! {
                         "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array before its result extent",
                     ))
                     .into()),
-                    ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
                         "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
                     ))
                     .into()),

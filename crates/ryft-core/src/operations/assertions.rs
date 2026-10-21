@@ -124,11 +124,11 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProvider,
-    ProgramError, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, RegionInterface,
-    Type, TypeError, TypeIdentity, TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDomainDispatch,
-    ValueProjection,
+    Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter,
+    OperationPayloadProjection, OperationProvider, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceEffect, ReferenceMemberType, RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Failure of a correctness assertion, including the named values observed at that assertion.
@@ -547,8 +547,8 @@ where
     }
 }
 
-impl<C: ContextProjection<ArrayType, Type = ArrayIrType, Value: Assert>> BatchableOperation<C, ArrayIrBatchingPolicy>
-    for AssertOperation<ArrayIrType>
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType, Value: Assert, Operation: OperationPayloadProjection>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for AssertOperation<ArrayIrType>
 where
     <C::Value as ValueProjection<ArrayType>>::Projected:
         ZeroLike + ConvertElementType + Select + DynamicSlice + Reshape + Reduce,
@@ -581,7 +581,12 @@ where
             .iter()
             .zip(&projected)
             .filter(|(_, projected)| **projected)
-            .map(|(input, _)| <ArrayIrBatchingPolicy as BatchingPolicyProjection<C, ArrayType>>::project_batch(input))
+            .map(|(input, _)| {
+                <ArrayIrBatchingPolicy as BatchingPolicyProjection<C, ArrayType>>::project_batch(
+                    context.parent(),
+                    input,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let projected_context =
             BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
@@ -1175,6 +1180,9 @@ impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
             Self::Reference(_) => {
                 Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() })
             }
+            Self::Ragged(_) => Err(ProgramError::UnsupportedOperation {
+                message: "assertion observations cannot be first-class ragged values".to_owned(),
+            }),
         }
     }
 
@@ -1185,6 +1193,9 @@ impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
             Self::Reference(_) => {
                 Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() })
             }
+            Self::Ragged(_) => Err(ProgramError::UnsupportedOperation {
+                message: "assertion observations cannot be first-class ragged values".to_owned(),
+            }),
         }
     }
 }

@@ -240,7 +240,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// ```
 ///
 /// Extract vector elements with ordinary array operations before crossing this gateway. This keeps indexing a general
-/// array concern and makes this operation the only numerical-data-to-dimension boundary:
+/// array concern and keeps this operation the numerical-data-to-scalar-dimension boundary:
 ///
 /// ```rust
 /// # use ryft_core::{

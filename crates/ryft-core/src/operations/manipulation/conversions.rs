@@ -1876,6 +1876,16 @@ impl CastType for ArrayIrType {
         operation: &CastOperation<Self>,
         input_types: &[Self],
     ) -> Result<(Self, Option<Self>), TypeError> {
+        if let Some(r#type) = input_types
+            .iter()
+            .chain(&operation.input_types)
+            .chain([&operation.output_type])
+            .find(|r#type| matches!(r#type, Self::Ragged(_)))
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` does not support first-class ragged type `{type}`",
+            )));
+        }
         let preserved = operation.validate_declaration(input_types)?;
         match (&input_types[0], &operation.output_type) {
             (Self::Array(input), Self::Array(output)) => {
@@ -2218,7 +2228,7 @@ impl CastType for ArrayIrType {
         let represent = |dimensions: Vec<Dimension>| match &operation.output_type {
             Self::Array(output) => Self::Array(output.clone().with_shape(Shape::new(dimensions))),
             Self::Dimension(_) => Self::Dimension(DimensionType::from(dimensions.into_iter().next().unwrap())),
-            Self::Reference(_) => unreachable!(),
+            Self::Reference(_) | Self::Ragged(_) => unreachable!(),
         };
 
         Ok((represent(dimensions), interpreted.map(represent)))
@@ -2404,6 +2414,11 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
             .filter_map(|witness| match witness {
                 ArrayIrValue::Array(value) => Some(Ok(value.clone())),
                 ArrayIrValue::Dimension(_) => None,
+                ArrayIrValue::Ragged(_) => Some(Err(TypeError::invalid(format!(
+                    "`{}` does not support first-class ragged type `{}`",
+                    CAST_OPERATION_NAME,
+                    witness.r#type(),
+                )))),
                 ArrayIrValue::Reference(_) => Some(Err(TypeError::invalid(format!(
                     "`{}` does not support reference type `{}`",
                     CAST_OPERATION_NAME,
@@ -2456,8 +2471,8 @@ mod tests {
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
         DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, RaggedAxis,
-        Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2,
-        f8e8m0fnu, i4, u2, u4,
+        RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension,
+        TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -8491,6 +8506,24 @@ mod tests {
                 &[ArrayType::new_static(DataType::F32, [2, 3]).into(), reference],
             ),
             Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
+        );
+    }
+
+    #[test]
+    fn test_cast_type_infer_cast_output_type_rejects_first_class_ragged_witnesses() {
+        let witness = ArrayIrType::Ragged(
+            RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let array = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let operation = CastOperation::checked(array.clone(), vec![array.clone(), witness.clone()]).unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[array, witness.clone()], &[]),
+            Err(TypeError::invalid(format!("`cast` does not support first-class ragged type `{witness}`",))),
         );
     }
 

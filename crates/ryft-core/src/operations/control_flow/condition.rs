@@ -44,11 +44,11 @@ use crate::partial::{
 };
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
-    OperationBoundaryPruning, OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder,
-    ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, RegionDataFlow, RegionDriver,
-    RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeRefinements,
-    Typed, Value, ValueProjection, discharge_positional_region_operation,
+    OperationBoundaryPruning, OperationPayloadProjection, OperationProjection, OperationProvider,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, RegionDataFlow,
+    RegionDriver, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
+    TypeRefinements, Typed, Value, ValueProjection, discharge_positional_region_operation,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -735,6 +735,7 @@ where
 // staged replay rejects branch-local type identities whose definition scopes would be lost when the branches flatten.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
 where
+    C::Operation: OperationPayloadProjection,
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
@@ -944,6 +945,9 @@ where
             .zip(false_outputs)
             .enumerate()
             .map(|(index, (true_output, false_output))| match true_output.unbatched_type() {
+                ArrayIrType::Ragged(_) => Err(BatchingError::UnsupportedOperation {
+                    message: "first-class ragged condition batching is not yet supported".to_owned(),
+                }),
                 ArrayIrType::Array(_) => {
                     <&ArrayType>::try_from(&false_output.unbatched_type())?;
                     select(&true_output, &false_output)
@@ -1431,7 +1435,7 @@ impl ConditionType for ArrayIrType {
     fn predicate_sharding(&self) -> Option<&Sharding> {
         match self {
             Self::Array(r#type) => r#type.predicate_sharding(),
-            Self::Dimension(_) | Self::Reference(_) => None,
+            Self::Dimension(_) | Self::Reference(_) | Self::Ragged(_) => None,
         }
     }
 
@@ -1442,6 +1446,9 @@ impl ConditionType for ArrayIrType {
         match self {
             Self::Array(output) => output.validate_condition_output(predicate),
             Self::Reference(output) => output.referent().validate_condition_output(predicate),
+            Self::Ragged(_) => Err(TypeError::invalid(format!(
+                "`{CONDITION_OPERATION_NAME}` does not support first-class ragged output `{self}`",
+            ))),
             Self::Dimension(_) => {
                 if predicate.sharding().is_none_or(|sharding| sharding.varying_manual_axes().is_empty()) {
                     return Ok(());
@@ -2430,7 +2437,7 @@ mod tests {
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
         DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
+        MeshAxisType, RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
@@ -13453,6 +13460,22 @@ mod tests {
                  produced under the varying predicate \
                  `bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]`",
             )),
+        );
+    }
+
+    #[test]
+    fn test_condition_type_validate_condition_output_rejects_first_class_ragged() {
+        let output = ArrayIrType::Ragged(
+            RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            output.validate_condition_output(&ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))),
+            Err(TypeError::invalid(format!("`condition` does not support first-class ragged output `{output}`",))),
         );
     }
 

@@ -183,6 +183,9 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, ZeroOperation<Ar
                 ))
                 .into());
             }
+            ArrayIrType::Ragged(_) => {
+                return Err(TypeError::invalid("cannot materialize a zero for a first-class ragged type").into());
+            }
         };
         check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &r#type)?;
         Ok(Self::Array(ArrayOperation::Zero(ZeroOperation::new(r#type))))

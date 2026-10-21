@@ -11,6 +11,7 @@ pub mod elements;
 pub mod ir;
 pub mod macros;
 pub mod operations;
+pub mod ragged;
 pub mod references;
 pub mod sharding;
 pub mod types;
@@ -36,6 +37,7 @@ pub use macros::dispatch_on_array_element_type;
 pub use operations::{
     ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, DimensionOperation, DimensionOperations,
 };
+pub use ragged::RaggedValue;
 pub use references::{
     ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayReferenceViewError,
@@ -47,6 +49,7 @@ pub use sharding::{
 pub use types::{
     ArrayIrType, ArrayIrTypeRefinements, ArrayType, ArrayTypeRefinements, AsArrayType, AsDimensionType, DataType,
     DataTypeError, Dimension, DimensionBounds, DimensionError, DimensionRefinements, DimensionType,
-    DimensionTypeRefinements, DimensionVariable, Layout, LayoutError, MAX_DIMENSION_EXTENT, Memory, Shape, StaticShape,
-    StridedLayout, Tile, TileDimension, TiledLayout,
+    DimensionTypeRefinements, DimensionVariable, Layout, LayoutError, MAX_DIMENSION_EXTENT, Memory, RaggedDimension,
+    RaggedType, RaggedTypeRefinements, RaggedValueKind, Shape, StaticShape, StridedLayout, Tile, TileDimension,
+    TiledLayout,
 };

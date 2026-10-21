@@ -171,6 +171,9 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, OneOperation<Arr
                 ))
                 .into());
             }
+            ArrayIrType::Ragged(_) => {
+                return Err(TypeError::invalid("cannot materialize a one for a first-class ragged type").into());
+            }
         };
         check_constructor_type_has_no_identity_references(ONE_OPERATION_NAME, &r#type)?;
         Ok(Self::Array(ArrayOperation::One(OneOperation::new(r#type))))

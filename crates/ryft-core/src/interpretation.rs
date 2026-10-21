@@ -615,6 +615,28 @@ impl<T: Type> ReplayTypeIdentities<T> {
                             }
                         }
                     }
+
+                    // Supplemental constructor definitions live in operation metadata rather than in standalone
+                    // definition-position values. Freshen them for this replay with the same simultaneous mapping
+                    // used by their output types and every dependent instruction.
+                    for instruction in region.instructions() {
+                        for identity in instruction.operation().type_identity_definitions().iter() {
+                            if signature.internal_identities().contains(identity)
+                                && !renaming.replacements().iter().any(|(source, _)| source == identity)
+                            {
+                                let unavailable = unavailable.get_or_insert_with(|| {
+                                    let mut identities = signature.identities().to_vec();
+                                    for input_type in input_types {
+                                        identities
+                                            .extend(input_type.identities().map(|(_, identity)| identity.clone()));
+                                    }
+                                    identities
+                                });
+                                let target = renaming.insert_fresh(identity.clone(), unavailable)?;
+                                unavailable.push(target);
+                            }
+                        }
+                    }
                 }
             }
             renaming
@@ -820,7 +842,7 @@ impl<T: Type> ReplayTypeIdentities<T> {
             .map(|(declared, actual)| (declared, actual.clone()))
             .unzip();
 
-        let definitions = declared
+        let mut definitions = declared
             .iter()
             .flat_map(Type::identities)
             .filter(|(position, identity)| {
@@ -828,11 +850,46 @@ impl<T: Type> ReplayTypeIdentities<T> {
             })
             .map(|(_, identity)| identity.clone())
             .collect::<Vec<_>>();
+        let supplemental = instruction.operation().type_identity_definitions();
+        for identity in supplemental.iter() {
+            if internal_identities.contains(identity) && !definitions.contains(identity) {
+                definitions.push(identity.clone());
+            }
+        }
         if definitions.is_empty() {
             return Ok(());
         }
 
-        let output_renaming = T::derive_identity_renaming(&declared, &actual)?;
+        let output_renaming = match T::derive_identity_renaming(&declared, &actual) {
+            Ok(renaming) => renaming,
+            Err(error) if supplemental.is_empty() => return Err(error.into()),
+            Err(_) => {
+                // Output definitions are established by the operation's runtime contract. Local output facts identify
+                // their names without pretending that structural substitution alone proves repeated indexed equality.
+                // Each definition still needs one unambiguous target; unrelated runtime identities cannot be merged.
+                let refinements = T::Refinements::from_local_declarations(&declared, &actual)?;
+                let mut output_renaming = TypeIdentityRenaming::new();
+                for class in refinements.identity_classes() {
+                    let sources = class.declared().iter().filter(|identity| definitions.contains(identity));
+                    for source in sources {
+                        match class.actual() {
+                            [] => {}
+                            [target] => output_renaming.insert(source.clone(), target.clone())?,
+                            _ => {
+                                return Err(TypeError::invalid(format!(
+                                    "operation `{}` output definition {} has multiple actual identities",
+                                    instruction.operation().name(),
+                                    source,
+                                ))
+                                .into());
+                            }
+                        }
+                    }
+                }
+                output_renaming
+            }
+        };
+
         let mut renaming = self.identity_renaming.borrow_mut();
         for (source, target) in output_renaming.replacements() {
             if source != target && definitions.contains(source) {
@@ -1425,7 +1482,9 @@ mod tests {
         NegOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::programs::regions::tests::{StructuralIdentity, StructuralOperation, StructuralType};
+    use crate::programs::regions::tests::{
+        StructuralIdentity, StructuralOperation, StructuralType, SupplementalIdentityOperation,
+    };
     use crate::programs::{
         AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, RegionId, RegionInterface,
         RegionSlot, TypeError,
@@ -1939,6 +1998,48 @@ mod tests {
                 "encountered output type f64[3] which is incompatible with the region's declared type f64[2]",
             )
             .into()),
+        );
+    }
+
+    #[test]
+    fn test_program_interpret_replayed_supplemental_identities() {
+        let identity = StructuralIdentity::new("local");
+        let operation = SupplementalIdentityOperation {
+            definitions: vec![identity.clone()],
+            outputs: vec![StructuralType::reference(identity.clone())],
+        };
+        let mut source = ProgramBuilder::<StructuralType, SupplementalIdentityOperation>::new();
+        let outputs = source.add_instruction(operation, Vec::new(), Vec::new(), None).unwrap().to_vec();
+        let source = source
+            .build::<Vec<StructuralType>, Vec<StructuralType>>(outputs, Vec::new(), vec![Placeholder])
+            .unwrap();
+        let context = TracingContext::<StructuralType, SupplementalIdentityOperation>::new();
+        let mut outputs = source.interpret_in_context(&context, Vec::new()).unwrap();
+        outputs.extend(source.interpret_in_context(&context, Vec::new()).unwrap());
+        let output_ids = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<StructuralType>, Vec<StructuralType>>(output_ids, Vec::new(), vec![Placeholder; 2])
+            .unwrap();
+        let identities = program.type_identity_signature().internal_identities();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1]);
+        assert_ne!(&identities[0], &identity);
+        assert_ne!(&identities[1], &identity);
+        for (instruction, identity) in program.instructions().iter().zip(identities) {
+            assert_eq!(instruction.operation().type_identity_definitions().as_ref(), std::slice::from_ref(identity));
+        }
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:definitions=[], references=[\"local\"] = supplemental_identity
+                    %1:definitions=[], references=[\"local\"] = supplemental_identity
+                in (%0, %1)
+            "}
+            .trim_end(),
         );
     }
 

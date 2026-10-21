@@ -37,6 +37,7 @@ use crate::operations::{
     NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
     ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
+    RaggedExtents, RaggedExtentsOperation, RaggedNew, RaggedNewOperation, RaggedStorage, RaggedStorageOperation,
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
@@ -366,6 +367,15 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
     DimensionToScalar(DimensionToScalarOperation),
 
+    /// Checks full extent payloads and assembles their padded storage into a first-class ragged representation.
+    RaggedNew(RaggedNewOperation),
+
+    /// Explicitly exposes a ragged representation's padded ordinary storage.
+    RaggedStorage(RaggedStorageOperation),
+
+    /// Explicitly exposes the full extent payload of one ragged storage-axis occurrence.
+    RaggedExtents(RaggedExtentsOperation),
+
     /// Creates a new whole-array reference root.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
@@ -564,6 +574,9 @@ pub trait ArrayIrOperations:
     + DimensionSize
     + DimensionFromScalar
     + DimensionToScalar
+    + RaggedNew
+    + RaggedStorage
+    + RaggedExtents
     + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
     + DynamicManipulationOperations<ArrayIrType>
     + DynamicRngBitGenerator<ArrayIrType>
@@ -578,6 +591,9 @@ impl<
         + DimensionSize
         + DimensionFromScalar
         + DimensionToScalar
+        + RaggedNew
+        + RaggedStorage
+        + RaggedExtents
         + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
         + DynamicManipulationOperations<ArrayIrType>
         + DynamicRngBitGenerator<ArrayIrType>,
@@ -3533,6 +3549,12 @@ mod tests {
         /// Updates a reference from an ordinary array without producing a value.
         ReferenceAndArrayToUnit,
 
+        /// Checked assembly of dense representation fields, optionally consuming an existing identity source.
+        FieldsToRagged,
+
+        /// Explicit decomposition of one ragged representation field into ordinary array data.
+        RaggedToArray,
+
         /// Consumes first-class dimensions as extents (or reads an array's extent as a dimension) without ever
         /// converting a value from one member kind into the other.
         DimensionMixed,
@@ -3576,6 +3598,10 @@ mod tests {
             ArrayIrOperation::ReferenceFreeze(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
+            ArrayIrOperation::RaggedNew(_) => MemberKindSignature::FieldsToRagged,
+            ArrayIrOperation::RaggedStorage(_) | ArrayIrOperation::RaggedExtents(_) => {
+                MemberKindSignature::RaggedToArray
+            }
             ArrayIrOperation::Reshape(_) => MemberKindSignature::DimensionMixed,
             ArrayIrOperation::Broadcast(_) => MemberKindSignature::DimensionMixed,
             ArrayIrOperation::Concatenate(_) => MemberKindSignature::DimensionMixed,
@@ -3686,6 +3712,19 @@ mod tests {
                 ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
                 MemberKindSignature::DimensionToArrayGateway,
             ),
+            (
+                ArrayIrOperation::RaggedNew(RaggedNewOperation::new(
+                    crate::RaggedType::new(
+                        ArrayType::new_static(DataType::F32, [8]),
+                        crate::RaggedValueKind::Array,
+                        vec![crate::RaggedDimension::new(0, first.clone(), vec![])],
+                    )
+                    .unwrap(),
+                )),
+                MemberKindSignature::FieldsToRagged,
+            ),
+            (ArrayIrOperation::RaggedStorage(RaggedStorageOperation), MemberKindSignature::RaggedToArray),
+            (ArrayIrOperation::RaggedExtents(RaggedExtentsOperation::new(0)), MemberKindSignature::RaggedToArray),
             (ArrayIrOperation::Reshape(DynamicReshapeOperation::new()), MemberKindSignature::DimensionMixed),
             (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::DimensionMixed),
             (
@@ -3830,7 +3869,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 42);
+        assert_eq!(expected.len(), 45);
         assert_eq!(
             expected
                 .iter()

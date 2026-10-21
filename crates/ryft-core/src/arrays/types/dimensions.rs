@@ -1170,53 +1170,6 @@ impl DimensionRefinements {
         Ok(renaming)
     }
 
-    /// Derives a structural renaming for complete declared and actual signatures of a [`Type`] whose facts span
-    /// several identity scopes (e.g., ordinary scalar extents and the indexed extents of ragged values), using
-    /// [`Self::derive_identity_renaming`] for the facts of every member pair.
-    ///
-    /// Members of an identity-free leading prefix contribute no cross-member facts. They are validated in place so that
-    /// ordinary static signatures retain an allocation-free structural path, and only the remaining suffix is buffered
-    /// and passed to `validate_scopes_fn` before its facts are consumed. A signature without identities therefore never
-    /// reaches `validate_scopes_fn`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `declared`: Declared signature whose identities are renamed.
-    ///   - `actual`: Corresponding actual signature supplying the target identities.
-    ///   - `refinement_facts_fn`: Returns the [`DimensionComparison::IdentityRenaming`] facts of one member pair,
-    ///     across all of the type's identity scopes.
-    ///   - `validate_scopes_fn`: Validates the buffered declared and actual suffixes, in that order, before
-    ///     their facts are consumed (e.g., rejecting an identity used in two incompatible scopes).
-    pub(crate) fn derive_signature_identity_renaming<
-        'o,
-        T: 'o + Type,
-        Facts: IntoIterator<Item = Result<DimensionRefinementFact<'o>, TypeError>>,
-    >(
-        declared: impl IntoIterator<Item = &'o T, IntoIter: ExactSizeIterator>,
-        actual: impl IntoIterator<Item = &'o T, IntoIter: ExactSizeIterator>,
-        refinement_facts_fn: impl Fn(&'o T, &'o T) -> Facts,
-        validate_scopes_fn: impl FnOnce(&[&'o T], &[&'o T]) -> Result<(), TypeError>,
-    ) -> Result<TypeIdentityRenaming<DimensionVariable>, TypeError> {
-        let mut pairs = type_signature_pairs(declared, actual)?;
-        let (declared, actual): (Vec<_>, Vec<_>) = loop {
-            let Some((declared, actual)) = pairs.next() else {
-                return Ok(TypeIdentityRenaming::new());
-            };
-            if declared.identities().next().is_none() && actual.identities().next().is_none() {
-                refinement_facts_fn(declared, actual).into_iter().try_for_each(|fact| fact.map(|_| ()))?;
-            } else {
-                break std::iter::once((declared, actual)).chain(pairs).unzip();
-            }
-        };
-        validate_scopes_fn(&declared, &actual)?;
-        Self::derive_identity_renaming(
-            declared
-                .into_iter()
-                .zip(actual)
-                .flat_map(|(declared, actual)| refinement_facts_fn(declared, actual)),
-        )
-    }
-
     /// Returns the [`DimensionRefinementFact`]s for one declared and one actual dimension, or their comparison error.
     /// [`DimensionComparison`] determines whether distinct identities with unknown extents are accepted and whether
     /// identical dimensions contribute facts. Structural comparisons preserve substitutions rather than infer
@@ -2366,53 +2319,6 @@ mod tests {
         assert_eq!(
             DimensionRefinements::derive_identity_renaming(facts),
             Err(TypeError::invalid("type identity `declared` is renamed to both `first` and `second`")),
-        );
-    }
-
-    #[test]
-    fn test_dimension_refinements_derive_signature_identity_renaming() {
-        fn facts<'o>(
-            declared: &'o DimensionType,
-            actual: &'o DimensionType,
-        ) -> impl Iterator<Item = Result<DimensionRefinementFact<'o>, TypeError>> {
-            DimensionTypeRefinements::refinement_facts(declared, actual, DimensionComparison::IdentityRenaming)
-        }
-
-        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
-        let [declared, actual] = ["declared", "actual"].map(|name| DimensionType::new(name, bounds));
-        let [two, three] = [2, 3].map(|extent| DimensionType::from(Dimension::Static(extent)));
-
-        // Identity-free signatures are compared in place and never reach scope validation.
-        let unreachable_scopes = |_: &[&DimensionType], _: &[&DimensionType]| -> Result<(), TypeError> {
-            panic!("identity-free signatures have no scopes to validate")
-        };
-        assert_eq!(
-            DimensionRefinements::derive_signature_identity_renaming([&three], [&three], facts, unreachable_scopes),
-            Ok(TypeIdentityRenaming::new()),
-        );
-        assert_eq!(
-            DimensionRefinements::derive_signature_identity_renaming([&three], [&two], facts, unreachable_scopes),
-            Err(TypeError::invalid("dimension type dimension<2> cannot instantiate declared type dimension<3>")),
-        );
-
-        // Only the suffix starting at the first member with identities is validated before deriving the renaming.
-        let renaming = DimensionRefinements::derive_signature_identity_renaming(
-            [&three, &declared, &two],
-            [&three, &actual, &two],
-            facts,
-            |declared_suffix, actual_suffix| {
-                assert_eq!(declared_suffix, [&declared, &two]);
-                assert_eq!(actual_suffix, [&actual, &two]);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(renaming.rename(&declared.to_variable()), actual.to_variable());
-        assert_eq!(
-            DimensionRefinements::derive_signature_identity_renaming([&declared], [&actual], facts, |_, _| {
-                Err(TypeError::invalid("invalid scope"))
-            }),
-            Err(TypeError::invalid("invalid scope")),
         );
     }
 

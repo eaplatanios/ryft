@@ -145,6 +145,9 @@ impl TemporalResidualType for ArrayIrType {
         Ok(match self {
             Self::Array(r#type) => Self::Array(r#type.clone()),
             Self::Dimension(_) => Self::Array(ArrayType::scalar(DIMENSION_DATA_TYPE)),
+            Self::Ragged(_) => {
+                return Err(TypeError::invalid("first-class ragged temporal residuals are not yet supported"));
+            }
             Self::Reference(_) => {
                 return Err(TypeError::invalid(
                     "a reference cannot be stored as a temporal residual; references are threaded as carries",
@@ -164,6 +167,9 @@ where
     fn residual_to_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
             ArrayIrType::Array(_) => None,
+            ArrayIrType::Ragged(_) => {
+                return Err(TypeError::invalid("first-class ragged temporal residuals are not yet supported"));
+            }
             ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
             ArrayIrType::Reference(_) => {
                 return Err(TypeError::invalid(
@@ -176,6 +182,9 @@ where
     fn residual_from_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
             ArrayIrType::Array(_) => None,
+            ArrayIrType::Ragged(_) => {
+                return Err(TypeError::invalid("first-class ragged temporal residuals are not yet supported"));
+            }
             ArrayIrType::Dimension(r#type) => Some(Self::from(DimensionFromScalarOperation::new(r#type.clone()))),
             ArrayIrType::Reference(_) => {
                 return Err(TypeError::invalid(

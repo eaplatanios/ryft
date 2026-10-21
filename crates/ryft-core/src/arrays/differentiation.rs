@@ -98,7 +98,11 @@ where
                 .into_iter()
                 .map(|(_, variable)| DimensionType::from(variable).into())
                 .collect(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => {
+                // Ragged zero materialization is rejected by the checked constructor until its extent residual protocol
+                // is available. This infallible declaration never treats padded storage as scalar dimension evidence.
+                Vec::new()
+            }
         }
     }
 
@@ -147,6 +151,11 @@ where
             }
             ArrayIrType::Reference(reference) => reference.referent(),
             ArrayIrType::Array(array_type) => array_type,
+            ArrayIrType::Ragged(_) => {
+                // Indexed logical extents are not scalar dimension evidence. Leave an unrelated candidate unused
+                // so a later ordinary dimension or array can still provide the requested dense zero's residual.
+                return Ok(None);
+            }
         };
 
         // Match the dimension identity before reading a reference or staging an extent query. The caller tries

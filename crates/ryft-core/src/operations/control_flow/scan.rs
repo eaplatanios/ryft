@@ -745,7 +745,7 @@ where
                         ArrayIrType::Array(r#type) => {
                             r#type.shape().dimensions().iter().any(|dimension| dimension.variable() == Some(variable))
                         }
-                        ArrayIrType::Reference(_) => false,
+                        ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => false,
                     })
                 })
             });
@@ -1610,6 +1610,9 @@ where
                     driver.align_batch_axis(context, input, Axis::from(0))
                 }
                 ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Ok(input),
+                ArrayIrType::Ragged(_) => Err(BatchingError::UnsupportedOperation {
+                    message: "first-class ragged scan batching is not yet supported".to_owned(),
+                }),
                 ArrayIrType::Dimension(_) => {
                     input.validate_replicated_dimension()?;
                     Ok(input)
@@ -2439,6 +2442,11 @@ impl ScanType for ArrayIrType {
                 "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body input count {stacked_input_end}",
             )));
         }
+        if let Some(r#type) = input_types.iter().find(|r#type| matches!(r#type, Self::Ragged(_))) {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` does not support first-class ragged input type `{type}`",
+            )));
+        }
         let mut body_input_types = vec![Self::Array(ArrayType::scalar(DataType::I64))];
         body_input_types.extend_from_slice(&input_types[..carry_count]);
         for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
@@ -2446,7 +2454,7 @@ impl ScanType for ArrayIrType {
             let stacked_type = match r#type {
                 Self::Array(r#type) => r#type,
                 Self::Reference(reference) => reference.referent(),
-                Self::Dimension(_) => {
+                Self::Dimension(_) | Self::Ragged(_) => {
                     return Err(TypeError::invalid(format!(
                         "`{SCAN_OPERATION_NAME}` stacked input {} must be an array or a reference but got `{type}`",
                         carry_count + index,
@@ -2529,7 +2537,7 @@ impl ScanType for ArrayIrType {
         let shape = |r#type: &Self| match r#type {
             Self::Array(r#type) => Some(r#type.shape().clone()),
             Self::Reference(r#type) => Some(r#type.referent().shape().clone()),
-            Self::Dimension(_) => None,
+            Self::Dimension(_) | Self::Ragged(_) => None,
         };
         // A first-class dimension carries its identity as itself, at a static extent when its bounds admit only one.
         let actual_dimension = |position: usize, axis: Option<usize>| match (&input_types[position], axis) {
@@ -2741,6 +2749,11 @@ fn composite_scan_boundary_types(
             body_types.len(),
         )));
     }
+    if let Some(r#type) = body_types.iter().find(|r#type| matches!(r#type, ArrayIrType::Ragged(_))) {
+        return Err(TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` does not support first-class ragged body {side} type `{type}`",
+        )));
+    }
     let mut boundary_types = body_types[..carry_count].to_vec();
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
         let index = carry_count + index;
@@ -2767,7 +2780,7 @@ fn composite_scan_boundary_types(
                     r#type = r#type,
                 )));
             }
-            (ArrayIrType::Dimension(_), _) => {
+            (ArrayIrType::Dimension(_) | ArrayIrType::Ragged(_), _) => {
                 return Err(TypeError::invalid(format!(
                     "`{SCAN_OPERATION_NAME}` stacked body {side} {} must be an array but got `{type}`",
                     index + usize::from(side == ScanBoundarySide::Input),
@@ -2840,7 +2853,7 @@ fn validate_scan_runtime_length(
             let stacked_type = match r#type {
                 ArrayIrType::Array(r#type) => Some(r#type),
                 ArrayIrType::Reference(reference) => Some(reference.referent()),
-                ArrayIrType::Dimension(_) => None,
+                ArrayIrType::Dimension(_) | ArrayIrType::Ragged(_) => None,
             };
             if !stacked_type.is_some_and(|r#type| r#type.rank() > 0 && length.has_equal_extents(&r#type.dimension(0))) {
                 return Err(TypeError::invalid(format!(
@@ -2858,7 +2871,7 @@ fn validate_scan_runtime_length(
         let stacked_type = match r#type {
             ArrayIrType::Array(r#type) => Some(r#type),
             ArrayIrType::Reference(reference) => Some(reference.referent()),
-            ArrayIrType::Dimension(_) => None,
+            ArrayIrType::Dimension(_) | ArrayIrType::Ragged(_) => None,
         };
         let leading_extent = match stacked_type {
             Some(r#type) if r#type.rank() > 0 => r#type.dimension(0).bounds().extent(),
@@ -4747,7 +4760,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, DataType,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        MeshAxis, MeshAxisType, RaggedType, RaggedValueKind, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchingTracer, RecursiveBatchingDriver, batch};
@@ -5901,6 +5914,39 @@ mod tests {
             Err(TypeError::invalid(
                 "`scan` body carry type signature mismatch: expected [f32[carry]] but got [f32[next]]"
             )),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_inference_composite_rejects_first_class_ragged_carries_and_stacks() {
+        let r#type = ArrayIrType::Ragged(
+            RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let body_inputs = [ArrayIrType::Array(ArrayType::scalar(DataType::I64)), r#type.clone()];
+        let error =
+            Err(TypeError::invalid(format!("`scan` does not support first-class ragged body input type `{type}`",)));
+        assert_eq!(
+            ArrayIrType::validate_scan_body_type_signature(
+                &body_inputs,
+                std::slice::from_ref(&r#type),
+                1,
+                &Dimension::Static(0),
+            ),
+            error,
+        );
+        assert_eq!(
+            ArrayIrType::validate_scan_body_type_signature(
+                &body_inputs,
+                std::slice::from_ref(&r#type),
+                0,
+                &Dimension::Static(2),
+            ),
+            error,
         );
     }
 

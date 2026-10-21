@@ -1244,6 +1244,12 @@ impl ShardMap {
                         ArrayIrType::Array(array_type) => array_type.sharding(),
                         ArrayIrType::Reference(reference_type) => reference_type.referent().sharding(),
                         ArrayIrType::Dimension(_) => None,
+                        ArrayIrType::Ragged(_) => {
+                            return Err(ProgramError::UnsupportedOperation {
+                                message: "first-class ragged values are not supported in `shard_map` bodies".to_owned(),
+                            }
+                            .into());
+                        }
                     };
                     let varying_axes = sharding.map(Sharding::varying_manual_axes);
                     if let Some(axis_name) = released_axes

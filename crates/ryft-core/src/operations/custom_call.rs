@@ -70,8 +70,8 @@ use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, EmptyRegionDriver, MemberOperation, Operation, OperationFormatter,
-    OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
+    OperationPayloadProjection, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
@@ -2507,7 +2507,8 @@ where
         + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: PartialEq + Value<Type = ArrayType> + Transpose>,
-    C::Operation: From<CustomCallOperation>
+    C::Operation: OperationPayloadProjection
+        + From<CustomCallOperation>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>

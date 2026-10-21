@@ -11,7 +11,7 @@ use crate::arrays::types::dimensions::{
 };
 use crate::operations::DIMENSION_DATA_TYPE;
 use crate::parameters::Parameter;
-use crate::programs::types::type_signature_pairs;
+use crate::programs::types::{derive_signature_identity_renaming, type_signature_pairs};
 use crate::programs::{
     NoReferent, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityClass, TypeIdentityPosition,
     TypeIdentityRenaming, TypeRefinements, type_identities_needing_runtime_checks,
@@ -571,7 +571,7 @@ impl Type for RaggedType {
     where
         Self: 'o,
     {
-        DimensionRefinements::derive_signature_identity_renaming(
+        derive_signature_identity_renaming(
             declared,
             actual,
             |declared, actual| {
@@ -592,6 +592,7 @@ impl Type for RaggedType {
                 Self::validate_unrepeated_indexed_identities(declared.iter().copied())?;
                 Self::validate_unrepeated_indexed_identities(actual.iter().copied())
             },
+            DimensionRefinements::derive_identity_renaming,
         )
     }
 
