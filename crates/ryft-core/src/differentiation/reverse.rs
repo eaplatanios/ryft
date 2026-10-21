@@ -6812,6 +6812,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_region_transpose_shared_normalizes_ineffective_zero_materialization() {
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+
+        // A zero-materialization flag only affects a returned non-reference cotangent. Flags on a reference input, on
+        // an ignored cotangent, and on the buffered cotangent of a non-reference input cannot change the transposed
+        // program, so they share the artifact of the unflagged arguments.
+        for destination_kinds in [
+            [CotangentDestinationKind::Reference, CotangentDestinationKind::Return],
+            [CotangentDestinationKind::Ignore, CotangentDestinationKind::Ignore],
+            [CotangentDestinationKind::Reference, CotangentDestinationKind::Reference],
+        ] {
+            let unflagged = region.transpose_shared(&[0, 1], &[false, false], &destination_kinds).unwrap();
+            let materialize_zeros = [true, destination_kinds[1] != CotangentDestinationKind::Return];
+            let flagged = region.transpose_shared(&[0, 1], &materialize_zeros, &destination_kinds).unwrap();
+            assert!(Arc::ptr_eq(flagged.program(), unflagged.program()));
+            assert_eq!(flagged.cotangents(), unflagged.cotangents());
+        }
+    }
+
+    #[test]
     fn test_program_transpose() {
         // Test that transposing an identity instruction forwards the output cotangent straight to the input.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -8826,6 +8861,49 @@ pub(crate) mod tests {
         for (actual, expected) in outputs[0].to_f64s().iter().zip(expected) {
             assert_abs_diff_eq!(actual, &expected, epsilon = 1e-9);
         }
+    }
+
+    #[test]
+    fn test_vjp_captures_no_zero_space_output_tangents() {
+        // The output `k: i32[n]` of `f(x, k) = (x, k)` has the zero-space tangent type `zero[n]`, whose zero needs
+        // the runtime extent `n`. Only an applied pushforward rebuilds that tangent, so the pullback reads no extent
+        // of `k`.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let key_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let x = context.input(scalar_type.clone().into());
+        let k = context.input(key_type.clone().into());
+        let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(inputs), vec![x.clone(), k.clone()], ()).unwrap();
+        assert!(pullback.residuals().is_empty());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // The pushforward of the same function reads the extent of `k` while linearizing and rebuilds its tangent
+        // from that extent when applied.
+        let (_, pushforward) = context.linearize(|inputs: Vec<_>, ()| Ok(inputs), vec![x, k], ()).unwrap();
+        let tangent = context.input(scalar_type.into());
+        let key_tangent = context.input(key_type.tangent().unwrap().into());
+        let tangents = pushforward.apply(vec![tangent, key_tangent]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                tangents.iter().map(|tangent| tangent.atom_id().unwrap()).collect(),
+                vec![Placeholder; 4],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:i32[n], %2:f32[], %3:zero[n] .
+                let %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %1
+                    %5:zero[n] = zero [type=zero[n]] %4
+                in (%2, %5)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
