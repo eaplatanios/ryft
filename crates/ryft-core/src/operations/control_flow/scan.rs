@@ -4186,9 +4186,9 @@ where
 ///      scan consumed them, making reverse mode through the scan total with no array-reversal operation.
 ///
 /// The returned cotangents place the reversed scan's carry cotangents at the carry-input positions, its scanned-output
-/// cotangents at the linear scanned-input positions, and a structural [`MaybeZero::Zero`] at the known scanned-input
-/// positions, which carry no cotangent. Known initializers promoted to internal linear state also receive a structural
-/// zero after their reversed carry cotangents have been computed. The body recursion happens through the
+/// cotangents at the live scanned-input positions, and a structural [`MaybeZero::Zero`] at known or disconnected
+/// scanned-input positions, which carry no cotangent. Known initializers promoted to internal linear state also receive
+/// a structural zero after their reversed carry cotangents have been computed. The body recursion happens through the
 /// instruction-scoped driver's transposition requests in the same operation family, so it introduces no recursive
 /// [`TransposableOperation`] obligation on `O`.
 ///
@@ -4499,7 +4499,7 @@ where
 
     // Reassemble one cotangent per input. The reversed scan outputs `[carry_cotangent..., scanned_input_cotangent...]`,
     // the carry cotangents (including the re-inserted zeros for known carries, and excluding the dropped dead reference
-    // carries) leading the scanned-input cotangents over the *linear* non-reference scanned inputs. Every carry input
+    // carries) leading the scanned-input cotangents over the live non-reference scanned inputs. Every carry input
     // precedes every scanned input, so a single sequential drain hands each retained carry input the next carry
     // cotangent and each live non-reference scanned input the next scanned-input cotangent in turn. Disconnected
     // scanned inputs and known scanned inputs carry structural zeros, consuming no scan outputs. Known initializers
@@ -16604,6 +16604,120 @@ mod tests {
             hessian.iter_blocks().map(|block| block.value().to_f64s()).collect::<Vec<_>>(),
             vec![vec![0f64; 9], vec![0f64; 9], vec![0f64; 9], vec![2f64, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0]],
         );
+    }
+
+    #[test]
+    fn test_scan_differentiation_disconnected_scanned_input_reverse_over_reverse() {
+        // The scan computes 3 * live² while ignoring every slice of `dead`. Differentiating its live gradient
+        // again must retain the zero in the dead slot through both reverse-mode boundaries.
+        let (first_derivative, (dead_cotangent, second_derivative)) =
+            differentiate_at((Array::vector(vec![7f64; 3]).unwrap(), Array::scalar(2f64).unwrap()))
+                .value_and_gradient(|inputs| {
+                    let (_, live_gradient) = differentiate_at(inputs).gradient(|(dead, live)| {
+                        let initial = live.domain().lift(Array::scalar(0f64).unwrap())?;
+                        let body = scalar_body(3, |builder, inputs| {
+                            let square = builder
+                                .add_instruction(MulOperation::new(), Vec::new(), vec![inputs[2], inputs[2]], None)
+                                .unwrap()[0];
+                            let next = builder
+                                .add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], square], None)
+                                .unwrap()[0];
+                            vec![next, inputs[2]]
+                        });
+                        Ok(bind_scan(TestScanOperation::new(2, 3), body, &[initial, live, dead])?.remove(0))
+                    })?;
+                    Ok(live_gradient)
+                })
+                .unwrap();
+        assert_eq!(first_derivative, Array::scalar(12f64).unwrap());
+        assert_eq!(dead_cotangent, Array::vector(vec![0f64; 3]).unwrap());
+        assert_eq!(second_derivative, Array::scalar(6f64).unwrap());
+    }
+
+    #[test]
+    fn test_scan_transposition_disconnected_scanned_input_batched_pullback() {
+        // Only the carry and the live stack have executable cotangent slots. Batching the pullback preserves
+        // that compact signature and stacks live cotangents behind the scan axis, leaving the dead slot structural.
+        let body = scalar_body(3, |builder, inputs| {
+            let next =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[3]], None).unwrap()[0];
+            vec![next]
+        });
+        let program = scan_program(
+            TestScanOperation::new(1, 3),
+            body,
+            vec![
+                ArrayType::scalar(DataType::F64),
+                ArrayType::new_static(DataType::F64, [3]),
+                ArrayType::new_static(DataType::F64, [3]),
+            ],
+        );
+        let pullback = program.entry_region_ref().transpose(&[0, 1, 2], &[], &[]).unwrap();
+        assert_eq!(
+            pullback.cotangents(),
+            &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output],
+        );
+        let batched = pullback
+            .program()
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        assert_eq!(batched.output_axes(), &[BatchAxis::new(0), BatchAxis::new(1)]);
+        let batched = batched.into_parts().0;
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[2], %2:f64[3, 2] = scan [carry_count=1, length=3, reverse=true] %0 [
+                    body={
+                        lambda %0:i64[], %1:f64[2] .
+                        in (%1, %1)
+                    },
+                ]
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            batched.interpret(vec![Array::vector(vec![2f64, 3.0]).unwrap()]),
+            Ok(vec![
+                Array::vector(vec![2f64, 3.0]).unwrap(),
+                Array::matrix(3, 2, vec![2f64, 3.0, 2.0, 3.0, 2.0, 3.0]).unwrap(),
+            ]),
+        );
+
+        // Exercise the public pullback boundary inside vmap as well: the disconnected cotangent remains a
+        // `MaybeZero::Zero` at each logical batch item rather than becoming a batched buffer of zeros.
+        let (carry_cotangent, live_cotangent) = batch(
+            |(initial, dead, live, seed)| {
+                let (_, pullback) = differentiate_at((initial, dead, live)).vjp(|(initial, dead, live)| {
+                    let body = scalar_body(3, |builder, inputs| {
+                        let next = builder
+                            .add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[3]], None)
+                            .unwrap()[0];
+                        vec![next]
+                    });
+                    Ok(bind_scan(TestScanOperation::new(1, 3), body, &[initial, dead, live])?.remove(0))
+                })?;
+                let (carry_cotangent, dead_cotangent, live_cotangent) = pullback.apply(seed)?;
+                assert!(matches!(
+                    dead_cotangent,
+                    MaybeZero::Zero(r#type) if r#type == ArrayType::new_static(DataType::F64, [3]),
+                ));
+                Ok((carry_cotangent.as_value().unwrap().clone(), live_cotangent.as_value().unwrap().clone()))
+            },
+            (
+                Array::vector(vec![1f64, 4.0]).unwrap(),
+                Array::matrix(2, 3, vec![7f64; 6]).unwrap(),
+                Array::matrix(2, 3, vec![1f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+                Array::vector(vec![2f64, 3.0]).unwrap(),
+            ),
+            (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(carry_cotangent, Array::vector(vec![2f64, 3.0]).unwrap());
+        assert_eq!(live_cotangent, Array::matrix(2, 3, vec![2f64, 2.0, 2.0, 3.0, 3.0, 3.0]).unwrap());
     }
 
     #[test]

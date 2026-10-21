@@ -5542,7 +5542,7 @@ mod tests {
             .unwrap();
         let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
             |(dead, live)| {
-                let predicate = live.compare(&live, ComparisonDirection::Equal).unwrap();
+                let predicate = live.compare(&(-live.clone()), ComparisonDirection::GreaterThan).unwrap();
                 predicate
                     .condition((dead, live), |(_, live)| Ok(live.clone() * live), |(_, live)| Ok(live))
                     .unwrap()
@@ -5554,6 +5554,82 @@ mod tests {
         .unwrap();
         let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
+        assert_eq!(
+            gradient.source_program().program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
+                    %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:bool[][sharding={mesh<['x'=1:auto]>, []}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                        callee={
+                            lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                            let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = neg %1
+                                %3:bool[][sharding={mesh<['x'=1:auto]>, []}] = compare [direction=GreaterThan] %1 %2
+                                %4:f32[][sharding={mesh<['x'=1:auto]>, []}], %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %3 %0 %1 [
+                                    true={
+                                        lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                        let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %1 %1
+                                        in (%2, %1)
+                                    },
+                                    false={
+                                        lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                        let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = zero [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
+                                        in (%1, %2)
+                                    },
+                                ]
+                                %6:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %3 %5 [
+                                    true={
+                                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                        in (%0)
+                                    },
+                                    false={
+                                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                        let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = zero [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
+                                        in (%1)
+                                    },
+                                ]
+                            in (%4, %3, %6)
+                        },
+                    ]
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %6 %7 [
+                        callee={
+                            lambda %0:bool[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                            let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %0 %1 [
+                                true={
+                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    in (%0)
+                                },
+                                false={
+                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = zero [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
+                                    in (%1)
+                                },
+                            ]
+                            in (%2)
+                        },
+                    ]
+                    %9:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 %8 [
+                        callee={
+                            lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:bool[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                            let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %1 %0 %2 [
+                                true={
+                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %1 %0
+                                        %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %1 %0
+                                        %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = add %2 %3
+                                    in (%4)
+                                },
+                                false={
+                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%3)
+                        },
+                    ]
+                in (%3, %9)"#},
+        );
         let concrete_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -5564,11 +5640,18 @@ mod tests {
             values_to_bytes::<f32>(&[2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let live =
-            XlaArray::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
-        let (zero, derivative) = engine.interpret(&gradient.executable_function(), (dead, live)).unwrap();
-        assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
-        assert_eq!(read_f32_array(&client, &derivative), vec![14.0]);
+        for (value, expected_derivative) in [(7.0, 14.0), (-7.0, 1.0)] {
+            let live = XlaArray::from_host_buffer(
+                &engine,
+                scalar_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[value]).as_slice(),
+            )
+            .unwrap();
+            let (zero, derivative) = engine.interpret(&gradient.executable_function(), (dead.clone(), live)).unwrap();
+            assert_eq!(read_f32_array(&client, &zero), vec![0.0; 3]);
+            assert_eq!(read_f32_array(&client, &derivative), vec![expected_derivative]);
+        }
     }
 
     #[test]
@@ -5622,6 +5705,42 @@ mod tests {
         .unwrap();
         let gradient: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
+        assert_eq!(
+            gradient.source_program().program().to_string(),
+            indoc! {r#"
+                lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
+                    %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:dimension<extent ∈ [1, 5)> = jit_call %0 %1 [
+                        callee={
+                            lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                            let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
+                                %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, length=extent, reverse=false] %1 %0 %2 [
+                                    body={
+                                        lambda %0:i64[], %1:f32[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                        let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = add %1 %1
+                                        in (%3)
+                                    },
+                                ]
+                            in (%3, %2)
+                        },
+                    ]
+                    %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 [
+                        callee={
+                            lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:dimension<extent ∈ [1, 5)> .
+                            let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, length=extent, reverse=true] %0 %1 [
+                                body={
+                                    lambda %0:i64[], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                                    let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = add %1 %1
+                                    in (%2)
+                                },
+                            ]
+                            in (%2)
+                        },
+                    ]
+                in (%3, %7)"#},
+        );
         let concrete_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();

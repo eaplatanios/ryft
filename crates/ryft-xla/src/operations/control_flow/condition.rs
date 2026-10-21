@@ -632,6 +632,155 @@ mod tests {
     }
 
     #[test]
+    fn test_transposed_condition_without_cotangent_outputs_executes_backward_effects_on_cpu() {
+        use ryft_core::{CustomFunctionTransposeOperation, PrintOperation, TransposedProgramCotangent};
+
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let branch = |label| {
+            let mut backward = CompositeXlaProgramBuilder::new();
+            let seed = backward.add_input(scalar_type.clone().into());
+            backward
+                .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![seed], None)
+                .unwrap();
+            let zero =
+                backward.add_instruction(ZeroOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
+            let backward = backward
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let backward = builder.import_region(backward.entry_region_ref());
+            let input = builder.add_input(scalar_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    CustomFunctionTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                        0,
+                        vec![scalar_type.clone().into()],
+                        vec![scalar_type.clone().into()],
+                    ),
+                    vec![backward],
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_branch = builder.import_region(branch("true backward").entry_region_ref());
+        let false_branch = builder.import_region(branch("false backward").entry_region_ref());
+        let predicate = builder.add_input(predicate_type.clone().into());
+        let input = builder.add_input(scalar_type.clone().into());
+        let output = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_branch, false_branch],
+                vec![predicate, input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        let program = transposed.into_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f64[], %1:bool[] .
+                let () = condition %1 %0 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = print [label=true backward] %0
+                            %2:f64[] = zero [type=f64[]]
+                        in ()
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = print [label=false backward] %0
+                            %2:f64[] = zero [type=f64[]]
+                        in ()
+                    },
+                ]
+                in ()"#},
+        );
+        let module = to_mlir_module_for_program(
+            program.as_ref(),
+            &[],
+            &vec![scalar_type, predicate_type],
+            &Vec::<ArrayType>::new(),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<i1>) {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = "stablehlo.if"(%arg1) ({
+                      %2 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "true backward"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      stablehlo.return %2 : !stablehlo.token
+                    }, {
+                      %2 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "false backward"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      stablehlo.return %2 : !stablehlo.token
+                    }) : (tensor<i1>) -> !stablehlo.token
+                    return
+                  }
+                }
+                "#},
+        );
+        let client = execution_client();
+        ensure_print_handler_registered(&client).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        for (predicate, expected) in [(true, "true backward: 7.0"), (false, "false backward: 7.0")] {
+            let inputs = vec![
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(&7f64.to_ne_bytes(), BufferType::F64, &[], None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(&[u8::from(predicate)], BufferType::Predicate, &[], None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ];
+            let (outputs, lines) = with_captured_prints(|| {
+                executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        Vec::new(),
+                        0,
+                        None,
+                        Some(file!()),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .block_until_ready()
+                    .unwrap()
+            });
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].outputs.len(), 0);
+            assert_eq!(lines, vec![expected]);
+        }
+    }
+
+    #[test]
     fn test_condition_without_outputs_executes_selected_effects_in_order_on_cpu() {
         use ryft_core::PrintOperation;
 

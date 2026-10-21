@@ -2211,7 +2211,9 @@ where
 ///
 /// Returns an error if the boundary counts disagree, the predicate has no known value, a branch cannot be transposed, a
 /// structural zero cannot be reconstructed from the available runtime extents, or the transposed condition cannot be
-/// bound in `context`. Callers must supply a validated condition boundary with matching branch signatures.
+/// bound in `context`. Manual-variation validation follows branch transposition because it needs the resulting
+/// cotangent metadata, so branch-transposition errors take precedence over manual-variation errors. Callers must supply
+/// a validated condition boundary with matching branch signatures.
 pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
     context: &mut TracingContext<V, O>,
     driver: &D,
@@ -2353,6 +2355,13 @@ where
         }
     }
 
+    if transposed_branches[0].cotangents() != transposed_branches[1].cotangents() {
+        return Err(ProgramError::InvalidArgument {
+            message: "condition branch transposition returned inconsistent cotangent metadata after materializing \
+                      one-sided zeros"
+                .to_owned(),
+        });
+    }
     let transposed_condition = ConditionOperation::new();
 
     // Stage the transposed condition over `[predicate, outputs..., cotangent_references..., residuals...]`. Its
@@ -2437,10 +2446,13 @@ mod tests {
     use crate::operations::assertions::AssertOperation;
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::tests::{CountingBatchingDriver, array, dimension, resolve_captures};
     use crate::operations::control_flow::r#while::WhileOperation;
     use crate::operations::custom_functions::operations::CustomFunctionTransposeOperation;
+    use crate::operations::debugging::PrintOperation;
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::DimensionAddOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
@@ -10182,7 +10194,7 @@ mod tests {
         // The `true` branch narrows `x: f32[n]` to `f32[2]` with a checked cast, while the `false` branch returns `y`.
         // Linearization retains one dimension<n> witness for the true branch's tangent cast. The false branch
         // supplies that witness's placeholder by reading x. Its disconnected x needs no separate residual. Condition
-        // transposition still materializes branch outputs in this phase, using the shared witness for its zero.
+        // transposition materializes each one-sided zero using the shared witness when its type needs runtime extents.
         type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
@@ -12383,6 +12395,40 @@ mod tests {
         )
         .unwrap();
         let linearization = program.into_flat_program().linearize_with_respect_to(&[1, 2]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[extent], %2:f32[2] .
+                let %3:f32[2], %4:f32[extent] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:f32[extent], %1:f32[2] .
+                        let %2:f32[2] = cast [type=f32[2], inputs=[f32[extent]], checked=true] %0
+                        in (%2, %0)
+                    },
+                    false={
+                        lambda %0:f32[extent], %1:f32[2] .
+                        in (%1, %0)
+                    },
+                ]
+                in (%3, %0, %4)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:f32[2], %2:bool[], %3:f32[extent] .
+                let %4:f32[2] = condition %2 %0 %1 %3 [
+                    true={
+                        lambda %0:f32[extent], %1:f32[2], %2:f32[extent] .
+                        let %3:f32[2] = cast [type=f32[2], inputs=[f32[extent], f32[extent]]] %0 %2
+                        in (%3)
+                    },
+                    false={
+                        lambda %0:f32[extent], %1:f32[2], %2:f32[extent] .
+                        in (%1)
+                    },
+                ]
+                in (%4)"},
+        );
         assert_eq!(linearization.residual_count(), 2);
         let pullback = linearization.pullback().unwrap();
         assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Output; 2]);
@@ -12405,9 +12451,10 @@ mod tests {
                 ]
                 in (%3, %4)"},
         );
-        for (predicate, x, expected) in [
-            (true, vec![2.0f32, 3.0], [vec![1.0f32, 2.0], vec![0.0f32, 0.0]]),
-            (false, vec![2.0f32, 3.0, 4.0], [vec![0.0f32, 0.0, 0.0], vec![1.0f32, 2.0]]),
+        for (predicate, x, expected_value, expected) in [
+            (true, vec![2.0f32, 3.0], vec![2.0f32, 3.0], [vec![1.0f32, 2.0], vec![0.0f32, 0.0]]),
+            (false, vec![2.0f32, 3.0], vec![5.0f32, 6.0], [vec![0.0f32, 0.0], vec![1.0f32, 2.0]]),
+            (false, vec![2.0f32, 3.0, 4.0], vec![5.0f32, 6.0], [vec![0.0f32, 0.0, 0.0], vec![1.0f32, 2.0]]),
         ] {
             let mut outputs = linearization
                 .primal()
@@ -12419,11 +12466,21 @@ mod tests {
                 .unwrap();
             let mut inputs = vec![Array::vector(vec![1.0f32, 2.0]).unwrap()];
             inputs.extend(outputs.split_off(1));
+            assert_eq!(outputs, vec![Array::vector(expected_value).unwrap()]);
             assert_eq!(
                 pullback.program().interpret(inputs),
                 Ok(expected.map(|values| Array::vector(values).unwrap()).to_vec()),
             );
         }
+        assert!(matches!(
+            linearization.primal().interpret(vec![
+                Array::scalar(true).unwrap(),
+                Array::vector(vec![2.0f32, 3.0, 4.0]).unwrap(),
+                Array::vector(vec![5.0f32, 6.0]).unwrap(),
+            ]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
+        ));
     }
 
     #[test]
@@ -12455,6 +12512,234 @@ mod tests {
                 .unwrap();
             assert_eq!(gradient, Array::scalar(expected_gradient).unwrap());
             assert_eq!(tangent, Array::scalar(expected_tangent).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_condition_differentiation_disconnected_input_reverse_over_reverse() {
+        for (input, expected) in [(2.0f64, 2.0f64), (-2.0f64, -12.0f64)] {
+            let second = differentiate_at(Array::scalar(input).unwrap())
+                .gradient(|input| {
+                    let ignored = input.context().lift(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap())?;
+                    let (_, gradient) = differentiate_at((ignored, input)).gradient(|(ignored, input)| {
+                        let zero = input.context().lift(Array::scalar(0.0f64).unwrap())?;
+                        let predicate = input
+                            .context()
+                            .bind(
+                                CompareOperation::new(ComparisonDirection::GreaterThan),
+                                Vec::new(),
+                                &[input.clone(), zero],
+                            )?
+                            .remove(0);
+                        predicate.condition(
+                            (ignored, input),
+                            |(_, value)| Ok(value.clone() * value),
+                            |(_, value)| Ok(value.clone() * value.clone() * value),
+                        )
+                    })?;
+                    Ok(gradient)
+                })
+                .unwrap();
+            assert_eq!(second, Array::scalar(expected).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_condition_differentiation_batches_pullbacks_with_structural_zeros() {
+        for (predicate, expected) in [(true, vec![4.0f64, 8.0, 12.0]), (false, vec![1.0f64, 2.0, 3.0])] {
+            let cotangents = batch(
+                |seed| {
+                    let context = seed.context();
+                    let ignored = context.lift(Array::vector(vec![7.0f64; 2]).unwrap())?;
+                    let live = context.lift(Array::scalar(2.0f64).unwrap())?;
+                    let predicate = context.lift(Array::scalar(predicate).unwrap())?;
+                    let (_, pullback) = context.vjp(
+                        |(ignored, live), predicate| {
+                            predicate.condition(
+                                (ignored, live),
+                                |(_, live)| Ok(live.clone() * live),
+                                |(_, live)| Ok(live),
+                            )
+                        },
+                        (ignored, live),
+                        predicate,
+                    )?;
+                    let (ignored, live) = pullback.apply(seed)?;
+                    assert_eq!(ignored, MaybeZero::Zero(ArrayType::new_static(DataType::F64, [2])));
+                    Ok(live.as_value().unwrap().clone())
+                },
+                Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(cotangents, Array::vector(expected).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_condition_transposition_omits_structural_zeros_through_nested_scan() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let vector = ArrayType::new_static(DataType::F64, [3]);
+        let branch = || {
+            let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            body.add_input(ArrayType::scalar(DataType::I64));
+            let carry = body.add_input(scalar.clone());
+            body.add_input(scalar.clone());
+            let next = body.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0];
+            let body =
+                body.build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let ignored = builder.add_input(vector.clone());
+            let carry = builder.add_input(scalar.clone());
+            let body = builder.import_program(body);
+            let output =
+                builder.add_instruction(ScanOperation::new(1, 3), vec![body], vec![carry, ignored], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let ignored = builder.add_input(vector.clone());
+        let live = builder.add_input(scalar.clone());
+        let branches = vec![builder.import_program(branch()), builder.import_program(branch())];
+        let output = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, ignored, live], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1, 2], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[] .
+                let %2:f64[] = condition %1 %0 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = scan [carry_count=1, length=3, reverse=true] %0 [
+                            body={
+                                lambda %0:i64[], %1:f64[] .
+                                let %2:f64[] = add %1 %1
+                                in (%2)
+                            },
+                        ]
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = scan [carry_count=1, length=3, reverse=true] %0 [
+                            body={
+                                lambda %0:i64[], %1:f64[] .
+                                let %2:f64[] = add %1 %1
+                                in (%2)
+                            },
+                        ]
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+        for predicate in [true, false] {
+            assert_eq!(
+                transposed
+                    .program()
+                    .interpret(vec![Array::scalar(2.0f64).unwrap(), Array::scalar(predicate).unwrap()]),
+                Ok(vec![Array::scalar(16.0f64).unwrap()])
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_transposition_preserves_zero_result_backward_effects() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let branch = |label| {
+            let mut backward = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let seed = backward.add_input(scalar.clone());
+            backward.add_instruction(PrintOperation::new(label), Vec::new(), vec![seed], None).unwrap();
+            let zero =
+                backward.add_instruction(ZeroOperation::new(scalar.clone()), Vec::new(), Vec::new(), None).unwrap()[0];
+            let backward =
+                backward.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let tangent = builder.add_input(scalar.clone());
+            let backward = builder.import_program(backward);
+            let carrier = CustomFunctionTransposeOperation::<Array, ArrayOperation<Array>>::from_backward_region(
+                0,
+                vec![scalar.clone()],
+                vec![scalar.clone()],
+            );
+            let output = builder.add_instruction(carrier, vec![backward], vec![tangent], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let tangent = builder.add_input(scalar.clone());
+        let branches =
+            vec![builder.import_program(branch("true backward")), builder.import_program(branch("false backward"))];
+        let output = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, tangent], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        assert!(transposed.program().effects().classes().is_ordered());
+        assert!(transposed.program().output_ids().is_empty());
+        assert_eq!(
+            transposed.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[] .
+                let () = condition %1 %0 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = print [label=true backward] %0
+                            %2:f64[] = zero [type=f64[]]
+                        in ()
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = print [label=false backward] %0
+                            %2:f64[] = zero [type=f64[]]
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let simplified = transposed.program().simplified().unwrap();
+        assert_eq!(
+            simplified.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[] .
+                let () = condition %1 %0 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = print [label=true backward] %0
+                        in ()
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = print [label=false backward] %0
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        // Standard-error capture is unavailable here. The retained ordered print and successful execution of both
+        // selected branches pin this path; backend tests additionally capture the actual callback output.
+        for program in [transposed.program().as_ref(), &simplified] {
+            assert!(program.effects().classes().is_ordered());
+            assert!(program.output_ids().is_empty());
+            for predicate in [true, false] {
+                assert_eq!(
+                    program.interpret(vec![Array::scalar(3.0f64).unwrap(), Array::scalar(predicate).unwrap()]),
+                    Ok(Vec::new())
+                );
+            }
         }
     }
 

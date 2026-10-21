@@ -6,7 +6,7 @@
 
 **Architecture review:** 2026-09-10; includes a targeted substrate and primary-source refresh
 
-**Targeted research update:** 2026-09-25; SkySynth shared-prefix specialization and ZML/LLMD
+**Targeted research updates:** 2026-09-25, SkySynth and ZML/LLMD; 2026-10-20, DeepInfer
 
 **Scope:** one inference system for agentic/RL rollouts, embedded use, and production online serving
 
@@ -113,6 +113,20 @@ contract; retain the established baselines. The concrete additions below are par
 loading, deployment artifacts, and startup/streaming measurements. They do not expand the initial hardware scope.
 The inspected ZML source revision contains compiler and loading infrastructure, but no LLMD server or DFlash
 implementation; its LLM CLI is not evidence for the server's scheduling or feature-combination correctness.
+
+### DeepInfer: execution mechanisms and release boundary
+
+The October 20 review pins DeepInfer to `774ce244b87cc0eb8d4b94ab9f5de2ab22049f01`. The release supports
+DeepSeek-V4.1-Flash offline execution on NVIDIA SM100 and Ascend 950; the complete cache service, stage disaggregation,
+and replica load balancing are not included. Its published prefill/decode curves use different deployments: four and
+64 SM100 GPUs respectively. These are specialized execution measurements, not a matched serving comparison with Ryft.
+
+The useful additions are confidence-aware verification budgets, explicit exact-versus-approximate state reconstruction,
+time-budgeted scheduling, and topology-aware MoE experiments. Existing async execution, portable provider, numerical
+contract, and state-service designs remain appropriate. DeepInfer's deployment guidance also motivates measuring cache
+lookup/fetch costs independently and comparing locality routing with shared storage. Its companion `deepseek-recipe`
+illustrates a separate protocol/conversation/token adapter boundary. None requires adding DeepSeek or a large MoE
+cluster to the initial Gemma milestone; the corresponding experiments below are gated on supported models and hardware.
 
 ### Durable conclusions
 
@@ -388,6 +402,22 @@ Prefix eligibility is the latest common token boundary reconstructible across al
 retention and recurrent checkpoints must not falsely advertise an arbitrary historical prefix. Test these contracts
 early with append-only, sliding-window, and tiny recurrent conformance state; production Qwen kernels can remain later.
 
+### Reconstruction semantics
+
+A reconstruction strategy declares whether it restores exact model state or changes the computation. Exact suffix
+replay requires a valid starting checkpoint and all dependencies; a sliding-window size alone does not bound the
+receptive field through multiple layers. DeepInfer's SWA bounded replay truncates attention within the replayed segment
+and is explicitly approximate. Do not transplant its window or checkpoint constants into Gemma or recurrent models.
+
+Keep exact restoration as the default. Any approximate strategy is an opt-in model capability with a named quality
+policy, cache/provenance identity, and separate acceptance results. Reconstructed approximate state cannot enter an
+exact-state cache or be represented as the unchanged training policy. Test long-context retrieval, repeated reuse,
+logits/logprobs, and downstream task quality against full recomputation. Declare incompatible modes such as prompt
+logprob scoring explicitly rather than returning partial or approximate scores under an exact contract.
+Budget ring-buffer capacity for the window, maximum speculative overwrite/backtracking, and in-flight accesses;
+preserve a completed checkpoint before overwrite.
+Validate wraparound and partial acceptance at checkpoint boundaries, including delayed copies and cancellation.
+
 ### Main types
 
 - `StatePool`: one physical allocation class on one device/memory tier.
@@ -427,6 +457,13 @@ the expected reuse value exceeds the transfer and capacity cost.
 
 Use a radix tree or block-hash tree only as an index. Keep it separate from physical allocation and tier I/O. This makes
 the index replaceable and avoids the large coupled cache-manager classes now being split in mature engines.
+
+For remote tiers, measure metadata lookup, storage fetch, host staging, and device swap-in separately. A metadata hit
+is not resident state. Compare local-affinity routing with a shared cache accessible to all workers under the same
+capacity and bandwidth budget; shared access may reduce routing imbalance but adds network and storage failure modes.
+Choose retention by measured reuse distance and avoided recompute cost, including storage write amplification and
+weight-version invalidation. Do not adopt multi-day retention or a dedicated storage cluster without that evidence.
+Layer-wise prefetch may overlap compute only when readiness fences and leased staging buffers prevent early use/reuse.
 
 ## 9. Scheduler design
 
@@ -472,6 +509,18 @@ reuse. Tests cover cancellation after enqueue, partial writes, out-of-order call
 
 Policies implement a small trait over immutable scheduler snapshots. The transition engine and resource invariants are
 not replaceable. Record every decision so a trace can be replayed deterministically.
+
+### Measured execution-cost budgets
+
+Refine token/page limits with a calibrated execution-time estimate using query tokens, existing context, state format,
+phase, and device topology. In Phase 2, compare fixed chunks with chunks chosen to fit a latency budget; retain hard
+memory/token limits, prediction-error margins, and a conservative fallback when estimates drift. Report cost-model
+error and retraining overhead, not only average chunk utilization. Deadline and fairness rules remain authoritative.
+
+For synchronized worker groups, budget the slowest participating rank and preserve collective ordering even for empty
+local work. Decode routing should consider both active sequence count and estimated attention bytes/work, rather than
+assuming equal request counts produce equal work. Test heterogeneous context lengths and skewed arrivals before
+replacing the simpler policy. Model- and hardware-specific fits are observations, not universal scheduling constants.
 
 ### Policy and numerical configuration
 
@@ -649,7 +698,8 @@ distribution; distribution-changing acceleration must be an explicit alternative
 
 - **Replay reproducibility:** repeat a request with a recorded RNG stream and execution configuration on a declared
   runtime/hardware scope. Specify the RNG counter mapping for sequence branches, token positions, and proposal draws
-  so cancellation and rejection do not silently perturb unrelated requests.
+  so cancellation and rejection do not silently perturb unrelated requests. Partition draws by sampling purpose
+  (proposal, acceptance, correction, ordinary sampling), independently of physical batch rows or compaction.
 - **Batch invariance:** invariance to batch composition and supported profile choices requires validated kernels and
   reduction strategies. Advertise the supported matrix and performance cost separately from replay reproducibility.
 - **Numerical agreement:** define tolerances for layers, logits, and both logprob forms across training, reference,
@@ -663,6 +713,11 @@ distribution; distribution-changing acceleration must be an explicit alternative
 Record weight version, RNG stream, sampling transforms, numerical mode, kernel/profile identity, and relevant compiler
 identity. Do not promise bitwise equivalence across arbitrary providers, topologies, or compiler revisions. Training
 and rollout parity gates validate the declared numerical and probability contract, not unexplained token equality.
+
+Test reproducibility across changes in batch membership, sequence order, profile buckets, and speculative lengths.
+Feature composition is explicit: DeepInfer's documented deterministic mode disables variable-length verification.
+Ryft must either prove the combined contract with stable RNG draw identities or reject/fall back for that combination;
+individual deterministic kernels and a request seed do not establish whole-engine reproducibility.
 
 ### Structured output
 
@@ -694,6 +749,26 @@ Prove the verifier's declared greedy or stochastic distribution contract, includ
 infer stochastic exactness from greedy agreement or from a method's headline claim. Charge feature extraction,
 draft weights/state, verification, rejected work, and reduced serving capacity to effective speedup. Adapt block size
 and enablement using measured latency, acceptance, concurrency, and memory limits.
+
+### Confidence-aware verification budgets
+
+Extend adaptive speculation to choose per-request verification prefix lengths under a shared token/time budget.
+Where the proposer supplies calibrated conditional acceptance estimates, use cumulative prefix survival and a measured
+whole-step cost curve, including sampler time and context-dependent timing corrections, to estimate accepted tokens
+per unit time. Preserve prefix closure: verifying a later proposal requires its predecessors. Confidence changes
+resource allocation, never the target verifier's acceptance rule.
+Prove that selection does not bias the target distribution: later draft outcomes/confidences must not improperly
+influence whether earlier tokens are verified. Track the provenance and age of feedback used for budget decisions,
+including overlapping steps; prefix closure alone is insufficient. Add statistical tests against fixed verification.
+Without a suitable confidence signal, retain fixed-length or empirically tuned verification; do not require a new
+confidence head in every model or confuse token probability with calibrated acceptance probability.
+
+Use fixed-capacity verification profiles with device-resident logical lengths and mappings. The host may select a
+capacity from completed historical statistics while device work finalizes current request lengths from ready signals;
+explicit dependencies and sequence generations prevent stale feedback after slot reuse. Charge padding, ranking,
+packing, and synchronization to the decision; keep mandatory target progress and fairness for low-confidence requests.
+Compare adaptive and fixed verification independently of draft-model choice across low and high concurrency. Revalidate
+calibration after weight updates, grammar changes, or workload shifts, and disable adaptation when it loses goodput.
 
 ## 13. RL and agentic integration
 
@@ -749,6 +824,19 @@ state pools, executables, and a local scheduler. PJRT/XLA handles the compiled c
 The external control plane owns membership, discovery, health, placement, rolling updates, draining, and retries. Do not
 use the existing ordered XLA artifact-exchange protocol as a service-discovery or fault-recovery protocol.
 
+### MoE topology and expert placement
+
+When an MoE model is selected, evaluate attention data parallelism with expert parallelism and phase-specific layouts.
+Sweep group size within the actual fabric; a larger expert group can improve expert batches while increasing dispatch,
+synchronization, and failure-domain costs. Compare specialized fused dispatch/compute/combine providers with unfused
+paths, including graph compatibility and simultaneous communication/workspace memory. Reuse semantic provider contracts.
+
+Measure per-expert demand and slowest-rank/mean step time. Add redundant hot-expert placement and periodic rebalancing
+only when skew justifies the extra weight memory and transfer cost. Version placement maps; fence weight moves and
+publish a consistent map across ranks before new dispatches can use it. Benchmark routing drift, cold experts, and
+rebalancing intervals including their stalls. On rank failure, recover the worker group coherently; changing EP size
+requires a newly validated topology/profile and state handoff, not an in-place change to outstanding collectives.
+
 ### Routing
 
 Route with a scored combination of:
@@ -782,6 +870,12 @@ workload demonstrate better SLO goodput.
 - Health/liveness/readiness, graceful drain, rolling model/adapter update, and reproducible configuration snapshots.
 - Tokenizer/chat-template adapters are CPU components and can scale separately from GPU workers.
 - Python bindings wrap the Rust API; they do not become an internal execution plane.
+
+Keep protocol conversion, a canonical conversation representation, model-specific prompt/token encoding, and streamed
+output parsing separate from execution. Use `deepseek-recipe` as a design reference, not a Gemma template dependency.
+Version templates with the tokenizer; test tool/reasoning boundaries, stop sequences split across chunks, token usage,
+and round-trip protocol fixtures. User text resembling control tokens must remain text unless explicitly encoded as
+trusted structure. Rendering a schema in a prompt does not enforce it: structured decoding remains an engine contract.
 
 ### Model loading and deployment artifacts
 
@@ -995,9 +1089,12 @@ Deliverables:
 - [ ] Evaluate grouped cascade decode attention with reusable runtime group metadata, ordinary paged fallback, and
       deadline/fairness bounds. Start with independent groups; gate hierarchy on measured benefit.
 - [ ] Tune chunked prefill and mixed `extend` execution against homogeneous profiles using token and state budgets.
-      Add deadlines/slack, fairness/starvation bounds, and deterministic scheduler decision replay.
+      Add deadlines/slack, fairness/starvation bounds, and deterministic scheduler decision replay. Compare calibrated
+      time-budgeted chunks with fixed chunks under mixed context lengths, including prediction error and fallback.
 - [ ] Add session pause/resume, retention/expiry, and cost-aware admission for tool-paused and bursty workloads.
 - [ ] Extend conformance coverage for each feature, including hybrid checkpoint validity and shared-prefix cancellation.
+      Validate ring wraparound, speculation headroom, and checkpoint-copy completion; keep approximate replay disabled
+      unless a separate model-specific quality contract and cache identity have been accepted.
 - [ ] Run controlled ablations for prefix retention, mixed execution, and lookahead, including cold-cache and hostile
       reuse distributions. Separately ablate cascade attention with prefix storage reuse held constant; vary group size,
       prefix/suffix lengths, and independent/nested roots. Charge grouping/planning costs and measure KV traffic.
@@ -1040,9 +1137,13 @@ Deliverables:
 - [ ] Add grammar compilation/masking and deterministic-span fast forwarding.
 - [ ] Add n-gram speculation, then compare compatible Gemma MTP and DFlash proposers with adaptive enablement/depth
       or block size. Validate feature-buffer ownership, target/draft compatibility, and sampling semantics before use.
+      Evaluate confidence-aware variable verification separately where calibrated signals exist; test determinism
+      combinations and charge padding/packing costs. No DSpark-specific model integration is required for Gemma.
 - [ ] Add quantized weights/KV and adapter/LoRA registry based on measured demand.
 - [ ] Bring up Qwen3.6 27B as the second model, including hybrid recurrent/attention state behind the existing
       `SequenceState` and scheduler contracts.
+- [ ] If an MoE model is selected, benchmark phase-specific attention-DP/EP layouts, fused expert providers, and skew.
+      Gate redundant expert placement/rebalancing on measured benefit and coherent map/weight publication.
 - [ ] Reach CUDA/ROCm provider parity for the supported feature slice or publish explicit capability degradation.
 
 Exit gate: multi-rank failures fail coherently; Gemma performance scales predictably; Qwen requires no scheduler or
@@ -1053,6 +1154,7 @@ request-lifecycle fork; advanced features improve their target traces without un
 Deliverables:
 
 - [ ] OpenAI-compatible service, lower-level protocol, auth/quota adapters, health/readiness, and graceful drain.
+      Add canonical conversation/encoding/stream-parser fixtures and verify structured-output enforcement boundaries.
 - [ ] Hot model/adapter load, rolling update, overload/load-shed policy, and operational runbooks.
 - [ ] Production trace capture/replay, capacity estimator, and configuration advisor.
 - [ ] Security review of model files, grammars, request limits, FFI plugins, and multi-tenant state isolation.
@@ -1070,7 +1172,10 @@ Deliverables:
 - [ ] Worker discovery/membership, KV-aware routing, replica placement, global state-event index, and autoscaling hooks.
 - [ ] Aggregated-versus-P/D profiler/simulator and online planner.
 - [ ] Versioned state-session handoff with measured transport providers and complete cleanup paths.
-- [ ] Host/remote state tiers only where reuse-value models show benefit.
+- [ ] Host/remote state tiers only where reuse-value models show benefit. Compare cache-local and shared-storage routing,
+      account for lookup/fetch/swap-in stalls and retention economics, and test partial-tier misses and storage failures.
+- [ ] Balance decode request counts and attention work separately; size prefill/decode capacity from measured demand.
+      Include spare-capacity cost and drain/migration tails in scaling and failure tests.
 - [ ] Multi-node rolling upgrade, drain, retry, and partition behavior.
 
 Exit gate: disaggregation beats aggregated serving on a declared workload/SLO/fabric after charging transfer and control
@@ -1188,6 +1293,14 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
   shared-prefix bursts complement held-out real agent traces; they cannot replace semantic or realistic workload tests.
 - For DFlash/MTP, compare no-speculation and optimized baselines across concurrency and block sizes under the same
   total device-memory budget. Measure streaming stalls and SLO goodput, not only acceptance or average tokens/user.
+- Separate directly counted accepted-token throughput from capacity estimates derived from step rate and assumed
+  acceptance. DeepInfer's pinned sweep/plot path applies a supplied acceptance factor; its benchmark filters expert
+  load-statistics flush intervals. Preserve those modes as diagnostics, but include periodic maintenance, rebalancing,
+  real acceptance/rejection, queueing, and all serving stages in end-to-end claims. Report the unfiltered time series.
+- For phase-separated results, publish prefill and decode GPU counts, fabric, cached/uncached input work, numerical
+  formats, and total deployment resources. Do not combine per-stage maxima into a claimed full-service rate.
+- Test exact versus approximate reconstruction separately. Evaluate task quality and long-context dependence alongside
+  speed, and never let approximate replay pass the controlled exact-state comparison by matching only short prompts.
 - Treat project-reported numbers as hypotheses until reproduced in this harness.
 
 ## 19. Risks and explicit mitigations
@@ -1349,3 +1462,15 @@ faster, more complete, and more production-proven is not.
 - [ZML backend compilation policy](https://github.com/zml/zml/blob/c6530f08d39d9c502bd2b3c7035d73bbaf7196c9/zml/Compiler.zig)
 - [DFlash paper](https://arxiv.org/abs/2602.06036)
 - [DFlash implementation and supported draft checkpoints](https://github.com/z-lab/dflash)
+
+### DeepInfer release review (2026-10-20)
+
+- [Pinned release scope](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/README.md)
+- [Deployment design and limitations](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/doc/inference_deployment_qa.md)
+- [Benchmark accounting](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/benchmark.py)
+- [Sweep configuration](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/run_sweep.sh)
+- [Acceptance-based throughput estimates](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py)
+- [DeepSeek Recipe protocol/encoding boundary](https://github.com/deepseek-ai/deepseek-recipe)
+- [Verification budget and feedback semantics](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/mtp_varlen.hpp)
+- [Device-side verification metadata](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/tilelang_ops/cuda/schedule_mtp_varlen.py)
+- [Request-local random sampling](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/tilelang_ops/cuda/random_sampling.py)
