@@ -53,16 +53,24 @@ where
         }
 
         // Inspect candidates before binding anything: another representation or merely equal bounds cannot supply
-        // this zero's complete type. The consumer owns the source; no exemplar is captured as a residual here.
-        let source = sources.into_iter().find(|source| source.r#type().as_ref() == &r#type).ok_or_else(|| {
-            ProgramError::UnsupportedOperation {
+        // this zero's complete type. The consumer owns the source; no exemplar is captured as a residual here. A
+        // source of a different type is rejected even when it names the same extents (e.g., the primal `i32[n]` of
+        // a `zero[n]` cotangent), because this universe has no first-class dimensions to carry them across types.
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == &r#type) else {
+            let source_types = sources.iter().map(|source| source.r#type().to_string()).collect::<Vec<_>>();
+            return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "cannot materialize a zero of type {type} because no value in scope has exactly that type",
+                    "cannot materialize a zero of type {} because no source has exactly that type (source types: [{}])",
+                    r#type,
+                    source_types.join(", "),
                 ),
-            }
-        })?;
+            });
+        };
 
-        Ok(context.bind(O::from(ZeroLikeOperation::new()), Vec::new(), std::slice::from_ref(source))?.remove(0))
+        Ok(context
+            .bind(O::from(ZeroLikeOperation::new()), Vec::new(), std::slice::from_ref(*source))?
+            .remove(0))
     }
 }
 
@@ -568,7 +576,9 @@ mod tests {
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiableType, ReverseModeDifferentiate, TransposedProgramCotangent};
+    use crate::differentiation::{
+        DifferentiableType, Differentiate, ReverseModeDifferentiate, TransposedProgramCotangent,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ReferenceType;
 
@@ -681,10 +691,6 @@ mod tests {
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::unbounded()).into()]),
         ));
-        let expected = Err(ProgramError::UnsupportedOperation {
-            message: "cannot materialize a zero of type f32[extent] because no value in scope has exactly that type"
-                .into(),
-        });
         assert_eq!(
             ArrayOperation::<Array>::materialize_zero_from_residual_sources(
                 &context,
@@ -692,8 +698,14 @@ mod tests {
                 &[],
             )
             .map(|_| ()),
-            expected,
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type f32[extent] because no source has exactly that type \
+                          (source types: [])"
+                    .into(),
+            }),
         );
+
+        // A source with an equally named but distinct extent identity renders like the zero type yet is not exact.
         assert_eq!(
             ArrayOperation::<Array>::materialize_zero_from_residual_sources(
                 &context,
@@ -701,9 +713,33 @@ mod tests {
                 [&other_representation, &other_identity],
             )
             .map(|_| ()),
-            expected,
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type f32[extent] because no source has exactly that type \
+                          (source types: [f8e8m0fnu[extent], f32[extent]])"
+                    .into(),
+            }),
         );
         assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_array_operation_materialize_zero_from_residual_sources_gradient_cotangent_type() {
+        // The gradient of a disconnected `k: i32[extent]` is a structural zero of the cotangent type `zero[extent]`.
+        // The primal `k` is its only source, but its type differs, and this universe has no first-class dimensions
+        // that could carry `extent` from `k` to the zero, so the gradient is rejected explicitly.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let key_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let x = context.input(ArrayType::scalar(DataType::F32));
+        let k = context.input(key_type);
+        assert_eq!(
+            context.differentiate_at((x, k)).value_and_gradient(|(x, _)| x).map(|_| ()),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type zero[extent] because no source has exactly that type \
+                          (source types: [i32[extent]])"
+                    .into(),
+            })),
+        );
     }
 
     #[test]

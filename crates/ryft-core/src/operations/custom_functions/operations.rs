@@ -7275,6 +7275,55 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_differentiation_vjp_rule_forwarded_zero_seed() {
+        // The backward rule of `(x, y) ↦ (x, y)` returns its seeds as the cotangents of `x` and `y`. When the call's
+        // output `x` is dead, its seed is a structural zero that the carrier materializes only because the backward
+        // rule takes a value. The cotangent of `x` forwards that seed, so it remains a structural zero instead of
+        // crossing the pullback boundary as a materialized value.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let identity = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
+            builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let primal = builder.import_program(identity());
+        let forward = builder.import_program(identity());
+        let backward = builder.import_program(identity());
+        let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
+        let outputs = builder
+            .add_instruction(
+                ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Absent,
+                    true,
+                )),
+                vec![primal, forward, backward],
+                inputs,
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[1]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let pullback = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+            .unwrap()
+            .pullback()
+            .unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_custom_function_differentiation_vjp_rule_nonlinear_backward_seed() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
