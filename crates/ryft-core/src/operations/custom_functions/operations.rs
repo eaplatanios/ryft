@@ -7260,18 +7260,20 @@ mod tests {
             ]),
         );
 
-        // An effectful backward rule runs even when every seed is dead, so both zero seeds need the seed extents.
+        // An effectful backward rule runs even when every seed is dead, so both zero seeds need the seed extents. The
+        // rule forwards both seeds, so neither contributes a cotangent: `x` receives only the cotangent of its direct
+        // use, and the dense transposition materializes the structural zero cotangent of `y` from the seed extent `m`.
         let (_, dead) = linearize(false);
         assert_eq!(
             dead.to_string(),
             indoc! {"
-                lambda %0:f32[n], %1:dimension<n ∈ [1, 8)>, %2:dimension<m ∈ [1, 8)>, %3:dimension<m ∈ [1, 8)> .
-                let %4:f32[n] = zero [type=f32[n]] %1
-                    %5:f32[m] = zero [type=f32[m]] %2
-                    %6:i32[] = const 1
-                    %7:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %6
-                    %8:f32[n] = add %0 %4
-                in (%8, %5)
+                lambda %0:f32[n], %1:dimension<n ∈ [1, 8)>, %2:dimension<m ∈ [1, 8)> .
+                let %3:f32[n] = zero [type=f32[n]] %1
+                    %4:f32[m] = zero [type=f32[m]] %2
+                    %5:i32[] = const 1
+                    %6:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %5
+                    %7:f32[m] = zero [type=f32[m]] %2
+                in (%0, %7)
             "}
             .trim_end(),
         );
