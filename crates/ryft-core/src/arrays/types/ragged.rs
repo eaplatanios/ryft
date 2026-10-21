@@ -37,8 +37,8 @@ pub enum RaggedValueKind {
 /// Consider padded storage with shape `[2, 3, 4]`, whose axes are `batch`, `time`, and `element`. Suppose the `element`
 /// axis has a different logical length at each `batch`/`time` coordinate. Its descriptor has [`axis`](Self::axis) equal
 /// to `2` and `extent_axes = [0, 1]`: axis `0` of the extents payload corresponds to storage axis `0` (i.e., `batch`),
-/// and axis `1` corresponds to storage axis `1` (i.e., `time`). The extents payload therefore has shape `[2, 3]`,
-/// for example:
+/// and axis `1` corresponds to storage axis `1` (i.e., `time`). The extents payload therefore has shape `[2, 3]`.
+/// For example:
 ///
 /// ```text
 /// [[1, 4, 2],
@@ -91,36 +91,33 @@ impl RaggedDimension {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Immutable representation shared by clones of one [`RaggedType`].
+/// Internal immutable representation shared by clones of one [`RaggedType`].
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct RaggedTypePayload {
-    /// Physical padded storage, including its placement metadata.
-    storage: ArrayType,
+    /// Refer to the documentation of [`RaggedType::storage_type`].
+    storage_type: ArrayType,
 
-    /// Logical kind represented by the physical storage.
+    /// Refer to the documentation of [`RaggedType::value_kind`].
     value_kind: RaggedValueKind,
 
-    /// Canonical ragged occurrences in increasing storage-axis order.
+    /// Refer to the documentation of [`RaggedType::ragged_dimensions`].
     ragged_dimensions: Vec<RaggedDimension>,
 
-    /// Logical shape derived once during validated construction.
+    /// Refer to the documentation of [`RaggedType::logical_shape`].
     logical_shape: Shape,
 
-    /// Exact dense payload types in canonical descriptor order.
+    /// Refer to the documentation of [`RaggedType::extent_types`].
     extent_types: Vec<ArrayType>,
 }
 
 /// Type of one logical value containing padded array storage and a flat list of dense indexed extents.
 ///
-/// Every ragged storage axis has exactly its dimension's maximum admitted extent: an exclusive upper bound of
-/// `8` requires storage extent `7`, including when the maximum admitted extent is zero. Other axes retain their
-/// ordinary [`Dimension`](crate::Dimension)s. The [`logical_shape`](Self::logical_shape) replaces each padded axis by
-/// its descriptor's variable without removing dependency-domain axes. Descriptors are canonicalized in storage-axis
-/// order. A domain may name an earlier ragged axis, whose sibling descriptor determines which payload entries are
-/// live; self and later ragged dependencies are rejected. Domain order itself is preserved because it determines
-/// payload layout.
+/// Every ragged storage axis has exactly its dimension's maximum admitted extent (e.g., an exclusive upper bound of `8`
+/// requires storage extent `7`, including when the maximum admitted extent is zero). Other axes retain their ordinary
+/// [`Dimension`](crate::Dimension)s. The [`logical_shape`](Self::logical_shape) replaces each padded axis by its
+/// descriptor's variable without removing dependency-domain axes. Descriptors are canonicalized in storage-axis order.
+/// A domain may name an earlier ragged axis, whose sibling descriptor determines which payload entries are live; self
+/// and later ragged dependencies are rejected. Domain order itself is preserved because it determines payload layout.
 ///
 /// Extents have [`DIMENSION_DATA_TYPE`], full domain shape, the storage memory space, and projected sharding. Their
 /// layouts are unspecified. This structural description does not establish numerical extent bounds; the checked
@@ -129,13 +126,44 @@ struct RaggedTypePayload {
 ///
 /// Descriptors of array values reference their indexed identities. A dimension value defines its represented identity,
 /// independently of any descriptors describing its domain. Indexed identities cannot also describe ordinary scalar
-/// dimensions in one identity scope: a storage capacity never proves a scalar logical extent. Ragged values do not
-/// implicitly project to [`ArrayType`], admit constants or references, or support zero/one construction yet.
+/// dimensions in one identity scope (i.e., a storage capacity never proves a scalar logical extent). Ragged values do
+/// not implicitly project to [`ArrayType`], admit constants or references, or support zero/one construction yet.
+///
+/// # Example
+///
+/// Consider `f32` storage with shape `[2, 3, 4]`, whose axes are `batch`, `time`, and `element`. The number of live
+/// elements varies at each `batch`/`time` coordinate. Let `n` be a [`DimensionVariable`] with bounds `[0, 5)`,
+/// admitting lengths `0` through `4`. The single descriptor has `axis=2`, `dimension=n`, and `extent_axes=[0, 1]`.
+/// The corresponding ragged type describes the following representation:
+///
+/// | Accessor                                       | Description                                         |
+/// |------------------------------------------------|-----------------------------------------------------|
+/// | [`storage_type`](Self::storage_type)           | Padded array type `f32[2, 3, 4]`.                   |
+/// | [`value_kind`](Self::value_kind)               | [`RaggedValueKind::Array`].                         |
+/// | [`ragged_dimensions`](Self::ragged_dimensions) | The one descriptor for the `element` axis.          |
+/// | [`logical_shape`](Self::logical_shape)         | `[2, 3, n]`, retaining the `batch` and `time` axes. |
+/// | [`extent_types`](Self::extent_types)           | One dense integer array type: `i64[2, 3]`.          |
+///
+/// A corresponding [`RaggedValue`](crate::RaggedValue) contains the padded `f32[2, 3, 4]` storage and one `i64[2, 3]`
+/// extent payload. For example:
+///
+/// ```text
+/// [[1, 4, 2],
+///  [3, 0, 1]]
+/// ```
+///
+/// Here, `storage[b, t, k]` is live when `k < extents[b, t]`. The slice at `batch=0` and `time=1` has four live
+/// elements, while the slice at `batch=1` and `time=1` is entirely padding. The symbolic `n` records the indexed
+/// lengths' shared identity and bounds; the concrete length at each coordinate belongs to the value's extent payload.
+/// The same type can describe different length payloads across executions; occurrences sharing `n` within an execution
+/// must still agree on their live extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct RaggedType {
     /// Shared immutable validated representation; clones retain its descriptor and payload-type allocations.
     payload: Arc<RaggedTypePayload>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl RaggedType {
     /// Constructs a structurally validated ragged representation, canonicalizing descriptor order.
@@ -146,7 +174,7 @@ impl RaggedType {
     /// duplicate axes, unbounded ragged dimensions, storage outside the declared maximum extent, cyclic or out-of-order
     /// ragged domain dependencies, or a projected sharding that cannot be represented.
     pub fn new(
-        storage: ArrayType,
+        storage_type: ArrayType,
         value_kind: RaggedValueKind,
         mut ragged_dimensions: Vec<RaggedDimension>,
     ) -> Result<Self, TypeError> {
@@ -155,23 +183,23 @@ impl RaggedType {
                 return Err(TypeError::invalid("a ragged array type requires at least one ragged dimension"));
             }
             RaggedValueKind::Array => {}
-            RaggedValueKind::Dimension(_) if storage.data_type() != DIMENSION_DATA_TYPE => {
+            RaggedValueKind::Dimension(_) if storage_type.data_type() != DIMENSION_DATA_TYPE => {
                 return Err(TypeError::invalid(format!(
                     "ragged dimension storage must have data type `{DIMENSION_DATA_TYPE}` but got `{}`",
-                    storage.data_type(),
+                    storage_type.data_type(),
                 )));
             }
             RaggedValueKind::Dimension(_) => {}
         }
         ragged_dimensions.sort_by_key(RaggedDimension::axis);
-        let mut logical_dimensions = storage.shape().dimensions().to_vec();
+        let mut logical_dimensions = storage_type.shape().dimensions().to_vec();
         let mut extent_types = Vec::with_capacity(ragged_dimensions.len());
         for (index, descriptor) in ragged_dimensions.iter().enumerate() {
-            if descriptor.axis >= storage.rank() {
+            if descriptor.axis >= storage_type.rank() {
                 return Err(TypeError::invalid(format!(
                     "ragged axis {} is out of bounds for rank-{} storage",
                     descriptor.axis,
-                    storage.rank(),
+                    storage_type.rank(),
                 )));
             }
             if index > 0 && ragged_dimensions[index - 1].axis == descriptor.axis {
@@ -187,22 +215,22 @@ impl RaggedType {
                     descriptor.dimension
                 ))
             })?;
-            if storage.dimension(descriptor.axis).value() != Some(maximum) {
+            if storage_type.dimension(descriptor.axis).value() != Some(maximum) {
                 return Err(TypeError::invalid(format!(
                     "ragged axis {} requires storage extent {} for dimension `{}` but got `{}`",
                     descriptor.axis,
                     maximum,
                     descriptor.dimension,
-                    storage.dimension(descriptor.axis),
+                    storage_type.dimension(descriptor.axis),
                 )));
             }
             for (extent_axis_index, axis) in descriptor.extent_axes.iter().copied().enumerate() {
-                if axis >= storage.rank() {
+                if axis >= storage_type.rank() {
                     return Err(TypeError::invalid(format!(
                         "ragged axis {} domain axis {} is out of bounds for rank-{} storage",
                         descriptor.axis,
                         axis,
-                        storage.rank(),
+                        storage_type.rank(),
                     )));
                 }
                 if descriptor.extent_axes[..extent_axis_index].contains(&axis) {
@@ -219,8 +247,8 @@ impl RaggedType {
                 }
             }
             logical_dimensions[descriptor.axis] = descriptor.dimension.clone().into();
-            let shape = Shape::new(descriptor.extent_axes.iter().map(|axis| storage.dimension(*axis)).collect());
-            let sharding = storage
+            let shape = Shape::new(descriptor.extent_axes.iter().map(|axis| storage_type.dimension(*axis)).collect());
+            let sharding = storage_type
                 .sharding()
                 .map(|sharding| {
                     sharding.with_dimensions(
@@ -231,14 +259,14 @@ impl RaggedType {
                 .map_err(|error| TypeError::invalid(format!("ragged extent sharding is invalid: {error}")))?;
             extent_types.push(
                 ArrayType::new(DIMENSION_DATA_TYPE, shape)
-                    .with_memory(storage.memory())
+                    .with_memory(storage_type.memory())
                     .with_sharding(sharding)
                     .map_err(|error| TypeError::invalid(format!("ragged extent type is invalid: {error}")))?,
             );
         }
         let r#type = Self {
             payload: Arc::new(RaggedTypePayload {
-                storage,
+                storage_type,
                 value_kind,
                 ragged_dimensions,
                 logical_shape: Shape::new(logical_dimensions),
@@ -249,28 +277,51 @@ impl RaggedType {
         Ok(r#type)
     }
 
-    /// Returns the exact padded storage type.
-    pub fn storage(&self) -> &ArrayType {
-        &self.payload.storage
+    /// Returns the [`ArrayType`] of the physical storage, including its element data type, layout, memory space, and
+    /// sharding. Each ragged axis has its dimension's maximum admitted extent; ordinary axes retain their original
+    /// dimensions. Use [`Self::logical_shape`] for the shape with symbolic ragged dimensions in place of capacities.
+    /// For dimension values, this storage contains the represented integer extents themselves, as described by
+    /// [`Self::value_kind`].
+    pub fn storage_type(&self) -> &ArrayType {
+        &self.payload.storage_type
     }
 
-    /// Returns the kind of logical value represented by the storage.
+    /// Returns whether this representation contains array elements or indexed dimension values.
+    /// [`RaggedValueKind::Array`] uses storage for numerical elements and separate payloads for ragged-axis extents.
+    /// [`RaggedValueKind::Dimension`] uses integer storage for the dimension values themselves; its [`DimensionType`]
+    /// supplies their bounds and optional symbolic identity. In either case, [`Self::ragged_dimensions`] describes
+    /// ragged axes of that storage's coordinate shape, independently of the represented value kind.
     pub fn value_kind(&self) -> &RaggedValueKind {
         &self.payload.value_kind
     }
 
-    /// Returns the normalized ragged occurrences in increasing storage-axis order.
+    /// Returns the ragged-axis descriptors in increasing storage-axis order, regardless of their construction order.
+    /// Each [`RaggedDimension`] identifies a storage axis, its logical extent identity, and the ordered storage axes
+    /// that index its extent payload. The descriptor at index `i` corresponds to [`Self::extent_types`] entry `i`.
+    /// Array values require at least one descriptor; dimension values may have none when their coordinate shape is
+    /// entirely ordinary. Dependencies on other ragged storage axes must precede the described axis; those axes'
+    /// sibling descriptors determine which extent-payload coordinates are live.
     pub fn ragged_dimensions(&self) -> &[RaggedDimension] {
         &self.payload.ragged_dimensions
     }
 
-    /// Returns the packed logical shape, retaining every domain coordinate axis.
+    /// Returns the logical shape obtained by replacing each ragged storage axis's padded capacity with its
+    /// descriptor's [`DimensionVariable`]. The shape has the same rank and axis order as [`Self::storage_type`],
+    /// including all axes used to index extent payloads. Its ragged symbolic dimensions describe indexed extents; their
+    /// concrete values at each coordinate reside in the value's payloads. For dimension values, this is the shape
+    /// indexing those values; the type of the dimensions themselves is carried by [`Self::value_kind`].
+    /// The shape is computed once during construction and returned by reference here.
     pub fn logical_shape(&self) -> &Shape {
         &self.payload.logical_shape
     }
 
-    /// Returns full dense extents types in canonical descriptor order. No singleton or omitted-coordinate payload
-    /// stands in for a wider domain.
+    /// Returns one exact dense extent-payload [`ArrayType`] per [`Self::ragged_dimensions`] entry, in the same order.
+    /// Each payload uses [`DIMENSION_DATA_TYPE`] and has the shape selected from [`Self::storage_type`] by its
+    /// descriptor's [`RaggedDimension::extent_axes`], preserving their order. An empty mapping produces a scalar.
+    /// Payloads share the storage memory space, have sharding projected onto their selected axes, and have no layout
+    /// constraint. They cover the full padded shapes of their coordinate axes; sibling descriptors determine live
+    /// coordinates when those axes are themselves ragged. Compact or singleton payloads cannot replace a wider shape.
+    /// These types establish representation structure; checked producers must still validate live numerical extents.
     pub fn extent_types(&self) -> &[ArrayType] {
         &self.payload.extent_types
     }
@@ -284,7 +335,7 @@ impl RaggedType {
             .chain(match &self.payload.value_kind {
                 RaggedValueKind::Array => None,
                 RaggedValueKind::Dimension(dimension) => {
-                    dimension.variable().map(|identity| (identity, (0..self.payload.storage.rank()).collect()))
+                    dimension.variable().map(|identity| (identity, (0..self.payload.storage_type.rank()).collect()))
                 }
             })
     }
@@ -338,7 +389,7 @@ impl RaggedType {
 
 impl Display for RaggedType {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "ragged<{}", self.payload.storage)?;
+        write!(formatter, "ragged<{}", self.payload.storage_type)?;
         if let RaggedValueKind::Dimension(dimension) = &self.payload.value_kind {
             write!(formatter, "; item={dimension}")?;
         }
@@ -369,7 +420,7 @@ impl Type for RaggedType {
 
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
         self.payload
-            .storage
+            .storage_type
             .identities()
             .chain(
                 self.payload
@@ -405,7 +456,7 @@ impl Type for RaggedType {
             RaggedValueKind::Dimension(dimension) => RaggedValueKind::Dimension(dimension.rename_identities(renaming)?),
         };
         Self::new(
-            self.payload.storage.rename_identities(renaming)?,
+            self.payload.storage_type.rename_identities(renaming)?,
             value_kind,
             self.payload
                 .ragged_dimensions
@@ -426,7 +477,7 @@ impl Type for RaggedType {
     }
 
     fn is_refined_by(&self, other: &Self) -> bool {
-        self.payload.storage.is_refined_by(other.storage())
+        self.payload.storage_type.is_refined_by(other.storage_type())
             && Self::indexed_refinement_facts(self, other, DimensionComparison::Refinement).is_ok()
     }
 
@@ -436,7 +487,7 @@ impl Type for RaggedType {
 
     fn is_complex(&self) -> bool {
         match self.payload.value_kind {
-            RaggedValueKind::Array => self.payload.storage.is_complex(),
+            RaggedValueKind::Array => self.payload.storage_type.is_complex(),
             RaggedValueKind::Dimension(_) => false,
         }
     }
@@ -618,14 +669,14 @@ mod tests {
     fn test_ragged_type_new() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
-        let storage = ArrayType::new_static(DataType::F32, [2, 4, 7]).with_memory(Memory::Host { pinned: false });
+        let storage_type = ArrayType::new_static(DataType::F32, [2, 4, 7]).with_memory(Memory::Host { pinned: false });
         let r#type = RaggedType::new(
-            storage.clone(),
+            storage_type.clone(),
             RaggedValueKind::Array,
             vec![RaggedDimension::new(2, columns.clone(), vec![1, 0]), RaggedDimension::new(1, rows.clone(), vec![0])],
         )
         .unwrap();
-        assert_eq!(r#type.storage(), &storage);
+        assert_eq!(r#type.storage_type(), &storage_type);
         assert_eq!(
             r#type.ragged_dimensions(),
             &[RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, columns.clone(), vec![1, 0])]
@@ -634,8 +685,8 @@ mod tests {
         assert_eq!(
             r#type.extent_types(),
             &[
-                ArrayType::new_static(DIMENSION_DATA_TYPE, [2]).with_memory(storage.memory()),
-                ArrayType::new_static(DIMENSION_DATA_TYPE, [4, 2]).with_memory(storage.memory()),
+                ArrayType::new_static(DIMENSION_DATA_TYPE, [2]).with_memory(storage_type.memory()),
+                ArrayType::new_static(DIMENSION_DATA_TYPE, [4, 2]).with_memory(storage_type.memory()),
             ]
         );
     }
@@ -643,14 +694,14 @@ mod tests {
     #[test]
     fn test_ragged_type_new_invalid_structure() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
-        let storage = ArrayType::new_static(DataType::F32, [2, 4]);
+        let storage_type = ArrayType::new_static(DataType::F32, [2, 4]);
         assert_eq!(
-            RaggedType::new(storage.clone(), RaggedValueKind::Array, vec![]),
+            RaggedType::new(storage_type.clone(), RaggedValueKind::Array, vec![]),
             Err(TypeError::invalid("a ragged array type requires at least one ragged dimension"))
         );
         assert_eq!(
             RaggedType::new(
-                storage.clone(),
+                storage_type.clone(),
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(2, rows.clone(), vec![0])]
             ),
@@ -658,7 +709,7 @@ mod tests {
         );
         assert_eq!(
             RaggedType::new(
-                storage.clone(),
+                storage_type.clone(),
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(1, rows.clone(), vec![])]
             ),
@@ -666,7 +717,7 @@ mod tests {
         );
         assert_eq!(
             RaggedType::new(
-                storage.clone(),
+                storage_type.clone(),
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(1, rows.clone(), vec![2])]
             ),
@@ -674,7 +725,7 @@ mod tests {
         );
         assert_eq!(
             RaggedType::new(
-                storage.clone(),
+                storage_type.clone(),
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(1, rows.clone(), vec![0, 0])]
             ),
@@ -682,14 +733,14 @@ mod tests {
         );
         assert_eq!(
             RaggedType::new(
-                storage.clone(),
+                storage_type.clone(),
                 RaggedValueKind::Array,
                 vec![RaggedDimension::new(1, rows.clone(), vec![1])]
             ),
             Err(TypeError::invalid("ragged axis 1 depends on ragged axis 1; dependencies must precede their consumer"))
         );
         assert_eq!(
-            RaggedType::new(storage, RaggedValueKind::Dimension(DimensionType::from(rows)), vec![]),
+            RaggedType::new(storage_type, RaggedValueKind::Dimension(DimensionType::from(rows)), vec![]),
             Err(TypeError::invalid("ragged dimension storage must have data type `i64` but got `f32`"))
         );
     }
@@ -741,7 +792,7 @@ mod tests {
                 vec![RaggedDimension::new(0, singleton, vec![])]
             )
             .unwrap()
-            .storage(),
+            .storage_type(),
             &ArrayType::new_static(DataType::F32, [1])
         );
     }
@@ -790,15 +841,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_type_storage() {
-        let storage = ArrayType::new_static(DIMENSION_DATA_TYPE, [2]);
+    fn test_ragged_type_storage_type() {
+        let storage_type = ArrayType::new_static(DIMENSION_DATA_TYPE, [2]);
         let r#type = RaggedType::new(
-            storage.clone(),
+            storage_type.clone(),
             RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(1))),
             vec![],
         )
         .unwrap();
-        assert_eq!(r#type.storage(), &storage);
+        assert_eq!(r#type.storage_type(), &storage_type);
     }
 
     #[test]
