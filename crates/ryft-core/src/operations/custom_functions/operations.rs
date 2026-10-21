@@ -7236,12 +7236,15 @@ mod tests {
             "}
             .trim_end(),
         );
+        // The carrier materializes the zero seed of `x` for the backward rule, which forwards it. The cotangent of `x`
+        // therefore remains a structural zero, which the dense transposition materializes again at its boundary.
         assert_eq!(
             used.to_string(),
             indoc! {"
                 lambda %0:f32[m], %1:dimension<n ∈ [1, 8)>, %2:dimension<m ∈ [1, 8)> .
                 let %3:f32[n] = zero [type=f32[n]] %1
-                in (%3, %0)
+                    %4:f32[n] = zero [type=f32[n]] %1
+                in (%4, %0)
             "}
             .trim_end(),
         );
@@ -7312,11 +7315,15 @@ mod tests {
             .unwrap()
             .pullback()
             .unwrap();
+
+        // The seed that the carrier materializes for the backward rule stays behind as a dead instruction,
+        // but no zero crosses the pullback boundary.
         assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
         assert_eq!(
             pullback.program().to_string(),
             indoc! {"
                 lambda %0:f32[] .
+                let %1:f32[] = zero [type=f32[]]
                 in (%0)
             "}
             .trim_end(),

@@ -8880,9 +8880,9 @@ pub(crate) mod tests {
 
         // The pushforward of the same function reads the extent of `k` while linearizing and rebuilds its tangent
         // from that extent when applied.
-        let (_, pushforward) = context.linearize(|inputs: Vec<_>, ()| Ok(inputs), vec![x, k], ()).unwrap();
         let tangent = context.input(scalar_type.into());
         let key_tangent = context.input(key_type.tangent().unwrap().into());
+        let (_, pushforward) = context.linearize(|inputs: Vec<_>, ()| Ok(inputs), vec![x, k], ()).unwrap();
         let tangents = pushforward.apply(vec![tangent, key_tangent]).unwrap();
         let program = context
             .builder()

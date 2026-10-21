@@ -2223,7 +2223,9 @@ mod tests {
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiableOperation, DifferentiationContext, TranspositionContext};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, TransposedProgramCotangent, TranspositionContext,
+    };
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -5297,7 +5299,7 @@ mod tests {
         );
 
         // Extreme edges crop every input position despite their balanced finite output shape, so the input cotangent
-        // is zero and the whole output cotangent flows to the padding value.
+        // is a structural zero that the pullback omits, and the whole output cotangent flows to the padding value.
         let linearization = dynamic_pad_program(
             DimensionBounds::new(1, Some(3)).unwrap(),
             DimensionBounds::new(0, Some(2)).unwrap(),
@@ -5307,6 +5309,10 @@ mod tests {
         )
         .linearize()
         .unwrap();
+        let cotangent_types = linearization.primal().input_types()[..2]
+            .iter()
+            .map(|r#type| r#type.cotangent().unwrap())
+            .collect::<Vec<_>>();
         let mut outputs = linearization
             .primal()
             .interpret(vec![
@@ -5319,12 +5325,16 @@ mod tests {
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
         )];
         cotangents.extend(outputs.split_off(1));
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
         assert_eq!(
-            linearization.pullback().unwrap().program().interpret(cotangents),
+            pullback.assemble_cotangents(&cotangent_types, pullback.program().interpret(cotangents).unwrap()),
             Ok(vec![
-                ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[0_f32]).unwrap()),
-                ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap()),
-            ])
+                Some(MaybeZero::Zero(cotangent_types[0].clone())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap(),
+                ))),
+            ]),
         );
         let mut outputs = linearization
             .primal()
@@ -5341,13 +5351,13 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().program().interpret(cotangents),
+            pullback.assemble_cotangents(&cotangent_types, pullback.program().interpret(cotangents).unwrap()),
             Ok(vec![
-                ArrayIrValue::Array(
-                    Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[0_f32, 0.]).unwrap()
-                ),
-                ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[7_f32]).unwrap()),
-            ])
+                Some(MaybeZero::Zero(cotangent_types[0].clone())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::scalar(DataType::F32), &[7_f32]).unwrap(),
+                ))),
+            ]),
         );
         let linearization = dynamic_pad_program(
             DimensionBounds::new(1, Some(3)).unwrap(),
@@ -5370,12 +5380,16 @@ mod tests {
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
         )];
         cotangents.extend(outputs.split_off(1));
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
         assert_eq!(
-            linearization.pullback().unwrap().program().interpret(cotangents),
+            pullback.assemble_cotangents(&cotangent_types, pullback.program().interpret(cotangents).unwrap()),
             Ok(vec![
-                ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[0_f32]).unwrap()),
-                ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap()),
-            ])
+                Some(MaybeZero::Zero(cotangent_types[0].clone())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::scalar(DataType::F32), &[0_f32]).unwrap(),
+                ))),
+            ]),
         );
         let mut outputs = linearization
             .primal()
@@ -5392,13 +5406,13 @@ mod tests {
         )];
         cotangents.extend(outputs.split_off(1));
         assert_eq!(
-            linearization.pullback().unwrap().program().interpret(cotangents),
+            pullback.assemble_cotangents(&cotangent_types, pullback.program().interpret(cotangents).unwrap()),
             Ok(vec![
-                ArrayIrValue::Array(
-                    Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[0_f32, 0.]).unwrap()
-                ),
-                ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[7_f32]).unwrap()),
-            ])
+                Some(MaybeZero::Zero(cotangent_types[0].clone())),
+                Some(MaybeZero::Value(ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::scalar(DataType::F32), &[7_f32]).unwrap(),
+                ))),
+            ]),
         );
     }
 
