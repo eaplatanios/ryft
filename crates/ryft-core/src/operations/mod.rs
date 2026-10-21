@@ -29,6 +29,7 @@ pub mod extrema;
 pub mod logical;
 pub mod manipulation;
 pub mod quantization;
+pub mod ragged;
 pub mod random;
 pub mod reductions;
 pub mod references;
@@ -144,6 +145,10 @@ pub use manipulation::{
     UpdateSliceOperation,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
+pub use ragged::{
+    RAGGED_EXTENTS_OPERATION_NAME, RAGGED_NEW_OPERATION_NAME, RAGGED_STORAGE_OPERATION_NAME, RaggedExtents,
+    RaggedExtentsOperation, RaggedNew, RaggedNewOperation, RaggedStorage, RaggedStorageOperation,
+};
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
     RngBitGenerator, RngBitGeneratorOperation,

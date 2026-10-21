@@ -10,20 +10,20 @@ use crate::arrays::types::ragged::RaggedType;
 use crate::parameters::Parameter;
 use crate::programs::{LiteralIdentity, Type, TypeError, TypeIdentityRenaming, Typed, Value};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Shared immutable payload of a [`RaggedValue`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RaggedValuePayload<A: Value<Type = ArrayType>> {
     /// Complete validated structural type of this value.
     r#type: RaggedType,
 
-    /// Padded numerical storage, or the indexed extent data of a dimension value.
+    /// Padded underlying array storage, or the indexed extent data of a dimension value.
     storage: A,
 
     /// Full dense extent payloads in [`RaggedType::ragged_dimensions`] order.
     extents: Vec<A>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One logical ragged value, consisting of padded array storage and one dense extent payload per
 /// [`RaggedDimension`](crate::arrays::types::ragged::RaggedDimension) of its [`RaggedType`]. The payloads have the

@@ -853,9 +853,14 @@ where
     /// some metadata in the member carrier must therefore fail with an exact diagnostic naming what it cannot carry,
     /// rather than narrow the carrier and continue.
     ///
+    /// The supplied parent context is the active context owning the packed value. An implementation may bind explicit
+    /// representation operations through it to project an opaque value while preserving its dependencies and enclosing
+    /// transforms. The default needs no additional context capabilities and ignores this argument.
+    ///
     /// [`Self::lift_batch`] is the inverse boundary crossing.
     #[inline]
     fn project_batch(
+        _context: &C,
         batch: &Self::Batch,
     ) -> Result<<Self::Projected as BatchingPolicy<ProjectedContext<C, T>>>::Batch, BatchingError>
     where
@@ -874,15 +879,23 @@ where
     /// Projecting, applying the member rule, and lifting must present the member rule's outputs to the outer policy's
     /// [`BatchingPolicy::validate_operation_outputs`] exactly as a native (i.e., unprojected) rule's outputs would be
     /// presented. That round trip is what lets the conservation law judge member rules and native rules by one
-    /// standard instead of exempting whatever crossed a projection.
+    /// standard instead of exempting whatever crossed a projection. The supplied parent context is the same active
+    /// context that [`Self::project_batch`] receives, so reconstruction can bind representation operations there. The
+    /// original invocation inputs let a policy preserve its composite representation choices without adding provenance
+    /// to the homogeneous carrier. They do not establish a positional correspondence between an output and any input.
+    /// The default ignores both the context and inputs and requires no additional context capabilities.
     #[inline]
     fn lift_batch(
+        context: &C,
         batch: &<Self::Projected as BatchingPolicy<ProjectedContext<C, T>>>::Batch,
+        inputs: &[Self::Batch],
     ) -> Result<Self::Batch, BatchingError>
     where
         C::Value: ValueProjection<T, Projected: Value<Type = T>>,
         ProjectedContext<C, T>: Context<Value = <C::Value as ValueProjection<T>>::Projected>,
     {
+        let _ = context;
+        let _ = inputs;
         Self::batch(C::Value::from_projected(Self::Projected::value(batch).clone()), Self::Projected::batch_axis(batch))
     }
 }
@@ -2194,12 +2207,19 @@ pub fn batch_projected_operation<
     )
     .with_axis_name(context.axis_name().map(str::to_string))
     .with_axis_sharding(context.axis_sharding().clone());
-    let inputs = inputs.iter().map(P::project_batch).collect::<Result<Vec<_>, BatchingError>>()?;
+    let projected_inputs = inputs
+        .iter()
+        .map(|input| P::project_batch(context.parent(), input))
+        .collect::<Result<Vec<_>, BatchingError>>()?;
 
     // `BatchingPolicyProjection` pins the member policy's evidence to the outer policy's, so the member rule's
     // evidence reaches the composite validation boundary exactly as the member rule stated it.
-    let (outputs, evidence) = operation.batch(&projected_context, &EmptyRegionDriver, inputs.as_slice())?.into_parts();
-    let outputs = outputs.iter().map(P::lift_batch).collect::<Result<Vec<_>, BatchingError>>()?;
+    let (outputs, evidence) =
+        operation.batch(&projected_context, &EmptyRegionDriver, projected_inputs.as_slice())?.into_parts();
+    let outputs = outputs
+        .iter()
+        .map(|output| P::lift_batch(context.parent(), output, inputs))
+        .collect::<Result<Vec<_>, BatchingError>>()?;
     Ok(BatchedOutputs::new(outputs, evidence))
 }
 
@@ -2316,6 +2336,8 @@ pub(crate) fn reject_ragged_carriers<C: Context, P: BatchingPolicy<C>>(
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
@@ -3205,6 +3227,108 @@ mod tests {
             }],
         );
         assert_eq!(evidence, ());
+    }
+
+    #[test]
+    fn test_batch_projected_operation_supplies_active_parent_to_policy_hooks() {
+        /// Independent eager context whose shared state records the two carrier-boundary crossings.
+        #[derive(Clone)]
+        struct ProjectionContext {
+            /// Crossings observed by this active context and its clones.
+            crossings: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl Domain for ProjectionContext {
+            type Type = ProjectedProgramType;
+            type Value = ProjectedProgramValue;
+            type Constant = ProjectedProgramValue;
+            type Operation = ProjectedProgramOperation;
+        }
+
+        impl Context for ProjectionContext {
+            fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+                Ok(constant)
+            }
+
+            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+                &self,
+                operation: O,
+                driver: D,
+                inputs: &[Self::Value],
+            ) -> Result<Vec<Self::Value>, ProgramError> {
+                ProjectedProgramContext::new().bind(operation, driver, inputs)
+            }
+
+            fn is_eager(&self) -> bool {
+                true
+            }
+
+            fn provenance(&self) -> Provenance {
+                Provenance::unknown()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+                ProjectedProgramContext::new().invoke_with_provenance_origin(origin, function)
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+                ProjectedProgramContext::new().invoke_with_provenance_scope(scope, function)
+            }
+        }
+
+        impl BatchingPolicyProjection<ProjectionContext, ProjectedMemberType<2>> for ProjectedProgramBatching {
+            type Projected = ProjectedMemberBatching<2>;
+
+            fn project_batch(
+                context: &ProjectionContext,
+                batch: &ProjectedBatch<ProjectedProgramValue>,
+            ) -> Result<ProjectedBatch<ProjectedMemberValue<2>>, BatchingError> {
+                context.crossings.borrow_mut().push("project");
+                Ok(ProjectedBatch {
+                    value: ValueProjection::<ProjectedMemberType<2>>::into_projected(batch.value.clone())?,
+                    batch_axis: batch.batch_axis,
+                })
+            }
+
+            fn lift_batch(
+                context: &ProjectionContext,
+                batch: &ProjectedBatch<ProjectedMemberValue<2>>,
+                inputs: &[ProjectedBatch<ProjectedProgramValue>],
+            ) -> Result<ProjectedBatch<ProjectedProgramValue>, BatchingError> {
+                assert_eq!(
+                    inputs,
+                    &[ProjectedBatch {
+                        value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                        batch_axis: BatchAxis::replicated(),
+                    }],
+                );
+                context.crossings.borrow_mut().push("lift");
+                Ok(ProjectedBatch {
+                    value: <ProjectedProgramValue as ValueProjection<ProjectedMemberType<2>>>::from_projected(
+                        batch.value.clone(),
+                    ),
+                    batch_axis: batch.batch_axis,
+                })
+            }
+        }
+
+        // Neither this policy nor its direct-dispatch values support ragged representation operations. The generic
+        // adapter supplies the active parent without imposing the array composite policy's provider requirements.
+        let crossings = Rc::new(RefCell::new(Vec::new()));
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(
+            ProjectionContext { crossings: crossings.clone() },
+            5,
+        );
+        let input = <ProjectedProgramBatching as BatchingPolicy<ProjectionContext>>::replicated(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+        );
+        let (outputs, evidence) =
+            batch_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, std::slice::from_ref(&input))
+                .unwrap()
+                .into_parts();
+        assert_eq!(outputs, vec![input]);
+        assert_eq!(evidence, ());
+        assert_eq!(*crossings.borrow(), ["project", "lift"]);
     }
 
     #[test]
