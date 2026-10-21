@@ -1331,11 +1331,33 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::data::DataType;
-    use crate::arrays::types::dimensions::{Dimension, DimensionBounds};
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionError};
     use crate::arrays::types::memories::Memory;
 
     use super::*;
+
+    #[test]
+    fn test_ragged_value_kind_equality_and_hashing() {
+        let item = DimensionType::new("item", DimensionBounds::unbounded());
+        let array = RaggedValueKind::Array;
+        let dimension = RaggedValueKind::Dimension(item.clone());
+
+        // Kinds are equal only when they have the same variant and represented dimension type, and nominally distinct
+        // dimension types with the same name and bounds are distinct kinds.
+        assert_eq!(array.clone(), array);
+        assert_eq!(dimension.clone(), dimension);
+        assert_ne!(array, dimension);
+        assert_ne!(dimension, RaggedValueKind::Dimension(DimensionType::new("item", item.bounds())));
+
+        // Hashing agrees with equality.
+        let kinds = HashMap::from([(array.clone(), "array"), (dimension, "dimension")]);
+        assert_eq!(kinds.get(&array), Some(&"array"));
+        assert_eq!(kinds.get(&RaggedValueKind::Dimension(item)), Some(&"dimension"));
+        assert_eq!(kinds.get(&RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3)))), None);
+    }
 
     #[test]
     fn test_ragged_dimension_new() {
@@ -1376,7 +1398,7 @@ mod tests {
         assert_eq!(r#type.storage_type(), &storage_type);
         assert_eq!(
             r#type.ragged_dimensions(),
-            &[RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, columns.clone(), vec![1, 0])]
+            &[RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, columns.clone(), vec![1, 0])],
         );
         assert_eq!(r#type.logical_shape(), &Shape::new(vec![Dimension::Static(2), rows.into(), columns.into()]));
         assert_eq!(
@@ -1384,7 +1406,7 @@ mod tests {
             &[
                 ArrayType::new_static(DIMENSION_DATA_TYPE, [2]).with_memory(storage_type.memory()),
                 ArrayType::new_static(DIMENSION_DATA_TYPE, [4, 2]).with_memory(storage_type.memory()),
-            ]
+            ],
         );
     }
 
@@ -1394,51 +1416,51 @@ mod tests {
         let storage_type = ArrayType::new_static(DataType::F32, [2, 4]);
         assert_eq!(
             RaggedType::new(storage_type.clone(), RaggedValueKind::Array, vec![]),
-            Err(TypeError::invalid("a ragged array type requires at least one ragged dimension"))
+            Err(TypeError::invalid("a ragged array type requires at least one ragged dimension")),
         );
         assert_eq!(
             RaggedType::new(
                 storage_type.clone(),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(2, rows.clone(), vec![0])]
+                vec![RaggedDimension::new(2, rows.clone(), vec![0])],
             ),
-            Err(TypeError::invalid("ragged axis 2 is out of bounds for rank-2 storage"))
+            Err(TypeError::invalid("ragged axis 2 is out of bounds for rank-2 storage")),
         );
         assert_eq!(
             RaggedType::new(
                 storage_type.clone(),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(1, rows.clone(), vec![])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(1, rows.clone(), vec![])],
             ),
-            Err(TypeError::invalid("ragged storage axis 1 is described more than once"))
+            Err(TypeError::invalid("ragged storage axis 1 is described more than once")),
         );
         assert_eq!(
             RaggedType::new(
                 storage_type.clone(),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![2])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![2])],
             ),
-            Err(TypeError::invalid("ragged axis 1 extent axis 2 is out of bounds for rank-2 storage"))
+            Err(TypeError::invalid("ragged axis 1 extent axis 2 is out of bounds for rank-2 storage")),
         );
         assert_eq!(
             RaggedType::new(
                 storage_type.clone(),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![0, 0])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![0, 0])],
             ),
-            Err(TypeError::invalid("ragged axis 1 repeats extent axis 0"))
+            Err(TypeError::invalid("ragged axis 1 repeats extent axis 0")),
         );
         assert_eq!(
             RaggedType::new(
                 storage_type.clone(),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![1])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![1])],
             ),
-            Err(TypeError::invalid("ragged axis 1 depends on ragged axis 1; dependencies must precede their consumer"))
+            Err(TypeError::invalid("ragged axis 1 depends on ragged axis 1; dependencies must precede their consumer")),
         );
         assert_eq!(
             RaggedType::new(storage_type, RaggedValueKind::Dimension(DimensionType::from(rows)), vec![]),
-            Err(TypeError::invalid("ragged dimension storage must have data type `i64` but got `f32`"))
+            Err(TypeError::invalid("ragged dimension storage must have data type `i64` but got `f32`")),
         );
     }
 
@@ -1449,48 +1471,48 @@ mod tests {
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 3]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![0])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![0])],
             ),
-            Err(TypeError::invalid("ragged axis 1 requires storage extent 4 for dimension `rows` but got `3`"))
+            Err(TypeError::invalid("ragged axis 1 requires storage extent 4 for dimension `rows` but got `3`")),
         );
         assert_eq!(
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 5]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows, vec![0])]
+                vec![RaggedDimension::new(1, rows, vec![0])],
             ),
-            Err(TypeError::invalid("ragged axis 1 requires storage extent 4 for dimension `rows` but got `5`"))
+            Err(TypeError::invalid("ragged axis 1 requires storage extent 4 for dimension `rows` but got `5`")),
         );
         let unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
         assert_eq!(
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, unbounded, vec![0])]
+                vec![RaggedDimension::new(1, unbounded, vec![0])],
             ),
-            Err(TypeError::invalid("ragged dimension `unbounded` must have a finite upper bound"))
+            Err(TypeError::invalid("ragged dimension `unbounded` must have a finite upper bound")),
         );
         let empty = DimensionVariable::new("empty", DimensionBounds::non_negative(Some(1)).unwrap());
         assert_eq!(
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [0]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(0, empty, vec![])]
+                vec![RaggedDimension::new(0, empty, vec![])],
             )
             .unwrap()
             .extent_types(),
-            &[ArrayType::scalar(DIMENSION_DATA_TYPE)]
+            &[ArrayType::scalar(DIMENSION_DATA_TYPE)],
         );
         let singleton = DimensionVariable::new("singleton", DimensionBounds::positive(Some(2)).unwrap());
         assert_eq!(
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [1]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(0, singleton, vec![])]
+                vec![RaggedDimension::new(0, singleton, vec![])],
             )
             .unwrap()
             .storage_type(),
-            &ArrayType::new_static(DataType::F32, [1])
+            &ArrayType::new_static(DataType::F32, [1]),
         );
     }
 
@@ -1502,17 +1524,17 @@ mod tests {
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 4, 7]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![2]), RaggedDimension::new(2, columns.clone(), vec![0])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![2]), RaggedDimension::new(2, columns.clone(), vec![0])],
             ),
-            Err(TypeError::invalid("ragged axis 1 depends on ragged axis 2; dependencies must precede their consumer"))
+            Err(TypeError::invalid("ragged axis 1 depends on ragged axis 2; dependencies must precede their consumer")),
         );
         assert_eq!(
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 4, 7]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows, vec![2]), RaggedDimension::new(2, columns, vec![1])]
+                vec![RaggedDimension::new(1, rows, vec![2]), RaggedDimension::new(2, columns, vec![1])],
             ),
-            Err(TypeError::invalid("ragged axis 1 depends on ragged axis 2; dependencies must precede their consumer"))
+            Err(TypeError::invalid("ragged axis 1 depends on ragged axis 2; dependencies must precede their consumer")),
         );
     }
 
@@ -1533,7 +1555,45 @@ mod tests {
             RaggedType::new(ArrayType::scalar(DIMENSION_DATA_TYPE), RaggedValueKind::Dimension(exact.clone()), vec![])
                 .unwrap()
                 .value_kind(),
-            &RaggedValueKind::Dimension(exact)
+            &RaggedValueKind::Dimension(exact),
+        );
+    }
+
+    #[test]
+    fn test_ragged_type_new_extent_sharding() {
+        // Extent types carry the storage sharding of their extent axes, in extent-axis order.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4, 4])
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![
+                            ShardingDimension::sharded(["x"]),
+                            ShardingDimension::sharded(["y"]),
+                            ShardingDimension::replicated(),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows, vec![1, 0])],
+        )
+        .unwrap();
+        assert_eq!(
+            r#type.extent_types(),
+            &[ArrayType::new_static(DIMENSION_DATA_TYPE, [4, 2])
+                .with_sharding(
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])])
+                        .unwrap(),
+                )
+                .unwrap()],
         );
     }
 
@@ -1554,7 +1614,7 @@ mod tests {
         let kind = RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(1)));
         assert_eq!(
             RaggedType::new(ArrayType::scalar(DIMENSION_DATA_TYPE), kind.clone(), vec![]).unwrap().value_kind(),
-            &kind
+            &kind,
         );
     }
 
@@ -1566,11 +1626,11 @@ mod tests {
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 RaggedValueKind::Array,
-                vec![descriptor.clone()]
+                vec![descriptor.clone()],
             )
             .unwrap()
             .ragged_dimensions(),
-            &[descriptor]
+            &[descriptor],
         );
     }
 
@@ -1581,11 +1641,11 @@ mod tests {
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![0])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![0])],
             )
             .unwrap()
             .logical_shape(),
-            &Shape::new(vec![Dimension::Static(2), rows.into()])
+            &Shape::new(vec![Dimension::Static(2), rows.into()]),
         );
     }
 
@@ -1596,16 +1656,229 @@ mod tests {
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows, vec![])]
+                vec![RaggedDimension::new(1, rows, vec![])],
             )
             .unwrap()
             .extent_types(),
-            &[ArrayType::scalar(DIMENSION_DATA_TYPE)]
+            &[ArrayType::scalar(DIMENSION_DATA_TYPE)],
         );
     }
 
     #[test]
-    fn test_ragged_type_formatting_equality_and_hashing() {
+    fn test_ragged_type_indexed_identities() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let rows = DimensionVariable::new("rows", bounds);
+        let columns = DimensionVariable::new("columns", bounds);
+
+        // Array values report each ragged dimension in storage-axis order, paired with its ordered extent axes.
+        let array = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, columns.clone(), vec![1, 0]), RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        assert_eq!(array.indexed_identities().collect::<Vec<_>>(), vec![(&rows, vec![0]), (&columns, vec![1, 0])]);
+
+        // Dimension values also report a symbolic represented dimension over every storage axis, while a static
+        // represented dimension adds no entry.
+        let item = DimensionType::new("item", DimensionBounds::unbounded());
+        let symbolic = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Dimension(item.clone()),
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        assert_eq!(
+            symbolic.indexed_identities().collect::<Vec<_>>(),
+            vec![(&rows, vec![0]), (item.variable().unwrap(), vec![0, 1])],
+        );
+        let exact = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        assert_eq!(exact.indexed_identities().collect::<Vec<_>>(), vec![(&rows, vec![0])]);
+    }
+
+    #[test]
+    fn test_ragged_type_indexed_refinement_facts() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let rows = DimensionVariable::new("rows", bounds);
+        let other = DimensionVariable::new("other", bounds);
+        let declared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other.clone(), vec![0])],
+        )
+        .unwrap();
+
+        // Every pair of ragged dimensions records a correspondence, even between identical identities. Refinement
+        // requires the same identity, while the other comparison modes relate distinct identities.
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &declared, DimensionComparison::Refinement).as_deref(),
+            Ok([DimensionRefinementFact::Correspondence(declared_identity, actual_identity)])
+                if *declared_identity == &rows && *actual_identity == &rows,
+        ));
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &actual, DimensionComparison::LocalDeclarations).as_deref(),
+            Ok([DimensionRefinementFact::Correspondence(declared_identity, actual_identity)])
+                if *declared_identity == &rows && *actual_identity == &other,
+        ));
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &actual, DimensionComparison::IdentityRenaming).as_deref(),
+            Ok([DimensionRefinementFact::Correspondence(declared_identity, actual_identity)])
+                if *declared_identity == &rows && *actual_identity == &other,
+        ));
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &actual, DimensionComparison::Refinement),
+            Err(TypeError::Invalid { message })
+                if message == "indexed dimension `other` does not refine declared indexed dimension `rows`",
+        ));
+
+        // Actual identities must fit within the declared bounds in every comparison mode.
+        let wide = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 8]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(
+                1,
+                DimensionVariable::new("wide", DimensionBounds::non_negative(Some(9)).unwrap()),
+                vec![0],
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &wide, DimensionComparison::LocalDeclarations),
+            Err(TypeError::Invalid { message })
+                if message == "indexed dimension `wide` does not refine declared indexed dimension `rows`",
+        ));
+
+        // Ragged dimensions must agree in number, storage axes, extent axes, and value kind.
+        let columns = DimensionVariable::new("columns", bounds);
+        let longer = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other.clone(), vec![0]), RaggedDimension::new(2, columns, vec![0])],
+        )
+        .unwrap();
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &longer, DimensionComparison::LocalDeclarations),
+            Err(TypeError::Invalid { message }) if message == "ragged types have different numbers of ragged dimensions",
+        ));
+        let transposed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [4, 2]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, other.clone(), vec![1])],
+        )
+        .unwrap();
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &transposed, DimensionComparison::LocalDeclarations),
+            Err(TypeError::Invalid { message })
+                if message == "ragged types have different occurrence axes or extent axes",
+        ));
+        let shared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other.clone(), vec![])],
+        )
+        .unwrap();
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &shared, DimensionComparison::LocalDeclarations),
+            Err(TypeError::Invalid { message })
+                if message == "ragged types have different occurrence axes or extent axes",
+        ));
+        let dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Dimension(DimensionType::new("item", DimensionBounds::unbounded())),
+            vec![RaggedDimension::new(1, other, vec![0])],
+        )
+        .unwrap();
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared, &dimension, DimensionComparison::LocalDeclarations),
+            Err(TypeError::Invalid { message }) if message == "ragged types have different value kinds",
+        ));
+
+        // Represented dimension values are compared as local declarations even in refinement mode, so distinct
+        // identities correspond and exact supplied values record declared extents.
+        let declared_item = DimensionType::new("declared_item", bounds);
+        let actual_item = DimensionType::new("actual_item", bounds);
+        let declared_dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(declared_item.clone()),
+            vec![],
+        )
+        .unwrap();
+        let actual_dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(actual_item.clone()),
+            vec![],
+        )
+        .unwrap();
+        let exact_dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(
+                &declared_dimension,
+                &actual_dimension,
+                DimensionComparison::Refinement,
+            )
+            .as_deref(),
+            Ok([DimensionRefinementFact::Correspondence(declared_identity, actual_identity)])
+                if Some(*declared_identity) == declared_item.variable()
+                    && Some(*actual_identity) == actual_item.variable(),
+        ));
+        assert!(matches!(
+            RaggedType::indexed_refinement_facts(&declared_dimension, &exact_dimension, DimensionComparison::Refinement)
+                .as_deref(),
+            Ok([DimensionRefinementFact::Declared(identity, 3)]) if Some(*identity) == declared_item.variable(),
+        ));
+    }
+
+    #[test]
+    fn test_ragged_type_validate_unrepeated_indexed_identities() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let other = DimensionVariable::new("other", rows.bounds());
+        let first = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let second = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(RaggedType::validate_unrepeated_indexed_identities([&first, &second]), Ok(()));
+
+        // Repeated indexed occurrences carry independent extent payloads, whether they occur across several types or
+        // within a single type.
+        let error = TypeError::invalid(
+            "indexed dimension `rows` has repeated extent occurrences whose equality requires runtime checking",
+        );
+        assert_eq!(RaggedType::validate_unrepeated_indexed_identities([&first, &first]), Err(error.clone()));
+        let repeated = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, rows, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(RaggedType::validate_unrepeated_indexed_identities([&repeated]), Err(error));
+    }
+
+    #[test]
+    fn test_ragged_type_equality_and_hashing() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::F32, [2, 4]),
@@ -1613,25 +1886,69 @@ mod tests {
             vec![RaggedDimension::new(1, rows.clone(), vec![0])],
         )
         .unwrap();
-        assert_eq!(r#type.to_string(), "ragged<f32[2, 4]; 1:rows over [0]>");
-        assert_eq!(r#type.clone(), r#type);
+        let rebuilt = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
         let other = RaggedType::new(
             ArrayType::new_static(DataType::F32, [2, 4]),
             RaggedValueKind::Array,
             vec![RaggedDimension::new(1, DimensionVariable::new("rows", rows.bounds()), vec![0])],
         )
         .unwrap();
+
+        // Clones and independently constructed types with the same components are equal, while a nominally distinct
+        // identity with the same name and bounds produces a distinct type.
+        assert_eq!(r#type.clone(), r#type);
+        assert_eq!(rebuilt, r#type);
         assert_ne!(r#type, other);
+
+        // Hashing agrees with equality.
         let types = HashMap::from([(r#type.clone(), "first")]);
-        assert_eq!(types.get(&r#type.clone()), Some(&"first"));
+        assert_eq!(types.get(&r#type), Some(&"first"));
+        assert_eq!(types.get(&rebuilt), Some(&"first"));
         assert_eq!(types.get(&other), None);
-        let item = RaggedType::new(
+    }
+
+    #[test]
+    fn test_ragged_type_display() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let rows = DimensionVariable::new("rows", bounds);
+        let columns = DimensionVariable::new("columns", bounds);
+
+        // Ragged dimensions render in storage-axis order, each with its ordered extent axes.
+        let array = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        assert_eq!(array.to_string(), "ragged<f32[2, 4]; 1:rows over [0]>");
+        let nested = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, columns, vec![1, 0]), RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        assert_eq!(nested.to_string(), "ragged<f32[2, 4, 4]; 1:rows over [0]; 2:columns over [1, 0]>");
+
+        // Dimension values also render their represented dimension type before any ragged dimensions.
+        let exact = RaggedType::new(
             ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
             RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
             vec![],
         )
         .unwrap();
-        assert_eq!(item.to_string(), "ragged<i64[2]; item=dimension<3>>");
+        assert_eq!(exact.to_string(), "ragged<i64[2]; item=dimension<3>>");
+        let symbolic = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Dimension(DimensionType::new("item", bounds)),
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(symbolic.to_string(), "ragged<i64[2, 4]; item=dimension<item ∈ [0, 5)>; 1:rows over [0]>");
     }
 
     #[test]
@@ -1663,9 +1980,9 @@ mod tests {
             RaggedType::new(
                 scalar_storage,
                 RaggedValueKind::Array,
-                vec![RaggedDimension::new(1, rows.clone(), vec![0])]
+                vec![RaggedDimension::new(1, rows.clone(), vec![0])],
             ),
-            Err(error)
+            Err(error),
         );
 
         // Occurrences in separate carriers need compatible extent coordinates without repeated dimensions.
@@ -1677,7 +1994,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             RaggedType::validate_identity_scope([&indexed, &different]),
-            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates"))
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates")),
         );
         let ambiguous = RaggedType::new(
             ArrayType::new_static(DataType::F32, [2, 2, 4]),
@@ -1687,34 +2004,85 @@ mod tests {
         .unwrap();
         assert_eq!(
             RaggedType::validate_identity_scope([&ambiguous, &ambiguous]),
-            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated extent coordinates"))
+            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated extent coordinates")),
         );
     }
 
     #[test]
-    fn test_ragged_type_identities_and_renaming() {
+    fn test_ragged_type_validate_zero() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let array = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let error = TypeError::invalid("zero construction for first-class ragged types is not supported yet");
+        assert_eq!(array.validate_zero(), Err(error.clone()));
+        assert_eq!(dimension.validate_zero(), Err(error));
+    }
+
+    #[test]
+    fn test_ragged_type_validate_one() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let array = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let error = TypeError::invalid("one construction for first-class ragged types is not supported yet");
+        assert_eq!(array.validate_one(), Err(error.clone()));
+        assert_eq!(dimension.validate_one(), Err(error));
+    }
+
+    #[test]
+    fn test_ragged_type_identities() {
         let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
         let first = DimensionVariable::new("first", bounds);
         let second = DimensionVariable::new("second", bounds);
+
+        // Ragged dimensions reference their indexed identities in storage-axis order.
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::F32, [4, 4]),
             RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, first.clone(), vec![]), RaggedDimension::new(1, second.clone(), vec![0])],
+            vec![RaggedDimension::new(1, second.clone(), vec![0]), RaggedDimension::new(0, first.clone(), vec![])],
         )
         .unwrap();
         assert_eq!(
-            r#type.identities().map(|(position, identity)| (position, identity.clone())).collect::<Vec<_>>(),
-            vec![(TypeIdentityPosition::Reference, first.clone()), (TypeIdentityPosition::Reference, second.clone())]
+            r#type.identities().collect::<Vec<_>>(),
+            vec![(TypeIdentityPosition::Reference, &first), (TypeIdentityPosition::Reference, &second)],
         );
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(first.clone(), second.clone()).unwrap();
-        renaming.insert(second.clone(), first.clone()).unwrap();
-        let renamed = r#type.rename_identities(&renaming).unwrap();
+
+        // Storage-shape identities come first, and a symbolic represented dimension is a definition reported last.
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let item = DimensionType::new("item", DimensionBounds::unbounded());
+        let dimension = RaggedType::new(
+            ArrayType::new(DIMENSION_DATA_TYPE, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Dimension(item.clone()),
+            vec![RaggedDimension::new(1, first.clone(), vec![0])],
+        )
+        .unwrap();
         assert_eq!(
-            renamed.ragged_dimensions(),
-            &[RaggedDimension::new(0, second, vec![]), RaggedDimension::new(1, first, vec![0])]
+            dimension.identities().collect::<Vec<_>>(),
+            vec![
+                (TypeIdentityPosition::Reference, &batch),
+                (TypeIdentityPosition::Reference, &first),
+                (TypeIdentityPosition::Definition, item.variable().unwrap()),
+            ],
         );
-        assert_eq!(renamed.rename_identities(&renaming), Ok(r#type));
     }
 
     #[test]
@@ -1752,7 +2120,7 @@ mod tests {
         assert_eq!(RaggedType::derive_identity_renaming([&item(3)], [&item(3)]), Ok(TypeIdentityRenaming::new()));
         assert_eq!(
             RaggedType::derive_identity_renaming([&item(3)], [&item(2)]),
-            Err(TypeError::invalid("dimension type dimension<2> cannot instantiate declared type dimension<3>"))
+            Err(TypeError::invalid("dimension type dimension<2> cannot instantiate declared type dimension<3>")),
         );
 
         // Repeated indexed occurrences carry independent payloads, which a structural renaming cannot relate.
@@ -1760,8 +2128,945 @@ mod tests {
             RaggedType::derive_identity_renaming([&declared, &declared], [&actual, &actual]),
             Err(TypeError::invalid(
                 "indexed dimension `declared_rows` has repeated extent occurrences whose equality requires runtime \
-                 checking"
-            ))
+                 checking",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_ragged_type_rename_identities() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [4, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, first.clone(), vec![]), RaggedDimension::new(1, second.clone(), vec![0])],
+        )
+        .unwrap();
+
+        // Ragged-dimension identities are renamed simultaneously, so swapping them is its own inverse.
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(first.clone(), second.clone()).unwrap();
+        renaming.insert(second.clone(), first.clone()).unwrap();
+        let renamed = r#type.rename_identities(&renaming).unwrap();
+        assert_eq!(
+            renamed.ragged_dimensions(),
+            &[RaggedDimension::new(0, second.clone(), vec![]), RaggedDimension::new(1, first.clone(), vec![0])],
+        );
+        assert_eq!(renamed.rename_identities(&renaming), Ok(r#type.clone()));
+
+        // Represented dimension identities are renamed too.
+        let item = DimensionType::new("item", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(item.to_variable(), target.clone()).unwrap();
+        assert_eq!(
+            RaggedType::new(ArrayType::new_static(DIMENSION_DATA_TYPE, [2]), RaggedValueKind::Dimension(item), vec![])
+                .unwrap()
+                .rename_identities(&renaming),
+            RaggedType::new(
+                ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+                RaggedValueKind::Dimension(DimensionType::from(target)),
+                vec![],
+            ),
+        );
+
+        // Renamed types are validated again, so a narrower target must still match the padded storage.
+        let narrow = DimensionVariable::new("narrow", DimensionBounds::non_negative(Some(3)).unwrap());
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(first, narrow).unwrap();
+        assert_eq!(
+            r#type.rename_identities(&renaming),
+            Err(TypeError::invalid("ragged axis 0 requires storage extent 2 for dimension `narrow` but got `4`")),
+        );
+    }
+
+    #[test]
+    fn test_ragged_type_is_compatible_with() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let declared = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+
+        // Compatibility is exact type equality, unlike the refinement relation tested by
+        // `test_ragged_type_is_refined_by`.
+        assert!(declared.is_compatible_with(&declared.clone()));
+        assert!(!declared.is_compatible_with(&actual));
+        assert!(!actual.is_compatible_with(&declared));
+    }
+
+    #[test]
+    fn test_ragged_type_is_refined_by() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let rows = DimensionVariable::new("rows", bounds);
+        let other = DimensionVariable::new("other", bounds);
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let declared = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+
+        // Storage follows array refinement.
+        assert!(declared.is_refined_by(&declared));
+        assert!(declared.is_refined_by(&actual));
+        assert!(!actual.is_refined_by(&declared));
+
+        // Ragged dimensions require the same indexed identities.
+        let renamed = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other, vec![0])],
+        )
+        .unwrap();
+        assert!(!declared.is_refined_by(&renamed));
+
+        // Value kinds must agree even when the storage types refine each other.
+        let item = DimensionType::new("item", bounds);
+        let integer_array = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let symbolic_dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Dimension(item.clone()),
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        assert!(!integer_array.is_refined_by(&symbolic_dimension));
+
+        // Represented dimension values are refined by any values within their bounds.
+        let exact_dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let item_dimension =
+            RaggedType::new(ArrayType::new_static(DIMENSION_DATA_TYPE, [2]), RaggedValueKind::Dimension(item), vec![])
+                .unwrap();
+        assert!(item_dimension.is_refined_by(&exact_dimension));
+        assert!(!exact_dimension.is_refined_by(&item_dimension));
+    }
+
+    #[test]
+    fn test_ragged_type_is_scalar() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let array = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, rows, vec![])],
+        )
+        .unwrap();
+        let dimension = RaggedType::new(
+            ArrayType::scalar(DIMENSION_DATA_TYPE),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        assert!(!array.is_scalar());
+        assert!(!dimension.is_scalar());
+    }
+
+    #[test]
+    fn test_ragged_type_is_complex() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let complex = RaggedType::new(
+            ArrayType::new_static(DataType::C64, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let real = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        assert!(complex.is_complex());
+        assert!(!real.is_complex());
+        assert!(!dimension.is_complex());
+    }
+
+    #[test]
+    fn test_ragged_type_referent() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(r#type.referent(), None);
+        assert!(!r#type.is_reference());
+    }
+
+    #[test]
+    fn test_ragged_type_as_referent() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(r#type.as_referent(), None);
+    }
+
+    #[test]
+    fn test_ragged_identity_scope_record_scalar() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+
+        // Scalar extent identities may repeat and are recorded once, in first-occurrence order.
+        let mut scope = RaggedIdentityScope::default();
+        assert_eq!(scope.record_scalar(&rows), Ok(()));
+        assert_eq!(scope.record_scalar(&rows), Ok(()));
+        assert_eq!(scope.scalar_identities, vec![rows.clone()]);
+
+        // An identity already recorded as indexed cannot also describe a scalar extent.
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let mut scope = RaggedIdentityScope::default();
+        assert_eq!(scope.record_ragged(0, &indexed), Ok(()));
+        assert_eq!(
+            scope.record_scalar(&rows),
+            Err(TypeError::invalid(
+                "dimension identity `rows` is used as both a scalar extent and indexed ragged extents",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_ragged_identity_scope_record_ragged() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3, 5]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0, 2])],
+        )
+        .unwrap();
+
+        // Indexed identities are recorded with the extent coordinates, member index, and extent axes of their first
+        // occurrence, and later carriers may index them by the same extent coordinates in another order.
+        let mut scope = RaggedIdentityScope::default();
+        assert_eq!(scope.record_ragged(0, &indexed), Ok(()));
+        assert_eq!(
+            scope.indexed_identities,
+            vec![(rows.clone(), vec![Dimension::Static(2), Dimension::Static(5)], 0, vec![0, 2])],
+        );
+        let permuted = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [5, 2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows.clone(), vec![0, 1])],
+        )
+        .unwrap();
+        assert_eq!(scope.record_ragged(1, &permuted), Ok(()));
+
+        // Other extent coordinates are incompatible.
+        let different = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [4, 3, 5]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0, 2])],
+        )
+        .unwrap();
+        assert_eq!(
+            scope.record_ragged(2, &different),
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates")),
+        );
+
+        // An identity already recorded as a scalar extent cannot also describe indexed extents.
+        let mut scope = RaggedIdentityScope::default();
+        assert_eq!(scope.record_scalar(&rows), Ok(()));
+        assert_eq!(
+            scope.record_ragged(0, &indexed),
+            Err(TypeError::invalid(
+                "dimension identity `rows` is used as both a scalar extent and indexed ragged extents",
+            )),
+        );
+
+        // Repeated extent coordinates cannot establish a correspondence across carriers, but one carrier may reuse
+        // its explicit extent-axis correspondence.
+        let ambiguous = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows.clone(), vec![0, 1])],
+        )
+        .unwrap();
+        let mut scope = RaggedIdentityScope::default();
+        assert_eq!(scope.record_ragged(0, &ambiguous), Ok(()));
+        assert_eq!(
+            scope.record_ragged(1, &ambiguous),
+            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated extent coordinates")),
+        );
+        let repeated = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 2, 3, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows.clone(), vec![0, 1]), RaggedDimension::new(3, rows, vec![0, 1])],
+        )
+        .unwrap();
+        assert_eq!(RaggedIdentityScope::default().record_ragged(0, &repeated), Ok(()));
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_from_local_declarations() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let other = DimensionVariable::new("other", rows.bounds());
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let declared = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other.clone(), vec![0])],
+        )
+        .unwrap();
+
+        // Indexed correspondences form a separate scope, each side records the extent coordinates of its indexed
+        // identities, and the mixed-scope class order starts empty.
+        assert_eq!(
+            RaggedDimensionRefinements::from_local_declarations([(&declared, &actual)]),
+            Ok(RaggedDimensionRefinements {
+                indexed: DimensionRefinements::from_refinement_facts([Ok(DimensionRefinementFact::Correspondence(
+                    &rows, &other,
+                ))])
+                .unwrap(),
+                declared_extent_coordinates: vec![(rows, vec![batch.into()])],
+                actual_extent_coordinates: vec![(other, vec![Dimension::Static(2)])],
+                identity_class_order: Vec::new(),
+            }),
+        );
+
+        // Indexed identities outside the declared bounds are rejected.
+        let wide = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 8]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(
+                1,
+                DimensionVariable::new("wide", DimensionBounds::non_negative(Some(9)).unwrap()),
+                vec![0],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            RaggedDimensionRefinements::from_local_declarations([(&declared, &wide)]),
+            Err(TypeError::invalid("indexed dimension `wide` does not refine declared indexed dimension `rows`")),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_with_identity_class_order() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [first, batch, second] = ["first", "batch", "second"].map(|name| DimensionVariable::new(name, bounds));
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, first.clone(), vec![0])],
+        )
+        .unwrap();
+        let batched = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, second.clone(), vec![0])],
+        )
+        .unwrap();
+        let storage_types = [indexed.storage_type(), batched.storage_type()];
+        let scalar = ArrayTypeRefinements::from_local_declarations(storage_types, storage_types).unwrap();
+        let ragged =
+            RaggedDimensionRefinements::from_local_declarations([(&indexed, &indexed), (&batched, &batched)]).unwrap();
+
+        // Tagged facts record each scalar or indexed class once, at its first observation.
+        let ordered = ragged
+            .clone()
+            .with_identity_class_order(
+                &scalar,
+                [
+                    (true, Ok(DimensionRefinementFact::Correspondence(&second, &second))),
+                    (false, Ok(DimensionRefinementFact::Correspondence(&batch, &batch))),
+                    (true, Ok(DimensionRefinementFact::Correspondence(&first, &first))),
+                    (true, Ok(DimensionRefinementFact::Correspondence(&second, &second))),
+                ],
+            )
+            .unwrap();
+        assert_eq!(ordered.identity_class_order, vec![(true, 1), (false, 0), (true, 0)]);
+
+        // Fact errors are propagated, while scopes without indexed identities keep the ordinary scalar order and do
+        // not consume the facts.
+        let error = TypeError::invalid("invalid fact");
+        assert_eq!(ragged.with_identity_class_order(&scalar, [(true, Err(error.clone()))]), Err(error.clone()));
+        assert_eq!(
+            RaggedDimensionRefinements::default().with_identity_class_order(&scalar, [(true, Err(error))]),
+            Ok(RaggedDimensionRefinements::default()),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_refinement_facts() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let other = DimensionVariable::new("other", rows.bounds());
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let declared = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other.clone(), vec![0])],
+        )
+        .unwrap();
+
+        // Successful comparisons yield only indexed facts; storage facts belong to the caller's scalar scope.
+        assert!(matches!(
+            RaggedDimensionRefinements::refinement_facts(&declared, &actual, DimensionComparison::LocalDeclarations)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Ok(DimensionRefinementFact::Correspondence(declared_identity, actual_identity))]
+                if *declared_identity == &rows && *actual_identity == &other,
+        ));
+
+        // Failed comparisons yield only their error.
+        assert!(matches!(
+            RaggedDimensionRefinements::refinement_facts(&declared, &actual, DimensionComparison::Refinement)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Err(TypeError::Invalid { message })]
+                if message == "indexed dimension `other` does not refine declared indexed dimension `rows`",
+        ));
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_identity_classes() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [first, batch, second] = ["first", "batch", "second"].map(|name| DimensionVariable::new(name, bounds));
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, first.clone(), vec![0])],
+        )
+        .unwrap();
+        let batched = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, second.clone(), vec![0])],
+        )
+        .unwrap();
+        let storage_types = [indexed.storage_type(), batched.storage_type()];
+        let scalar = ArrayTypeRefinements::from_local_declarations(storage_types, storage_types).unwrap();
+        let ragged =
+            RaggedDimensionRefinements::from_local_declarations([(&indexed, &indexed), (&batched, &batched)]).unwrap();
+        let first_class = TypeIdentityClass::new(std::slice::from_ref(&first), std::slice::from_ref(&first), false);
+        let batch_class = TypeIdentityClass::new(std::slice::from_ref(&batch), std::slice::from_ref(&batch), false);
+        let second_class = TypeIdentityClass::new(std::slice::from_ref(&second), std::slice::from_ref(&second), false);
+
+        // Without a recorded class order, scalar classes precede indexed classes.
+        assert_eq!(
+            ragged.identity_classes(&scalar).collect::<Vec<_>>(),
+            vec![batch_class.clone(), first_class.clone(), second_class.clone()]
+        );
+
+        // A recorded class order interleaves both scopes in their mixed first-observation order.
+        let ragged = ragged
+            .with_identity_class_order(
+                &scalar,
+                [
+                    (true, Ok(DimensionRefinementFact::Correspondence(&first, &first))),
+                    (false, Ok(DimensionRefinementFact::Correspondence(&batch, &batch))),
+                    (true, Ok(DimensionRefinementFact::Correspondence(&second, &second))),
+                ],
+            )
+            .unwrap();
+        assert_eq!(ragged.identity_classes(&scalar).collect::<Vec<_>>(), vec![first_class, batch_class, second_class]);
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_merge_identities_needing_runtime_checks() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [first, second, rows, other] =
+            ["first", "second", "rows", "other"].map(|name| DimensionVariable::new(name, bounds));
+        let first_declared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, first.clone(), vec![0])],
+        )
+        .unwrap();
+        let second_declared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, second.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+
+        // Distinct declarations entering through one repeated actual indexed identity all keep runtime checks.
+        let repeated = RaggedDimensionRefinements::from_local_declarations([
+            (&first_declared, &actual),
+            (&second_declared, &actual),
+        ])
+        .unwrap();
+        assert_eq!(
+            repeated.merge_identities_needing_runtime_checks(Vec::new(), [&first, &second], [&actual, &actual]),
+            vec![first.clone(), second.clone()],
+        );
+
+        // Results follow the first occurrence of each identity in the declared signature, without repetitions.
+        assert_eq!(
+            repeated.merge_identities_needing_runtime_checks(
+                vec![second.clone()],
+                [&second, &first, &second],
+                [&actual, &actual],
+            ),
+            vec![second.clone(), first.clone()],
+        );
+
+        // Without a repeated actual indexed identity, only the provided identities need runtime checks.
+        let distinct = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other, vec![0])],
+        )
+        .unwrap();
+        let unrepeated = RaggedDimensionRefinements::from_local_declarations([
+            (&first_declared, &actual),
+            (&second_declared, &distinct),
+        ])
+        .unwrap();
+        assert_eq!(
+            unrepeated.merge_identities_needing_runtime_checks(
+                vec![second.clone()],
+                [&first, &second],
+                [&actual, &distinct],
+            ),
+            vec![second],
+        );
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_validate_scalar() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let other = DimensionVariable::new("other", rows.bounds());
+        let declared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, other.clone(), vec![0])],
+        )
+        .unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([(&declared, &actual)]).unwrap();
+
+        // Indexed identities of the selected scope cannot be reused as scalar extents.
+        assert_eq!(
+            ragged.validate_scalar(&rows, true),
+            Err(TypeError::invalid(
+                "dimension identity `rows` is used as both a scalar extent and indexed ragged extents",
+            )),
+        );
+        assert_eq!(
+            ragged.validate_scalar(&other, false),
+            Err(TypeError::invalid(
+                "dimension identity `other` is used as both a scalar extent and indexed ragged extents",
+            )),
+        );
+
+        // The declared and actual scopes are separate.
+        assert_eq!(ragged.validate_scalar(&other, true), Ok(()));
+        assert_eq!(ragged.validate_scalar(&rows, false), Ok(()));
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_validate_ragged() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let declared = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let scalar = ArrayTypeRefinements::new([declared.storage_type()], [actual.storage_type()]).unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([(&declared, &actual)]).unwrap();
+        let incompatible = TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates");
+
+        // Extent coordinates are compared after applying the scalar scope's exact facts.
+        assert_eq!(ragged.validate_ragged(&declared, &scalar, true), Ok(()));
+        assert_eq!(ragged.validate_ragged(&actual, &scalar, true), Ok(()));
+        assert_eq!(ragged.validate_ragged(&actual, &scalar, false), Ok(()));
+        assert_eq!(ragged.validate_ragged(&actual, &ArrayTypeRefinements::default(), true), Err(incompatible.clone()));
+
+        // Other extent coordinates are incompatible.
+        let different = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        assert_eq!(ragged.validate_ragged(&different, &scalar, true), Err(incompatible));
+
+        // Scalar identities of the selected scope cannot be reused as indexed identities.
+        let aliased = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 8]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, batch, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(
+            ragged.validate_ragged(&aliased, &scalar, true),
+            Err(TypeError::invalid(
+                "dimension identity `batch` is used as both a scalar extent and indexed ragged extents",
+            )),
+        );
+
+        // Recorded extent coordinates with repeated dimensions cannot establish a correspondence.
+        let ambiguous = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(2, rows, vec![0, 1])],
+        )
+        .unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([(&ambiguous, &ambiguous)]).unwrap();
+        assert_eq!(
+            ragged.validate_ragged(&ambiguous, &ArrayTypeRefinements::default(), true),
+            Err(TypeError::invalid("indexed dimension `rows` has ambiguous repeated extent coordinates")),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_validate_declared_extents() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let item = DimensionType::new("item", bounds);
+        let declared =
+            RaggedType::new(ArrayType::new_static(DIMENSION_DATA_TYPE, [2]), RaggedValueKind::Dimension(item), vec![])
+                .unwrap();
+        let three = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let two = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(2))),
+            vec![],
+        )
+        .unwrap();
+        let mut ragged = RaggedDimensionRefinements::from_local_declarations([(&declared, &three)]).unwrap();
+
+        // Output facts must agree with the exact indexed extents recorded by the inputs.
+        assert_eq!(ragged.validate_declared_extents(&declared, &three, &[]), Ok(()));
+        assert_eq!(
+            ragged.validate_declared_extents(&declared, &two, &[]),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "item".to_owned(),
+                expected: 3,
+                actual: 2,
+            })),
+        );
+
+        // An unresolved identity records its first exact extent only when it is closed.
+        let fresh = DimensionType::new("fresh", bounds);
+        let unresolved = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(fresh.clone()),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            ragged.validate_declared_extents(&unresolved, &three, &[]),
+            Err(TypeError::invalid("dimension identity fresh does not belong to the validated boundary signature")),
+        );
+        assert_eq!(ragged.validate_declared_extents(&unresolved, &three, &[fresh.to_variable()]), Ok(()));
+        assert_eq!(
+            ragged.validate_declared_extents(&unresolved, &two, &[fresh.to_variable()]),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "fresh".to_owned(),
+                expected: 3,
+                actual: 2,
+            })),
+        );
+
+        // Output pairs are compared under refinement rules, which require the same indexed identities.
+        let rows = DimensionVariable::new("rows", bounds);
+        let other = DimensionVariable::new("other", bounds);
+        assert_eq!(
+            ragged.validate_declared_extents(
+                &RaggedType::new(
+                    ArrayType::new_static(DataType::F32, [2, 4]),
+                    RaggedValueKind::Array,
+                    vec![RaggedDimension::new(1, rows, vec![0])],
+                )
+                .unwrap(),
+                &RaggedType::new(
+                    ArrayType::new_static(DataType::F32, [2, 4]),
+                    RaggedValueKind::Array,
+                    vec![RaggedDimension::new(1, other, vec![0])],
+                )
+                .unwrap(),
+                &[],
+            ),
+            Err(TypeError::invalid("indexed dimension `other` does not refine declared indexed dimension `rows`")),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_refine_declared_type() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+
+        // Storage is refined with the scalar scope.
+        let declared = RaggedType::new(
+            ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let scalar = ArrayTypeRefinements::new([declared.storage_type()], [actual.storage_type()]).unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([(&declared, &actual)]).unwrap();
+        assert_eq!(ragged.refine_declared_type(&declared, &scalar, &[]), Ok(actual));
+        assert_eq!(ragged.refine_declared_type(&declared, &scalar, &[batch]), Ok(declared));
+
+        // Exact indexed facts refine represented dimension values but retain ragged dimensions and padded storage.
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let item = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(rows.clone())),
+            vec![],
+        )
+        .unwrap();
+        let exact = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let storage_types = [indexed.storage_type(), item.storage_type(), exact.storage_type()];
+        let scalar = ArrayTypeRefinements::new(storage_types, storage_types).unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([
+            (&indexed, &indexed),
+            (&item, &item),
+            (&item, &exact),
+        ])
+        .unwrap();
+        assert_eq!(ragged.refine_declared_type(&item, &scalar, &[]), Ok(exact));
+        assert_eq!(ragged.refine_declared_type(&item, &scalar, &[rows]), Ok(item));
+        assert_eq!(ragged.refine_declared_type(&indexed, &scalar, &[]), Ok(indexed));
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_refine_actual_type() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let item = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(rows.clone())),
+            vec![],
+        )
+        .unwrap();
+        let exact = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let storage_types = [indexed.storage_type(), item.storage_type(), exact.storage_type()];
+        let scalar = ArrayTypeRefinements::new(storage_types, storage_types).unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([
+            (&indexed, &indexed),
+            (&item, &item),
+            (&item, &exact),
+        ])
+        .unwrap();
+
+        // Exact indexed facts refine supplied dimension values but retain ragged dimensions and padded storage.
+        assert_eq!(ragged.refine_actual_type(&item, &scalar, &[]), Ok(exact));
+        assert_eq!(ragged.refine_actual_type(&item, &scalar, &[rows]), Ok(item));
+        assert_eq!(ragged.refine_actual_type(&indexed, &scalar, &[]), Ok(indexed));
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_retype_actual() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+
+        // Represented dimension values select a compatible preferred identity from the declared counterpart's class.
+        let declared_item = DimensionType::new("declared", bounds);
+        let first_item = DimensionType::new("first", bounds);
+        let second_item = DimensionType::new("second", bounds);
+        let declared = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(declared_item),
+            vec![],
+        )
+        .unwrap();
+        let first = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(first_item),
+            vec![],
+        )
+        .unwrap();
+        let second = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(second_item.clone()),
+            vec![],
+        )
+        .unwrap();
+        let storage_types = [declared.storage_type(), declared.storage_type()];
+        let scalar = ArrayTypeRefinements::new(storage_types, [first.storage_type(), second.storage_type()]).unwrap();
+        let ragged =
+            RaggedDimensionRefinements::from_local_declarations([(&declared, &first), (&declared, &second)]).unwrap();
+        assert_eq!(ragged.retype_actual(&declared, &first, &scalar, &[]), Ok(first.clone()));
+        assert_eq!(ragged.retype_actual(&declared, &first, &scalar, &[second_item.to_variable()]), Ok(second.clone()),);
+
+        // Exact indexed facts make supplied dimension values static but retain the supplied ragged dimensions.
+        let rows = DimensionVariable::new("rows", bounds);
+        let indexed = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let item = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(rows.clone())),
+            vec![],
+        )
+        .unwrap();
+        let exact = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2]),
+            RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+            vec![],
+        )
+        .unwrap();
+        let storage_types = [indexed.storage_type(), item.storage_type(), exact.storage_type()];
+        let scalar = ArrayTypeRefinements::new(storage_types, storage_types).unwrap();
+        let ragged = RaggedDimensionRefinements::from_local_declarations([
+            (&indexed, &indexed),
+            (&item, &item),
+            (&item, &exact),
+        ])
+        .unwrap();
+        assert_eq!(ragged.retype_actual(&item, &item, &scalar, &[]), Ok(exact));
+        assert_eq!(ragged.retype_actual(&indexed, &indexed, &scalar, &[]), Ok(indexed.clone()));
+
+        // Supplied types must have the declared ragged dimensions and value kind.
+        let shared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![])],
+        )
+        .unwrap();
+        assert_eq!(
+            ragged.retype_actual(&indexed, &shared, &scalar, &[]),
+            Err(TypeError::invalid("ragged types have different occurrence axes or extent axes")),
+        );
+        let dimension = RaggedType::new(
+            ArrayType::new_static(DIMENSION_DATA_TYPE, [2, 4]),
+            RaggedValueKind::Dimension(DimensionType::new("item", DimensionBounds::unbounded())),
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(
+            ragged.retype_actual(&indexed, &dimension, &scalar, &[]),
+            Err(TypeError::invalid("ragged types have different value kinds")),
+        );
+    }
+
+    #[test]
+    fn test_ragged_dimension_refinements_extent_coordinates() {
+        let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
+        let [rows, columns] = ["rows", "columns"].map(|name| DimensionVariable::new(name, bounds));
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(9)).unwrap());
+        let item = DimensionType::new("item", DimensionBounds::unbounded());
+        let array = RaggedType::new(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![batch.clone().into(), Dimension::Static(4), Dimension::Static(4)]),
+            ),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, columns.clone(), vec![1, 0])],
+        )
+        .unwrap();
+        let dimension = RaggedType::new(
+            ArrayType::new(DIMENSION_DATA_TYPE, Shape::new(vec![batch.clone().into(), Dimension::Static(4)])),
+            RaggedValueKind::Dimension(item.clone()),
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+
+        // Each indexed identity records the logical dimensions of its first occurrence's extent axes, in signature
+        // order, including ragged extent axes and represented dimension values.
+        assert_eq!(
+            RaggedDimensionRefinements::extent_coordinates([&array, &dimension]),
+            vec![
+                (rows.clone(), vec![batch.clone().into()]),
+                (columns, vec![rows.clone().into(), batch.clone().into()]),
+                (item.to_variable(), vec![batch.into(), rows.into()]),
+            ],
         );
     }
 
@@ -1785,7 +3090,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             RaggedTypeRefinements::new([&r#type], [&other]),
-            Err(TypeError::invalid("indexed dimension `other` does not refine declared indexed dimension `rows`"))
+            Err(TypeError::invalid("indexed dimension `other` does not refine declared indexed dimension `rows`")),
         );
     }
 
@@ -1808,7 +3113,7 @@ mod tests {
         let refinements = RaggedTypeRefinements::from_local_declarations([&declared], [&actual]).unwrap();
         assert_eq!(
             refinements.identity_classes().collect::<Vec<_>>(),
-            vec![TypeIdentityClass::new(&[rows.clone()], &[other.clone()], false)]
+            vec![TypeIdentityClass::new(&[rows.clone()], &[other.clone()], false)],
         );
         assert_eq!(refinements.refine_actual(&actual, &[]), Ok(actual));
     }
@@ -1831,7 +3136,7 @@ mod tests {
         let refinements = RaggedTypeRefinements::new([&declared], [&actual]).unwrap();
         assert_eq!(
             refinements.identity_classes().collect::<Vec<_>>(),
-            vec![TypeIdentityClass::new(std::slice::from_ref(dimension.variable().unwrap()), &[], true)]
+            vec![TypeIdentityClass::new(std::slice::from_ref(dimension.variable().unwrap()), &[], true)],
         );
     }
 
@@ -1860,7 +3165,7 @@ mod tests {
                 TypeIdentityClass::new(std::slice::from_ref(&first), std::slice::from_ref(&first), false),
                 TypeIdentityClass::new(std::slice::from_ref(&batch), std::slice::from_ref(&batch), false),
                 TypeIdentityClass::new(std::slice::from_ref(&second), std::slice::from_ref(&second), false),
-            ]
+            ],
         );
     }
 
@@ -1873,8 +3178,30 @@ mod tests {
             vec![RaggedDimension::new(1, rows.clone(), vec![0])],
         )
         .unwrap();
+
+        // Repeated indexed payloads keep runtime checks even when their nominal types agree.
         let refinements = RaggedTypeRefinements::new([&r#type, &r#type], [&r#type, &r#type]).unwrap();
-        assert_eq!(refinements.identities_needing_runtime_checks(), &[rows]);
+        assert_eq!(refinements.identities_needing_runtime_checks(), &[rows.clone()]);
+
+        // Distinct declarations supplied by one repeated actual indexed identity also keep runtime checks.
+        let first = DimensionVariable::new("first", rows.bounds());
+        let second = DimensionVariable::new("second", rows.bounds());
+        let first_declared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, first.clone(), vec![0])],
+        )
+        .unwrap();
+        let second_declared = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, second.clone(), vec![0])],
+        )
+        .unwrap();
+        let refinements =
+            RaggedTypeRefinements::from_local_declarations([&first_declared, &second_declared], [&r#type, &r#type])
+                .unwrap();
+        assert_eq!(refinements.identities_needing_runtime_checks(), &[first, second]);
     }
 
     #[test]
@@ -1902,11 +3229,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             refinements.validate_refinement([&declared], [&different], &[dimension.to_variable()]),
-            Err(TypeError::from(crate::arrays::types::dimensions::DimensionError::InputDimensionMismatch {
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
                 dimension: "item".to_owned(),
                 expected: 3,
-                actual: 2
-            }))
+                actual: 2,
+            })),
         );
     }
 
@@ -1945,7 +3272,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             indexed_refinements.validate_refinement([&different], [&different], &closed),
-            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates"))
+            Err(TypeError::invalid("indexed dimension `rows` is indexed by incompatible extent coordinates")),
         );
     }
 
