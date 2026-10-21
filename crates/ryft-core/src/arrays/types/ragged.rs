@@ -344,9 +344,39 @@ impl RaggedType {
         &self.payload.extent_types
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns indexed identities and their domains, including a dimension value's whole-storage domain.
+    /// Returns each indexed [`DimensionVariable`] together with the storage axes used to look up its runtime extent.
+    /// An entry `(n, [0, 2])` means that `n` has an extent at each coordinate of storage axes `0` and `2`, in that
+    /// order. The returned integers are axis positions, not coordinates or extent values. An empty axis list means
+    /// one shared extent, represented by a scalar payload.
+    ///
+    /// This function first yields one entry per [`RaggedDimension`], in increasing storage-axis order, pairing its
+    /// [`dimension`](RaggedDimension::dimension) with its [`extent_axes`](RaggedDimension::extent_axes). For
+    /// [`RaggedValueKind::Dimension`], it also yields the represented dimension's variable, if any, paired with every
+    /// storage axis in order: the storage itself holds those dimension values. A static represented dimension adds
+    /// no entry. Repeated identities are retained. Ordinary storage-shape variables are handled separately by
+    /// [`ArrayIrType::scalar_extent_identities`].
+    ///
+    /// # Example
+    ///
+    /// Consider storage with shape `[2, 4]`, indexed by `batch` and `element`. A single [`RaggedDimension`] describes
+    /// axis `1` using identity `r` with bounds `[0, 5)` and `extent_axes=[0]`. For [`RaggedValueKind::Array`], this
+    /// function yields:
+    ///
+    /// ```text
+    /// (r, [0])
+    /// ```
+    ///
+    /// Here, `r[b]` gives the number of live elements in batch row `b`. If the same shape instead holds integer
+    /// dimension values with kind `Dimension(n)` for a symbolic `n`, the function yields:
+    ///
+    /// ```text
+    /// (r, [0])
+    /// (n, [0, 1])
+    /// ```
+    ///
+    /// Now `r[b]` gives the number of live dimension values in row `b`, and `n[b, j]` is the dimension value stored
+    /// at each live coordinate `[b, j]`. This function reports the identities and their indexing axes; it does not
+    /// read either payload or determine which coordinates are live.
     pub(crate) fn indexed_identities(&self) -> impl Iterator<Item = (&DimensionVariable, Vec<usize>)> {
         self.payload
             .ragged_dimensions
@@ -360,7 +390,47 @@ impl RaggedType {
             })
     }
 
-    /// Validates physical structure and returns indexed correspondences without making scalar facts from padding.
+    /// Compares the indexed extent requirements of a declared type with those of a supplied
+    /// actual type, returning [`DimensionRefinementFact`]s that relate their identities. For example, a
+    /// [`Correspondence(n, m)`](DimensionRefinementFact::Correspondence) requires the declared indexed
+    /// extents `n` and supplied indexed extents `m` to agree at corresponding live coordinates.
+    ///
+    /// The types must have the same number of [`RaggedDimension`] entries, with matching storage axes and ordered
+    /// [`extent_axes`](RaggedDimension::extent_axes) mappings. Each actual identity's bounds must fit within the
+    /// declared identity's bounds. For each pair, this function records a correspondence, in storage-axis order.
+    /// [`DimensionComparison::Refinement`] additionally requires the same identity on both sides;
+    /// [`DimensionComparison::LocalDeclarations`] and [`DimensionComparison::IdentityRenaming`] allow distinct
+    /// identities and record their relationship according to the selected comparison mode.
+    ///
+    /// Both types must also have the same value kind. For [`RaggedValueKind::Dimension`], facts about
+    /// the represented dimension values follow the ragged-axis correspondences. These are derived by
+    /// [`DimensionTypeRefinements::refinement_facts`], using `LocalDeclarations` for both `Refinement` and
+    /// `LocalDeclarations`, or preserving `IdentityRenaming`. Thus, represented dimension values can have distinct
+    /// identities even in `Refinement` mode. Their facts describe the values at live storage coordinates, separately
+    /// from the extents of the axes indexing those values.
+    ///
+    /// This function inspects types only. Any equality requirements in the returned facts still depend on the required
+    /// runtime checks succeeding. Dense storage-type validation is the caller's responsibility, and padded storage
+    /// capacities never establish exact logical extents here.
+    ///
+    /// # Example
+    ///
+    /// Consider two array-value types with storage `f32[2, 4]`. Each has one [`RaggedDimension`] for axis `1`, with
+    /// `extent_axes=[0]`. The declared type uses identity `n`, the actual type uses a distinct identity `m`, and both
+    /// identities admit lengths `0` through `4`. With `LocalDeclarations`, this function returns:
+    ///
+    /// ```text
+    /// [Correspondence(n, m)]
+    /// ```
+    ///
+    /// This means that `n[b]` and `m[b]` must agree for each batch row `b` once the supplied value satisfies the
+    /// declaration's runtime requirements. It does not imply that either length is `4`: that is only the padded
+    /// capacity. With `Refinement`, the same comparison fails because `n` and `m` are distinct identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypeError`] for mismatched ragged axes, extent-axis mappings, or value kinds, or when actual
+    /// identities or represented dimension types do not satisfy the declared bounds and comparison rules.
     pub(crate) fn indexed_refinement_facts<'o>(
         declared: &'o Self,
         actual: &'o Self,
@@ -369,6 +439,7 @@ impl RaggedType {
         if declared.payload.ragged_dimensions.len() != actual.payload.ragged_dimensions.len() {
             return Err(TypeError::invalid("ragged types have different numbers of ragged dimensions"));
         }
+
         let mut facts = Vec::new();
         for (declared, actual) in declared.payload.ragged_dimensions.iter().zip(&actual.payload.ragged_dimensions) {
             if declared.axis != actual.axis || declared.extent_axes != actual.extent_axes {
@@ -384,6 +455,7 @@ impl RaggedType {
             }
             facts.push(DimensionRefinementFact::Correspondence(&declared.dimension, &actual.dimension));
         }
+
         match (&declared.payload.value_kind, &actual.payload.value_kind) {
             (RaggedValueKind::Array, RaggedValueKind::Array) => {}
             (RaggedValueKind::Dimension(declared), RaggedValueKind::Dimension(actual)) => {
@@ -403,6 +475,7 @@ impl RaggedType {
                 return Err(TypeError::invalid("ragged types have different value kinds"));
             }
         }
+
         Ok(facts)
     }
 }
@@ -419,6 +492,8 @@ impl Display for RaggedType {
         write!(formatter, ">")
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Type for RaggedType {
     type Identity = DimensionVariable;
