@@ -34,11 +34,11 @@ pub enum RaggedValueKind {
 ///
 /// # Example
 ///
-/// Consider padded storage with shape `[2, 3, 4]`, whose axes are `batch`, `time`, and `element`. Suppose the `element`
-/// axis has a different logical length at each `batch`/`time` coordinate. Its descriptor has [`axis`](Self::axis) equal
-/// to `2` and `extent_axes = [0, 1]`: axis `0` of the extents payload corresponds to storage axis `0` (i.e., `batch`),
-/// and axis `1` corresponds to storage axis `1` (i.e., `time`). The extents payload therefore has shape `[2, 3]`.
-/// For example:
+/// Consider padded storage with shape `[2, 3, 4]`, whose axes are `batch`, `time`, and `element`. Suppose
+/// the `element` axis has a different logical length at each `batch`/`time` coordinate. Its [`RaggedDimension`] has
+/// [`axis`](Self::axis) equal to `2` and `extent_axes = [0, 1]`: axis `0` of the extents payload corresponds to storage
+/// axis `0` (i.e., `batch`), and axis `1` corresponds to storage axis `1` (i.e., `time`). The extents payload therefore
+/// has shape `[2, 3]`. For example:
 ///
 /// ```text
 /// [[1, 4, 2],
@@ -46,8 +46,8 @@ pub enum RaggedValueKind {
 /// ```
 ///
 /// The storage element at `[b, t, k]` is live when `k < extents[b, t]`. Thus, the slice at `batch=0` and `time=1` has
-/// four live elements, while the one at `batch=1` and `time=1` has none. The descriptor's `axis` identifies the axis
-/// whose length varies and `extent_axes` identifies the axes used to look up that length.
+/// four live elements, while the one at `batch=1` and `time=1` has none. The [`RaggedDimension`] identifies the axis
+/// whose length varies through `axis`, while `extent_axes` identifies the axes used to look up that length.
 ///
 /// Note that order matters. In this case, `extent_axes = [1, 0]` would instead require a payload with shape `[3, 2]`,
 /// indexed as `extents[t, b]`. An empty `extent_axes` would require a scalar payload giving one shared length for every
@@ -114,33 +114,35 @@ struct RaggedTypePayload {
 ///
 /// Every ragged storage axis has exactly its dimension's maximum admitted extent (e.g., an exclusive upper bound of `8`
 /// requires storage extent `7`, including when the maximum admitted extent is zero). Other axes retain their ordinary
-/// [`Dimension`](crate::Dimension)s. The [`logical_shape`](Self::logical_shape) replaces each padded axis by its
-/// descriptor's variable without removing dependency-domain axes. Descriptors are canonicalized in storage-axis order.
-/// A domain may name an earlier ragged axis, whose sibling descriptor determines which payload entries are live; self
-/// and later ragged dependencies are rejected. Domain order itself is preserved because it determines payload layout.
+/// [`Dimension`](crate::Dimension)s. The [`logical_shape`](Self::logical_shape) replaces each padded axis by the
+/// variable of its [`RaggedDimension`] without removing dependency-domain axes. The [`RaggedDimension`] entries are
+/// canonicalized in storage-axis order. A domain may name an earlier ragged axis, whose sibling [`RaggedDimension`]
+/// determines which payload entries are live; self and later ragged dependencies are rejected. Domain order itself is
+/// preserved because it determines payload layout.
 ///
 /// Extents have [`DIMENSION_DATA_TYPE`], full domain shape, the storage memory space, and projected sharding. Their
 /// layouts are unspecified. This structural description does not establish numerical extent bounds; the checked
 /// [`RaggedNew`](crate::RaggedNew) boundary establishes them. Reconstruction may omit checks only when an actual
 /// checked producer proves the exact field relationships.
 ///
-/// Descriptors of array values reference their indexed identities. A dimension value defines its represented identity,
-/// independently of any descriptors describing its domain. Indexed identities cannot also describe ordinary scalar
-/// dimensions in one identity scope (i.e., a storage capacity never proves a scalar logical extent). Ragged values do
-/// not implicitly project to [`ArrayType`], admit constants or references, or support zero/one construction yet.
+/// [`RaggedDimension`] entries of array values reference their indexed identities. A dimension value defines its
+/// represented identity, independently of any [`RaggedDimension`] entries describing its domain. Indexed identities
+/// cannot also describe ordinary scalar dimensions in one identity scope (i.e., a storage capacity never proves a
+/// scalar logical extent). Ragged values do not implicitly project to [`ArrayType`], admit constants or references,
+/// or support zero/one construction yet.
 ///
 /// # Example
 ///
 /// Consider `f32` storage with shape `[2, 3, 4]`, whose axes are `batch`, `time`, and `element`. The number of live
 /// elements varies at each `batch`/`time` coordinate. Let `n` be a [`DimensionVariable`] with bounds `[0, 5)`,
-/// admitting lengths `0` through `4`. The single descriptor has `axis=2`, `dimension=n`, and `extent_axes=[0, 1]`.
-/// The corresponding ragged type describes the following representation:
+/// admitting lengths `0` through `4`. The single [`RaggedDimension`] has `axis=2`, `dimension=n`, and
+/// `extent_axes=[0, 1]`. The corresponding ragged type describes the following representation:
 ///
 /// | Accessor                                       | Description                                         |
 /// |------------------------------------------------|-----------------------------------------------------|
 /// | [`storage_type`](Self::storage_type)           | Padded array type `f32[2, 3, 4]`.                   |
 /// | [`value_kind`](Self::value_kind)               | [`RaggedValueKind::Array`].                         |
-/// | [`ragged_dimensions`](Self::ragged_dimensions) | The one descriptor for the `element` axis.          |
+/// | [`ragged_dimensions`](Self::ragged_dimensions) | The [`RaggedDimension`] for the `element` axis.     |
 /// | [`logical_shape`](Self::logical_shape)         | `[2, 3, n]`, retaining the `batch` and `time` axes. |
 /// | [`extent_types`](Self::extent_types)           | One dense integer array type: `i64[2, 3]`.          |
 ///
@@ -159,12 +161,12 @@ struct RaggedTypePayload {
 /// must still agree on their live extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct RaggedType {
-    /// Shared immutable validated representation; clones retain its descriptor and payload-type allocations.
+    /// Shared immutable validated representation; clones retain its [`RaggedDimension`] and payload-type allocations.
     payload: Arc<RaggedTypePayload>,
 }
 
 impl RaggedType {
-    /// Constructs a new structurally validated [`RaggedType`], canonicalizing descriptor order.
+    /// Constructs a new structurally validated [`RaggedType`], canonicalizing [`RaggedDimension`] order.
     ///
     /// # Errors
     ///
@@ -287,13 +289,12 @@ impl RaggedType {
         Ok(r#type)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the [`ArrayType`] of the physical storage, including its element data type, layout, memory space, and
     /// sharding. Each ragged axis has its dimension's maximum admitted extent; ordinary axes retain their original
     /// dimensions. Use [`Self::logical_shape`] for the shape with symbolic ragged dimensions in place of capacities.
     /// For dimension values, this storage contains the represented integer extents themselves, as described by
     /// [`Self::value_kind`].
+    #[inline]
     pub fn storage_type(&self) -> &ArrayType {
         &self.payload.storage_type
     }
@@ -303,40 +304,47 @@ impl RaggedType {
     /// [`RaggedValueKind::Dimension`] uses integer storage for the dimension values themselves; its [`DimensionType`]
     /// supplies their bounds and optional symbolic identity. In either case, [`Self::ragged_dimensions`] describes
     /// ragged axes of that storage's coordinate shape, independently of the represented value kind.
+    #[inline]
     pub fn value_kind(&self) -> &RaggedValueKind {
         &self.payload.value_kind
     }
 
-    /// Returns the ragged-axis descriptors in increasing storage-axis order, regardless of their construction order.
-    /// Each [`RaggedDimension`] identifies a storage axis, its logical extent identity, and the ordered storage axes
-    /// that index its extent payload. The descriptor at index `i` corresponds to [`Self::extent_types`] entry `i`.
-    /// Array values require at least one descriptor; dimension values may have none when their coordinate shape is
-    /// entirely ordinary. Dependencies on other ragged storage axes must precede the described axis; those axes'
-    /// sibling descriptors determine which extent-payload coordinates are live.
+    /// Returns the [`RaggedDimension`] entries in increasing storage-axis order, regardless of their construction
+    /// order. Each [`RaggedDimension`] identifies a storage axis, its logical extent identity, and the ordered storage
+    /// axes that index its extent payload. The [`RaggedDimension`] at index `i` corresponds to [`Self::extent_types`]
+    /// entry `i`. Array values require at least one [`RaggedDimension`]; dimension values may have none when their
+    /// coordinate shape is entirely ordinary. Dependencies on other ragged storage axes must precede the described
+    /// axis; those axes' sibling [`RaggedDimension`] entries determine which extent-payload coordinates are live.
+    #[inline]
     pub fn ragged_dimensions(&self) -> &[RaggedDimension] {
         &self.payload.ragged_dimensions
     }
 
-    /// Returns the logical shape obtained by replacing each ragged storage axis's padded capacity with its
-    /// descriptor's [`DimensionVariable`]. The shape has the same rank and axis order as [`Self::storage_type`],
-    /// including all axes used to index extent payloads. Its ragged symbolic dimensions describe indexed extents; their
-    /// concrete values at each coordinate reside in the value's payloads. For dimension values, this is the shape
-    /// indexing those values; the type of the dimensions themselves is carried by [`Self::value_kind`].
-    /// The shape is computed once during construction and returned by reference here.
+    /// Returns the logical shape obtained by replacing each ragged storage axis's padded capacity with the
+    /// [`DimensionVariable`] of its [`RaggedDimension`]. The shape has the same rank and axis order as
+    /// [`Self::storage_type`], including all axes used to index extent payloads. Its ragged symbolic dimensions
+    /// describe indexed extents; their concrete values at each coordinate reside in the value's payloads. For
+    /// dimension values, this is the shape indexing those values; the type of the dimensions themselves is carried
+    /// by [`Self::value_kind`]. The shape is computed once during construction and returned by reference here.
+    #[inline]
     pub fn logical_shape(&self) -> &Shape {
         &self.payload.logical_shape
     }
 
     /// Returns one exact dense extent-payload [`ArrayType`] per [`Self::ragged_dimensions`] entry, in the same order.
-    /// Each payload uses [`DIMENSION_DATA_TYPE`] and has the shape selected from [`Self::storage_type`] by its
-    /// descriptor's [`RaggedDimension::extent_axes`], preserving their order. An empty mapping produces a scalar.
-    /// Payloads share the storage memory space, have sharding projected onto their selected axes, and have no layout
-    /// constraint. They cover the full padded shapes of their coordinate axes; sibling descriptors determine live
-    /// coordinates when those axes are themselves ragged. Compact or singleton payloads cannot replace a wider shape.
-    /// These types establish representation structure; checked producers must still validate live numerical extents.
+    /// Each payload uses [`DIMENSION_DATA_TYPE`] and has the shape selected from [`Self::storage_type`] by the
+    /// corresponding [`RaggedDimension::extent_axes`] mapping, preserving axis order. An empty mapping produces a
+    /// scalar. Payloads share the storage memory space, have sharding projected onto their selected axes, and have
+    /// no layout constraint. They cover the full padded shapes of their coordinate axes; sibling [`RaggedDimension`]
+    /// entries determine live coordinates when those axes are themselves ragged. Compact or singleton payloads cannot
+    /// replace a wider shape. These types establish representation structure; checked producers must still validate
+    /// live numerical extents.
+    #[inline]
     pub fn extent_types(&self) -> &[ArrayType] {
         &self.payload.extent_types
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns indexed identities and their domains, including a dimension value's whole-storage domain.
     pub(crate) fn indexed_identities(&self) -> impl Iterator<Item = (&DimensionVariable, Vec<usize>)> {
