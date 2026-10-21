@@ -163,10 +163,8 @@ pub struct RaggedType {
     payload: Arc<RaggedTypePayload>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl RaggedType {
-    /// Constructs a structurally validated ragged representation, canonicalizing descriptor order.
+    /// Constructs a new structurally validated [`RaggedType`], canonicalizing descriptor order.
     ///
     /// # Errors
     ///
@@ -185,12 +183,14 @@ impl RaggedType {
             RaggedValueKind::Array => {}
             RaggedValueKind::Dimension(_) if storage_type.data_type() != DIMENSION_DATA_TYPE => {
                 return Err(TypeError::invalid(format!(
-                    "ragged dimension storage must have data type `{DIMENSION_DATA_TYPE}` but got `{}`",
+                    "ragged dimension storage must have data type `{}` but got `{}`",
+                    DIMENSION_DATA_TYPE,
                     storage_type.data_type(),
                 )));
             }
             RaggedValueKind::Dimension(_) => {}
         }
+
         ragged_dimensions.sort_by_key(RaggedDimension::axis);
         let mut logical_dimensions = storage_type.shape().dimensions().to_vec();
         let mut extent_types = Vec::with_capacity(ragged_dimensions.len());
@@ -202,19 +202,23 @@ impl RaggedType {
                     storage_type.rank(),
                 )));
             }
+
             if index > 0 && ragged_dimensions[index - 1].axis == descriptor.axis {
                 return Err(TypeError::invalid(format!(
                     "ragged storage axis {} is described more than once",
                     descriptor.axis
                 )));
             }
+
             descriptor.dimension.bounds().representable_extent_range()?;
+
             let maximum = DimensionType::from(descriptor.dimension.clone()).maximum_extent().ok_or_else(|| {
                 TypeError::invalid(format!(
                     "ragged dimension `{}` must have a finite upper bound",
                     descriptor.dimension
                 ))
             })?;
+
             if storage_type.dimension(descriptor.axis).value() != Some(maximum) {
                 return Err(TypeError::invalid(format!(
                     "ragged axis {} requires storage extent {} for dimension `{}` but got `{}`",
@@ -224,6 +228,7 @@ impl RaggedType {
                     storage_type.dimension(descriptor.axis),
                 )));
             }
+
             for (extent_axis_index, axis) in descriptor.extent_axes.iter().copied().enumerate() {
                 if axis >= storage_type.rank() {
                     return Err(TypeError::invalid(format!(
@@ -233,12 +238,14 @@ impl RaggedType {
                         storage_type.rank(),
                     )));
                 }
+
                 if descriptor.extent_axes[..extent_axis_index].contains(&axis) {
                     return Err(TypeError::invalid(format!(
                         "ragged axis {} repeats domain axis {}",
                         descriptor.axis, axis,
                     )));
                 }
+
                 if ragged_dimensions.iter().any(|dependency| dependency.axis == axis) && axis >= descriptor.axis {
                     return Err(TypeError::invalid(format!(
                         "ragged axis {} depends on ragged axis {}; dependencies must precede their consumer",
@@ -246,6 +253,7 @@ impl RaggedType {
                     )));
                 }
             }
+
             logical_dimensions[descriptor.axis] = descriptor.dimension.clone().into();
             let shape = Shape::new(descriptor.extent_axes.iter().map(|axis| storage_type.dimension(*axis)).collect());
             let sharding = storage_type
@@ -264,6 +272,7 @@ impl RaggedType {
                     .map_err(|error| TypeError::invalid(format!("ragged extent type is invalid: {error}")))?,
             );
         }
+
         let r#type = Self {
             payload: Arc::new(RaggedTypePayload {
                 storage_type,
@@ -273,9 +282,12 @@ impl RaggedType {
                 extent_types,
             }),
         };
+
         ArrayIrType::validate_identity_scope([ArrayIrType::Ragged(r#type.clone())])?;
         Ok(r#type)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the [`ArrayType`] of the physical storage, including its element data type, layout, memory space, and
     /// sharding. Each ragged axis has its dimension's maximum admitted extent; ordinary axes retain their original
