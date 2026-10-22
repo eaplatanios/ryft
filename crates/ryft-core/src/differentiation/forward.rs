@@ -7,14 +7,17 @@ use std::sync::Arc;
 use ryft_macros::Parameter;
 
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
-use crate::differentiation::reverse::{TransposableOperation, TransposedProgram};
+use crate::differentiation::metadata::{
+    DifferentialBoundaryMetadata, DifferentialMetadataProvider, DifferentialMetadataPurpose,
+};
+use crate::differentiation::reverse::{SupportsCotangentAdd, TransposableOperation, TransposedProgram};
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
     ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, capture_and_validate_zero_residual_values,
 };
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
+use crate::operations::{ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::residuals::ResidualPlacement;
 use crate::partial::{
@@ -478,7 +481,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                     <O as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = O,
-            > + From<AddOperation<V::Type>>,
+            > + SupportsCotangentAdd,
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
@@ -528,6 +531,14 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// [`DifferentiationRule::JvpForTranspose`], which is converted into a [`Pullback`](crate::Pullback) and
     /// never applied, so that linearization captures no runtime dimensions solely to rebuild output tangents.
     tangent_reconstruction: Option<ZeroSpaceBoundaryReconstruction<C::Value>>,
+
+    /// Runtime metadata used to validate public tangent inputs, including supplied zero-space indexed inputs. It is
+    /// retained separately from the executable program's numerical residuals.
+    input_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
+
+    /// Runtime metadata used to validate public tangent outputs. Zero-space output reconstruction reuses this capture,
+    /// which is retained separately from the executable program's numerical residuals.
+    output_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
 
     /// Complete public primal input boundary. The executable pushforward omits inputs whose derived tangent type is a
     /// zero differential space.
@@ -673,6 +684,8 @@ impl<
             program,
             residuals,
             tangent_reconstruction,
+            input_boundary_metadata: DifferentialBoundaryMetadata::default(),
+            output_boundary_metadata: DifferentialBoundaryMetadata::default(),
             primal_input_types,
             primal_output_types,
             primal_references,
@@ -696,13 +709,17 @@ impl<
     }
 
     /// Consumes this [`Pushforward`] and returns its context, compact pushforward program, linearization-point
-    /// residuals, primal input types, primal output types, and retained primal reference boundary, in that order.
-    /// The program maps `(live(ẋ), r)` to `live(ẏ)`, with the residuals `r` aligned to its trailing inputs. The
-    /// complete primal types and reference boundary retain information needed to validate subsequent derivative calls
-    /// that cannot be recovered from the compact program alone.
+    /// residuals, input boundary metadata, output boundary metadata, primal input types, primal output types, and
+    /// retained primal reference boundary, in that order. The program maps `(live(ẋ), r)` to `live(ẏ)`, with the
+    /// residuals `r` aligned to its trailing inputs. The complete primal types, metadata, and reference boundary retain
+    /// information needed to validate subsequent derivative calls that cannot be recovered from the compact program
+    /// alone. Both metadata collections use complete public boundary positions, including omitted zero-space leaves.
     ///
     /// Unlike [`apply`](Self::apply), the returned program does not insert typed-zero values for public tangent leaves
     /// omitted from its Single Static Assignment (SSA) boundary because their differential spaces contain only zero.
+    /// Boundary metadata remains separate from numerical program residuals. Callers interpreting the program directly
+    /// must use the returned metadata to validate their public tangent inputs and outputs; program interpretation alone
+    /// does not perform those checks.
     #[allow(clippy::type_complexity)]
     #[inline]
     pub fn into_parts(
@@ -711,6 +728,8 @@ impl<
         C,
         Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         Vec<C::Value>,
+        DifferentialBoundaryMetadata<C::Value>,
+        DifferentialBoundaryMetadata<C::Value>,
         Vec<C::Type>,
         Vec<C::Type>,
         ReferenceBoundary<DifferentiationBoundaryPosition>,
@@ -719,6 +738,8 @@ impl<
             self.context,
             self.program,
             self.residuals,
+            self.input_boundary_metadata,
+            self.output_boundary_metadata,
             self.primal_input_types,
             self.primal_output_types,
             self.primal_references,
@@ -739,7 +760,7 @@ impl<
     #[inline]
     pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
     where
-        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + DifferentialMetadataProvider<C::Type>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -777,6 +798,7 @@ impl<
                     tangent_type,
                 )));
             }
+            let value = self.input_boundary_metadata.validate(&self.context, index, value, primal_type)?;
             if !tangent_type.is_zero_space() {
                 program_inputs.push(value);
             }
@@ -793,7 +815,16 @@ impl<
                 "a pushforward linearized for transposition cannot be applied".to_string(),
             ));
         };
-        let outputs = tangent_reconstruction.rebuild(&self.context, tangent_outputs)?;
+
+        let outputs = tangent_reconstruction
+            .rebuild(&self.context, tangent_outputs)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                self.output_boundary_metadata
+                    .validate(&self.context, index, value, &self.primal_output_types[index])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Restore the closure's original structured output shape after rebuilding every flattened tangent leaf.
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
@@ -2976,7 +3007,9 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
-        Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
+        Self::Operation: DifferentiableOperation<Self>
+            + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
+            + DifferentialMetadataProvider<Self::Type>,
     {
         if primal.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -3008,8 +3041,40 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             .into_parameters()
             .zip(tangent.into_parameters())
             .map(|(primal, tangent)| {
+                let (tangent_type, tangent) = {
+                    let primal_type = primal.r#type();
+                    let tangent_type = primal_type.tangent()?;
+                    if tangent.r#type().as_ref() != &tangent_type {
+                        return Err(TypeError::invalid(format!(
+                            "tangent type {} does not match type {} required by primal type {}",
+                            tangent.r#type().as_ref(),
+                            tangent_type,
+                            primal.r#type().as_ref(),
+                        ))
+                        .into());
+                    }
+
+                    let metadata = Self::Operation::capture_differential_metadata(
+                        self,
+                        &primal,
+                        &tangent_type,
+                        DifferentialMetadataPurpose::Validation,
+                    )?;
+
+                    let tangent =
+                        Self::Operation::validate_differential(self, tangent, primal_type.as_ref(), &metadata)?;
+                    (tangent_type, tangent)
+                };
+
+                // Canonicalize only after the supplied indexed payload has been checked, including zero-space input.
+                let tangent = if tangent_type.is_zero_space() {
+                    MaybeZero::Zero(tangent_type)
+                } else {
+                    MaybeZero::Value(tangent)
+                };
+
                 Ok::<_, ProgramError>(DifferentiationTracer::new(
-                    DifferentiationDual::new(primal, tangent)?,
+                    DifferentiationDual { primal, tangent },
                     context.clone(),
                 ))
             })
@@ -3034,7 +3099,6 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         for (output_index, output_dual) in output_duals.into_iter().enumerate() {
             let (primal, tangent) = output_dual.into_dual().into_parts();
             let tangent = match tangent {
-                MaybeZero::Value(tangent) => tangent,
                 MaybeZero::Zero(_) if primal.r#type().is_reference() => {
                     // A reference type is never a zero differential space and a zero reference tangent cannot be
                     // materialized, so a reference output rooted in a captured (i.e., plumbing) reference is rejected
@@ -3055,6 +3119,16 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                     let mut outputs = self.bind(operation, Vec::new(), zero_inputs.as_slice())?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs.remove(0)
+                }
+                MaybeZero::Value(tangent) => {
+                    let primal_type = primal.r#type();
+                    let metadata = Self::Operation::capture_differential_metadata(
+                        self,
+                        &primal,
+                        &primal_type.tangent()?,
+                        DifferentialMetadataPurpose::Validation,
+                    )?;
+                    Self::Operation::validate_differential(self, tangent, primal_type.as_ref(), &metadata)?
                 }
             };
             tangent_outputs.push(tangent);
@@ -3088,7 +3162,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     where
         Self::Operation: PartiallyEvaluatableOperation<Self>
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-            + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
+            + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
+            + DifferentialMetadataProvider<Self::Type>,
     {
         linearize_for_rule(self, function, primal, capture, DifferentiationRule::Jvp)
     }
@@ -3117,7 +3192,8 @@ pub(crate) fn linearize_for_rule<
 where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>
+        + DifferentialMetadataProvider<C::Type>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
@@ -3135,6 +3211,18 @@ where
     let input_structure = primal.parameter_structure();
     let input_values = primal.into_parameters().collect::<Vec<_>>();
     let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+    let mut input_boundary_metadata = DifferentialBoundaryMetadata::default();
+    if rule == DifferentiationRule::Jvp {
+        for (index, (value, primal_type)) in input_values.iter().zip(&input_types).enumerate() {
+            input_boundary_metadata.capture(
+                context,
+                index,
+                value,
+                &primal_type.tangent()?,
+                DifferentialMetadataPurpose::Validation,
+            )?;
+        }
+    }
 
     // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
     // so they can be residualized when needed without increasing the pushforward's tangent arity.
@@ -3252,9 +3340,19 @@ where
 
     // Only an applied pushforward rebuilds zero-space output tangents. A pullback converts the pushforward and returns
     // input cotangents instead, so transposition captures no runtime dimensions for the output tangents.
+    let mut output_boundary_metadata = DifferentialBoundaryMetadata::default();
+    for (index, (value, primal_type)) in primal_outputs.iter().zip(&output_types).enumerate() {
+        let tangent_type = primal_type.tangent()?;
+        let purpose = if rule == DifferentiationRule::Jvp && tangent_type.is_zero_space() {
+            DifferentialMetadataPurpose::ValidationAndReconstruction
+        } else {
+            DifferentialMetadataPurpose::Validation
+        };
+        output_boundary_metadata.capture(context, index, value, &tangent_type, purpose)?;
+    }
     let tangent_reconstruction = match rule {
         DifferentiationRule::Jvp => {
-            Some(ZeroSpaceBoundaryReconstruction::capture(context, primal_outputs.as_slice(), output_types.as_slice())?)
+            Some(ZeroSpaceBoundaryReconstruction::capture(context, &output_types, &output_boundary_metadata)?)
         }
         DifferentiationRule::JvpForTranspose => None,
     };
@@ -3335,7 +3433,7 @@ where
         residuals.extend(zero_residuals);
     }
 
-    let pushforward = Pushforward::new(
+    let mut pushforward = Pushforward::new(
         context.clone(),
         program,
         residuals,
@@ -3345,6 +3443,9 @@ where
         primal_references,
         output_structure,
     )?;
+    // TODO(eaplatanios): Make these part of `Pushforward::new`.
+    pushforward.input_boundary_metadata = input_boundary_metadata;
+    pushforward.output_boundary_metadata = output_boundary_metadata;
 
     Ok((output, pushforward))
 }
@@ -3588,7 +3689,7 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Shape, ShardingDimension,
+        DimensionVariable, RaggedDimension, RaggedType, RaggedValue, RaggedValueKind, Shape, ShardingDimension,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -4205,6 +4306,17 @@ pub(crate) mod tests {
         }
     }
 
+    impl DifferentialMetadataProvider<ProjectedMemberType<3>> for ProjectedMemberOperation<3> {
+        fn capture_differential_metadata<C: Context<Type = ProjectedMemberType<3>, Operation = Self>>(
+            _context: &C,
+            _primal: &C::Value,
+            _differential_type: &ProjectedMemberType<3>,
+            _purpose: DifferentialMetadataPurpose,
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            Ok(Vec::new())
+        }
+    }
+
     /// Builds a fused JVP with one primal output, one residual tangent, and one known zero tangent. Known work writes
     /// the primal result into the reference input, making execution before boundary validation observable.
     fn partitioned_jvp_with_known_effect() -> PartitionedProgram<TestValue, TestOperation> {
@@ -4297,7 +4409,11 @@ pub(crate) mod tests {
         let context = EagerContext::new();
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
         let output_types = outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(&context, outputs, &output_types)?;
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
+            &context,
+            &output_types,
+            &DifferentialBoundaryMetadata::default(),
+        )?;
         let references = ReferenceBoundary::new_for_differentiation(&context, inputs, &[], &[])?;
         Pushforward::new(
             context,
@@ -4565,7 +4681,7 @@ pub(crate) mod tests {
         assert_eq!(pushforward.program().to_string(), program.to_string());
         assert_eq!(pushforward.residuals(), &[Array::scalar(7.0_f32).unwrap()]);
         assert_eq!(pushforward.apply(vec![Array::scalar(5.0_f64).unwrap()]), Ok(vec![Array::scalar(0.0_f64).unwrap()]));
-        let (_, actual_program, residuals, input_types, output_types, _) = pushforward.into_parts();
+        let (_, actual_program, residuals, _, _, input_types, output_types, _) = pushforward.into_parts();
         assert_eq!(input_types, vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(output_types, vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(actual_program.to_string(), program.to_string());
@@ -4624,6 +4740,49 @@ pub(crate) mod tests {
             Err(ProgramError::MalformedProgram(message)) if message == "pushforward program tangent output 0 has type \
                 f32[] but its public boundary requires tangent type f64[]",
         ));
+    }
+
+    #[test]
+    fn test_pushforward_into_parts() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let representation = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let primal = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                representation,
+                Array::matrix(2, 3, vec![2f32; 6]).unwrap(),
+                vec![Array::vector(vec![1i64, 2]).unwrap()],
+            )
+            .unwrap(),
+        );
+        let (output, pushforward) = differentiate_at(primal.clone()).linearize(Ok).unwrap();
+        let (
+            context,
+            program,
+            residuals,
+            input_boundary_metadata,
+            output_boundary_metadata,
+            input_types,
+            output_types,
+            _,
+        ) = pushforward.into_parts();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ragged<f32[2, 3]; 1:rows over [0]> .
+                in (%0)"},
+        );
+        assert!(residuals.is_empty());
+        assert_eq!(input_types, vec![primal.r#type().into_owned()]);
+        assert_eq!(output_types, vec![output.r#type().into_owned()]);
+
+        // Indexed validation needs the captured shape carriers, so discarding either collection would fail these calls.
+        assert_eq!(input_boundary_metadata.validate(&context, 0, primal.clone(), &input_types[0]), Ok(primal));
+        assert_eq!(output_boundary_metadata.validate(&context, 0, output.clone(), &output_types[0]), Ok(output));
     }
 
     #[test]
