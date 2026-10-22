@@ -2050,7 +2050,11 @@ macro_rules! impl_differentiable_operation {
         impl<
             $value: $crate::Value,
             $operations: $crate::Operation<Type = <$value as $crate::Typed>::Type>
-                + ::std::convert::From<$crate::AddOperation<<$value as $crate::Typed>::Type>>,
+                + $crate::OperationProvider<
+                    <$value as $crate::Typed>::Type,
+                    $crate::AddOperation<<$value as $crate::Typed>::Type>,
+                    Operation = $operations,
+                >,
             $($generic,)*
         > $crate::TransposableOperation<$value, $operations> for $operation
         where
@@ -2283,7 +2287,11 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<
             $type: $crate::Type,
             __V: $crate::Value<Type = $type>,
-            __O: $crate::Operation<Type = $type> + ::std::convert::From<$crate::AddOperation<$type>>,
+            __O: $crate::Operation<Type = $type> + $crate::OperationProvider<
+                $type,
+                $crate::AddOperation<$type>,
+                Operation = __O,
+            >,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = $type>,
@@ -2786,8 +2794,11 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $($transpose_type_bound)+,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<Type = __T>
-                + ::std::convert::From<$crate::AddOperation<__T>> $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T> + $crate::OperationProvider<
+                __T,
+                $crate::AddOperation<__T>,
+                Operation = __O,
+            > $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
@@ -2910,8 +2921,11 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $crate::DifferentiableType,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<Type = __T>
-                + ::std::convert::From<$crate::AddOperation<__T>> $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T> + $crate::OperationProvider<
+                __T,
+                $crate::AddOperation<__T>,
+                Operation = __O,
+            > $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,

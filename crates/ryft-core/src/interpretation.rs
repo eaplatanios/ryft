@@ -580,7 +580,7 @@ impl<T: Type> ReplayTypeIdentities<T> {
                         })
                         .map(|(declared, actual)| (declared, actual.clone()))
                         .unzip();
-                    for (source, target) in T::derive_identity_renaming(&declared, &actual)?.replacements() {
+                    for (source, target) in T::derive_scope_identity_renaming(&declared, &actual)?.replacements() {
                         if source != target && input_definitions.contains(source) {
                             renaming.insert(source.clone(), target.clone())?;
                         }
@@ -620,7 +620,7 @@ impl<T: Type> ReplayTypeIdentities<T> {
                     // definition-position values. Freshen them for this replay with the same simultaneous mapping
                     // used by their output types and every dependent instruction.
                     for instruction in region.instructions() {
-                        for identity in instruction.operation().type_identity_definitions().iter() {
+                        for identity in instruction.operation().defined_type_identities().iter() {
                             if signature.internal_identities().contains(identity)
                                 && !renaming.replacements().iter().any(|(source, _)| source == identity)
                             {
@@ -782,9 +782,9 @@ impl<T: Type> ReplayTypeIdentities<T> {
                 reified_inputs.iter().map(|(_, actual)| actual),
                 region.type_identity_signature().identities(),
             )?;
-            let local = T::derive_identity_renaming(
-                &reified_inputs.iter().map(|(declared, _)| declared.clone()).collect::<Vec<_>>(),
-                &reified_inputs.iter().map(|(_, actual)| actual.clone()).collect::<Vec<_>>(),
+            let local = T::derive_scope_identity_renaming(
+                reified_inputs.iter().map(|(declared, _)| declared),
+                reified_inputs.iter().map(|(_, actual)| actual),
             )?;
             let mut combined = TypeIdentityRenaming::new();
             for (source, target) in renaming.replacements() {
@@ -850,7 +850,7 @@ impl<T: Type> ReplayTypeIdentities<T> {
             })
             .map(|(_, identity)| identity.clone())
             .collect::<Vec<_>>();
-        let supplemental = instruction.operation().type_identity_definitions();
+        let supplemental = instruction.operation().defined_type_identities();
         for identity in supplemental.iter() {
             if internal_identities.contains(identity) && !definitions.contains(identity) {
                 definitions.push(identity.clone());
@@ -2029,7 +2029,7 @@ mod tests {
         assert_ne!(&identities[0], &identity);
         assert_ne!(&identities[1], &identity);
         for (instruction, identity) in program.instructions().iter().zip(identities) {
-            assert_eq!(instruction.operation().type_identity_definitions().as_ref(), std::slice::from_ref(identity));
+            assert_eq!(instruction.operation().defined_type_identities().as_ref(), std::slice::from_ref(identity));
         }
         assert_eq!(
             program.to_string(),

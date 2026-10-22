@@ -311,13 +311,13 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
         Self::validate_identity_scope(actual())?;
 
         // The fallback must reproduce the complete actual signature, including the unbuffered prefix. A refinement
-        // accepted above may add layout or sharding metadata, which exact alpha-renaming cannot introduce.
+        // accepted above may add layout or sharding metadata, which renaming identities alone cannot introduce.
         if !exact_prefix {
             return Err(error);
         }
 
-        // Renaming replaces the identity's metadata too. Check both directions so a bound change cannot masquerade
-        // as exact alpha-renaming merely because replacing the whole identity reproduces the actual type.
+        // Renaming replaces the identity's metadata too. Check both directions so a change in bounds cannot pass as
+        // a change of identity alone merely because replacing the whole identity reproduces the actual type.
         if Self::Refinements::from_local_declarations(declared(), actual()).is_err()
             || Self::Refinements::from_local_declarations(actual(), declared()).is_err()
         {

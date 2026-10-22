@@ -594,7 +594,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // Deriving the renaming both validates the requested boundary and determines whether importing the callee
         // would actually change any live identity. Calls without `input_types` have no instantiation to derive.
         let renaming = input_types
-            .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types))
+            .map(|input_types| V::Type::derive_scope_identity_renaming(callee.input_types().as_slice(), input_types))
             .transpose()?;
 
         let non_identity_renaming = renaming.as_ref().filter(|renaming| !renaming.is_identity());

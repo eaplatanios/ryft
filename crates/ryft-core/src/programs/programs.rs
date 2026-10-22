@@ -542,13 +542,15 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     }
 
     /// Returns this [`Program`] with its formal [`TypeIdentity`](crate::TypeIdentity)s instantiated for `input_types`.
-    /// This method validates `input_types` against the declared program input types and derives the simultaneous
+    /// This function validates `input_types` against the declared program input types and derives the simultaneous
     /// [`TypeIdentityRenaming`] implied by that complete boundary. It applies a nonempty renaming throughout the
     /// program, rebuilding and structurally reclosing the complete [`RegionArena`]. Static refinements are validated
     /// but do not specialize the returned program's types. When no renaming is required, the result borrows this
-    /// program.
+    /// program. Renaming identities without changing their relationships preserves the body's validation obligations,
+    /// including those for repeated indexed input families; it does not prove equality between their runtime extent
+    /// payloads.
     pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<'_, Self>, ProgramError> {
-        let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
+        let renaming = V::Type::derive_scope_identity_renaming(self.input_types().as_slice(), input_types)?;
         if renaming.is_identity() {
             return Ok(Cow::Borrowed(self));
         }
