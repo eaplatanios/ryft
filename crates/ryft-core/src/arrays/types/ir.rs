@@ -757,7 +757,7 @@ mod tests {
     use crate::arrays::types::data::DataType::F32;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionError, Shape};
     use crate::arrays::types::ragged::RaggedDimension;
-    use crate::operations::DIMENSION_DATA_TYPE;
+    use crate::operations::{AssertionError, AssertionFailure, DIMENSION_DATA_TYPE};
     use crate::parameters::Placeholder;
     use crate::programs::{Operation, ProgramBuilder, ProgramError, RegionInterface, Typed};
 
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_type_ragged_program_rejects_unproved_payload_equality() {
+    fn test_array_ir_type_ragged_program_checks_repeated_payload_equality() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
         let ragged = RaggedType::new(
             ArrayType::new_static(F32, [2, 3]),
@@ -1217,7 +1217,33 @@ mod tests {
         let count_error = TypeError::invalid("declared type count 2 does not match actual type count 1");
         assert_eq!(ArrayIrType::derive_identity_renaming(&declared, &actual), Err(count_error.clone()));
         assert_eq!(ArrayIrTypeRefinements::from_local_declarations(&declared, &actual), Err(count_error));
-        assert_eq!(program.interpret(vec![first, second]), Err(ProgramError::Concretization { message: "`guard` cannot check symbolic type relationships during interpretation; bind the operation through its context".to_owned() }));
+
+        // Interpretation checks the repeated indexed identity numerically rather than treating the shared nominal
+        // identity as proof: the two payloads disagree at every batch item.
+        let error = program.interpret(vec![first, second]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::FailedElements {
+                message: "guarded ragged occurrences of `rows` must have equal live extents".to_owned(),
+                failures: vec![
+                    AssertionFailure {
+                        index: vec![0],
+                        observations: vec![
+                            ("extent".to_owned(), "2".to_owned()),
+                            ("other_extent".to_owned(), "1".to_owned())
+                        ],
+                    },
+                    AssertionFailure {
+                        index: vec![1],
+                        observations: vec![
+                            ("extent".to_owned(), "1".to_owned()),
+                            ("other_extent".to_owned(), "2".to_owned())
+                        ],
+                    },
+                ],
+                omitted: 0,
+            }),
+        );
     }
 
     #[test]
