@@ -414,7 +414,9 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
             KernelOperation::Portable(
                 operation @ (ArrayIrOperation::RaggedNew(_)
                 | ArrayIrOperation::RaggedStorage(_)
-                | ArrayIrOperation::RaggedExtents(_)),
+                | ArrayIrOperation::RaggedExtents(_)
+                | ArrayIrOperation::RaggedAdd(_)
+                | ArrayIrOperation::RaggedZero(_)),
             ) => {
                 return Err(Error::Unsupported {
                     operation: operation.name(),
@@ -1839,7 +1841,7 @@ mod tests {
                         ArrayIrOperation::Cast(operation)
                     }
                 } else {
-                    ArrayIrOperation::Guard(GuardOperation::new("kernel", vec![r#type.clone(); 2]))
+                    ArrayIrOperation::from(GuardOperation::new("kernel", vec![r#type.clone(); 2]))
                 };
                 value.context().bind(operation, vec![], &[value.clone(), value.clone()])?;
                 Ok(())

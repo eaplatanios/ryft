@@ -695,17 +695,47 @@ impl XlaValueLayout {
         Ok(leaves)
     }
 
-    /// Instantiates this result signature for one execution. Input families referenced by results retain the
-    /// corresponding runtime names; unreturned input families require no name choice. Output-local families receive
-    /// one fresh name shared by every output occurrence of that family.
+    /// Names the indexed families of this result signature for one execution. Input families referenced by results
+    /// retain the corresponding runtime names; unreturned input families require no name choice. Output-local
+    /// families, and input families supplied only by exact dimension items, receive one fresh name shared by every
+    /// output occurrence of that family, so values returned by different executions never share a formal name.
     pub(crate) fn result_identity_renaming(
         &self,
         inputs: &Self,
         actual_inputs: &[ArrayIrType],
     ) -> Result<TypeIdentityRenaming<DimensionVariable>, ProgramError> {
+        Ok(self.result_instantiation(inputs, actual_inputs)?.map(|(_, renaming)| renaming).unwrap_or_default())
+    }
+
+    /// Instantiates this result signature for one execution. Exact facts of the actual inputs replace the dimension
+    /// items that they determine, just as eager dense values carry static extents: a result whose item family is
+    /// supplied as `dimension<3>` has item `dimension<3>`, not the executable's formal family. The remaining indexed
+    /// families are then named by [`Self::result_identity_renaming`]. Ragged descriptors and storage keep their
+    /// representation, since an exact fact never erases a [`RaggedDimension`](ryft_core::RaggedDimension) entry.
+    pub(crate) fn result_types(
+        &self,
+        inputs: &Self,
+        actual_inputs: &[ArrayIrType],
+    ) -> Result<Vec<ArrayIrType>, ProgramError> {
+        let Some((refinements, renaming)) = self.result_instantiation(inputs, actual_inputs)? else {
+            return Ok(self.logical_types.to_vec());
+        };
+        self.logical_types
+            .iter()
+            .map(|r#type| Ok(refinements.refine_declared(r#type, &[])?.rename_identities(&renaming)?))
+            .collect()
+    }
+
+    /// Returns the input refinements and result renaming shared by [`Self::result_identity_renaming`] and
+    /// [`Self::result_types`], or `None` when no result is ragged and the signature therefore needs no instantiation.
+    fn result_instantiation(
+        &self,
+        inputs: &Self,
+        actual_inputs: &[ArrayIrType],
+    ) -> Result<Option<(ArrayIrTypeRefinements, TypeIdentityRenaming<DimensionVariable>)>, ProgramError> {
         check_count!("input", actual_inputs, inputs.logical_count(), ProgramError);
         if !self.logical_types.iter().any(|r#type| matches!(r#type, ArrayIrType::Ragged(_))) {
-            return Ok(TypeIdentityRenaming::new());
+            return Ok(None);
         }
         let actual_inputs = inputs
             .logical_types
@@ -727,7 +757,10 @@ impl XlaValueLayout {
             {
                 match class.actual() {
                     [actual] => renaming.insert(identity.clone(), actual.clone())?,
-                    [] => {} // An exact dimension-item type has no runtime identity to forward.
+
+                    // Exact dimension items have no runtime identity to forward. Refinement replaces the items
+                    // themselves, and any descriptor that still names the family gets a per-execution name.
+                    [] => renaming.insert(identity.clone(), identity.fresh())?,
                     _ => {
                         return Err(TypeError::invalid(
                             "a forwarded indexed result requires one unambiguous runtime input identity",
@@ -742,27 +775,28 @@ impl XlaValueLayout {
                 renaming.insert(identity.clone(), identity.fresh())?;
             }
         }
-        Ok(renaming)
+        Ok(Some((refinements, renaming)))
     }
 
-    /// Reassembles handles at their actual dense physical types, retaining logical indexed identities and the session.
+    /// Reassembles handles at their actual dense physical types, retaining the logical indexed metadata of
+    /// `result_types` (i.e., this signature as instantiated by [`Self::result_types`]) and the session.
     pub(crate) fn regroup<'c>(
         &self,
         leaves: Vec<XlaArray<'c>>,
         domain: &XlaDomain<'c>,
-        renaming: &TypeIdentityRenaming<DimensionVariable>,
+        result_types: &[ArrayIrType],
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
+        check_count!("output", result_types, self.logical_count(), ProgramError);
         if leaves.len() != self.leaf_count() {
             return Err(ProgramError::InvalidOutputCount { expected: self.leaf_count(), actual: leaves.len() });
         }
         let mut leaves = leaves.into_iter();
         let mut values = Vec::with_capacity(self.logical_count());
-        for r#type in self.logical_types.iter() {
+        for r#type in result_types {
             let storage = leaves.next().unwrap();
             match r#type {
                 ArrayIrType::Array(_) => values.push(XlaValue::Array(storage)),
                 ArrayIrType::Ragged(r#type) => {
-                    let r#type = r#type.rename_identities(renaming)?;
                     let actual = RaggedType::new(
                         storage.r#type().into_owned(),
                         r#type.value_kind().clone(),
@@ -1464,6 +1498,54 @@ mod tests {
     }
 
     #[test]
+    fn test_layout_result_types() {
+        let storage_type = ArrayType::new_static(DataType::I64, [2]);
+        let items = |kind: ryft_core::DimensionType| {
+            RaggedType::new(storage_type.clone(), RaggedValueKind::Dimension(kind), vec![]).unwrap()
+        };
+        let item = DimensionVariable::new("item", DimensionBounds::non_negative(Some(8)).unwrap());
+        let declared = items(item.clone().into());
+        let exact = |extent: usize| items(Dimension::Static(extent).into());
+        let inputs = XlaValueLayout::new(&[declared.clone().into()]).unwrap();
+
+        // Exact items replace the formal family in every aliasing result, independently for each execution.
+        let aliases = XlaValueLayout::new(&[declared.clone().into(), declared.clone().into()]).unwrap();
+        assert_eq!(aliases.result_types(&inputs, &[exact(3).into()]), Ok(vec![exact(3).into(), exact(3).into()]));
+        assert_eq!(aliases.result_types(&inputs, &[exact(5).into()]), Ok(vec![exact(5).into(), exact(5).into()]));
+
+        // A dynamic actual family is forwarded under its runtime name.
+        let runtime = items(item.fresh().into());
+        assert_eq!(
+            aliases.result_types(&inputs, &[runtime.clone().into()]),
+            Ok(vec![runtime.clone().into(), runtime.into()]),
+        );
+
+        // A declared exact item has no family to instantiate.
+        let static_inputs = XlaValueLayout::new(&[exact(3).into()]).unwrap();
+        assert_eq!(static_inputs.result_types(&static_inputs, &[exact(3).into()]), Ok(vec![exact(3).into()]));
+
+        // Refinement never erases a descriptor naming the family. Each execution gives it one fresh shared name.
+        let rows = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 7]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, item.clone(), vec![0])],
+        )
+        .unwrap();
+        let outputs = XlaValueLayout::new(&[declared.into(), rows.clone().into(), rows.clone().into()]).unwrap();
+        let first = outputs.result_types(&inputs, &[exact(3).into()]).unwrap();
+        let second = outputs.result_types(&inputs, &[exact(3).into()]).unwrap();
+        let descriptor =
+            |r#type: &ArrayIrType| <&RaggedType>::try_from(r#type).unwrap().ragged_dimensions()[0].dimension().clone();
+        let first_rows = descriptor(&first[1]);
+        assert_ne!(first_rows, item);
+        assert_ne!(first_rows, descriptor(&second[1]));
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(item.clone(), first_rows).unwrap();
+        let renamed = ArrayIrType::Ragged(rows.rename_identities(&renaming).unwrap());
+        assert_eq!(first, vec![exact(3).into(), renamed.clone(), renamed]);
+    }
+
+    #[test]
     fn test_invocation_comparison_preserves_dense_resharding_contract() {
         use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
 
@@ -1962,9 +2044,9 @@ mod tests {
     fn test_static_dimension_item_results_carry_actual_kind() {
         /// Calls one declared dimension-item family with different exact items through compiled and eager dispatch.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{CompiledFunctionDispatcher, DimensionType, Value, try_jit_with_options};
+            use ryft_core::{CompiledFunctionDispatcher, DimensionType, try_jit_with_options};
 
-            use crate::experimental::domains::XlaOptions;
+            use crate::experimental::domains::{XlaDomainError, XlaOptions};
 
             let storage_type = ArrayType::new_static(DataType::I64, [2]);
             let item = DimensionType::new("item", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -1982,28 +2064,73 @@ mod tests {
             let three = items(3);
             let five = items(5);
 
-            // One compiled specialization at the declared family returns each call's exact item kind.
+            // One compiled specialization at the declared family returns each call's exact item kind, rather than
+            // the executable's formal family, and forwards a dynamic family under its runtime name.
             let compiled: CompiledFunctionDispatcher<XlaDomain<'c>, _, (), ArrayIrType, ArrayIrType> =
-                try_jit_with_options(domain, |(), input: RuntimeLeaf<'c>| Ok(input), XlaOptions::new(mesh))
+                try_jit_with_options(domain, |(), input: RuntimeLeaf<'c>| Ok(input), XlaOptions::new(mesh.clone()))
                     .with_staged_input_types(Some(ArrayIrType::Ragged(declared.clone())))
                     .unwrap();
             let compiled_three = compiled.call((), three.clone()).unwrap();
             let compiled_five = compiled.call((), five.clone()).unwrap();
-            eprintln!("compiled: {} {} (inputs {} {})", compiled_three.r#type(), compiled_five.r#type(), three.r#type(), five.r#type());
+            let dynamic_type = RaggedType::new(
+                storage_type.clone(),
+                RaggedValueKind::Dimension(DimensionType::new(
+                    "runtime_item",
+                    DimensionBounds::non_negative(Some(8)).unwrap(),
+                )),
+                vec![],
+            )
+            .unwrap();
+            let dynamic = domain
+                .lift(ryft_core::Array::vector(vec![1i64, 6]).unwrap().into())
+                .unwrap()
+                .ragged_new(dynamic_type, &[])
+                .unwrap();
+            let compiled_dynamic = compiled.call((), dynamic.clone()).unwrap();
+            assert_eq!(compiled.specialization_count(), 1);
+            assert_eq!(compiled_three.r#type(), three.r#type());
+            assert_eq!(compiled_five.r#type(), five.r#type());
+            assert_eq!(compiled_dynamic.r#type(), dynamic.r#type());
+            for (result, items) in [(&compiled_three, [3, 3]), (&compiled_five, [5, 5]), (&compiled_dynamic, [1, 6])] {
+                assert_eq!(read_i64(&result.ragged_storage().unwrap()), items);
+                assert!(Arc::ptr_eq(result.xla_domain().session(), domain.session()));
+            }
 
-            // Eager dispatch of a call whose callee declares the same family.
+            // Results with different exact items do not share a formal name, so one repeated declared family rejects
+            // them at dispatch, before any runtime entry check.
+            let consumer: CompiledFunctionDispatcher<XlaDomain<'c>, _, (), Vec<ArrayIrType>, Vec<ArrayIrType>> =
+                try_jit_with_options(domain, |(), inputs: Vec<RuntimeLeaf<'c>>| Ok(inputs), XlaOptions::new(mesh))
+                    .with_staged_input_types(vec![
+                        Some(ArrayIrType::Ragged(declared.clone())),
+                        Some(ArrayIrType::Ragged(declared.clone())),
+                    ])
+                    .unwrap();
+            assert!(matches!(
+                consumer.call((), vec![compiled_three.clone(), compiled_five]),
+                Err(XlaDomainError::Tracing(ProgramError::Type(error)))
+                    if error == TypeError::custom(ryft_core::DimensionError::InputDimensionMismatch {
+                        dimension: "item".to_owned(),
+                        expected: 3,
+                        actual: 5,
+                    }),
+            ));
+
+            // Eager executables are compiled at the actual input types, so their exact items are already formal.
             let (_, callee) =
-                LeafContext::trace(|inputs: Vec<Leaf>| Ok(inputs), vec![ArrayIrType::Ragged(declared)]).unwrap();
+                LeafContext::trace(|inputs: Vec<Leaf>| Ok(inputs), vec![three.r#type().into_owned()]).unwrap();
             let call = JitCallOperation::new(0)
                 .with_callee_type_signature(&callee.input_types(), &callee.output_types())
                 .unwrap();
-            let eager_three = domain.bind(call.clone(), vec![callee.clone()], &[three.clone()]).unwrap();
-            let eager_five = domain.bind(call, vec![callee], &[five.clone()]).unwrap();
-            eprintln!("eager: {} {}", eager_three[0].r#type(), eager_five[0].r#type());
-            assert_eq!(compiled_three.r#type(), three.r#type());
-            assert_eq!(compiled_five.r#type(), five.r#type());
-            assert_eq!(eager_three[0].r#type(), three.r#type());
-            assert_eq!(eager_five[0].r#type(), five.r#type());
+            let before = domain.eager_dispatch_statistics();
+            for _ in 0..2 {
+                let outputs = domain.bind(call.clone(), vec![callee.clone()], &[compiled_three.clone()]).unwrap();
+                assert_eq!(outputs[0].r#type(), three.r#type());
+                assert_eq!(read_i64(&outputs[0].ragged_storage().unwrap()), [3, 3]);
+                assert!(Arc::ptr_eq(outputs[0].xla_domain().session(), domain.session()));
+            }
+            let after = domain.eager_dispatch_statistics();
+            assert_eq!(after.misses - before.misses, 1);
+            assert_eq!(after.hits - before.hits, 1);
         }
         let client = crate::tests::execution_client();
         let mesh = cpu_mesh(&client);

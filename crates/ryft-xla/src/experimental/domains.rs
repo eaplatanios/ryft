@@ -3828,7 +3828,8 @@ impl<'c> XlaCompiledProgram<'c> {
 
     /// Returns the public output signature before aggregate values are expanded into dense array leaves.
     /// Output-local indexed identities describe the executable's result scope. Each execution gives those families
-    /// fresh runtime identities; forwarded families retain their actual input identities across all output aliases.
+    /// fresh runtime identities; forwarded families retain their actual input identities across all output aliases,
+    /// and input families supplied as exact dimension items return those exact items.
     pub fn logical_output_types(&self) -> Vec<ArrayIrType> {
         match &self.logical_boundary {
             Some(boundary) => boundary.outputs.logical_types()[..boundary.output_count].to_vec(),
@@ -3860,8 +3861,8 @@ impl<'c> XlaCompiledProgram<'c> {
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
         match &self.logical_boundary {
             Some(boundary) => {
-                let renaming = boundary.outputs.result_identity_renaming(&boundary.inputs, input_types)?;
-                boundary.outputs.regroup(outputs, domain, &renaming)
+                let result_types = boundary.outputs.result_types(&boundary.inputs, input_types)?;
+                boundary.outputs.regroup(outputs, domain, &result_types)
             }
             None => Ok(outputs.into_iter().map(XlaValue::Array).collect()),
         }

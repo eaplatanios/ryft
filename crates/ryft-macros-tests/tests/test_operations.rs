@@ -315,8 +315,15 @@ trait Operation: Clone {
 
     fn name(&self) -> &'static str;
 
-    fn type_identity_definitions(&self) -> std::borrow::Cow<'_, [<Self::Type as Type>::Identity]> {
+    fn defined_type_identities(&self) -> std::borrow::Cow<'_, [<Self::Type as Type>::Identity]> {
         std::borrow::Cow::Borrowed(&[])
+    }
+
+    fn consumed_type_identities(
+        &self,
+        _input_types: &[Self::Type],
+    ) -> Result<Vec<<Self::Type as Type>::Identity>, TypeError> {
+        Ok(Vec::new())
     }
 
     fn region_slots(&self) -> &'static [RegionSlot] {
@@ -1246,8 +1253,12 @@ struct PrintOperation;
 impl Operation for PrintOperation {
     type Type = DataType;
 
-    fn type_identity_definitions(&self) -> std::borrow::Cow<'_, [NoIdentity]> {
+    fn defined_type_identities(&self) -> std::borrow::Cow<'_, [NoIdentity]> {
         std::borrow::Cow::Owned(vec![NoIdentity])
+    }
+
+    fn consumed_type_identities(&self, input_types: &[DataType]) -> Result<Vec<NoIdentity>, TypeError> {
+        Ok(input_types.iter().map(|_| NoIdentity).collect())
     }
 
     fn name(&self) -> &'static str {
@@ -1480,6 +1491,13 @@ impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
         "projected"
     }
 
+    fn consumed_type_identities(
+        &self,
+        input_types: &[ProjectedMemberType<MEMBER>],
+    ) -> Result<Vec<NoIdentity>, TypeError> {
+        Ok(input_types.iter().map(|_| NoIdentity).collect())
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[ProjectedMemberType<MEMBER>],
@@ -1556,6 +1574,12 @@ fn test_operation_generates_projected_member_dispatch() {
     // and lift results back into the composite family.
     assert_eq!(first.name(), "projected");
     assert_eq!(first.to_string(), "projected");
+    assert_eq!(first.consumed_type_identities(std::slice::from_ref(&first_type)).unwrap().len(), 1);
+    assert_eq!(third.consumed_type_identities(std::slice::from_ref(&third_type)).unwrap().len(), 1);
+    assert_eq!(
+        first.consumed_type_identities(std::slice::from_ref(&third_type)).err(),
+        Some(TypeError::invalid("wrong projected member type")),
+    );
     assert_eq!(first.infer_output_types(std::slice::from_ref(&first_type), &[]), Ok(vec![first_type.clone()]));
     assert_eq!(
         first.infer_output_types(std::slice::from_ref(&third_type), &[]),
@@ -1767,8 +1791,10 @@ fn test_operation_generates_operation_forwarding() {
     let add = DataOperation::<ScalarFactor>::from(AddOperation);
     let print = DataOperation::<ScalarFactor>::from(PrintOperation);
 
-    assert_eq!(add.type_identity_definitions().len(), 0);
-    assert_eq!(print.type_identity_definitions().len(), 1);
+    assert_eq!(add.defined_type_identities().len(), 0);
+    assert_eq!(print.defined_type_identities().len(), 1);
+    assert_eq!(add.consumed_type_identities(&[DataType]).unwrap().len(), 0);
+    assert_eq!(print.consumed_type_identities(&[DataType, DataType]).unwrap().len(), 2);
 
     assert_eq!(add.effects().into_owned(), Effects::Pure);
     assert_eq!(print.effects().into_owned(), Effects::Read);
@@ -2110,6 +2136,19 @@ mod mixed_members {
     }
 
     impl MemberOperation<ArrayIrType> for InterleavedOperation {
+        fn parent_consumed_type_identities(
+            &self,
+            input_types: &[ArrayIrType],
+        ) -> Result<Vec<DimensionVariable>, TypeError> {
+            Ok(input_types
+                .iter()
+                .filter_map(|r#type| match r#type {
+                    ArrayIrType::Dimension(dimension) => dimension.variable().cloned(),
+                    _ => None,
+                })
+                .collect())
+        }
+
         fn infer_parent_region_input_types(
             &self,
             _input_types: &[ArrayIrType],
@@ -2500,6 +2539,22 @@ mod mixed_members {
         let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent().unwrap();
         assert_eq!(second_cotangent_type, &dimension_cotangent_type);
         assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
+    }
+
+    #[test]
+    fn test_operation_generates_member_identity_consumption() {
+        type Operation = MixedProgramOperation<Array>;
+        let dimension = DimensionVariable::new("length", DimensionBounds::unbounded());
+        let inputs = [ArrayIrType::Dimension(dimension.clone().into())];
+        let mixed = Operation::from(InterleavedOperation);
+        assert_eq!(mixed.consumed_type_identities(&inputs).unwrap(), vec![dimension]);
+
+        // Projecting a homogeneous member must reject this parent-only input instead of invoking the mixed adapter.
+        let projected = Operation::Array(MixedMemberOperation::Interleaved(InterleavedOperation));
+        assert_eq!(
+            projected.consumed_type_identities(&inputs).unwrap_err(),
+            <&ArrayType>::try_from(&inputs[0]).unwrap_err()
+        );
     }
 
     #[test]

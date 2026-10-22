@@ -265,7 +265,9 @@ impl Lowering {
                 KernelOperation::Portable(
                     operation @ (ArrayIrOperation::RaggedNew(_)
                     | ArrayIrOperation::RaggedStorage(_)
-                    | ArrayIrOperation::RaggedExtents(_)),
+                    | ArrayIrOperation::RaggedExtents(_)
+                    | ArrayIrOperation::RaggedAdd(_)
+                    | ArrayIrOperation::RaggedZero(_)),
                 ) => {
                     return Err(unsupported(
                         operation.name(),

@@ -894,19 +894,44 @@ impl OperationEnum {
         let operation_self_type = &self.self_type;
         let (impl_generics, _, where_clause) = self.operation_generics.split_for_impl();
         let name_arms = self.operation_forwarding_arms(quote!(name), quote!());
-        let type_identity_definition_arms = self.variants.iter().map(|variant| {
+        let defined_type_identity_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             let definitions = match &variant.class {
                 OperationVariantClass::MixedMember { .. } => quote! {
-                    <#payload_type as #ryft::MemberOperation<#primary_type>>::parent_type_identity_definitions(#receiver)
+                    <#payload_type as #ryft::MemberOperation<#primary_type>>::parent_defined_type_identities(#receiver)
                 },
                 OperationVariantClass::CompositeNative | OperationVariantClass::ProjectedMember { .. } => quote! {
-                    <#payload_type as #ryft::Operation>::type_identity_definitions(#receiver)
+                    <#payload_type as #ryft::Operation>::defined_type_identities(#receiver)
                 },
             };
             quote! { Self::#variant_ident(operation) => { #definitions }, }
+        });
+        let consumed_type_identity_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            let consumption = match &variant.class {
+                OperationVariantClass::MixedMember { .. } => quote! {
+                    <#payload_type as #ryft::MemberOperation<#primary_type>>::parent_consumed_type_identities(
+                        #receiver, input_types,
+                    )
+                },
+                OperationVariantClass::CompositeNative => quote! {
+                    <#payload_type as #ryft::Operation>::consumed_type_identities(#receiver, input_types)
+                },
+                OperationVariantClass::ProjectedMember { member_type, .. } => quote! {
+                    let input_types = input_types
+                        .iter()
+                        .map(|input_type| {
+                            <&#member_type as ::std::convert::TryFrom<&#primary_type>>::try_from(input_type).cloned()
+                        })
+                        .collect::<::std::result::Result<::std::vec::Vec<_>, #ryft::TypeError>>()?;
+                    <#payload_type as #ryft::Operation>::consumed_type_identities(#receiver, &input_types)
+                },
+            };
+            quote! { Self::#variant_ident(operation) => { #consumption }, }
         });
         let infer_output_type_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
@@ -1108,8 +1133,15 @@ impl OperationEnum {
                     match self { #(#name_arms)* }
                 }
 
-                fn type_identity_definitions(&self) -> ::std::borrow::Cow<'_, [<#primary_type as #ryft::Type>::Identity]> {
-                    match self { #(#type_identity_definition_arms)* }
+                fn defined_type_identities(&self) -> ::std::borrow::Cow<'_, [<#primary_type as #ryft::Type>::Identity]> {
+                    match self { #(#defined_type_identity_arms)* }
+                }
+
+                fn consumed_type_identities(
+                    &self,
+                    input_types: &[#primary_type],
+                ) -> ::std::result::Result<::std::vec::Vec<<#primary_type as #ryft::Type>::Identity>, #ryft::TypeError> {
+                    match self { #(#consumed_type_identity_arms)* }
                 }
 
                 fn region_slots(&self) -> &'static [#ryft::RegionSlot] {
@@ -3478,9 +3510,30 @@ mod tests {
         // rule under its member policy, whereas a structural member binds its payload once under the outer policy's
         // replicated projection and therefore requires neither a member policy nor a member batching rule.
         assert!(generated.contains("infer_projected_operation_output_types(operation,input_types,region_interfaces,)"));
-        assert!(generated.contains("<ArrayOperation<A>asryft::Operation>::type_identity_definitions(operation)"));
+        assert!(generated.contains("<ArrayOperation<A>asryft::Operation>::defined_type_identities(operation)"));
+        assert!(
+            generated.contains("<&ArrayTypeas::std::convert::TryFrom<&ArrayIrType>>::try_from(input_type).cloned()")
+        );
+        assert!(
+            generated
+                .contains("<ArrayOperation<A>asryft::Operation>::consumed_type_identities(operation,&input_types)")
+        );
+        assert!(
+            generated
+                .contains("<&DimensionTypeas::std::convert::TryFrom<&ArrayIrType>>::try_from(input_type).cloned()")
+        );
+        assert!(
+            generated
+                .contains("<DimensionOperationasryft::Operation>::consumed_type_identities(operation,&input_types)")
+        );
         assert!(generated.contains(
-            "<ParallelAllGatherOperationasryft::MemberOperation<ArrayIrType>>::parent_type_identity_definitions(operation)",
+            "<ParallelAllGatherOperationasryft::MemberOperation<ArrayIrType>>::parent_consumed_type_identities(operation,input_types,)",
+        ));
+        assert!(generated.contains(
+            "<NativeOperation<ArrayIrType>asryft::Operation>::consumed_type_identities(operation,input_types)"
+        ));
+        assert!(generated.contains(
+            "<ParallelAllGatherOperationasryft::MemberOperation<ArrayIrType>>::parent_defined_type_identities(operation)",
         ));
         assert!(
             generated.contains("Self::Array(operation)=>{ryft::batch_projected_operation(context,operation,inputs)}")
