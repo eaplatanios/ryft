@@ -3241,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_zero_and_cotangent_add() {
+    fn test_ragged_zero_and_cotangent_add_operation() {
         let value = differential_value();
         let r#type = <&RaggedType>::try_from(value.r#type().as_ref()).unwrap().clone();
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3255,7 +3255,8 @@ mod tests {
         );
         assert_eq!(zero.ragged_extents(1), value.ragged_extents(1));
         let operation =
-            ArrayIrOperation::<Array>::cotangent_add(&[&r#type.clone().into(), &r#type.clone().into()]).unwrap();
+            ArrayIrOperation::<Array>::cotangent_add_operation(&[&r#type.clone().into(), &r#type.clone().into()])
+                .unwrap();
         assert!(matches!(operation, ArrayIrOperation::RaggedAdd(_)));
         let sum = context.bind(operation, Vec::new(), &[value.clone(), value.clone()]).unwrap().remove(0);
         assert_eq!(

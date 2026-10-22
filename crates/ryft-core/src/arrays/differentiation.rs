@@ -28,7 +28,7 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 impl<A: Value<Type = ArrayType>> SupportsCotangentAdd for ArrayIrOperation<A> {
-    fn cotangent_add(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+    fn cotangent_add_operation(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
         match (input_types[0], input_types[1]) {
             (ArrayIrType::Ragged(_), ArrayIrType::Ragged(_)) => Ok(Self::RaggedAdd(RaggedAddOperation)),
@@ -737,14 +737,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_array_ir_operation_cotangent_add() {
+    fn test_array_ir_operation_cotangent_add_operation() {
         let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         assert_eq!(
-            ArrayIrOperation::<Array>::cotangent_add(&[&array_type, &array_type]),
+            ArrayIrOperation::<Array>::cotangent_add_operation(&[&array_type, &array_type]),
             Ok(ArrayIrOperation::from(AddOperation::<ArrayType>::new())),
         );
         assert_eq!(
-            ArrayIrOperation::<Array>::cotangent_add(&[]),
+            ArrayIrOperation::<Array>::cotangent_add_operation(&[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
@@ -764,7 +764,7 @@ mod tests {
         let right_type = ArrayIrType::Ragged(right_type);
 
         // Selection depends on member kinds; binding owns validation of the selected operation's complete signature.
-        let operation = ArrayIrOperation::<Array>::cotangent_add(&[&left_type, &right_type]).unwrap();
+        let operation = ArrayIrOperation::<Array>::cotangent_add_operation(&[&left_type, &right_type]).unwrap();
         assert_eq!(operation, ArrayIrOperation::RaggedAdd(RaggedAddOperation));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let left = builder.add_input(left_type);

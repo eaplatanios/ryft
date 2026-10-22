@@ -577,6 +577,8 @@ impl<
     /// the complete public input boundary so that [`apply`](Self::apply) can validate and filter its tangent arguments.
     /// `tangent_reconstruction` independently preserves the reconstruction plan for omitted output leaves, while
     /// `primal_output_types` validates the compact program boundary and remains available to reverse-mode conversion.
+    /// The input and output boundary metadata were captured at the same linearization point and retain the runtime
+    /// information needed to validate complete public tangent boundaries, including omitted zero-space leaves.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume
     /// one leading input for every non-zero tangent in `primal_input_types`, followed by one input for every residual,
@@ -592,6 +594,9 @@ impl<
     ///     trailing inputs.
     ///   - `tangent_reconstruction`: Reconstruction plan for zero-space output tangents rebuilt by
     ///     [`apply`](Self::apply), or [`None`] for a pushforward that is only transposed and never applied.
+    ///   - `input_boundary_metadata`: Captured runtime metadata indexed by the complete public primal input boundary.
+    ///   - `output_boundary_metadata`: Captured runtime metadata indexed by the complete public primal output boundary,
+    ///     shared with output tangent reconstruction where needed.
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
     ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
@@ -605,6 +610,8 @@ impl<
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
         tangent_reconstruction: Option<ZeroSpaceBoundaryReconstruction<C::Value>>,
+        input_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
+        output_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
         primal_input_types: Vec<C::Type>,
         primal_output_types: Vec<C::Type>,
         primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
@@ -684,8 +691,8 @@ impl<
             program,
             residuals,
             tangent_reconstruction,
-            input_boundary_metadata: DifferentialBoundaryMetadata::default(),
-            output_boundary_metadata: DifferentialBoundaryMetadata::default(),
+            input_boundary_metadata,
+            output_boundary_metadata,
             primal_input_types,
             primal_output_types,
             primal_references,
@@ -3433,20 +3440,18 @@ where
         residuals.extend(zero_residuals);
     }
 
-    let mut pushforward = Pushforward::new(
+    let pushforward = Pushforward::new(
         context.clone(),
         program,
         residuals,
         tangent_reconstruction,
+        input_boundary_metadata,
+        output_boundary_metadata,
         input_types,
         output_types,
         primal_references,
         output_structure,
     )?;
-    // TODO(eaplatanios): Make these part of `Pushforward::new`.
-    pushforward.input_boundary_metadata = input_boundary_metadata;
-    pushforward.output_boundary_metadata = output_boundary_metadata;
-
     Ok((output, pushforward))
 }
 
@@ -4420,6 +4425,8 @@ pub(crate) mod tests {
             program,
             residuals,
             Some(reconstruction),
+            DifferentialBoundaryMetadata::default(),
+            DifferentialBoundaryMetadata::default(),
             input_types,
             output_types,
             references,

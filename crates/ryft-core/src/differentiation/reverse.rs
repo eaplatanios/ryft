@@ -56,12 +56,12 @@ pub trait SupportsCotangentAdd: Operation {
     ///
     /// Returns a [`ProgramError`] if the input count is not two or this family cannot select an addition operation
     /// for these input types. The selected operation validates its complete signature when bound.
-    fn cotangent_add(input_types: &[&Self::Type]) -> Result<Self, ProgramError>;
+    fn cotangent_add_operation(input_types: &[&Self::Type]) -> Result<Self, ProgramError>;
 }
 
 impl<T: Type, O: Operation<Type = T> + From<AddOperation<T>>> SupportsCotangentAdd for O {
     #[inline]
-    fn cotangent_add(input_types: &[&T]) -> Result<Self, ProgramError> {
+    fn cotangent_add_operation(input_types: &[&T]) -> Result<Self, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
         Ok(Self::from(AddOperation::new()))
     }
@@ -492,7 +492,7 @@ impl CotangentAccumulator {
                     let output = {
                         let mut builder = context.builder().borrow_mut();
                         let operation =
-                            O::cotangent_add(&[existing.r#type().as_ref(), contribution.r#type().as_ref()])?;
+                            O::cotangent_add_operation(&[existing.r#type().as_ref(), contribution.r#type().as_ref()])?;
                         let outputs = builder.add_instruction(
                             operation,
                             Vec::new(),
@@ -591,10 +591,9 @@ where
 /// value cotangent accumulator handles; such contributions are rejected.
 ///
 /// Reference-state buffers are allocated lazily when needed. [`Self::dimension_sources`] retains values from which
-/// runtime dimensions can be obtained, including known primal values and previously encountered cotangents. These
-/// sources remain available after value cotangents are extracted, so a later rule can still construct a correctly
-/// shaped reference-state zero or witness a cast's input identities even when the types involved do not supply the
-/// required dimensions.
+/// runtime extents can be obtained, including known primal values and previously encountered cotangents. These sources
+/// remain available after value cotangents are extracted, so a later rule can still construct a correctly shaped
+/// reference-state zero or supply a cast's input identities when the types alone do not provide the required extents.
 ///
 /// # Reference Accesses
 ///
@@ -634,8 +633,8 @@ where
     /// Root accumulators accessed by [`Self::cotangent_accumulator_reference`]. Refer to that function for more information.
     reference_accumulators: BTreeMap<ReferenceRoot, CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>>,
 
-    /// Values supplying runtime dimensions for cast witnesses and reference-state zeros, returned by
-    /// [`Self::dimension_sources`]. Refer to that function for more information.
+    /// Values supplying runtime extents or cast input identities for transpose rules and reference-state zeros,
+    /// returned by [`Self::dimension_sources`]. Refer to that function for more information.
     dimension_sources: Vec<Tracer<TracingContext<V, O>>>,
 }
 
@@ -764,14 +763,13 @@ where
         self.reference_analysis.as_ref()
     }
 
-    /// Returns retained values that supply runtime dimensions to transpose rules, for example to construct a reference
-    /// state zero or witness a cast's input identities. A source can be an array or an explicit dimension. These are
-    /// candidate sources, rather than dimensions already extracted for a particular operation. They include known
-    /// primal values and cotangents encountered during transposition, and remain available after value cotangent
-    /// storage is drained.
+    /// Returns retained values that supply runtime extents or input identities to transpose rules, for example to
+    /// construct a reference-state zero or bind a cast. A source can be an array or an explicit dimension. These values
+    /// are candidates from which a rule can obtain the extents it needs. They include known primal values and
+    /// cotangents encountered during transposition, and remain available after value cotangent storage is drained.
     ///
     /// For example, constructing a zero buffer of type `f32[n]` requires the runtime value of `n`, which the type alone
-    /// does not supply. An available array of type `f64[n]` can supply that dimension even though its element type is
+    /// does not supply. An available array of type `f64[n]` can supply that extent even though its element type is
     /// different. A slice's length does not necessarily supply the length of its root buffer, so view indices alone
     /// are insufficient. Zero materialization searches these values for the dimension identities it needs.
     ///
@@ -1491,8 +1489,8 @@ impl<
     /// r) ↦ live(ẏ)` and the linearization-point residuals `r` its trailing inputs consume, in that order). The
     /// returned linear program omits public leaves whose differential spaces contain only zero from its Single Static
     /// Assignment (SSA) boundary. [`into_transposed_parts`](Self::into_transposed_parts) returns its transpose with
-    /// metadata describing disconnected input cotangents. Shape witnesses retained by the callable are not returned;
-    /// replaying these open parts directly does not enforce the callable's differential-boundary checks.
+    /// metadata describing disconnected input cotangents. The callable's runtime input and output boundary metadata
+    /// is omitted; replaying these open parts directly does not enforce its differential compatibility checks.
     #[inline]
     pub fn into_linear_parts(
         self,
@@ -1505,9 +1503,9 @@ impl<
     /// all-[`Return`](CotangentDestinationKind::Return) transposition served from the linear program's retained
     /// transform cache, so it is valid only for a reference-free boundary and, like
     /// [`into_linear_parts`](Self::into_linear_parts), it omits zero-space leaves from its Single Static Assignment
-    /// (SSA) boundary. Disconnected cotangents also have no executable output; their slots are recorded in the
-    /// returned metadata. The callable's shape witnesses are not returned, so directly replaying these open parts
-    /// requires the caller to validate the runtime differential boundary.
+    /// (SSA) boundary. Disconnected cotangents also have no executable output; their slots are recorded in the returned
+    /// metadata. The callable's runtime input and output boundary metadata is omitted, so directly replaying these open
+    /// parts requires the caller to validate the runtime differential boundary.
     ///
     /// # Errors
     ///
@@ -3033,7 +3031,7 @@ where
             },
         )?;
 
-        // Retain known primal extents for transpose rules, including cast witnesses and reference-state zeros.
+        // Retain known primal extent sources for cast input identities and reference-state zeros.
         // Static types need no source, and references cannot supply dimensions through this protocol. Registered
         // pullback atoms are tracked so that each known value is registered at most once.
         let mut dimension_source_atoms = HashSet::new();
@@ -3141,8 +3139,8 @@ where
                 .to_vec();
             check_count!("output", outputs, instruction.outputs().len(), ProgramError);
 
-            // A replayed assertion can define an identity that no rule input supplies later (e.g., a dimension that
-            // only witnesses a narrowing cast), so its outputs supply runtime extents like known rule inputs do.
+            // A replayed assertion can define an identity that no rule input supplies later (e.g., a narrowing cast's
+            // input identity), so its outputs supply runtime extents like known rule inputs do.
             for (&source, mapped) in instruction.outputs().iter().zip(outputs) {
                 known_map[source.index()] = Some(mapped);
                 let known = context.tracer(mapped, None);
@@ -3317,8 +3315,8 @@ where
                         )?;
                         let known = context.tracer(atom, Some(r#type));
 
-                        // A known intermediate supplies runtime extents like a known program input does (e.g.,
-                        // a dimension that only its producer defines), so later rules can witness its identities.
+                        // A known intermediate supplies runtime extents like a known program input does. Its producer
+                        // may define an identity that later rules need as a cast input.
                         if !known.r#type().is_reference()
                             && known.r#type().identities().next().is_some()
                             && dimension_source_atoms.insert(atom)
@@ -3331,8 +3329,8 @@ where
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let transposition_driver = RecursiveTranspositionDriver::new(*self, instruction_index)?;
 
-            // Retain runtime extents before the rule consumes these cotangents. Later rules may need them for cast
-            // witnesses or reference-state zeros after value cotangent storage has been drained.
+            // Retain runtime extent sources before the rule consumes these cotangents. Later rules may need their
+            // identities for cast inputs or reference-state zeros after value cotangent storage has been drained.
             context.dimension_sources.extend(
                 instruction_output_cotangents
                     .iter()
@@ -3400,9 +3398,9 @@ where
                     cotangents.push(TransposedProgramCotangent::Output);
                 }
                 MaybeZero::Zero(r#type) if materialize_zeros[output_index] => {
-                    // A dense transpose has no occurrence-specific primal shape witness. A repeated indexed input
-                    // identity would require runtime equality checks that its signature alone cannot establish;
-                    // reject it before the zero provider can select an unrelated occurrence as its shape source.
+                    // A dense transpose does not retain each input occurrence's primal extent metadata. Repeated
+                    // indexed identities require runtime equality checks that its signature alone cannot establish;
+                    // reject them before the zero provider can select an unrelated occurrence as its extent source.
                     if !zero_sources_validated
                         && r#type.identities().next().is_some()
                         && O::requires_zero_source(&r#type)
@@ -4854,14 +4852,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_cotangent_add() {
+    fn test_array_operation_cotangent_add_operation() {
         let input_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
-            ArrayOperation::<Array>::cotangent_add(&[&input_type, &input_type]),
+            ArrayOperation::<Array>::cotangent_add_operation(&[&input_type, &input_type]),
             Ok(ArrayOperation::Add(AddOperation::new())),
         );
         assert_eq!(
-            ArrayOperation::<Array>::cotangent_add(&[]),
+            ArrayOperation::<Array>::cotangent_add_operation(&[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
     }
@@ -7389,7 +7387,7 @@ pub(crate) mod tests {
         assert!(matches!(program.transpose_with_respect_to(&[0, 1], &[]),
             Err(error) if error == DifferentiationError::from(TypeError::invalid(
                 "indexed dimension `rows` has repeated extent occurrences whose equality requires runtime checking"))));
-        // Compact pullbacks preserve the structural zero and let its consumer use the corresponding primal witness.
+        // Compact transposition preserves structural zeros so a pullback can materialize each from its input metadata.
         let compact = program.entry_region_ref().transpose(&[0, 1], &[], &[]).unwrap();
         assert_eq!(compact.cotangents(), &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero]);
         assert_eq!(

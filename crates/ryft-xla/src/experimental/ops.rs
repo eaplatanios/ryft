@@ -993,8 +993,8 @@ impl<Constant> SupportsCotangentAdd for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn cotangent_add(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::cotangent_add(input_types)?.into())
+    fn cotangent_add_operation(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        Ok(ArrayIrOperation::<Constant::Projected>::cotangent_add_operation(input_types)?.into())
     }
 }
 

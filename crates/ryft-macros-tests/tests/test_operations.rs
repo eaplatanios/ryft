@@ -3973,7 +3973,7 @@ fn test_operation_generates_all_selected_dispatchers() {
 }
 
 #[test]
-fn test_operation_cotangent_add_without_conversion() {
+fn test_operation_cotangent_add_operation_without_conversion() {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -3990,7 +3990,7 @@ fn test_operation_cotangent_add_without_conversion() {
     }
 
     impl SupportsCotangentAdd for CustomOperation {
-        fn cotangent_add(input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+        fn cotangent_add_operation(input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
             check_count!("input", input_types, 2, ProgramError);
             Ok(Self::Add(AddOperation::new()))
         }

@@ -3769,8 +3769,8 @@ mod tests {
     }
 
     impl SupportsCotangentAdd for ReferenceTestOperation {
-        fn cotangent_add(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            ArrayIrOperation::<Array>::cotangent_add(input_types).map(Self::Base)
+        fn cotangent_add_operation(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+            ArrayIrOperation::<Array>::cotangent_add_operation(input_types).map(Self::Base)
         }
     }
 

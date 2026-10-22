@@ -389,7 +389,7 @@ where
         left: &CustomRuleTracer<V, O>,
         right: &CustomRuleTracer<V, O>,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError> {
-        let operation = O::cotangent_add(&[left.r#type().as_ref(), right.r#type().as_ref()])?;
+        let operation = O::cotangent_add_operation(&[left.r#type().as_ref(), right.r#type().as_ref()])?;
         let mut outputs = left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))

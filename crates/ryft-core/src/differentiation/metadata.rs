@@ -119,9 +119,9 @@ pub trait DifferentialMetadataProvider<T: Type>: Operation {
 /// are omitted. Empty captures allocate nothing; non-empty captures share one flat value vector across sparse leaf
 /// ranges and both validation and reconstruction.
 ///
-/// [`Pushforward::into_parts`](crate::Pushforward::into_parts) returns these collections so callers can preserve runtime
-/// validation and reconstruction sources when interpreting the compact program themselves. The operation family owns
-/// the captured values' representation; callers use [`validate`](Self::validate) for compatibility checks and
+/// [`Pushforward::into_parts`](crate::Pushforward::into_parts) returns these collections so callers can preserve
+/// runtime validation and reconstruction sources when interpreting the compact program themselves. The operation family
+/// owns the captured values' representation; callers use [`validate`](Self::validate) for compatibility checks and
 /// [`sources`](Self::sources) to obtain reconstruction sources for one public boundary leaf.
 ///
 /// # Example
@@ -624,7 +624,7 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![checked.atom_id().unwrap()], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        // The returned tracer must depend on the validation operation rather than directly returning the unchecked input.
+        // The result must depend on the validation operation, preserving its checks when later operations consume it.
         assert_eq!(
             program.to_string(),
             indoc! {"
