@@ -243,13 +243,16 @@ impl<V: Value> Default for DifferentialBoundaryMetadata<V> {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
-    use crate::contexts::{Domain, EagerContext};
+    use crate::contexts::{Domain, EagerContext, StagingContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::ConstantOperation;
-    use crate::programs::{RegionInterface, TypeError};
+    use crate::parameters::Placeholder;
+    use crate::programs::{RegionInterface, TypeError, Typed};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -580,14 +583,46 @@ mod tests {
         let marker = Array::scalar(7f32).unwrap();
         let other_marker = Array::scalar(11f32).unwrap();
         let metadata = DifferentialBoundaryMetadata {
-            values: vec![first.clone(), marker.clone(), second.clone(), marker, other_marker],
+            values: vec![first.clone(), second.clone(), marker, other_marker],
             leaves: vec![
-                (1, 0..2, DifferentialMetadataPurpose::ValidationAndReconstruction),
-                (4, 2..5, DifferentialMetadataPurpose::ValidationAndReconstruction),
+                (1, 0..1, DifferentialMetadataPurpose::Validation),
+                (4, 1..4, DifferentialMetadataPurpose::ValidationAndReconstruction),
             ],
         };
         assert_eq!(metadata.validate(&context, 1, first.clone(), first.r#type().as_ref()), Ok(first));
         assert_eq!(metadata.validate(&context, 4, second.clone(), second.r#type().as_ref()), Ok(second));
+    }
+
+    #[test]
+    fn test_differential_boundary_metadata_validate_staged() {
+        let context = TracingContext::<Array, MetadataProbeOperation>::new();
+        let primal_type = ArrayType::scalar(DataType::F32);
+        let differential = context.input(primal_type.clone());
+        let captured = context.input(primal_type.clone());
+        let metadata = DifferentialBoundaryMetadata {
+            values: vec![captured],
+            leaves: vec![(1, 0..1, DifferentialMetadataPurpose::Validation)],
+        };
+        let checked = metadata.validate(&context, 1, differential, &primal_type).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![checked.atom_id().unwrap()], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // The returned tracer must depend on the validation operation rather than directly returning the unchecked input.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = metadata_validation_probe %0 %1
+                in (%2)"},
+        );
+        assert_eq!(
+            program.interpret(vec![Array::scalar(2f32).unwrap(), Array::scalar(2f32).unwrap()]),
+            Ok(vec![Array::scalar(2f32).unwrap()]),
+        );
     }
 
     #[test]
@@ -596,12 +631,15 @@ mod tests {
         let differential = Array::scalar(2f32).unwrap();
         let differential_type = differential.r#type().into_owned();
         let metadata = DifferentialBoundaryMetadata {
-            values: vec![differential.clone()],
-            leaves: vec![(2, 0..1, DifferentialMetadataPurpose::Validation)],
+            values: vec![differential.clone(), differential.clone()],
+            leaves: vec![
+                (2, 0..1, DifferentialMetadataPurpose::Validation),
+                (4, 1..2, DifferentialMetadataPurpose::Validation),
+            ],
         };
 
         // Missing entries still dispatch validation with an empty slice, before, between, or after stored leaves.
-        for index in [0, 1, 3] {
+        for index in [0, 3, 5] {
             assert_eq!(
                 metadata.validate(&context, index, differential.clone(), &differential_type),
                 Err(ProgramError::InvalidArgument { message: "metadata probe received no captured values".into() }),
