@@ -472,6 +472,23 @@ pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Typ
     /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee through a shared-callee
     /// region driver, while `capture_count` records the exact leading lifted-capture prefix of that callee boundary.
     fn compiled_call(capture_count: usize) -> Self;
+
+    /// Constructs one call with its exact callee signature. Families that export callee-local nominal identities
+    /// override this hook to allocate instruction-owned result identities while forwarding input identities.
+    /// Allocation happens when the call is built; output inference must remain deterministic.
+    ///
+    /// The default returns [`Self::compiled_call`], leaving result inference to the family. A family whose inference
+    /// reports the callee's result types then makes each call instruction define the callee-local identities itself.
+    /// Program construction rejects a second call to the same callee in one region, because it would define those
+    /// identities again although sharing a callee root does not make the runtime results of separate calls the same
+    /// quantity. Override this function to instantiate fresh result identities for every call instead.
+    fn compiled_call_with_type_signature(
+        capture_count: usize,
+        _input_types: &[Constant::Type],
+        _output_types: &[Constant::Type],
+    ) -> Result<Self, TypeError> {
+        Ok(Self::compiled_call(capture_count))
+    }
 }
 
 /// Staged, unlowered form of one compiled function.
@@ -628,11 +645,13 @@ where
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
-        let outputs = context.bind(
-            D::Operation::compiled_call(capture_count),
-            CalleeRegionDriver::new(&[self.lifted_program()?]),
-            flat_inputs.as_slice(),
+        let callee = self.lifted_program()?;
+        let operation = D::Operation::compiled_call_with_type_signature(
+            capture_count,
+            &callee.input_types(),
+            &callee.output_types(),
         )?;
+        let outputs = context.bind(operation, CalleeRegionDriver::new(&[callee]), flat_inputs.as_slice())?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
@@ -691,11 +710,13 @@ where
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        context.bind(
-            D::Operation::compiled_call(captures.len()),
-            CalleeRegionDriver::new(&[self.lifted_program()?]),
-            flat_inputs.as_slice(),
-        )
+        let callee = self.lifted_program()?;
+        let operation = D::Operation::compiled_call_with_type_signature(
+            captures.len(),
+            &callee.input_types(),
+            &callee.output_types(),
+        )?;
+        context.bind(operation, CalleeRegionDriver::new(&[callee]), flat_inputs.as_slice())
     }
 
     /// Returns the source program with its runtime captures lifted into leading flat inputs, in the

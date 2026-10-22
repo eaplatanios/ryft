@@ -45,7 +45,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType,
+    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayOperation, ArrayType, DataType,
     FloatingPointArrayElement, NumericArrayElement, RealArrayElement,
 };
 use crate::contexts::StagingContext;
@@ -193,15 +193,10 @@ impl_differentiable_elementwise_operation! {
     rule = [@positive, @positive],
 }
 
-impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
-    // Cotangent accumulation adds two composite cotangents by binding an `AddOperation<ArrayIrType>` (refer to
-    // `Linearization::pullback` and the reverse-mode `From<AddOperation<C::Type>>` bounds), so the composite family
-    // lifts the type-generic add into the homogeneous array member that owns elementwise addition. The source payload
-    // is stateless, so no input type survives the conversion, and member type inference rejects a dimension input.
-
+impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
-    fn from(_operation: AddOperation<ArrayIrType>) -> Self {
-        Self::Array(ArrayOperation::Add(AddOperation::new()))
+    fn from(operation: AddOperation<ArrayType>) -> Self {
+        Self::Array(ArrayOperation::Add(operation))
     }
 }
 

@@ -1243,10 +1243,10 @@ where
 
 impl<C: Context<Type = ArrayIrType>> ReferenceAccumulationPolicy<C> for ArrayReferenceDischarge
 where
-    C::Operation: From<AddOperation<ArrayIrType>>
-        + OperationProjection<
+    C::Operation: OperationProjection<
             ArrayType,
-            Projected: From<ReshapeOperation>
+            Projected: From<AddOperation<ArrayType>>
+                           + From<ReshapeOperation>
                            + From<BroadcastOperation>
                            + From<SliceOperation>
                            + From<UpdateSliceOperation>
@@ -1261,17 +1261,16 @@ where
         update: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        // Composite array IR values deliberately expose no value-level addition: the composite family carries array
-        // payloads through `ArrayIrOperation::Array` and lifts the type-generic `AddOperation<ArrayIrType>` into that
-        // member instead, which is the same seam generic reverse mode uses to accumulate cotangents. Accumulation
-        // therefore binds the lifted addition through the context, requiring nothing beyond the conversion the
-        // operation family already provides.
+        // Reference views select ordinary array data, so accumulation binds array addition through the family's
+        // array projection before rebuilding the enclosing view.
         let carrier = ContextTransformCarrier { context };
         let intermediates = alias.intermediates_in(&carrier, current.clone())?;
 
         // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
         let selected = intermediates.last().unwrap().clone();
-        let mut outputs = context.bind(C::Operation::from(AddOperation::new()), Vec::new(), &[selected, update])?;
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(AddOperation::new());
+        let operation = C::Operation::from(operation);
+        let mut outputs = context.bind(operation, Vec::new(), &[selected, update])?;
         check_count!("output", outputs, 1, ProgramError);
         let accumulated = outputs.remove(0);
         alias.reconstruct_in(&carrier, &intermediates[..alias.transforms().len()], accumulated)
@@ -3800,7 +3799,7 @@ mod tests {
             1
         );
         assert_eq!(TestOperation::ReferenceFreeze(ReferenceFreezeOperation::new()).base_input_count(), 1);
-        assert_eq!(TestOperation::from(AddOperation::<ArrayIrType>::new()).base_input_count(), 0);
+        assert_eq!(TestOperation::from(AddOperation::<ArrayType>::new()).base_input_count(), 0);
     }
 
     #[test]
@@ -3819,7 +3818,7 @@ mod tests {
         assert!(descriptor.transforms().is_empty());
         assert_eq!(descriptor.bindings(), 1..1);
         assert_eq!(freeze.reference_access_descriptor(1), None);
-        assert_eq!(TestOperation::from(AddOperation::<ArrayIrType>::new()).reference_access_descriptor(0), None);
+        assert_eq!(TestOperation::from(AddOperation::<ArrayType>::new()).reference_access_descriptor(0), None);
     }
 
     #[test]
@@ -3855,7 +3854,7 @@ mod tests {
                 if message == "`reference_freeze` cannot replace the reference transforms at input 0",
         ));
         assert!(matches!(
-            TestOperation::from(AddOperation::<ArrayIrType>::new()).with_reference_access_transforms(0, Vec::new()),
+            TestOperation::from(AddOperation::<ArrayType>::new()).with_reference_access_transforms(0, Vec::new()),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`add` cannot replace the reference transforms at input 0",
         ));

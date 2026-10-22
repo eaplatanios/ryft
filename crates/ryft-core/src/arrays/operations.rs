@@ -11,8 +11,8 @@ use crate::contexts::{ContextProjection, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
-    MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, SupportsCotangentAdd,
+    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
 // TODO(eaplatanios): Import from `crate::operations` directly.
 use crate::operations::attention::{
@@ -36,17 +36,18 @@ use crate::operations::{
     LogicalOperations, LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation,
     NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
-    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
-    RaggedExtents, RaggedExtentsOperation, RaggedNew, RaggedNewOperation, RaggedStorage, RaggedStorageOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select,
-    SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Sort,
-    SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
-    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedAddOperation,
+    RaggedDotOperation, RaggedExtents, RaggedExtentsOperation, RaggedNew, RaggedNewOperation, RaggedStorage,
+    RaggedStorageOperation, RaggedZeroOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
+    ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation,
+    ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation, ShardMapOperation,
+    ShardingOperations, SignOperation, SinOperation, SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient,
+    StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation,
+    TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -375,6 +376,12 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Explicitly exposes the full extent payload of one ragged storage-axis occurrence.
     RaggedExtents(RaggedExtentsOperation),
+
+    /// Adds checked ragged cotangent storage while retaining all indexed extents.
+    RaggedAdd(RaggedAddOperation),
+
+    /// Materializes zero storage from a ragged shape source.
+    RaggedZero(RaggedZeroOperation),
 
     /// Creates a new whole-array reference root.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
@@ -929,7 +936,7 @@ where
     ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
     O: Operation<Type = ArrayIrType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-        + From<AddOperation<ArrayIrType>>
+        + SupportsCotangentAdd
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
@@ -3599,6 +3606,7 @@ mod tests {
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::RaggedNew(_) => MemberKindSignature::FieldsToRagged,
+            ArrayIrOperation::RaggedZero(_) | ArrayIrOperation::RaggedAdd(_) => MemberKindSignature::KindPreserving,
             ArrayIrOperation::RaggedStorage(_) | ArrayIrOperation::RaggedExtents(_) => {
                 MemberKindSignature::RaggedToArray
             }
@@ -3725,6 +3733,18 @@ mod tests {
             ),
             (ArrayIrOperation::RaggedStorage(RaggedStorageOperation), MemberKindSignature::RaggedToArray),
             (ArrayIrOperation::RaggedExtents(RaggedExtentsOperation::new(0)), MemberKindSignature::RaggedToArray),
+            (ArrayIrOperation::RaggedAdd(RaggedAddOperation), MemberKindSignature::KindPreserving),
+            (
+                ArrayIrOperation::RaggedZero(RaggedZeroOperation::new(
+                    crate::RaggedType::new(
+                        ArrayType::new_static(DataType::F32, [8]),
+                        crate::RaggedValueKind::Array,
+                        vec![crate::RaggedDimension::new(0, first.clone(), vec![])],
+                    )
+                    .unwrap(),
+                )),
+                MemberKindSignature::KindPreserving,
+            ),
             (ArrayIrOperation::Reshape(DynamicReshapeOperation::new()), MemberKindSignature::DimensionMixed),
             (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::DimensionMixed),
             (
@@ -3869,7 +3889,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 45);
+        assert_eq!(expected.len(), 47);
         assert_eq!(
             expected
                 .iter()
@@ -3890,7 +3910,7 @@ mod tests {
         );
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::KindPreserving).count(),
-            2,
+            4,
         );
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ArrayToReference).count(),
