@@ -205,7 +205,7 @@ pub use forward::{
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
-pub use metadata::{DifferentialMetadataProvider, DifferentialMetadataPurpose};
+pub use metadata::{DifferentialBoundaryMetadata, DifferentialMetadataProvider, DifferentialMetadataPurpose};
 pub use rematerialization::{
     DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
     DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,

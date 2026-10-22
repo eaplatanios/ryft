@@ -3637,7 +3637,7 @@ mod tests {
             ArrayIrValue::Ragged(RaggedValue::new(r#type, Array::vector(vec![3i64, 3]).unwrap(), Vec::new()).unwrap());
         let (output, pushforward) = differentiate_at(primal).linearize(|input| input.ragged_storage()).unwrap();
         assert_eq!(output, Array::vector(vec![3i64, 3]).unwrap().into());
-        let (_, linear, residuals, _, _, _) = pushforward.into_parts();
+        let (_, linear, residuals, ..) = pushforward.into_parts();
         assert!(linear.input_types().is_empty());
         assert!(linear.output_types().is_empty());
         assert!(residuals.is_empty());
@@ -3711,7 +3711,7 @@ mod tests {
         let (_, pullback) = differentiate_at(primal.clone()).vjp(Ok).unwrap();
         assert_eq!(pullback.apply(mismatch).unwrap_err().downcast_custom(), Some(&differential_shape_mismatch()));
         assert_eq!(pullback.apply_materialized(tangent.clone()), Ok(tangent));
-        let (_, linear, residuals, _, _, _) = pushforward.into_parts();
+        let (_, linear, residuals, ..) = pushforward.into_parts();
         assert!(linear.output_types().is_empty());
         assert!(linear.input_types().iter().all(DifferentiableType::is_zero_space));
         for residual in residuals {
@@ -4111,7 +4111,7 @@ mod tests {
         assert_eq!(pushforward.apply(tangent.clone().into()), Ok(tangent.into()));
 
         // Only the extents and a Zero-storage shape carrier are retained; the numerical primal storage is not.
-        let (_, linear, residuals, _, _, _) = pushforward.into_parts();
+        let (_, linear, residuals, ..) = pushforward.into_parts();
         assert_eq!(
             residuals.iter().map(|residual| residual.r#type().to_string()).collect::<Vec<_>>(),
             vec!["i64[2]".to_owned(), "ragged<zero[2, 3]; 1:rows over [0]>".to_owned()],

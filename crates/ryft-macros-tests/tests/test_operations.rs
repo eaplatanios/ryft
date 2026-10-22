@@ -4016,6 +4016,62 @@ fn test_operation_cotangent_add_without_conversion() {
 }
 
 #[test]
+fn test_operation_differential_metadata_without_zero_provider() {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use ryft::{
+        Array, ArrayType, ConstantOperation, Context, DataType, DifferentialMetadataProvider,
+        DifferentialMetadataPurpose, Placeholder, ProgramError, StagingContext, TracingContext,
+    };
+
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(type(ArrayType), constant(Array))]
+    enum MetadataOperation {
+        Constant(ConstantOperation<Array>),
+    }
+
+    impl DifferentialMetadataProvider<ArrayType> for MetadataOperation {
+        fn capture_differential_metadata<C: Context<Type = ArrayType, Operation = Self>>(
+            _context: &C,
+            primal: &C::Value,
+            _differential_type: &ArrayType,
+            _purpose: DifferentialMetadataPurpose,
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            Ok(vec![primal.clone(), primal.clone()])
+        }
+    }
+
+    let context = TracingContext::<Array, MetadataOperation>::new();
+    let differential_type = ArrayType::scalar(DataType::F32);
+    let primal = context.input(differential_type.clone());
+    let metadata = MetadataOperation::capture_differential_metadata(
+        &context,
+        &primal,
+        &differential_type,
+        DifferentialMetadataPurpose::Reconstruction,
+    )
+    .unwrap();
+    let program = context
+        .builder()
+        .borrow()
+        .clone()
+        .build::<Array, Vec<Array>>(
+            metadata.iter().map(|value| value.atom_id().unwrap()).collect(),
+            Placeholder,
+            vec![Placeholder; 2],
+        )
+        .unwrap();
+    assert_eq!(
+        program.to_string(),
+        indoc! {"
+        lambda %0:f32[] .
+        in (%0, %0)"}
+    );
+    assert_eq!(program.interpret(Array::scalar(3f32).unwrap()), Ok(vec![Array::scalar(3f32).unwrap(); 2]));
+}
+
+#[test]
 fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");

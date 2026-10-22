@@ -295,7 +295,7 @@ where
 
     // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
     // Verify that the derived program still satisfies this contract before constructing its packed inputs.
-    let (_, program, residuals, _, _, _) = pushforward.into_parts();
+    let (_, program, residuals, ..) = pushforward.into_parts();
     let program_input_types = program.input_types();
     let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(

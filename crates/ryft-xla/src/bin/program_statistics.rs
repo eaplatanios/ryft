@@ -250,7 +250,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
         Array::scalar(2.0)?,
         (),
     )?;
-    let (_, pushforward, residuals, _, _, _) = pushforward.into_parts();
+    let (_, pushforward, residuals, ..) = pushforward.into_parts();
     let (_, closed_pushforward) = context.interpret_and_trace(
         move |tangent| {
             let tracing_context = tangent.context().clone();
