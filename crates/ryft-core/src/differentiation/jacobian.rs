@@ -4,12 +4,15 @@ use ryft_macros::Parameterized;
 
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
-use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation, TransposedProgramCotangent};
+use crate::differentiation::metadata::DifferentialMetadataProvider;
+use crate::differentiation::reverse::{
+    ReverseModeDifferentiate, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
+};
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ZeroOperation};
+use crate::operations::{ReferenceAddUpdateOperation, ReferenceNewOperation, ZeroOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -222,7 +225,8 @@ where
     C::Type: DenseDifferentiableType<C>,
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>
+        + DifferentialMetadataProvider<C::Type>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
@@ -425,6 +429,7 @@ where
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
+        + DifferentialMetadataProvider<C::Type>
         + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>>
         + OperationProvider<
             C::Type,
@@ -438,7 +443,7 @@ where
                 <C::Operation as ReferenceAccessOperation>::Transform,
             >,
             Operation = C::Operation,
-        > + From<AddOperation<C::Type>>,
+        > + SupportsCotangentAdd,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {

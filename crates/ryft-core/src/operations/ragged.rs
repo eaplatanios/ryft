@@ -38,9 +38,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, SupportsCotangentAdd,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentialMetadataProvider,
+    DifferentialMetadataPurpose, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_transposable_operation, impl_reference_dischargeable_operation};
@@ -348,7 +349,14 @@ where
                 // The tangent reads its extents and identity from a Zero-storage shape carrier of the primal result,
                 // like the reverse rule below. Under `linearize`, the carrier, not the primal result, becomes the
                 // retained residual, so the pushforward never retains numerical primal storage solely for shape.
-                let source = C::Operation::capture_zero_source(context.primal(), &primal, &tangent_type)?;
+                let mut metadata = C::Operation::capture_differential_metadata(
+                    context.primal(),
+                    &primal,
+                    &tangent_type,
+                    DifferentialMetadataPurpose::Reconstruction,
+                )?;
+                check_count!("input", metadata, 1, ProgramError);
+                let source = metadata.remove(0);
                 let source = context.primal_to_tangent(source)?;
                 let target = <&RaggedType>::try_from(&tangent_type)?.clone();
                 let mut fields = vec![value.clone()];
@@ -382,7 +390,14 @@ where
             _ if tangent_type.is_zero_space() => MaybeZero::Zero(tangent_type),
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
-                let source = C::Operation::capture_zero_source(context.primal(), &primal, &tangent_type)?;
+                let mut metadata = C::Operation::capture_differential_metadata(
+                    context.primal(),
+                    &primal,
+                    &tangent_type,
+                    DifferentialMetadataPurpose::Reconstruction,
+                )?;
+                check_count!("input", metadata, 1, ProgramError);
+                let source = metadata.remove(0);
                 let source = context.primal_to_tangent(source)?;
                 let target = <&RaggedType>::try_from(&tangent_type)?.clone();
                 let outputs = LinearCallOperation::stage(
@@ -636,8 +651,14 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
                 let input_cotangent_type = inputs[0].primal().r#type().cotangent()?;
-                let source =
-                    C::Operation::capture_zero_source(context.primal(), inputs[0].primal(), &input_cotangent_type)?;
+                let mut metadata = C::Operation::capture_differential_metadata(
+                    context.primal(),
+                    inputs[0].primal(),
+                    &input_cotangent_type,
+                    DifferentialMetadataPurpose::Reconstruction,
+                )?;
+                check_count!("input", metadata, 1, ProgramError);
+                let source = metadata.remove(0);
                 let source = context.primal_to_tangent(source)?;
                 let target = <&RaggedType>::try_from(&input_cotangent_type)?.clone();
                 let outputs = LinearCallOperation::stage(
@@ -1752,13 +1773,17 @@ fn assert_live<A: Clone + Or + Not + Assert>(
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, Dimension, DimensionBounds, DimensionError, MAX_DIMENSION_EXTENT,
-        RaggedDimension, Shape,
+        ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayOperation, Dimension, DimensionBounds,
+        DimensionError, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, RaggedDimension, Shape,
+        Sharding,
     };
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::EagerContext;
+    use crate::differentiation::differentiate_at;
     use crate::macros::check_operation_type_inference;
     use crate::operations::assertions::{AssertionError, AssertionFailure};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -2721,9 +2746,6 @@ mod tests {
 
     #[test]
     fn test_ragged_new_batching() {
-        use crate::arrays::ArrayIrBatchingPolicy;
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
@@ -3018,9 +3040,6 @@ mod tests {
 
     #[test]
     fn test_ragged_extents_batching() {
-        use crate::arrays::ArrayIrBatchingPolicy;
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
@@ -3272,8 +3291,6 @@ mod tests {
 
     #[test]
     fn test_ragged_complex_zero_and_add() {
-        use num_complex::Complex;
-
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::C64, [2, 3]),
@@ -3310,9 +3327,6 @@ mod tests {
 
     #[test]
     fn test_ragged_zero_and_add_manual_variation_and_memory() {
-        use crate::arrays::{LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding};
-        use crate::differentiation::DifferentiableType;
-
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 2).with_varying_manual_axes(["m"]).unwrap();
         let storage_type = ArrayType::new_static(DataType::F32, [2, 3])
@@ -3373,8 +3387,14 @@ mod tests {
             .unwrap(),
         );
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let residual =
-            ArrayIrOperation::<Array>::capture_zero_source(&context, &source, &r#type.clone().into()).unwrap();
+        let residual = ArrayIrOperation::<Array>::capture_differential_metadata(
+            &context,
+            &source,
+            &r#type.clone().into(),
+            DifferentialMetadataPurpose::Reconstruction,
+        )
+        .unwrap()
+        .remove(0);
         let ArrayIrValue::Ragged(shape) = &residual else { panic!("expected ragged shape carrier") };
         assert_eq!(shape.storage().r#type().data_type(), DataType::Zero);
         assert!(shape.storage().storage_bytes().is_empty());
@@ -3400,8 +3420,6 @@ mod tests {
 
     #[test]
     fn test_ragged_identity_pullback_rejects_changed_seed_extents() {
-        use crate::differentiation::differentiate_at;
-
         let primal = differential_value();
         let ArrayIrValue::Ragged(primal_value) = &primal else { unreachable!() };
         let seed = ArrayIrValue::Ragged(
@@ -3451,8 +3469,6 @@ mod tests {
 
     #[test]
     fn test_ragged_identity_pushforward_rejects_changed_tangent_extents() {
-        use crate::differentiation::differentiate_at;
-
         let primal = differential_value();
         let ArrayIrValue::Ragged(primal_value) = &primal else { unreachable!() };
         let tangent = ArrayIrValue::Ragged(
@@ -3476,8 +3492,6 @@ mod tests {
 
     #[test]
     fn test_ragged_identity_jvp_rejects_changed_tangent_extents() {
-        use crate::differentiation::differentiate_at;
-
         let primal = differential_value();
         let ArrayIrValue::Ragged(primal_value) = &primal else { unreachable!() };
         let tangent = ArrayIrValue::Ragged(
@@ -3503,8 +3517,6 @@ mod tests {
 
     #[test]
     fn test_ragged_add_pullback_rejects_changed_seed_extents() {
-        use crate::differentiation::differentiate_at;
-
         let primal = differential_value();
         let ArrayIrValue::Ragged(primal_value) = &primal else { unreachable!() };
         let seed = ArrayIrValue::Ragged(
@@ -3528,8 +3540,6 @@ mod tests {
 
     #[test]
     fn test_ragged_identity_differentials_preserve_inactive_padding() {
-        use crate::differentiation::differentiate_at;
-
         let r#type = nested_type(2);
         let primal = ArrayIrValue::Ragged(
             RaggedValue::new(
@@ -3562,7 +3572,6 @@ mod tests {
 
     #[test]
     fn test_ragged_storage_reverse_accumulation_and_disconnected_zero() {
-        use crate::differentiation::differentiate_at;
         let first = differential_value();
         // This independent family has different extents, so borrowing the active input's zero source would be wrong.
         let ArrayIrValue::Ragged(value) = &first else { unreachable!() };
@@ -3618,7 +3627,6 @@ mod tests {
 
     #[test]
     fn test_ragged_dimension_value_compact_differentials() {
-        use crate::differentiation::differentiate_at;
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::I64, [2]),
             RaggedValueKind::Dimension(Dimension::Static(3).into()),
@@ -3636,9 +3644,6 @@ mod tests {
     }
     #[test]
     fn test_ragged_dimension_value_batched_storage_consumes_item_identity() {
-        use crate::arrays::ArrayIrBatchingPolicy;
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let item = DimensionVariable::new("item", DimensionBounds::non_negative(Some(4)).unwrap());
         let r#type = RaggedType::new(
@@ -3662,7 +3667,6 @@ mod tests {
 
     #[test]
     fn test_ragged_integer_value_compact_differentials() {
-        use crate::differentiation::differentiate_at;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::I64, [2, 3]),
@@ -3719,9 +3723,6 @@ mod tests {
 
     #[test]
     fn test_ragged_storage_batching_differentiation_orders() {
-        use crate::arrays::{ArrayIrBatch, ArrayIrBatchingPolicy};
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-        use crate::differentiation::{DifferentiationContext, differentiate_at};
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type Differentiated = DifferentiationContext<Eager>;
         let primal = differential_value();
@@ -3783,10 +3784,6 @@ mod tests {
 
     #[test]
     fn test_ragged_storage_batching_differentiation_replicated_tangent() {
-        use crate::arrays::ArrayIrBatchingPolicy;
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-        use crate::differentiation::differentiate_at;
-
         // One replicated item tangent serves every item of a mapped primal whose per-item extents all equal its own.
         // The tangent validation aligns it to the primal's mapped representation and checks each item separately.
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -3859,9 +3856,6 @@ mod tests {
 
     #[test]
     fn test_ragged_add_batching_replicated_contribution() {
-        use crate::arrays::ArrayIrBatchingPolicy;
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
@@ -3946,10 +3940,6 @@ mod tests {
 
     #[test]
     fn test_ragged_new_batching_differentiation_orders() {
-        use crate::arrays::{ArrayIrBatch, ArrayIrBatchingPolicy};
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-        use crate::differentiation::differentiate_at;
-
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
@@ -4049,7 +4039,6 @@ mod tests {
 
     #[test]
     fn test_ragged_new_differentiation_keeps_unknown_extent_checks() {
-        use crate::differentiation::differentiate_at;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
         let representation = RaggedType::new(
             ArrayType::new_static(DataType::F32, [3]),
@@ -4102,7 +4091,6 @@ mod tests {
 
     #[test]
     fn test_ragged_new_differentiation_linearize_retains_shape_carrier() {
-        use crate::differentiation::differentiate_at;
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
         let representation = RaggedType::new(
             ArrayType::new_static(DataType::F32, [2, 3]),

@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use crate::contexts::Context;
+use crate::differentiation::metadata::DifferentialBoundaryMetadata;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::{Zero, ZeroOperation};
@@ -14,7 +15,7 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// Structural zeros carry only their [`Type`] while they flow through differentiation and cross pullback boundaries.
 /// A disconnected input cotangent therefore needs no executable output or saved primal extent. The consumer that
 /// owns an extent source materializes it when a concrete value is required: pullbacks and scalar gradients use the
-/// primal inputs that the pullback retains, and region boundaries use live cotangents or known dimensions when their
+/// zero sources captured from primal inputs, and region boundaries use live cotangents or known dimensions when their
 /// signatures require concrete zeros.
 ///
 /// Dynamic array types carry dimension identities and bounds, rather than defining runtime extents. Constructing a
@@ -59,8 +60,10 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// on the first source with exactly the requested type, so [`Self::requires_zero_source`] reports symbolic types even
 /// though they declare no residuals. Unexpected residuals are rejected rather than silently ignored. Eligible
 /// [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket implementation that captures runtime
-/// dimensions and assembles zeros with explicit extent inputs. This includes both the core composite family and its
-/// XLA backend counterpart; neither needs its own residual-protocol implementation.
+/// dimensions and assembles zeros with explicit extent inputs. Ragged array zeros instead retain one shape-only ragged
+/// carrier with [`Zero`] storage and every indexed occurrence; no numerical primal bytes are saved solely for shape.
+/// This includes both the core composite family and its XLA backend counterpart; neither needs its own
+/// residual-protocol implementation.
 ///
 /// Other type universes opt in explicitly. An input-free family can use an empty implementation when it already
 /// implements `OperationProvider<T, ZeroOperation<T>>`; a family requiring residuals overrides declaration, capture,
@@ -356,52 +359,76 @@ pub(crate) struct ZeroSpaceBoundaryReconstruction<V: Value> {
 }
 
 impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
-    /// Captures the runtime dimensions and reconstruction plan for every zero-space leaf of one differential boundary.
-    ///
-    /// For each primal output leaf type `Tᵢ`, the boundary type is its tangent type `D(Tᵢ)`. A nonzero-space `D(Tᵢ)`
-    /// remains a live output of the compact derivative program and needs no entry in the stored plan. For a zero-space
-    /// `D(Tᵢ)`, this function captures and validates the runtime values declared by
-    /// [`ResidualZeroProvider::zero_residual_types`] from the corresponding primal value, then records the leaf index,
-    /// differential type, and captured residual range. Reconstruction therefore never needs the primal boundary or
-    /// tangent mapping again.
+    /// Records the residual signature and reconstruction plan for every zero-space tangent leaf, reusing metadata
+    /// already captured for the complete output boundary. When that metadata has the declared residual signature, its
+    /// values are reused in order. Otherwise, the zero provider reads its named quantities from the captured sources.
+    /// Nonzero tangent spaces remain live outputs of the compact program and need no reconstruction entry.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Context in which the operation family reads runtime dimensions from the primal values.
-    ///   - `primal_values`: Complete flattened primal boundary values in leaf order.
-    ///   - `primal_types`: Complete flattened primal boundary types in the same order as `primal_values`.
+    ///   - `context`: Context in which any remaining residual reads execute or are staged.
+    ///   - `metadata`: Output metadata captured for reconstruction, optionally shared with validation.
+    ///   - `primal_types`: Complete flattened primal output types, aligned with public metadata positions.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] if the primal value/type counts differ or if an operation family
-    /// captures residual values whose count or types disagree with its declaration.
+    /// Returns [`ProgramError::MalformedProgram`] when captured sources cannot supply the declared zero residuals
+    /// or a provider returns a residual with an incompatible type.
     pub(crate) fn capture<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
     >(
         context: &C,
-        primal_values: &[C::Value],
+        metadata: &DifferentialBoundaryMetadata<C::Value>,
         primal_types: &[C::Type],
     ) -> Result<Self, ProgramError> {
-        if primal_values.len() != primal_types.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} has {} primal values but {} primal types",
-                OUTPUT_TANGENT_BOUNDARY,
-                primal_values.len(),
-                primal_types.len(),
-            )));
-        }
         let mut residuals = Vec::new();
         let mut zero_leaves = Vec::new();
-        for (index, (value, primal_type)) in primal_values.iter().zip(primal_types).enumerate() {
+        for (index, primal_type) in primal_types.iter().enumerate() {
             let differential_type = primal_type.tangent()?;
             if differential_type.is_zero_space() {
                 let residual_start = residuals.len();
-                residuals.extend(capture_and_validate_zero_residual_values(
-                    context,
-                    value,
-                    &differential_type,
-                    OUTPUT_TANGENT_BOUNDARY,
-                )?);
+                let expected_types = C::Operation::zero_residual_types(&differential_type);
+                let sources = metadata.sources(index);
+                if sources.len() == expected_types.len()
+                    && sources
+                        .iter()
+                        .zip(&expected_types)
+                        .all(|(source, expected)| source.r#type().as_ref() == expected)
+                {
+                    // Reconstruction metadata already has the declared residual signature. Reuse values in capture
+                    // order, preserving repeated occurrences instead of searching or deduplicating them by type.
+                    residuals.extend_from_slice(sources);
+                } else {
+                    // Ordinary deferred sources can still be primal exemplars. Resolve each declared zero residual
+                    // through the family's existing identity-directed protocol while the boundary is being captured.
+                    for (residual_index, expected_type) in expected_types.iter().enumerate() {
+                        let mut captured = None;
+                        for source in sources {
+                            if let Some(value) =
+                                C::Operation::capture_zero_residual_value(context, source, expected_type)?
+                            {
+                                captured = Some(value);
+                                break;
+                            }
+                        }
+                        let value = captured.ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "{OUTPUT_TANGENT_BOUNDARY} cannot capture zero residual \
+                             {residual_index} of type {expected_type}",
+                            ))
+                        })?;
+                        if value.r#type().as_ref() != expected_type {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "{} zero residual {} has type {} but expected {}",
+                                OUTPUT_TANGENT_BOUNDARY,
+                                residual_index,
+                                value.r#type().as_ref(),
+                                expected_type,
+                            )));
+                        }
+                        residuals.push(value);
+                    }
+                }
                 zero_leaves.push(ZeroSpaceBoundaryLeaf {
                     index,
                     r#type: differential_type,
@@ -474,6 +501,7 @@ mod tests {
         DimensionBounds, DimensionType, DimensionVariable, Shape,
     };
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::metadata::DifferentialMetadataPurpose;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, MaybeZero, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
@@ -669,9 +697,17 @@ mod tests {
 
         // Capture retains the key's dynamic extent and records that only the accumulator tangent remains live in the
         // compact output boundary. Rebuild must recover the omitted key tangent from that stored plan.
-        let reconstruction =
-            ZeroSpaceBoundaryReconstruction::capture(&context, primal_values.as_slice(), primal_types.as_slice())
-                .unwrap();
+        let mut metadata = DifferentialBoundaryMetadata::default();
+        metadata
+            .capture(
+                &context,
+                0,
+                &primal_values[0],
+                &key_type.tangent().unwrap().into(),
+                DifferentialMetadataPurpose::Reconstruction,
+            )
+            .unwrap();
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(&context, &metadata, &primal_types).unwrap();
         let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
         let key_tangent_type = ArrayIrType::Array(key_type.tangent().unwrap());
         assert_eq!(outputs.len(), 2);
@@ -697,9 +733,8 @@ mod tests {
             ArrayType::scalar(DataType::F64),
             ArrayType::scalar(DataType::I32),
         ];
-        let primal_values = primal_types.iter().map(|r#type| context.input(r#type.clone())).collect::<Vec<_>>();
         let reconstruction =
-            ZeroSpaceBoundaryReconstruction::capture(&context, primal_values.as_slice(), primal_types.as_slice())
+            ZeroSpaceBoundaryReconstruction::capture(&context, &DifferentialBoundaryMetadata::default(), &primal_types)
                 .unwrap();
 
         // Live values fill the nonzero-space leaves in order, and each zero-space leaf keeps its boundary index
@@ -724,13 +759,12 @@ mod tests {
     #[test]
     fn test_zero_space_boundary_reconstruction_reports_stored_boundary() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let primal = Array::scalar(3.0).unwrap();
         let primal_type = ArrayType::scalar(DataType::F64);
 
         // The reconstruction identifies a missing compact-program result without a caller-supplied diagnostic context.
         let output_tangent = ZeroSpaceBoundaryReconstruction::capture(
             &context,
-            std::slice::from_ref(&primal),
+            &DifferentialBoundaryMetadata::default(),
             std::slice::from_ref(&primal_type),
         )
         .unwrap();

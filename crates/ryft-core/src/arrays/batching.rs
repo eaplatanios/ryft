@@ -5308,14 +5308,14 @@ pub(crate) mod tests {
         InterpretableBatchableOperation, RecursiveBatchingPolicy, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer, differentiate_at};
     use crate::operations::{
         AddOperation, AssertionError, AssertionFailure, CompareOperation, ComparisonDirection, ConcatenateOperation,
         ConditionOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionSize,
-        DimensionToScalar, DimensionToScalarOperation, DynamicBroadcast, DynamicReshapeOperation, NegOperation,
-        OneLike, ParallelReduceOperation, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReshardOperation, Slice,
-        SliceOperation, ZeroOperation,
+        DimensionToScalar, DimensionToScalarOperation, DynamicBroadcast, DynamicReshapeOperation, Mul, NegOperation,
+        OneLike, ParallelReduceOperation, RaggedExtents, RaggedStorage, Reduce, ReduceOperation, ReductionKind,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReshardOperation, Slice, SliceOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -9555,10 +9555,8 @@ pub(crate) mod tests {
     -> Result<(), ProgramError> {
         // The transposed `ragged_storage` rebuilds a ragged cotangent with mapped storage over the replicated primal's
         // shape, and the batched transposed linear call receives that cotangent beside the replicated shape residual.
-        use crate::differentiation::differentiate_at;
-        use crate::operations::{Mul, RaggedExtents, RaggedStorage};
-
         type Batched = BatchingTracer<ArrayIrEagerContext, ArrayIrBatchingPolicy>;
+
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4))?);
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::F32, [3]),
