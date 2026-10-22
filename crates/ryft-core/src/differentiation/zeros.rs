@@ -367,8 +367,8 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// # Parameters
     ///
     ///   - `context`: Context in which any remaining residual reads execute or are staged.
-    ///   - `metadata`: Output metadata captured for reconstruction, optionally shared with validation.
     ///   - `primal_types`: Complete flattened primal output types, aligned with public metadata positions.
+    ///   - `metadata`: Output metadata captured for reconstruction, optionally shared with validation.
     ///
     /// # Errors
     ///
@@ -378,8 +378,8 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
     >(
         context: &C,
-        metadata: &DifferentialBoundaryMetadata<C::Value>,
         primal_types: &[C::Type],
+        metadata: &DifferentialBoundaryMetadata<C::Value>,
     ) -> Result<Self, ProgramError> {
         let mut residuals = Vec::new();
         let mut zero_leaves = Vec::new();
@@ -707,7 +707,7 @@ mod tests {
                 DifferentialMetadataPurpose::Reconstruction,
             )
             .unwrap();
-        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(&context, &metadata, &primal_types).unwrap();
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(&context, &primal_types, &metadata).unwrap();
         let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
         let key_tangent_type = ArrayIrType::Array(key_type.tangent().unwrap());
         assert_eq!(outputs.len(), 2);
@@ -734,7 +734,7 @@ mod tests {
             ArrayType::scalar(DataType::I32),
         ];
         let reconstruction =
-            ZeroSpaceBoundaryReconstruction::capture(&context, &DifferentialBoundaryMetadata::default(), &primal_types)
+            ZeroSpaceBoundaryReconstruction::capture(&context, &primal_types, &DifferentialBoundaryMetadata::default())
                 .unwrap();
 
         // Live values fill the nonzero-space leaves in order, and each zero-space leaf keeps its boundary index
@@ -764,8 +764,8 @@ mod tests {
         // The reconstruction identifies a missing compact-program result without a caller-supplied diagnostic context.
         let output_tangent = ZeroSpaceBoundaryReconstruction::capture(
             &context,
-            &DifferentialBoundaryMetadata::default(),
             std::slice::from_ref(&primal_type),
+            &DifferentialBoundaryMetadata::default(),
         )
         .unwrap();
         assert_eq!(
