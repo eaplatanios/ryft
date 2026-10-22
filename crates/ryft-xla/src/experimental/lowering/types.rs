@@ -444,6 +444,7 @@ where
     match value {
         XlaConstant::Captured(value) => lower_captured_constant(value, captured_values),
         XlaConstant::Dimension(value) => lower_dimension_extent(value, block, context, location),
+        XlaConstant::Literal(value) => lower_literal_value(value.array(), block, context, location),
         XlaConstant::Boolean(value) => {
             lower_literal_value(&XlaArrayConstant::Boolean(*value), block, context, location)
         }

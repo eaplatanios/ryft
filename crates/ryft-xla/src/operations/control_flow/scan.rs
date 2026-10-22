@@ -202,7 +202,7 @@ pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamil
     // types carry unchanged next to the leading length axis. Guarding the original carries and stacks therefore checks
     // what eager entry validation checks, which happens whatever the trip count is, so the guard precedes the
     // zero-length and the fully unrolled paths too.
-    let entry_types = scan.declared_input_types(&body_input_types).map_err(ProgramError::from)?;
+    let entry_types = scan.declared_input_types(&body_input_types, input_types).map_err(ProgramError::from)?;
     lower_region_guard(
         SCAN_OPERATION_NAME,
         &entry_types,
@@ -1896,7 +1896,7 @@ mod tests {
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let doubled = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![carry, carry], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -1970,7 +1970,7 @@ mod tests {
             let first = builder.add_input(carry_type.clone().into());
             let second = builder.add_input(carry_type.clone().into());
             let sum = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -2041,7 +2041,7 @@ mod tests {
             let first = builder.add_input(carry_type.clone().into());
             let second = builder.add_input(carry_type.clone().into());
             let sum = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -2189,7 +2189,7 @@ mod tests {
             let carry = builder.add_input(scalar_type.clone().into());
             let slice = builder.add_input(scalar_type.clone().into());
             let sum = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, slice], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![carry, slice], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])

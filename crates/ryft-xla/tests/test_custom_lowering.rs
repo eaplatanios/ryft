@@ -84,7 +84,7 @@ fn test_downstream_operation_family_lowers_through_the_public_api() {
         .unwrap()[0];
     let sum = builder
         .add_instruction(
-            ExtendedOperation::Xla(Box::new(XlaOperation::from(AddOperation::<ArrayIrType>::new()))),
+            ExtendedOperation::Xla(Box::new(XlaOperation::from(AddOperation::<ArrayType>::new()))),
             Vec::new(),
             vec![doubled, input],
             None,

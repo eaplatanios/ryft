@@ -20,13 +20,13 @@ use ryft_core::{
     DimensionSize, DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext,
     EffectClass, EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh,
     LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
-    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
-    ReferenceReplacementPreparation, ReferenceSource, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape,
-    Sharding, ShardingDimension, SortDirection, SpecializationCache, SpecializationCacheEntry,
-    SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
-    Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
-    Zero, ZeroOperation, validate_reference_boundary,
+    Placeholder, ProgramError, Provenance, ProvenanceScope, RaggedValueKind, ReadyOrPendingReferenceGuard,
+    ReductionKind, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution,
+    ReferenceId, ReferenceReplacementPreparation, ReferenceSource, RegionKey, RegionRef, ScatterMode,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, SpecializationCache,
+    SpecializationCacheEntry, SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain,
+    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
+    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array, ProjectedContext};
@@ -38,6 +38,7 @@ use ryft_pjrt::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::grouping::{XlaValueLayout, legalize_ragged_program};
 use super::lowering::signature::XlaExecutableSignature;
 use super::lowering::{LoweringError, contains_unresolved_references, contains_unresolved_state};
 use super::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder};
@@ -1148,6 +1149,22 @@ impl<'c> Context for XlaDomain<'c> {
             XlaConstant::Boolean(value) => {
                 Ok(XlaValue::Array(self.eager_scalar(DataType::Boolean, &[u8::from(value)])?))
             }
+            XlaConstant::Literal(value) => {
+                let array = value.array();
+                let mesh = self.eager_mesh(&[], &[array.r#type().into_owned()])?;
+                let r#type = if array.r#type().sharding().is_some() {
+                    array.r#type().into_owned()
+                } else {
+                    array
+                        .r#type()
+                        .replicated(&mesh)
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+                };
+                Ok(XlaValue::Array(
+                    XlaArray::from_host_buffer(self, r#type, mesh, array.storage_bytes())
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?,
+                ))
+            }
         }
     }
 
@@ -1156,8 +1173,9 @@ impl<'c> Context for XlaDomain<'c> {
     /// served from the session's eager dispatch cache, and otherwise the operation is traced into a
     /// single-instruction program over the inputs' physical [`ArrayType`]s (shardings included), compiled through this
     /// domain's compile cache, and executed on this domain's PJRT client via the crate-private `eager_bind` path. The
-    /// nullary additive/multiplicative identities keep a fast path that materializes the constant directly through the
-    /// runtime client without compiling a program.
+    /// nullary additive/multiplicative identities materialize their constants directly through the runtime client.
+    /// Ragged field projections return existing handles with their original completion dependencies, without compiling
+    /// or executing a program.
     fn bind<P, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
@@ -1171,6 +1189,9 @@ impl<'c> Context for XlaDomain<'c> {
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let operation = operation.into();
         operation.validate_region_interfaces(&driver.region_interfaces())?;
+        if let Some(outputs) = self.eager_ragged_projection(&operation, inputs) {
+            return outputs;
+        }
         let name = operation.name();
         if inputs.is_empty() && (name == ZERO_OPERATION_NAME || name == ONE_OPERATION_NAME) {
             let array_type = eager_identity_output_type(&operation)?;
@@ -1307,6 +1328,34 @@ impl<'c> XlaDomain<'c> {
         }))
     }
 
+    /// Returns existing ragged fields without compilation, execution or buffer transfer. Their original domains and
+    /// completion dependencies remain attached, so projecting a checked producer cannot escape its pending assertions.
+    fn eager_ragged_projection(
+        &self,
+        operation: &XlaOperation,
+        inputs: &[XlaValue<'c>],
+    ) -> Option<Result<Vec<XlaValue<'c>>, ProgramError>> {
+        if !matches!(operation, XlaOperation::RaggedStorage(_) | XlaOperation::RaggedExtents(_)) {
+            return None;
+        }
+        let context = EagerContext::<ArrayIrValue<XlaArray<'c>>>::new();
+        let inputs = inputs.iter().cloned().map(XlaValue::into_array_ir_value).collect::<Vec<_>>();
+        let outputs = match operation {
+            XlaOperation::RaggedStorage(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs),
+            XlaOperation::RaggedExtents(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs),
+            _ => unreachable!("only ragged projections enter this interpreter"),
+        };
+        Some(outputs.map(|outputs| {
+            outputs
+                .into_iter()
+                .map(|output| match output {
+                    ArrayIrValue::Array(array) => XlaValue::Array(array),
+                    _ => unreachable!("ragged projections produce ordinary arrays"),
+                })
+                .collect()
+        }))
+    }
+
     /// Uploads a replicated scalar with the provided host `bytes` and `data_type`, placed through [`Self::eager_mesh`].
     fn eager_scalar(&self, data_type: DataType, bytes: &[u8]) -> Result<XlaArray<'c>, ProgramError> {
         let output_type = ArrayType::scalar(data_type);
@@ -1344,17 +1393,6 @@ impl<'c> XlaDomain<'c> {
         driver: D,
         inputs: &[XlaValue<'c>],
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
-        if matches!(
-            operation,
-            XlaOperation::RaggedNew(_) | XlaOperation::RaggedStorage(_) | XlaOperation::RaggedExtents(_)
-        ) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{}` requires grouped ragged XLA execution, which is not yet supported",
-                    operation.name()
-                ),
-            });
-        }
         if let Some(outputs) = self.eager_reference_bind(&operation, inputs) {
             return outputs;
         }
@@ -1455,10 +1493,12 @@ impl<'c> XlaDomain<'c> {
 
         let array_inputs = inputs
             .iter()
-            .filter_map(|input| match input {
-                XlaValue::Array(array) => Some(array.clone()),
-                XlaValue::Dimension(_) | XlaValue::Reference(_) => None,
+            .flat_map(|input| match input {
+                XlaValue::Array(array) => Some(array).into_iter().chain([].iter()),
+                XlaValue::Ragged(value) => Some(value.storage()).into_iter().chain(value.extents().iter()),
+                XlaValue::Dimension(_) | XlaValue::Reference(_) => None.into_iter().chain([].iter()),
             })
+            .cloned()
             .collect::<Vec<_>>();
 
         if let XlaOperation::Cast(operation) = &operation
@@ -1540,7 +1580,21 @@ impl<'c> XlaDomain<'c> {
         let outputs = self
             .execute_xla_program(&compiled, array_inputs)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(outputs.into_iter().map(XlaValue::Array).collect())
+        let input_types = if compiled.logical_boundary.is_some() {
+            // Host dimensions became constants in `compile_eager_operation`; only array/ragged inputs have
+            // runtime slots in this executable's logical boundary.
+            inputs
+                .iter()
+                .filter_map(|input| match input {
+                    XlaValue::Array(_) | XlaValue::Ragged(_) => Some(input.r#type().into_owned()),
+                    XlaValue::Dimension(_) => None,
+                    XlaValue::Reference(_) => unreachable!("eager references use their own execution boundary"),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        compiled.regroup_outputs(outputs, self, &input_types).map_err(ProgramError::from)
     }
 
     /// Traces one eager operation application into a single-instruction program over the inputs' physical types
@@ -1566,6 +1620,7 @@ impl<'c> XlaDomain<'c> {
                 .iter()
                 .map(|input| match input {
                     XlaValue::Array(array) => Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned()))),
+                    XlaValue::Ragged(value) => Ok(builder.add_input(ArrayIrType::Ragged(value.r#type().into_owned()))),
                     XlaValue::Dimension(dimension) => {
                         let dimension = dimension.value();
                         if let Some(&atom) = dimension_atoms.get(dimension) {
@@ -1591,18 +1646,14 @@ impl<'c> XlaDomain<'c> {
         self.validate_eager_placement(array_inputs)?;
         let output_count = output_atoms.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let input_count = builder.input_ids().len();
         let program: FlatXlaProgram =
-            builder.build(output_atoms, vec![Placeholder; array_inputs.len()], vec![Placeholder; output_count])?;
+            builder.build(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
 
         // Derive the mesh after tracing so that input-free operations can fall back to their inferred output
         // shardings, and then compile through the domain's compilation cache.
-        let output_types = program
-            .output_types()
-            .iter()
-            .map(<&ArrayType>::try_from)
-            .map(|result| result.cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let mesh = self.eager_mesh(array_inputs, output_types.as_slice())?;
+        let output_layout = XlaValueLayout::new(&program.output_types())?;
+        let mesh = self.eager_mesh(array_inputs, output_layout.leaf_types())?;
         let options = XlaOptions::new(mesh);
         let lowered = self
             .lower_xla_program(&program, 0, &options)
@@ -1610,9 +1661,12 @@ impl<'c> XlaDomain<'c> {
         let cache_key = self
             .compilation_key(&lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        self.compilation_context()
+        let compiled = self
+            .compilation_context()
             .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+            .and_then(|compiled| compiled.with_requested_logical_boundary(&lowered))
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        Ok(compiled)
     }
 
     /// Validates that every input lives on this domain's PJRT client and that all inputs share one device placement,
@@ -1957,6 +2011,9 @@ enum XlaDispatchKeyKind {
     /// Exact runtime abstract signature used when bucketing is disabled, shared with the effective staged types.
     Exact(Arc<[ArrayIrType]>),
 
+    /// Exact grouped leaf signature and logical relationships, independent of runtime indexed names.
+    Grouped { physical: Vec<u8>, logical: Vec<u8> },
+
     /// Alpha-normalized bounded signature used when bucketing is enabled.
     Bucketed(BucketedDispatchSignature),
 }
@@ -2011,6 +2068,9 @@ enum XlaEagerDispatchInput {
 
     /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
     Dimension(DimensionValue),
+
+    /// Ragged input, including its value kind, indexed identities and complete extent-axis structure.
+    Ragged(ryft_core::RaggedType),
 }
 
 /// Borrowed form of one [`XlaEagerDispatchInput`], which owned keys and borrowed queries compare and hash alike.
@@ -2021,6 +2081,9 @@ enum XlaEagerDispatchInputRef<'a> {
 
     /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
     Dimension(&'a DimensionValue),
+
+    /// Complete logical ragged signature, independent of runtime extent payload values.
+    Ragged(Cow<'a, ryft_core::RaggedType>),
 }
 
 impl XlaEagerDispatchInputRef<'_> {
@@ -2029,6 +2092,7 @@ impl XlaEagerDispatchInputRef<'_> {
         match self {
             Self::Array(r#type) => XlaEagerDispatchInput::Array(r#type.into_owned()),
             Self::Dimension(dimension) => XlaEagerDispatchInput::Dimension(dimension.clone()),
+            Self::Ragged(r#type) => XlaEagerDispatchInput::Ragged(r#type.into_owned()),
         }
     }
 }
@@ -2048,6 +2112,27 @@ trait XlaEagerDispatchKeyView {
 
     /// Returns the input at `index`, which must be smaller than [`Self::input_count`].
     fn input(&self, index: usize) -> XlaEagerDispatchInputRef<'_>;
+
+    /// Returns the complete array/ragged input layout when indexed names can be scoped by this invocation.
+    /// Mixed structural signatures retain their existing nominal key.
+    fn grouped_input_layout(&self) -> Option<XlaValueLayout> {
+        if !(0..self.input_count()).any(|index| matches!(self.input(index), XlaEagerDispatchInputRef::Ragged(_))) {
+            return None;
+        }
+        let mut types = Vec::with_capacity(self.input_count());
+        let mut ragged = false;
+        for index in 0..self.input_count() {
+            types.push(match self.input(index) {
+                XlaEagerDispatchInputRef::Array(r#type) => r#type.into_owned().into(),
+                XlaEagerDispatchInputRef::Ragged(r#type) => {
+                    ragged = true;
+                    r#type.into_owned().into()
+                }
+                XlaEagerDispatchInputRef::Dimension(_) => return None,
+            });
+        }
+        if ragged { Some(XlaValueLayout::new(&types).unwrap()) } else { None }
+    }
 
     /// Returns the mesh that the eager lowering compiles against, if it is not derived from the operation alone.
     fn mesh(&self) -> Option<&DeviceMesh>;
@@ -2073,6 +2158,7 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchKey {
         match &self.inputs[index] {
             XlaEagerDispatchInput::Array(r#type) => XlaEagerDispatchInputRef::Array(Cow::Borrowed(r#type)),
             XlaEagerDispatchInput::Dimension(dimension) => XlaEagerDispatchInputRef::Dimension(dimension),
+            XlaEagerDispatchInput::Ragged(r#type) => XlaEagerDispatchInputRef::Ragged(Cow::Borrowed(r#type)),
         }
     }
 
@@ -2087,12 +2173,30 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchKey {
 
 impl PartialEq for dyn XlaEagerDispatchKeyView + '_ {
     fn eq(&self, other: &Self) -> bool {
-        self.operation() == other.operation()
-            && self.regions() == other.regions()
-            && self.input_count() == other.input_count()
-            && (0..self.input_count()).all(|index| self.input(index) == other.input(index))
-            && self.mesh() == other.mesh()
-            && Arc::ptr_eq(self.compilation_options(), other.compilation_options())
+        if self.regions() != other.regions()
+            || self.input_count() != other.input_count()
+            || self.mesh() != other.mesh()
+            || !Arc::ptr_eq(self.compilation_options(), other.compilation_options())
+        {
+            return false;
+        }
+        match (self.grouped_input_layout(), other.grouped_input_layout()) {
+            (Some(left), Some(right)) => {
+                if canonical_grouped_input_signature(&left) != canonical_grouped_input_signature(&right) {
+                    return false;
+                }
+                // Rebind the other operation's input-owned indexed names into this invocation's scope. Attribute
+                // differences remain significant; output-local identities remain local to their payloads.
+                let Ok(renaming) = right.result_identity_renaming(&right, left.logical_types()) else { return false };
+                let Ok(operation) = other.operation().rename_type_identities(&renaming) else { return false };
+                self.operation() == &operation
+            }
+            (None, None) => {
+                self.operation() == other.operation()
+                    && (0..self.input_count()).all(|index| self.input(index) == other.input(index))
+            }
+            _ => false,
+        }
     }
 }
 
@@ -2100,10 +2204,17 @@ impl Eq for dyn XlaEagerDispatchKeyView + '_ {}
 
 impl Hash for dyn XlaEagerDispatchKeyView + '_ {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.operation().hash(state);
+        if let Some(layout) = self.grouped_input_layout() {
+            // Payload hashes contain nominal IDs. Hash the operation's kind and exact canonical signature here;
+            // equality above compares every renamed attribute, so distinct payloads can only collide, never alias.
+            self.operation().name().hash(state);
+            canonical_grouped_input_signature(&layout).hash(state);
+        } else {
+            self.operation().hash(state);
+            (0..self.input_count()).for_each(|index| self.input(index).hash(state));
+        }
         self.regions().hash(state);
         self.input_count().hash(state);
-        (0..self.input_count()).for_each(|index| self.input(index).hash(state));
         self.mesh().hash(state);
         Arc::as_ptr(self.compilation_options()).hash(state);
     }
@@ -2165,6 +2276,7 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchQuery<'_, '_> {
         match &self.inputs[index] {
             XlaValue::Array(array) => XlaEagerDispatchInputRef::Array(array.r#type()),
             XlaValue::Dimension(dimension) => XlaEagerDispatchInputRef::Dimension(dimension.value()),
+            XlaValue::Ragged(value) => XlaEagerDispatchInputRef::Ragged(value.r#type()),
             XlaValue::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
         }
     }
@@ -2385,6 +2497,84 @@ impl std::hash::Hash for XlaOptions {
     }
 }
 
+/// Logical aggregate boundary retained around the existing dense-array executable metadata. Leaf counts below this
+/// boundary include extent payloads; logical counts above it continue to count each ragged value once.
+#[derive(Clone, Debug)]
+struct XlaLogicalBoundary {
+    /// Complete input grouping, with captures preceding public inputs.
+    inputs: XlaValueLayout,
+
+    /// Complete output grouping, including any hidden reference-state suffix.
+    outputs: XlaValueLayout,
+
+    /// Number of logical captures before expanding them into dense leaves.
+    capture_count: usize,
+
+    /// Number of public logical outputs before a hidden reference-state suffix.
+    output_count: usize,
+}
+
+impl XlaLogicalBoundary {
+    /// Encodes logical kind, bounds, identity sharing, and occurrence coordinates independently of variable names.
+    /// Dense physical metadata is encoded by the existing canonical array signature; these bytes retain the logical
+    /// distinctions that equal physical leaf lists cannot express.
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut identities = Vec::<DimensionVariable>::new();
+        let mut identity_index = |identity: &DimensionVariable| {
+            if let Some(index) = identities.iter().position(|existing| existing == identity) {
+                index
+            } else {
+                identities.push(identity.clone());
+                identities.len() - 1
+            }
+        };
+        let mut encode = |r#type: &ArrayIrType| match r#type {
+            ArrayIrType::Array(_) => serde_json::json!({ "kind": "array" }),
+            ArrayIrType::Ragged(r#type) => {
+                let dimensions = r#type
+                    .ragged_dimensions()
+                    .iter()
+                    .map(|descriptor| {
+                        serde_json::json!({
+                            "axis": descriptor.axis(),
+                            "identity": identity_index(descriptor.dimension()),
+                            "extent_axes": descriptor.extent_axes(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let value_kind = match r#type.value_kind() {
+                    RaggedValueKind::Array => serde_json::json!({ "kind": "array" }),
+                    RaggedValueKind::Dimension(r#type) => match r#type.dimension() {
+                        Dimension::Static(extent) => serde_json::json!({ "kind": "static", "extent": extent }),
+                        Dimension::Dynamic(identity) => {
+                            serde_json::json!({ "kind": "dynamic", "identity": identity_index(identity) })
+                        }
+                    },
+                };
+                serde_json::json!({ "kind": "ragged", "value_kind": value_kind, "dimensions": dimensions })
+            }
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
+                unreachable!("grouped executable boundaries contain only arrays and ragged values")
+            }
+        };
+        let inputs = self.inputs.logical_types().iter().map(&mut encode).collect::<Vec<_>>();
+        let outputs = self.outputs.logical_types().iter().map(&mut encode).collect::<Vec<_>>();
+        let bounds = identities
+            .iter()
+            .map(|identity| (identity.bounds().lower(), identity.bounds().upper()))
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "inputs": inputs,
+            "outputs": outputs,
+            "bounds": bounds,
+            "capture_count": self.capture_count,
+            "output_count": self.output_count,
+        }))
+        .unwrap()
+    }
+}
+
 /// StableHLO lowering and call-boundary metadata produced before PJRT compilation.
 #[derive(Clone, Debug)]
 pub struct XlaLoweredProgram {
@@ -2410,6 +2600,9 @@ pub struct XlaLoweredProgram {
 
     /// Logical-to-physical StableHLO/PJRT boundary mapping.
     signature: XlaExecutableSignature,
+
+    /// Aggregate grouping before the independent dense executable ABI, absent for the unchanged dense path.
+    logical_boundary: Option<Arc<XlaLogicalBoundary>>,
 
     /// Whether execution requires Ryft's host runtime assertion handler.
     requires_assertion_handler: bool,
@@ -2452,11 +2645,23 @@ impl XlaLoweredProgram {
         &self.stable_hlo
     }
 
-    /// Returns the effective public logical flat output types, including zero-space leaves erased from the
-    /// executable ABI but excluding the hidden final-state output suffix appended by reference discharge.
+    /// Returns the public dense-leaf output signature, including erased zero-space leaves and excluding hidden
+    /// reference states. A ragged result contributes its storage followed by every extent payload; use
+    /// [`Self::logical_output_types`] to retain the logical result grouping.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types[..self.output_count]
+    }
+
+    /// Returns the logical public output types, retaining ragged grouping before dense leaves are projected onto the
+    /// executable ABI.
+    /// Indexed identities are scoped declarations: runtime results instantiate output-local families freshly for
+    /// each execution while preserving the names of families forwarded from actual inputs.
+    pub fn logical_output_types(&self) -> Vec<ArrayIrType> {
+        match &self.logical_boundary {
+            Some(boundary) => boundary.outputs.logical_types()[..boundary.output_count].to_vec(),
+            None => self.output_types().iter().cloned().map(ArrayIrType::Array).collect(),
+        }
     }
 
     /// Returns the device mesh this lowering targets.
@@ -2593,6 +2798,10 @@ struct XlaPersistentKeyV8<'a> {
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
     signature: PersistentCanonicalArraySignatureV3,
+
+    /// Logical aggregate structure omitted from legacy dense keys, whose bytes remain unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_boundary: Option<Vec<u8>>,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
     input_dimensions: Vec<PersistentBoundaryDimensionV5>,
@@ -3290,6 +3499,9 @@ fn decode_data_type(value: u8) -> Result<DataType, XlaDomainError> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct XlaCompilationKey {
     canonical_bytes: Arc<[u8]>,
+
+    /// Grouped logical metadata is included in memory identity but is not yet serialized with executable metadata.
+    persistent: bool,
 }
 
 /// Loaded PJRT executable plus the metadata required to invoke it safely.
@@ -3301,6 +3513,7 @@ pub struct XlaCompiledProgram<'c> {
     output_count: usize,
     reference_states: Arc<[ExternalReferenceBinding]>,
     signature: XlaExecutableSignature,
+    logical_boundary: Option<Arc<XlaLogicalBoundary>>,
     requires_assertion_handler: bool,
     donation_flags: Arc<[bool]>,
     capture_count: usize,
@@ -3475,6 +3688,7 @@ struct XlaInvocationMetadata<'a> {
     output_count: usize,
     reference_states: &'a [ExternalReferenceBinding],
     signature: &'a XlaExecutableSignature,
+    logical_boundary: Option<&'a XlaLogicalBoundary>,
     donation_flags: &'a [bool],
     capture_count: usize,
     expected_argument_shardings: &'a [Sharding],
@@ -3491,6 +3705,7 @@ impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
             output_count: program.output_count,
             reference_states: &program.reference_states,
             signature: &program.signature,
+            logical_boundary: program.logical_boundary.as_deref(),
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
@@ -3509,6 +3724,7 @@ impl<'a> From<&'a XlaLoweredProgram> for XlaInvocationMetadata<'a> {
             output_count: program.output_count,
             reference_states: &program.reference_states,
             signature: &program.signature,
+            logical_boundary: program.logical_boundary.as_deref(),
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
@@ -3529,6 +3745,17 @@ fn canonical_boundary_types(input_types: &[ArrayType], output_types: &[ArrayType
     serde_json::to_vec(&PersistentArraySignatureV3::encode(input_types, output_types).into_canonical()).unwrap()
 }
 
+/// Encodes exact physical input types and logical equality classes without incidental indexed names.
+fn canonical_grouped_input_signature(layout: &XlaValueLayout) -> (Vec<u8>, Vec<u8>) {
+    let logical = XlaLogicalBoundary {
+        inputs: layout.clone(),
+        outputs: XlaValueLayout::new(&[]).unwrap(),
+        capture_count: 0,
+        output_count: 0,
+    };
+    (canonical_boundary_types(layout.leaf_types(), &[]), logical.canonical_bytes())
+}
+
 /// Returns the first invocation-metadata field on which the two programs disagree, if any.
 fn incompatible_xla_invocation_field(
     current: XlaInvocationMetadata<'_>,
@@ -3538,6 +3765,10 @@ fn incompatible_xla_invocation_field(
         != canonical_boundary_types(other.input_types, other.output_types)
     {
         Some("boundary types")
+    } else if current.logical_boundary.map(XlaLogicalBoundary::canonical_bytes)
+        != other.logical_boundary.map(XlaLogicalBoundary::canonical_bytes)
+    {
+        Some("logical aggregate boundary")
     } else if current.output_count != other.output_count {
         Some("output count")
     } else if current.reference_states != other.reference_states {
@@ -3587,11 +3818,53 @@ impl<'c> XlaCompiledProgram<'c> {
         &self.input_types
     }
 
-    /// Returns the public logical flat output types in user-visible order, including reconstructed zero-space
-    /// leaves but excluding the hidden final-state output suffix appended by reference discharge.
+    /// Returns the public dense-leaf output signature, including reconstructed zero-space leaves and excluding
+    /// hidden reference states. A ragged result contributes storage followed by its extent payloads; use
+    /// [`Self::logical_output_types`] for the grouped result signature.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types[..self.output_count]
+    }
+
+    /// Returns the public output signature before aggregate values are expanded into dense array leaves.
+    /// Output-local indexed identities describe the executable's result scope. Each execution gives those families
+    /// fresh runtime identities; forwarded families retain their actual input identities across all output aliases.
+    pub fn logical_output_types(&self) -> Vec<ArrayIrType> {
+        match &self.logical_boundary {
+            Some(boundary) => boundary.outputs.logical_types()[..boundary.output_count].to_vec(),
+            None => self.output_types().iter().cloned().map(ArrayIrType::Array).collect(),
+        }
+    }
+
+    /// Shares a cached executable while restoring this request's nominal aggregate signature. Alpha-equivalent
+    /// compilations share machine code, but their live indexed quantities remain distinct in returned values.
+    fn with_requested_logical_boundary(
+        self: Arc<Self>,
+        expected: &XlaLoweredProgram,
+    ) -> Result<Arc<Self>, XlaDomainError> {
+        validate_xla_replacement_metadata(expected.into(), self.as_ref().into())?;
+        if expected.logical_boundary.is_none() {
+            return Ok(self);
+        }
+        let mut rebound = self.as_ref().clone();
+        rebound.logical_boundary = expected.logical_boundary.clone();
+        Ok(Arc::new(rebound))
+    }
+
+    /// Reconstructs public aggregate values from already reconstructed dense leaves, preserving each leaf's session.
+    fn regroup_outputs(
+        &self,
+        outputs: Vec<XlaArray<'c>>,
+        domain: &XlaDomain<'c>,
+        input_types: &[ArrayIrType],
+    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
+        match &self.logical_boundary {
+            Some(boundary) => {
+                let renaming = boundary.outputs.result_identity_renaming(&boundary.inputs, input_types)?;
+                boundary.outputs.regroup(outputs, domain, &renaming)
+            }
+            None => Ok(outputs.into_iter().map(XlaValue::Array).collect()),
+        }
     }
 
     /// Returns whether this executable requires a stateful reference invocation boundary.
@@ -3915,7 +4188,14 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
         let Some(bucketing) = options.input_bound_bucketing else {
             let input_types: Arc<[ArrayIrType]> = input_types.into();
-            return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
+            let key = if input_types.iter().any(|r#type| matches!(r#type, ArrayIrType::Ragged(_))) {
+                let layout = XlaValueLayout::new(&input_types)?;
+                let (physical, logical) = canonical_grouped_input_signature(&layout);
+                XlaDispatchKeyKind::Grouped { physical, logical }
+            } else {
+                XlaDispatchKeyKind::Exact(input_types.clone())
+            };
+            return Ok((XlaDispatchKey(key), input_types));
         };
         if options.mesh.devices().len() > 1 {
             return Err(XlaDomainError::InvalidCompilationOptions {
@@ -4056,9 +4336,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             staged.staged().source_program().captures().len(),
             staged.staged().options(),
         )?;
-        let output_types = program.output_types().to_vec();
+        let output_types = program.logical_output_types();
         validate_output_types(staged.staged().output_types(), &output_types)?;
-        Ok(staged.into_lowered(program, output_types.into_iter().map(Into::into).collect()))
+        Ok(staged.into_lowered(program, output_types))
     }
 
     fn compile<Request>(
@@ -4071,12 +4351,25 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         // Cheap clone: the lowered program is a bundle of `Arc` handles. The snapshot outlives `compile_request`,
         // which consumes the request, so the resolved program can be cross-checked below even on cache hits.
         let expected = lowered.lowered().lowered_program().clone();
-        let compiled = self.compilation_context().compile_request(
-            self,
-            lowered,
-            |program| self.compile_xla_program(program),
-            |program| program.output_types().iter().cloned().map(Into::into).collect(),
-        )?;
+        let compiled = if expected.logical_boundary.is_some() {
+            // The executable cache is alpha-normalized, whereas a ragged result retains its nominal identities at
+            // runtime. Rebind only the logical wrapper to this request before the generic output-refinement check.
+            let key = self.compilation_key(&expected)?;
+            let program = self
+                .compilation_context()
+                .get_or_compile(self, key, || self.compile_xla_program(&expected))?
+                .with_requested_logical_boundary(&expected)?;
+            let output_types = program.logical_output_types();
+            validate_output_types(lowered.lowered().output_types(), &output_types)?;
+            lowered.into_compiled(program, output_types)
+        } else {
+            self.compilation_context().compile_request(
+                self,
+                lowered,
+                |program| self.compile_xla_program(program),
+                XlaCompiledProgram::logical_output_types,
+            )?
+        };
         // Fresh compilations copy this metadata verbatim, so this rejects only programs resolved from the in-memory,
         // persistent, or distributed cache tiers whose invocation contract does not match the requesting lowering
         // (e.g., a corrupted or colliding persistent entry). The stateful transaction trusts this metadata, so a
@@ -4126,29 +4419,49 @@ impl<'c> XlaDomain<'c> {
             .into());
         }
         for (declared, input) in executable.input_types().iter().zip(request.inputs()) {
-            let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
-            // Array inputs borrow their types, while the composite type of other inputs is built only to report them.
-            match input {
-                XlaValue::Array(array) => validate_xla_input_type(declared, &array.r#type())?,
-                input => validate_xla_input_type(
-                    declared,
-                    <&ArrayType>::try_from(input.r#type().as_ref()).map_err(ProgramError::from)?,
-                )?,
+            if let (ArrayIrType::Array(declared), XlaValue::Array(array)) = (declared, input) {
+                validate_xla_input_type(declared, &array.r#type())?;
+            } else if matches!((declared, input), (ArrayIrType::Ragged(_), XlaValue::Ragged(_)))
+                && executable.compiled_program().logical_boundary.is_some()
+            {
+                // The complete grouped signature is validated below while preserving actual leaf placement for
+                // the existing runtime resharding path, just as dense input admission does above.
+            } else if !declared.is_refined_by(input.r#type().as_ref()) {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "runtime input type `{}` does not refine declared type `{declared}`",
+                        input.r#type()
+                    ),
+                }
+                .into());
             }
         }
-        let arguments = request
-            .into_arguments()
-            .into_iter()
-            .map(ValueProjection::<ArrayType>::into_projected)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?;
+        let arguments = request.into_arguments();
+        let logical_input_types = executable
+            .compiled_program()
+            .logical_boundary
+            .as_ref()
+            .map(|_| arguments.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>());
+        let arguments = match &executable.compiled_program().logical_boundary {
+            Some(boundary) => boundary.inputs.flatten(&arguments)?,
+            None => arguments
+                .into_iter()
+                .map(ValueProjection::<ArrayType>::into_projected)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)?,
+        };
         let execution = self.execute_compiled_async(executable.compiled_program(), arguments)?;
         if execution.output().is_empty() && !executable.compiled_program().signature.has_effects() {
             execution.fence().block_until_ready()?;
         }
         let (outputs, fence) = execution.into_parts();
         validate_runtime_outputs(executable.compiled_program().output_types(), &outputs)?;
-        let output = Request::reconstruct(&executable, outputs.into_iter().map(XlaValue::Array).collect())?;
+        let outputs = executable.compiled_program().regroup_outputs(
+            outputs,
+            self,
+            logical_input_types.as_deref().unwrap_or_default(),
+        )?;
+        let output = Request::reconstruct(&executable, outputs)?;
         Ok((output, fence))
     }
 
@@ -4637,6 +4950,67 @@ impl<'c> XlaDomain<'c> {
         reference_states: &[ExternalReferenceBinding],
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
+        // Group logical aggregates once, before the existing dense lowering projects zero-space leaves, hidden
+        // dynamic sizes, and effect tokens. Dense programs take the borrowed path without replay or changed MLIR.
+        if let Some(grouped) = legalize_ragged_program(program, capture_count)? {
+            if !reference_states.is_empty()
+                && (grouped.input_layout.logical_types().iter().any(|r#type| matches!(r#type, ArrayIrType::Ragged(_)))
+                    || grouped.output_layout.logical_types()[..output_count]
+                        .iter()
+                        .any(|r#type| matches!(r#type, ArrayIrType::Ragged(_))))
+            {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: "external reference state cannot yet share a public or captured ragged value boundary"
+                        .to_string(),
+                });
+            }
+            let mut grouped_options = options.clone();
+            if let Some(flags) = &options.donation_flags {
+                let public_count = grouped.input_layout.logical_count() - capture_count;
+                if flags.len() != public_count {
+                    return Err(XlaDomainError::InvalidCompilationOptions {
+                        reason: format!(
+                            "donation_flags has {} entries but the program has {} flat public input(s)",
+                            flags.len(),
+                            public_count,
+                        ),
+                    });
+                }
+                let logical_flags =
+                    std::iter::repeat_n(false, capture_count).chain(flags.iter().copied()).collect::<Vec<_>>();
+                grouped_options.donation_flags =
+                    Some(grouped.input_layout.donation_flags(&logical_flags)?[grouped.capture_count..].to_vec());
+            }
+            let mut logical_outputs = grouped.output_layout.logical_types().to_vec();
+            let public_outputs = apply_signature_shardings(
+                logical_outputs[..output_count].to_vec(),
+                options.out_shardings.as_deref(),
+                "out",
+            )?;
+            logical_outputs[..output_count].clone_from_slice(&public_outputs);
+            let output_layout = XlaValueLayout::new(&logical_outputs)?;
+            let leaf_output_count = output_layout.prefix_leaf_count(output_count);
+            grouped_options.out_shardings = options.out_shardings.as_ref().map(|_| {
+                output_layout.leaf_types()[..leaf_output_count]
+                    .iter()
+                    .map(|r#type| r#type.sharding().cloned().unwrap())
+                    .collect()
+            });
+            let mut lowered = self.lower_verified_reference_free_xla_program(
+                &grouped.program,
+                grouped.capture_count,
+                leaf_output_count,
+                reference_states,
+                &grouped_options,
+            )?;
+            lowered.logical_boundary = Some(Arc::new(XlaLogicalBoundary {
+                inputs: grouped.input_layout,
+                outputs: output_layout,
+                capture_count,
+                output_count,
+            }));
+            return Ok(lowered);
+        }
         if contains_unresolved_state(program) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "discharged program still contains ordered state, which XLA lowering cannot represent"
@@ -4886,6 +5260,7 @@ impl<'c> XlaDomain<'c> {
             output_count,
             reference_states: reference_states.into(),
             signature,
+            logical_boundary: None,
             requires_assertion_handler,
             donation_flags: donation_flags.into(),
             capture_count,
@@ -4920,6 +5295,7 @@ impl<'c> XlaDomain<'c> {
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
             signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types).into_canonical(),
+            logical_boundary: program.logical_boundary.as_deref().map(XlaLogicalBoundary::canonical_bytes),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             input_dimensions: persistent_input_dimensions(&program.signature),
@@ -4950,7 +5326,10 @@ impl<'c> XlaDomain<'c> {
         };
         let canonical_bytes = serde_json::to_vec(&key)
             .map_err(|error| persistent_error(format!("failed to encode persistent key: {error}")))?;
-        Ok(XlaCompilationKey { canonical_bytes: canonical_bytes.into() })
+        Ok(XlaCompilationKey {
+            canonical_bytes: canonical_bytes.into(),
+            persistent: program.logical_boundary.is_none(),
+        })
     }
 
     pub(crate) fn compile_xla_program(
@@ -4978,6 +5357,7 @@ impl<'c> XlaDomain<'c> {
             output_count: program.output_count,
             reference_states: Arc::clone(&program.reference_states),
             signature: program.signature.clone(),
+            logical_boundary: program.logical_boundary.clone(),
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: Arc::clone(&program.donation_flags),
             capture_count: program.capture_count,
@@ -5026,10 +5406,15 @@ impl<'c> XlaDomain<'c> {
     /// executable sources and must not be writable by untrusted users.
     #[inline]
     fn xla_persistent_cache_key(&self, key: &XlaCompilationKey) -> Option<Vec<u8>> {
-        Some(key.canonical_bytes.to_vec())
+        key.persistent.then(|| key.canonical_bytes.to_vec())
     }
 
     fn serialize_xla_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
+        // Logical aggregate metadata is deliberately not part of the V8 executable envelope. In-memory execution is
+        // supported; declining persistence prevents loading a leaf-compatible executable with an incompatible schema.
+        if program.logical_boundary.is_some() {
+            return Ok(None);
+        }
         let executable = match program.executable.executable() {
             Ok(executable) => executable,
             Err(ryft_pjrt::Error::Unimplemented { .. }) => return Ok(None),
@@ -5338,6 +5723,7 @@ impl<'c> XlaDomain<'c> {
             output_count,
             reference_states: reference_states.into(),
             signature,
+            logical_boundary: None,
             requires_assertion_handler: metadata.requires_assertion_handler,
             donation_flags: donation_flags.into(),
             capture_count,
@@ -5426,12 +5812,11 @@ pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) 
     }
 }
 
-fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), XlaDomainError> {
+fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayIrType]) -> Result<(), XlaDomainError> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
     }
     for (declared, actual) in declared.iter().zip(actual) {
-        let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
         if !declared.is_refined_by(actual) {
             return Err(ProgramError::InvalidArgument {
                 message: format!("backend output type {actual} does not refine declared type {declared}"),
@@ -5562,12 +5947,33 @@ fn apply_signature_shardings(
         });
     }
     for (r#type, sharding) in types.iter_mut().zip(shardings) {
-        let array_type = <&ArrayType>::try_from(&*r#type).map_err(ProgramError::from)?;
-        *r#type = ArrayType::new(array_type.data_type(), array_type.shape().clone())
-            .with_layout(array_type.layout().cloned())
-            .with_sharding(sharding.clone())
-            .map_err(|error| XlaDomainError::Array(error.into()))?
-            .into();
+        *r#type = match r#type {
+            ArrayIrType::Array(array_type) => array_type
+                .clone()
+                .with_sharding(sharding.clone())
+                .map_err(|error| XlaDomainError::Array(error.into()))?
+                .into(),
+            ArrayIrType::Ragged(ragged_type) => {
+                let storage_type = ragged_type
+                    .storage_type()
+                    .clone()
+                    .with_sharding(sharding.clone())
+                    .map_err(|error| XlaDomainError::Array(error.into()))?;
+                ryft_core::RaggedType::new(
+                    storage_type,
+                    ragged_type.value_kind().clone(),
+                    ragged_type.ragged_dimensions().to_vec(),
+                )
+                .map_err(ProgramError::from)?
+                .into()
+            }
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
+                return Err(ProgramError::from(TypeError::invalid(format!(
+                    "cannot apply an array sharding to type `{type}`",
+                )))
+                .into());
+            }
+        };
     }
     Ok(types)
 }
@@ -5817,7 +6223,11 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
 
     match operation {
         XlaOperation::Array(operation) => array_data_dependent_padding_discipline(operation),
-        XlaOperation::RaggedNew(_) | XlaOperation::RaggedStorage(_) | XlaOperation::RaggedExtents(_) => {
+        XlaOperation::RaggedNew(_)
+        | XlaOperation::RaggedStorage(_)
+        | XlaOperation::RaggedExtents(_)
+        | XlaOperation::RaggedAdd(_)
+        | XlaOperation::RaggedZero(_) => {
             Unsupported { reason: "first-class ragged operations require grouped XLA lowering" }
         }
         XlaOperation::RngBitGenerator(_) => Unsupported {
@@ -8117,6 +8527,7 @@ mod tests {
             output_count: 0,
             reference_states: &[],
             signature: &signature,
+            logical_boundary: None,
             donation_flags: &[false],
             capture_count: 0,
             expected_argument_shardings: &[],
@@ -12271,6 +12682,7 @@ mod tests {
                     XlaValue::Array(array) => array,
                     XlaValue::Dimension(_) => panic!("padding fixture returned a first-class dimension"),
                     XlaValue::Reference(_) => panic!("padding fixture returned a reference"),
+                    XlaValue::Ragged(_) => panic!("padding fixture returned a ragged value"),
                 })
                 .collect::<Vec<_>>();
             let compiled = domain.execute_xla_program(&compiled, vec![input]).unwrap();
@@ -12403,6 +12815,7 @@ mod tests {
                     XlaValue::Array(array) => array,
                     XlaValue::Dimension(_) => panic!("attention fixture returned a first-class dimension"),
                     XlaValue::Reference(_) => panic!("attention fixture returned a reference"),
+                    XlaValue::Ragged(_) => panic!("attention fixture returned a ragged value"),
                 })
                 .collect::<Vec<_>>();
             let compiled = domain.execute_xla_program(&compiled, vec![input]).unwrap();
@@ -13024,7 +13437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_data_dependent_compilation_rejects_ragged_atoms() {
+    fn test_validate_data_dependent_compilation_rejects_unlegalized_ragged_atoms() {
         use ryft_core::{RaggedType, RaggedValueKind};
 
         let r#type = RaggedType::new(
@@ -13055,8 +13468,8 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_domain_rejects_ragged_construction_before_execution() {
-        use ryft_core::{RaggedNewOperation, RaggedType, RaggedValueKind};
+    fn test_xla_domain_executes_ragged_construction() {
+        use ryft_core::{RaggedNewOperation, RaggedStorageOperation, RaggedType, RaggedValueKind};
 
         let r#type = RaggedType::new(
             ArrayType::new_static(DataType::I64, [2]),
@@ -13079,25 +13492,240 @@ mod tests {
                     [output_type=ragged<i64[2]; item=dimension<3>>] %0
                 in (%1)"},
         );
-        assert!(matches!(
-            validate_data_dependent_compilation(&program),
-            Err(XlaDomainError::Lowering(TraceError::Lowering(LoweringError::UnsupportedRaggedType {
-                r#type: actual,
-            }))) if actual == r#type,
-        ));
-
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let storage =
             XlaArray::from_host_buffer(&domain, r#type.storage_type().clone(), mesh, values_to_bytes(&[3_i64, 3]))
                 .unwrap();
-        assert!(matches!(
-            domain.bind(operation, Vec::new(), &[XlaValue::Array(storage)]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "`ragged_new` requires grouped ragged XLA execution, which is not yet supported",
-        ));
-        assert_eq!(domain.cache_size(), 0);
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(storage.mesh().clone())).unwrap();
+        assert_eq!(lowered.logical_output_types(), vec![ArrayIrType::Ragged(r#type)]);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![storage.clone()]).unwrap();
+        let outputs = compiled.regroup_outputs(outputs, &domain, &[storage.r#type().into_owned().into()]).unwrap();
+        let XlaValue::Ragged(output) = &outputs[0] else { panic!("expected a ragged output") };
+        assert_eq!(read_i64s(&client, output.storage()), vec![3, 3]);
+
+        let eager = domain.bind(operation, Vec::new(), &[XlaValue::Array(storage)]).unwrap();
+        let XlaValue::Ragged(output) = &eager[0] else { panic!("expected a ragged output") };
+        assert_eq!(read_i64s(&client, output.storage()), vec![3, 3]);
+        assert!(Arc::ptr_eq(output.storage().xla_domain().session(), domain.session()));
+        assert!(output.storage().execution_fence().is_some());
+        let statistics = domain.eager_dispatch_statistics();
+        let projected = domain.bind(RaggedStorageOperation, Vec::new(), &eager).unwrap().remove(0);
+        let XlaValue::Array(projected) = projected else { panic!("expected checked producer storage") };
+        assert_eq!(&projected, output.storage());
+        assert!(projected.execution_fence().is_some());
+        assert_eq!(domain.eager_dispatch_statistics(), statistics);
+    }
+
+    #[test]
+    fn test_eager_ragged_projections_reuse_buffers_and_session_without_dispatch() {
+        use ryft_core::{
+            RaggedDimension, RaggedExtentsOperation, RaggedStorageOperation, RaggedType, RaggedValue, RaggedValueKind,
+        };
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let owner = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let caller = XlaSession::new(&client).domain();
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let storage = XlaArray::from_host_buffer(
+            &owner,
+            r#type.storage_type().clone(),
+            mesh.clone(),
+            values_to_bytes(&[1f32; 6]),
+        )
+        .unwrap();
+        let extents =
+            XlaArray::from_host_buffer(&owner, r#type.extent_types()[0].clone(), mesh, values_to_bytes(&[1i64, 3]))
+                .unwrap();
+        let r#type = RaggedType::new(
+            storage.r#type().into_owned(),
+            r#type.value_kind().clone(),
+            r#type.ragged_dimensions().to_vec(),
+        )
+        .unwrap();
+        let input = XlaValue::Ragged(RaggedValue::new(r#type, storage.clone(), vec![extents.clone()]).unwrap());
+        let before = caller.eager_dispatch_statistics();
+        for (operation, expected) in [
+            (XlaOperation::RaggedStorage(RaggedStorageOperation), &storage),
+            (XlaOperation::RaggedExtents(RaggedExtentsOperation::new(-1)), &extents),
+        ] {
+            let output = caller.bind(operation, Vec::new(), &[input.clone()]).unwrap().remove(0);
+            let XlaValue::Array(output) = output else { panic!("expected an existing array field") };
+            assert_eq!(&output, expected);
+            assert!(Arc::ptr_eq(output.xla_domain().session(), owner.session()));
+        }
+        assert_eq!(caller.eager_dispatch_statistics(), before);
+        assert_eq!(caller.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_compiled_ragged_boundary_preserves_zero_storage_and_dynamic_extents() {
+        use ryft_core::{RaggedDimension, RaggedType, RaggedValue, RaggedValueKind};
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(4)).unwrap());
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let storage_type = ArrayType::new(DataType::Zero, Shape::new(vec![batch.into(), 3.into()]));
+        let declared =
+            RaggedType::new(storage_type, RaggedValueKind::Array, vec![RaggedDimension::new(1, rows.clone(), vec![0])])
+                .unwrap();
+        let staged = ryft_core::stage_function::<_, _, ArrayIrType, Vec<ArrayIrType>>(
+            &domain,
+            |input| vec![input.clone(), input],
+            declared.clone().into(),
+            XlaOptions { donation_flags: Some(vec![true]), ..XlaOptions::new(mesh.clone()) },
+        )
+        .unwrap();
+        let lowered = domain.lower(staged).unwrap();
+        assert_eq!(lowered.lowered_program().logical_output_types(), vec![declared.into(); 2]);
+        assert_eq!(lowered.lowered_program().donation_flags.as_ref(), &[true, false]);
+        // Dynamic zero storage retains its shape-only carrier, independently of the live i64 extent leaf. Both
+        // dynamic dense axes use the existing hidden-size protocol before two logical results are reconstructed.
+        assert_eq!(lowered.lowered_program().signature.input_mapping(), &[Some(0), Some(1)]);
+        assert_eq!(lowered.lowered_program().signature.input_dimensions().len(), 2);
+        let key = domain.compilation_key(lowered.lowered_program()).unwrap();
+        assert_eq!(domain.persistent_cache_key(&key), None);
+        let compiled = domain.compile(lowered).unwrap();
+        assert_eq!(domain.serialize_xla_program(compiled.compiled_program()).unwrap(), None);
+
+        let actual = RaggedType::new(
+            ArrayType::new_static(DataType::Zero, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let storage = XlaArray::from_host_buffer(&domain, actual.storage_type().clone(), mesh.clone(), []).unwrap();
+        let extents =
+            XlaArray::from_host_buffer(&domain, actual.extent_types()[0].clone(), mesh, values_to_bytes(&[1i64, 3]))
+                .unwrap();
+        let actual = RaggedType::new(
+            storage.r#type().into_owned(),
+            actual.value_kind().clone(),
+            actual.ragged_dimensions().to_vec(),
+        )
+        .unwrap();
+        let input = XlaValue::Ragged(RaggedValue::new(actual, storage, vec![extents]).unwrap());
+        let outputs = ryft_core::compilation::call_function(&domain, compiled.executable_function(), input).unwrap();
+        assert_eq!(outputs.len(), 2);
+        for output in outputs {
+            let XlaValue::Ragged(output) = output else { panic!("expected a grouped ragged result") };
+            assert_eq!(output.storage().data_type(), DataType::Zero);
+            assert_eq!(output.storage().shape().as_slice(), &[2, 3]);
+            assert_eq!(read_i64s(&client, &output.extents()[0]), vec![1, 3]);
+            assert!(Arc::ptr_eq(output.storage().xla_domain().session(), domain.session()));
+            assert!(Arc::ptr_eq(output.extents()[0].xla_domain().session(), domain.session()));
+        }
+    }
+
+    #[test]
+    fn test_ragged_cache_reuses_code_without_reusing_nominal_result_identities() {
+        use ryft_core::{RaggedDimension, RaggedNewOperation, RaggedType, RaggedValue, RaggedValueKind};
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let storage_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let storage =
+            XlaArray::from_host_buffer(&domain, storage_type.clone(), mesh.clone(), values_to_bytes(&[1f32; 6]))
+                .unwrap();
+        let mut previous = None;
+        let mut cache_size = None;
+        for lengths in [[1i64, 2], [2, 3]] {
+            let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+            let r#type = RaggedType::new(
+                storage_type.clone(),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+            )
+            .unwrap();
+            let extents = XlaArray::from_host_buffer(
+                &domain,
+                r#type.extent_types()[0].clone(),
+                mesh.clone(),
+                values_to_bytes(&lengths),
+            )
+            .unwrap();
+            let output = domain
+                .bind(
+                    RaggedNewOperation::new(r#type.clone()),
+                    Vec::new(),
+                    &[XlaValue::Array(storage.clone()), XlaValue::Array(extents.clone())],
+                )
+                .unwrap()
+                .remove(0);
+            let XlaValue::Ragged(output) = output else { panic!("expected checked ragged output") };
+            assert_ne!(output.r#type().ragged_dimensions()[0].dimension(), &rows);
+            assert_eq!(read_i64s(&client, &output.extents()[0]), lengths.to_vec());
+            let result_identity = output.r#type().ragged_dimensions()[0].dimension().clone();
+            if let Some(previous) = previous.replace(result_identity.clone()) {
+                assert_ne!(previous, result_identity);
+            }
+            if let Some(cache_size) = cache_size.replace(domain.cache_size()) {
+                assert_eq!(domain.cache_size(), cache_size);
+            }
+
+            let staged = ryft_core::stage_function::<_, _, ArrayIrType, ArrayIrType>(
+                &domain,
+                |input| input,
+                r#type.clone().into(),
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap();
+            let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+            let r#type = RaggedType::new(
+                storage.r#type().into_owned(),
+                r#type.value_kind().clone(),
+                r#type.ragged_dimensions().to_vec(),
+            )
+            .unwrap();
+            let input = XlaValue::Ragged(RaggedValue::new(r#type, storage.clone(), vec![extents]).unwrap());
+            let output = ryft_core::compilation::call_function(&domain, compiled.executable_function(), input).unwrap();
+            let XlaValue::Ragged(output) = output else { panic!("expected compiled ragged output") };
+            assert_eq!(output.r#type().ragged_dimensions()[0].dimension(), &rows);
+            assert_eq!(read_i64s(&client, &output.extents()[0]), lengths.to_vec());
+            cache_size = Some(domain.cache_size());
+        }
+    }
+
+    #[test]
+    fn test_ragged_logical_boundary_encoding_preserves_kind_bounds_and_coordinates() {
+        use ryft_core::{RaggedDimension, RaggedType, RaggedValueKind};
+
+        let boundary = |lower, axes: Vec<usize>, kind| {
+            let rows = DimensionVariable::new("rows", DimensionBounds::new(lower, Some(4)).unwrap());
+            let r#type = RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2, 2, 3]),
+                kind,
+                vec![RaggedDimension::new(2, rows, axes)],
+            )
+            .unwrap();
+            let inputs = XlaValueLayout::new(&[r#type.clone().into()]).unwrap();
+            let outputs = XlaValueLayout::new(&[r#type.into()]).unwrap();
+            XlaLogicalBoundary { inputs, outputs, capture_count: 0, output_count: 1 }
+        };
+        let original = boundary(0, vec![0, 1], RaggedValueKind::Array);
+        let equivalent = boundary(0, vec![0, 1], RaggedValueKind::Array);
+        assert_eq!(original.canonical_bytes(), equivalent.canonical_bytes());
+        for different in [
+            boundary(1, vec![0, 1], RaggedValueKind::Array),
+            boundary(0, vec![1, 0], RaggedValueKind::Array),
+            boundary(0, vec![0, 1], RaggedValueKind::Dimension(Dimension::Static(1).into())),
+        ] {
+            assert_eq!(original.inputs.leaf_types(), different.inputs.leaf_types());
+            assert_ne!(original.canonical_bytes(), different.canonical_bytes());
+        }
+        assert_eq!(original.inputs.donation_flags(&[true]).unwrap(), vec![true, false]);
     }
 
     #[test]

@@ -2944,8 +2944,8 @@ mod custom_array_transforms {
     }
 
     impl From<AddOperation<ArrayIrType>> for CustomOperation {
-        fn from(operation: AddOperation<ArrayIrType>) -> Self {
-            Self::Core(operation.into())
+        fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+            Self::Core(ArrayOperation::Add(AddOperation::<ArrayType>::new()).into())
         }
     }
 

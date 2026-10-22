@@ -146,3 +146,21 @@ fn test_static_array_ir_identity_renaming_does_not_allocate() {
     );
     assert_eq!(statistics, AllocationStatistics::default());
 }
+
+#[test]
+fn test_static_array_ir_scope_identity_renaming_does_not_allocate() {
+    let statistics = measure_allocations(
+        || {
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3])),
+                ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3))),
+            ]
+        },
+        |types| {
+            let declared = black_box(&types).iter();
+            let actual = black_box(&types).iter();
+            ArrayIrType::derive_scope_identity_renaming(declared, actual).unwrap()
+        },
+    );
+    assert_eq!(statistics, AllocationStatistics::default());
+}

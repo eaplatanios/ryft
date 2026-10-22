@@ -5675,7 +5675,7 @@ mod tests {
         let carry = body.add_input(scalar_type.clone().into());
         body.add_input(slice_type.into());
         let doubled = body
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![carry, carry], None)
             .unwrap()[0];
         let body = Arc::new(
             body.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder; 3], vec![Placeholder])

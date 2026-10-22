@@ -1,7 +1,8 @@
 //! Session-carrying composite values of the [`XlaDomain`].
 //!
 //! [`XlaValue`] is the [`XlaDomain`] counterpart of [`ArrayIrValue`]: it holds an [`XlaArray`], a first-class runtime
-//! dimension ([`XlaDimension`]), or an array reference ([`XlaReference`]). Unlike [`ArrayIrValue`], whose dimension and
+//! dimension ([`XlaDimension`]), an array reference ([`XlaReference`]), or a [`RaggedValue`] of ordinary XLA arrays.
+//! Unlike [`ArrayIrValue`], whose dimension and
 //! reference members are session-free host values, every member of an [`XlaValue`] (and every projected representation
 //! of a member) owns the [`XlaDomain`] session that it belongs to. This has three consequences:
 //!
@@ -27,8 +28,8 @@ use std::fmt::{Debug, Display};
 use ryft_core::{
     Add, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, Compare, CompareOperation,
     ComparisonDirection, Concretizable, Context, DimensionType, DimensionValue, Div, Mul, Neg, Parameter, ProgramError,
-    ProjectedContext, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueDomainDispatch, ValueProjection, WhilePredicate,
+    ProjectedContext, RaggedType, RaggedValue, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming,
+    Typed, Value, ValueDomainDispatch, ValueProjection, WhilePredicate,
 };
 use ryft_macros::Parameter;
 
@@ -236,6 +237,9 @@ pub enum XlaValue<'c> {
 
     /// Array reference.
     Reference(XlaReference<'c>),
+
+    /// Padded storage and canonical extent arrays, each retaining its execution session.
+    Ragged(RaggedValue<XlaArray<'c>>),
 }
 
 impl<'c> XlaValue<'c> {
@@ -245,6 +249,7 @@ impl<'c> XlaValue<'c> {
             Self::Array(value) => value.xla_domain(),
             Self::Dimension(value) => value.xla_domain(),
             Self::Reference(value) => value.xla_domain(),
+            Self::Ragged(value) => value.storage().xla_domain(),
         }
     }
 
@@ -256,12 +261,12 @@ impl<'c> XlaValue<'c> {
             Self::Array(value) => ArrayIrValue::Array(value),
             Self::Dimension(value) => ArrayIrValue::Dimension(value.into_value()),
             Self::Reference(value) => ArrayIrValue::Reference(value.into_handle()),
+            Self::Ragged(value) => ArrayIrValue::Ragged(value),
         }
     }
 
     /// Converts a session-free [`ArrayIrValue`] over XLA arrays into an [`XlaValue`], binding dimension and reference
-    /// members to `domain`. Array members keep their own domain. Ragged values are rejected until XLA has a grouped
-    /// representation that preserves their storage and extents together.
+    /// members to `domain`. Array and ragged members keep the domains carried by their array handles.
     pub(crate) fn from_array_ir_value(
         value: ArrayIrValue<XlaArray<'c>>,
         domain: &XlaDomain<'c>,
@@ -270,7 +275,7 @@ impl<'c> XlaValue<'c> {
             ArrayIrValue::Array(value) => Ok(Self::Array(value)),
             ArrayIrValue::Dimension(value) => Ok(Self::Dimension(XlaDimension::new(value, domain.clone()))),
             ArrayIrValue::Reference(value) => Ok(Self::Reference(XlaReference::new(value, domain.clone()))),
-            ArrayIrValue::Ragged(_) => Err(TypeError::invalid("ragged values are not supported in the XLA domain")),
+            ArrayIrValue::Ragged(value) => Ok(Self::Ragged(value)),
         }
     }
 
@@ -280,6 +285,7 @@ impl<'c> XlaValue<'c> {
             Self::Array(_) => "array",
             Self::Dimension(_) => "dimension",
             Self::Reference(_) => "reference",
+            Self::Ragged(_) => "ragged",
         }
     }
 }
@@ -290,6 +296,7 @@ impl Display for XlaValue<'_> {
             Self::Array(value) => Display::fmt(value, formatter),
             Self::Dimension(value) => Display::fmt(value, formatter),
             Self::Reference(value) => Display::fmt(value, formatter),
+            Self::Ragged(value) => Display::fmt(value, formatter),
         }
     }
 }
@@ -302,6 +309,7 @@ impl Typed for XlaValue<'_> {
             Self::Array(value) => ArrayIrType::Array(value.r#type().into_owned()),
             Self::Dimension(value) => ArrayIrType::Dimension(value.r#type().into_owned()),
             Self::Reference(value) => ArrayIrType::Reference(value.r#type().into_owned()),
+            Self::Ragged(value) => ArrayIrType::Ragged(value.r#type().into_owned()),
         })
     }
 }
@@ -320,6 +328,9 @@ impl<'c> Value for XlaValue<'c> {
             Self::Array(value) if value.xla_domain().mesh().is_err() => {
                 value.xla_domain().with_mesh(value.mesh().clone())
             }
+            Self::Ragged(value) if value.storage().xla_domain().mesh().is_err() => {
+                value.storage().xla_domain().with_mesh(value.storage().mesh().clone())
+            }
             _ => self.xla_domain().clone(),
         }
     }
@@ -335,6 +346,10 @@ impl<'c> Value for XlaValue<'c> {
                 value.handle().rename_type_identities(renaming)?,
                 value.xla_domain().clone(),
             ))),
+            Self::Ragged(_) => Self::from_array_ir_value(
+                self.clone().into_array_ir_value().rename_type_identities(renaming)?,
+                self.xla_domain(),
+            ),
         }
     }
 
@@ -345,7 +360,7 @@ impl<'c> Value for XlaValue<'c> {
     fn is_zero(&self) -> bool {
         match self {
             Self::Array(value) => value.is_zero(),
-            Self::Dimension(_) | Self::Reference(_) => false,
+            Self::Dimension(_) | Self::Reference(_) | Self::Ragged(_) => false,
         }
     }
 
@@ -354,7 +369,7 @@ impl<'c> Value for XlaValue<'c> {
 
     fn reference_id(&self) -> Option<ReferenceId> {
         match self {
-            Self::Array(_) | Self::Dimension(_) => None,
+            Self::Array(_) | Self::Dimension(_) | Self::Ragged(_) => None,
             Self::Reference(value) => Some(value.handle().id()),
         }
     }
@@ -443,6 +458,35 @@ impl<'c> ValueProjection<ReferenceType<ArrayType>> for XlaValue<'c> {
         match self {
             Self::Reference(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
+        }
+    }
+}
+
+impl<'c> ValueProjection<RaggedType> for XlaValue<'c> {
+    type Projected = RaggedValue<XlaArray<'c>>;
+    type ProjectedRef<'v>
+        = &'v RaggedValue<XlaArray<'c>>
+    where
+        Self: 'v;
+
+    fn from_projected(value: Self::Projected) -> Self {
+        Self::Ragged(value)
+    }
+
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        RaggedType: 'v,
+    {
+        match self {
+            Self::Ragged(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected ragged type but got {} type", other.kind_name()))),
+        }
+    }
+
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        match self {
+            Self::Ragged(value) => Ok(value),
+            other => Err(TypeError::invalid(format!("expected ragged type but got {} type", other.kind_name()))),
         }
     }
 }
@@ -780,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_from_array_ir_value_rejects_ragged_values() {
+    fn test_xla_value_from_array_ir_value_preserves_ragged_values() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);
@@ -792,10 +836,9 @@ mod tests {
         )
         .unwrap();
         let ragged = ArrayIrValue::Ragged(RaggedValue::new(r#type, storage, Vec::new()).unwrap());
-        assert_eq!(
-            XlaValue::from_array_ir_value(ragged, &domain),
-            Err(TypeError::invalid("ragged values are not supported in the XLA domain")),
-        );
+        let value = XlaValue::from_array_ir_value(ragged.clone(), &domain).unwrap();
+        assert!(same_session(value.xla_domain(), &domain));
+        assert_eq!(value.into_array_ir_value(), ragged);
     }
 
     #[test]

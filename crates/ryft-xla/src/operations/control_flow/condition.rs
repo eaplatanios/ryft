@@ -902,7 +902,7 @@ mod tests {
             let second = builder.add_input(branch_input_type.clone().into());
             let output = if add {
                 builder
-                    .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                    .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                     .unwrap()[0]
             } else {
                 first

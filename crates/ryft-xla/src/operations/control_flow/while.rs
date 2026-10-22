@@ -1094,7 +1094,7 @@ mod tests {
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -1241,7 +1241,7 @@ mod tests {
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![first, second], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(

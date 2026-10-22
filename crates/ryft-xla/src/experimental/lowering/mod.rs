@@ -8,10 +8,10 @@ use ryft_core::{
     CustomCallOperation, DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation,
     DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
     LogicalMesh, Memory, OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError,
-    Provenance, RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation, RaggedType,
-    RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape, ShardMap,
-    ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed, Value,
-    ZeroLikeOperation,
+    Provenance, RaggedAddOperation, RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation, RaggedType,
+    RaggedZeroOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation,
+    Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed,
+    Value, ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -742,7 +742,7 @@ macro_rules! impl_unsupported_ragged_lowering {
                 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
                     // The payload remains stageable, but one-value replay cannot preserve its aggregate fields.
                     Err(ProgramError::UnsupportedOperation {
-                        message: format!("`{}` requires grouped ragged XLA lowering, which is not yet supported", self.name()),
+                        message: format!("`{}` must pass through grouped ragged XLA replay before primitive lowering", self.name()),
                     }.into())
                 }
             }
@@ -750,7 +750,13 @@ macro_rules! impl_unsupported_ragged_lowering {
     };
 }
 
-impl_unsupported_ragged_lowering!(RaggedNewOperation, RaggedStorageOperation, RaggedExtentsOperation);
+impl_unsupported_ragged_lowering!(
+    RaggedNewOperation,
+    RaggedStorageOperation,
+    RaggedExtentsOperation,
+    RaggedZeroOperation,
+    RaggedAddOperation
+);
 
 impl LowerableOperation for XlaOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -791,6 +797,8 @@ impl LowerableOperation for XlaOperation {
             RaggedNew,
             RaggedStorage,
             RaggedExtents,
+            RaggedZero,
+            RaggedAdd,
             Reshape,
             Broadcast,
             Concatenate,
@@ -1786,6 +1794,7 @@ impl MlirLowerableValue for XlaArrayConstant {
         match self {
             Self::Captured(value) => Err(LoweringError::MissingCapturedConstant { index: value.index() }),
             Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
+            Self::Literal(value) => value.array().to_dense_elements_attribute(tensor_type, context),
         }
     }
 
@@ -1802,7 +1811,7 @@ impl MlirLowerableValue for XlaArrayConstant {
     {
         match self {
             Self::Captured(value) => lower_captured_constant(value, captured_values),
-            Self::Boolean(_) => lower_literal_value(self, block, context, location),
+            Self::Boolean(_) | Self::Literal(_) => lower_literal_value(self, block, context, location),
         }
     }
 }
@@ -1828,7 +1837,10 @@ impl MlirLowerableValue for Array {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         let data_type = self.r#type().data_type();
-        if matches!(data_type, DataType::Token | DataType::Zero) {
+        if data_type == DataType::Zero {
+            return types::lower_f64_scalar_elements_attribute(data_type, tensor_type, 0.0, context);
+        }
+        if data_type == DataType::Token {
             return Err(LoweringError::UnsupportedDataType { data_type });
         }
 

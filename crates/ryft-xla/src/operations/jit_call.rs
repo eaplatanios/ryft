@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -8,17 +9,17 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, BatchAxis,
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    CalleeRegionDriver, CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinationKind,
-    CotangentDestinations, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, InputRegionProvenance,
-    InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
+    CalleeRegionDriver, CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinations,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Dimension, InputRegionProvenance, InterpretableOperation,
+    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter, OperationProvider,
+    OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
     RematerializationOptimizationBarrier, ShardMapOperation, StagingContext, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection,
-    ValueResolution, Zero, ZeroOperation, discharge_positional_region_operation,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
+    Value, ValueProjection, ValueResolution, Zero, ZeroOperation, discharge_positional_region_operation,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -47,6 +48,9 @@ pub(crate) struct JitCallProgramKey {
     /// Canonical [`Program`](ryft_core::Program) rendering (operation names, all bracketed attributes, and attached
     /// region bodies).
     rendered: String,
+
+    /// Original logical group signature retained when the callee is legalized to dense leaves.
+    logical_signature: Option<Arc<(Vec<ArrayIrType>, Vec<ArrayIrType>)>>,
 
     /// Flat input types, which together with the rendering pin the full callee signature.
     pub(crate) input_types: Vec<ArrayIrType>,
@@ -100,9 +104,13 @@ fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionR
 /// structural deduplication (see [`supports_structural_dedup`]) and therefore always inline. The key is generic over
 /// the program's constant universe so that lookups from the value-generic lowering path type-check; the map itself is
 /// only ever populated from the staged [`XlaConstant`]-keyed pipeline.
-fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>) -> Option<JitCallProgramKey> {
+fn jit_call_program_key<O: LowerableOperationFamily>(
+    program: &FlatXlaProgram<O>,
+    operation: &JitCallOperation<ArrayIrType>,
+) -> Option<JitCallProgramKey> {
     supports_structural_dedup(program).then(|| JitCallProgramKey {
         rendered: program.to_string(),
+        logical_signature: operation.logical_signature.clone(),
         input_types: program.input_types(),
         output_types: program.output_types(),
     })
@@ -111,11 +119,13 @@ fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>
 /// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
 fn jit_call_region_key<O: LowerableOperationFamily>(
     region: RegionRef<'_, XlaConstant, O>,
+    operation: &JitCallOperation<ArrayIrType>,
 ) -> Option<JitCallProgramKey> {
     supports_structural_dedup_region(region).then(|| {
         let program = region.to_program();
         JitCallProgramKey {
             rendered: program.to_string(),
+            logical_signature: operation.logical_signature.clone(),
             input_types: program.input_types(),
             output_types: program.output_types(),
         }
@@ -159,8 +169,12 @@ impl<O> Default for JitCallFunctionMap<O> {
 
 impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     /// Returns the shared function for `program`, if one was emitted for its identity.
-    pub(crate) fn get(&self, program: &FlatXlaProgram<O>) -> Option<&JitCallFunction<O>> {
-        self.functions.get(&jit_call_program_key(program)?)
+    pub(crate) fn get(
+        &self,
+        program: &FlatXlaProgram<O>,
+        operation: &JitCallOperation<ArrayIrType>,
+    ) -> Option<&JitCallFunction<O>> {
+        self.functions.get(&jit_call_program_key(program, operation)?)
     }
 }
 
@@ -206,7 +220,7 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
             for &nested in instruction.regions() {
                 walk(program, nested, counts, order, memo, visited);
             }
-            if instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>().is_some() {
+            if let Some(operation) = instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>() {
                 let Some(&callee_region) = instruction.regions().first() else {
                     continue;
                 };
@@ -216,12 +230,13 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
                         let callee = program
                             .region_ref(callee_region)
                             .expect("jit_call callee regions are validated at build time");
-                        jit_call_region_key(callee)
+                        jit_call_region_key(callee, operation)
                     })
                     .clone();
-                let Some(key) = key else {
+                let Some(mut key) = key else {
                     continue;
                 };
+                key.logical_signature = operation.logical_signature.clone();
                 let entry = counts.entry(key.clone()).or_insert_with(|| {
                     order.push(key.clone());
                     (
@@ -363,7 +378,7 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
 /// independent capture namespaces of nested calls inside the callee arena.
 pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatXlaProgram<O>,
-    capture_count: usize,
+    operation: &JitCallOperation<ArrayIrType>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -376,7 +391,7 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     // shared-function path below never interacts with the caller's effect tokens; effectful callees always take the
     // inline path, which threads the caller's per-class tokens through the callee body in program order.
     if let Some(map) = nested_functions {
-        if let Some(function) = map.get(program) {
+        if let Some(function) = map.get(program, operation) {
             // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
             // matching arity is the only guard needed before emitting the symbol call; anything else inlines.
             if input_values.len() == function.input_types.len() {
@@ -408,6 +423,7 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
             }
         }
     }
+    let capture_count = operation.capture_count();
     if input_values.len() < capture_count {
         return Err(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
     }
@@ -449,16 +465,170 @@ pub struct JitCallOperation<T: Type> {
 
     /// Type universe of the callee boundary.
     marker: PhantomData<fn() -> T>,
-}
 
-impl<T: Type> Copy for JitCallOperation<T> {}
+    /// Logical signature before backend grouping; dense calls retain no extra metadata.
+    logical_signature: Option<Arc<(Vec<T>, Vec<T>)>>,
+
+    /// Caller-owned result types instantiating identities defined inside the callee.
+    output_types: Option<Arc<[T]>>,
+
+    /// Formal input scope used to preserve forwarded names when an attached callee is instantiated for new operands.
+    input_types: Option<Arc<[T]>>,
+}
 
 impl<T: Type> JitCallOperation<T> {
     /// Creates a staged jitted-call operation. The flat callee program is supplied as a shared region attachment to
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
     pub(crate) fn new(capture_count: usize) -> Self {
-        Self { capture_count, marker: PhantomData }
+        Self { capture_count, marker: PhantomData, logical_signature: None, output_types: None, input_types: None }
+    }
+
+    /// Instantiates every callee-local result identity freshly for this call. Input identities continue to name the
+    /// forwarded quantities. Call this after constructing the callee and before binding a call with local results;
+    /// repeated inference allocates no identities and returns the same result types.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for an oversized capture prefix or a type that cannot rename its local identities.
+    pub fn with_callee_type_signature(mut self, input_types: &[T], output_types: &[T]) -> Result<Self, TypeError> {
+        self.validate_capture_prefix(input_types.len())?;
+        if !output_types
+            .iter()
+            .flat_map(Type::identities)
+            .any(|(_, identity)| !input_types.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+        {
+            self.output_types = None;
+            self.input_types = None;
+            return Ok(self);
+        }
+        let mut unavailable = input_types
+            .iter()
+            .chain(output_types)
+            .flat_map(Type::identities)
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>();
+        let mut renaming = TypeIdentityRenaming::new();
+        for (_, identity) in output_types.iter().flat_map(Type::identities) {
+            if renaming.target(identity).is_none()
+                && !input_types.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+            {
+                let fresh = renaming.insert_fresh(identity.clone(), &unavailable)?;
+                unavailable.push(fresh);
+            }
+        }
+        self.output_types = if renaming.replacements().is_empty() {
+            None
+        } else {
+            Some(
+                output_types
+                    .iter()
+                    .map(|r#type| r#type.rename_identities(&renaming))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            )
+        };
+        self.input_types = self.output_types.as_ref().map(|_| input_types.into());
+        Ok(self)
+    }
+
+    /// Retains already-owned scalar result identities when aggregate fields are legalized to dense values.
+    pub(crate) fn with_result_type_signature(
+        mut self,
+        input_types: &[T],
+        callee_outputs: &[T],
+        outputs: Vec<T>,
+    ) -> Result<Self, TypeError> {
+        if callee_outputs == outputs {
+            self.output_types = None;
+            self.input_types = None;
+            self.output_renaming(input_types, callee_outputs)?;
+            return Ok(self);
+        }
+        self.output_types = Some(outputs.into());
+        self.input_types = Some(input_types.into());
+        self.output_renaming(input_types, callee_outputs)?;
+        Ok(self)
+    }
+
+    /// Checks that the lexical capture namespace is a valid prefix of this callee's actual boundary.
+    fn validate_capture_prefix(&self, input_count: usize) -> Result<(), TypeError> {
+        if self.capture_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "`jit_call` lifted capture prefix {} exceeds its {input_count} callee inputs",
+                self.capture_count,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rebinds forwarded result names from the retained formal input scope to this callee instantiation.
+    fn instantiated_output_types(&self, inputs: &[T]) -> Result<Option<Vec<T>>, TypeError> {
+        let Some(outputs) = &self.output_types else { return Ok(None) };
+        let declared = self.input_types.as_deref().expect("result declarations retain their formal input scope");
+        if declared == inputs {
+            return Ok(Some(outputs.to_vec()));
+        }
+        let renaming = T::derive_scope_identity_renaming(declared, inputs)?;
+        outputs
+            .iter()
+            .map(|r#type| r#type.rename_identities(&renaming))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    /// Validates exact local-result instantiation and returns the callee-to-caller result correspondence.
+    fn output_renaming(
+        &self,
+        inputs: &[T],
+        callee_outputs: &[T],
+    ) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
+        if self.output_types.is_none() {
+            if callee_outputs
+                .iter()
+                .flat_map(Type::identities)
+                .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+            {
+                return Err(TypeError::invalid(
+                    "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
+                ));
+            }
+            return Ok(TypeIdentityRenaming::new());
+        }
+        let locals = callee_outputs
+            .iter()
+            .flat_map(Type::identities)
+            .filter_map(|(_, identity)| {
+                (!inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)).then_some(identity)
+            })
+            .collect::<Vec<_>>();
+        let outputs = self.instantiated_output_types(inputs)?.expect("local result declarations were checked above");
+        let renaming = T::derive_scope_identity_renaming(callee_outputs, &outputs)?;
+        for (_, identity) in callee_outputs.iter().flat_map(Type::identities) {
+            let target = renaming.target(identity).unwrap_or(identity);
+            if locals.contains(&identity) {
+                if target == identity
+                    || inputs
+                        .iter()
+                        .chain(callee_outputs)
+                        .flat_map(Type::identities)
+                        .any(|(_, original)| original == target)
+                {
+                    return Err(TypeError::invalid("`jit_call` local result declarations must use fresh identities"));
+                }
+            } else if target != identity {
+                return Err(TypeError::invalid(
+                    "`jit_call` result declarations must preserve forwarded input identities",
+                ));
+            }
+        }
+        Ok(renaming)
+    }
+
+    /// Retains the original aggregate signature in call identity after backend legalization.
+    pub(crate) fn with_logical_signature(mut self, inputs: Vec<T>, outputs: Vec<T>) -> Self {
+        self.logical_signature = Some(Arc::new((inputs, outputs)));
+        self
     }
 
     /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
@@ -472,6 +642,14 @@ impl CompiledCallOperation<XlaConstant> for XlaOperation {
     #[inline]
     fn compiled_call(capture_count: usize) -> Self {
         Self::JitCall(JitCallOperation::new(capture_count))
+    }
+
+    fn compiled_call_with_type_signature(
+        capture_count: usize,
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Self, TypeError> {
+        Ok(Self::JitCall(JitCallOperation::new(capture_count).with_callee_type_signature(input_types, output_types)?))
     }
 }
 
@@ -516,6 +694,60 @@ impl<T: Type> Operation for JitCallOperation<T> {
         JIT_CALL_OPERATION_NAME
     }
 
+    fn defined_type_identities(&self) -> Cow<'_, [T::Identity]> {
+        let Some(outputs) = &self.output_types else { return Cow::Borrowed(&[]) };
+        let mut definitions = Vec::new();
+        for (_, identity) in outputs.iter().flat_map(Type::identities) {
+            let forwarded = self
+                .input_types
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(Type::identities)
+                .any(|(_, input)| input == identity);
+            if !forwarded && !definitions.contains(identity) {
+                definitions.push(identity.clone());
+            }
+        }
+        Cow::Owned(definitions)
+    }
+
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let mut renamed = self.clone();
+        if let Some(signature) = &self.logical_signature {
+            let inputs =
+                signature.0.iter().map(|r#type| r#type.rename_identities(renaming)).collect::<Result<Vec<_>, _>>()?;
+            let outputs =
+                signature.1.iter().map(|r#type| r#type.rename_identities(renaming)).collect::<Result<Vec<_>, _>>()?;
+            renamed.logical_signature = Some(Arc::new((inputs, outputs)));
+        }
+        let mut local_renaming = TypeIdentityRenaming::new();
+        for (source, target) in renaming.replacements() {
+            if !self
+                .input_types
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(Type::identities)
+                .any(|(_, input)| input == source)
+            {
+                local_renaming.insert(source.clone(), target.clone())?;
+            }
+        }
+        renamed.output_types = self
+            .output_types
+            .as_ref()
+            .map(|types| {
+                types
+                    .iter()
+                    .map(|r#type| r#type.rename_identities(&local_renaming))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Arc::from)
+            })
+            .transpose()?;
+        Ok(renamed)
+    }
+
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         const { &[RegionSlot::computation("callee")] }
@@ -534,8 +766,29 @@ impl<T: Type> Operation for JitCallOperation<T> {
             )));
         }
         let callee_interface = &region_interfaces[0];
+        self.validate_capture_prefix(callee_interface.input_types().len())?;
         ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
-        Ok(callee_interface.output_types().to_vec())
+        self.output_renaming(callee_interface.input_types(), callee_interface.output_types())?;
+        Ok(self
+            .instantiated_output_types(callee_interface.input_types())?
+            .unwrap_or_else(|| callee_interface.output_types().to_vec()))
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        check_count!("region", interfaces, 1, TypeError);
+        let declared = interfaces[0].input_types();
+        if declared == input_types {
+            return Ok(vec![None]);
+        }
+        let renaming = T::derive_scope_identity_renaming(declared, input_types)?;
+        let renamed =
+            declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+        ensure_call_input_types(self.name(), &renamed, input_types)?;
+        Ok(vec![Some(input_types.to_vec())])
     }
 
     #[inline]
@@ -567,7 +820,24 @@ impl<T: Type> Operation for JitCallOperation<T> {
         let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
         kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
         check_count!("input", kept_inputs, input_count, ProgramError);
-        Ok(Some(OperationBoundaryPruning { operation: *self, kept_inputs, kept_outputs: used_outputs.to_vec() }))
+        let mut operation = self.clone();
+        operation.output_types = self.output_types.as_ref().map(|types| {
+            types
+                .iter()
+                .zip(used_outputs)
+                .filter_map(|(r#type, used)| used.then_some(r#type.clone()))
+                .collect::<Vec<_>>()
+                .into()
+        });
+        operation.input_types = self.input_types.as_ref().map(|types| {
+            types
+                .iter()
+                .zip(&kept_inputs)
+                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
+                .collect::<Vec<_>>()
+                .into()
+        });
+        Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
     }
 
     #[inline]
@@ -577,10 +847,22 @@ impl<T: Type> Operation for JitCallOperation<T> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
-        if self.capture_count == 0 {
+        if self.capture_count == 0 && self.logical_signature.is_none() && self.output_types.is_none() {
             Ok(())
         } else {
-            operation.bracketed(|operation| operation.field("capture_count", self.capture_count))
+            operation.bracketed(|operation| {
+                if self.capture_count != 0 {
+                    operation.field("capture_count", self.capture_count)?;
+                }
+                if let Some(signature) = &self.logical_signature {
+                    operation.list("logical_inputs", &signature.0)?;
+                    operation.list("logical_outputs", &signature.1)?;
+                }
+                if let Some(outputs) = &self.output_types {
+                    operation.list("output_types", outputs.iter())?;
+                }
+                Ok(())
+            })
         }
     }
 }
@@ -588,14 +870,14 @@ impl<T: Type> Operation for JitCallOperation<T> {
 // A jitted call forwards its operands onto its callee's inputs one for one and reports the callee's outputs as its
 // own, which is the positionally forwarding shape the shared structured rewrite serves with no leading operands. The
 // callee's lifted capture prefix is unaffected: threaded state is appended after every declared operand, so the prefix
-// keeps its positions.
+// keeps its positions. Instantiated result types belong to the source callee signature, which discharge changes by
+// turning discharged references into arrays and appending state inputs and outputs. The rebuilt call therefore keeps
+// the same caller-owned result identities but derives its result metadata from the rebuilt callee signature.
 impl<T, C, P> ReferenceDischargeableOperation<C, P> for JitCallOperation<T>
 where
-    T: Type,
-    JitCallOperation<T>: Operation<Type = C::Type>,
-    C: Context<Operation: From<JitCallOperation<T>>>,
+    T: Type + From<P::Referent>,
+    C: Context<Type = T, Operation: From<JitCallOperation<T>>>,
     P: ReferenceDischargePolicy<C>,
-    C::Type: From<P::Referent>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -603,7 +885,25 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_positional_region_operation(self, context, driver, inputs, 0, |_| self.clone())
+        let result_renaming = match &self.output_types {
+            Some(_) => {
+                let callee = driver.region(0)?;
+                Some(self.output_renaming(&callee.input_types(), &callee.output_types())?)
+            }
+            None => None,
+        };
+        discharge_positional_region_operation(self, context, driver, inputs, 0, |_, regions| {
+            let Some(result_renaming) = result_renaming else { return Ok(self.clone()) };
+            check_count!("region", regions, 1, TypeError);
+            let input_types = regions[0].input_types();
+            let callee_outputs = regions[0].output_types();
+            let outputs = callee_outputs
+                .iter()
+                .map(|r#type| r#type.rename_identities(&result_renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+            let operation = Self { output_types: None, input_types: None, ..self.clone() };
+            Ok(operation.with_result_type_signature(&input_types, &callee_outputs, outputs)?)
+        })
     }
 }
 
@@ -656,7 +956,7 @@ where
             });
         if (all_known && !inline_known) || inputs.iter().all(PartialEvaluationValue::is_unknown) {
             return context.fold_or_residualize(
-                XlaOperation::JitCall(*self),
+                XlaOperation::JitCall(self.clone()),
                 driver.regions().map(|region| region.to_program()).collect(),
                 inputs,
             );
@@ -679,7 +979,7 @@ where
                 .instructions_in_closure()
                 .any(|(_, instruction)| instruction.operation().effects().has_accesses());
         if accesses_references {
-            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+            return context.fold_or_residualize(XlaOperation::JitCall(self.clone()), vec![callee.to_program()], inputs);
         }
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
         // split boundary would leave them naming a compacted or absent capture prefix — failing lowering at best and
@@ -688,7 +988,7 @@ where
         if callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         }) {
-            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+            return context.fold_or_residualize(XlaOperation::JitCall(self.clone()), vec![callee.to_program()], inputs);
         }
         if all_known {
             // Keep effectful work and nominally scoped types behind their validated call boundary. The pure,
@@ -698,7 +998,11 @@ where
                 || inputs.iter().any(|input| input.r#type().identities().next().is_some())
                 || callee.contains_atom_type_in_closure(|r#type| r#type.identities().next().is_some())
             {
-                return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+                return context.fold_or_residualize(
+                    XlaOperation::JitCall(self.clone()),
+                    vec![callee.to_program()],
+                    inputs,
+                );
             }
             return driver.partially_evaluate_region(context, 0, inputs.to_vec());
         }
@@ -708,7 +1012,7 @@ where
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+            return context.fold_or_residualize(XlaOperation::JitCall(self.clone()), vec![callee.to_program()], inputs);
         }
         // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
         // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
@@ -720,11 +1024,19 @@ where
         // can hold one.
         let known_capture_count =
             partition.known_input_indices().iter().filter(|index| **index < self.capture_count()).count();
+        let known_call = JitCallOperation::new(known_capture_count).with_callee_type_signature(
+            &partition.known_program().input_types(),
+            &partition.known_program().output_types(),
+        )?;
+        let residual_call = JitCallOperation::new(0).with_callee_type_signature(
+            &partition.residual_program().input_types(),
+            &partition.residual_program().output_types(),
+        )?;
         context.inline_partitioned_program(
             partition,
             inputs,
-            |known_program| (XlaOperation::JitCall(JitCallOperation::new(known_capture_count)), vec![known_program]),
-            |residual_program| (XlaOperation::JitCall(JitCallOperation::new(0)), vec![residual_program]),
+            |known_program| (XlaOperation::JitCall(known_call), vec![known_program]),
+            |residual_program| (XlaOperation::JitCall(residual_call), vec![residual_program]),
         )
     }
 }
@@ -767,7 +1079,7 @@ where
             return Ok(context
                 .parent()
                 .bind(
-                    *self,
+                    self.clone(),
                     vec![driver.region(0)?.to_program()],
                     &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
                 )?
@@ -783,7 +1095,9 @@ where
             .into_parts();
         let mut values = vec![context.axis_extent().clone()];
         values.extend(inputs.iter().map(|input| input.value().clone()));
-        let mut outputs = context.parent().bind(Self::new(self.capture_count() + 1), vec![callee], &values)?;
+        let operation = Self::new(self.capture_count() + 1)
+            .with_callee_type_signature(&callee.input_types(), &callee.output_types())?;
+        let mut outputs = context.parent().bind(operation, vec![callee], &values)?;
         check_count!("output", outputs, axes.len() + 1, ProgramError);
         outputs.remove(0);
         Ok(outputs
@@ -845,10 +1159,12 @@ where
                 (callee.to_program(), output_axes)
             }
         };
+        let operation = Self::new(self.capture_count())
+            .with_callee_type_signature(&batched_callee.input_types(), &batched_callee.output_types())?;
         let outputs =
             context
                 .parent()
-                .bind(*self, CalleeRegionDriver::new(&[Arc::new(batched_callee)]), &physical_inputs)?;
+                .bind(operation, CalleeRegionDriver::new(&[Arc::new(batched_callee)]), &physical_inputs)?;
         Ok(outputs
             .into_iter()
             .zip(output_axes)
@@ -981,7 +1297,7 @@ where
             let callee = Arc::new(callee.to_program());
             return context
                 .primal()
-                .bind(XlaOperation::JitCall(*self), CalleeRegionDriver::new(&[callee]), &primal_operands)?
+                .bind(XlaOperation::JitCall(self.clone()), CalleeRegionDriver::new(&[callee]), &primal_operands)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect();
@@ -993,7 +1309,10 @@ where
         // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
         // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
         // survives verbatim and its length carries over.
-        let primal_call = XlaOperation::JitCall(JitCallOperation::new(self.capture_count()));
+        let primal_call = XlaOperation::JitCall(
+            JitCallOperation::new(self.capture_count())
+                .with_callee_type_signature(&primal_program.input_types(), &primal_program.output_types())?,
+        );
         let mut primal_call_outputs =
             context.primal().bind(primal_call, CalleeRegionDriver::new(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
@@ -1025,7 +1344,10 @@ where
         // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
         // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
         // value.
-        let tangent_call = XlaOperation::JitCall(JitCallOperation::new(0));
+        let tangent_call = XlaOperation::JitCall(
+            JitCallOperation::new(0)
+                .with_callee_type_signature(&tangent_program.input_types(), &tangent_program.output_types())?,
+        );
         let tangent_outputs =
             context
                 .tangent()
@@ -1194,7 +1516,10 @@ pub fn transpose_primal_jit_call<
     // The transposed callee's inputs are output cotangents, cotangent references, and known input values — never a
     // lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
     // through fresh-root contexts.
-    let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0));
+    let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0).with_callee_type_signature(
+        &transposed_callee.program().input_types(),
+        &transposed_callee.program().output_types(),
+    )?);
     let input_cotangents = context.bind(
         transposed_call,
         CalleeRegionDriver::new(&[transposed_callee.program().clone()]),
@@ -1271,7 +1596,13 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType>
         driver: &D,
         inputs: &[XlaValue<'c>],
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
-        driver.interpret_region(context, 0, inputs.to_vec())
+        let callee = driver.region(0)?;
+        let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
+        driver
+            .interpret_region(context, 0, inputs.to_vec())?
+            .iter()
+            .map(|value| value.rename_type_identities(&renaming).map_err(Into::into))
+            .collect()
     }
 }
 
@@ -1290,7 +1621,7 @@ impl LowerableOperation for JitCallOperation<ArrayIrType> {
         };
         lower_jit_call(
             callee,
-            self.capture_count(),
+            self,
             input_values,
             &mut lowerer.block,
             lowerer.context,
@@ -4011,5 +4342,137 @@ mod tests {
         assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(discharged.program().output_types().len(), 2);
         assert_eq!(discharged.program().entry_region_ref().instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_instantiates_callee_local_results() {
+        use ryft_core::{
+            Device, DeviceMesh, DimensionFromScalarOperation, DimensionToScalarOperation, ValueProjection,
+        };
+
+        use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+        use crate::{CompiledXlaFunction, FromPjrt, XlaSession};
+
+        // The callee mutates a reference and returns a dimension that it defines itself, so the call instantiates a
+        // fresh result identity. Discharge widens the callee with the reference state, which must not leave the
+        // call's result metadata pinned to the narrower pre-discharge callee signature.
+        let client = execution_client();
+        let device = Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
+        let value_type = value_type.unwrap();
+        let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
+        let extent_type = extent_type.unwrap();
+        let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
+
+        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = callee_builder.add_input(ReferenceType::new(value_type.clone()).into());
+        let update = callee_builder.add_input(value_type.clone().into());
+        let extent = callee_builder.add_input(extent_type.clone().into());
+        let previous = callee_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap()[0];
+        let dimension = callee_builder
+            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent], None)
+            .unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![previous, dimension],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let operation = JitCallOperation::new(0)
+            .with_callee_type_signature(&callee.input_types(), &callee.output_types())
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_program(callee);
+        let initial = builder.add_input(value_type.clone().into());
+        let update = builder.add_input(value_type.clone().into());
+        let extent = builder.add_input(extent_type.clone().into());
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(operation), vec![callee], vec![root, update, extent], None)
+            .unwrap()
+            .to_vec();
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let extent =
+            builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![outputs[1]], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![outputs[0], extent, frozen],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{value_type}, %1:{value_type}, %2:{extent_type} .
+                let %3:{value_type}, %4:dimension<rows ∈ [0, 8)>, %5:{value_type} = jit_call [
+                    output_types=[{value_type}, dimension<rows ∈ [0, 8)>, {value_type}],
+                ] %0 %1 %2 [
+                    callee={{
+                        lambda %0:{value_type}, %1:{value_type}, %2:{extent_type} .
+                        let %3:dimension<rows ∈ [0, 8)> = dimension_from_scalar [bounds=[0, 8)] %2
+                        in (%0, %3, %1)
+                    }},
+                ]
+                    %6:i64[] = dimension_to_scalar %4
+                in (%3, %6, %5)"},
+        );
+        // The call owns a fresh result identity, distinct from the callee-local identity it instantiates.
+        let call = &program.entry_region_ref().instructions()[0];
+        assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &ArrayIrType::Dimension(rows));
+
+        // Execute the discharged program on CPU, with the call staged inside one compiled function.
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
+            crate::compile(
+                |(initial, update, extent)| {
+                    let initial = initial.into_value();
+                    let inputs = vec![initial.clone(), update.into_value(), extent.into_value()];
+                    let outputs = program.interpret_in_context(initial.context(), inputs).unwrap();
+                    let mut outputs =
+                        outputs.into_iter().map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap());
+                    (outputs.next().unwrap(), outputs.next().unwrap(), outputs.next().unwrap())
+                },
+                (value_type.clone(), value_type.clone(), extent_type.clone()),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+        let array = |r#type: &ArrayType, bytes: Vec<u8>| {
+            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
+        };
+        let (previous, extent, state) = domain
+            .interpret(
+                &compiled.executable_function(),
+                (
+                    array(&value_type, values_to_bytes(&[3f32])),
+                    array(&value_type, values_to_bytes(&[4f32])),
+                    array(&extent_type, values_to_bytes(&[5i64])),
+                ),
+            )
+            .unwrap();
+        let read = |array: &XlaArray<'_>| {
+            array
+                .addressable_shards()
+                .next()
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap()
+        };
+        assert_eq!(values_from_bytes::<f32>(&read(&previous)), vec![3f32]);
+        assert_eq!(values_from_bytes::<i64>(&read(&extent)), vec![5i64]);
+        assert_eq!(values_from_bytes::<f32>(&read(&state)), vec![4f32]);
     }
 }

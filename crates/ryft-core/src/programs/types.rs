@@ -235,6 +235,123 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
         Ok(TypeIdentityRenaming::new())
     }
 
+    /// Derives the simultaneous identity renaming for instantiating a complete program or region input scope.
+    /// This accepts every correspondence accepted by [`Self::derive_identity_renaming`], and additionally admits an
+    /// exact, bijective renaming of the complete signature. The latter preserves all declared relationships, including
+    /// relationships between repeated indexed extent payloads that still require runtime checks. Every occurrence must
+    /// retain its positional role, and applying the renaming must reproduce `actual` exactly, including bounds and
+    /// non-identity metadata.
+    ///
+    /// Callers must preserve the instantiated body's runtime validation. Success establishes a correspondence of
+    /// names, not numerical equality of the supplied values. Use [`Self::derive_identity_renaming`] instead when a
+    /// transformation needs proof that checks can be omitted. In particular, renaming two repeated raw ragged inputs
+    /// does not prove that their extent arrays agree.
+    ///
+    /// # Example
+    ///
+    /// Let `Ragged<rows=n>` denote a raw ragged array whose row extents carry indexed identity `n`. With equal bounds,
+    /// storage layouts and extent coordinates on both sides, the following complete input scopes differ only in names:
+    ///
+    /// ```text
+    /// declared: [Ragged<rows=n>, Ragged<rows=n>]
+    /// actual:   [Ragged<rows=m>, Ragged<rows=m>]
+    /// renaming: n -> m
+    /// ```
+    ///
+    /// This function accepts that correspondence so the program can be instantiated under `m`. Its boundary must still
+    /// compare the two actual extent payloads: `[1, 2]` and `[1, 2]` agree, whereas `[1, 2]` and `[2, 1]` do not. The
+    /// function only receives types and cannot distinguish these values. [`Self::derive_identity_renaming`] rejects
+    /// this repeated indexed relationship because its equality cannot be proved from the types alone.
+    ///
+    /// An actual signature `[Ragged<rows=p>, Ragged<rows=q>]` with independent `p` and `q` is rejected even here:
+    /// splitting one declared identity would change the relationship instead of renaming its scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the proof-only comparison's error when the signatures admit neither that comparison nor an exact
+    /// bijective renaming, or an error for an invalid identity scope.
+    fn derive_scope_identity_renaming<
+        't,
+        D: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+    >(
+        declared: D,
+        actual: A,
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+    where
+        Self: 't,
+    {
+        let mut pairs = type_signature_pairs(declared, actual)?;
+        let mut exact_prefix = true;
+        let pairs = loop {
+            let Some((declared, actual)) = pairs.next() else {
+                return Ok(TypeIdentityRenaming::new());
+            };
+
+            // Identity-free members cannot contribute cross-member substitutions or relationships. Validate them
+            // without buffering, retaining whether their accepted metadata refinements are also exact matches.
+            if declared.identities().next().is_none()
+                && actual.identities().next().is_none()
+                && Self::derive_identity_renaming([declared], [actual]).is_ok()
+            {
+                exact_prefix &= declared == actual;
+            } else {
+                break std::iter::once((declared, actual)).chain(pairs).collect::<Vec<_>>();
+            }
+        };
+
+        let declared = || pairs.iter().map(|(declared, _)| *declared);
+        let actual = || pairs.iter().map(|(_, actual)| *actual);
+        let error = match Self::derive_identity_renaming(declared(), actual()) {
+            Ok(renaming) => return Ok(renaming),
+            Err(error) => error,
+        };
+
+        Self::validate_identity_scope(declared())?;
+        Self::validate_identity_scope(actual())?;
+
+        // The fallback must reproduce the complete actual signature, including the unbuffered prefix. A refinement
+        // accepted above may add layout or sharding metadata, which exact alpha-renaming cannot introduce.
+        if !exact_prefix {
+            return Err(error);
+        }
+
+        // Renaming replaces the identity's metadata too. Check both directions so a bound change cannot masquerade
+        // as exact alpha-renaming merely because replacing the whole identity reproduces the actual type.
+        if Self::Refinements::from_local_declarations(declared(), actual()).is_err()
+            || Self::Refinements::from_local_declarations(actual(), declared()).is_err()
+        {
+            return Err(error);
+        }
+
+        let mut renaming = TypeIdentityRenaming::new();
+        for (declared, actual) in &pairs {
+            let mut actual_identities = actual.identities();
+            for (position, source) in declared.identities() {
+                let Some((actual_position, target)) = actual_identities.next() else { return Err(error) };
+                if position != actual_position
+                    || renaming.replacements().iter().any(|(old, mapped)| old != source && mapped == target)
+                    || renaming.target(source).is_some_and(|mapped| mapped != target)
+                {
+                    return Err(error);
+                }
+                renaming.insert(source.clone(), target.clone())?;
+            }
+
+            if actual_identities.next().is_some() {
+                return Err(error);
+            }
+        }
+
+        for (declared, actual) in &pairs {
+            if declared.rename_identities(&renaming)? != **actual {
+                return Err(error);
+            }
+        }
+
+        Ok(renaming)
+    }
+
     /// Returns this [`Type`] after simultaneously renaming all of its live [`TypeIdentity`]s.
     #[inline]
     fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
@@ -1016,8 +1133,9 @@ mod tests {
 
     use crate::arrays::types::dimensions::{DimensionComparison, DimensionRefinementFact};
     use crate::arrays::{
-        ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionBounds, DimensionRefinements, DimensionType,
-        DimensionTypeRefinements, DimensionVariable, Shape,
+        ArrayIrType, ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionBounds, DimensionRefinements,
+        DimensionType, DimensionTypeRefinements, DimensionVariable, Layout, RaggedDimension, RaggedType,
+        RaggedValueKind, Shape, StridedLayout,
     };
 
     use super::*;
@@ -1274,6 +1392,102 @@ mod tests {
                 DimensionRefinements::derive_identity_renaming,
             ),
             Err(TypeError::invalid("invalid scope")),
+        );
+    }
+
+    #[test]
+    fn test_type_derive_scope_identity_renaming() {
+        let declared = [DataType::F32, DataType::I64];
+        let actual = [DataType::F32, DataType::I64];
+        assert_eq!(
+            DataType::derive_scope_identity_renaming(declared.iter(), actual.iter()),
+            Ok(TypeIdentityRenaming::new()),
+        );
+        assert_eq!(
+            DataType::derive_scope_identity_renaming(std::iter::empty(), std::iter::empty()),
+            Ok(TypeIdentityRenaming::new()),
+        );
+        assert_eq!(
+            DataType::derive_scope_identity_renaming(declared.iter(), actual[..1].iter()),
+            Err(TypeError::invalid("declared type count 2 does not match actual type count 1")),
+        );
+    }
+
+    #[test]
+    fn test_type_scope_identity_renaming_preserves_indexed_obligations() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let actual_rows = rows.fresh();
+        let raw = |identity| {
+            ArrayIrType::from(
+                RaggedType::new(
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                    RaggedValueKind::Array,
+                    vec![RaggedDimension::new(1, identity, vec![0])],
+                )
+                .unwrap(),
+            )
+        };
+        let declared = vec![raw(rows.clone()); 2];
+        let actual = vec![raw(actual_rows.clone()); 2];
+        let error = ArrayIrType::derive_identity_renaming(&declared, &actual).unwrap_err();
+        assert_eq!(
+            error,
+            TypeError::invalid(
+                "indexed dimension `rows` has repeated extent occurrences whose equality requires runtime checking"
+            ),
+        );
+
+        // These borrowed, single-use iterators are not Clone; scope instantiation must not require replayable inputs.
+        let declared_inputs: Box<dyn ExactSizeIterator<Item = &ArrayIrType> + '_> = Box::new(declared.iter());
+        let actual_inputs: Box<dyn ExactSizeIterator<Item = &ArrayIrType> + '_> = Box::new(actual.iter());
+        let renaming = ArrayIrType::derive_scope_identity_renaming(declared_inputs, actual_inputs).unwrap();
+        assert_eq!(renaming.target(&rows), Some(&actual_rows));
+        assert_eq!(
+            declared.iter().map(|r#type| r#type.rename_identities(&renaming).unwrap()).collect::<Vec<_>>(),
+            actual,
+        );
+        let scalar = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let laid_out = ArrayIrType::from(
+            ArrayType::scalar(DataType::F32).with_layout(Layout::Strided(StridedLayout::new(vec![]))),
+        );
+        assert_eq!(ArrayIrType::derive_identity_renaming([&scalar], [&laid_out]), Ok(TypeIdentityRenaming::new()),);
+        let declared_with_prefix = [scalar.clone(), declared[0].clone(), declared[1].clone()];
+        let mut actual_with_prefix = [scalar, actual[0].clone(), actual[1].clone()];
+        assert_eq!(
+            ArrayIrType::derive_scope_identity_renaming(declared_with_prefix.iter(), actual_with_prefix.iter()),
+            Ok(renaming.clone()),
+        );
+
+        // Structural prefix refinement is valid alone, but cannot weaken the complete exact-renaming fallback.
+        actual_with_prefix[0] = laid_out;
+        assert_eq!(
+            ArrayIrType::derive_scope_identity_renaming(declared_with_prefix.iter(), actual_with_prefix.iter()),
+            Err(error.clone()),
+        );
+
+        // A unique indexed occurrence needs no fallback, so ordinary prefix refinements remain admissible.
+        assert_eq!(
+            ArrayIrType::derive_scope_identity_renaming(
+                declared_with_prefix[..2].iter(),
+                actual_with_prefix[..2].iter(),
+            ),
+            Ok(renaming),
+        );
+
+        // Scope matching may rename names, but cannot split or merge their occurrence relationships.
+        assert_eq!(
+            ArrayIrType::derive_scope_identity_renaming(&declared, &[actual[0].clone(), raw(rows.fresh())]),
+            Err(error.clone()),
+        );
+        assert_eq!(
+            ArrayIrType::derive_scope_identity_renaming(&[declared[0].clone(), raw(rows.fresh())], &actual),
+            Err(error.clone()),
+        );
+        let other_bounds = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
+        assert_eq!(ArrayIrType::derive_scope_identity_renaming(&declared, &vec![raw(other_bounds); 2]), Err(error),);
+        assert_eq!(
+            DataType::derive_scope_identity_renaming(&[DataType::F32], &[DataType::F64]),
+            Err(TypeError::invalid("type f64 does not refine declared type f32")),
         );
     }
 }

@@ -1399,19 +1399,22 @@ mod tests {
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
 
-        // Payload-free logical types never enter raw construction and report the standard structured lowering error.
+        // Zero literals use the established false i1 physical carrier without introducing logical payload bytes.
         let tensor_type = context
             .tensor_type(context.signless_integer_type(1), &[MlirSize::Static(2)], None, location)
             .unwrap();
-        for data_type in [DataType::Zero, DataType::Token] {
-            let literal =
-                Array::from_logical_bytes(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])), &[])
-                    .unwrap();
-            assert_eq!(
-                literal.to_dense_elements_attribute(tensor_type, &context),
-                Err(LoweringError::UnsupportedDataType { data_type }),
-            );
-        }
+        let zero = Array::from_logical_bytes(ArrayType::new_static(DataType::Zero, [2]), &[]).unwrap();
+        assert_eq!(
+            zero.to_dense_elements_attribute(tensor_type, &context).unwrap().to_string(),
+            "dense<false> : tensor<2xi1>"
+        );
+
+        // Tokens remain effect values and have no dense literal representation.
+        let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
+        assert_eq!(
+            token.to_dense_elements_attribute(tensor_type, &context),
+            Err(LoweringError::UnsupportedDataType { data_type: DataType::Token }),
+        );
     }
 
     #[test]

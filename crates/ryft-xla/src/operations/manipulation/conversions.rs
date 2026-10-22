@@ -1717,7 +1717,7 @@ mod tests {
             )
             .unwrap()
             .to_vec();
-        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), narrowed, None).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), narrowed, None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
-    Accuracy, Array, ArrayOperation, ArrayType, CastOperation, CastType, Context, DataType, EagerContext, LogicalMesh,
-    ManualVariationAlignment, NoIdentity, Operation, ParallelVary, Parameter, Placeholder, Program, ProgramBuilder,
-    ProgramError, Region, Sin, SinOperation, Type, TypeError, Typed, Value, ValueDirectDispatch,
+    Accuracy, Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, CastOperation, CastType,
+    CompiledCallOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation, DimensionType,
+    DimensionVariable, EagerContext, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation, ParallelVary,
+    Parameter, Placeholder, Program, ProgramBuilder, ProgramError, Region, RegionInterface, RegionSlot, Sin,
+    SinOperation, Type, TypeError, Typed, Value, ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.
@@ -263,4 +265,94 @@ fn test_external_cast_type_owns_inference() {
         Err(TypeError::invalid("`cast` requires a declared first input type")),
     );
     assert_eq!(INFERENCES.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn test_compiled_call_operation_compiled_call_with_type_signature() {
+    /// Downstream call whose results are exactly its callee's results.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct ExternalCallOperation;
+
+    impl Operation for ExternalCallOperation {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "external_call"
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("callee")] }
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ArrayIrType],
+            region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            Ok(region_interfaces[0].output_types().to_vec())
+        }
+    }
+
+    /// Downstream operation family that implements only the required `compiled_call` constructor.
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    #[ryft(crate = "ryft_core", type(ArrayIrType), constant(ArrayIrValue<Array>))]
+    enum ExternalOperation {
+        DimensionFromScalar(DimensionFromScalarOperation),
+        Call(ExternalCallOperation),
+    }
+
+    impl CompiledCallOperation<ArrayIrValue<Array>> for ExternalOperation {
+        fn compiled_call(_capture_count: usize) -> Self {
+            Self::Call(ExternalCallOperation)
+        }
+    }
+
+    // The callee defines its result dimension itself, so the identity is local to the callee.
+    let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+    let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ExternalOperation>::new();
+    let extent = builder.add_input(ArrayType::scalar(DataType::I64).into());
+    let dimension = builder
+        .add_instruction(
+            ExternalOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionType::from(rows))),
+            Vec::new(),
+            vec![extent],
+            None,
+        )
+        .unwrap()[0];
+    let callee = builder
+        .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![dimension],
+            vec![Placeholder],
+            vec![Placeholder],
+        )
+        .unwrap();
+
+    // The default binds `compiled_call`, so the call instruction itself defines the callee-local result identity.
+    let operation =
+        ExternalOperation::compiled_call_with_type_signature(0, &callee.input_types(), &callee.output_types()).unwrap();
+    let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ExternalOperation>::new();
+    let extent = builder.add_input(ArrayType::scalar(DataType::I64).into());
+    let region = builder.import_program(callee.clone());
+    let output = builder.add_instruction(operation.clone(), vec![region], vec![extent], None).unwrap()[0];
+    let program = builder
+        .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .unwrap();
+    assert_eq!(program.output_types(), callee.output_types());
+
+    // A second call cannot define the same identity again: separate calls need not produce the same extent.
+    let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ExternalOperation>::new();
+    let region = builder.import_program(callee);
+    let first = builder.add_input(ArrayType::scalar(DataType::I64).into());
+    let second = builder.add_input(ArrayType::scalar(DataType::I64).into());
+    let first = builder.add_instruction(operation.clone(), vec![region], vec![first], None).unwrap()[0];
+    let second = builder.add_instruction(operation, vec![region], vec![second], None).unwrap()[0];
+    assert!(matches!(
+        builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![first, second],
+            vec![Placeholder; 2],
+            vec![Placeholder; 2],
+        ),
+        Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+            if message == "operation `external_call` output defines identity rows more than once in this region",
+    ));
 }

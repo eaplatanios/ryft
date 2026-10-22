@@ -1814,10 +1814,10 @@ mod tests {
         assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
         assert_eq!(builder.atoms()[outputs[2].index()].r#type().as_ref(), &vector(&m));
         let partial = builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![outputs[0], outputs[1]], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![outputs[0], outputs[1]], None)
             .unwrap()[0];
         let sum = builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![partial, outputs[2]], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![partial, outputs[2]], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
@@ -1860,7 +1860,7 @@ mod tests {
             GuardOperation::new("region", vec![vector(&n), vector(&n)]).with_retained_identities(vec![m.to_variable()]);
         let outputs = builder.add_instruction(guard, Vec::new(), vec![first, second], None).unwrap().to_vec();
         assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
-        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), outputs, None).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), outputs, None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2013,8 +2013,7 @@ mod tests {
                     .into()
             };
             let guarded = builder.add_instruction(guard, Vec::new(), reads, None).unwrap().to_vec();
-            let sum =
-                builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), guarded, None).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), guarded, None).unwrap()[0];
             let source = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
