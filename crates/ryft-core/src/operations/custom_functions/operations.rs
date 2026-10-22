@@ -18,11 +18,11 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiationPolicy, ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_non_transposable_operation};
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::custom_functions::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey,
@@ -33,11 +33,11 @@ use crate::operations::custom_functions::rules::{
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider,
-    OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    RegionDataFlow, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements,
-    Typed, Value, discharge_local_reference_operation, discharge_reference_free_operation,
+    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance,
+    ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow,
+    RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    discharge_local_reference_operation, discharge_reference_free_operation,
 };
 use crate::tracing::TracingContext;
 
@@ -2174,7 +2174,7 @@ where
     O: Operation<Type = V::Type>
         + From<CustomFunctionTransposeOperation<V, O>>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        + SupportsCotangentAdd,
     S: CustomRuleSpecializer<V, O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -3765,6 +3765,12 @@ mod tests {
                 Self::LinearCall(operation) => operation.render(formatter, indentation),
                 Self::CustomFunctionTranspose(operation) => operation.render(formatter, indentation),
             }
+        }
+    }
+
+    impl SupportsCotangentAdd for ReferenceTestOperation {
+        fn cotangent_add(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+            ArrayIrOperation::<Array>::cotangent_add(input_types).map(Self::Base)
         }
     }
 

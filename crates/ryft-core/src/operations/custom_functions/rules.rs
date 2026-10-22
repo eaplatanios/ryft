@@ -36,10 +36,10 @@ use crate::batching::{
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
-    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    DifferentiableType, DifferentiationError, ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation,
+    TranspositionContext,
 };
 use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::custom_functions::operations::{
     CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomFunctionTransposeOperation,
 };
@@ -360,14 +360,14 @@ trait CustomRuleAxisDependence<V, O>: Send + Sync {
 }
 
 /// [`CustomRuleAxisDependence`] that takes diagonals with the canonical batching policy of the family's type universe
-/// and adds values with [`AddOperation`].
+/// and combines differential contributions with [`SupportsCotangentAdd`].
 struct PolicyAxisDependence<V, O>(PhantomData<fn() -> (V, O)>);
 
 impl<V, O> CustomRuleAxisDependence<V, O> for PolicyAxisDependence<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
-    O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    O: Operation<Type = V::Type> + SupportsCotangentAdd,
 {
     fn diagonal(
         &self,
@@ -389,7 +389,7 @@ where
         left: &CustomRuleTracer<V, O>,
         right: &CustomRuleTracer<V, O>,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError> {
-        let operation = O::provide(AddOperation::new(), &[left.r#type().as_ref(), right.r#type().as_ref()])?;
+        let operation = O::cotangent_add(&[left.r#type().as_ref(), right.r#type().as_ref()])?;
         let mut outputs = left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -962,7 +962,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 >,
                 Operation = O,
             >
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+            + SupportsCotangentAdd,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1012,7 +1012,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 >,
                 Operation = O,
             >
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+            + SupportsCotangentAdd,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1067,7 +1067,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 >,
                 Operation = O,
             >
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+            + SupportsCotangentAdd,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1217,7 +1217,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + DifferentiableOperation<TracingContext<V, O>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
             + ResidualZeroProvider<V::Type, Operation = O>
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+            + SupportsCotangentAdd,
         R: 'static
             + Fn(
                 &BatchingLevel<V::Type>,

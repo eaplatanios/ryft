@@ -95,12 +95,11 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    SupportsCotangentAdd, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
@@ -109,9 +108,9 @@ use crate::partial::{
     PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter,
-    OperationProvider, ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueDomainDispatch,
+    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter, ProgramError,
+    RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1638,7 +1637,7 @@ where
 impl<
     T: DifferentiableType + CastType,
     V: Value<Type = T>,
-    O: Operation<Type = T> + OperationProvider<T, AddOperation<T>, Operation = O> + From<CastOperation<T>>,
+    O: Operation<Type = T> + SupportsCotangentAdd + From<CastOperation<T>>,
 > TransposableOperation<V, O> for CastOperation<T>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,

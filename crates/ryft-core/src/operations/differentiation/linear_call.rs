@@ -9,17 +9,15 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    SupportsCotangentAdd, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
-    ProgramError, RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
-    Value,
+    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError,
+    RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -624,7 +622,7 @@ where
 impl<
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
+        + SupportsCotangentAdd
         + ResidualZeroProvider<V::Type, Operation = O>
         + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>

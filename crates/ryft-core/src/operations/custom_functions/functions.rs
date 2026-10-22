@@ -23,10 +23,9 @@ use crate::batching::{
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TranspositionContext,
 };
 use crate::macros::check_count;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::custom_functions::operations::{
     CUSTOM_FUNCTION_OPERATION_NAME, CustomFunctionOperation, validate_non_differentiated_count,
@@ -370,7 +369,7 @@ where
             >,
             Operation = O,
         >
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        + SupportsCotangentAdd,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -457,7 +456,7 @@ where
             >,
             Operation = O,
         >
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        + SupportsCotangentAdd,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -550,7 +549,7 @@ where
             >,
             Operation = O,
         >
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        + SupportsCotangentAdd,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<CotangentAccumulator>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -762,7 +761,7 @@ where
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        + SupportsCotangentAdd,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
     Output: 'static

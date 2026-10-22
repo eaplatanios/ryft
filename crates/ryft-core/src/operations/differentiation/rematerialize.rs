@@ -9,12 +9,11 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    NOTHING_SAVABLE_POLICY_NAME, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    NOTHING_SAVABLE_POLICY_NAME, ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::manipulation::conversions::ReducePrecisionOperation;
 use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::references::ReferenceNewOperation;
@@ -657,7 +656,7 @@ where
 impl<
     V: Value<Type: 'static + DifferentiableType + ReferenceMemberType>,
     O: Operation<Type = V::Type>
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
+        + SupportsCotangentAdd
         + From<RematerializeOperation<V::Type>>
         + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<

@@ -19,8 +19,8 @@ use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, Stag
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    MemberDifferentiableOperation, MemberTransposableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
+    MemberDifferentiableOperation, MemberTransposableOperation, SupportsCotangentAdd, TransposableOperation,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -506,7 +506,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
     for SliceOperation
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+    O: SupportsCotangentAdd
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<
             ArrayType,
@@ -2033,7 +2033,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
     for DynamicSliceOperation<ArrayType>
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+    O: SupportsCotangentAdd
         + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<

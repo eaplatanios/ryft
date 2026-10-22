@@ -3973,6 +3973,49 @@ fn test_operation_generates_all_selected_dispatchers() {
 }
 
 #[test]
+fn test_operation_cotangent_add_without_conversion() {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use ryft::{
+        AddOperation, Array, ArrayType, DataType, MaybeZero, Placeholder, ProgramError, StagingContext,
+        SupportsCotangentAdd, TracingContext, TranspositionContext, check_count,
+    };
+
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(type(ArrayType), constant(Array))]
+    enum CustomOperation {
+        #[ryft(skip_from)]
+        Add(AddOperation<ArrayType>),
+    }
+
+    impl SupportsCotangentAdd for CustomOperation {
+        fn cotangent_add(input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 2, ProgramError);
+            Ok(Self::Add(AddOperation::new()))
+        }
+    }
+
+    let mut context = TranspositionContext::new(TracingContext::<Array, CustomOperation>::new());
+    let input_type = ArrayType::scalar(DataType::F32);
+    let accumulator = context.cotangent_accumulator(input_type.clone(), true);
+    let contribution = context.input(input_type);
+    accumulator.accumulate(&mut context, MaybeZero::Value(contribution.clone())).unwrap();
+    accumulator.accumulate(&mut context, MaybeZero::Value(contribution)).unwrap();
+    let builder = context.builder().borrow().clone();
+    let outputs = builder.instructions()[0].outputs().to_vec();
+    let program = builder.build::<Array, Array>(outputs, Placeholder, Placeholder).unwrap();
+    assert_eq!(
+        program.to_string(),
+        indoc! {"
+            lambda %0:f32[] .
+            let %1:f32[] = add %0 %0
+            in (%1)"},
+    );
+    assert_eq!(program.interpret(Array::scalar(3f32).unwrap()), Ok(Array::scalar(6f32).unwrap()));
+}
+
+#[test]
 fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");

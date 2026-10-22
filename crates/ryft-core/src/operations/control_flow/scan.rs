@@ -19,7 +19,8 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -2417,7 +2418,7 @@ where
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
-        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+        + SupportsCotangentAdd
         + From<ScanOperation<ArrayIrType>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {

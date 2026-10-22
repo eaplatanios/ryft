@@ -849,9 +849,20 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, DataType, DimensionBounds, DimensionVariable, EffectClass, EffectClasses, RaggedDimension,
-        RaggedExtents, RaggedStorage, RaggedValueKind,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, BatchAxis,
+        BatchingContext, BatchingPolicyProjection, CapturingContext, Compare, ComparisonDirection, CompilationDomain,
+        CompiledFunctionDispatcher, DataType, Device, DeviceMesh, DifferentiableType, DimensionBounds,
+        DimensionConstant, DimensionFromScalarOperation, DimensionToScalar, DimensionType, DimensionVariable,
+        DynamicArrayExtentBatchingPolicy, EffectClass, EffectClasses, LinearCallOperation, LogicalMesh, MeshAxis,
+        MeshAxisType, Print, ProjectedContext, RaggedArrayExtentBatchingPolicy, RaggedDimension, RaggedExtents,
+        RaggedStorage, RaggedValueKind, RaggedZeroOperation, Reduce, ReductionKind, Shape, Sharding, StagedFunction,
+        Value, call_function, differentiate_at, stage_function, try_jit_with_options,
     };
+
+    use crate::experimental::domains::XlaDomainError;
+    use crate::operations::debugging::with_captured_prints;
+    use crate::operations::jit_call::collect_jit_call_functions;
+    use crate::{FromPjrt, XlaOptions, XlaSession};
 
     use super::*;
 
@@ -860,9 +871,6 @@ mod tests {
 
     /// Uses the shared CPU client's first device for exact single-device transport checks.
     fn cpu_mesh(client: &ryft_pjrt::Client<'_>) -> ryft_core::DeviceMesh {
-        use crate::FromPjrt;
-        use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
-
         let logical = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         DeviceMesh::new(logical, vec![device]).unwrap()
@@ -886,8 +894,6 @@ mod tests {
 
     /// Builds a counter-controlled body that increments extents under fresh local indexed identities.
     fn changing_extent_while_regions(state_types: Vec<ArrayIrType>) -> (FlatXlaProgram, FlatXlaProgram) {
-        use ryft_core::{Compare, ComparisonDirection};
-
         let (_, condition) = LeafContext::trace_with_context_and_named_axes(
             |context, input: Vec<Leaf>| {
                 let two = context.lift(ryft_core::Array::scalar(2i64)?.into())?;
@@ -924,11 +930,6 @@ mod tests {
     fn test_eager_and_compiled_while_transport_changing_extents() {
         /// Keeps the compilation tracer and runtime value tied to the same client lifetime.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use crate::experimental::domains::XlaOptions;
-            use ryft_core::{
-                CompiledFunctionDispatcher, Reduce, ReductionKind, Value, WhileOperation, try_jit_with_options,
-            };
-
             let initial = runtime_ragged(domain);
             let counter = domain.lift(ryft_core::Array::scalar(0i64).unwrap().into()).unwrap();
             let types = vec![counter.r#type().into_owned(), initial.r#type().into_owned()];
@@ -986,13 +987,6 @@ mod tests {
     fn test_jit_grouped_captures_inline_and_deduplicated_execution() {
         /// Keeps the compilation tracer and runtime value tied to the same client lifetime.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use crate::experimental::domains::XlaOptions;
-            use crate::operations::jit_call::collect_jit_call_functions;
-            use ryft_core::{
-                CapturingContext, CompiledFunctionDispatcher, Reduce, ReductionKind, StagedFunction, Value,
-                stage_function, try_jit_with_options,
-            };
-
             let source = runtime_ragged(domain);
             let offset = domain.lift(ryft_core::Array::scalar(2i64).unwrap().into()).unwrap();
             let input_types = vec![source.r#type().into_owned(), offset.r#type().into_owned()];
@@ -1086,14 +1080,6 @@ mod tests {
     fn test_scan_shared_and_permuted_nested_extent_transport() {
         /// Keeps the compilation tracer and runtime value tied to the same client lifetime.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use crate::experimental::domains::XlaOptions;
-            use ryft_core::{
-                Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis,
-                BatchingContext, BatchingPolicyProjection, CompiledFunctionDispatcher, DimensionConstant,
-                DynamicArrayExtentBatchingPolicy, ProjectedContext, RaggedArrayExtentBatchingPolicy, Reduce,
-                ReductionKind, Value, try_jit_with_options,
-            };
-
             for (length, reverse) in [(2usize, false), (2, true), (0, false)] {
                 let rows = DimensionVariable::new("stack_rows", DimensionBounds::non_negative(Some(3)).unwrap());
                 let columns = DimensionVariable::new("stack_columns", DimensionBounds::non_negative(Some(4)).unwrap());
@@ -1251,12 +1237,6 @@ mod tests {
     fn test_dynamic_scan_runtime_length_reuses_compiled_dispatcher_on_cpu() {
         /// Uses one bounded signature and one dispatcher for nonempty and zero-trip physical values.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{
-                CompiledFunctionDispatcher, DimensionSize, Reduce, ReductionKind, Shape, Value, try_jit_with_options,
-            };
-
-            use crate::experimental::domains::XlaOptions;
-
             let length = DimensionVariable::new("runtime_scan_length", DimensionBounds::non_negative(Some(3)).unwrap());
             let rows = DimensionVariable::new("runtime_scan_rows", DimensionBounds::non_negative(Some(4)).unwrap());
             let declared = RaggedType::new(
@@ -1547,8 +1527,6 @@ mod tests {
 
     #[test]
     fn test_invocation_comparison_preserves_dense_resharding_contract() {
-        use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-
         let declared = representation();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let storage = declared.storage_type().clone().with_sharding(Sharding::replicated(mesh, 2)).unwrap();
@@ -1634,8 +1612,6 @@ mod tests {
 
     #[test]
     fn test_jit_deduplication_retains_logical_group_schema() {
-        use crate::operations::jit_call::collect_jit_call_functions;
-
         let descriptor = |name, axes| {
             RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 2, 3]),
@@ -1680,8 +1656,6 @@ mod tests {
 
     #[test]
     fn test_jit_local_result_identity_inference_and_renaming() {
-        use ryft_core::TypeIdentityRenaming;
-
         let r#type = representation();
         let (_, callee) = LeafContext::trace(
             |input: Vec<Leaf>| Ok(vec![input[0].ragged_new(r#type.clone(), &input[1..])?]),
@@ -1714,12 +1688,6 @@ mod tests {
     fn test_staged_jit_calls_keep_different_runtime_extent_families() {
         /// Keeps the compilation tracer and runtime value tied to the same client lifetime.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use crate::experimental::domains::XlaOptions;
-            use ryft_core::{
-                CompiledFunctionDispatcher, Reduce, ReductionKind, StagedFunction, Value, stage_function,
-                try_jit_with_options,
-            };
-
             let storage = domain.lift(ryft_core::Array::matrix(2, 3, vec![7f32; 6]).unwrap().into()).unwrap();
             let left = domain.lift(ryft_core::Array::vector(vec![0i64, 1]).unwrap().into()).unwrap();
             let right = domain.lift(ryft_core::Array::vector(vec![2i64, 3]).unwrap().into()).unwrap();
@@ -1765,10 +1733,6 @@ mod tests {
     fn test_compiled_executions_own_local_identities_and_forward_runtime_input_identities() {
         /// Keeps the compilation tracer and runtime handles tied to the same CPU client.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use crate::experimental::domains::XlaOptions;
-            use ryft_core::{
-                CompiledFunctionDispatcher, RaggedZeroOperation, Reduce, ReductionKind, try_jit_with_options,
-            };
             let producer: CompiledFunctionDispatcher<XlaDomain<'c>, _, (), Vec<ArrayIrType>, ArrayIrType> =
                 try_jit_with_options(
                     domain,
@@ -1834,10 +1798,6 @@ mod tests {
     fn test_jit_call_repeated_alpha_inputs_preserve_entry_checks() {
         /// Compares one tracer passed twice with separate untrusted values under the same fresh input scope.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{CompiledFunctionDispatcher, Value, try_jit_with_options};
-
-            use crate::experimental::domains::XlaOptions;
-
             let left = runtime_ragged(domain);
             let actual_type = left.r#type();
             let actual = <&RaggedType>::try_from(actual_type.as_ref()).unwrap().clone();
@@ -1920,10 +1880,6 @@ mod tests {
     fn test_jit_call_aliased_dimension_items_have_one_owner() {
         /// Runs two independent calls exporting aliases of one callee-local dimension item family.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{CompilationDomain, StagedFunction, Value, call_function, stage_function};
-
-            use crate::experimental::domains::XlaOptions;
-
             let storage_type = ArrayType::new_static(DataType::I64, [2]);
             let item = ryft_core::DimensionType::new("item", DimensionBounds::non_negative(Some(4)).unwrap());
             let raw = RaggedType::new(storage_type.clone(), RaggedValueKind::Dimension(item), vec![]).unwrap();
@@ -1984,9 +1940,6 @@ mod tests {
     fn test_compiled_independent_results_ignore_unreturned_input_families() {
         /// Uses one explicit formal equality class with independent runtime input names, checked at entry.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use crate::experimental::domains::XlaOptions;
-            use ryft_core::{CompilationDomain, StagedFunction, call_function, stage_function};
-
             let formal = representation();
             let local = representation();
             let staged: StagedFunction<XlaDomain<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>> = stage_function(
@@ -2044,10 +1997,6 @@ mod tests {
     fn test_static_dimension_item_results_carry_actual_kind() {
         /// Calls one declared dimension-item family with different exact items through compiled and eager dispatch.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{CompiledFunctionDispatcher, DimensionType, try_jit_with_options};
-
-            use crate::experimental::domains::{XlaDomainError, XlaOptions};
-
             let storage_type = ArrayType::new_static(DataType::I64, [2]);
             let item = DimensionType::new("item", DimensionBounds::non_negative(Some(8)).unwrap());
             let declared = RaggedType::new(storage_type.clone(), RaggedValueKind::Dimension(item), vec![]).unwrap();
@@ -2140,8 +2089,6 @@ mod tests {
 
     #[test]
     fn test_jit_call_jvp_preserves_local_result_shape_relationships() {
-        use ryft_core::DifferentiableType;
-
         let r#type = representation();
         let input_types = vec![
             ArrayIrType::Array(r#type.storage_type().clone()),
@@ -2171,10 +2118,6 @@ mod tests {
     fn test_grouped_region_entry_checks_untrusted_extent_payloads_on_cpu() {
         /// Keeps both dispatch paths tied to one client while isolating failed assertion scopes.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{CompiledFunctionDispatcher, Reduce, ReductionKind, Value, try_jit_with_options};
-
-            use crate::experimental::domains::XlaOptions;
-
             for length in [2, 0] {
                 let rows = DimensionVariable::new("entry_rows", DimensionBounds::non_negative(Some(4)).unwrap());
                 let r#type = RaggedType::new(
@@ -2267,8 +2210,6 @@ mod tests {
         /// loop body print after their ragged entry checks, between two prints of the enclosing program. Each `before`
         /// print observes a constant, so only the effect token chain orders it after the enclosing entry check.
         fn programs(ragged: ArrayIrType, counter: ArrayIrType) -> (FlatXlaProgram, FlatXlaProgram) {
-            use ryft_core::{Array, Compare, ComparisonDirection, Print, Reduce, ReductionKind};
-
             let ragged = vec![ragged; 2];
             let (_, callee) = LeafContext::trace(
                 |input: Vec<Leaf>| {
@@ -2325,10 +2266,6 @@ mod tests {
 
         /// Keeps compilation and execution on one client while isolating failed assertion scopes.
         fn run<'c>(domain: &XlaDomain<'c>) {
-            use ryft_core::Array;
-
-            use crate::operations::debugging::with_captured_prints;
-
             let matching = runtime_ragged(domain);
             let storage = domain.lift(Array::matrix(2, 3, vec![7f32; 6]).unwrap().into()).unwrap();
             let extents = domain.lift(Array::vector(vec![2i64, 3]).unwrap().into()).unwrap();
@@ -2619,15 +2556,6 @@ mod tests {
     fn test_nested_ragged_policy_masked_storage_reduction_on_cpu() {
         /// Keeps compilation and execution on one client while using the public batching-policy surface.
         fn run<'c>(domain: &XlaDomain<'c>, mesh: ryft_core::DeviceMesh) {
-            use ryft_core::{
-                ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, BatchAxis, BatchingContext,
-                BatchingPolicyProjection, CompiledFunctionDispatcher, DimensionConstant,
-                DynamicArrayExtentBatchingPolicy, ProjectedContext, RaggedArrayExtentBatchingPolicy, Reduce,
-                ReductionKind, Value, try_jit_with_options,
-            };
-
-            use crate::experimental::domains::XlaOptions;
-
             let r#type = RaggedType::new(
                 ArrayType::new_static(DataType::F32, [2, 2, 3]).replicated(&mesh).unwrap(),
                 RaggedValueKind::Array,
@@ -2739,8 +2667,6 @@ mod tests {
 
     #[test]
     fn test_linear_call_final_replay_preserves_passive_extent_fields() {
-        use ryft_core::LinearCallOperation;
-
         let r#type = representation();
         let (_, forward) =
             LeafContext::trace(|input: Vec<Leaf>| Ok(input), vec![ArrayIrType::Ragged(r#type.clone())]).unwrap();
@@ -2762,10 +2688,6 @@ mod tests {
 
     #[test]
     fn test_linear_call_final_replay_preserves_scalar_result_definition() {
-        use ryft_core::{
-            DifferentiableType, DimensionFromScalarOperation, DimensionToScalar, DimensionType, LinearCallOperation,
-        };
-
         let inputs = vec![ArrayIrType::Ragged(representation()), ArrayIrType::Array(ArrayType::scalar(DataType::I64))];
         let dimension = DimensionType::new("computed", DimensionBounds::non_negative(Some(3)).unwrap());
         let (_, forward) = LeafContext::trace_with_context_and_named_axes(
@@ -2809,11 +2731,6 @@ mod tests {
 
     #[test]
     fn test_ragged_reverse_accumulation_and_disconnected_zero_cpu() {
-        use ryft_core::{Array, CompiledFunctionDispatcher, differentiate_at, try_jit_with_options};
-
-        use crate::XlaSession;
-        use crate::experimental::domains::XlaOptions;
-
         fn read_f32(value: &XlaValue<'_>) -> Vec<f32> {
             let array = <XlaValue<'_> as ValueProjection<ArrayType>>::projected(value).unwrap();
             let bytes = array

@@ -17,7 +17,8 @@ use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -1334,7 +1335,7 @@ where
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
-        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+        + SupportsCotangentAdd
         + From<ConditionOperation<ArrayIrType>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
@@ -2913,13 +2914,12 @@ mod tests {
     ) where
         O: From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
             + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
-            + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>,
+            + From<AddOperation<ArrayType>>,
     {
         let value =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         if mutate {
-            let value_type = builder.atoms()[value.index()].r#type();
-            let operation = O::provide(AddOperation::new(), &[value_type.as_ref(), value_type.as_ref()]).unwrap();
+            let operation = AddOperation::<ArrayType>::new();
             let doubled = builder.add_instruction(operation, Vec::new(), vec![value, value], None).unwrap()[0];
             builder
                 .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)

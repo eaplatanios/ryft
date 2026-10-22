@@ -39,8 +39,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, SupportsCotangentAdd,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_transposable_operation, impl_reference_dischargeable_operation};
@@ -1063,8 +1063,8 @@ impl_non_transposable_operation!(RaggedZeroOperation);
 pub const RAGGED_ADD_OPERATION_NAME: &str = "ragged_add";
 
 /// Adds two ragged cotangent representations after checking all live extent occurrences for agreement. Indexed
-/// metadata is copied rather than numerically added. This operation is selected by the addition provider; ordinary
-/// numerical capabilities continue to require explicit ordinary storage projection.
+/// metadata is copied rather than numerically added. The [`SupportsCotangentAdd`] trait selects this operation;
+/// ordinary numerical capabilities continue to require explicit ordinary storage projection.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RaggedAddOperation;
 
@@ -1218,7 +1218,7 @@ where
 impl<V, O> TransposableOperation<V, O> for RaggedAddOperation
 where
     V: Value<Type = ArrayIrType>,
-    O: Operation<Type = ArrayIrType> + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>,
+    O: Operation<Type = ArrayIrType> + SupportsCotangentAdd,
     TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -3222,7 +3222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_zero_and_add_provider() {
+    fn test_ragged_zero_and_cotangent_add() {
         let value = differential_value();
         let r#type = <&RaggedType>::try_from(value.r#type().as_ref()).unwrap().clone();
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3235,9 +3235,8 @@ mod tests {
             Array::from_elements(r#type.storage_type().clone(), &[0f32; 6]).unwrap().into()
         );
         assert_eq!(zero.ragged_extents(1), value.ragged_extents(1));
-        let request = AddOperation::<ArrayIrType>::new();
         let operation =
-            ArrayIrOperation::<Array>::provide(request, &[&r#type.clone().into(), &r#type.clone().into()]).unwrap();
+            ArrayIrOperation::<Array>::cotangent_add(&[&r#type.clone().into(), &r#type.clone().into()]).unwrap();
         assert!(matches!(operation, ArrayIrOperation::RaggedAdd(_)));
         let sum = context.bind(operation, Vec::new(), &[value.clone(), value.clone()]).unwrap().remove(0);
         assert_eq!(
@@ -3780,6 +3779,169 @@ mod tests {
         .unwrap_err()
         .into();
         assert_eq!(error.downcast_custom(), Some(&differential_shape_mismatch()));
+    }
+
+    #[test]
+    fn test_ragged_storage_batching_differentiation_replicated_tangent() {
+        use crate::arrays::ArrayIrBatchingPolicy;
+        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
+        use crate::differentiation::differentiate_at;
+
+        // One replicated item tangent serves every item of a mapped primal whose per-item extents all equal its own.
+        // The tangent validation aligns it to the primal's mapped representation and checks each item separately.
+        type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let primal = |extents: Vec<i64>| {
+            ArrayIrValue::Ragged(
+                RaggedValue::new(
+                    RaggedType::new(
+                        ArrayType::new_static(DataType::F32, [2, 3]),
+                        RaggedValueKind::Array,
+                        vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+                    )
+                    .unwrap(),
+                    Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap(),
+                    vec![Array::vector(extents).unwrap()],
+                )
+                .unwrap(),
+            )
+        };
+        let tangent = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                RaggedType::new(
+                    ArrayType::new_static(DataType::F32, [3]),
+                    RaggedValueKind::Array,
+                    vec![RaggedDimension::new(0, rows.clone(), Vec::new())],
+                )
+                .unwrap(),
+                Array::vector(vec![7f32, 8., 9.]).unwrap(),
+                vec![Array::scalar(2i64).unwrap()],
+            )
+            .unwrap(),
+        );
+        let batched_derivative = |primal: ArrayIrValue<Array>| {
+            batch(
+                |(primal, tangent): (Batched, Batched)| {
+                    differentiate_at(primal)
+                        .jvp(tangent, |input| input.ragged_storage())
+                        .map(|(_, tangent)| tangent)
+                        .map_err(Into::into)
+                },
+                (primal, tangent.clone()),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            )
+        };
+        assert_eq!(
+            batched_derivative(primal(vec![2, 2])),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![7f32, 8., 9., 7., 8., 9.]).unwrap())),
+        );
+
+        // A primal item whose live extent differs from the shared tangent extent fails for that item alone.
+        let error: ProgramError = batched_derivative(primal(vec![1, 2])).unwrap_err().into();
+        assert_eq!(
+            error.downcast_custom(),
+            Some(&AssertionError::FailedElements {
+                message: "guarded ragged occurrences of `rows` must have equal live extents".to_owned(),
+                failures: vec![AssertionFailure {
+                    index: vec![0],
+                    observations: vec![
+                        ("extent".to_owned(), "1".to_owned()),
+                        ("other_extent".to_owned(), "2".to_owned()),
+                    ],
+                }],
+                omitted: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_ragged_add_batching_replicated_contribution() {
+        use crate::arrays::ArrayIrBatchingPolicy;
+        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
+
+        type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let mapped = |descriptor: RaggedDimension, extents: Array| {
+            ArrayIrValue::Ragged(
+                RaggedValue::new(
+                    RaggedType::new(
+                        ArrayType::new_static(DataType::F32, [2, 3]),
+                        RaggedValueKind::Array,
+                        vec![descriptor],
+                    )
+                    .unwrap(),
+                    Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap(),
+                    vec![extents],
+                )
+                .unwrap(),
+            )
+        };
+        let replicated = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                RaggedType::new(
+                    ArrayType::new_static(DataType::F32, [3]),
+                    RaggedValueKind::Array,
+                    vec![RaggedDimension::new(0, rows.clone(), Vec::new())],
+                )
+                .unwrap(),
+                Array::vector(vec![10f32, 20., 30.]).unwrap(),
+                vec![Array::scalar(2i64).unwrap()],
+            )
+            .unwrap(),
+        );
+        let sum = |inputs: Vec<ArrayIrValue<Array>>, axes: Vec<BatchAxis>| {
+            batch(
+                |inputs: Vec<Batched>| {
+                    inputs[0].domain().bind(RaggedAddOperation, Vec::new(), &inputs)?.remove(0).ragged_storage()
+                },
+                inputs,
+                axes,
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            )
+        };
+        let expected = Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![11f32, 22., 33., 14., 25., 36.]).unwrap()));
+
+        // The replicated contribution is aligned to the mapped storage axis in either input order, taking per-item
+        // extents where the mapped contribution varies over the batch coordinate and its shared extent elsewhere.
+        let per_item = mapped(RaggedDimension::new(1, rows.clone(), vec![0]), Array::vector(vec![2i64, 2]).unwrap());
+        let shared = mapped(RaggedDimension::new(1, rows.clone(), Vec::new()), Array::scalar(2i64).unwrap());
+        for mapped in [per_item, shared] {
+            assert_eq!(
+                sum(vec![mapped.clone(), replicated.clone()], vec![BatchAxis::new(0), BatchAxis::replicated()]),
+                expected,
+            );
+            assert_eq!(
+                sum(vec![replicated.clone(), mapped], vec![BatchAxis::replicated(), BatchAxis::new(0)]),
+                expected,
+            );
+        }
+
+        // Every batch item's live extents are still checked against the replicated contribution.
+        let error: ProgramError = sum(
+            vec![mapped(RaggedDimension::new(1, rows, vec![0]), Array::vector(vec![2i64, 1]).unwrap()), replicated],
+            vec![BatchAxis::new(0), BatchAxis::replicated()],
+        )
+        .unwrap_err()
+        .into();
+        assert_eq!(
+            error.downcast_custom(),
+            Some(&AssertionError::FailedElements {
+                message: "ragged identity source for `rows` must have equal live extents".to_owned(),
+                failures: vec![AssertionFailure {
+                    index: vec![1],
+                    observations: vec![
+                        ("extent".to_owned(), "2".to_owned()),
+                        ("source_extent".to_owned(), "1".to_owned()),
+                    ],
+                }],
+                omitted: 0,
+            }),
+        );
     }
 
     #[test]

@@ -29,9 +29,9 @@ use ryft_core::{
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
     ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
-    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
-    TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming, Typed,
-    UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
+    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, SupportsCotangentAdd, TagOperation,
+    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming,
+    Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
     XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_macros::Parameter;
@@ -989,14 +989,12 @@ where
     }
 }
 
-impl<Constant> OperationProvider<ArrayIrType, AddOperation<ArrayIrType>> for XlaOperation<Constant>
+impl<Constant> SupportsCotangentAdd for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    type Operation = Self;
-
-    fn provide(request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
+    fn cotangent_add(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        Ok(ArrayIrOperation::<Constant::Projected>::cotangent_add(input_types)?.into())
     }
 }
 

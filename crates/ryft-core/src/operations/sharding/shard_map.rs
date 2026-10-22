@@ -184,11 +184,11 @@ use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -2693,7 +2693,7 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
-        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
+        + SupportsCotangentAdd
         + From<ShardMapOperation>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
         + OperationProjection<
@@ -5170,7 +5170,7 @@ mod tests {
         DifferentiationRule, Linearization, NothingSavable, TransposedProgram, TransposedProgramCotangent,
         differentiate_at, rematerialize,
     };
-    use crate::operations::arithmetic::{MulOperation, NegOperation, SubOperation};
+    use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::axis_index::{AxisIndex, AxisIndexOperation};
     use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
     use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
