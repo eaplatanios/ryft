@@ -35,7 +35,7 @@ impl ReferenceId {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         Self(
             NEXT_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("reference allocation identities exhausted"),
         )
     }

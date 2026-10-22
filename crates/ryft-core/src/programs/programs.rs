@@ -550,7 +550,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// including those for repeated indexed input families; it does not prove equality between their runtime extent
     /// payloads.
     pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<'_, Self>, ProgramError> {
-        let renaming = V::Type::derive_scope_identity_renaming(self.input_types().as_slice(), input_types)?;
+        let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
         if renaming.is_identity() {
             return Ok(Cow::Borrowed(self));
         }

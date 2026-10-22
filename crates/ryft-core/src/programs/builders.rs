@@ -391,7 +391,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// its inputs to the caller-provided `inputs` and returning the builder atoms holding the program's outputs, in
     /// output order. This is a structural relocation and not a re-interpretation or partial evaluation. Boundary
     /// identities are instantiated from the caller-provided input types, and [`TypeIdentity`](crate::TypeIdentity)s
-    /// defined inside the source graph are replaced with fresh identities for each splice. Every fresh replacement
+    /// defined inside the source graph are replaced with fresh identities for each splice, except identities also
+    /// bound by the source entry inputs. Closed rules retain those caller bindings. Every fresh replacement
     /// is checked against the source graph, the destination builder, and replacements generated earlier in the same
     /// splice. Every instruction and live constant is otherwise rebuilt verbatim. Conditional reconstruction, for
     /// example, uses this relocation to graft partitioned branch programs into their shared known and residual
@@ -432,6 +433,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 
         // Reserve every source type identity before generating targets, while retaining the internally defined subset
         // that this splice must rename.
+        let entry_identities = program.type_identity_signature().input_identities();
         let mut internal_type_identities = Vec::new();
         for region_index in 0..program.regions().len() {
             let signature = program
@@ -439,7 +441,16 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 .type_identity_signature(RegionId::new(region_index))
                 .expect("iterating a region arena by index must produce valid region identifiers");
             unavailable_type_identities.extend(signature.identities().iter().cloned());
-            internal_type_identities.extend(signature.internal_identities().iter().cloned());
+
+            // A closed rule can locally define a dimension also bound by the enclosing entry. Its caller binding
+            // must remain consistent with that rule and the relocated entry input atoms.
+            internal_type_identities.extend(
+                signature
+                    .internal_identities()
+                    .iter()
+                    .filter(|identity| !entry_identities.contains(identity))
+                    .cloned(),
+            );
         }
 
         let mut renaming = TypeIdentityRenaming::new();
@@ -594,7 +605,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // Deriving the renaming both validates the requested boundary and determines whether importing the callee
         // would actually change any live identity. Calls without `input_types` have no instantiation to derive.
         let renaming = input_types
-            .map(|input_types| V::Type::derive_scope_identity_renaming(callee.input_types().as_slice(), input_types))
+            .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types))
             .transpose()?;
 
         let non_identity_renaming = renaming.as_ref().filter(|renaming| !renaming.is_identity());
@@ -944,6 +955,7 @@ mod tests {
     use std::fmt::Display;
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -1834,6 +1846,139 @@ mod tests {
         let outputs = builder.add_instruction_or_fold(operation, Vec::new(), vec![input], None).unwrap();
         assert_eq!(outputs, vec![AtomId::new(1)]);
         assert_eq!(builder.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_pins_entry_identities_in_closed_rules() -> Result<(), ProgramError> {
+        /// A closed rule defines its caller's dimension locally and also owns an unrelated private dimension.
+        #[derive(Clone)]
+        enum ClosedRuleOperation {
+            Define(DimensionType),
+            Call(DimensionType),
+        }
+
+        impl Operation for ClosedRuleOperation {
+            type Type = DimensionType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Define(_) => "define",
+                    Self::Call(_) => "closed_rule",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Define(_) => &[],
+                    Self::Call(_) => const { &[RegionSlot::computation("rule")] },
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[DimensionType],
+                regions: &[RegionInterface<DimensionType>],
+            ) -> Result<Vec<DimensionType>, TypeError> {
+                match self {
+                    Self::Define(r#type) => {
+                        check_count!("input", input_types, 0, TypeError);
+                        check_count!("region", regions, 0, TypeError);
+                        Ok(vec![r#type.clone()])
+                    }
+                    Self::Call(r#type) => {
+                        check_count!("input", input_types, 1, TypeError);
+                        check_count!("region", regions, 1, TypeError);
+                        if input_types[0] != *r#type || regions[0].output_types().first() != Some(r#type) {
+                            return Err(TypeError::invalid("closed rule must preserve its caller dimension identity"));
+                        }
+                        Ok(vec![r#type.clone()])
+                    }
+                }
+            }
+
+            fn rename_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<DimensionVariable>,
+            ) -> Result<Self, TypeError> {
+                match self {
+                    Self::Define(r#type) => Ok(Self::Define(r#type.rename_identities(renaming)?)),
+                    Self::Call(r#type) => Ok(Self::Call(r#type.rename_identities(renaming)?)),
+                }
+            }
+        }
+
+        let bounds = DimensionBounds::new(1, Some(4))?;
+        let entry_type = DimensionType::new("entry", bounds);
+        let private_type = DimensionType::new("private", bounds);
+        let mut child = ProgramBuilder::<DimensionValue, ClosedRuleOperation>::new();
+        let child_entry =
+            child.add_instruction(ClosedRuleOperation::Define(entry_type.clone()), Vec::new(), Vec::new(), None)?[0];
+        let child_private =
+            child.add_instruction(ClosedRuleOperation::Define(private_type.clone()), Vec::new(), Vec::new(), None)?[0];
+        let child = child.build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+            vec![child_entry, child_private],
+            Vec::new(),
+            vec![Placeholder; 2],
+        )?;
+        let mut builder = ProgramBuilder::<DimensionValue, ClosedRuleOperation>::new();
+        let input = builder.add_input(entry_type.clone());
+        let child = builder.import_region(child.entry_region_ref());
+        let output =
+            builder.add_instruction(ClosedRuleOperation::Call(entry_type.clone()), vec![child], vec![input], None)?[0];
+        let program = builder.build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+            vec![output],
+            vec![Placeholder],
+            vec![Placeholder],
+        )?;
+
+        // Unchanged and fresh caller input namespaces pin their identities throughout closed rules.
+        // Only genuinely private definitions are freshened, independently for each splice.
+        for caller in [entry_type, DimensionType::new("caller", bounds)] {
+            let mut destination = ProgramBuilder::<DimensionValue, ClosedRuleOperation>::new();
+            let input = destination.add_input(caller.clone());
+            let first = destination.splice_program(&program, &[input])?;
+            let first_program = destination.clone().build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                first.clone(),
+                vec![Placeholder],
+                vec![Placeholder],
+            )?;
+            let caller_name = caller.variable().unwrap().name();
+            assert_eq!(
+                first_program.to_string(),
+                format!(
+                    indoc! {"
+                    lambda %0:dimension<{caller_name} ∈ [1, 4)> .
+                    let %1:dimension<{caller_name} ∈ [1, 4)> = closed_rule %0 [
+                        rule={{
+                            lambda  .
+                            let %0:dimension<{caller_name} ∈ [1, 4)> = define
+                                %1:dimension<private ∈ [1, 4)> = define
+                            in (%0, %1)
+                        }},
+                    ]
+                    in (%1)
+                "},
+                    caller_name = caller_name,
+                )
+                .trim_end(),
+            );
+            let second = destination.splice_program(&program, &[input])?;
+            let relocated = destination.build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                [first, second].concat(),
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )?;
+            assert_eq!(relocated.input_types(), vec![caller.clone()]);
+            assert_eq!(relocated.output_types(), vec![caller.clone(); 2]);
+            let first = relocated.region(relocated.instructions()[0].regions()[0])?;
+            let second = relocated.region(relocated.instructions()[1].regions()[0])?;
+            assert_eq!(first.output_types()[0], caller);
+            assert_eq!(second.output_types()[0], caller);
+            assert_ne!(first.output_types()[1], private_type);
+            assert_ne!(second.output_types()[1], private_type);
+            assert_ne!(first.output_types()[1], second.output_types()[1]);
+        }
+        Ok(())
     }
 
     #[test]

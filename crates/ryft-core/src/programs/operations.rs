@@ -520,37 +520,6 @@ pub trait Operation: Clone {
         Cow::Borrowed(&[])
     }
 
-    /// Returns input [`TypeIdentity`](crate::TypeIdentity)s whose logical information this operation may deliberately
-    /// omit from its outputs. An empty declaration requires transforms to preserve every identity-bearing carrier
-    /// unless their rule supplies separate evidence that it consumed the information correctly.
-    ///
-    /// `input_types` describes the original logical application. Batching queries this function with per-item types
-    /// excluding its mapped dimension, so the declaration cannot accidentally consume identities introduced by the
-    /// transform. Implementations validate their declaration against these types and must reject any returned identity
-    /// absent from them. An identity may still occur in outputs. The declaration must follow
-    /// [`Self::rename_type_identities`] when operation-owned identities are renamed.
-    ///
-    /// Consumption permits an output to discard an association, such as projecting padded storage out of a ragged
-    /// value. It neither removes the identity from its enclosing scope nor proves numerical relationships between
-    /// runtime extents. Transform-specific claims remain the responsibility of each transform rule.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Logical input types supplied to this operation, in input order.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] if the input types do not admit this operation's consumption declaration,
-    /// including when a declared identity does not occur in an input type.
-    #[inline]
-    fn consumed_type_identities(
-        &self,
-        input_types: &[Self::Type],
-    ) -> Result<Vec<<Self::Type as Type>::Identity>, TypeError> {
-        let _ = input_types;
-        Ok(Vec::new())
-    }
-
     /// Returns declarations for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in operation-defined
     /// order. Each [`RegionSlot`] supplies the stable name used by diagnostics and rendering together with the
     /// [`RegionRole`] that determines whether the region may execute during ordinary interpretation. The declared
@@ -1098,14 +1067,6 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
-    fn consumed_type_identities(
-        &self,
-        input_types: &[Self::Type],
-    ) -> Result<Vec<<Self::Type as Type>::Identity>, TypeError> {
-        self.as_ref().consumed_type_identities(input_types)
-    }
-
-    #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         self.as_ref().region_slots()
     }
@@ -1429,60 +1390,11 @@ pub trait MemberOperation<U: Type>: Operation {
     /// constructor whose outputs only reference the identities of its first-class dimension inputs therefore keeps the
     /// default. The declared identities are operation metadata and must follow [`Self::rename_parent_type_identities`].
     ///
-    /// # Examples
-    ///
-    /// A custom call keeps its native array payload, whose output in the homogeneous array universe is padded storage
-    /// such as `f32[batch, 8]`. Under a ragged contract with a fresh output binding, the same call produces a ragged
-    /// value in the mixed universe whose descriptor references the binding's dimension `length`. That identity is
-    /// established by the call (its live extents come from another output of the same call), so the member declares
-    /// it in the parent universe while its native [`Operation::defined_type_identities`] stays empty:
-    ///
-    /// ```rust,ignore
-    /// impl MemberOperation<ArrayIrType> for CustomCallOperation {
-    ///     fn parent_defined_type_identities(&self) -> Cow<'_, [DimensionVariable]> {
-    ///         // One declaration per fresh ragged output dimension, in output order; a dimension that an input
-    ///         // binding preserves is forwarded from that input and is not declared.
-    ///         let Some(contract) = self.ragged_contract() else {
-    ///             return Cow::Borrowed(&[]);
-    ///         };
-    ///         Cow::Owned(
-    ///             contract
-    ///                 .output_bindings()
-    ///                 .iter()
-    ///                 .filter_map(|binding| match binding {
-    ///                     CustomCallRaggedOutputBinding::Fresh { dimension, .. } => Some(dimension.clone()),
-    ///                     CustomCallRaggedOutputBinding::Preserved { .. } => None,
-    ///                     CustomCallRaggedOutputBinding::Consumed => None,
-    ///                 })
-    ///                 .collect(),
-    ///         )
-    ///     }
-    ///
-    ///     // ...
-    /// }
-    /// ```
-    ///
-    /// Region sealing then records `length` as defined by this instruction, in output-occurrence order,
-    /// and rejects a later instruction that declares it again without consuming it.
+    /// Region sealing records these definitions in output-occurrence order and rejects a later instruction that
+    /// declares an existing identity without forwarding it from an input.
     #[inline]
     fn parent_defined_type_identities(&self) -> Cow<'_, [U::Identity]> {
         Cow::Borrowed(&[])
-    }
-
-    /// Returns the input identities this instruction may consume in parent universe `U`, using
-    /// [`Operation::consumed_type_identities`] semantics. Mixed members declare parent identities explicitly
-    /// because their native identity vocabulary and logical input types may differ from the parent universe's.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Logical parent-universe input types, in input order.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] if these parent input types do not admit the consumption declaration.
-    #[inline]
-    fn parent_consumed_type_identities(&self, _input_types: &[U]) -> Result<Vec<U::Identity>, TypeError> {
-        Ok(Vec::new())
     }
 
     /// Validates the attached-[`Region`](crate::Region) interfaces of this payload's instruction in parent universe

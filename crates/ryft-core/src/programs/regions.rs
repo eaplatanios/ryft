@@ -205,8 +205,6 @@ impl<V: Typed + Parameter, O> Region<V, O> {
     where
         O: Operation<Type = V::Type>,
     {
-        V::Type::validate_identity_scope(self.atoms.iter().map(Typed::r#type))?;
-
         // Region inputs establish the identities that are available at entry. Preserve first-occurrence order and
         // record each identity once even when several input types refer to the same dynamic quantity. Note that the
         // complete ordered signature is also the dominance environment while walking the region. Every identity
@@ -1790,8 +1788,7 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Repla
                 // Derive the additional substitution required by the requested formal inputs, such as `n -> k` when
                 // a region declared over `Array[n]` is called with `Array[k]`. This validates the complete input
                 // signature before importing the corresponding body.
-                let input_renaming =
-                    V::Type::derive_scope_identity_renaming(region.input_types().as_slice(), input_types)?;
+                let input_renaming = V::Type::derive_identity_renaming(region.input_types().as_slice(), input_types)?;
                 let imported = if input_renaming.is_identity() {
                     // No additional substitution is needed. Descendants can share the map for this replay
                     // type-identity renaming, including entries created by the direct-import path above.
