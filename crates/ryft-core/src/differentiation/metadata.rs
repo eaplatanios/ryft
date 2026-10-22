@@ -248,6 +248,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::contexts::{Domain, EagerContext, StagingContext};
+    use crate::differentiation::types::DifferentiableType;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::ConstantOperation;
     use crate::parameters::Placeholder;
@@ -261,17 +262,17 @@ mod tests {
     #[ryft(type(ArrayType), constant(Array))]
     enum MetadataProbeOperation {
         Constant(ConstantOperation<Array>),
-        Validate(MetadataValidationProbe),
+        Validate(MetadataValidationProbeOperation),
     }
 
     /// Requires the original differential, its primal type, and an ordered prefix of the probe's metadata markers.
     #[derive(Clone, Debug)]
-    struct MetadataValidationProbe {
-        /// Primal type received by the metadata provider, checked against the differential's type during interpretation.
+    struct MetadataValidationProbeOperation {
+        /// Primal type forwarded by the provider; its tangent type must match the differential's type.
         primal_type: ArrayType,
     }
 
-    impl Operation for MetadataValidationProbe {
+    impl Operation for MetadataValidationProbeOperation {
         type Type = ArrayType;
 
         fn name(&self) -> &'static str {
@@ -289,7 +290,7 @@ mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType, Value = Array>> InterpretableOperation<C> for MetadataValidationProbe {
+    impl<C: Domain<Type = ArrayType, Value = Array>> InterpretableOperation<C> for MetadataValidationProbeOperation {
         fn interpret<D: InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -297,13 +298,19 @@ mod tests {
             inputs: &[Array],
         ) -> Result<Vec<Array>, ProgramError> {
             let (differential, metadata) = inputs.split_first().unwrap();
-            assert_eq!(&self.primal_type, differential.r#type().as_ref());
             if metadata.is_empty() {
                 return Err(ProgramError::InvalidArgument {
                     message: "metadata probe received no captured values".into(),
                 });
             }
-            let expected = [differential.clone(), Array::scalar(7f32).unwrap(), Array::scalar(11f32).unwrap()];
+            assert_eq!(&self.primal_type, metadata[0].r#type().as_ref());
+            assert_eq!(&self.primal_type.tangent().unwrap(), differential.r#type().as_ref());
+            let expected_primal = if differential.r#type().data_type() == DataType::Zero {
+                metadata[0].clone()
+            } else {
+                differential.clone()
+            };
+            let expected = [expected_primal, Array::scalar(7f32).unwrap(), Array::scalar(11f32).unwrap()];
             if metadata.len() > expected.len() || metadata != &expected[..metadata.len()] {
                 return Err(ProgramError::InvalidArgument {
                     message: "metadata probe received incompatible values".into(),
@@ -349,7 +356,7 @@ mod tests {
         ) -> Result<C::Value, ProgramError> {
             let inputs = std::iter::once(differential).chain(metadata.iter().cloned()).collect::<Vec<_>>();
             Ok(context
-                .bind(MetadataValidationProbe { primal_type: primal_type.clone() }, Vec::new(), &inputs)?
+                .bind(MetadataValidationProbeOperation { primal_type: primal_type.clone() }, Vec::new(), &inputs)?
                 .remove(0))
         }
     }
@@ -509,7 +516,7 @@ mod tests {
             metadata.leaves,
             vec![
                 (2, 0..1, DifferentialMetadataPurpose::Validation),
-                (5, 1..3, DifferentialMetadataPurpose::Reconstruction)
+                (5, 1..3, DifferentialMetadataPurpose::Reconstruction),
             ],
         );
     }
@@ -570,7 +577,7 @@ mod tests {
             metadata.leaves,
             vec![
                 (1, 0..1, DifferentialMetadataPurpose::Validation),
-                (4, 1..2, DifferentialMetadataPurpose::Validation)
+                (4, 1..2, DifferentialMetadataPurpose::Validation),
             ],
         );
     }
@@ -580,17 +587,23 @@ mod tests {
         let context = EagerContext::<Array, MetadataProbeOperation>::new();
         let first = Array::scalar(2f32).unwrap();
         let second = Array::vector(vec![3f32, 4f32]).unwrap();
+        let integer = Array::scalar(9i32).unwrap();
+        let zero = Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap();
         let marker = Array::scalar(7f32).unwrap();
         let other_marker = Array::scalar(11f32).unwrap();
         let metadata = DifferentialBoundaryMetadata {
-            values: vec![first.clone(), second.clone(), marker, other_marker],
+            values: vec![first.clone(), second.clone(), marker, other_marker, integer.clone()],
             leaves: vec![
                 (1, 0..1, DifferentialMetadataPurpose::Validation),
                 (4, 1..4, DifferentialMetadataPurpose::ValidationAndReconstruction),
+                (6, 4..5, DifferentialMetadataPurpose::Validation),
             ],
         };
         assert_eq!(metadata.validate(&context, 1, first.clone(), first.r#type().as_ref()), Ok(first));
         assert_eq!(metadata.validate(&context, 4, second.clone(), second.r#type().as_ref()), Ok(second));
+
+        // An integer primal and its zero-space differential have different types; the cached primal type must survive.
+        assert_eq!(metadata.validate(&context, 6, zero.clone(), integer.r#type().as_ref()), Ok(zero));
     }
 
     #[test]
