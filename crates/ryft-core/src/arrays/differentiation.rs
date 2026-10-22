@@ -2,25 +2,44 @@ use std::borrow::Cow;
 
 use crate::arrays::batching::{ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy};
 use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
+use crate::arrays::types::ragged::{RaggedType, RaggedValueKind};
 use crate::axes::Axis;
 use crate::batching::BatchingError;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiationDual, DifferentiationError, ResidualZeroProvider,
+    CotangentBatchingPolicy, DifferentialMetadataProvider, DifferentialMetadataPurpose, DifferentiationDual,
+    DifferentiationError, ResidualZeroProvider, SupportsCotangentAdd,
 };
+use crate::macros::check_count;
 use crate::operations::{
-    ConstantOperation, DimensionSizeOperation, GuardOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
-    ReferenceReadOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    AddOperation, ConstantOperation, DimensionSizeOperation, GuardOperation, Permutation, RaggedAddOperation, Reduce,
+    ReduceOperation, ReductionKind, ReferenceReadOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     AtomId, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, Type,
     TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
+
+impl<A: Value<Type = ArrayType>> SupportsCotangentAdd for ArrayIrOperation<A> {
+    fn cotangent_add(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        match (input_types[0], input_types[1]) {
+            (ArrayIrType::Ragged(_), ArrayIrType::Ragged(_)) => Ok(Self::RaggedAdd(RaggedAddOperation)),
+            _ => {
+                <&ArrayType>::try_from(input_types[0])?;
+                <&ArrayType>::try_from(input_types[1])?;
+                Ok(Self::from(AddOperation::<ArrayType>::new()))
+            }
+        }
+    }
+}
 
 // Homogeneous array operations construct input-free zeros when their output types need no runtime extent source.
 // Symbolic zeros instead require an exact-type source, because this universe has no first-class dimension values.
@@ -98,11 +117,8 @@ where
                 .into_iter()
                 .map(|(_, variable)| DimensionType::from(variable).into())
                 .collect(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => {
-                // Ragged zero materialization is rejected by the checked constructor until its extent residual protocol
-                // is available. This infallible declaration never treats padded storage as scalar dimension evidence.
-                Vec::new()
-            }
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
+            ArrayIrType::Ragged(r#type) => vec![ragged_shape_type(r#type).into()],
         }
     }
 
@@ -112,6 +128,12 @@ where
         source: AtomId,
         r#type: &ArrayIrType,
     ) -> Result<Vec<AtomId>, ProgramError> {
+        if let ArrayIrType::Ragged(r#type) = r#type {
+            let residual_type = ragged_shape_type(r#type);
+            let operation = Self::provide(ZeroOperation::new(residual_type.into()), &[&r#type.clone().into()])?;
+            return Ok(builder.add_instruction(operation, Vec::new(), vec![source], None)?.to_vec());
+        }
+
         // Reading only each identity's first source axis establishes the same deduplicated residual ordering
         // used by zero construction, including when several axes share one identity.
         let r#type = <&ArrayType>::try_from(r#type)?;
@@ -138,6 +160,26 @@ where
         let ArrayIrType::Dimension(residual_type) = residual_type else {
             return Ok(None);
         };
+
+        if let ArrayIrType::Ragged(residual_type) = residual_type {
+            let source_type = source.r#type();
+            let ArrayIrType::Ragged(source_type) = source_type.as_ref() else { return Ok(None) };
+
+            // Only shape-compatible sources are candidates: the provider accepts a source whose indexed occurrences
+            // and storage coordinates equal the residual's. The emitted operation rebuilds the zero from this source's
+            // own extents and checks nothing against any other occurrence of the same identity, so choosing the first
+            // candidate is correct only when no two candidates carry one indexed identity with different extents.
+            // Proof-only `derive_identity_renaming` rejects repeated indexed identities through
+            // `RaggedType::validate_unrepeated_indexed_identities` (i.e., "has repeated extent occurrences whose
+            // equality requires runtime checking"). Scope renaming preserves those checks and supplies no such proof.
+            // Pullback materialization passes each input's own retained source. Dense transposition checks the input
+            // signature before materializing a disconnected zero, rejecting repeated indexed identities whose
+            // independent payloads it cannot validate.
+            let operation =
+                Self::provide(ZeroOperation::new(residual_type.clone().into()), &[&source_type.clone().into()]);
+            let Ok(operation) = operation else { return Ok(None) };
+            return Ok(Some(context.bind(operation, Vec::new(), std::slice::from_ref(source))?.remove(0)));
+        }
 
         // A static residual has no identity for a source to supply.
         let Some(variable) = residual_type.variable() else {
@@ -193,6 +235,17 @@ where
         r#type: ArrayIrType,
         residuals: &[R],
     ) -> Result<(O, Vec<R>), ProgramError> {
+        if let ArrayIrType::Ragged(r#type) = &r#type {
+            if residuals.len() != 1 {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("ragged zero expected 1 shape residual but got {}", residuals.len()),
+                });
+            }
+            let residual_type = ragged_shape_type(r#type).into();
+            let operation = Self::provide(ZeroOperation::new(r#type.clone().into()), &[&residual_type])?;
+            return Ok((operation, residuals.to_vec()));
+        }
+
         // Capture stores one residual per distinct dimension identity, even when that identity occurs on
         // several axes. Validate that compact list before expanding it into constructor inputs.
         let array_type = <&ArrayType>::try_from(&r#type)?;
@@ -217,6 +270,95 @@ where
         let zero_inputs = shape.dynamic_dimensions(residuals);
         Ok((O::from(ZeroOperation::new(array_type.clone())), zero_inputs))
     }
+}
+
+impl<O: Operation<Type = ArrayType> + ResidualZeroProvider<ArrayType, Operation = O>>
+    DifferentialMetadataProvider<ArrayType> for O
+{
+    #[inline]
+    fn capture_differential_metadata<C: Context<Type = ArrayType, Operation = O>>(
+        _context: &C,
+        primal: &C::Value,
+        differential_type: &ArrayType,
+        purpose: DifferentialMetadataPurpose,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        // This family has no first-class dimensions: symbolic zero reconstruction keeps its exact-type exemplar.
+        Ok(if purpose.reconstructs() && Self::requires_zero_source(differential_type) {
+            vec![primal.clone()]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType> + ResidualZeroProvider<ArrayIrType, Operation = O>>
+    DifferentialMetadataProvider<ArrayIrType> for O
+{
+    fn capture_differential_metadata<C: Context<Type = ArrayIrType, Operation = O>>(
+        context: &C,
+        primal: &C::Value,
+        differential_type: &ArrayIrType,
+        purpose: DifferentialMetadataPurpose,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        if let ArrayIrType::Ragged(r#type) = differential_type
+            && r#type.value_kind() == &RaggedValueKind::Array
+        {
+            let residual_type = ragged_shape_type(r#type).into();
+            let metadata = Self::capture_zero_residual_value(context, primal, &residual_type)?.ok_or_else(|| {
+                ProgramError::InvalidArgument { message: "ragged zero has no compatible indexed shape source".into() }
+            })?;
+            return Ok(vec![metadata]);
+        }
+
+        // Preserve deferred ordinary dimension reads: the zero provider selects and reads the required dimensions
+        // only if a concrete zero is later needed. Validation alone captures nothing for ordinary array values.
+        Ok(if purpose.reconstructs() && Self::requires_zero_source(differential_type) {
+            vec![primal.clone()]
+        } else {
+            Vec::new()
+        })
+    }
+
+    fn validate_differential<C: Context<Type = ArrayIrType, Operation = O>>(
+        context: &C,
+        differential: C::Value,
+        primal_type: &ArrayIrType,
+        metadata: &[C::Value],
+    ) -> Result<C::Value, ProgramError> {
+        if !matches!(primal_type, ArrayIrType::Ragged(r#type) if r#type.value_kind() == &RaggedValueKind::Array) {
+            return Ok(differential);
+        }
+
+        check_count!("input", metadata, 1, ProgramError);
+        let source = &metadata[0];
+        let input_types = vec![differential.r#type().into_owned(), source.r#type().into_owned()];
+        let mut identities = Vec::new();
+        for (_, identity) in input_types.iter().flat_map(Type::identities) {
+            if !identities.contains(identity) {
+                identities.push(identity.clone());
+            }
+        }
+
+        let guard = GuardOperation::new("differential shape", input_types.clone()).with_retained_identities(identities);
+        let guard = <O as OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>>>::provide(
+            guard,
+            &[&input_types[0], &input_types[1]],
+        )?;
+        let mut outputs = context.bind(guard, Vec::new(), &[differential, source.clone()])?;
+        check_count!("output", outputs, 2, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+// TODO(eaplatanios): Should this be moved to a public function on `RaggedType`?
+/// Uses the same coordinate system and every indexed occurrence without retaining numerical primal storage.
+fn ragged_shape_type(r#type: &RaggedType) -> RaggedType {
+    RaggedType::new(
+        r#type.storage_type().clone().with_data_type(DataType::Zero).with_layout(None),
+        RaggedValueKind::Array,
+        r#type.ragged_dimensions().to_vec(),
+    )
+    .expect("changing array storage to Zero preserves a validated ragged coordinate system")
 }
 
 /// Exact runtime [`Shape`] expressed in the coordinate system of a [`LinearResiduals`] list, so that it can be
@@ -584,6 +726,7 @@ mod tests {
     use crate::arrays::references::ArrayReference;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
+    use crate::arrays::types::ragged::RaggedDimension;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableType, Differentiate, ReverseModeDifferentiate, TransposedProgramCotangent,
@@ -592,6 +735,45 @@ mod tests {
     use crate::programs::ReferenceType;
 
     use super::*;
+
+    #[test]
+    fn test_array_ir_operation_cotangent_add() {
+        let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        assert_eq!(
+            ArrayIrOperation::<Array>::cotangent_add(&[&array_type, &array_type]),
+            Ok(ArrayIrOperation::from(AddOperation::<ArrayType>::new())),
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::cotangent_add(&[]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        );
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
+        let left_type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, rows, Vec::new())],
+        )
+        .unwrap();
+        let right_type = RaggedType::new(
+            left_type.storage_type().clone().with_data_type(DataType::F64),
+            RaggedValueKind::Array,
+            left_type.ragged_dimensions().to_vec(),
+        )
+        .unwrap();
+        let left_type = ArrayIrType::Ragged(left_type);
+        let right_type = ArrayIrType::Ragged(right_type);
+
+        // Selection depends on member kinds; binding owns validation of the selected operation's complete signature.
+        let operation = ArrayIrOperation::<Array>::cotangent_add(&[&left_type, &right_type]).unwrap();
+        assert_eq!(operation, ArrayIrOperation::RaggedAdd(RaggedAddOperation));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left = builder.add_input(left_type);
+        let right = builder.add_input(right_type);
+        assert_eq!(
+            builder.add_instruction(operation, Vec::new(), vec![left, right], None),
+            Err(ProgramError::Type(TypeError::invalid("`ragged_add` requires two identical array-kind ragged types"))),
+        );
+    }
 
     #[test]
     fn test_array_operation_requires_zero_source() {
@@ -967,6 +1149,47 @@ mod tests {
         assert_eq!(dimension_size.inputs(), &[source.atom_id().unwrap()]);
         assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[dimension_size.outputs()[0], dimension_size.outputs()[0]]);
+    }
+
+    #[test]
+    fn test_array_ir_operation_differential_metadata() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let differential_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![extent.into()])));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let primal = context.input(differential_type.clone());
+        assert_eq!(
+            ArrayIrOperation::<Array>::capture_differential_metadata(
+                &context,
+                &primal,
+                &differential_type,
+                DifferentialMetadataPurpose::Validation,
+            ),
+            Ok(Vec::new()),
+        );
+        let metadata = ArrayIrOperation::<Array>::capture_differential_metadata(
+            &context,
+            &primal,
+            &differential_type,
+            DifferentialMetadataPurpose::Reconstruction,
+        )
+        .unwrap();
+        assert_eq!(metadata, vec![primal]);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                metadata.iter().map(|value| value.atom_id().unwrap()).collect(),
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[extent] .
+            in (%0)"}
+        );
     }
 
     #[test]
