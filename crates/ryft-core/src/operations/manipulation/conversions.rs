@@ -109,9 +109,9 @@ use crate::partial::{
     PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter, ProgramError,
-    RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value,
-    ValueDomainDispatch,
+    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter,
+    OperationProvider, ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1638,7 +1638,7 @@ where
 impl<
     T: DifferentiableType + CastType,
     V: Value<Type = T>,
-    O: Operation<Type = T> + From<AddOperation<T>> + From<CastOperation<T>>,
+    O: Operation<Type = T> + OperationProvider<T, AddOperation<T>, Operation = O> + From<CastOperation<T>>,
 > TransposableOperation<V, O> for CastOperation<T>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,

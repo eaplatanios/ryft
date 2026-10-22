@@ -63,11 +63,11 @@
 //! # }
 //! ```
 
-use crate::arrays::{ArrayIrType, ArrayType};
+use crate::arrays::{ArrayIrType, ArrayType, DimensionVariable};
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
-use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition, TypeRefinements};
+use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements};
 
 // TODO(eaplatanios): Review this module since it is mostly vibe coded and also add a module docstring that follows
 //  our established conventions.
@@ -83,6 +83,78 @@ pub use condition::{
 pub use scan::{SCAN_OPERATION_NAME, ScanOperation, ScanType};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
+
+/// Derives the simultaneous rebinding of fresh indexed body outputs onto the next iteration's formal carry types.
+/// Only indexed ragged identities may change: ordinary dimensions, bounds, placement, layouts, value kinds and extent
+/// coordinates must match exactly after renaming. This is a scoped iteration boundary, never a numeric equality proof
+/// or a conversion between two values that coexist within one iteration.
+///
+/// Returns [`None`] when the body outputs do not preserve the carry layout, including when the rebinding would not be
+/// a bijection between body and formal identities (e.g., one body identity for two independent formal identities).
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming `operation_name`, the carry index, the ragged dimension, and the declared and body
+/// bounds when a body output changes the bounds of an indexed occurrence whose extent axes it otherwise preserves.
+/// Type renderings omit bounds, so a generic signature mismatch could not identify a lower-bound change.
+pub(crate) fn rebind_ragged_carry_types(
+    operation_name: &str,
+    state_types: &[ArrayIrType],
+    body_outputs: &[ArrayIrType],
+) -> Result<Option<TypeIdentityRenaming<DimensionVariable>>, TypeError> {
+    if state_types == body_outputs {
+        return Ok(Some(TypeIdentityRenaming::new()));
+    }
+    if state_types.len() != body_outputs.len() {
+        return Ok(None);
+    }
+    let mut renaming = TypeIdentityRenaming::new();
+    for (index, (state_type, output_type)) in state_types.iter().zip(body_outputs).enumerate() {
+        match (state_type, output_type) {
+            (ArrayIrType::Ragged(state_type), ArrayIrType::Ragged(output_type)) => {
+                let state_identities = state_type.indexed_identities().collect::<Vec<_>>();
+                let output_identities = output_type.indexed_identities().collect::<Vec<_>>();
+                if state_identities.len() != output_identities.len() {
+                    return Ok(None);
+                }
+                for ((target, target_axes), (source, source_axes)) in
+                    state_identities.into_iter().zip(output_identities)
+                {
+                    if source.bounds() != target.bounds() {
+                        if source_axes != target_axes {
+                            return Ok(None);
+                        }
+                        return Err(TypeError::invalid(format!(
+                            "`{operation_name}` carry {index} declares ragged dimension `{target}` with bounds {} but \
+                             its body returns `{source}` with bounds {}",
+                            target.bounds(),
+                            source.bounds(),
+                        )));
+                    }
+                    if renaming.replacements().iter().any(|(existing, mapped)| {
+                        (existing != source && mapped == target) || (existing == source && mapped != target)
+                    }) {
+                        return Ok(None);
+                    }
+                    renaming.insert(source.clone(), target.clone())?;
+                }
+            }
+            (ArrayIrType::Array(_), ArrayIrType::Array(_))
+            | (ArrayIrType::Dimension(_), ArrayIrType::Dimension(_))
+            | (ArrayIrType::Reference(_), ArrayIrType::Reference(_)) => {
+                if state_type != output_type {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    let renamed = body_outputs
+        .iter()
+        .map(|r#type| r#type.rename_identities(&renaming))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((renamed == state_types).then_some(renaming))
+}
 
 /// Type-family storage policy for values that must cross an iteration boundary as stacked residuals.
 ///
@@ -274,6 +346,18 @@ pub(crate) fn validate_output_identities<T: Type>(
     input_types: &[T],
     output_types: &[T],
 ) -> Result<(), TypeError> {
+    validate_output_identities_with_definitions(operation_name, input_types, output_types, &[])
+}
+
+/// Validates a control-flow output signature including indexed identities explicitly exported by the operation.
+/// Callers must derive `definitions` from the validated attached body signature and publish the same declarations
+/// through [`Operation::defined_type_identities`]; region sealing independently enforces their freshness and roles.
+pub(crate) fn validate_output_identities_with_definitions<T: Type>(
+    operation_name: &str,
+    input_types: &[T],
+    output_types: &[T],
+    definitions: &[T::Identity],
+) -> Result<(), TypeError> {
     let defined_identities = output_types
         .iter()
         .flat_map(Type::identities)
@@ -282,10 +366,11 @@ pub(crate) fn validate_output_identities<T: Type>(
     let input_identities =
         input_types.iter().flat_map(Type::identities).map(|(_, identity)| identity).collect::<Vec<_>>();
     for (index, output_type) in output_types.iter().enumerate() {
-        if let Some((_, identity)) = output_type
-            .identities()
-            .find(|(_, identity)| !defined_identities.contains(identity) && !input_identities.contains(identity))
-        {
+        if let Some((_, identity)) = output_type.identities().find(|(_, identity)| {
+            !defined_identities.contains(identity)
+                && !input_identities.contains(identity)
+                && !definitions.contains(identity)
+        }) {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` output {index} has type `{output_type}`, which refers to the identity `{identity}` \
                  that no input carries and no output defines",
@@ -299,7 +384,12 @@ pub(crate) fn validate_output_identities<T: Type>(
 mod tests {
     use std::cell::Cell;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionType, DimensionValue};
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{
+        Array, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, RaggedDimension, RaggedType, RaggedValueKind,
+    };
     use crate::axes::Axis;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
@@ -308,7 +398,9 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::Context;
     use crate::parameters::Placeholder;
-    use crate::programs::{Atom, Operation, Program, Region, RegionDriver, RegionRef, Value};
+    use crate::programs::{Atom, Operation, Program, Region, RegionDriver, RegionRef, Type, TypeError, Value};
+
+    use super::{rebind_ragged_carry_types, validate_output_identities_with_definitions};
 
     /// Wraps an [`Array`] as an array [`ArrayIrValue`].
     pub(super) fn array(value: Array) -> ArrayIrValue<Array> {
@@ -441,5 +533,102 @@ mod tests {
         ) -> Result<P::Batch, BatchingError> {
             P::align_batch_axis(context, batch, axis)
         }
+    }
+
+    #[test]
+    fn test_rebind_ragged_carry_types() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let next_rows = DimensionVariable::new("next_rows", rows.bounds());
+        let state = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let next = RaggedType::new(
+            state.storage_type().clone(),
+            RaggedValueKind::Array,
+            vec![
+                RaggedDimension::new(1, next_rows.clone(), vec![0]),
+                RaggedDimension::new(2, next_rows.clone(), vec![0]),
+            ],
+        )
+        .unwrap();
+        let state = ArrayIrType::Ragged(state);
+        let next = ArrayIrType::Ragged(next);
+        let renaming = rebind_ragged_carry_types("while", &[state.clone()], &[next.clone()]).unwrap().unwrap();
+        assert_eq!(renaming.replacements(), &[(next_rows, rows)]);
+        assert_eq!(next.rename_identities(&renaming), Ok(state));
+    }
+
+    #[test]
+    fn test_rebind_ragged_carry_types_rejects_changed_layout_and_scalar_identities() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let next_rows = DimensionVariable::new("next_rows", DimensionBounds::new(1, Some(4)).unwrap());
+        let state = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap();
+        let next = RaggedType::new(
+            state.storage_type().clone(),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, next_rows.clone(), vec![0])],
+        )
+        .unwrap();
+        // A changed bound is reported precisely because type renderings omit bounds.
+        assert_eq!(
+            rebind_ragged_carry_types("while", &[state.clone().into()], &[next.clone().into()]),
+            Err(TypeError::invalid(
+                "`while` carry 0 declares ragged dimension `rows` with bounds [0, 4) but its body returns `next_rows` \
+                 with bounds [1, 4)",
+            )),
+        );
+        assert_eq!(
+            rebind_ragged_carry_types(
+                "while",
+                &[DimensionType::from(rows.clone()).into()],
+                &[DimensionType::from(next_rows).into()],
+            ),
+            Ok(None),
+        );
+
+        // One body identity cannot rebind onto two independent formal identities.
+        let columns = DimensionVariable::new("columns", rows.bounds());
+        let shared = DimensionVariable::new("shared", rows.bounds());
+        let independent = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0]), RaggedDimension::new(2, columns, vec![0])],
+        )
+        .unwrap();
+        let repeated = RaggedType::new(
+            independent.storage_type().clone(),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, shared.clone(), vec![0]), RaggedDimension::new(2, shared, vec![0])],
+        )
+        .unwrap();
+        assert_eq!(rebind_ragged_carry_types("while", &[independent.into()], &[repeated.into()]), Ok(None));
+    }
+
+    #[test]
+    fn test_validate_output_identities_with_definitions() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let output: ArrayIrType = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
+        )
+        .unwrap()
+        .into();
+        assert_eq!(validate_output_identities_with_definitions("scan", &[], &[output.clone()], &[rows]), Ok(()));
+        assert_eq!(
+            validate_output_identities_with_definitions("scan", &[], &[output], &[]),
+            Err(TypeError::invalid(
+                "`scan` output 0 has type `ragged<f32[2, 3]; 1:rows over [0]>`, which refers to the identity `rows` \
+                 that no input carries and no output defines",
+            )),
+        );
     }
 }

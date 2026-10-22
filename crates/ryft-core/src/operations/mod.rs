@@ -49,7 +49,7 @@ pub use arithmetic::{
 };
 pub use assertions::{
     ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
-    AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
+    AssertionValue, GUARD_OPERATION_NAME, GuardBatching, GuardDifferentiation, GuardInterpretation, GuardOperation,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveMode, CollectiveOperations, CollectiveOptions,
@@ -146,8 +146,9 @@ pub use manipulation::{
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use ragged::{
-    RAGGED_EXTENTS_OPERATION_NAME, RAGGED_NEW_OPERATION_NAME, RAGGED_STORAGE_OPERATION_NAME, RaggedExtents,
-    RaggedExtentsOperation, RaggedNew, RaggedNewOperation, RaggedStorage, RaggedStorageOperation,
+    RAGGED_ADD_OPERATION_NAME, RAGGED_EXTENTS_OPERATION_NAME, RAGGED_NEW_OPERATION_NAME, RAGGED_STORAGE_OPERATION_NAME,
+    RAGGED_ZERO_OPERATION_NAME, RaggedAddOperation, RaggedExtents, RaggedExtentsOperation, RaggedNew,
+    RaggedNewOperation, RaggedStorage, RaggedStorageOperation, RaggedZeroOperation,
 };
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,

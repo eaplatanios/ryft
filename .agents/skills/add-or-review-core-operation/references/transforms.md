@@ -15,6 +15,9 @@ and ragged extents. Use the owning transform's current contracts as the source o
 - Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
   diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
   differentiation.
+- `Operation::consumed_type_identities` owns validation of its input-dependent declaration. Batching supplies logical
+  per-item types and validates preservation and rule evidence; do not add a separate wrapper that rechecks the returned
+  identities against those inputs.
 
 ## Batching and Manual Variation
 

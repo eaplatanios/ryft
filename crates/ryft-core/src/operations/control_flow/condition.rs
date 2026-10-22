@@ -439,7 +439,7 @@ where
                 }
             }
         }
-        discharge_positional_region_operation(self, context, driver, inputs, 1, |_| *self)
+        discharge_positional_region_operation(self, context, driver, inputs, 1, |_, _| Ok(*self))
     }
 }
 
@@ -1334,7 +1334,7 @@ where
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
-        + From<AddOperation<ArrayIrType>>
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ConditionOperation<ArrayIrType>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
@@ -2913,14 +2913,14 @@ mod tests {
     ) where
         O: From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
             + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
-            + From<AddOperation<ArrayIrType>>,
+            + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>,
     {
         let value =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         if mutate {
-            let doubled = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, value], None)
-                .unwrap()[0];
+            let value_type = builder.atoms()[value.index()].r#type();
+            let operation = O::provide(AddOperation::new(), &[value_type.as_ref(), value_type.as_ref()]).unwrap();
+            let doubled = builder.add_instruction(operation, Vec::new(), vec![value, value], None).unwrap()[0];
             builder
                 .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)
                 .unwrap();
@@ -3759,7 +3759,7 @@ mod tests {
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let doubled = true_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![snapshot, snapshot], None)
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
@@ -4506,7 +4506,7 @@ mod tests {
         // The condition's outputs are bound in the *parent*, so a later parent instruction consumes them directly. A
         // value stamped with a branch's own destination builder would be rejected here instead of staged.
         let doubled = builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![snapshot, snapshot], None)
             .unwrap()[0];
         let frozen = builder
             .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![allocation], None)
@@ -4693,9 +4693,7 @@ mod tests {
                 let root = StagingContext::constant(&branch, branch.capture(root.clone())?);
                 let index = StagingContext::constant(&branch, branch.capture(index.clone())?);
                 let element = ReferenceView::new(root)?.dynamic_index(0, &index)?.read()?;
-                Ok(branch
-                    .bind(AddOperation::<ArrayIrType>::new(), Vec::new(), &[element, inputs[0].clone()])?
-                    .remove(0))
+                Ok(branch.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[element, inputs[0].clone()])?.remove(0))
             },
             vec![ArrayType::scalar(DataType::F32).into()],
         )
@@ -9478,7 +9476,7 @@ mod tests {
         let reference = true_builder.add_input(reference_type.clone().into());
         let value = true_builder.add_input(scalar_type.clone().into());
         let doubled = true_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, value], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![value, value], None)
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -10322,7 +10320,7 @@ mod tests {
             let current =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             let output = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, current], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![value, current], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])

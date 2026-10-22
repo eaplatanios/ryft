@@ -1998,10 +1998,10 @@ pub enum XlaInputBoundBucketing {
 /// Opaque retained-JIT specialization key derived by [`XlaDomain`].
 ///
 /// Exact dispatch preserves nominal [`DimensionVariable`] identity and shares its type slice with the effective staged
-/// signature, so keying a call costs no deep type clone. Dispatch with input-bound bucketing instead uses a structural,
-/// alpha-normalized physical-bound signature so calls routed to the same bucket share one staged and compiled
-/// specialization. Bucketed keys index dimension variables by first occurrence and exclude their diagnostic names,
-/// which survive only in the effective staged types.
+/// signature, so keying a call costs no deep type clone. Dispatch with input-bound bucketing instead uses a structural
+/// physical-bound signature with dimension variables numbered by first occurrence, so calls routed to the same bucket
+/// share one staged and compiled specialization. Bucketed keys exclude diagnostic names, which survive only in the
+/// effective staged types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct XlaDispatchKey(XlaDispatchKeyKind);
 
@@ -2014,7 +2014,7 @@ enum XlaDispatchKeyKind {
     /// Exact grouped leaf signature and logical relationships, independent of runtime indexed names.
     Grouped { physical: Vec<u8>, logical: Vec<u8> },
 
-    /// Alpha-normalized bounded signature used when bucketing is enabled.
+    /// Bounded signature using canonical variable indices when bucketing is enabled.
     Bucketed(BucketedDispatchSignature),
 }
 
@@ -2290,7 +2290,7 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchQuery<'_, '_> {
     }
 }
 
-/// Alpha-normalized bounded input signature used as the bucketed retained-dispatch key.
+/// Bounded input signature with dimension variables numbered by first occurrence, used as the retained-dispatch key.
 ///
 /// Dimension variables are numbered by first occurrence across the whole input signature under
 /// [`DimensionVariable`] identity, and only their bounds are retained. Two bucketed signatures are therefore equal
@@ -2305,17 +2305,17 @@ struct BucketedDispatchSignature {
     input_types: Vec<BucketedArrayTypeKey>,
 }
 
-/// One bucketed input array type split into a shape-free carrier and its alpha-normalized shape pattern.
+/// One bucketed input array type split into a shape-free carrier and a shape pattern using canonical variable indices.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BucketedArrayTypeKey {
     /// Array type with an empty shape, retaining data type, layout, sharding, and memory identity.
     carrier: ArrayType,
 
-    /// Per-axis alpha-normalized dimensions, which also fix the array's rank.
+    /// Per-axis static extents or canonical variable indices, which also fix the array's rank.
     dimensions: Vec<BucketedDimensionKey>,
 }
 
-/// One alpha-normalized axis of a [`BucketedArrayTypeKey`].
+/// One static extent or canonical variable index of a [`BucketedArrayTypeKey`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum BucketedDimensionKey {
     /// Statically known extent. Bucketing rewrites every static input axis into a bounded dynamic axis, so this
@@ -2328,7 +2328,7 @@ enum BucketedDimensionKey {
 }
 
 impl BucketedDispatchSignature {
-    /// Alpha-normalizes the already bucketed `input_types` into a name-free dispatch key.
+    /// Builds a dispatch key from the already bucketed `input_types`, numbering dimension variables by first occurrence.
     fn new(input_types: &[ArrayType]) -> Self {
         let mut variables = Vec::<DimensionVariable>::new();
         let input_types = input_types
@@ -3027,8 +3027,7 @@ struct PersistentDeviceV1 {
 }
 
 impl PersistentArraySignatureV3 {
-    /// Encodes input and output types while alpha-normalizing their shared dynamic dimension variables by first
-    /// occurrence.
+    /// Encodes input and output types with shared dynamic dimension variables numbered by first occurrence.
     fn encode(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
         let mut variables = Vec::<DimensionVariable>::new();
         let mut encode_type = |r#type: &ArrayType| {
@@ -3735,7 +3734,8 @@ impl<'a> From<&'a XlaLoweredProgram> for XlaInvocationMetadata<'a> {
     }
 }
 
-/// Encodes one boundary's input and output types through the alpha-normalized persistent signature encoding.
+/// Encodes one boundary's input and output types using the persistent signature's canonical dimension-variable
+/// numbering.
 ///
 /// [`ArrayType`] equality is dimension-variable identity equality, and two structurally identical lowerings (or one
 /// lowering and its cache-restored executable) never share variable identities, so boundary compatibility must be
@@ -3837,8 +3837,8 @@ impl<'c> XlaCompiledProgram<'c> {
         }
     }
 
-    /// Shares a cached executable while restoring this request's nominal aggregate signature. Alpha-equivalent
-    /// compilations share machine code, but their live indexed quantities remain distinct in returned values.
+    /// Shares a cached executable while restoring this request's nominal aggregate signature. Compilations that differ
+    /// only in identity names share machine code, but their live indexed quantities remain distinct in returned values.
     fn with_requested_logical_boundary(
         self: Arc<Self>,
         expected: &XlaLoweredProgram,
@@ -4353,8 +4353,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         // which consumes the request, so the resolved program can be cross-checked below even on cache hits.
         let expected = lowered.lowered().lowered_program().clone();
         let compiled = if expected.logical_boundary.is_some() {
-            // The executable cache is alpha-normalized, whereas a ragged result retains its nominal identities at
-            // runtime. Rebind only the logical wrapper to this request before the generic output-refinement check.
+            // The executable cache keys identities by their relationships rather than their names, whereas a ragged
+            // result retains its nominal identities at runtime. Rebind only the logical wrapper to this request before
+            // the generic output-refinement check.
             let key = self.compilation_key(&expected)?;
             let program = self
                 .compilation_context()
@@ -8577,10 +8578,10 @@ mod tests {
                 if reason == "replacement executable has incompatible assertion-handler requirement",
         ));
 
-        // Boundary types compare through the alpha-normalized persistent encoding: structurally identical
-        // bounded-dynamic boundaries built from fresh dimension variables must be compatible even though
-        // `ArrayType` equality is dimension-variable identity equality, while a genuinely different boundary
-        // must be rejected.
+        // Boundary types compare through the persistent encoding with canonical dimension-variable numbering:
+        // structurally identical bounded-dynamic boundaries built from fresh dimension variables must be compatible
+        // even though `ArrayType` equality is dimension-variable identity equality, while a genuinely different
+        // boundary must be rejected.
         let dynamic_boundary = || {
             vec![ArrayType::new(
                 DataType::F32,

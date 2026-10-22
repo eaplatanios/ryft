@@ -33,11 +33,11 @@ use crate::operations::custom_functions::rules::{
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance,
-    ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow,
-    RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
-    discharge_local_reference_operation, discharge_reference_free_operation,
+    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider,
+    OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    RegionDataFlow, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements,
+    Typed, Value, discharge_local_reference_operation, discharge_reference_free_operation,
 };
 use crate::tracing::TracingContext;
 
@@ -2174,7 +2174,7 @@ where
     O: Operation<Type = V::Type>
         + From<CustomFunctionTransposeOperation<V, O>>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + From<AddOperation<V::Type>>,
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     S: CustomRuleSpecializer<V, O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -3779,8 +3779,8 @@ mod tests {
         }
     }
 
-    impl From<AddOperation<ArrayIrType>> for ReferenceTestOperation {
-        fn from(operation: AddOperation<ArrayIrType>) -> Self {
+    impl From<AddOperation<ArrayType>> for ReferenceTestOperation {
+        fn from(operation: AddOperation<ArrayType>) -> Self {
             Self::Base(operation.into())
         }
     }

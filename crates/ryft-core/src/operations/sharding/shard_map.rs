@@ -2693,7 +2693,7 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
-        + From<AddOperation<ArrayIrType>>
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ShardMapOperation>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
         + OperationProjection<

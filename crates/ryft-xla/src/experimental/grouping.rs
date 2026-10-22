@@ -678,8 +678,8 @@ impl XlaValueLayout {
             .zip(values)
             .map(|(declared, value)| invocation_type(declared, value.r#type().as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        // A cached executable owns a formal input scope. Invocation admits an alpha-equivalent runtime scope;
-        // repeated-family relationships still execute through the grouped region's entry guard.
+        // A cached executable owns a formal input scope. Invocation admits a runtime scope with the same structure
+        // under different identity names; repeated-family relationships still execute through the region's entry guard.
         ArrayIrTypeRefinements::from_local_declarations(self.logical_types.iter(), &actual)?;
         let mut leaves = Vec::with_capacity(self.leaf_count());
         for value in values {

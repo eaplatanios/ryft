@@ -52,8 +52,9 @@
 //! each outer carrier remains part of the inner level's parent value.
 //!
 //! Every rule returns [`BatchedOutputs`], pairing carriers with operation-local [`BatchingPolicy::Evidence`]. The
-//! active context validates that evidence immediately and discards it before the next operation, preventing
-//! rule-specific claims from escaping their application boundary.
+//! active context passes the operation and evidence to the policy's output validator. Policies that enforce identity
+//! conservation query [`Operation::consumed_type_identities`] against logical input types. Evidence is discarded
+//! before the next operation, preventing rule-specific claims from escaping their application boundary.
 //!
 //! # Nested Programs
 //!
@@ -700,8 +701,10 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// The batching transform calls this hook after every rule, including rules replayed directly inside a nested
     /// region, and before exposing their outputs to subsequent operations. The default accepts every transition.
     /// A policy whose carrier owns semantic metadata that is absent from [`Type`] overrides this method to reject
-    /// transitions that would silently drop that metadata, using `evidence` to recognize the rules that consumed it
-    /// deliberately.
+    /// transitions that would silently drop that metadata. The operation's semantic declarations permit consumption;
+    /// `evidence` records additional facts specific to this batching rule application. Query
+    /// [`Operation::consumed_type_identities`] using the logical input types returned by [`Self::unbatched_type`],
+    /// and propagate errors from the operation's own validation of that declaration.
     ///
     /// This is a carrier-invariant boundary and not an additional batching rule. The outputs are borrowed immutably,
     /// so an implementation can accept or reject a transition but cannot rewrite one. The evidence is owned by the
@@ -711,24 +714,33 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// The division of labor is deliberate. This hook states the policy-owned conservation law once and applies it
     /// uniformly to the open set of [`BatchableOperation`] rules, precisely because the rules cannot police that law
     /// themselves: the defect class is a rule that is oblivious to the carrier metadata, and an oblivious rule does
-    /// not know it should check anything. Every fact specific to one operation must therefore arrive as
-    /// [`Self::Evidence`] supplied by the rule. If an implementation of this method ever needs to branch on
-    /// `operation_name`, that is the signal that the missing knowledge belongs in the evidence type rather than here.
+    /// not know it should check anything. Semantic permission to omit an input identity comes from
+    /// [`Operation::consumed_type_identities`]; additional transform-specific facts arrive as [`Self::Evidence`].
+    /// Implementations use these semantic hooks and evidence rather than matching concrete operation variants or
+    /// branching on [`Operation::name`], which is used only for diagnostics.
     ///
     /// # Parameters
     ///
-    ///   - `operation_name`: Canonical name of the [`Operation`] whose batching rule produced `outputs` that is used
-    ///     only for diagnostic purposes (e.g., error reporting).
+    ///   - `operation`: Original [`Operation`] whose batching rule produced `outputs`.
     ///   - `inputs`: Batch carriers supplied to that rule.
     ///   - `outputs`: Batch carriers produced by that rule.
     ///   - `evidence`: Operation-local [`Self::Evidence`] that the rule returned alongside `outputs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when the policy rejects the transition or a semantic declaration used to justify
+    /// it is invalid.
     #[inline]
     fn validate_operation_outputs(
-        _operation_name: &'static str,
-        _inputs: &[Self::Batch],
-        _outputs: &[Self::Batch],
-        _evidence: &Self::Evidence,
+        operation: &C::Operation,
+        inputs: &[Self::Batch],
+        outputs: &[Self::Batch],
+        evidence: &Self::Evidence,
     ) -> Result<(), BatchingError> {
+        let _ = operation;
+        let _ = inputs;
+        let _ = outputs;
+        let _ = evidence;
         Ok(())
     }
 
@@ -1884,12 +1896,7 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
         // The rule's evidence is scoped to this one application. It is read by the validation boundary below and
         // dropped at the end of this statement group, so it can never be observed by the next operation.
         let (output_batches, evidence) = operation.batch(self, &driver, input_batches.as_slice())?.into_parts();
-        P::validate_operation_outputs(
-            operation.name(),
-            input_batches.as_slice(),
-            output_batches.as_slice(),
-            &evidence,
-        )?;
+        P::validate_operation_outputs(&operation, &input_batches, &output_batches, &evidence)?;
         Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
     }
 
@@ -2344,12 +2351,14 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
         ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, Shape, ShardingDimension, StaticArrayExtentBatchingPolicy,
+        DimensionVariable, RaggedAxis, Shape, ShardingDimension, StaticArrayExtentBatchingPolicy,
     };
     use crate::contexts::EagerContext;
-    use crate::operations::{AddOperation, NegOperation, Reduce, ReductionKind};
+    use crate::operations::{
+        AddOperation, BroadcastOperation, NegOperation, Reduce, ReductionKind, TransposeOperation, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, Typed};
+    use crate::programs::{ProgramBuilder, RegionInterface, Typed};
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue, TestArrayContext, TestArrayOperation,
@@ -3020,6 +3029,150 @@ mod tests {
     }
 
     #[test]
+    fn test_batching_policy_validate_operation_outputs_consumption() -> Result<(), BatchingError> {
+        /// Input-sensitive declaration that also detects accidental use of the packed signature.
+        #[derive(Clone, Debug)]
+        struct ConsumptionOperation {
+            input_type: ArrayType,
+            consumed: Vec<DimensionVariable>,
+            evidence: Vec<DimensionVariable>,
+        }
+
+        impl Operation for ConsumptionOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "consume"
+            }
+
+            fn consumed_type_identities(&self, input_types: &[ArrayType]) -> Result<Vec<DimensionVariable>, TypeError> {
+                if input_types != std::slice::from_ref(&self.input_type) {
+                    return Err(TypeError::invalid("consumption requires the logical input signature"));
+                }
+
+                for identity in &self.consumed {
+                    if !input_types.iter().any(|r#type| r#type.identities().any(|(_, input)| input == identity)) {
+                        return Err(TypeError::invalid(format!(
+                            "operation `{}` declares consumption of identity `{}` absent from its logical inputs",
+                            self.name(),
+                            identity,
+                        )));
+                    }
+                }
+
+                Ok(self.consumed.clone())
+            }
+
+            fn infer_output_types(
+                &self,
+                _inputs: &[ArrayType],
+                _regions: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(Vec::new())
+            }
+        }
+
+        impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ConsumptionOperation {
+            fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+                &self,
+                _context: &BatchingContext<C, ArrayBatchingPolicy>,
+                _driver: &D,
+                _inputs: &[ArrayBatch<C::Value>],
+            ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy>, BatchingError> {
+                Ok(BatchedOutputs::new(Vec::new(), self.evidence.clone()))
+            }
+        }
+
+        #[derive(Clone, Debug, ryft_macros::Operation)]
+        #[ryft(type(ArrayType), constant(Array), dispatch(batching))]
+        enum ConsumptionFamily {
+            Zero(ZeroOperation<ArrayType>),
+            Consume(ConsumptionOperation),
+            Broadcast(BroadcastOperation),
+            Transpose(TransposeOperation),
+        }
+
+        type Parent = TracingContext<Array, ConsumptionFamily>;
+        let parent = Parent::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(3)).unwrap());
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let packed_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]));
+        let input = ArrayBatch::new(parent.input(packed_type), Some(0))?.with_ragged_axes(vec![RaggedAxis::new(
+            1,
+            parent.input(ArrayType::new_static(DataType::I64, [2])),
+            rows.clone(),
+            vec![0],
+        )])?;
+        let operation = ConsumptionOperation {
+            input_type: input.unbatched_type(),
+            consumed: vec![rows.clone()],
+            evidence: Vec::new(),
+        };
+        assert_eq!(
+            ConsumptionFamily::from(operation.clone()).consumed_type_identities(&[input.unbatched_type()]),
+            Ok(vec![rows.clone()]),
+        );
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 2);
+        let tracer = BatchingTracer::new(context.clone(), input.clone());
+        assert_eq!(
+            <ArrayBatchingPolicy as BatchingPolicy<Parent>>::validate_operation_outputs(
+                &ConsumptionFamily::from(operation.clone()),
+                std::slice::from_ref(&input),
+                &[],
+                &Vec::new(),
+            ),
+            Ok(()),
+        );
+        assert!(context.bind(operation.clone(), Vec::new(), std::slice::from_ref(&tracer))?.is_empty());
+
+        // Direct region replay must query the same logical signature and honor the same declaration.
+        let mut builder = ProgramBuilder::<Array, ConsumptionFamily>::new();
+        let region_input = builder.add_input(operation.input_type.clone());
+        builder.add_instruction(operation.clone(), Vec::new(), vec![region_input], None)?;
+        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new())?;
+        assert!(
+            <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::batch_region(
+                &context,
+                program.entry_region_ref(),
+                vec![input],
+            )?
+            .is_empty()
+        );
+
+        let undeclared = ConsumptionOperation { consumed: Vec::new(), ..operation.clone() };
+        assert_eq!(
+            BatchingError::from(
+                context.bind(undeclared.clone(), Vec::new(), std::slice::from_ref(&tracer)).unwrap_err()
+            ),
+            BatchingError::UnsupportedOperation {
+                message: "operation `consume` neither preserves nor consumes bounded ragged dimension `rows`"
+                    .to_owned(),
+            }
+        );
+
+        // A batching rule can still supply its own evidence without an operation-level declaration.
+        let attested = ConsumptionOperation { evidence: vec![rows], ..undeclared };
+        assert!(context.bind(attested, Vec::new(), std::slice::from_ref(&tracer))?.is_empty());
+
+        // The mapped dimension occurs in packed storage, but is absent from the logical operation's input type.
+        let invalid = ConsumptionOperation { consumed: vec![batch], ..operation };
+        assert_eq!(
+            invalid.consumed_type_identities(std::slice::from_ref(&invalid.input_type)),
+            Err(TypeError::invalid(
+                "operation `consume` declares consumption of identity `batch` absent from its logical inputs",
+            )),
+        );
+        assert_eq!(
+            BatchingError::from(context.bind(invalid, Vec::new(), &[tracer]).unwrap_err()),
+            BatchingError::Type(TypeError::invalid(
+                "operation `consume` declares consumption of identity `batch` absent from its logical inputs",
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_batching_context_bind_validates_operation_evidence() {
         /// Batching policy pinning the [`BatchedOutputs`] evidence lifecycle. Its carrier, extent, and batched-program
         /// boundary are the ordinary array ones, but its validator accepts an operation only when that operation's own
@@ -3069,11 +3222,12 @@ mod tests {
             }
 
             fn validate_operation_outputs(
-                operation_name: &'static str,
+                operation: &C::Operation,
                 _inputs: &[Self::Batch],
                 _outputs: &[Self::Batch],
                 evidence: &Self::Evidence,
             ) -> Result<(), BatchingError> {
+                let operation_name = operation.name();
                 if evidence.contains(&operation_name) {
                     Ok(())
                 } else {

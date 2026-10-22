@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -5,8 +6,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionValue, MAX_DIMENSION_EXTENT,
-    Sharding,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionValue, DimensionVariable,
+    MAX_DIMENSION_EXTENT, Sharding,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -31,8 +32,8 @@ use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type, validate_reference_carry_axis};
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{
-    TemporalResidualOperation, TemporalResidualType, refine_output_types, region_input_mismatch,
-    validate_output_identities,
+    TemporalResidualOperation, TemporalResidualType, rebind_ragged_carry_types, refine_output_types,
+    region_input_mismatch, validate_output_identities_with_definitions,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::logical::AndOperation;
@@ -52,7 +53,7 @@ use crate::programs::{
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow, RegionDataFlowBoundary,
     RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef,
-    RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    RegionSlot, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -64,7 +65,10 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 /// [`Operation`] that repeatedly applies a body [`Region`](crate::Region) to a loop-carried state while a condition
 /// [`Region`](crate::Region) over that same state produces a true Boolean predicate. The condition and body
 /// consume identical state type signatures, the body produces the next state with that same signature, and the
-/// operation outputs the final state once the condition produces false.
+/// operation outputs the final state once the condition produces false. Indexed ragged extents may change under
+/// scoped identity rebinding when their bounds and full coordinate layout stay equal. Declare that correspondence
+/// with [`Self::with_body_type_signature`]; each operation then owns fresh final-result identities, including when
+/// the loop executes zero iterations. Its initial and final values can coexist without claiming equal extents.
 ///
 /// The condition and body computations are not part of this payload: they are [`Region`](crate::Region)s attached to
 /// the [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots)
@@ -101,6 +105,13 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///     available. Loops that cannot satisfy this partition are rejected, and unbounded tangent loops do not support
 ///     transposition.
 ///
+/// These derivative regimes do not yet propagate the result identity binders of changing indexed ragged carries.
+/// Its active derivative rule rejects before either region executes. Bounded reverse mode also rejects first-class
+/// ragged temporal residual storage. Automatic batching of raw ragged carries and per-item ragged state masking remain
+/// unsupported; scalar-predicate core interpretation and grouped backend transport support changing indexed extents.
+/// Unchanged raw ragged carries are not excluded by the changing-result-binder check, but that check does not establish
+/// support for every derivative or batching path.
+///
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
 /// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the
 /// shared implementation supports homogeneous array and composite array IR loops.
@@ -109,6 +120,12 @@ pub struct WhileOperation<T: Type> {
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
     /// truncating even while the condition still produces true.
     pub(crate) iteration_bound: Option<usize>,
+
+    /// Formal-to-result indexed binders distinguishing final extents from the still-live initial quantities.
+    carry_output_identities: Vec<(T::Identity, T::Identity)>,
+
+    /// Fresh result identities owned jointly across all result occurrences, including intrinsic definitions.
+    output_identity_definitions: Vec<T::Identity>,
 
     /// Type universe of the loop-carried state and attached regions.
     marker: PhantomData<fn() -> T>,
@@ -120,7 +137,12 @@ impl<T: Type> WhileOperation<T> {
     /// [`Operation::infer_output_types`] validates the loop contract over their interfaces.
     #[inline]
     pub fn new() -> Self {
-        Self { iteration_bound: None, marker: PhantomData }
+        Self {
+            iteration_bound: None,
+            carry_output_identities: Vec::new(),
+            output_identity_definitions: Vec::new(),
+            marker: PhantomData,
+        }
     }
 
     /// Returns this [`WhileOperation`] with its semantic iteration bound set to `bound` (or cleared when `bound` is
@@ -153,11 +175,114 @@ impl<T: Type> WhileOperation<T> {
         Ok(self)
     }
 
+    /// Declares fresh result identities for indexed carries that the body reconstructs under fresh local identities.
+    /// Invoke this builder once after constructing the body, before binding the operation. Identity allocation occurs
+    /// here rather than during inference, so repeated inference is deterministic and separate loops have separate
+    /// result families. A zero-iteration loop retains its input payloads under these fresh result identities.
+    ///
+    /// The body outputs must preserve the exact carry layout and bounds under scoped indexed-identity rebinding.
+    /// Ordinary arrays, dimensions and reference carries keep their existing exact-signature contract.
+    /// An indexed identity whose result is rebound cannot also name an ordinary scalar or dense extent in the carried
+    /// signature: the complete result rename would change that ordinary occurrence too, so validation rejects it.
+    pub fn with_body_type_signature(
+        mut self,
+        body_input_types: &[T],
+        body_output_types: &[T],
+    ) -> Result<Self, TypeError>
+    where
+        T: WhileType,
+    {
+        self.carry_output_identities.clear();
+        self.rebind_body_type_signature(body_input_types, body_output_types)
+    }
+
+    /// Retargets a rebuilt body while retaining existing parent-result identities for surviving formal carries.
+    fn rebind_body_type_signature(mut self, body_input_types: &[T], body_output_types: &[T]) -> Result<Self, TypeError>
+    where
+        T: WhileType,
+    {
+        let rebinding = T::while_carry_rebinding(body_input_types, body_output_types)?
+            .ok_or_else(|| TypeError::invalid("`while` body does not preserve its carry layout and bounds"))?;
+        let mut unavailable = body_input_types
+            .iter()
+            .chain(body_output_types)
+            .flat_map(Type::identities)
+            .map(|(_, identity)| identity.clone())
+            .chain(self.carry_output_identities.iter().map(|(_, result)| result.clone()))
+            .collect::<Vec<_>>();
+        let mut result_renaming = TypeIdentityRenaming::new();
+        for (source, formal) in rebinding.replacements() {
+            if source != formal {
+                if let Some((_, result)) = self.carry_output_identities.iter().find(|(old, _)| old == formal) {
+                    result_renaming.insert(formal.clone(), result.clone())?;
+                } else {
+                    let result = result_renaming.insert_fresh(formal.clone(), &unavailable)?;
+                    unavailable.push(result);
+                }
+            }
+        }
+        self.carry_output_identities = result_renaming.replacements().to_vec();
+        self.output_identity_definitions =
+            self.carry_output_identities.iter().map(|(_, result)| result.clone()).collect();
+        Ok(self)
+    }
+
     /// Returns the semantic iteration bound of this [`WhileOperation`], if any. Refer to the documentation of
     /// [`Self::with_iteration_bound`] for the truncation semantics a bound carries.
     #[inline]
     pub fn iteration_bound(&self) -> Option<usize> {
         self.iteration_bound
+    }
+
+    /// Validates stored result declarations against the body's exact carry correspondence, without allocating IDs.
+    fn carry_output_renaming(
+        &self,
+        state_types: &[T],
+        body_outputs: &[T],
+    ) -> Result<TypeIdentityRenaming<T::Identity>, TypeError>
+    where
+        T: WhileType,
+    {
+        let body_rebinding = T::while_carry_rebinding(state_types, body_outputs)?
+            .ok_or_else(|| TypeError::invalid("`while` body does not preserve its carry layout and bounds"))?;
+        let changed = body_rebinding
+            .replacements()
+            .iter()
+            .filter_map(|(source, formal)| (source != formal).then_some(formal))
+            .collect::<Vec<_>>();
+        if changed.len() != self.carry_output_identities.len() {
+            return Err(TypeError::invalid(
+                "`while` result identity declarations do not match changing indexed carries; use `with_body_type_signature`",
+            ));
+        }
+        let mut renaming = TypeIdentityRenaming::new();
+        for ((formal, result), expected) in self.carry_output_identities.iter().zip(changed) {
+            if formal != expected
+                || state_types
+                    .iter()
+                    .chain(body_outputs)
+                    .flat_map(Type::identities)
+                    .any(|(_, identity)| identity == result)
+                || renaming.replacements().iter().any(|(_, existing)| existing == result)
+            {
+                return Err(TypeError::invalid(
+                    "`while` result identity declarations must be fresh and match changing carries",
+                ));
+            }
+            renaming.insert(formal.clone(), result.clone())?;
+        }
+        if !renaming.is_identity() {
+            let outputs = state_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(&renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+            if T::while_carry_rebinding(state_types, &outputs)?.is_none() {
+                return Err(TypeError::invalid(
+                    "`while` result identity declarations must preserve carry bounds and layout",
+                ));
+            }
+        }
+        Ok(renaming)
     }
 
     /// Validates the shared state positions and the condition's predicate boundary used by region data flow.
@@ -176,8 +301,6 @@ impl<T: Type> WhileOperation<T> {
         Ok(())
     }
 }
-
-impl<T: Type> Copy for WhileOperation<T> {}
 
 impl<T: Type> Default for WhileOperation<T> {
     #[inline]
@@ -200,6 +323,10 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         WHILE_OPERATION_NAME
     }
 
+    fn defined_type_identities(&self) -> Cow<'_, [T::Identity]> {
+        Cow::Borrowed(&self.output_identity_definitions)
+    }
+
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         const { &[RegionSlot::computation("condition"), RegionSlot::computation("body")] }
@@ -210,7 +337,8 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         // declared signatures here means that specialization cannot make a mismatched body agree with its state types,
         // and that eager execution rejects such a body even when the loop would not iterate.
         self.validate_region_count(region_interfaces.len())?;
-        validated_while_interfaces(region_interfaces)?;
+        let (_, body) = validated_while_interfaces(region_interfaces)?;
+        self.carry_output_renaming(body.input_types(), body.output_types())?;
         Ok(())
     }
 
@@ -242,6 +370,11 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         // propagated, because the body may change it.
         let (_, body_interface) = validated_while_interfaces(region_interfaces)?;
         let state_types = body_interface.input_types();
+        let result_renaming = self.carry_output_renaming(state_types, body_interface.output_types())?;
+        let declared_output_types = state_types
+            .iter()
+            .map(|r#type| r#type.rename_identities(&result_renaming))
+            .collect::<Result<Vec<_>, _>>()?;
         check_count!("input", input_types, state_types.len(), TypeError);
         for (index, (state_type, input_type)) in state_types.iter().zip(input_types).enumerate() {
             if let Some(relation) = region_input_mismatch(state_type, input_type) {
@@ -251,10 +384,15 @@ impl<T: WhileType> Operation for WhileOperation<T> {
                 )));
             }
         }
-        let output_types = refine_output_types(state_types, input_types, state_types, |index| {
+        let output_types = refine_output_types(state_types, input_types, &declared_output_types, |index| {
             self.reference_output_identity_input(index)
         })?;
-        validate_output_identities(WHILE_OPERATION_NAME, input_types, output_types.as_slice())?;
+        validate_output_identities_with_definitions(
+            WHILE_OPERATION_NAME,
+            input_types,
+            output_types.as_slice(),
+            self.defined_type_identities().as_ref(),
+        )?;
         Ok(output_types)
     }
 
@@ -293,12 +431,38 @@ impl<T: WhileType> Operation for WhileOperation<T> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, WHILE_OPERATION_NAME)?;
-        match self.iteration_bound {
-            Some(iteration_bound) => {
-                operation.bracketed(|operation| operation.field("iteration_bound", iteration_bound))
-            }
-            None => Ok(()),
+        if self.iteration_bound.is_none() && self.carry_output_identities.is_empty() {
+            return Ok(());
         }
+        operation.bracketed(|operation| {
+            if let Some(iteration_bound) = self.iteration_bound {
+                operation.field("iteration_bound", iteration_bound)?;
+            }
+            if !self.carry_output_identities.is_empty() {
+                operation.list(
+                    "carry_output_identities",
+                    self.carry_output_identities.iter().map(|(formal, result)| format!("{formal}->{result}")),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Self {
+            iteration_bound: self.iteration_bound,
+            output_identity_definitions: self
+                .output_identity_definitions
+                .iter()
+                .map(|identity| renaming.rename(identity))
+                .collect(),
+            carry_output_identities: self
+                .carry_output_identities
+                .iter()
+                .map(|(formal, result)| (renaming.rename(formal), renaming.rename(result)))
+                .collect(),
+            marker: PhantomData,
+        })
     }
 }
 
@@ -385,9 +549,8 @@ impl<T: WhileType> RegionDataFlowRule for WhileOperation<T> {
 // accesses replay as the operations the source performed, and it publishes no state successor.
 impl<T, C, P> ReferenceDischargeableOperation<C, P> for WhileOperation<T>
 where
-    T: Type,
-    WhileOperation<T>: Operation<Type = C::Type>,
-    C: Context<Operation: From<WhileOperation<T>>>,
+    T: WhileType,
+    C: Context<Type = T, Operation: From<WhileOperation<T>>>,
     C::Type: From<P::Referent>,
     P: ReferenceDischargePolicy<C>,
 {
@@ -515,11 +678,14 @@ where
                     state_allocations.as_slice(),
                     condition_published.as_slice(),
                 )?;
-                (WhileOperation::<T>::new(), vec![rotated_condition, rotated_body])
+                let operation = self
+                    .clone()
+                    .rebind_body_type_signature(&rotated_body.input_types(), &rotated_body.output_types())?;
+                (operation, vec![rotated_condition, rotated_body])
             }
-            None => (*self, vec![condition_result.into_program(), body_result.into_program()]),
+            None => (self.clone(), vec![condition_result.into_program(), body_result.into_program()]),
         };
-        let mut outputs = context.parent().bind(operation, regions, discharged_inputs.as_slice())?;
+        let mut outputs = context.parent().bind(operation.clone(), regions, discharged_inputs.as_slice())?;
         if rotate {
             check_count!("output", outputs, inputs.len() + entering.len() + 1, ProgramError);
             outputs.pop();
@@ -562,23 +728,36 @@ where
         let state_count = inputs.len();
         let mut state = inputs.to_vec();
         let mut completed_iterations = 0;
+        let body = driver.region(1)?;
+        let rebind_outputs = body.input_types() != body.output_types();
         loop {
             // The iteration bound is semantic: a bounded loop runs at most `bound` iterations by definition, so the
             // loop exits here even while the condition still produces true.
             if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
-                return Ok(state);
+                break;
             }
             let condition_outputs = driver.interpret_region(context, 0, state.clone())?;
             check_count!("output", condition_outputs, 1, ProgramError);
             let predicate = &condition_outputs[0];
             if !predicate.any_true()? {
-                return Ok(state);
+                break;
             }
             // Masked state update: items whose predicate is true take the body's candidate update, the rest keep
             // their carried state. For a scalar predicate this reduces to taking the candidates wholesale, since a
             // false scalar predicate exits above.
-            let candidates = driver.interpret_region(context, 1, state.clone())?;
+            let mut candidates = driver.interpret_region(context, 1, state.clone())?;
             check_count!("output", candidates, state_count, ProgramError);
+            if rebind_outputs {
+                let state_types = state.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+                let candidate_types = candidates.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+                let renaming = C::Type::while_carry_rebinding(&state_types, &candidate_types)?.ok_or_else(|| {
+                    TypeError::invalid("`while` body values do not preserve the declared carry layout")
+                })?;
+                candidates = candidates
+                    .into_iter()
+                    .map(|value| value.rename_type_identities(&renaming))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             state = candidates
                 .iter()
                 .zip(state.iter())
@@ -586,6 +765,14 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             completed_iterations += 1;
         }
+        if !self.carry_output_identities.is_empty() {
+            let renaming = self.carry_output_renaming(&body.input_types(), &body.output_types())?;
+            state = state
+                .into_iter()
+                .map(|value| value.rename_type_identities(&renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        Ok(state)
     }
 }
 
@@ -644,7 +831,7 @@ where
         // default behavior.
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             return context.fold_or_residualize(
-                C::Operation::from(*self),
+                C::Operation::from(self.clone()),
                 driver.regions().map(|region| region.to_program()).collect(),
                 inputs,
             );
@@ -669,7 +856,7 @@ where
             || body.effects().has_deferred_work()
         {
             return context.fold_or_residualize(
-                C::Operation::from(*self),
+                C::Operation::from(self.clone()),
                 vec![condition.to_program(), body.to_program()],
                 inputs,
             );
@@ -686,7 +873,7 @@ where
                 return Ok(outputs);
             }
             context.fold_or_residualize(
-                C::Operation::from(*self),
+                C::Operation::from(self.clone()),
                 vec![condition.to_program(), body.to_program()],
                 inputs,
             )
@@ -779,7 +966,7 @@ where
             vec![Placeholder; state_count],
         )?;
 
-        let while_operation = WhileOperation::new().with_iteration_bound(self.iteration_bound)?;
+        let while_operation = self.clone();
 
         // The residual while's inputs are exactly the original while's inputs: each state element's init value (now a
         // known residual for the folded elements) in state order.
@@ -1233,7 +1420,9 @@ where
         packed_inputs.push(context.axis_extent().clone());
         packed_inputs.extend(state.iter().map(|value| value.value().clone()));
         let mut outputs =
-            context.parent().bind(*self, vec![batched_condition, batched_body], packed_inputs.as_slice())?;
+            context
+                .parent()
+                .bind(self.clone(), vec![batched_condition, batched_body], packed_inputs.as_slice())?;
         check_count!("output", outputs, state_count + 1, ProgramError);
         outputs.remove(0);
         Ok(outputs
@@ -1273,6 +1462,12 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if !self.carry_output_identities.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "`jvp` of a `while` loop with changing indexed ragged carries is not yet supported".to_owned(),
+            }
+            .into());
+        }
         // The rule requests all nested-computation work through its driver (region 0 is the condition and
         // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
         let condition = driver.region(0)?.to_program();
@@ -1328,8 +1523,11 @@ where
 /// along its leading axes. This mirrors JAX's batched `while_p` contract, where the batching transform emits a loop
 /// whose condition returns a batched predicate and the loop's consumers implement the masked semantics.
 ///
-/// [`ArrayIrType`] conditions must produce a Boolean array member and may carry mixed array, dimension, and reference
-/// state. Reference state is supported under scalar predicates; batched predicates require reference discharge first
+/// [`ArrayIrType`] conditions must produce a Boolean array member and may carry mixed array, dimension, reference,
+/// and ragged state. A scalar predicate transports a ragged value as one opaque carry: its extent payloads may change
+/// while its complete logical type, storage bounds, and extent-axis structure remain fixed. Batched predicates over
+/// raw ragged state are rejected until automatic loop batching supplies the corresponding per-item masks.
+/// Reference state is supported under scalar predicates; batched predicates require reference discharge first
 /// because reference effects cannot be masked per item. Under a batched predicate the prefix requirement applies to the
 /// array members only, since a first-class dimension carries no shape, and such a dimension carry must additionally be
 /// *loop-invariant*: one dimension value cannot represent independently masked per-item extents, but masking a carry
@@ -1348,6 +1546,19 @@ pub trait WhileType: Type {
     ///   - `condition_output`: The single output type produced by the condition program.
     ///   - `state_types`: The loop-carried state types the condition and body consume.
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError>;
+
+    /// Returns the simultaneous identity rebinding from body results to the next iteration's formal carries, or
+    /// [`None`] when the state signature changes. The default requires exact types. Composite ragged carries permit
+    /// fresh indexed identities with exactly matching bounds, layout, and coordinate structure, and return an error
+    /// naming the carry, the ragged dimension, and both bounds when a body changes a declared indexed bound.
+    /// Rebinding changes only scoped metadata; it does not assert equal extent payloads across iterations or supply
+    /// numeric validation.
+    fn while_carry_rebinding(
+        state_types: &[Self],
+        body_outputs: &[Self],
+    ) -> Result<Option<TypeIdentityRenaming<Self::Identity>>, TypeError> {
+        Ok((state_types == body_outputs).then(TypeIdentityRenaming::new))
+    }
 
     /// Returns whether `condition_output` is a *batched* (per-item) predicate carrying one termination decision per
     /// leading-axes item, rather than a whole-loop scalar predicate. This is `true` for a non-scalar Boolean
@@ -1372,17 +1583,27 @@ impl WhileType for ArrayType {
 }
 
 impl WhileType for ArrayIrType {
+    fn while_carry_rebinding(
+        state_types: &[Self],
+        body_outputs: &[Self],
+    ) -> Result<Option<TypeIdentityRenaming<DimensionVariable>>, TypeError> {
+        rebind_ragged_carry_types(WHILE_OPERATION_NAME, state_types, body_outputs)
+    }
+
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
-        if let Some(r#type) = state_types.iter().find(|r#type| matches!(r#type, Self::Ragged(_))) {
-            return Err(TypeError::invalid(format!(
-                "`{WHILE_OPERATION_NAME}` does not support first-class ragged state `{type}`",
-            )));
-        }
         let Self::Array(predicate) = condition_output else {
             return Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got {condition_output}"
             )));
         };
+        if predicate.rank() > 0
+            && let Some(r#type) = state_types.iter().find(|r#type| matches!(r#type, Self::Ragged(_)))
+        {
+            return Err(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` condition with a batched predicate cannot carry first-class ragged state \
+                 `{type}`; per-item ragged state masking is not yet supported",
+            )));
+        }
         // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such a
         // carry must instead be loop-invariant, which `WhilePredicate::mask_select` enforces dynamically (refer to the
         // documentation of `WhileType`).
@@ -1394,7 +1615,8 @@ impl WhileType for ArrayIrType {
             }),
         )?;
         // A reference's referent changes with every iteration that writes it, so it follows the same variation rule
-        // as array state.
+        // as array state. Every ragged field also follows that rule: selecting a whole aggregate on each device may
+        // change both its numerical storage and its extent payloads.
         validate_while_state_variation(
             predicate,
             state_types.iter().filter_map(|state_type| match state_type {
@@ -1403,6 +1625,14 @@ impl WhileType for ArrayIrType {
                 Self::Dimension(_) | Self::Ragged(_) => None,
             }),
         )?;
+        for state_type in state_types {
+            if let Self::Ragged(state_type) = state_type {
+                validate_while_state_variation(
+                    predicate,
+                    std::iter::once(state_type.storage_type()).chain(state_type.extent_types()),
+                )?;
+            }
+        }
         // Reference operations are effectful, and a batched predicate masks carries per batch item after the body ran
         // for the whole batch. Effectful state cannot be masked that way, because the items whose predicate is already
         // false would still observe the body's writes.
@@ -1506,7 +1736,9 @@ fn validated_while_interfaces<'i, T: WhileType>(
         )));
     }
     T::validate_while_condition_output(&condition_output_types[0], state_types)?;
-    check_types!(@same, format!("`{WHILE_OPERATION_NAME}` body output"), [state_types, body_interface.output_types()]);
+    if T::while_carry_rebinding(state_types, body_interface.output_types())?.is_none() {
+        check_types!(@same, format!("`{WHILE_OPERATION_NAME}` body output"), [state_types, body_interface.output_types()]);
+    }
     if T::is_batched_predicate(&condition_output_types[0])
         && (!condition_interface.effects().is_empty() || !body_interface.effects().is_empty())
     {
@@ -1718,7 +1950,9 @@ where
 
     // Bind the known loop into the enclosing known-side context over the original known inits, and emit the
     // original loop unchanged into the residual program for the unknown state elements' finals.
-    let known_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
+    let known_while = operation
+        .clone()
+        .rebind_body_type_signature(&known_body.input_types(), &known_body.output_types())?;
     let known_inputs = known_state_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
     let known_outputs = context.fold_or_residualize(
         O::from(known_while),
@@ -1727,7 +1961,7 @@ where
     )?;
     check_count!("output", known_outputs, known_count, ProgramError);
     let residual_outputs =
-        context.residualize(O::from(*operation), vec![condition.to_program(), body.to_program()], inputs)?;
+        context.residualize(O::from(operation.clone()), vec![condition.to_program(), body.to_program()], inputs)?;
     check_count!("output", residual_outputs, state_count, ProgramError);
 
     // Assemble the loop's outputs in state order: known finals from the known loop, unknown finals from the
@@ -2304,7 +2538,7 @@ where
                         continue;
                     }
                     let mut restored =
-                        trace_context.bind(operation, Vec::new(), std::slice::from_ref(storage_input))?;
+                        trace_context.bind(operation.clone(), Vec::new(), std::slice::from_ref(storage_input))?;
                     check_count!("output", restored, 1, ProgramError);
                     let restored = restored.remove(0);
                     restored_residuals.push((residual_type.clone(), restored.clone()));
@@ -2755,7 +2989,7 @@ where
     }
     for axis in missing_axes {
         let operation = O::residual_stack_vary(axis, value.r#type().array_type()?)?;
-        let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(&value))?;
+        let mut outputs = context.bind(operation.clone(), Vec::new(), std::slice::from_ref(&value))?;
         check_count!("output", outputs, 1, ProgramError);
         value = outputs.remove(0);
     }
@@ -2886,7 +3120,8 @@ where
                 residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
             {
                 let storage_output = if let Some(operation) = O::residual_to_storage(residual_type)? {
-                    let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(residual_output))?;
+                    let mut outputs =
+                        context.bind(operation.clone(), Vec::new(), std::slice::from_ref(residual_output))?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs.remove(0)
                 } else {
@@ -3231,9 +3466,24 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
             }
         };
         match (on_true, on_false) {
-            (Self::Ragged(_), _) | (_, Self::Ragged(_)) => Err(ProgramError::UnsupportedOperation {
-                message: "first-class ragged while state selection is not yet supported".to_owned(),
-            }),
+            (Self::Ragged(on_true), Self::Ragged(on_false)) => {
+                if on_true.r#type() != on_false.r#type() {
+                    return Err(TypeError::invalid(format!(
+                        "`while` predicate cannot select between mismatched state types `{}` and `{}`",
+                        on_true.r#type(),
+                        on_false.r#type(),
+                    ))
+                    .into());
+                }
+                if predicate.r#type().rank() != 0 {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: "a batched `while` predicate cannot select first-class ragged state; per-item \
+                                  ragged state masking is not yet supported"
+                            .to_string(),
+                    });
+                }
+                Ok(Self::Ragged(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
+            }
             (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.mask_select(on_true, on_false)?)),
             (Self::Dimension(on_true), Self::Dimension(on_false)) => {
                 // Selecting between equal dimension carries (e.g., the loop-invariant mapped extent that structural
@@ -3305,7 +3555,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        MeshAxis, MeshAxisType, RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension, StridedLayout,
+        MeshAxis, MeshAxisType, RaggedDimension, RaggedType, RaggedValue, RaggedValueKind, Shape, Sharding,
+        ShardingDimension, StridedLayout,
     };
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::batch;
@@ -3331,6 +3582,7 @@ mod tests {
     use crate::operations::debugging::PrintOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::manipulation::reshaping::DynamicReshapeOperation;
+    use crate::operations::ragged::{RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
@@ -3710,7 +3962,7 @@ mod tests {
         assert_eq!(operation.iteration_bound(), None);
         let bounded = WhileOperation::new().with_iteration_bound(2).unwrap();
         assert_eq!(bounded.iteration_bound(), Some(2));
-        assert_eq!(bounded.with_iteration_bound(None).unwrap().iteration_bound(), None);
+        assert_eq!(bounded.clone().with_iteration_bound(None).unwrap().iteration_bound(), None);
         assert_eq!(
             WhileOperation::<ArrayType>::new().with_iteration_bound(0).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid("`while` iteration bound must be at least 1".to_string()))),
@@ -3737,23 +3989,24 @@ mod tests {
 
         // Eager binding iterates the body until the condition produces false.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let outputs =
-            context.bind(operation, [condition.clone(), body.clone()], &[Array::scalar(3.0).unwrap()]).unwrap();
+        let outputs = context
+            .bind(operation.clone(), [condition.clone(), body.clone()], &[Array::scalar(3.0).unwrap()])
+            .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![0.0]);
         let outputs = context
-            .bind(operation, vec![condition.clone(), body.clone()], &[Array::scalar(-1.0).unwrap()])
+            .bind(operation.clone(), vec![condition.clone(), body.clone()], &[Array::scalar(-1.0).unwrap()])
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![-1.0]);
 
         // A bounded while runs at most `bound` iterations by definition: the subtract-one loop at 5 would run five
         // iterations on its own, but the bound of 2 truncates it at 3 even though the condition is still true.
         let outputs = context
-            .bind(bounded, vec![condition.clone(), body.clone()], &[Array::scalar(5.0).unwrap()])
+            .bind(bounded.clone(), vec![condition.clone(), body.clone()], &[Array::scalar(5.0).unwrap()])
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![3.0]);
         // A loop that exits before reaching the bound is unaffected by it.
         let outputs = context
-            .bind(bounded, vec![condition.clone(), body.clone()], &[Array::scalar(1.0).unwrap()])
+            .bind(bounded.clone(), vec![condition.clone(), body.clone()], &[Array::scalar(1.0).unwrap()])
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![0.0]);
 
@@ -3763,7 +4016,7 @@ mod tests {
         let builder = context.builder().clone();
         let staged_state = context.input(state_type.clone());
         let outputs = context
-            .stage_operation(operation, [condition.clone(), body.clone()], std::slice::from_ref(&staged_state))
+            .stage_operation(operation.clone(), [condition.clone(), body.clone()], std::slice::from_ref(&staged_state))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         let builder = builder.borrow();
@@ -3781,7 +4034,7 @@ mod tests {
         let program_state = builder.add_input(state_type);
         let program_output = builder
             .add_instruction(
-                ArrayOperation::While(bounded),
+                ArrayOperation::While(bounded.clone()),
                 vec![condition_region, body_region],
                 vec![program_state],
                 None,
@@ -3983,7 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_type_validate_while_condition_output_rejects_first_class_ragged() {
+    fn test_while_type_validate_while_condition_output_ragged() {
         let state = ArrayIrType::Ragged(
             RaggedType::new(
                 ArrayType::new_static(DataType::I64, [2]),
@@ -3997,8 +4250,416 @@ mod tests {
                 &ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
                 std::slice::from_ref(&state),
             ),
-            Err(TypeError::invalid(format!("`while` does not support first-class ragged state `{state}`",))),
+            Ok(()),
         );
+        assert_eq!(
+            ArrayIrType::validate_while_condition_output(
+                &ArrayIrType::Array(ArrayType::new_static(DataType::Boolean, [2])),
+                std::slice::from_ref(&state),
+            ),
+            Err(TypeError::invalid(format!(
+                "`while` condition with a batched predicate cannot carry first-class ragged state `{state}`; \
+                 per-item ragged state masking is not yet supported",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_while_predicate_mask_select_ragged() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let first = TestIrValue::Ragged(
+            RaggedValue::new(
+                r#type.clone(),
+                Array::from_elements(r#type.storage_type().clone(), &[1f32; 6]).unwrap(),
+                vec![Array::vector(vec![1i64, 2]).unwrap()],
+            )
+            .unwrap(),
+        );
+        let second = TestIrValue::Ragged(
+            RaggedValue::new(
+                r#type.clone(),
+                Array::from_elements(r#type.storage_type().clone(), &[2f32; 6]).unwrap(),
+                vec![Array::vector(vec![2i64, 3]).unwrap()],
+            )
+            .unwrap(),
+        );
+        assert_eq!(array(Array::scalar(true).unwrap()).mask_select(&first, &second), Ok(first.clone()));
+        assert_eq!(array(Array::scalar(false).unwrap()).mask_select(&first, &second), Ok(second.clone()));
+        assert_eq!(
+            array(Array::vector(vec![true, false]).unwrap()).mask_select(&first, &second),
+            Err(ProgramError::UnsupportedOperation {
+                message: "a batched `while` predicate cannot select first-class ragged state; per-item ragged state \
+                          masking is not yet supported"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            array(Array::scalar(true).unwrap()).mask_select(&first, &array(Array::vector(vec![3i64, 3]).unwrap())),
+            Err(TypeError::invalid(
+                "`while` predicate cannot select between mismatched state types \
+                 `ragged<f32[2, 3]; 1:rows over [0]>` and `i64[2]`",
+            )
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_while_interpretation_ragged_extent_rebinding() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let next_rows = DimensionVariable::new("next_rows", rows.bounds());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let next_type = RaggedType::new(
+            r#type.storage_type().clone(),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, next_rows, vec![0])],
+        )
+        .unwrap();
+        let counter_type = ArrayType::scalar(DataType::I64);
+        let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = condition.add_input(counter_type.clone().into());
+        condition.add_input(r#type.clone().into());
+        let limit = condition
+            .add_instruction(
+                ArrayOperation::Constant(ConstantOperation::new(Array::scalar(2i64).unwrap())),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let predicate = condition
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            condition.to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:ragged<f32[2, 3]; 1:rows over [0]> .
+                let %2:i64[] = constant [value=2]
+                    %3:bool[] = compare [direction=LessThan] %0 %2
+                in (%3)"},
+        );
+
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = body.add_input(counter_type.into());
+        let carry = body.add_input(r#type.clone().into());
+        let one = body
+            .add_instruction(
+                ArrayOperation::Constant(ConstantOperation::new(Array::scalar(1i64).unwrap())),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let next_counter = body
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, one], None)
+            .unwrap()[0];
+        let storage = body.add_instruction(RaggedStorageOperation, Vec::new(), vec![carry], None).unwrap()[0];
+        let extents = body.add_instruction(RaggedExtentsOperation::new(1), Vec::new(), vec![carry], None).unwrap()[0];
+        let next_extents = body
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![extents, one], None)
+            .unwrap()[0];
+        let next = body
+            .add_instruction(RaggedNewOperation::new(next_type), Vec::new(), vec![storage, next_extents], None)
+            .unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next_counter, next],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:ragged<f32[2, 3]; 1:rows over [0]> .
+                let %2:i64[] = constant [value=1]
+                    %3:i64[] = add %0 %2
+                    %4:f32[2, 3] = ragged_storage %1
+                    %5:i64[2] = ragged_extents [axis=1] %1
+                    %6:i64[2] = add %5 %2
+                    %7:ragged<f32[2, 3]; 1:next_rows over [0]> = ragged_new \
+                        [output_type=ragged<f32[2, 3]; 1:next_rows over [0]>] %4 %6
+                in (%3, %7)"},
+        );
+
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let storage = Array::from_elements(r#type.storage_type().clone(), &[1f32, 2.0, 91.0, 3.0, 92.0, 93.0]).unwrap();
+        let extents = Array::vector(vec![0i64, 1]).unwrap();
+        let carry = context
+            .bind(
+                RaggedNewOperation::new(r#type.clone()),
+                Vec::new(),
+                &[array(storage.clone()), array(extents.clone())],
+            )
+            .unwrap()
+            .remove(0);
+        let operation =
+            WhileOperation::new().with_body_type_signature(&body.input_types(), &body.output_types()).unwrap();
+        let regions = vec![condition, body];
+        let output = context
+            .bind(operation.clone(), regions.clone(), &[array(Array::scalar(0i64).unwrap()), carry.clone()])
+            .unwrap();
+        assert_eq!(output[0], array(Array::scalar(2i64).unwrap()));
+        let TestIrValue::Ragged(result) = &output[1] else { panic!("expected a ragged loop carry") };
+        assert_ne!(result.r#type().ragged_dimensions()[0].dimension(), r#type.ragged_dimensions()[0].dimension());
+        assert_eq!(result.storage(), &storage);
+        assert_eq!(result.extents(), &[Array::vector(vec![2i64, 3]).unwrap()]);
+
+        let unchanged =
+            context.bind(operation.clone(), regions, &[array(Array::scalar(2i64).unwrap()), carry]).unwrap();
+        assert_eq!(unchanged[0], array(Array::scalar(2i64).unwrap()));
+        let TestIrValue::Ragged(unchanged) = &unchanged[1] else { panic!("expected a ragged loop carry") };
+        assert_eq!(unchanged.r#type(), result.r#type());
+        assert_eq!(unchanged.storage(), &storage);
+        assert_eq!(unchanged.extents(), &[extents]);
+    }
+
+    #[test]
+    fn test_while_aliased_dimension_item_carries() -> Result<(), ProgramError> {
+        let raw = || {
+            RaggedType::new(
+                ArrayType::new_static(DataType::I64, [2]),
+                RaggedValueKind::Dimension(DimensionType::new("item", DimensionBounds::non_negative(Some(4)).unwrap())),
+                vec![],
+            )
+            .unwrap()
+        };
+        let entering = raw();
+        let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition.add_input(entering.clone().into());
+        condition.add_input(entering.clone().into());
+        let predicate = condition.add_instruction(
+            ArrayOperation::Constant(ConstantOperation::new(Array::scalar(true)?)),
+            vec![],
+            vec![],
+            None,
+        )?[0];
+        let condition = condition.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![predicate],
+            vec![Placeholder; 2],
+            vec![Placeholder],
+        )?;
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first = body.add_input(entering.clone().into());
+        body.add_input(entering.clone().into());
+        let storage = body.add_instruction(RaggedStorageOperation, vec![], vec![first], None)?[0];
+        let result = body.add_instruction(RaggedNewOperation::new(raw()), vec![], vec![storage], None)?[0];
+        let body = body.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![result, result],
+            vec![Placeholder; 2],
+            vec![Placeholder; 2],
+        )?;
+        for bound in [1, 2] {
+            let operation = WhileOperation::<ArrayIrType>::new()
+                .with_iteration_bound(bound)?
+                .with_body_type_signature(&body.input_types(), &body.output_types())?;
+            assert_eq!(operation.defined_type_identities().len(), 1);
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let inputs = vec![builder.add_input(entering.clone().into()), builder.add_input(entering.clone().into())];
+            let regions = vec![builder.import_program(condition.clone()), builder.import_program(body.clone())];
+            let outputs = builder.add_instruction(operation, regions, inputs, None)?.to_vec();
+            let program = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                outputs,
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )?;
+            assert_eq!(
+                program.to_string(),
+                indoc::formatdoc! {"
+                    lambda %0:ragged<i64[2]; item=dimension<item ∈ [0, 4)>>, %1:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> .
+                    let %2:ragged<i64[2]; item=dimension<item ∈ [0, 4)>>, %3:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> = while \
+                        [iteration_bound={bound}, carry_output_identities=[item->item]] %0 %1 [
+                        condition={{
+                            lambda %0:ragged<i64[2]; item=dimension<item ∈ [0, 4)>>, %1:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> .
+                            let %2:bool[] = constant [value=true]
+                            in (%2)
+                        }},
+                        body={{
+                            lambda %0:ragged<i64[2]; item=dimension<item ∈ [0, 4)>>, %1:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> .
+                            let %2:i64[2] = ragged_storage %0
+                                %3:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> = ragged_new \
+                                    [output_type=ragged<i64[2]; item=dimension<item ∈ [0, 4)>>] %2
+                            in (%3, %3)
+                        }},
+                    ]
+                    in (%2, %3)"},
+            );
+            let value =
+                ArrayIrValue::Ragged(RaggedValue::new(entering.clone(), Array::vector(vec![1i64, 3])?, vec![])?);
+            let outputs = program.interpret(vec![value.clone(), value])?;
+            assert_eq!(outputs[0], outputs[1]);
+            assert_eq!(
+                outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(),
+                program.output_types()
+            );
+            let ArrayIrValue::Ragged(result) = &outputs[0] else { panic!("expected dimension items") };
+            assert_eq!(result.storage(), &Array::vector(vec![1i64, 3])?);
+            assert_ne!(result.r#type().as_ref(), &entering);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_while_ragged_carry_bound_changes_rejected() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let r#type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition.add_input(r#type.clone().into());
+        let predicate = condition
+            .add_instruction(
+                ArrayOperation::Constant(ConstantOperation::new(Array::scalar(false).unwrap())),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        // Type renderings omit bounds, so both an upper-bound and a lower-bound change must name the bounds. A changed
+        // upper bound also changes the padded storage capacity, which the body allocates itself.
+        for (bounds, capacity, message) in [
+            (
+                DimensionBounds::non_negative(Some(5)).unwrap(),
+                4,
+                "`while` carry 0 declares ragged dimension `rows` with bounds [0, 4) but its body returns `next_rows` \
+                 with bounds [0, 5)",
+            ),
+            (
+                DimensionBounds::new(1, Some(4)).unwrap(),
+                3,
+                "`while` carry 0 declares ragged dimension `rows` with bounds [0, 4) but its body returns `next_rows` \
+                 with bounds [1, 4)",
+            ),
+        ] {
+            let storage =
+                Array::from_fn_elements(ArrayType::new_static(DataType::F32, [2, capacity]), |_| Ok(0f32)).unwrap();
+            let next_type = RaggedType::new(
+                storage.r#type().into_owned(),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(1, DimensionVariable::new("next_rows", bounds), vec![0])],
+            )
+            .unwrap();
+            let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let carry = body.add_input(r#type.clone().into());
+            let storage = body
+                .add_instruction(
+                    ArrayOperation::Constant(ConstantOperation::new(storage)),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )
+                .unwrap()[0];
+            let extents =
+                body.add_instruction(RaggedExtentsOperation::new(1), Vec::new(), vec![carry], None).unwrap()[0];
+            let next = body
+                .add_instruction(RaggedNewOperation::new(next_type), Vec::new(), vec![storage, extents], None)
+                .unwrap()[0];
+            let body = body
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                WhileOperation::<ArrayIrType>::new()
+                    .with_body_type_signature(&body.input_types(), &body.output_types())
+                    .unwrap_err(),
+                TypeError::invalid(message),
+            );
+            assert_eq!(
+                WhileOperation::<ArrayIrType>::new()
+                    .infer_output_types(&[r#type.clone().into()], &[condition.interface(), body.interface()]),
+                Err(TypeError::invalid(message)),
+            );
+        }
+    }
+
+    #[test]
+    fn test_while_differentiation_changing_indexed_carries_rejected() {
+        // An eager derivative previously returned the entering identity on zero trips and the body's local identity
+        // at a one-iteration bound, bypassing the while's independent parent-result family in both cases.
+        for continue_loop in [false, true] {
+            let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
+            let next_rows = DimensionVariable::new("next_rows", rows.bounds());
+            let r#type = RaggedType::new(
+                ArrayType::new_static(DataType::F32, [2]),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(0, rows, Vec::new())],
+            )
+            .unwrap();
+            let next_type = RaggedType::new(
+                r#type.storage_type().clone(),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(0, next_rows, Vec::new())],
+            )
+            .unwrap();
+            let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            condition.add_input(r#type.clone().into());
+            let predicate = condition.add_constant(array(Array::scalar(continue_loop).unwrap()));
+            let condition = condition
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let input = body.add_input(r#type.clone().into());
+            let storage = body.add_instruction(RaggedStorageOperation, Vec::new(), vec![input], None).unwrap()[0];
+            let extents =
+                body.add_instruction(RaggedExtentsOperation::new(0), Vec::new(), vec![input], None).unwrap()[0];
+            let output = body
+                .add_instruction(RaggedNewOperation::new(next_type), Vec::new(), vec![storage, extents], None)
+                .unwrap()[0];
+            let body = body
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let operation = WhileOperation::new()
+                .with_iteration_bound(1)
+                .unwrap()
+                .with_body_type_signature(&body.input_types(), &body.output_types())
+                .unwrap();
+            let regions = vec![condition, body];
+            let value = TestIrValue::Ragged(
+                RaggedValue::new(
+                    r#type.clone(),
+                    Array::vector(vec![7f32, 9.]).unwrap(),
+                    vec![Array::scalar(1i64).unwrap()],
+                )
+                .unwrap(),
+            );
+            let tangent = TestIrValue::Ragged(
+                RaggedValue::new(r#type, Array::vector(vec![3f32, 5.]).unwrap(), vec![Array::scalar(1i64).unwrap()])
+                    .unwrap(),
+            );
+            let result = differentiate_at(value).jvp(tangent, |input| {
+                input
+                    .domain()
+                    .bind(operation.clone(), regions.clone(), &[input.clone()])
+                    .map(|mut outputs| outputs.remove(0))
+            });
+            let expected = ProgramError::UnsupportedOperation {
+                message: "`jvp` of a `while` loop with changing indexed ragged carries is not yet supported".to_owned(),
+            };
+            assert!(matches!(result, Err(DifferentiationError::Program(error)) if error == expected));
+        }
     }
 
     #[test]
@@ -4416,7 +5077,7 @@ mod tests {
             Ok(vec![Some(vec![true]), Some(vec![true, true])]),
         );
         assert_eq!(
-            operation.with_iteration_bound(3).unwrap().execution_demands(
+            operation.clone().with_iteration_bound(3).unwrap().execution_demands(
                 &[false, false],
                 boundary,
                 &mut CompleteBoundary,
@@ -4686,7 +5347,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let step = body_builder.add_constant(TestIrValue::Array(Array::scalar(-1.0f32).unwrap()));
         let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -5253,7 +5914,7 @@ mod tests {
         let reference = body_builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let accumulator = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![accumulator, accumulator], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![accumulator, accumulator], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -5308,11 +5969,11 @@ mod tests {
         let accumulator = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
         oracle_body_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let doubled = oracle_body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![accumulator, accumulator], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![accumulator, accumulator], None)
             .unwrap()[0];
         let step = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0).unwrap()));
         let counter = oracle_body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let limit = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(5.0).unwrap()));
         let predicate = oracle_body_builder
@@ -5337,7 +5998,7 @@ mod tests {
         let accumulator = oracle_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let step = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0).unwrap()));
         let counter = oracle_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![initial, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![initial, step], None)
             .unwrap()[0];
         let limit = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(5.0).unwrap()));
         let predicate = oracle_builder
@@ -5417,7 +6078,7 @@ mod tests {
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, counter], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, counter], None)
             .unwrap()[0];
         body_builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)
@@ -5448,11 +6109,11 @@ mod tests {
         let counter = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
         oracle_body_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let doubled = oracle_body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, counter], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, counter], None)
             .unwrap()[0];
         let step = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0).unwrap()));
         let counter = oracle_body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![doubled, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![doubled, step], None)
             .unwrap()[0];
         let limit = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()));
         let predicate = oracle_body_builder
@@ -5476,7 +6137,7 @@ mod tests {
         let initial = oracle_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let step = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0).unwrap()));
         let counter = oracle_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![initial, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![initial, step], None)
             .unwrap()[0];
         let limit = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()));
         let predicate = oracle_builder
@@ -5775,7 +6436,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let step = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0).unwrap()));
         let next = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -5906,7 +6567,7 @@ mod tests {
         let state = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let update = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(2.0).unwrap()));
         let updated = oracle_body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![state, update], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![state, update], None)
             .unwrap()[0];
         let oracle_body = oracle_body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![updated], vec![Placeholder], vec![Placeholder])
@@ -6017,7 +6678,7 @@ mod tests {
                 .unwrap();
             let one = builder.add_constant(TestIrValue::Array(Array::scalar(1i64).unwrap()));
             let incremented = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, one], None)
+                .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, one], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -6119,11 +6780,11 @@ mod tests {
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let next_value = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, state], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![value, state], None)
             .unwrap()[0];
         let one = body_builder.add_constant(TestIrValue::Array(Array::scalar(1i64).unwrap()));
         let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, one], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, one], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -6557,7 +7218,7 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, one], None)
             .unwrap();
         let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -6652,7 +7313,7 @@ mod tests {
             .unwrap();
         let step = body_builder.add_constant(array(Array::scalar(-1f32).unwrap()));
         let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -8163,15 +8824,19 @@ mod tests {
 
         let context = crate::contexts::EagerContext::<Array, ArrayOperation<Array>>::new();
         let outputs = context
-            .bind(operation, vec![condition.clone(), body.clone()], &[Array::vector(vec![3.0, 1.0, 2.0]).unwrap()])
+            .bind(
+                operation.clone(),
+                vec![condition.clone(), body.clone()],
+                &[Array::vector(vec![3.0, 1.0, 2.0]).unwrap()],
+            )
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![0.0, 0.0, 0.0]);
 
         // The semantic iteration bound truncates the shared masked iterations: item 0 stops at 1.0 after two body
         // applications while items 1 and 2 finish on their own predicates first.
-        let bounded = operation.with_iteration_bound(2).unwrap();
+        let bounded = operation.clone().with_iteration_bound(2).unwrap();
         let outputs = context
-            .bind(bounded, vec![condition, body], &[Array::vector(vec![3.0, 1.0, 2.0]).unwrap()])
+            .bind(bounded.clone(), vec![condition, body], &[Array::vector(vec![3.0, 1.0, 2.0]).unwrap()])
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![1.0, 0.0, 0.0]);
     }
@@ -8316,8 +8981,11 @@ mod tests {
         // at most two body applications, so batch item 0 truncates at 1.0 — the numbers of the eager operational
         // bounded path.
         let (countdown_operation, countdown_regions) = countdown_while_operation();
-        let program =
-            batch_while_under_tracing(countdown_operation.with_iteration_bound(2).unwrap(), countdown_regions, 3);
+        let program = batch_while_under_tracing(
+            countdown_operation.clone().with_iteration_bound(2).unwrap(),
+            countdown_regions,
+            3,
+        );
         let rendered = program.to_string();
         assert!(rendered.contains("iteration_bound=2"), "{rendered}");
         let output = program.interpret(Array::vector(vec![3.0, 1.0, 2.0]).unwrap()).unwrap();
@@ -8855,7 +9523,7 @@ mod tests {
             .unwrap();
         let step = body_builder.add_constant(TestIrValue::Array(Array::scalar(-1.0f32).unwrap()));
         let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .add_instruction(AddOperation::<ArrayType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -9177,7 +9845,7 @@ mod tests {
             let (value, gradient) = StagedDispatchTestDomain
                 .differentiate_at(Array::scalar(initial).unwrap())
                 .value_and_gradient(move |state| {
-                    state.context().bind(operation, regions.clone(), &[state.clone()]).unwrap().remove(0)
+                    state.context().bind(operation.clone(), regions.clone(), &[state.clone()]).unwrap().remove(0)
                 })
                 .unwrap();
             assert_eq!(value.to_f64s(), vec![expected_value]);

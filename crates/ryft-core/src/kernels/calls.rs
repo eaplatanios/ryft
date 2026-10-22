@@ -1201,7 +1201,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
             ArrayIrOperation::RaggedNew(_)
             | ArrayIrOperation::RaggedStorage(_)
-            | ArrayIrOperation::RaggedExtents(_) => {
+            | ArrayIrOperation::RaggedExtents(_)
+            | ArrayIrOperation::RaggedAdd(_)
+            | ArrayIrOperation::RaggedZero(_) => {
                 return Err(TypeError::invalid(
                     "first-class ragged operations have no kernel semantic descriptor encoding",
                 ));

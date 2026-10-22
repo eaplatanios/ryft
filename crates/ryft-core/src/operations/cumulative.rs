@@ -22,11 +22,12 @@
 //! # Batching
 //!
 //! The identity of each combining operator matters beyond the empty-prefix case: it is what the batching rule writes
-//! over the padding of a bounded ragged scanned axis (refer to [`RaggedMaskIdentity`]), so that padded positions cannot
-//! contribute to any live prefix. Masking is where cumulative batching parts company with a reduction's: a prefix scan
-//! keeps every axis it touches, so it _consumes_ no bounded ragged axis. The input's ragged axes ride through onto
-//! the result unchanged and the rule reports no consumption evidence. A scan whose axis is not ragged never reaches the
-//! masking hook at all, and so passes through exactly as it would with no ragged metadata.
+//! over the padding of every bounded ragged axis that is either the scanned axis itself or one whose extents vary
+//! along the scanned axis (refer to [`RaggedMaskIdentity`]), so that padded positions cannot contribute to any live
+//! prefix. Masking is where cumulative batching parts company with a reduction's: a prefix scan keeps every axis it
+//! touches, so it _consumes_ no bounded ragged axis. The input's ragged axes ride through onto the result unchanged and
+//! the rule reports no consumption evidence. A scan whose axis is neither ragged nor an extent axis of a ragged axis
+//! never reaches the masking hook at all, and so passes through exactly as it would with no ragged metadata.
 //!
 //! # Differentiation
 //!
@@ -96,7 +97,7 @@ pub const CUMULATIVE_OPERATION_NAME: &str = "cumulative";
 
 /// Associative combining operator of a [`CumulativeOperation`]. Every kind accumulates in the input's own element data
 /// type, so each partial result is rounded to the input's element encoding (i.e., there is no widened accumulation),
-/// and each kind has an identity that neutralizes the padding of a bounded ragged scanned axis.
+/// and each kind has an identity that neutralizes the padding that bounded ragged batching would otherwise scan.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CumulativeKind {
     /// Prefix sum. The identity is `0` and the combiner is addition. Real and complex numeric inputs are supported,
@@ -310,11 +311,23 @@ where
             None => (self.axis, BatchAxis::replicated()),
         };
 
-        // Padding along a _scanned_ ragged axis is neutralized with the identity of the combining operator first, so
-        // that padded positions cannot contribute to any live prefix. A payload-free structural zero needs no masking,
-        // because every element of it (padding included) is the same zero, whose every prefix sum or product is zero.
-        let scans_ragged_axis = inputs[0].ragged_axes().iter().any(|ragged_axis| ragged_axis.axis() == lifted_axis);
-        let input = match scans_ragged_axis && !inputs[0].r#type().data_type().is_zero() {
+        // A prefix along the scanned axis combines elements at different scanned positions, so padding must first be
+        // neutralized with the identity of the combining operator along every ragged axis whose padding can differ
+        // between those positions. That is the case both when the scanned axis is itself ragged and when it is one of
+        // the extent axes of a ragged axis (i.e., when the per-item extents of that ragged axis vary along the scanned
+        // axis). In the latter case, an element that is padding at one scanned position can share its ragged coordinate
+        // with a live element at a later position (or an earlier one, for a reverse scan), into whose prefix it would
+        // otherwise accumulate its stored value. A ragged axis whose extents do not vary along the scanned axis has the
+        // same live coordinates at every scanned position, so its padding only ever combines with other padding and
+        // needs no mask. A payload-free structural zero needs no masking either, because every element of it (padding
+        // included) is the same zero, whose every prefix sum or product is zero.
+        let masked_axes = inputs[0]
+            .ragged_axes()
+            .iter()
+            .filter(|ragged_axis| ragged_axis.axis() == lifted_axis || ragged_axis.extent_axes().contains(&lifted_axis))
+            .map(|ragged_axis| ragged_axis.axis())
+            .collect::<Vec<_>>();
+        let input = match !masked_axes.is_empty() && !inputs[0].r#type().data_type().is_zero() {
             true => {
                 let identity = match self.kind {
                     CumulativeKind::Sum => RaggedMaskIdentity::Zero,
@@ -323,7 +336,7 @@ where
                     CumulativeKind::Max => RaggedMaskIdentity::Lowest,
                     CumulativeKind::Min => RaggedMaskIdentity::Highest,
                 };
-                P::mask_identity_input(context, &inputs[0], &[lifted_axis], identity)?
+                P::mask_identity_input(context, &inputs[0], &masked_axes, identity)?
             }
             false => inputs[0].clone(),
         };
@@ -1243,11 +1256,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, DimensionVariable,
-        DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape,
-        Sharding, StridedLayout, f4e2m1fn, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e8m0fnu,
+        ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, StridedLayout, f4e2m1fn, f8e4m3fn, f8e4m3fnuz,
+        f8e5m2, f8e8m0fnu,
     };
-    use crate::batching::batch;
+    use crate::batching::{BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
@@ -1573,6 +1587,81 @@ mod tests {
                 in (%12)"
             },
         );
+    }
+
+    #[test]
+    fn test_cumulative_batching_ragged_extent_axis() {
+        // Each item is a `[time, columns]` array whose ragged `columns` extents vary along `time`, so the two time
+        // steps of an item can have different live columns. A scan along `time` combines elements that share a column,
+        // and so padding at one time step would accumulate into a live element at another (a later one, or an earlier
+        // one for a reverse scan) unless the rule first masks `columns` with the identity of the kind's combining
+        // operator. Every padded element below stores `100`, which no live output may observe, and padded output
+        // elements hold prefixes of the masked input. Scanning `columns` itself masks the same ragged axis.
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let packed = |values: &[f32]| {
+            ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2, 3]), values).unwrap(),
+            )
+        };
+        let infinity = f32::INFINITY;
+        for (operation, extents, input, expected) in [
+            // The scanned axis is the ragged `columns` axis.
+            (
+                CumulativeOperation::new(1, CumulativeKind::Sum),
+                [1i64, 3, 2, 3],
+                [1.0, 100.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 1.0, 2.0, 2.0, 1.0, 2.0, 3.0],
+            ),
+            // The scanned axis is the `time` extent axis of the ragged `columns` axis.
+            (
+                CumulativeOperation::new(0, CumulativeKind::Sum),
+                [1, 3, 2, 3],
+                [1.0, 100.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 1.0, 1.0],
+                [1.0, 0.0, 0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 0.0, 2.0, 2.0, 1.0],
+            ),
+            (
+                CumulativeOperation::new(0, CumulativeKind::Sum).with_reverse(true),
+                [3, 1, 3, 2],
+                [1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0],
+                [2.0, 1.0, 1.0, 1.0, 0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.0],
+            ),
+            (
+                CumulativeOperation::new(0, CumulativeKind::Product),
+                [1, 3, 2, 3],
+                [2.0, 100.0, 100.0, 3.0, 3.0, 3.0, 2.0, 2.0, 100.0, 3.0, 3.0, 3.0],
+                [2.0, 1.0, 1.0, 6.0, 3.0, 3.0, 2.0, 2.0, 1.0, 6.0, 6.0, 3.0],
+            ),
+            (
+                CumulativeOperation::new(0, CumulativeKind::Max),
+                [1, 3, 2, 3],
+                [1.0, 100.0, 100.0, 2.0, 2.0, 2.0, 1.0, 1.0, 100.0, 2.0, 2.0, 2.0],
+                [1.0, -infinity, -infinity, 2.0, 2.0, 2.0, 1.0, 1.0, -infinity, 2.0, 2.0, 2.0],
+            ),
+        ] {
+            // The `columns` extents are indexed by both the batch axis and the `time` axis of the packed array.
+            let extents = Array::from_elements::<i64>(ArrayType::new_static(DataType::I64, [2, 2]), &extents).unwrap();
+            let ragged_axes = vec![RaggedAxis::new(2, ArrayIrValue::Array(extents), columns.clone(), vec![0, 1])];
+            let batch = |values: &[f32]| {
+                ArrayIrBatch::new(packed(values), BatchAxis::new(0))
+                    .unwrap()
+                    .with_ragged_axes(ragged_axes.clone())
+                    .unwrap()
+            };
+            let [output] = context
+                .bind(
+                    ArrayIrOperation::Array(ArrayOperation::Cumulative(operation)),
+                    Vec::new(),
+                    &[BatchingTracer::new(context.clone(), batch(&input))],
+                )
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert_eq!(output.into_batch(), batch(&expected));
+        }
     }
 
     #[test]

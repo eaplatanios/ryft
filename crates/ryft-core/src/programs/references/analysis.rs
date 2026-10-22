@@ -4345,7 +4345,12 @@ mod tests {
             let reference = body.add_input(reference_type.clone());
             let step = body.add_constant(TestArrayValue::Array(Array::scalar(1.0f32).unwrap()));
             let next = body
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+                .add_instruction(
+                    ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                    Vec::new(),
+                    vec![counter, step],
+                    None,
+                )
                 .unwrap()[0];
             body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, step], None)
                 .unwrap();

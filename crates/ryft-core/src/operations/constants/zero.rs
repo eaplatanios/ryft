@@ -17,6 +17,7 @@ use crate::macros::{
 use crate::operations::constants::{
     check_constructor_type_has_no_identity_references, validate_dynamic_constant_dimensions,
 };
+use crate::operations::ragged::RaggedZeroOperation;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface, Type,
@@ -165,7 +166,6 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, ZeroOperation<Ar
     type Operation = Self;
 
     fn provide(request: ZeroOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 0, ProgramError);
         let r#type = match request.r#type {
             ArrayIrType::Array(r#type) => r#type,
             ArrayIrType::Dimension(_) => {
@@ -183,10 +183,14 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, ZeroOperation<Ar
                 ))
                 .into());
             }
-            ArrayIrType::Ragged(_) => {
-                return Err(TypeError::invalid("cannot materialize a zero for a first-class ragged type").into());
+            ArrayIrType::Ragged(r#type) => {
+                let operation = RaggedZeroOperation::new(r#type);
+                operation
+                    .infer_output_types(&input_types.iter().map(|r#type| (*r#type).clone()).collect::<Vec<_>>(), &[])?;
+                return Ok(Self::RaggedZero(operation));
             }
         };
+        check_count!("input", input_types, 0, ProgramError);
         check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &r#type)?;
         Ok(Self::Array(ArrayOperation::Zero(ZeroOperation::new(r#type))))
     }

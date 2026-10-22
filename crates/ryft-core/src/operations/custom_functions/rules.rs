@@ -367,7 +367,7 @@ impl<V, O> CustomRuleAxisDependence<V, O> for PolicyAxisDependence<V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>>>,
-    O: Operation<Type = V::Type> + From<AddOperation<V::Type>>,
+    O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
 {
     fn diagonal(
         &self,
@@ -389,7 +389,8 @@ where
         left: &CustomRuleTracer<V, O>,
         right: &CustomRuleTracer<V, O>,
     ) -> Result<CustomRuleTracer<V, O>, ProgramError> {
-        let mut outputs = left.context().bind(AddOperation::new(), Vec::new(), &[left.clone(), right.clone()])?;
+        let operation = O::provide(AddOperation::new(), &[left.r#type().as_ref(), right.r#type().as_ref()])?;
+        let mut outputs = left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -961,7 +962,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 >,
                 Operation = O,
             >
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1011,7 +1012,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 >,
                 Operation = O,
             >
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1066,7 +1067,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 >,
                 Operation = O,
             >
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1216,7 +1217,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + DifferentiableOperation<TracingContext<V, O>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
             + ResidualZeroProvider<V::Type, Operation = O>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         R: 'static
             + Fn(
                 &BatchingLevel<V::Type>,

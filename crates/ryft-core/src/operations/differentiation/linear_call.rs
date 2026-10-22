@@ -17,8 +17,9 @@ use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError,
-    RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeRefinements, Typed, Value,
+    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
+    ProgramError, RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -379,13 +380,24 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
         check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
         let forward = &region_interfaces[0];
-        let renaming = T::derive_identity_renaming(forward.input_types(), input_types)?;
+        let same_forward_inputs = forward.input_types() == input_types;
+
+        // Keeping an unchanged region needs no structural substitution. Repeated indexed inputs still require
+        // numerical equality at region entry; deriving a renaming cannot prove that relationship from their types.
+        let renaming = if same_forward_inputs {
+            TypeIdentityRenaming::new()
+        } else {
+            T::derive_identity_renaming(forward.input_types(), input_types)?
+        };
+
         let (residual_types, _) = self.split_inputs(input_types)?;
         let mut transpose_input_types = residual_types.to_vec();
         for r#type in forward.output_types() {
             transpose_input_types.push(r#type.rename_identities(&renaming)?.cotangent()?);
         }
-        Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
+        let transpose_inputs =
+            (transpose_input_types != region_interfaces[1].input_types()).then_some(transpose_input_types);
+        Ok(vec![(!same_forward_inputs).then(|| input_types.to_vec()), transpose_inputs])
     }
 
     fn infer_output_types(
@@ -612,7 +624,7 @@ where
 impl<
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>
-        + From<AddOperation<V::Type>>
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
         + ResidualZeroProvider<V::Type, Operation = O>
         + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>

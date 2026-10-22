@@ -4390,14 +4390,17 @@ pub fn discharge_local_reference_operation<
 ///   - `leading_input_count`: Number of leading inputs that parameterize the operation itself rather than being
 ///     forwarded to its regions, which is one for a condition's predicate and zero for a call.
 ///   - `widened_operation_fn`: Function called once before binding the rebuilt operation, with the number of inputs
-///     appended after the declared ones (not the total input count). It returns the operation to bind over that widened
-///     input list. Most operations simply return `operation.clone()`, while operations with per-input configuration
-///     extend that configuration to cover the appended inputs. For example,
-///     [`RematerializeOperation`](crate::RematerializeOperation) can carry an explicit optimization barrier mask with
-///     one entry per input. Its callback appends `false` for each added captured-reference-state input: appending one
-///     input changes `[true, false]` to `[true, false, false]`. This keeps the mask aligned with the call's inputs
-///     without selecting the added bookkeeping state for the barrier. The callback is also called when no inputs
-///     are appended, in which case the operation's existing input configuration remains valid.
+///     appended after the declared ones (not the total input count) and the rebuilt regions in operation-defined order.
+///     It returns the operation to bind over that widened input list. Most operations simply return
+///     `operation.clone()`, while operations with per-input configuration extend that configuration to cover the
+///     appended inputs. For example, [`RematerializeOperation`](crate::RematerializeOperation) can carry an explicit
+///     optimization barrier mask with one entry per input. Its callback appends `false` for each added
+///     captured-reference-state input: appending one input changes `[true, false]` to `[true, false, false]`. This
+///     keeps the mask aligned with the call's inputs without selecting the added bookkeeping state for the barrier.
+///     Operations whose payload records region signatures (e.g., instantiated result types of a call) derive them from
+///     the rebuilt regions, whose discharged references and appended state change those signatures. The callback is
+///     also called when no inputs are appended, in which case the operation's existing input configuration remains
+///     valid.
 ///
 /// # Errors
 ///
@@ -4411,7 +4414,7 @@ pub fn discharge_positional_region_operation<
     C: Context<Type: From<P::Referent>, Operation: From<O>>,
     P: ReferenceDischargePolicy<C>,
     D: ReferenceDischargeDriver<C, P>,
-    F: FnOnce(usize) -> O,
+    F: FnOnce(usize, &[Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>]) -> Result<O, ProgramError>,
 >(
     operation: &O,
     context: &ReferenceDischargeContext<C, P>,
@@ -4498,7 +4501,8 @@ pub fn discharge_positional_region_operation<
             context.boundary_value(&ReferenceDischargeValue::Reference(context.allocation_reference(*allocation)?))?,
         );
     }
-    let outputs = context.parent().bind(widened_operation_fn(entering.len()), regions, boundary_values.as_slice())?;
+    let widened_operation = widened_operation_fn(entering.len(), regions.as_slice())?;
+    let outputs = context.parent().bind(widened_operation, regions, boundary_values.as_slice())?;
     check_count!("output", outputs, source_output_count + leaving.len(), ProgramError);
 
     // A declared output that denotes a reference is reported as the handle the caller already holds rather than as a
@@ -5215,7 +5219,7 @@ mod tests {
                     Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
                 }
                 Self::Call | Self::ScopedCall { .. } => {
-                    discharge_positional_region_operation(self, context, driver, inputs, 0, |_| self.clone())
+                    discharge_positional_region_operation(self, context, driver, inputs, 0, |_, _| Ok(self.clone()))
                 }
             }
         }
@@ -9372,7 +9376,7 @@ mod tests {
                     }
                     Self::Native(_) => discharge_reference_free_operation(self, context, driver, inputs),
                     Self::Call => {
-                        discharge_positional_region_operation(self, context, driver, inputs, 0, |_| self.clone())
+                        discharge_positional_region_operation(self, context, driver, inputs, 0, |_, _| Ok(self.clone()))
                     }
                 }
             }
@@ -9427,8 +9431,8 @@ mod tests {
         }
 
         impl From<AddOperation<ArrayIrType>> for CallingOperation {
-            fn from(operation: AddOperation<ArrayIrType>) -> Self {
-                Self::Native(operation.into())
+            fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+                Self::Native(ArrayOperation::Add(AddOperation::<ArrayType>::new()).into())
             }
         }
 
@@ -10457,8 +10461,8 @@ mod tests {
         let allocation = forwarded.allocation_id();
         let inputs = [allocated.clone(), ReferenceDischargeValue::Value(ListIrValue::List(vec![7, 8]))];
         assert_eq!(
-            discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &inputs, 0, |_| {
-                ListOperation::Call
+            discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &inputs, 0, |_, _| {
+                Ok(ListOperation::Call)
             }),
             Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![7, 8]))]),
         );
@@ -10467,8 +10471,8 @@ mod tests {
 
         // Fewer inputs than the leading count, or a reference among the leading inputs, are malformed.
         assert_eq!(
-            discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &inputs, 3, |_| {
-                ListOperation::Call
+            discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &inputs, 3, |_, _| {
+                Ok(ListOperation::Call)
             }),
             Err(ProgramError::MalformedProgram(
                 "operation `list.call` forwards its inputs after 3 leading inputs but the application has 2 inputs"
@@ -10476,8 +10480,8 @@ mod tests {
             )),
         );
         assert_eq!(
-            discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &inputs, 1, |_| {
-                ListOperation::Call
+            discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &inputs, 1, |_, _| {
+                Ok(ListOperation::Call)
             }),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge expected a value leading input 0 of `list.call` but received {allocation} \
@@ -10493,7 +10497,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &inputs,
                 0,
-                |_| ListOperation::Call
+                |_, _| Ok(ListOperation::Call)
             ),
             Err(ProgramError::MalformedProgram(
                 "operation `list.call` forwards its inputs but attaches no regions".to_string()
@@ -10523,9 +10527,9 @@ mod tests {
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         // The captured allocation enters through one input appended after the declared ones.
-        let widened_operation_fn = |appended_input_count| {
+        let widened_operation_fn = |appended_input_count, _: &[_]| {
             assert_eq!(appended_input_count, 1);
-            ListOperation::Call
+            Ok(ListOperation::Call)
         };
         let results = discharge_positional_region_operation(
             &ListOperation::Call,
@@ -10564,8 +10568,8 @@ mod tests {
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
-        let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0, |_| {
-            ListOperation::Call
+        let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0, |_, _| {
+            Ok(ListOperation::Call)
         })
         .unwrap();
         assert_eq!(results.len(), 1);

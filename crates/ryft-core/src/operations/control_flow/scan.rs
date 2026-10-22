@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -6,8 +7,8 @@ use std::sync::Arc;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType,
-    Dimension, DimensionType, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape,
-    ShardingDimension,
+    Dimension, DimensionType, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, RaggedDimension,
+    RaggedType, RaggedValue, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -27,8 +28,8 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
 use crate::operations::control_flow::{
-    TemporalResidualOperation, TemporalResidualType, refine_output_types, region_input_mismatch,
-    validate_output_identities,
+    TemporalResidualOperation, TemporalResidualType, rebind_ragged_carry_types, refine_output_types,
+    region_input_mismatch, validate_output_identities_with_definitions,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
@@ -49,8 +50,8 @@ use crate::programs::{
     ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena, RegionDataFlow,
     RegionDataFlowBoundary, RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface,
-    RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
-    ValueProjection, rewrite_reference_access_transforms, validated_reference_access_descriptors,
+    RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming,
+    Typed, Value, ValueProjection, rewrite_reference_access_transforms, validated_reference_access_descriptors,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -67,8 +68,10 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 ///
 /// The body [`Program`] maps `[index, carry..., x_slice_or_reference...]` to `[carry..., y_slice...]`. Input zero is a
 /// scalar [`I64`](DataType::I64) array containing the selected slice index. The next [`carry_count`](Self::carry_count)
-/// inputs and the first `carry_count` outputs hold loop-carried state with matching types. Remaining array inputs
-/// receive one slice of a stacked instruction input; remaining reference inputs receive the whole reference unchanged.
+/// inputs and the first `carry_count` outputs hold loop-carried state with matching types. Ragged carries may use
+/// fresh local indexed identities at body outputs when their bounds and complete layouts match; the iteration boundary
+/// rebinds them to the formal carry identities without asserting equal extent payloads. Remaining array inputs receive
+/// one slice of a stacked instruction input; remaining reference inputs receive the whole reference unchanged.
 /// Remaining outputs contribute slices to stacked array results.
 ///
 /// Operation inputs are `[carry..., stacked_xs...]` and outputs are `[final_carry..., stacked_ys...]`. The intrinsic
@@ -83,8 +86,15 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// same runtime extent: the same dimension identity, or a static extent proved equal by singleton bounds. An unrelated
 /// runtime length identity is admitted only when its bounds fix one exact extent and every stack has that extent.
 ///
-/// Batching rejects bounded ragged inputs because the body's structurally batched boundary cannot retain their
-/// per-item extent carriers. Shared dynamic dimensions remain supported by composite scans.
+/// A first-class ragged stack has an ordinary leading scan axis. Its padded storage is sliced on that axis, while
+/// each extent payload is sliced only if its coordinate domain contains the scan axis, at that payload's corresponding
+/// axis position. Shared payloads pass unchanged. Every stacked ragged output stores its per-iteration extent payloads
+/// over a new leading scan coordinate. Fresh indexed body outputs must be declared through
+/// [`with_body_type_signature`](Self::with_body_type_signature), which exposes the checked body's scoped identities
+/// in the parent region without weakening identity schemas or changing payload validation.
+///
+/// Batching still rejects legacy bounded ragged carriers at the scan boundary because the body's structurally batched
+/// interface cannot retain their per-item extent carriers. Shared dynamic dimensions remain supported.
 ///
 /// A composite body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index
 /// transform to each access, with the body's index input as the first transform binding. Reference operations and their
@@ -118,6 +128,17 @@ pub struct ScanOperation<T: Type> {
     /// Lowering-only unroll factor: the number of body copies emitted per loop trip (`1` keeps one body per trip).
     pub(crate) unroll: usize,
 
+    /// Formal carry identities and their independent parent-result identities when a body updates their payloads.
+    carry_output_identities: Vec<(DimensionVariable, DimensionVariable)>,
+
+    /// Indexed body-output identities and the independent identities of their stacked results. Every scan declared
+    /// through [`Self::with_body_type_signature`] creates its own families, including when several scans share a body
+    /// or an input has the same extent coordinates. Only scans rebuilt from one source scan retain its families.
+    stacked_output_identities: Vec<(DimensionVariable, DimensionVariable)>,
+
+    /// Operation-owned result identities, shared across intrinsic and reference occurrences of each family.
+    output_identity_definitions: Vec<DimensionVariable>,
+
     /// Type universe of the loop-carried state, stacked values, and attached body region.
     marker: PhantomData<fn() -> T>,
 }
@@ -135,7 +156,16 @@ impl<T: Type> ScanOperation<T> {
     ///   - `length`: Shape-determined trip count.
     #[inline]
     pub fn new<L: Into<Dimension>>(carry_count: usize, length: L) -> Self {
-        Self { carry_count, length: length.into(), reverse: false, unroll: 1, marker: PhantomData }
+        Self {
+            carry_count,
+            length: length.into(),
+            reverse: false,
+            unroll: 1,
+            carry_output_identities: Vec::new(),
+            stacked_output_identities: Vec::new(),
+            output_identity_definitions: Vec::new(),
+            marker: PhantomData,
+        }
     }
 
     /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. Reversal changes the order in which
@@ -223,7 +253,8 @@ impl ScanOperation<ArrayIrType> {
     /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e., the
     /// intrinsic iteration index followed by the carries and the slices or reference stacks of the stacked inputs),
     /// excluding the trailing runtime length of a dynamic scan. Carries keep their types, a reference stack keeps its
-    /// type, and a stacked array gains the leading scan axis while keeping only the memory placement of its slice:
+    /// type, and a stacked array gains the leading scan axis while keeping only the memory placement of its slice.
+    /// `input_types` supplies each ragged stack's shared or varying extent schema and payload-axis order:
     /// scan input validation compares the actual inputs against these types with [`Type::is_refined_by`], so a stack
     /// may carry any sharding that type inference admits (e.g., one whose scan axis is sharded over an `Auto` mesh
     /// axis). Backends that check the entry of a scan whose body they inline (e.g., with an
@@ -233,11 +264,171 @@ impl ScanOperation<ArrayIrType> {
     ///
     /// Returns an error when `body_input_types` has no index, fewer inputs than carries, or a stacked input that the
     /// body cannot declare (e.g., a first-class dimension, or a reference whose leading axis is not the scan length).
-    pub fn declared_input_types(&self, body_input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError> {
+    pub fn declared_input_types(
+        &self,
+        body_input_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         let Some((_, body_input_types)) = body_input_types.split_first() else {
             return Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body has no index input")));
         };
-        composite_scan_boundary_types(ScanBoundarySide::Input, body_input_types, self.carry_count, &self.length)
+        composite_scan_input_types(body_input_types, self.carry_count, &self.length, Some(input_types))
+    }
+}
+
+impl<T: ScanType> ScanOperation<T> {
+    /// Records the scoped indexed identities exported by this scan's validated body. Changing ragged carries get
+    /// independent parent-result identities because the initial and final values can coexist with different extent
+    /// payloads. Every indexed family in stacked results gets a fresh result identity, including body-local families
+    /// when several scans share one body. A slice does not reveal whether its input extent payload was shared across
+    /// iterations, so forwarded families also get new names. This covers both shared and varying payloads without
+    /// claiming equality between different coordinate domains. All fresh identities are allocated here; inference
+    /// only validates the recorded metadata, and no declaration supplies numeric proof. Call this before binding a scan
+    /// whose ragged body introduces, changes, or stacks indexed identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid body signature or carry types whose complete schemas cannot be rebound.
+    pub fn with_body_type_signature(self, body_input_types: &[T], body_output_types: &[T]) -> Result<Self, TypeError> {
+        Self { carry_output_identities: Vec::new(), stacked_output_identities: Vec::new(), ..self }
+            .rebind_body_type_signature(body_input_types, body_output_types)
+    }
+
+    /// Retargets a body rebuilt from this scan's body while retaining this scan's parent-result identities for every
+    /// surviving body family, and allocates fresh result identities only for the families that this scan did not
+    /// export. Scans split from one source scan (e.g., the primal and tangent scans of a linearization) thereby
+    /// export one result identity for each source family, including a family whose results the split places on both
+    /// sides, so that each output declaration of the source scan maps to one actual identity. The retained
+    /// declarations are validated against the rebuilt body exactly as [`Self::with_body_type_signature`] validates
+    /// fresh ones.
+    fn rebind_body_type_signature(
+        mut self,
+        body_input_types: &[T],
+        body_output_types: &[T],
+    ) -> Result<Self, TypeError> {
+        T::validate_scan_body_type_signature(body_input_types, body_output_types, self.carry_count, &self.length)?;
+        let rebinding = T::scan_carry_rebinding(
+            &body_input_types[1..1 + self.carry_count],
+            &body_output_types[..self.carry_count],
+        )?
+        .ok_or_else(|| TypeError::invalid("`scan` body carry outputs do not preserve the declared carry layout"))?;
+        let carry_output_identities = rebinding
+            .replacements()
+            .iter()
+            .filter(|(source, target)| source != target)
+            .map(|(source, formal)| {
+                let result = self
+                    .carry_output_identities
+                    .iter()
+                    .find(|(retained, _)| retained == formal)
+                    .map_or_else(|| source.fresh(), |(_, result)| result.clone());
+                (formal.clone(), result)
+            })
+            .collect();
+        self.carry_output_identities = carry_output_identities;
+        self.carry_output_renaming(body_input_types, body_output_types)?;
+        let stacked =
+            T::scan_stacked_output_identities(body_input_types, body_output_types, self.carry_count, &self.length)?;
+        let stacked_output_identities = stacked
+            .into_iter()
+            .map(|identity| {
+                let result = self
+                    .stacked_output_identities
+                    .iter()
+                    .find(|(retained, _)| *retained == identity)
+                    .map_or_else(|| identity.fresh(), |(_, result)| result.clone());
+                (identity, result)
+            })
+            .collect();
+        self.stacked_output_identities = stacked_output_identities;
+        self.stacked_output_renaming(body_input_types, body_output_types)?;
+        self.output_identity_definitions = self.derive_output_identity_definitions();
+        Ok(self)
+    }
+
+    /// Validates the exact indexed carry binder while preserving all scalar identities and complete type schemas.
+    fn carry_output_renaming(
+        &self,
+        body_input_types: &[T],
+        body_output_types: &[T],
+    ) -> Result<TypeIdentityRenaming<DimensionVariable>, TypeError> {
+        let rebinding = T::scan_carry_rebinding(
+            &body_input_types[1..1 + self.carry_count],
+            &body_output_types[..self.carry_count],
+        )?
+        .ok_or_else(|| TypeError::invalid("`scan` body carry outputs do not preserve the declared carry layout"))?;
+        let changed = rebinding
+            .replacements()
+            .iter()
+            .filter(|(source, target)| source != target)
+            .map(|(_, formal)| formal)
+            .collect::<Vec<_>>();
+        let invalid = || {
+            TypeError::invalid(
+                "`scan` output identity declaration does not match its body; construct the scan with `with_body_type_signature`",
+            )
+        };
+        if changed.len() != self.carry_output_identities.len() {
+            return Err(invalid());
+        }
+        let mut renaming = TypeIdentityRenaming::new();
+        for ((formal, result), expected) in self.carry_output_identities.iter().zip(changed) {
+            if formal != expected
+                || formal.bounds() != result.bounds()
+                || body_input_types
+                    .iter()
+                    .chain(body_output_types)
+                    .any(|r#type| r#type.identities().any(|(_, identity)| identity == result))
+                || renaming.replacements().iter().any(|(_, target)| target == result)
+            {
+                return Err(invalid());
+            }
+            renaming.insert(formal.clone(), result.clone())?;
+        }
+        Ok(renaming)
+    }
+
+    /// Validates the fresh stacked-result binders against the complete body signature.
+    fn stacked_output_renaming(
+        &self,
+        body_input_types: &[T],
+        body_output_types: &[T],
+    ) -> Result<TypeIdentityRenaming<DimensionVariable>, TypeError> {
+        let stacked =
+            T::scan_stacked_output_identities(body_input_types, body_output_types, self.carry_count, &self.length)?;
+        let invalid = || {
+            TypeError::invalid(
+                "`scan` output identity declaration does not match its body; construct the scan with `with_body_type_signature`",
+            )
+        };
+        if stacked.len() != self.stacked_output_identities.len() {
+            return Err(invalid());
+        }
+        let mut renaming = TypeIdentityRenaming::new();
+        for ((formal, result), expected) in self.stacked_output_identities.iter().zip(&stacked) {
+            if formal != expected
+                || formal.bounds() != result.bounds()
+                || body_input_types
+                    .iter()
+                    .chain(body_output_types)
+                    .any(|r#type| r#type.identities().any(|(_, identity)| identity == result))
+                || self.carry_output_identities.iter().any(|(_, carry)| carry == result)
+                || renaming.replacements().iter().any(|(_, target)| target == result)
+            {
+                return Err(invalid());
+            }
+            renaming.insert(formal.clone(), result.clone())?;
+        }
+        Ok(renaming)
+    }
+
+    /// Declares one owner for each fresh result family, including aliased intrinsic dimension definitions.
+    fn derive_output_identity_definitions(&self) -> Vec<DimensionVariable> {
+        self.carry_output_identities
+            .iter()
+            .chain(&self.stacked_output_identities)
+            .map(|(_, result)| result.clone())
+            .collect()
     }
 }
 
@@ -259,6 +450,11 @@ impl<T: ScanType> Operation for ScanOperation<T> {
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         const { &[RegionSlot::computation("body")] }
+    }
+
+    #[inline]
+    fn defined_type_identities(&self) -> Cow<'_, [DimensionVariable]> {
+        Cow::Borrowed(&self.output_identity_definitions)
     }
 
     fn infer_region_input_types(
@@ -309,14 +505,39 @@ impl<T: ScanType> Operation for ScanOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("region", region_interfaces, 1, TypeError);
         validate_scan_length(&self.length)?;
-        let output_types = T::infer_scan_output_types(
+        let mut output_types = T::infer_scan_output_types(
             region_interfaces[0].input_types(),
             region_interfaces[0].output_types(),
             self.carry_count,
             &self.length,
             input_types,
         )?;
-        validate_output_identities(SCAN_OPERATION_NAME, input_types, output_types.as_slice())?;
+        let renaming =
+            self.carry_output_renaming(region_interfaces[0].input_types(), region_interfaces[0].output_types())?;
+        if !renaming.is_identity() {
+            for output in &mut output_types[..self.carry_count] {
+                *output = output.rename_identities(&renaming)?;
+            }
+        }
+        let stacked_renaming =
+            self.stacked_output_renaming(region_interfaces[0].input_types(), region_interfaces[0].output_types())?;
+        if !stacked_renaming.is_identity() {
+            for output in &mut output_types[self.carry_count..] {
+                *output = output.rename_identities(&stacked_renaming)?;
+            }
+        }
+        let definitions = self.derive_output_identity_definitions();
+        if definitions != self.output_identity_definitions {
+            return Err(TypeError::invalid(
+                "`scan` output identity declaration does not match its body; construct the scan with `with_body_type_signature`",
+            ));
+        }
+        validate_output_identities_with_definitions(
+            SCAN_OPERATION_NAME,
+            input_types,
+            output_types.as_slice(),
+            &self.output_identity_definitions,
+        )?;
         Ok(output_types)
     }
 
@@ -348,6 +569,14 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        // Fresh stacked identities belong to this exact body signature. Keep that boundary whole when pruning
+        // cannot inspect the surviving result types to derive a new declaration.
+        if !self.output_identity_definitions.is_empty()
+            || !self.carry_output_identities.is_empty()
+            || !self.stacked_output_identities.is_empty()
+        {
+            return Ok(None);
+        }
         let carry_count = self.carry_count;
         if used_outputs.len() < carry_count {
             return Err(ProgramError::MalformedProgram(format!(
@@ -413,7 +642,25 @@ impl<T: ScanType> Operation for ScanOperation<T> {
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        Ok(Self { length: self.length.rename_type_identities(renaming), ..self.clone() })
+        Ok(Self {
+            length: self.length.rename_type_identities(renaming),
+            carry_output_identities: self
+                .carry_output_identities
+                .iter()
+                .map(|(formal, result)| (renaming.rename(formal), renaming.rename(result)))
+                .collect(),
+            stacked_output_identities: self
+                .stacked_output_identities
+                .iter()
+                .map(|(formal, result)| (renaming.rename(formal), renaming.rename(result)))
+                .collect(),
+            output_identity_definitions: self
+                .output_identity_definitions
+                .iter()
+                .map(|identity| renaming.rename(identity))
+                .collect(),
+            ..self.clone()
+        })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -421,6 +668,21 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             operation.field("carry_count", self.carry_count)?;
             operation.field("length", &self.length)?;
             operation.field("reverse", self.reverse)?;
+            if !self.carry_output_identities.is_empty() {
+                operation.list(
+                    "carry_output_identities",
+                    self.carry_output_identities.iter().map(|(formal, result)| format!("{formal}->{result}")),
+                )?;
+            }
+            if !self.stacked_output_identities.is_empty() {
+                operation.list(
+                    "stacked_output_identities",
+                    self.stacked_output_identities.iter().map(|(formal, result)| format!("{formal}->{result}")),
+                )?;
+            }
+            if !self.output_identity_definitions.is_empty() {
+                operation.list("output_identity_definitions", &self.output_identity_definitions)?;
+            }
             if self.unroll > 1 {
                 operation.field("unroll", self.unroll)?;
             }
@@ -507,8 +769,13 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         }
         // Boundary pruning already computes the carry fixed point, including inputs demanded by retained effects.
         // Reusing its kept outputs keeps replay demand and boundary pruning governed by one operation-owned rule.
-        let pruning = self.prune_boundary(boundary.input_count, used_outputs, regions)?.unwrap();
-        Ok(vec![Some(pruning.kept_outputs)])
+        let kept_outputs = match self.prune_boundary(boundary.input_count, used_outputs, regions)? {
+            Some(pruning) => pruning.kept_outputs,
+            // A scoped output binder keeps its entire signature. Retaining every body result also preserves the
+            // checked construction that establishes each exported family, even when a caller ignores the stack.
+            None => vec![true; boundary.regions[0].output_count],
+        };
+        Ok(vec![Some(kept_outputs)])
     }
 }
 
@@ -1092,7 +1359,7 @@ where
         // computed here: eager reference values may refine their declared reference types, which staged type
         // inference requires to match exactly.
         let expected_input_types =
-            composite_scan_boundary_types(ScanBoundarySide::Input, &body_input_types[1..], carry_count, self.length())?;
+            composite_scan_input_types(&body_input_types[1..], carry_count, self.length(), Some(&input_types))?;
         // Validate the primitive contract at the actual input types before any iteration runs, so that a zero-trip scan
         // still rejects inputs that type inference rejects (e.g., a stacked input whose scan axis is sharded over an
         // explicit mesh axis, or a dimension carry whose extent lies outside its declared bounds). Live reference
@@ -1126,57 +1393,79 @@ where
                 }
             }
         }
-        let declared_output_types =
-            composite_scan_boundary_types(ScanBoundarySide::Output, &body.output_types(), carry_count, self.length())?;
+        let mut normalized_body_outputs = body.output_types();
+        let carry_renaming = ArrayIrType::scan_carry_rebinding(
+            &body_input_types[1..1 + carry_count],
+            &normalized_body_outputs[..carry_count],
+        )?
+        .ok_or_else(|| TypeError::invalid("`scan` body carry outputs do not preserve the declared carry layout"))?;
+        let rebind_carries = body_input_types[1..1 + carry_count] != normalized_body_outputs[..carry_count];
+        for output in &mut normalized_body_outputs[..carry_count] {
+            *output = output.rename_identities(&carry_renaming)?;
+        }
+        let declared_output_types = composite_scan_boundary_types(
+            ScanBoundarySide::Output,
+            &normalized_body_outputs,
+            carry_count,
+            self.length(),
+        )?;
         let stacked_output_types = refine_output_types(
             expected_input_types.as_slice(),
             &input_types[..expected_input_types.len()],
             declared_output_types.as_slice(),
             |index| (index < carry_count).then_some(index),
         )?[carry_count..]
-            .iter()
-            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()?;
+            .to_vec();
         let (initial_carries, stacks) = inputs.split_at(carry_count);
         let mut carries = initial_carries.to_vec();
         let array_context = EagerContext::<A, ArrayOperation<A>>::new();
-        let mut accumulators = stacked_output_types
-            .iter()
-            .map(|r#type| {
-                let dimensions = r#type
+        let allocate_array = |r#type: &ArrayType| -> Result<A, ProgramError> {
+            let dimensions =
+                r#type
                     .shape()
                     .dimensions()
                     .iter()
                     .enumerate()
-                    .map(|(axis, dimension)| match dimension {
-                        _ if axis == 0 => Ok(Dimension::Static(length)),
-                        Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-                        // An identity that an output defines (e.g., a dimension carry) stays symbolic after refinement.
-                        // Resolve it through the input that the body declares with that identity, which may be a
-                        // constant or renamed dimension that validation accepted as refining it.
-                        Dimension::Dynamic(variable) => expected_input_types
-                            .iter()
-                            .zip(inputs)
-                            .find_map(|(declared_type, input)| match (declared_type, input) {
-                                (ArrayIrType::Dimension(declared_type), ArrayIrValue::Dimension(value))
-                                    if declared_type.variable() == Some(variable) =>
-                                {
-                                    Some(Dimension::Static(value.extent()))
-                                }
-                                _ => None,
-                            })
-                            .ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "cannot eagerly allocate `{}` output `{}` because its dynamic dimension `{}` is \
-                                     not supplied as a first-class `{}` input",
-                                    SCAN_OPERATION_NAME, r#type, variable, SCAN_OPERATION_NAME,
-                                ))
-                            }),
+                    .map(|(axis, dimension)| {
+                        match dimension {
+                _ if axis == 0 => Ok(Dimension::Static(length)),
+                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                // A first-class dimension input resolves an otherwise symbolic output storage coordinate.
+                Dimension::Dynamic(variable) => expected_input_types.iter().zip(inputs).find_map(|(declared, input)| {
+                    match (declared, input) {
+                        (ArrayIrType::Dimension(declared), ArrayIrValue::Dimension(value))
+                            if declared.variable() == Some(variable) => Some(Dimension::Static(value.extent())),
+                        _ => None,
+                    }
+                }).ok_or_else(|| TypeError::invalid(format!(
+                    "cannot eagerly allocate `{}` output `{}` because its dynamic dimension `{}` is \
+                     not supplied as a first-class `{}` input",
+                    SCAN_OPERATION_NAME, r#type, variable, SCAN_OPERATION_NAME,
+                ))),
+            }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                array_context.zero(&r#type.clone().with_shape(Shape::new(dimensions)))
+            array_context.zero(&r#type.clone().with_shape(Shape::new(dimensions)))
+        };
+        let mut accumulators = stacked_output_types
+            .iter()
+            .map(|r#type| match r#type {
+                ArrayIrType::Array(r#type) => allocate_array(r#type).map(ArrayIrValue::Array),
+                ArrayIrType::Ragged(r#type) => {
+                    let storage = allocate_array(r#type.storage_type())?;
+                    let extents = r#type.extent_types().iter().map(&allocate_array).collect::<Result<Vec<_>, _>>()?;
+                    let concrete_type = RaggedType::new(
+                        storage.r#type().into_owned(),
+                        r#type.value_kind().clone(),
+                        r#type.ragged_dimensions().to_vec(),
+                    )?;
+                    Ok(ArrayIrValue::Ragged(RaggedValue::new(concrete_type, storage, extents)?))
+                }
+                ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
+                    Err(TypeError::invalid("`scan` stacked outputs must be arrays or first-class ragged values").into())
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, ProgramError>>()?;
         for visit in 0..length {
             let iteration = if reverse { length - 1 - visit } else { visit };
             let mut iteration_inputs =
@@ -1189,23 +1478,74 @@ where
                         // The body selects its own view with the explicit index; passing the root preserves
                         // shared storage when more than one body value aliases the same allocation.
                         ArrayIrValue::Reference(_) => Ok(stack.clone()),
-                        _ => Ok(ArrayIrValue::Array(read_scan_iteration(
-                            <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(stack)?,
-                            iteration,
-                        )?)),
+                        ArrayIrValue::Ragged(stack) => {
+                            read_ragged_scan_iteration(stack, iteration).map(ArrayIrValue::Ragged)
+                        }
+                        ArrayIrValue::Array(_) | ArrayIrValue::Dimension(_) => {
+                            Ok(ArrayIrValue::Array(read_scan_iteration(
+                                <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(stack)?,
+                                iteration,
+                            )?))
+                        }
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?,
             );
             let mut iteration_outputs = driver.interpret_region(context, 0, iteration_inputs)?;
             check_count!("output", iteration_outputs, carry_count + stacked_output_types.len(), ProgramError);
             let iteration_outputs_to_stack = iteration_outputs.split_off(carry_count);
+            if rebind_carries {
+                let state_types = carries.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+                let candidate_types =
+                    iteration_outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+                let renaming = ArrayIrType::scan_carry_rebinding(&state_types, &candidate_types)?.ok_or_else(|| {
+                    TypeError::invalid("`scan` body values do not preserve the declared carry layout")
+                })?;
+                iteration_outputs = iteration_outputs
+                    .into_iter()
+                    .map(|value| value.rename_type_identities(&renaming))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             carries = iteration_outputs;
             for (accumulator, value) in accumulators.iter_mut().zip(iteration_outputs_to_stack) {
-                let value = <ArrayIrValue<A> as ValueProjection<ArrayType>>::into_projected(value)?;
-                *accumulator = write_scan_iteration(accumulator.clone(), iteration, value)?;
+                *accumulator = match (&*accumulator, value) {
+                    (ArrayIrValue::Array(accumulator), ArrayIrValue::Array(value)) => {
+                        ArrayIrValue::Array(write_scan_iteration(accumulator.clone(), iteration, value)?)
+                    }
+                    (ArrayIrValue::Ragged(accumulator), ArrayIrValue::Ragged(value)) => {
+                        let storage =
+                            write_scan_iteration(accumulator.storage().clone(), iteration, value.storage().clone())?;
+                        let extents = accumulator
+                            .extents()
+                            .iter()
+                            .zip(value.extents())
+                            .map(|(stack, value)| write_scan_iteration(stack.clone(), iteration, value.clone()))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        ArrayIrValue::Ragged(RaggedValue::new(accumulator.r#type().into_owned(), storage, extents)?)
+                    }
+                    _ => {
+                        return Err(
+                            TypeError::invalid("`scan` body output does not match its stacked value kind").into()
+                        );
+                    }
+                };
             }
         }
-        carries.extend(accumulators.into_iter().map(ArrayIrValue::Array));
+        let result_renaming = self.carry_output_renaming(&body_input_types, &body.output_types())?;
+        if !result_renaming.is_identity() {
+            carries = carries
+                .into_iter()
+                .map(|value| value.rename_type_identities(&result_renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        // Stacks accumulate at body identities; export each family under this scan's own result identity.
+        let stacked_renaming = self.stacked_output_renaming(&body_input_types, &body.output_types())?;
+        if !stacked_renaming.is_identity() {
+            accumulators = accumulators
+                .into_iter()
+                .map(|value| value.rename_type_identities(&stacked_renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        carries.extend(accumulators);
         Ok(carries)
     }
 }
@@ -1428,7 +1768,8 @@ where
             }
             let batched_scan = ScanOperation::<ArrayType>::new(carry_count, self.length())
                 .with_reverse(self.reverse())
-                .with_unroll(self.unroll())?;
+                .with_unroll(self.unroll())?
+                .with_body_type_signature(&batched_body.input_types(), &batched_body.output_types())?;
             let mut values = carries.iter().map(|carry| carry.value().clone()).collect::<Vec<_>>();
             values.extend(stacks.iter().map(|stack| stack.value().clone()));
             let outputs = context.parent().bind(batched_scan, vec![batched_body], &values)?;
@@ -1724,7 +2065,8 @@ where
 
         let batched_scan = ScanOperation::<ArrayIrType>::new(carry_count + 1, self.length())
             .with_reverse(self.reverse())
-            .with_unroll(self.unroll())?;
+            .with_unroll(self.unroll())?
+            .with_body_type_signature(&batched_body.input_types(), &batched_body.output_types())?;
         let mut packed_inputs = Vec::with_capacity(inputs.len() + 1);
         packed_inputs.push(context.axis_extent().clone());
         packed_inputs.extend(carries.iter().map(|carry| carry.value().clone()));
@@ -1782,8 +2124,6 @@ where
         // its bounds free of the operation family's own semantic traits.
         let carry_count = self.carry_count();
         let length = self.length();
-        let reverse = self.reverse();
-        let unroll = self.unroll();
 
         // The fused body is compact: it carries a tangent input exactly for the body inputs whose tangent is live and a
         // tangent output exactly for the body outputs whose tangent is live. Plumbing references, zero-space inputs,
@@ -1894,11 +2234,13 @@ where
         let mut scan_inputs =
             input_order.iter().skip(1).map(|&index| fused_inputs[index - 1].clone()).collect::<Vec<_>>();
         scan_inputs.extend(runtime_length_inputs.iter().map(|input| (input.primal().clone(), true)));
-        let fused_scan = ScanOperation::<T>::new(carry_count + live_carry_count, length)
-            .with_reverse(reverse)
-            .with_unroll(unroll)?;
+        // The fused scan keeps this scan's result identities, so that the split primal and tangent scans built below
+        // export one identity for each family of this scan (refer to `reconstruct_partitioned_scan`).
+        let fused_scan = ScanOperation { carry_count: carry_count + live_carry_count, ..self.clone() };
         let outputs = if shared_destinations {
             let fused_body = reorder_program_boundary(&jvp_body, &input_order, &output_order)?;
+            let fused_scan =
+                fused_scan.with_body_type_signature(&fused_body.input_types(), &fused_body.output_types())?;
             let scan_input_values = scan_inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
             context
                 .primal()
@@ -1970,6 +2312,7 @@ where
                 &input_known,
                 &input_known[1..1 + carry_count + live_carry_count],
                 preserve_known_scan,
+                false,
                 &relationships,
                 partition,
                 |constant| Ok((context.primal().lift(constant)?, true)),
@@ -2074,7 +2417,7 @@ where
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
-        + From<AddOperation<ArrayIrType>>
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ScanOperation<ArrayIrType>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
@@ -2099,15 +2442,49 @@ where
 /// Type-family semantics for [`ScanOperation`].
 ///
 /// [`ArrayType`] stacks per-iteration arrays along a static leading axis. [`ArrayIrType`] additionally permits
-/// references and first-class dimensions in carry positions and a dynamic length supplied by a trailing dimension
-/// input. Both families require the body's first input to be a scalar [`I64`](DataType::I64) slice index.
+/// references and first-class dimensions in carry positions, first-class ragged carries and stacks, and a dynamic
+/// length supplied by a trailing dimension input. Both families require the body's first input to be a scalar
+/// [`I64`](DataType::I64) slice index.
 ///
-/// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the body
-/// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
-/// dimensions have a stacked value representation. Scan lengths are [`Dimension`]s, so every implementing family uses
-/// [`DimensionVariable`]s as its type identities. A dynamic length and every stacked leading axis must provably have
-/// equal extents; a static stack whose extent only lies within the length's bounds is insufficient.
+/// Trailing array and ragged inputs enter as slices. A reference to a statically shaped array stack enters unchanged,
+/// and the body creates any per-iteration view explicitly. Stacked outputs may be ordinary arrays or first-class ragged
+/// values; scalar first-class dimensions and references have no stacked value representation. Scan lengths are
+/// [`Dimension`]s, so every implementing family uses [`DimensionVariable`]s as its type identities. A dynamic length and
+/// every stacked leading axis must provably have equal extents; a static stack whose extent only lies within the
+/// length's bounds is insufficient.
 pub trait ScanType: Type<Identity = DimensionVariable> {
+    /// Returns the scoped identity rebinding from body carry results to the next iteration's formal carries, or
+    /// [`None`] when the carry layout changes. The default requires exact types. Composite ragged carries can rename
+    /// indexed identities bijectively when their bounds, storage, value kinds, and coordinate schemas otherwise match
+    /// exactly, and return an error naming the carry, the ragged dimension, and both bounds when a body changes a
+    /// declared indexed bound. This is not an extent equality assertion: checked body construction remains
+    /// responsible for validating each iteration's payloads.
+    fn scan_carry_rebinding(
+        state_types: &[Self],
+        body_outputs: &[Self],
+    ) -> Result<Option<TypeIdentityRenaming<DimensionVariable>>, TypeError> {
+        Ok((state_types == body_outputs).then(TypeIdentityRenaming::new))
+    }
+
+    /// Returns the indexed identities exported by stacked results, in occurrence order and without repetition.
+    /// Every scan exports these families under its own fresh result identities. Body-local families must remain
+    /// independent when scans share a body, and a forwarded body slice cannot establish whether its enclosing input
+    /// payload was shared across iterations or already varied over the scan coordinate. The default declares none
+    /// for type families without indexed extent payloads. Inference validates these declarations without allocating
+    /// identities; only [`ScanOperation::with_body_type_signature`] allocates their result names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the declared input or stacked output boundary cannot be derived from the body types.
+    fn scan_stacked_output_identities(
+        _body_input_types: &[Self],
+        _body_output_types: &[Self],
+        _carry_count: usize,
+        _length: &Dimension,
+    ) -> Result<Vec<DimensionVariable>, TypeError> {
+        Ok(Vec::new())
+    }
+
     /// Validates the intrinsic index and carry contracts of a declared iteration body independently of the values
     /// that bind it. Transform rules use this before rewriting or eliminating a scan so specialization cannot erase
     /// an invalid source signature. Homogeneous bodies require static array types; composite bodies additionally
@@ -2404,6 +2781,34 @@ impl ScanType for ArrayType {
 }
 
 impl ScanType for ArrayIrType {
+    fn scan_carry_rebinding(
+        state_types: &[Self],
+        body_outputs: &[Self],
+    ) -> Result<Option<TypeIdentityRenaming<DimensionVariable>>, TypeError> {
+        rebind_ragged_carry_types(SCAN_OPERATION_NAME, state_types, body_outputs)
+    }
+
+    fn scan_stacked_output_identities(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: &Dimension,
+    ) -> Result<Vec<DimensionVariable>, TypeError> {
+        Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, length)?;
+        // The stacked family belongs to this scan, whether its per-iteration extents came from an input slice or
+        // were created inside a body that other scans can share. Preserve aliasing across this scan's result slots.
+        let mut stacked = Vec::new();
+        for output in &body_output_types[carry_count..] {
+            let Self::Ragged(output) = output else { continue };
+            for (identity, _) in output.indexed_identities() {
+                if !stacked.contains(identity) {
+                    stacked.push(identity.clone());
+                }
+            }
+        }
+        Ok(stacked)
+    }
+
     fn validate_scan_body_type_signature(
         body_input_types: &[Self],
         body_output_types: &[Self],
@@ -2417,12 +2822,13 @@ impl ScanType for ArrayIrType {
             )));
         }
         let body_input_types = &body_input_types[1..];
-        composite_scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length)?;
+        composite_scan_input_types(body_input_types, carry_count, length, None)?;
         composite_scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, length)?;
-        check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
-            &body_input_types[..carry_count],
-            &body_output_types[..carry_count],
-        ]);
+        if Self::scan_carry_rebinding(&body_input_types[..carry_count], &body_output_types[..carry_count])?.is_none() {
+            check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
+                &body_input_types[..carry_count], &body_output_types[..carry_count],
+            ]);
+        }
         Ok(())
     }
 
@@ -2442,14 +2848,20 @@ impl ScanType for ArrayIrType {
                 "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body input count {stacked_input_end}",
             )));
         }
-        if let Some(r#type) = input_types.iter().find(|r#type| matches!(r#type, Self::Ragged(_))) {
-            return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` does not support first-class ragged input type `{type}`",
-            )));
-        }
         let mut body_input_types = vec![Self::Array(ArrayType::scalar(DataType::I64))];
         body_input_types.extend_from_slice(&input_types[..carry_count]);
         for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
+            if let Self::Ragged(r#type) = r#type {
+                let (slice, leading) = ragged_scan_slice_type(r#type)?;
+                if !length.is_refined_by(&leading) {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` stacked input {} must have leading dimension `{length}` but has type `{type}`",
+                        carry_count + index,
+                    )));
+                }
+                body_input_types.push(Self::Ragged(slice));
+                continue;
+            }
             // Arrays enter as slices; references enter as whole roots so the body can form its own indexed view.
             let stacked_type = match r#type {
                 Self::Array(r#type) => r#type,
@@ -2494,7 +2906,7 @@ impl ScanType for ArrayIrType {
     ) -> Result<(), TypeError> {
         let body_input_types = &body_input_types[1..];
         let expected_input_types =
-            composite_scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length)?;
+            composite_scan_input_types(body_input_types, carry_count, length, Some(input_types))?;
         let runtime_length_count = usize::from(length.variable().is_some());
         check_count!("input", input_types, expected_input_types.len() + runtime_length_count, TypeError);
         for (index, (expected, actual)) in
@@ -2533,11 +2945,12 @@ impl ScanType for ArrayIrType {
         input_sides: Option<&[bool]>,
     ) -> Result<Vec<Vec<usize>>, TypeError> {
         let declared_types =
-            composite_scan_boundary_types(ScanBoundarySide::Input, &body_input_types[1..], carry_count, length)?;
+            composite_scan_input_types(&body_input_types[1..], carry_count, length, Some(input_types))?;
         let shape = |r#type: &Self| match r#type {
             Self::Array(r#type) => Some(r#type.shape().clone()),
             Self::Reference(r#type) => Some(r#type.referent().shape().clone()),
-            Self::Dimension(_) | Self::Ragged(_) => None,
+            Self::Ragged(r#type) => Some(r#type.storage_type().shape().clone()),
+            Self::Dimension(_) => None,
         };
         // A first-class dimension carries its identity as itself, at a static extent when its bounds admit only one.
         let actual_dimension = |position: usize, axis: Option<usize>| match (&input_types[position], axis) {
@@ -2605,9 +3018,18 @@ impl ScanType for ArrayIrType {
         Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, length)?;
         Self::validate_scan_input_type_signature(body_input_types, carry_count, length, input_types)?;
         let expected_input_types =
-            composite_scan_boundary_types(ScanBoundarySide::Input, &body_input_types[1..], carry_count, length)?;
+            composite_scan_input_types(&body_input_types[1..], carry_count, length, Some(input_types))?;
+        let renaming =
+            Self::scan_carry_rebinding(&body_input_types[1..1 + carry_count], &body_output_types[..carry_count])?
+                .ok_or_else(|| {
+                    TypeError::invalid("`scan` body carry outputs do not preserve the declared carry layout")
+                })?;
+        let mut body_output_types = body_output_types.to_vec();
+        for output in &mut body_output_types[..carry_count] {
+            *output = output.rename_identities(&renaming)?;
+        }
         let output_types =
-            composite_scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, length)?;
+            composite_scan_boundary_types(ScanBoundarySide::Output, &body_output_types, carry_count, length)?;
         // A runtime length input that only refines the declared bounds fixes the trip count to one exact extent, so the
         // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
         // them symbolic would type a concretely sized result as an independent runtime extent.
@@ -2615,7 +3037,7 @@ impl ScanType for ArrayIrType {
             match validate_scan_runtime_length(length, input_types, carry_count, expected_input_types.len())? {
                 Some(extent) => composite_scan_boundary_types(
                     ScanBoundarySide::Output,
-                    body_output_types,
+                    &body_output_types,
                     carry_count,
                     &Dimension::Static(extent),
                 )?,
@@ -2665,6 +3087,58 @@ fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, 
              ({error}); reshard it so that its scan axis is not sharded over explicit mesh axes",
         ))
     })
+}
+
+/// Removes the ordinary leading scan coordinate from a ragged value. Payload coordinates retain their order, so a
+/// permuted extent payload loses precisely the axis that names scan coordinate zero; shared payloads lose none.
+fn ragged_scan_slice_type(stacked_type: &RaggedType) -> Result<(RaggedType, Dimension), TypeError> {
+    if stacked_type.storage_type().rank() == 0 {
+        return Err(TypeError::invalid("`scan` stacked ragged input must have rank at least 1"));
+    }
+    if stacked_type.ragged_dimensions().iter().any(|dimension| dimension.axis() == 0) {
+        return Err(TypeError::invalid("`scan` leading stacked axis must be ordinary rather than ragged"));
+    }
+    let (storage, length) = scan_slice_type(stacked_type.storage_type(), 0)?;
+    let descriptors = stacked_type
+        .ragged_dimensions()
+        .iter()
+        .map(|dimension| {
+            RaggedDimension::new(
+                dimension.axis() - 1,
+                dimension.dimension().clone(),
+                dimension.extent_axes().iter().filter(|&&axis| axis != 0).map(|axis| axis - 1).collect(),
+            )
+        })
+        .collect();
+    let slice = RaggedType::new(storage, stacked_type.value_kind().clone(), descriptors)?;
+    for ((descriptor, shared_type), sliced_type) in
+        stacked_type.ragged_dimensions().iter().zip(stacked_type.extent_types()).zip(slice.extent_types())
+    {
+        if !descriptor.extent_axes().contains(&0) && shared_type != sliced_type {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` cannot slice ragged storage whose scan axis changes a shared extent \
+                 payload's manual variation; reshard the scan axis before scanning",
+            )));
+        }
+    }
+    Ok((slice, length))
+}
+
+/// Adds a real scan axis to storage and all iteration-varying extent payloads. The caller owns the scoped indexed
+/// identity binding between the body and the parent boundary; this helper only derives physical coordinate layout.
+fn stacked_ragged_scan_type(slice_type: &RaggedType, length: &Dimension) -> Result<RaggedType, TypeError> {
+    let descriptors = slice_type
+        .ragged_dimensions()
+        .iter()
+        .map(|dimension| {
+            RaggedDimension::new(
+                dimension.axis() + 1,
+                dimension.dimension().clone(),
+                std::iter::once(0).chain(dimension.extent_axes().iter().map(|axis| axis + 1)).collect(),
+            )
+        })
+        .collect();
+    RaggedType::new(stacked_scan_type(slice_type.storage_type(), length), slice_type.value_kind().clone(), descriptors)
 }
 
 /// Validates that every dimension of `r#type` is static, reporting a precise error that names the scan `role` (for
@@ -2749,11 +3223,6 @@ fn composite_scan_boundary_types(
             body_types.len(),
         )));
     }
-    if let Some(r#type) = body_types.iter().find(|r#type| matches!(r#type, ArrayIrType::Ragged(_))) {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` does not support first-class ragged body {side} type `{type}`",
-        )));
-    }
     let mut boundary_types = body_types[..carry_count].to_vec();
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
         let index = carry_count + index;
@@ -2763,6 +3232,17 @@ fn composite_scan_boundary_types(
             }
             (ArrayIrType::Array(r#type), ScanBoundarySide::Output) => {
                 ArrayIrType::Array(stacked_scan_type(r#type, length))
+            }
+            (ArrayIrType::Ragged(r#type), side) => {
+                let stacked = stacked_ragged_scan_type(r#type, length)?;
+                ArrayIrType::Ragged(match side {
+                    ScanBoundarySide::Input => RaggedType::new(
+                        declared_stacked_scan_input_type(r#type.storage_type(), length),
+                        stacked.value_kind().clone(),
+                        stacked.ragged_dimensions().to_vec(),
+                    )?,
+                    ScanBoundarySide::Output => stacked,
+                })
             }
             (ArrayIrType::Reference(reference), ScanBoundarySide::Input) => {
                 validate_static_scan_type("input", index + 1, reference.referent())?;
@@ -2780,7 +3260,7 @@ fn composite_scan_boundary_types(
                     r#type = r#type,
                 )));
             }
-            (ArrayIrType::Dimension(_) | ArrayIrType::Ragged(_), _) => {
+            (ArrayIrType::Dimension(_), _) => {
                 return Err(TypeError::invalid(format!(
                     "`{SCAN_OPERATION_NAME}` stacked body {side} {} must be an array but got `{type}`",
                     index + usize::from(side == ScanBoundarySide::Input),
@@ -2790,6 +3270,49 @@ fn composite_scan_boundary_types(
         });
     }
     Ok(boundary_types)
+}
+
+/// Retains each actual ragged input's shared/varying extent schema while deriving declared storage from its body
+/// slice. Types alone distinguish the schema: a shared payload is never broadcast across the scan coordinate.
+fn composite_scan_input_types(
+    body_types: &[ArrayIrType],
+    carry_count: usize,
+    length: &Dimension,
+    input_types: Option<&[ArrayIrType]>,
+) -> Result<Vec<ArrayIrType>, TypeError> {
+    let mut declared = composite_scan_boundary_types(ScanBoundarySide::Input, body_types, carry_count, length)?;
+    let Some(input_types) = input_types else { return Ok(declared) };
+    for (index, body_type) in body_types.iter().enumerate().skip(carry_count) {
+        let (ArrayIrType::Ragged(body), Some(ArrayIrType::Ragged(actual))) = (body_type, input_types.get(index)) else {
+            continue;
+        };
+        ragged_scan_slice_type(actual)?;
+        let descriptors = body
+            .ragged_dimensions()
+            .iter()
+            .enumerate()
+            .map(|(occurrence, dimension)| {
+                let mut axes = dimension.extent_axes().iter().map(|axis| axis + 1).collect::<Vec<_>>();
+                if let Some(position) = actual
+                    .ragged_dimensions()
+                    .get(occurrence)
+                    .and_then(|candidate| candidate.extent_axes().iter().position(|axis| *axis == 0))
+                {
+                    if position > axes.len() {
+                        return Err(TypeError::invalid("`scan` extent payload has incompatible scan coordinates"));
+                    }
+                    axes.insert(position, 0);
+                }
+                Ok(RaggedDimension::new(dimension.axis() + 1, dimension.dimension().clone(), axes))
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        declared[index] = ArrayIrType::Ragged(RaggedType::new(
+            declared_stacked_scan_input_type(body.storage_type(), length),
+            body.value_kind().clone(),
+            descriptors,
+        )?);
+    }
+    Ok(declared)
 }
 
 /// Validates the runtime dimension's identity or singleton refinement independently of stacked-axis equality.
@@ -2853,7 +3376,8 @@ fn validate_scan_runtime_length(
             let stacked_type = match r#type {
                 ArrayIrType::Array(r#type) => Some(r#type),
                 ArrayIrType::Reference(reference) => Some(reference.referent()),
-                ArrayIrType::Dimension(_) | ArrayIrType::Ragged(_) => None,
+                ArrayIrType::Ragged(r#type) => Some(r#type.storage_type()),
+                ArrayIrType::Dimension(_) => None,
             };
             if !stacked_type.is_some_and(|r#type| r#type.rank() > 0 && length.has_equal_extents(&r#type.dimension(0))) {
                 return Err(TypeError::invalid(format!(
@@ -2871,7 +3395,8 @@ fn validate_scan_runtime_length(
         let stacked_type = match r#type {
             ArrayIrType::Array(r#type) => Some(r#type),
             ArrayIrType::Reference(reference) => Some(reference.referent()),
-            ArrayIrType::Dimension(_) | ArrayIrType::Ragged(_) => None,
+            ArrayIrType::Ragged(r#type) => Some(r#type.storage_type()),
+            ArrayIrType::Dimension(_) => None,
         };
         let leading_extent = match stacked_type {
             Some(r#type) if r#type.rank() > 0 => r#type.dimension(0).bounds().extent(),
@@ -2933,8 +3458,16 @@ pub(crate) fn read_scan_iteration<V>(stack: &V, iteration: usize) -> Result<V, P
 where
     V: Value<Type = ArrayType> + Slice + Reshape,
 {
+    read_scan_axis_iteration(stack, iteration, 0)
+}
+
+/// Extracts one physical scan coordinate, including a scan coordinate that is not the first axis of an extent payload.
+fn read_scan_axis_iteration<V>(stack: &V, iteration: usize, axis: usize) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Slice + Reshape,
+{
     let stack_type = stack.r#type().into_owned();
-    let (slice_type, _) = scan_slice_type(&stack_type, 0)?;
+    let (slice_type, _) = scan_slice_type(&stack_type, axis)?;
     let dimensions = stack_type
         .shape()
         .dimensions()
@@ -2949,15 +3482,42 @@ where
         })
         .collect::<Result<Vec<usize>, ProgramError>>()?;
     let mut start_indices = vec![0; dimensions.len()];
-    start_indices[0] = iteration;
+    start_indices[axis] = iteration;
     let mut limit_indices = dimensions.clone();
-    limit_indices[0] = iteration + 1;
+    limit_indices[axis] = iteration + 1;
     let unit_strides = vec![1; dimensions.len()];
     let iteration_value = stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
     iteration_value.reshape_with_output_sharding(
-        Shape::new(dimensions[1..].iter().map(|&dimension| Dimension::Static(dimension)).collect()),
+        Shape::new(
+            dimensions
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != axis)
+                .map(|(_, &dimension)| Dimension::Static(dimension))
+                .collect(),
+        ),
         slice_type.sharding().cloned(),
     )
+}
+
+/// Slices padded storage and only those full extent payloads that vary over the selected scan coordinate.
+fn read_ragged_scan_iteration<V>(stack: &RaggedValue<V>, iteration: usize) -> Result<RaggedValue<V>, ProgramError>
+where
+    V: Value<Type = ArrayType> + Slice + Reshape,
+{
+    let stacked_type = stack.r#type();
+    let (slice_type, _) = ragged_scan_slice_type(stacked_type.as_ref())?;
+    let storage = read_scan_iteration(stack.storage(), iteration)?;
+    let extents = stacked_type
+        .ragged_dimensions()
+        .iter()
+        .zip(stack.extents())
+        .map(|(dimension, extent)| match dimension.extent_axes().iter().position(|axis| *axis == 0) {
+            Some(axis) => read_scan_axis_iteration(extent, iteration, axis),
+            None => Ok(extent.clone()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RaggedValue::new(slice_type, storage, extents)?)
 }
 
 /// Writes `value` as slice `iteration` of `accumulator` along its leading axis, prepending a unit axis to `value`
@@ -3078,6 +3638,7 @@ where
         &input_known,
         &carry_known,
         false,
+        true,
         relationships,
         partition,
         |constant| Ok(context.known_value(context.parent().lift(constant)?)),
@@ -3169,8 +3730,18 @@ where
 }
 
 /// Rebuilds two scans from a partitioned iteration body, storing each varying residual once per iteration. Returns
-/// `None` when a reference cannot cross the resulting boundary, the split has no known work, or the residual scan would
-/// have to validate a relationship without producing any of the original outputs.
+/// `None` when a reference cannot cross the resulting boundary, the split has no known work, the residual scan would
+/// have to validate a relationship without producing any of the original outputs, or `residualize_split_families` is
+/// set and the split would place results of one exported family on both sides.
+///
+/// Both rebuilt scans keep the source scan's result identities, so each family that the source scan exports (i.e., a
+/// changing ragged carry or an indexed family of its stacked results) keeps one identity on both sides, and each source
+/// output declaration maps to one actual identity. Two scans that export one family cannot share a region, because
+/// each one defines that family. Partial evaluation cannot tell whether the known side's results of a split family
+/// will reach the residual program, where the residual scan would define that family a second time, so it residualizes
+/// such a scan whole instead. Linearization stages its two scans into separate primal and tangent programs, so it
+/// splits such a scan and only keeps the known scan explicit: forwarding its inputs would replace the exported family
+/// with the inputs' families.
 ///
 /// Computed invariant residuals are hoisted only when the declared length guarantees an iteration. Direct input
 /// forwarding never evaluates body work and remains valid when the length admits zero.
@@ -3185,7 +3756,8 @@ where
 ///
 /// # Parameters
 ///
-///   - `scan`: Source scan, whose length, direction, and lowering attributes both derived scans retain.
+///   - `scan`: Source scan, whose length, direction, lowering attributes, and result identities both derived scans
+///     retain.
 ///   - `body_input_types`: Full iteration input signature, including the intrinsic index.
 ///   - `body_output_count`: Number of original iteration outputs before adding residual storage.
 ///   - `inputs`: Source operation values in the binding destinations' shared representation.
@@ -3193,6 +3765,7 @@ where
 ///   - `carry_known`: Converged knownness of the initial and next carry values.
 ///   - `preserve_known_scan`: Retains the known scan and its full input boundary when runtime extents require eager
 ///     value validation before any computed invariant work is hoisted.
+///   - `residualize_split_families`: Returns `None` instead of splitting an exported family across both sides.
 ///   - `relationships`: Groups of positions of `inputs` whose agreement only a scan boundary validates.
 ///   - `partition`: Known and residual body programs with their compact boundary descriptors.
 ///   - `lift_known`: Lifts a body constant into the known binding destination.
@@ -3210,6 +3783,7 @@ fn reconstruct_partitioned_scan<V, O, Input, LiftKnown, ResolveConstant, KnownBi
     input_known: &[bool],
     carry_known: &[bool],
     preserve_known_scan: bool,
+    residualize_split_families: bool,
     relationships: &[Vec<usize>],
     partition: PartitionedProgram<V, O>,
     mut lift_known: LiftKnown,
@@ -3315,6 +3889,40 @@ where
         return Ok(None);
     }
     let forwards_carries = relationships.is_empty();
+
+    // Collect the families that the source scan exports on the results of each side, as described above. A carry's
+    // family is named by its formal identity, and a stacked result's family by its body output identity.
+    let residual_output_types = residual_program.output_types();
+    let mut known_families = Vec::new();
+    let mut unknown_families = Vec::new();
+    for (index, output) in partition_outputs.iter().enumerate() {
+        let (known, families) = if index < carry_count {
+            let families = body_input_types[index + 1]
+                .identities()
+                .filter_map(|(_, identity)| {
+                    scan.carry_output_identities.iter().find(|(formal, _)| formal == identity).map(|(_, result)| result)
+                })
+                .collect::<Vec<_>>();
+            (carry_known[index], families)
+        } else {
+            let output_type = match output {
+                PartialEvaluationOutput::Known(output) => &known_program_output_types[*output],
+                PartialEvaluationOutput::Unknown(output) => &residual_output_types[*output],
+            };
+            let families = output_type
+                .identities()
+                .filter_map(|(_, identity)| {
+                    scan.stacked_output_identities.iter().find(|(body, _)| body == identity).map(|(_, result)| result)
+                })
+                .collect::<Vec<_>>();
+            (matches!(output, PartialEvaluationOutput::Known(_)), families)
+        };
+        if known { known_families.extend(families) } else { unknown_families.extend(families) }
+    }
+    let splits_families = known_families.iter().any(|family| unknown_families.contains(family));
+    if splits_families && residualize_split_families {
+        return Ok(None);
+    }
 
     // Assemble the known body's outputs: the known next-carries, then the known per-iteration outputs, then the
     // residual edges (the known feeders the unknown side consumes, plus the instantiated known next-carries of
@@ -3588,13 +4196,16 @@ where
     let known_body_inputs = known_body.input_ids().to_vec();
     let known_body_outputs = known_body.output_ids().to_vec();
     let (known_body, _) = known_body.into_filtered(&known_body_inputs, &known_body_outputs, &known_body_inputs)?;
-    let known_scan = ScanOperation::<V::Type>::new(known_carry_count, scan.length.clone())
-        .with_reverse(scan.reverse)
-        .with_unroll(scan.unroll)?;
+    // Both rebuilt scans retain the source scan's result identities (refer to `rebind_body_type_signature`), so a
+    // family that linearization splits between its primal and tangent scans keeps one identity on both sides.
+    let known_scan = ScanOperation { carry_count: known_carry_count, ..scan.clone() }
+        .rebind_body_type_signature(&known_body.input_types(), &known_body.output_types())?;
     // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original stacked
     // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep
-    // runtime-length scans explicit because their outputs may refine the stacked inputs' symbolic extent types.
+    // runtime-length scans explicit because their outputs may refine the stacked inputs' symbolic extent types, and
+    // keep scans that split an exported family explicit because their inputs do not carry that family.
     let forwarded_outputs = (!preserve_known_scan
+        && !splits_families
         && matches!(scan.length(), Dimension::Static(_))
         && known_carry_count == 0
         && known_body.instructions().is_empty())
@@ -3835,9 +4446,8 @@ where
             vec![Placeholder; unknown_output_count],
         )?;
         let unknown_carry_count = invariant_carry_atoms.len() + carry_known.iter().filter(|&&known| !known).count();
-        let unknown_scan = ScanOperation::<V::Type>::new(unknown_carry_count, scan.length.clone())
-            .with_reverse(scan.reverse)
-            .with_unroll(scan.unroll)?;
+        let unknown_scan = ScanOperation { carry_count: unknown_carry_count, ..scan.clone() }
+            .rebind_body_type_signature(&unknown_body.input_types(), &unknown_body.output_types())?;
 
         // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge
         // per residual edge, each edge fed by the known scan's matching stacked output.
@@ -4409,7 +5019,8 @@ where
 
     let transposed = ScanOperation::<T>::new(retained_carry_count, length)
         .with_reverse(!operation.reverse())
-        .with_unroll(operation.unroll())?;
+        .with_unroll(operation.unroll())?
+        .with_body_type_signature(&transposed_body.input_types(), &transposed_body.output_types())?;
 
     // Stage the reversed scan over `[carry_cotangents..., live_stacked_cotangents..., known_input_value_stacks...]`,
     // matching the transposed body's input order. The output cotangents are typed by the *scan operation's* outputs,
@@ -4784,6 +5395,9 @@ mod tests {
     use crate::operations::exponential::ExpOperation;
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
     use crate::operations::manipulation::slicing::DynamicSliceOperation;
+    use crate::operations::ragged::{
+        RaggedAddOperation, RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation,
+    };
     use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
@@ -5064,7 +5678,12 @@ mod tests {
             )
             .unwrap()[0];
         let next_carry = builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, current],
+                None,
+            )
             .unwrap()[0];
         builder.build(vec![next_carry], vec![Placeholder; 3], vec![Placeholder]).unwrap()
     }
@@ -5086,7 +5705,12 @@ mod tests {
             )
             .unwrap()[0];
         let next_carry = builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, current],
+                None,
+            )
             .unwrap()[0];
         builder.build(vec![next_carry], vec![Placeholder; 3], vec![Placeholder]).unwrap()
     }
@@ -5184,7 +5808,12 @@ mod tests {
         let carry = body_builder.add_input(vector_type.clone().into());
         let slice = body_builder.add_input(vector_type.into());
         let next = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, slice], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, slice],
+                None,
+            )
             .unwrap()[0];
         let squared = body_builder
             .add_instruction(
@@ -5285,6 +5914,54 @@ mod tests {
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
+    /// Builds a program that scans two ragged stacks of one `rows` family whose extents vary along the scan axis, with
+    /// a body that returns both slices, and returns both stacked results followed by their `ragged_add`. Both stacked
+    /// results carry the one family that the scan exports for the body's `rows`, which `ragged_add` requires. Returns
+    /// the program together with the stack type of its inputs.
+    fn shared_ragged_family_scan_program() -> (TestIrProgram, RaggedType) {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
+        let slice_type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, rows.clone(), vec![])],
+        )
+        .unwrap();
+        let stack_type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3, 2]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let first = builder.add_input(slice_type.clone().into());
+        let second = builder.add_input(slice_type.into());
+        let body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first, second],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let scan = ScanOperation::<ArrayIrType>::new(0, 3)
+            .with_body_type_signature(&body.input_types(), &body.output_types())
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first = builder.add_input(stack_type.clone().into());
+        let second = builder.add_input(stack_type.clone().into());
+        let body = builder.import_program(body);
+        let outputs = builder.add_instruction(scan, vec![body], vec![first, second], None).unwrap().to_vec();
+        let sum = builder.add_instruction(RaggedAddOperation, vec![], outputs.clone(), None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![outputs[0], outputs[1], sum],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        (program, stack_type)
+    }
+
     /// Returns whether `result` failed with an [`InputDimensionMismatch`](DimensionError::InputDimensionMismatch) for
     /// the dimension named `name`.
     fn is_input_dimension_mismatch<T>(result: &Result<T, ProgramError>, name: &str) -> bool {
@@ -5331,6 +6008,7 @@ mod tests {
         assert_eq!(
             format!("{operation:?}"),
             "ScanOperation { carry_count: 1, length: Static(3), reverse: false, unroll: 1, \
+             carry_output_identities: [], stacked_output_identities: [], output_identity_definitions: [], \
              marker: PhantomData<fn() -> ryft_core::arrays::types::arrays::ArrayType> }",
         );
         assert_eq!(operation, operation.clone());
@@ -5918,7 +6596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_inference_composite_rejects_first_class_ragged_carries_and_stacks() {
+    fn test_scan_type_inference_composite_first_class_ragged_carries_and_stacks() {
         let r#type = ArrayIrType::Ragged(
             RaggedType::new(
                 ArrayType::new_static(DataType::I64, [2]),
@@ -5927,26 +6605,37 @@ mod tests {
             )
             .unwrap(),
         );
-        let body_inputs = [ArrayIrType::Array(ArrayType::scalar(DataType::I64)), r#type.clone()];
-        let error =
-            Err(TypeError::invalid(format!("`scan` does not support first-class ragged body input type `{type}`",)));
+        let index = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         assert_eq!(
             ArrayIrType::validate_scan_body_type_signature(
-                &body_inputs,
+                &[index.clone(), r#type.clone()],
                 std::slice::from_ref(&r#type),
                 1,
                 &Dimension::Static(0),
             ),
-            error,
+            Ok(())
         );
+        let body = RegionInterface::new(vec![index, r#type.clone()], vec![r#type.clone()], EffectClasses::NONE);
         assert_eq!(
-            ArrayIrType::validate_scan_body_type_signature(
-                &body_inputs,
-                std::slice::from_ref(&r#type),
-                0,
-                &Dimension::Static(2),
+            ScanOperation::<ArrayIrType>::new(0, 2).infer_output_types(
+                &[ArrayIrType::Ragged(
+                    RaggedType::new(
+                        ArrayType::new_static(DataType::I64, [2, 2]),
+                        RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                        Vec::new(),
+                    )
+                    .unwrap()
+                )],
+                &[body],
             ),
-            error,
+            Ok(vec![ArrayIrType::Ragged(
+                RaggedType::new(
+                    ArrayType::new_static(DataType::I64, [2, 2]),
+                    RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
+                    Vec::new(),
+                )
+                .unwrap()
+            )])
         );
     }
 
@@ -6471,10 +7160,15 @@ mod tests {
         let unused = body.add_input(scalar_type.clone());
         let value = body.add_input(scalar_type.clone());
         let next_sum = body
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![sum, value], None)
+            .add_instruction(ArrayOperation::Add(AddOperation::<ArrayType>::new()), Vec::new(), vec![sum, value], None)
             .unwrap()[0];
         let doubled = body
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, value], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![value, value],
+                None,
+            )
             .unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -6608,7 +7302,12 @@ mod tests {
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let next_carry = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, element],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -6871,7 +7570,12 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, element], None)
             .unwrap();
         let next_carry = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, element],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(
@@ -7282,7 +7986,12 @@ mod tests {
             )
             .unwrap()[0];
         let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![current, current], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![current, current],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -7426,7 +8135,12 @@ mod tests {
             )
             .unwrap()[0];
         let next_carry = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, current],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next_carry], vec![Placeholder; 3], vec![Placeholder])
@@ -9837,7 +10551,12 @@ mod tests {
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(vector_type.into());
         let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, carry],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -9949,7 +10668,12 @@ mod tests {
                 )
                 .unwrap()[0];
             let next_carry = body_builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
+                .add_instruction(
+                    ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                    Vec::new(),
+                    vec![carry, current],
+                    None,
+                )
                 .unwrap()[0];
             let body = body_builder
                 .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next_carry], vec![Placeholder; 3], vec![Placeholder])
@@ -10148,6 +10872,7 @@ mod tests {
                 &[true, true, false],
                 &[true],
                 false,
+                true,
                 &[],
                 partition,
                 |_| panic!("a rejected split lifts no known values"),
@@ -11679,7 +12404,12 @@ mod tests {
             )
             .unwrap()[0];
         let next = body
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![accumulator, scaled], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![accumulator, scaled],
+                None,
+            )
             .unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -12129,6 +12859,137 @@ mod tests {
             Ok(vec![TestIrValue::Array(Array::scalar(19.0f32).unwrap())]),
         );
         assert_eq!(stack.read(), Ok(Array::vector(vec![2.0f32, 5.0, 11.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_scan_partial_evaluation_shared_ragged_family() {
+        // Splitting this scan would compute the known stack's result in a known scan and the unknown stack's result in
+        // a residual scan, and both scans would define the one family that `ragged_add` requires. The known result
+        // would then enter the residual program, which cannot define that family a second time, so the scan
+        // residualizes whole over the known stack, whichever stack is known.
+        let (program, stack_type) = shared_ragged_family_scan_program();
+        let extents = Array::vector(vec![1i64, 2, 0]).unwrap();
+        let first = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                stack_type.clone(),
+                Array::matrix(3, 2, vec![1f32, 2., 3., 4., 5., 6.]).unwrap(),
+                vec![extents.clone()],
+            )
+            .unwrap(),
+        );
+        let second = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                stack_type.clone(),
+                Array::matrix(3, 2, vec![10f32, 20., 30., 40., 50., 60.]).unwrap(),
+                vec![extents.clone()],
+            )
+            .unwrap(),
+        );
+        for (known_first, expected_program) in [
+            (
+                true,
+                indoc! {r#"
+                    lambda %0:ragged<f32[3, 2]; 1:rows over [0]>, %1:ragged<f32[3, 2]; 1:rows over [0]> .
+                    let %2:ragged<f32[3, 2]; 1:rows over [0]>, %3:ragged<f32[3, 2]; 1:rows over [0]> = guard [
+                        boundary="partial evaluation",
+                        declared_types=[ragged<f32[3, 2]; 1:rows over [0]>, ragged<f32[3, 2]; 1:rows over [0]>],
+                    ] %1 %0
+                        %4:ragged<f32[3, 2]; 1:rows over [0]>, %5:ragged<f32[3, 2]; 1:rows over [0]> = scan [
+                            carry_count=0,
+                            length=3,
+                            reverse=false,
+                            stacked_output_identities=[rows->rows],
+                            output_identity_definitions=[rows],
+                        ] %1 %3 [
+                            body={
+                                lambda %0:i64[], %1:ragged<f32[2]; 0:rows over []>, %2:ragged<f32[2]; 0:rows over []> .
+                                in (%1, %2)
+                            },
+                        ]
+                        %6:ragged<f32[3, 2]; 1:rows over [0]> = ragged_add %4 %5
+                    in (%4, %5, %6)
+                "#}
+                .trim_end(),
+            ),
+            (
+                false,
+                indoc! {r#"
+                    lambda %0:ragged<f32[3, 2]; 1:rows over [0]>, %1:ragged<f32[3, 2]; 1:rows over [0]> .
+                    let %2:ragged<f32[3, 2]; 1:rows over [0]>, %3:ragged<f32[3, 2]; 1:rows over [0]> = guard [
+                        boundary="partial evaluation",
+                        declared_types=[ragged<f32[3, 2]; 1:rows over [0]>, ragged<f32[3, 2]; 1:rows over [0]>],
+                    ] %0 %1
+                        %4:ragged<f32[3, 2]; 1:rows over [0]>, %5:ragged<f32[3, 2]; 1:rows over [0]> = scan [
+                            carry_count=0,
+                            length=3,
+                            reverse=false,
+                            stacked_output_identities=[rows->rows],
+                            output_identity_definitions=[rows],
+                        ] %2 %1 [
+                            body={
+                                lambda %0:i64[], %1:ragged<f32[2]; 0:rows over []>, %2:ragged<f32[2]; 0:rows over []> .
+                                in (%1, %2)
+                            },
+                        ]
+                        %6:ragged<f32[3, 2]; 1:rows over [0]> = ragged_add %4 %5
+                    in (%4, %5, %6)
+                "#}
+                .trim_end(),
+            ),
+        ] {
+            let (known, unknown) = if known_first { (&first, &second) } else { (&second, &first) };
+            let partial_inputs = if known_first {
+                vec![PartialValue::Known(known.clone()), PartialValue::Unknown(stack_type.clone().into())]
+            } else {
+                vec![PartialValue::Unknown(stack_type.clone().into()), PartialValue::Known(known.clone())]
+            };
+            let evaluation = program.partially_evaluate(&partial_inputs).unwrap();
+            assert_eq!(evaluation.program().to_string(), expected_program);
+            assert_eq!(
+                evaluation.inputs(),
+                &[
+                    PartialEvaluationInput::Unknown(usize::from(known_first)),
+                    PartialEvaluationInput::Known(known.clone()),
+                ],
+            );
+            assert_eq!(
+                evaluation.outputs(),
+                &[
+                    PartialEvaluationOutput::Unknown(0),
+                    PartialEvaluationOutput::Unknown(1),
+                    PartialEvaluationOutput::Unknown(2),
+                ],
+            );
+
+            // The residual scan is the only definition of the exported family, and all three results carry it.
+            let residual_scan = &evaluation.program().instructions()[1];
+            let families = residual_scan.operation().defined_type_identities();
+            assert_eq!(families.len(), 1);
+            assert_ne!(&families[0], stack_type.ragged_dimensions()[0].dimension());
+            let result_type = RaggedType::new(
+                ArrayType::new_static(DataType::F32, [3, 2]),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(1, families[0].clone(), vec![0])],
+            )
+            .unwrap();
+            assert_eq!(evaluation.program().output_types(), vec![ArrayIrType::Ragged(result_type.clone()); 3]);
+
+            // The residual program reproduces the original results, all of the exported family.
+            let result = |storage: Vec<f32>| {
+                ArrayIrValue::Ragged(
+                    RaggedValue::new(result_type.clone(), Array::matrix(3, 2, storage).unwrap(), vec![extents.clone()])
+                        .unwrap(),
+                )
+            };
+            assert_eq!(
+                evaluation.program().interpret(vec![unknown.clone(), known.clone()]),
+                Ok(vec![
+                    result(vec![1., 2., 3., 4., 5., 6.]),
+                    result(vec![10., 20., 30., 40., 50., 60.]),
+                    result(vec![11., 22., 33., 44., 55., 66.]),
+                ]),
+            );
+        }
     }
 
     #[test]
@@ -12696,7 +13557,12 @@ mod tests {
         let carry = body.add_input(scalar_type.clone());
         let value = body.add_input(scalar_type.clone());
         let next = body
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, value], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, value],
+                None,
+            )
             .unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
@@ -12772,7 +13638,12 @@ mod tests {
         let carry = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let slice = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let next = builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, slice], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, slice],
+                None,
+            )
             .unwrap()[0];
         let body = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next, next], vec![Placeholder; 3], vec![Placeholder; 2])
@@ -13880,6 +14751,82 @@ mod tests {
                 in (%4, %5)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_scan_differentiation_linearizes_shared_ragged_family() {
+        // Linearization stages the primal and tangent scans into separate programs, and both keep the family that the
+        // scan exports, so every tangent result has its primal result's type. The primal scan stays explicit:
+        // forwarding its stacked inputs instead would replace the exported family with the inputs' family.
+        let (program, stack_type) = shared_ragged_family_scan_program();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:ragged<f32[3, 2]; 1:rows over [0]>, %1:ragged<f32[3, 2]; 1:rows over [0]> .
+                let %2:ragged<f32[3, 2]; 1:rows over [0]>, %3:ragged<f32[3, 2]; 1:rows over [0]> = scan [
+                    carry_count=0,
+                    length=3,
+                    reverse=false,
+                    stacked_output_identities=[rows->rows],
+                    output_identity_definitions=[rows],
+                ] %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:ragged<f32[2]; 0:rows over []>, %2:ragged<f32[2]; 0:rows over []> .
+                        in (%1, %2)
+                    },
+                ]
+                    %4:ragged<f32[3, 2]; 1:rows over [0]> = ragged_add %2 %3
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:ragged<f32[3, 2]; 1:rows over [0]>, %1:ragged<f32[3, 2]; 1:rows over [0]> .
+                let %2:ragged<f32[3, 2]; 1:rows over [0]>, %3:ragged<f32[3, 2]; 1:rows over [0]> = scan [
+                    carry_count=0,
+                    length=3,
+                    reverse=false,
+                    stacked_output_identities=[rows->rows],
+                    output_identity_definitions=[rows],
+                ] %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:ragged<f32[2]; 0:rows over []>, %2:ragged<f32[2]; 0:rows over []> .
+                        in (%1, %2)
+                    },
+                ]
+                    %4:ragged<f32[3, 2]; 1:rows over [0]> = ragged_add %2 %3
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        let output_types = linearization.primal().output_types();
+        assert_eq!(linearization.tangent().output_types(), output_types);
+        let ArrayIrType::Ragged(result_type) = &output_types[0] else { panic!("expected a ragged stack type") };
+        assert_ne!(result_type, &stack_type);
+        assert_eq!(output_types, vec![ArrayIrType::Ragged(result_type.clone()); 3]);
+
+        // The tangent program stacks both input tangents under the exported family and adds them.
+        let extents = Array::vector(vec![1i64, 2, 0]).unwrap();
+        let value = |r#type: &RaggedType, storage: Vec<f32>| {
+            ArrayIrValue::Ragged(
+                RaggedValue::new(r#type.clone(), Array::matrix(3, 2, storage).unwrap(), vec![extents.clone()]).unwrap(),
+            )
+        };
+        assert_eq!(
+            linearization.tangent().interpret(vec![
+                value(&stack_type, vec![1., 2., 3., 4., 5., 6.]),
+                value(&stack_type, vec![0.5, 0.25, 1., 2., 4., 8.]),
+            ]),
+            Ok(vec![
+                value(result_type, vec![1., 2., 3., 4., 5., 6.]),
+                value(result_type, vec![0.5, 0.25, 1., 2., 4., 8.]),
+                value(result_type, vec![1.5, 2.25, 4., 6., 9., 14.]),
+            ]),
         );
     }
 
@@ -15302,7 +16249,12 @@ mod tests {
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let next_carry = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, element],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -15446,7 +16398,12 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, carry],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -16475,7 +17432,7 @@ mod tests {
         body_builder.add_input(item_type.clone().into());
         let live = body_builder.add_input(ArrayType::scalar(DataType::F64).into());
         let next = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, live], None)
+            .add_instruction(ArrayOperation::Add(AddOperation::<ArrayType>::new()), Vec::new(), vec![carry, live], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next], vec![Placeholder; 4], vec![Placeholder])
@@ -17239,7 +18196,12 @@ mod tests {
         let carry = body_builder.add_input(item_type.clone());
         let value = body_builder.add_input(item_type.clone());
         let sum = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, value], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, value],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![sum, carry], vec![Placeholder; 3], vec![Placeholder; 2])
@@ -17417,7 +18379,12 @@ mod tests {
                     )
                     .unwrap()[0];
                 carry = builder
-                    .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
+                    .add_instruction(
+                        ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                        Vec::new(),
+                        vec![carry, current],
+                        None,
+                    )
                     .unwrap()[0];
             }
             let frozen =
@@ -17601,7 +18568,12 @@ mod tests {
             )
             .unwrap();
         let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![carry, carry],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![doubled], vec![Placeholder; 3], vec![Placeholder])
@@ -17897,6 +18869,805 @@ mod tests {
         );
     }
 
+    /// Builds a checked body with a fresh local row identity. Its next carry and per-iteration result share the
+    /// newly checked payload; only the carry is rebound to the next iteration's formal row identity.
+    fn ragged_changing_scan_body(invalid_constant: bool) -> Result<(TestIrProgram, RaggedType), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3))?);
+        let next_rows = DimensionVariable::new("next_rows", rows.bounds().clone());
+        let storage_type = ArrayType::new_static(DataType::F32, [2]);
+        let carry_type =
+            RaggedType::new(storage_type.clone(), RaggedValueKind::Array, vec![RaggedDimension::new(0, rows, vec![])])?;
+        let next_type =
+            RaggedType::new(storage_type, RaggedValueKind::Array, vec![RaggedDimension::new(0, next_rows, vec![])])?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = builder.add_input(carry_type.clone().into());
+        let extent = builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let storage = builder.add_instruction(RaggedStorageOperation, vec![], vec![carry], None)?[0];
+        let extent =
+            if invalid_constant { builder.add_constant(ArrayIrValue::Array(Array::scalar(3i64)?)) } else { extent };
+        let next = builder.add_instruction(RaggedNewOperation::new(next_type), vec![], vec![storage, extent], None)?[0];
+        Ok((builder.build(vec![next, next], vec![Placeholder; 3], vec![Placeholder; 2])?, carry_type))
+    }
+
+    /// Places the checked body behind a scan boundary, including an explicit runtime length when requested.
+    fn ragged_changing_scan_program(
+        length: Dimension,
+        reverse: bool,
+        invalid_constant: bool,
+    ) -> Result<(TestIrProgram, RaggedType), ProgramError> {
+        let (body, carry_type) = ragged_changing_scan_body(invalid_constant)?;
+        let operation = ScanOperation::<ArrayIrType>::new(1, length.clone())
+            .with_reverse(reverse)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(carry_type.clone().into());
+        let stack = builder.add_input(ArrayType::new(DataType::I64, Shape::new(vec![length.clone()])).into());
+        let mut inputs = vec![initial, stack];
+        if let Some(variable) = length.variable() {
+            inputs.push(builder.add_input(DimensionType::from(variable.clone()).into()));
+        }
+        let input_count = inputs.len();
+        let body = builder.import_program(body);
+        let outputs = builder.add_instruction(operation, vec![body], inputs, None)?.to_vec();
+        Ok((builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; 2])?, carry_type))
+    }
+
+    #[test]
+    fn test_scan_ragged_changing_carry_and_stacked_extents() -> Result<(), ProgramError> {
+        for reverse in [false, true] {
+            let (program, carry_type) = ragged_changing_scan_program(Dimension::Static(3), reverse, false)?;
+            let initial = ArrayIrValue::Ragged(RaggedValue::new(
+                carry_type.clone(),
+                Array::vector(vec![7f32, 99.])?,
+                vec![Array::scalar(0i64)?],
+            )?);
+            let outputs = program.interpret(vec![initial, ArrayIrValue::Array(Array::vector(vec![2i64, 0, 1])?)])?;
+            let ArrayIrValue::Ragged(carry) = &outputs[0] else { panic!("expected a ragged carry") };
+            assert_eq!(carry.r#type().storage_type(), carry_type.storage_type());
+            assert_ne!(
+                carry.r#type().ragged_dimensions()[0].dimension(),
+                carry_type.ragged_dimensions()[0].dimension()
+            );
+            assert_eq!(carry.extents(), &[Array::scalar(if reverse { 2i64 } else { 1i64 })?]);
+            let ArrayIrValue::Ragged(stack) = &outputs[1] else { panic!("expected a ragged stack") };
+            assert_eq!(stack.storage(), &Array::matrix(3, 2, vec![7f32, 99., 7., 99., 7., 99.])?);
+            assert_eq!(stack.extents(), &[Array::vector(vec![2i64, 0, 1])?]);
+            assert_eq!(stack.r#type().ragged_dimensions()[0].extent_axes(), &[0]);
+            assert_ne!(
+                stack.r#type().ragged_dimensions()[0].dimension(),
+                carry_type.ragged_dimensions()[0].dimension()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_stacked_carry_identities() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3))?);
+        let next_rows = DimensionVariable::new("next_rows", rows.bounds().clone());
+        let storage_type = ArrayType::new_static(DataType::F32, [2]);
+        let carry_type =
+            RaggedType::new(storage_type.clone(), RaggedValueKind::Array, vec![RaggedDimension::new(0, rows, vec![])])?;
+        let next_type =
+            RaggedType::new(storage_type, RaggedValueKind::Array, vec![RaggedDimension::new(0, next_rows, vec![])])?;
+        let initial = ArrayIrValue::Ragged(RaggedValue::new(
+            carry_type.clone(),
+            Array::vector(vec![7f32, 99.])?,
+            vec![Array::scalar(1i64)?],
+        )?);
+        // Each body stacks its incoming carry (i.e., `ys = carry`), so the stack indexes the carry's identity over the
+        // scan coordinate while the initial carry indexes it over no coordinates. Both results coexist with the
+        // initial carry in the enclosing program, so the stack must export a fresh identity in both cases.
+        // The renderings print the fresh stack identity with its body name; the assertions below compare identities.
+        let unchanged_rendering = indoc! {"
+            lambda %0:ragged<f32[2]; 0:rows over []>, %1:i64[3] .
+            let %2:ragged<f32[2]; 0:rows over []>, %3:ragged<f32[3, 2]; 1:rows over [0]> = scan [
+                carry_count=1,
+                length=3,
+                reverse=false,
+                stacked_output_identities=[rows->rows],
+                output_identity_definitions=[rows],
+            ] %0 %1 [
+                body={
+                    lambda %0:i64[], %1:ragged<f32[2]; 0:rows over []>, %2:i64[] .
+                    in (%1, %1)
+                },
+            ]
+            in (%2, %3)"};
+        let changing_rendering = indoc! {"
+            lambda %0:ragged<f32[2]; 0:rows over []>, %1:i64[3] .
+            let %2:ragged<f32[2]; 0:next_rows over []>, %3:ragged<f32[3, 2]; 1:rows over [0]> = scan [
+                carry_count=1,
+                length=3,
+                reverse=false,
+                carry_output_identities=[rows->next_rows],
+                stacked_output_identities=[rows->rows],
+                output_identity_definitions=[next_rows, rows],
+            ] %0 %1 [
+                body={
+                    lambda %0:i64[], %1:ragged<f32[2]; 0:rows over []>, %2:i64[] .
+                    let %3:f32[2] = ragged_storage %1
+                        %4:ragged<f32[2]; 0:next_rows over []> = ragged_new \
+                            [output_type=ragged<f32[2]; 0:next_rows over []>] %3 %2
+                    in (%4, %1)
+                },
+            ]
+            in (%2, %3)"};
+        for (changing, rendering, final_extent, stack_extents) in
+            [(false, unchanged_rendering, 1i64, vec![1i64, 1, 1]), (true, changing_rendering, 1, vec![1, 2, 0])]
+        {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carry = builder.add_input(carry_type.clone().into());
+            let extent = builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let next = if changing {
+                let storage = builder.add_instruction(RaggedStorageOperation, vec![], vec![carry], None)?[0];
+                builder.add_instruction(
+                    RaggedNewOperation::new(next_type.clone()),
+                    vec![],
+                    vec![storage, extent],
+                    None,
+                )?[0]
+            } else {
+                carry
+            };
+            let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next, carry],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )?;
+            let operation = ScanOperation::<ArrayIrType>::new(1, 3)
+                .with_body_type_signature(&body.input_types(), &body.output_types())?;
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let initial_input = builder.add_input(carry_type.clone().into());
+            let stack = builder.add_input(ArrayType::new_static(DataType::I64, [3]).into());
+            let body = builder.import_program(body);
+            let outputs = builder.add_instruction(operation, vec![body], vec![initial_input, stack], None)?.to_vec();
+            let program = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                outputs,
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )?;
+            assert_eq!(program.to_string(), rendering);
+            let outputs =
+                program.interpret(vec![initial.clone(), ArrayIrValue::Array(Array::vector(vec![2i64, 0, 1])?)])?;
+            let ArrayIrValue::Ragged(carry) = &outputs[0] else { panic!("expected a ragged carry") };
+            assert_eq!(carry.storage(), &Array::vector(vec![7f32, 99.])?);
+            assert_eq!(carry.extents(), &[Array::scalar(final_extent)?]);
+            let ArrayIrValue::Ragged(stack) = &outputs[1] else { panic!("expected a ragged stack") };
+            assert_eq!(stack.storage(), &Array::matrix(3, 2, vec![7f32, 99., 7., 99., 7., 99.])?);
+            assert_eq!(stack.extents(), &[Array::vector(stack_extents)?]);
+            assert_eq!(stack.r#type().ragged_dimensions()[0].extent_axes(), &[0]);
+            assert_ne!(
+                stack.r#type().ragged_dimensions()[0].dimension(),
+                carry_type.ragged_dimensions()[0].dimension(),
+            );
+            assert_ne!(
+                stack.r#type().ragged_dimensions()[0].dimension(),
+                carry.r#type().ragged_dimensions()[0].dimension(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_stacked_dimension_carry_identities() -> Result<(), ProgramError> {
+        use crate::operations::ragged::RaggedStorage;
+        let item = DimensionType::new("item", DimensionBounds::non_negative(Some(4))?);
+        let carry_type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(item.clone()),
+            vec![],
+        )?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = builder.add_input(carry_type.clone().into());
+        let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![carry, carry],
+            vec![Placeholder; 2],
+            vec![Placeholder; 2],
+        )?;
+        let scan = ScanOperation::<ArrayIrType>::new(1, 2)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        // The scan owns one stacked item family, even when several result positions export that family.
+        assert_eq!(scan.defined_type_identities().len(), 1);
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = builder.add_input(carry_type.clone().into());
+        let region = builder.import_program(body);
+        let outputs = builder.add_instruction(scan, vec![region], vec![input], None)?.to_vec();
+        let program =
+            builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder], vec![Placeholder; 2])?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> .
+            let %1:ragged<i64[2]; item=dimension<item ∈ [0, 4)>>, %2:ragged<i64[2, 2]; item=dimension<item ∈ [0, 4)>> = scan [
+                carry_count=1,
+                length=2,
+                reverse=false,
+                stacked_output_identities=[item->item],
+                output_identity_definitions=[item],
+            ] %0 [
+                body={
+                    lambda %0:i64[], %1:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> .
+                    in (%1, %1)
+                },
+            ]
+            in (%1, %2)"}
+        );
+        let value = ArrayIrValue::Ragged(RaggedValue::new(carry_type, Array::vector(vec![1i64, 3])?, vec![])?);
+        let result = program.interpret(vec![value.clone()])?;
+        assert_eq!(result[0], value);
+        assert_eq!(result[1].ragged_storage()?, ArrayIrValue::Array(Array::matrix(2, 2, vec![1i64, 3, 1, 3])?));
+        let output_type = result[1].r#type();
+        let output = <&RaggedType>::try_from(output_type.as_ref())?;
+        let RaggedValueKind::Dimension(output_item) = output.value_kind() else { panic!("expected dimension items") };
+        assert_ne!(output_item.variable(), item.variable());
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_reused_body_local_output_identities() -> Result<(), ProgramError> {
+        let local = DimensionVariable::new("local", DimensionBounds::non_negative(Some(4))?);
+        let slice_type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, local.clone(), vec![])],
+        )?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let storage = builder.add_input(slice_type.storage_type().clone().into());
+        let extent = builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let value =
+            builder.add_instruction(RaggedNewOperation::new(slice_type), vec![], vec![storage, extent], None)?[0];
+        let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![value, value],
+            vec![Placeholder; 3],
+            vec![Placeholder; 2],
+        )?;
+        let first = ScanOperation::<ArrayIrType>::new(0, 2)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        let second = ScanOperation::<ArrayIrType>::new(0, 2)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let storage = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let left = builder.add_input(ArrayType::new_static(DataType::I64, [2]).into());
+        let right = builder.add_input(ArrayType::new_static(DataType::I64, [2]).into());
+        let region = builder.import_program(body);
+        let mut outputs = builder.add_instruction(first, vec![region], vec![storage, left], None)?.to_vec();
+        outputs.extend_from_slice(builder.add_instruction(second, vec![region], vec![storage, right], None)?);
+        let program =
+            builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 4])?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:i64[2], %2:i64[2] .
+                let %3:ragged<f32[2, 3]; 1:local over [0]>, %4:ragged<f32[2, 3]; 1:local over [0]> = scan [
+                    carry_count=0,
+                    length=2,
+                    reverse=false,
+                    stacked_output_identities=[local->local],
+                    output_identity_definitions=[local],
+                ] %0 %1 [
+                    body=^0={
+                        lambda %0:i64[], %1:f32[3], %2:i64[] .
+                        let %3:ragged<f32[3]; 0:local over []> = ragged_new \
+                            [output_type=ragged<f32[3]; 0:local over []>] %1 %2
+                        in (%3, %3)
+                    },
+                ]
+                    %5:ragged<f32[2, 3]; 1:local over [0]>, %6:ragged<f32[2, 3]; 1:local over [0]> = scan [
+                        carry_count=0,
+                        length=2,
+                        reverse=false,
+                        stacked_output_identities=[local->local],
+                        output_identity_definitions=[local],
+                    ] %0 %2 [
+                        body=^0,
+                    ]
+                in (%3, %4, %5, %6)"},
+        );
+        let types = program.output_types();
+        assert_eq!(types[0], types[1]);
+        assert_eq!(types[2], types[3]);
+        assert_ne!(types[0], types[2]);
+        assert_ne!(<&RaggedType>::try_from(&types[0])?.ragged_dimensions()[0].dimension(), &local);
+        let outputs = program.interpret(vec![
+            Array::matrix(2, 3, vec![7f32; 6])?.into(),
+            Array::vector(vec![1i64, 2])?.into(),
+            Array::vector(vec![3i64, 0])?.into(),
+        ])?;
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[2], outputs[3]);
+        assert_eq!(outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(), types);
+        let ArrayIrValue::Ragged(left) = &outputs[0] else { panic!("expected a ragged stack") };
+        let ArrayIrValue::Ragged(right) = &outputs[2] else { panic!("expected a ragged stack") };
+        assert_eq!(left.extents(), &[Array::vector(vec![1i64, 2])?]);
+        assert_eq!(right.extents(), &[Array::vector(vec![3i64, 0])?]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_reused_body_local_dimension_identities() -> Result<(), ProgramError> {
+        let item = DimensionType::new("item", DimensionBounds::non_negative(Some(4))?);
+        let slice_type = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(item.clone()),
+            vec![],
+        )?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let storage = builder.add_input(slice_type.storage_type().clone().into());
+        let value = builder.add_instruction(RaggedNewOperation::new(slice_type), vec![], vec![storage], None)?[0];
+        let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![value, value],
+            vec![Placeholder; 2],
+            vec![Placeholder; 2],
+        )?;
+        let first = ScanOperation::<ArrayIrType>::new(0, 3)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        let second = ScanOperation::<ArrayIrType>::new(0, 3)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        assert_eq!(first.defined_type_identities().len(), 1);
+        assert_eq!(second.defined_type_identities().len(), 1);
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let storage = builder.add_input(ArrayType::new_static(DataType::I64, [3, 2]).into());
+        let region = builder.import_program(body);
+        let first = builder.add_instruction(first, vec![region], vec![storage], None)?.to_vec();
+        let second = builder.add_instruction(second, vec![region], vec![storage], None)?.to_vec();
+        let program = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            [first, second].concat(),
+            vec![Placeholder],
+            vec![Placeholder; 4],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i64[3, 2] .
+                let %1:ragged<i64[3, 2]; item=dimension<item ∈ [0, 4)>>, %2:ragged<i64[3, 2]; item=dimension<item ∈ [0, 4)>> = scan [
+                    carry_count=0,
+                    length=3,
+                    reverse=false,
+                    stacked_output_identities=[item->item],
+                    output_identity_definitions=[item],
+                ] %0 [
+                    body=^0={
+                        lambda %0:i64[], %1:i64[2] .
+                        let %2:ragged<i64[2]; item=dimension<item ∈ [0, 4)>> = ragged_new \
+                            [output_type=ragged<i64[2]; item=dimension<item ∈ [0, 4)>>] %1
+                        in (%2, %2)
+                    },
+                ]
+                    %3:ragged<i64[3, 2]; item=dimension<item ∈ [0, 4)>>, %4:ragged<i64[3, 2]; item=dimension<item ∈ [0, 4)>> = scan [
+                        carry_count=0,
+                        length=3,
+                        reverse=false,
+                        stacked_output_identities=[item->item],
+                        output_identity_definitions=[item],
+                    ] %0 [
+                        body=^0,
+                    ]
+                in (%1, %2, %3, %4)"},
+        );
+        let types = program.output_types();
+        assert_eq!(types[0], types[1]);
+        assert_eq!(types[2], types[3]);
+        assert_ne!(types[0], types[2]);
+        let source_type = <&RaggedType>::try_from(&types[0])?;
+        assert_ne!(source_type.value_kind(), &RaggedValueKind::Dimension(item));
+        let storage = Array::matrix(3, 2, vec![1i64, 3, 0, 2, 2, 1])?;
+        let outputs = program.interpret(vec![storage.clone().into()])?;
+        assert_eq!(outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(), types);
+        let ArrayIrValue::Ragged(first) = &outputs[0] else { panic!("expected dimension items") };
+        let ArrayIrValue::Ragged(second) = &outputs[2] else { panic!("expected dimension items") };
+        assert_eq!(first.storage(), &storage);
+        assert_eq!(second.storage(), &storage);
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[2], outputs[3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_shared_input_restacking() -> Result<(), ProgramError> {
+        use indoc::formatdoc;
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4))?);
+        let slice = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, rows.clone(), vec![])],
+        )?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let input = builder.add_input(slice.into());
+        let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![input],
+            vec![Placeholder; 2],
+            vec![Placeholder],
+        )?;
+        for length in [0, 2] {
+            let stacked = RaggedType::new(
+                ArrayType::new_static(DataType::F32, [length, 3]),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(1, rows.clone(), vec![])],
+            )?;
+            let scan = ScanOperation::<ArrayIrType>::new(0, length)
+                .with_body_type_signature(&body.input_types(), &body.output_types())?;
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let input = builder.add_input(stacked.clone().into());
+            let region = builder.import_program(body.clone());
+            let outputs = builder.add_instruction(scan, vec![region], vec![input], None)?.to_vec();
+            let program =
+                builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder], vec![Placeholder])?;
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                lambda %0:ragged<f32[{length}, 3]; 1:rows over []> .
+                let %1:ragged<f32[{length}, 3]; 1:rows over [0]> = scan [
+                    carry_count=0,
+                    length={length},
+                    reverse=false,
+                    stacked_output_identities=[rows->rows],
+                    output_identity_definitions=[rows],
+                ] %0 [
+                    body={{
+                        lambda %0:i64[], %1:ragged<f32[3]; 0:rows over []> .
+                        in (%1)
+                    }},
+                ]
+                in (%1)"}
+            );
+            let storage = Array::from_elements(stacked.storage_type().clone(), &vec![7f32; length * 3])?;
+            let result = program.interpret(vec![ArrayIrValue::Ragged(RaggedValue::new(
+                stacked,
+                storage.clone(),
+                vec![Array::scalar(2i64)?],
+            )?)])?;
+            let ArrayIrValue::Ragged(output) = &result[0] else { panic!("expected a ragged stack") };
+            assert_eq!(output.storage(), &storage);
+            assert_eq!(output.extents(), &[Array::vector(vec![2i64; length])?]);
+            assert_eq!(output.r#type().ragged_dimensions()[0].extent_axes(), &[0]);
+            assert_ne!(output.r#type().ragged_dimensions()[0].dimension(), &rows);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_carry_bound_changes_rejected() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3))?);
+        let carry_type = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, rows, vec![])],
+        )?;
+        // Type renderings omit bounds, so both an upper-bound and a lower-bound change must name the bounds. A changed
+        // upper bound also changes the padded storage capacity, which the body allocates itself.
+        for (bounds, storage, message) in [
+            (
+                DimensionBounds::non_negative(Some(4))?,
+                Array::vector(vec![0f32; 3])?,
+                "`scan` carry 0 declares ragged dimension `rows` with bounds [0, 3) but its body returns `next_rows` \
+                 with bounds [0, 4)",
+            ),
+            (
+                DimensionBounds::new(1, Some(3))?,
+                Array::vector(vec![0f32; 2])?,
+                "`scan` carry 0 declares ragged dimension `rows` with bounds [0, 3) but its body returns `next_rows` \
+                 with bounds [1, 3)",
+            ),
+        ] {
+            let next_type = RaggedType::new(
+                storage.r#type().into_owned(),
+                RaggedValueKind::Array,
+                vec![RaggedDimension::new(0, DimensionVariable::new("next_rows", bounds), vec![])],
+            )?;
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carry = builder.add_input(carry_type.clone().into());
+            let storage = builder.add_constant(ArrayIrValue::Array(storage));
+            let extent = builder.add_instruction(RaggedExtentsOperation::new(0), vec![], vec![carry], None)?[0];
+            let next =
+                builder.add_instruction(RaggedNewOperation::new(next_type), vec![], vec![storage, extent], None)?[0];
+            let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )?;
+            assert_eq!(
+                ScanOperation::<ArrayIrType>::new(1, 3)
+                    .with_body_type_signature(&body.input_types(), &body.output_types())
+                    .unwrap_err(),
+                TypeError::invalid(message),
+            );
+            assert_eq!(
+                ScanOperation::<ArrayIrType>::new(1, 3)
+                    .infer_output_types(&[carry_type.clone().into()], &[body.interface()]),
+                Err(TypeError::invalid(message)),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_runtime_length_and_empty_body() -> Result<(), ProgramError> {
+        let length = DimensionVariable::new("time", DimensionBounds::non_negative(Some(4))?);
+        let (program, carry_type) = ragged_changing_scan_program(length.clone().into(), false, false)?;
+        let initial = ArrayIrValue::Ragged(RaggedValue::new(
+            carry_type,
+            Array::vector(vec![7f32, 99.])?,
+            vec![Array::scalar(0i64)?],
+        )?);
+        let outputs = program.interpret(vec![
+            initial,
+            ArrayIrValue::Array(Array::vector(vec![2i64, 0, 1])?),
+            ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(length), 3)?),
+        ])?;
+        let ArrayIrValue::Ragged(stack) = &outputs[1] else { panic!("expected a ragged stack") };
+        assert_eq!(stack.extents(), &[Array::vector(vec![2i64, 0, 1])?]);
+
+        // Type inference and zero-trip execution must not execute the body's invalid checked constructor.
+        let (empty, carry_type) = ragged_changing_scan_program(Dimension::Static(0), true, true)?;
+        let initial = ArrayIrValue::Ragged(RaggedValue::new(
+            carry_type,
+            Array::vector(vec![7f32, 99.])?,
+            vec![Array::scalar(1i64)?],
+        )?);
+        let outputs = empty.interpret(vec![initial.clone(), ArrayIrValue::Array(Array::vector(Vec::<i64>::new())?)])?;
+        let ArrayIrValue::Ragged(final_carry) = &outputs[0] else { panic!("expected a ragged carry") };
+        let ArrayIrValue::Ragged(initial) = initial else { panic!("expected a ragged carry") };
+        assert_eq!(final_carry.storage(), initial.storage());
+        assert_eq!(final_carry.extents(), initial.extents());
+        assert_ne!(final_carry.r#type(), initial.r#type());
+        let ArrayIrValue::Ragged(stack) = &outputs[1] else { panic!("expected a ragged stack") };
+        assert_eq!(stack.storage().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [0, 2]));
+        assert_eq!(stack.extents(), &[Array::vector(Vec::<i64>::new())?]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_shared_and_varying_nested_extents() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3))?);
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4))?);
+        let stacked = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3, 2, 3]),
+            RaggedValueKind::Array,
+            vec![
+                RaggedDimension::new(2, rows.clone(), vec![1]),
+                RaggedDimension::new(3, columns.clone(), vec![2, 0, 1]),
+            ],
+        )?;
+        let slice = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3, 2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0]), RaggedDimension::new(2, columns, vec![1, 0])],
+        )?;
+        let output = RaggedType::new(
+            slice.storage_type().clone(),
+            RaggedValueKind::Array,
+            vec![
+                RaggedDimension::new(
+                    1,
+                    DimensionVariable::new("output_rows", DimensionBounds::non_negative(Some(3))?),
+                    vec![0],
+                ),
+                RaggedDimension::new(
+                    2,
+                    DimensionVariable::new("output_columns", DimensionBounds::non_negative(Some(4))?),
+                    vec![1, 0],
+                ),
+            ],
+        )?;
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let input = builder.add_input(slice.into());
+        let storage = builder.add_instruction(RaggedStorageOperation, vec![], vec![input], None)?[0];
+        let rows = builder.add_instruction(RaggedExtentsOperation::new(1), vec![], vec![input], None)?[0];
+        let columns = builder.add_instruction(RaggedExtentsOperation::new(2), vec![], vec![input], None)?[0];
+        let result =
+            builder.add_instruction(RaggedNewOperation::new(output), vec![], vec![storage, rows, columns], None)?[0];
+        let body = builder.build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+            vec![result],
+            vec![Placeholder; 2],
+            vec![Placeholder],
+        )?;
+        // The input declaration leaves storage sharding unspecified just like a dense scan. Actual replication or
+        // Auto sharding of the scan axis refines it without changing indexed identities or extent coordinates.
+        let scan = ScanOperation::<ArrayIrType>::new(0, 2)
+            .with_body_type_signature(&body.input_types(), &body.output_types())?;
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        for sharding in [
+            Sharding::replicated(mesh.clone(), 4),
+            Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::replicated(),
+                ],
+            )
+            .unwrap(),
+        ] {
+            let placed = ArrayIrType::Ragged(RaggedType::new(
+                stacked.storage_type().clone().with_sharding(sharding).unwrap(),
+                stacked.value_kind().clone(),
+                stacked.ragged_dimensions().to_vec(),
+            )?);
+            let declared = scan.declared_input_types(&body.input_types(), std::slice::from_ref(&placed))?;
+            assert_eq!(<&RaggedType>::try_from(&declared[0])?.storage_type().sharding(), None);
+            assert!(declared[0].is_refined_by(&placed));
+            assert!(scan.infer_output_types(&[placed], &[body.interface()]).is_ok());
+        }
+        let input = ArrayIrValue::Ragged(RaggedValue::new(
+            stacked.clone(),
+            Array::from_elements(stacked.storage_type().clone(), &[7f32; 36])?,
+            vec![
+                Array::vector(vec![1i64, 2, 0])?,
+                Array::from_elements(
+                    stacked.extent_types()[1].clone(),
+                    &[1i64, 2, 0, 2, 1, 0, 999, 2, 999, 999, 1, 999],
+                )?,
+            ],
+        )?);
+        for reverse in [false, true] {
+            let operation = ScanOperation::<ArrayIrType>::new(0, 2)
+                .with_reverse(reverse)
+                .with_body_type_signature(&body.input_types(), &body.output_types())?;
+            let outputs = EagerContext::<TestIrValue, TestIrOperation>::new().bind(
+                operation,
+                vec![body.clone()],
+                std::slice::from_ref(&input),
+            )?;
+            let ArrayIrValue::Ragged(result) = &outputs[0] else { panic!("expected a ragged stack") };
+            assert_eq!(result.storage(), &Array::from_elements(stacked.storage_type().clone(), &[7f32; 36])?);
+            assert_eq!(
+                result.extents(),
+                &[
+                    Array::matrix(2, 3, vec![1i64, 2, 0, 1, 2, 0])?,
+                    Array::from_elements(
+                        ArrayType::new_static(DataType::I64, [2, 2, 3]),
+                        &[1i64, 2, 0, 999, 2, 999, 2, 1, 0, 999, 1, 999]
+                    )?,
+                ]
+            );
+            assert_eq!(result.r#type().ragged_dimensions()[0].extent_axes(), &[0, 1]);
+            assert_eq!(result.r#type().ragged_dimensions()[1].extent_axes(), &[0, 2, 1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_output_identity_metadata() -> Result<(), ProgramError> {
+        let (body, carry_type) = ragged_changing_scan_body(false)?;
+        let scan = ScanOperation::<ArrayIrType>::new(1, 3);
+        let types = vec![carry_type.into(), ArrayType::new_static(DataType::I64, [3]).into()];
+        assert_eq!(
+            scan.infer_output_types(&types, &[body.interface()]),
+            Err(TypeError::invalid(
+                "`scan` output identity declaration does not match its body; construct the scan with `with_body_type_signature`",
+            ))
+        );
+        let scan = scan.with_body_type_signature(&body.input_types(), &body.output_types())?;
+        let identities = scan.defined_type_identities();
+        assert_eq!(identities.len(), 2);
+        let original = identities[0].clone();
+        let replacement = DimensionVariable::new("exported", original.bounds().clone());
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(original, replacement.clone())?;
+        let renamed = scan.rename_type_identities(&renaming)?;
+        assert_eq!(renamed.defined_type_identities()[0], replacement);
+        assert_eq!(renamed.defined_type_identities()[1], identities[1]);
+        assert!(scan.to_string().contains("output_identity_definitions=[next_rows, next_rows]"));
+
+        // Keeping one result cannot prune away the checked body or invalidate its supplemental declaration.
+        let (program, _) = ragged_changing_scan_program(Dimension::Static(3), false, false)?;
+        let pruned = program.with_outputs(&[0])?.into_pruned()?;
+        let operation = &pruned.instructions()[0].operation();
+        assert_eq!(operation.defined_type_identities().len(), 2);
+        assert_eq!(pruned.instructions()[0].outputs().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ragged_scan_slice_type_and_iteration() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
+        let stacked = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3, 2, 3]),
+            crate::RaggedValueKind::Array,
+            vec![
+                RaggedDimension::new(2, rows.clone(), vec![1]),
+                RaggedDimension::new(3, columns.clone(), vec![2, 0, 1]),
+            ],
+        )?;
+        let expected = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3, 2, 3]),
+            crate::RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0]), RaggedDimension::new(2, columns, vec![1, 0])],
+        )?;
+        assert_eq!(ragged_scan_slice_type(&stacked), Ok((expected.clone(), Dimension::Static(2))));
+        let shared = Array::vector(vec![1i64, 2, 0])?;
+        let stack = RaggedValue::new(
+            stacked.clone(),
+            Array::from_elements(stacked.storage_type().clone(), &[7f32; 36])?,
+            vec![
+                shared.clone(),
+                Array::from_elements(
+                    stacked.extent_types()[1].clone(),
+                    &[1i64, 2, 0, 2, 1, 0, 999, 2, 999, 999, 1, 999],
+                )?,
+            ],
+        )?;
+        let slice = read_ragged_scan_iteration(&stack, 1)?;
+        assert_eq!(slice.r#type().as_ref(), &expected);
+        assert_eq!(slice.storage(), &Array::from_elements(expected.storage_type().clone(), &[7f32; 18])?);
+        assert_eq!(slice.extents(), &[shared, Array::matrix(2, 3, vec![2i64, 1, 0, 999, 1, 999])?]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_ragged_rejects_ragged_scan_axis() -> Result<(), TypeError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
+        let stacked = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(0, rows, vec![])],
+        )?;
+        assert_eq!(
+            ArrayIrType::infer_scan_body_input_types(&[ArrayIrType::Ragged(stacked)], 2, 0, &Dimension::Static(2),),
+            Err(TypeError::invalid("`scan` leading stacked axis must be ordinary rather than ragged"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ragged_scan_shared_extents_manual_variation() -> Result<(), TypeError> {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let storage = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            )
+            .unwrap();
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let stacked = RaggedType::new(storage, RaggedValueKind::Array, vec![RaggedDimension::new(1, rows, vec![])])?;
+        assert_eq!(
+            ragged_scan_slice_type(&stacked),
+            Err(TypeError::invalid(
+                "`scan` cannot slice ragged storage whose scan axis changes a shared extent payload's manual variation; reshard the scan axis before scanning",
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stacked_ragged_scan_type() -> Result<(), TypeError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
+        let slice = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [3, 2, 3]),
+            crate::RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows.clone(), vec![0]), RaggedDimension::new(2, columns.clone(), vec![1, 0])],
+        )?;
+        let length = DimensionVariable::new("time", DimensionBounds::non_negative(Some(5)).unwrap());
+        let stacked = stacked_ragged_scan_type(&slice, &length.clone().into())?;
+        assert_eq!(
+            stacked.storage_type().shape(),
+            &Shape::new(vec![length.into(), Dimension::Static(3), Dimension::Static(2), Dimension::Static(3)])
+        );
+        assert_eq!(stacked.logical_shape().rank(), 4);
+        assert_eq!(
+            stacked.ragged_dimensions(),
+            &[RaggedDimension::new(2, rows, vec![0, 1]), RaggedDimension::new(3, columns, vec![0, 2, 1]),]
+        );
+        let empty = stacked_ragged_scan_type(&slice, &Dimension::Static(0))?;
+        assert_eq!(empty.storage_type(), &ArrayType::new_static(DataType::F32, [0, 3, 2, 3]));
+        assert_eq!(
+            empty.extent_types(),
+            &[ArrayType::new_static(DataType::I64, [0, 3]), ArrayType::new_static(DataType::I64, [0, 2, 3]),]
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_stacked_scan_type_preserves_memory() {
         // Stacking prepends the scan length to the slice type and keeps the slice's memory placement.
@@ -17920,7 +19691,12 @@ mod tests {
         let accumulator = body.add_input(scalar_type);
         let reference = body.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let next = body
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![accumulator, scale], None)
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![accumulator, scale],
+                None,
+            )
             .unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(

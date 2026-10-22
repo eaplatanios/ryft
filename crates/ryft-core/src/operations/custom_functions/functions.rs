@@ -370,7 +370,7 @@ where
             >,
             Operation = O,
         >
-        + From<AddOperation<V::Type>>,
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -457,7 +457,7 @@ where
             >,
             Operation = O,
         >
-        + From<AddOperation<V::Type>>,
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -550,7 +550,7 @@ where
             >,
             Operation = O,
         >
-        + From<AddOperation<V::Type>>,
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<CotangentAccumulator>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -762,7 +762,7 @@ where
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + From<AddOperation<V::Type>>,
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     Input: 'static
         + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
     Output: 'static

@@ -370,10 +370,10 @@ impl<
         // body's outputs as its own, which is the positionally forwarding shape that the shared structured rewrite
         // serves with no leading inputs. The captured reference state that the rewrite appends carries no derivative
         // values, so its inputs are not selected by the optimization barrier.
-        discharge_positional_region_operation(self, context, driver, inputs, 0, |appended_input_count| {
-            self.with_remapped_optimization_barrier(|selected| {
+        discharge_positional_region_operation(self, context, driver, inputs, 0, |appended_input_count, _| {
+            Ok(self.with_remapped_optimization_barrier(|selected| {
                 selected.iter().copied().chain(std::iter::repeat_n(false, appended_input_count)).collect()
-            })
+            }))
         })
     }
 }
@@ -657,7 +657,7 @@ where
 impl<
     V: Value<Type: 'static + DifferentiableType + ReferenceMemberType>,
     O: Operation<Type = V::Type>
-        + From<AddOperation<V::Type>>
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
         + From<RematerializeOperation<V::Type>>
         + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<

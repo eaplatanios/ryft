@@ -248,18 +248,36 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
         }
     }
 
-    fn type_identity_definitions(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
+    fn defined_type_identities(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
         match self {
-            Self::Portable(operation) => operation.type_identity_definitions(),
-            Self::Call(operation) => operation.type_identity_definitions(),
-            Self::Scratch(operation) => operation.type_identity_definitions(),
-            Self::TileLoad(operation) => operation.type_identity_definitions(),
-            Self::AsyncCopy(operation) => operation.type_identity_definitions(),
-            Self::Wait(operation) => operation.type_identity_definitions(),
-            Self::MaskedLoad(operation) => operation.type_identity_definitions(),
-            Self::MaskedStore(operation) => operation.type_identity_definitions(),
-            Self::MaskedSwap(operation) => operation.type_identity_definitions(),
-            Self::Extension(operation) => operation.type_identity_definitions(),
+            Self::Portable(operation) => operation.defined_type_identities(),
+            Self::Call(operation) => operation.defined_type_identities(),
+            Self::Scratch(operation) => operation.defined_type_identities(),
+            Self::TileLoad(operation) => operation.defined_type_identities(),
+            Self::AsyncCopy(operation) => operation.defined_type_identities(),
+            Self::Wait(operation) => operation.defined_type_identities(),
+            Self::MaskedLoad(operation) => operation.defined_type_identities(),
+            Self::MaskedStore(operation) => operation.defined_type_identities(),
+            Self::MaskedSwap(operation) => operation.defined_type_identities(),
+            Self::Extension(operation) => operation.defined_type_identities(),
+        }
+    }
+
+    fn consumed_type_identities(
+        &self,
+        input_types: &[Self::Type],
+    ) -> Result<Vec<<Self::Type as Type>::Identity>, TypeError> {
+        match self {
+            Self::Portable(operation) => operation.consumed_type_identities(input_types),
+            Self::Call(operation) => operation.consumed_type_identities(input_types),
+            Self::Scratch(operation) => operation.consumed_type_identities(input_types),
+            Self::TileLoad(operation) => operation.consumed_type_identities(input_types),
+            Self::AsyncCopy(operation) => operation.consumed_type_identities(input_types),
+            Self::Wait(operation) => operation.consumed_type_identities(input_types),
+            Self::MaskedLoad(operation) => operation.consumed_type_identities(input_types),
+            Self::MaskedStore(operation) => operation.consumed_type_identities(input_types),
+            Self::MaskedSwap(operation) => operation.consumed_type_identities(input_types),
+            Self::Extension(operation) => operation.consumed_type_identities(input_types),
         }
     }
 
@@ -853,7 +871,8 @@ mod tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
-        AddOperation, RaggedNewOperation, ReferenceRead, ReferenceSwap, ScanOperation, TagOperation,
+        AddOperation, RaggedNewOperation, RaggedStorageOperation, ReferenceRead, ReferenceSwap, ScanOperation,
+        TagOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType};
@@ -879,9 +898,13 @@ mod tests {
         )
         .unwrap();
         let payload = ArrayIrOperation::<Array>::RaggedNew(RaggedNewOperation::new(r#type.clone()));
+        let storage = ArrayIrOperation::<Array>::RaggedStorage(RaggedStorageOperation);
+        for operation in [KernelOperation::Portable(storage.clone()), KernelOperation::Extension(storage)] {
+            assert_eq!(operation.consumed_type_identities(&[r#type.clone().into()]).unwrap(), vec![rows.clone()]);
+        }
         let input_types = vec![r#type.storage_type().clone().into(), r#type.extent_types()[0].clone().into()];
         for operation in [KernelOperation::Portable(payload.clone()), KernelOperation::Extension(payload)] {
-            assert_eq!(operation.type_identity_definitions().as_ref(), std::slice::from_ref(&rows));
+            assert_eq!(operation.defined_type_identities().as_ref(), std::slice::from_ref(&rows));
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<ArrayIrOperation<Array>>>::new();
             let fields = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect();
             let outputs = builder.add_instruction(operation, Vec::new(), fields, None).unwrap().to_vec();

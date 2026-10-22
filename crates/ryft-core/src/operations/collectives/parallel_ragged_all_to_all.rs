@@ -1240,6 +1240,7 @@ impl_differentiable_operation! {
         O: From<ZeroOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
             + From<NegOperation<ArrayType>>
+            + From<AddOperation<ArrayType>>
             + From<BroadcastOperation>
             + From<ConcatenateOperation<ArrayType>>
             + From<CompareOperation<ArrayType>>

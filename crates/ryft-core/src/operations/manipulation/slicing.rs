@@ -506,7 +506,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
     for SliceOperation
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: From<AddOperation<ArrayIrType>>
+    O: OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<
             ArrayType,
@@ -2033,7 +2033,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
     for DynamicSliceOperation<ArrayType>
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: From<AddOperation<ArrayIrType>>
+    O: OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<

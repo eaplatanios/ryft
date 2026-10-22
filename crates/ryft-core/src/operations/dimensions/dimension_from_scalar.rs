@@ -508,8 +508,8 @@ mod tests {
         assert_eq!(relocated_operation.output_type().variable().unwrap().name(), variable.name());
         assert_eq!(relocated_operation.output_type().bounds(), bounds);
 
-        // The relocated identity is nominally fresh but alpha-equivalent, so the relocated program renders exactly
-        // like its source.
+        // The relocated identity is fresh but retains the same bounds and relationships, so the relocated program
+        // renders exactly like its source.
         let relocated = relocated_builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 relocated_outputs,

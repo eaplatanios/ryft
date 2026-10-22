@@ -11,10 +11,14 @@
 //! extents before adding cotangent storage; ordinary addition still requires explicit storage projection.
 //!
 //! Batching transports aligned ordinary mapped storage axes, including the independent placement of that coordinate
-//! in each extent payload. Ragged addition requires equal mapped-axis positions. Standalone storage/new transposition
-//! cannot reconstruct all indexed checks from types alone; their JVPs carry executable forward/transpose regions with
-//! explicit shape residuals. Cotangents with reduced or unreduced extent placement remain unsupported because integer
-//! metadata cannot acquire numerical partial-sum semantics.
+//! in each extent payload. Construction broadcasts replicated storage along the batch axis when its extents or identity
+//! source are mapped. Ragged addition broadcasts a replicated contribution onto the mapped storage axis of the other
+//! contribution and checks its live extents against that contribution for every batch item. Two mapped contributions
+//! still require equal mapped-axis positions, because a first-class ragged carrier cannot yet move its batch axis.
+//! Standalone storage/new transposition cannot reconstruct all indexed checks from types alone; their JVPs carry
+//! executable forward/transpose regions with explicit shape residuals.
+//! Cotangents with reduced or unreduced extent placement remain unsupported because integer metadata cannot acquire
+//! numerical partial-sum semantics.
 
 // TODO(eaplatanios): Review this module.
 
@@ -114,7 +118,7 @@ impl Operation for RaggedNewOperation {
         RAGGED_NEW_OPERATION_NAME
     }
 
-    fn type_identity_definitions(&self) -> Cow<'_, [DimensionVariable]> {
+    fn defined_type_identities(&self) -> Cow<'_, [DimensionVariable]> {
         let item_definition = match self.output_type.value_kind() {
             RaggedValueKind::Array => None,
             RaggedValueKind::Dimension(dimension) => dimension.variable(),
@@ -126,6 +130,16 @@ impl Operation for RaggedNewOperation {
             }
         }
         Cow::Owned(identities)
+    }
+
+    fn consumed_type_identities(&self, input_types: &[ArrayIrType]) -> Result<Vec<DimensionVariable>, TypeError> {
+        let field_count = self.output_type.extent_types().len() + 1;
+        check_count!("input", input_types, field_count + usize::from(self.identity_source), TypeError);
+        if self.identity_source {
+            Ok(indexed_identities(<&RaggedType>::try_from(&input_types[field_count])?))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn infer_output_types(
@@ -231,16 +245,10 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let field_count = self.output_type.extent_types().len() + 1;
         check_count!("input", inputs, field_count + usize::from(self.identity_source), ProgramError);
-        let consumed = if self.identity_source {
-            let source_type = P::value(&inputs[field_count]).r#type();
-            indexed_identities(<&RaggedType>::try_from(source_type.as_ref())?)
-        } else {
-            Vec::new()
-        };
         if inputs.iter().all(|input| P::batch_axis(input).is_replicated()) {
             let values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
             let value = context.parent().bind(self.clone(), Vec::new(), &values)?.remove(0);
-            return Ok(BatchedOutputs::new(vec![P::replicated(value)], P::consumed_type_identities(&consumed)));
+            return Ok(vec![P::replicated(value)].into());
         }
 
         // Replicated storage combined with mapped extents or a mapped identity source denotes the same padded storage
@@ -309,7 +317,7 @@ where
             .cloned()
             .collect::<Vec<_>>();
         let value = context.parent().bind(operation, Vec::new(), &values)?.remove(0);
-        Ok(BatchedOutputs::new(vec![P::batch(value, batch_axis)?], P::consumed_type_identities(&consumed)))
+        Ok(vec![P::batch(value, batch_axis)?].into())
     }
 }
 
@@ -337,9 +345,11 @@ where
             _ if tangent_type.is_zero_space() => MaybeZero::Zero(tangent_type),
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(value) => {
-                // Forward mode can read shape directly from the primal result. Reverse linearization below instead
-                // captures Zero storage, so retaining its transpose never retains primal numerical bytes for shape.
-                let source = context.primal_to_tangent(primal.clone())?;
+                // The tangent reads its extents and identity from a Zero-storage shape carrier of the primal result,
+                // like the reverse rule below. Under `linearize`, the carrier, not the primal result, becomes the
+                // retained residual, so the pushforward never retains numerical primal storage solely for shape.
+                let source = C::Operation::capture_zero_source(context.primal(), &primal, &tangent_type)?;
+                let source = context.primal_to_tangent(source)?;
                 let target = <&RaggedType>::try_from(&tangent_type)?.clone();
                 let mut fields = vec![value.clone()];
                 for descriptor in target.ragged_dimensions() {
@@ -530,6 +540,11 @@ impl Operation for RaggedStorageOperation {
         RAGGED_STORAGE_OPERATION_NAME
     }
 
+    fn consumed_type_identities(&self, input_types: &[ArrayIrType]) -> Result<Vec<DimensionVariable>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        Ok(indexed_identities(<&RaggedType>::try_from(&input_types[0])?))
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[ArrayIrType],
@@ -572,14 +587,8 @@ where
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let input_type = P::value(&inputs[0]).r#type();
-        let input_type = <&RaggedType>::try_from(input_type.as_ref())?;
-        let identities = indexed_identities(input_type);
         let value = context.parent().bind(*self, Vec::new(), &[P::value(&inputs[0]).clone()])?.remove(0);
-        Ok(BatchedOutputs::new(
-            vec![P::batch(value, P::batch_axis(&inputs[0]))?],
-            P::consumed_type_identities(&identities),
-        ))
+        Ok(vec![P::batch(value, P::batch_axis(&inputs[0]))?].into())
     }
 }
 
@@ -740,6 +749,11 @@ impl Operation for RaggedExtentsOperation {
         RAGGED_EXTENTS_OPERATION_NAME
     }
 
+    fn consumed_type_identities(&self, input_types: &[ArrayIrType]) -> Result<Vec<DimensionVariable>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        Ok(indexed_identities(<&RaggedType>::try_from(&input_types[0])?))
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[ArrayIrType],
@@ -804,15 +818,11 @@ where
             .parent()
             .bind(Self::new(descriptor.axis()), Vec::new(), &[P::value(&inputs[0]).clone()])?
             .remove(0);
-        let identities = indexed_identities(packed_type);
-        Ok(BatchedOutputs::new(
-            vec![P::batch(
-                value,
-                output_axis
-                    .map_or_else(crate::batching::BatchAxis::replicated, crate::batching::BatchAxis::from_position),
-            )?],
-            P::consumed_type_identities(&identities),
-        ))
+        Ok(vec![P::batch(
+            value,
+            output_axis.map_or_else(crate::batching::BatchAxis::replicated, crate::batching::BatchAxis::from_position),
+        )?]
+        .into())
     }
 }
 
@@ -913,6 +923,11 @@ impl Operation for RaggedZeroOperation {
 
     fn name(&self) -> &'static str {
         RAGGED_ZERO_OPERATION_NAME
+    }
+
+    fn consumed_type_identities(&self, input_types: &[ArrayIrType]) -> Result<Vec<DimensionVariable>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        Ok(indexed_identities(<&RaggedType>::try_from(&input_types[0])?))
     }
 
     fn infer_output_types(
@@ -1022,12 +1037,7 @@ where
             output_type.ragged_dimensions().to_vec(),
         )?);
         let value = context.parent().bind(operation, Vec::new(), &[P::value(&inputs[0]).clone()])?.remove(0);
-        let source_type = P::value(&inputs[0]).r#type();
-        let consumed = indexed_identities(<&RaggedType>::try_from(source_type.as_ref())?);
-        Ok(BatchedOutputs::new(
-            vec![P::batch(value, P::batch_axis(&inputs[0]))?],
-            P::consumed_type_identities(&consumed),
-        ))
+        Ok(vec![P::batch(value, P::batch_axis(&inputs[0]))?].into())
     }
 }
 
@@ -1134,16 +1144,36 @@ impl<C: Context<Type = ArrayIrType, Operation: From<RaggedAddOperation>>> Partia
 
 impl<C, P> BatchableOperation<C, P> for RaggedAddOperation
 where
-    C: Context<Type = ArrayIrType, Operation: From<RaggedAddOperation>>,
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<RaggedAddOperation>
+        + From<RaggedNewOperation>
+        + From<RaggedStorageOperation>
+        + From<RaggedExtentsOperation>,
     P: BatchingPolicy<C>,
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
-        _driver: &D,
+        driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
+        self.infer_output_types(
+            &[P::unbatched_type(&inputs[0]).into_owned(), P::unbatched_type(&inputs[1]).into_owned()],
+            &[],
+        )?;
+
+        // A replicated contribution next to a mapped one is first aligned to the mapped storage axis through the
+        // policy, and then rebuilt in the mapped contribution's representation with that contribution as its identity
+        // source. The rebuild takes the aligned per-item extent payloads where the mapped representation varies over
+        // the batch coordinate and the shared payloads elsewhere, so both inputs of the parent addition have identical
+        // types, and it checks the live extents of every batch item against the mapped contribution.
+        let mut inputs = inputs.to_vec();
+        match (P::batch_axis(&inputs[0]).is_replicated(), P::batch_axis(&inputs[1]).is_replicated()) {
+            (false, true) => inputs[1] = align_ragged_contribution(context, driver, &inputs[1], &inputs[0])?,
+            (true, false) => inputs[0] = align_ragged_contribution(context, driver, &inputs[0], &inputs[1])?,
+            _ => {}
+        }
         if P::batch_axis(&inputs[0]) != P::batch_axis(&inputs[1]) {
             return Err(BatchingError::UnsupportedOperation {
                 message: "`ragged_add` requires both inputs to use the same mapped storage axis".into(),
@@ -1209,7 +1239,48 @@ where
     }
 }
 
-/// Indexed identities that a representation-level batching rule explicitly preserves or consumes. A dimension
+/// Aligns the `replicated` input of a batched [`RaggedAddOperation`] to the mapped storage axis of `mapped` and
+/// rebuilds it in the packed representation of `mapped`, which also serves as its identity source. Each extent payload
+/// comes from the aligned value when the corresponding descriptor of `mapped` varies over the batch coordinate, and
+/// from `replicated` itself when `mapped` shares one payload across the batch. Both inputs must have the same per-item
+/// type.
+fn align_ragged_contribution<C, P, D>(
+    context: &BatchingContext<C, P>,
+    driver: &D,
+    replicated: &P::Batch,
+    mapped: &P::Batch,
+) -> Result<P::Batch, BatchingError>
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<RaggedNewOperation> + From<RaggedStorageOperation> + From<RaggedExtentsOperation>,
+    P: BatchingPolicy<C>,
+    D: BatchingDriver<C, P>,
+{
+    let mapped_type = P::value(mapped).r#type();
+    let mapped_type = <&RaggedType>::try_from(mapped_type.as_ref())?;
+    let replicated_type = P::value(replicated).r#type();
+    let replicated_type = <&RaggedType>::try_from(replicated_type.as_ref())?;
+    let batch_axis = P::batch_axis(mapped);
+    let position = batch_axis.axis().unwrap().normalize(mapped_type.storage_type().rank())?;
+    let aligned = driver.align_batch_axis(context, replicated.clone(), Axis::from(position))?;
+    let parent = context.parent();
+    let mut fields = parent.bind(RaggedStorageOperation, Vec::new(), std::slice::from_ref(P::value(&aligned)))?;
+    for (descriptor, replicated_descriptor) in
+        mapped_type.ragged_dimensions().iter().zip(replicated_type.ragged_dimensions())
+    {
+        let (source, axis) = match descriptor.extent_axes().contains(&position) {
+            true => (P::value(&aligned), descriptor.axis()),
+            false => (P::value(replicated), replicated_descriptor.axis()),
+        };
+        fields.extend(parent.bind(RaggedExtentsOperation::new(axis), Vec::new(), std::slice::from_ref(source))?);
+    }
+    fields.push(P::value(mapped).clone());
+    let operation = RaggedNewOperation::with_identity_source(mapped_type.clone());
+    let value = parent.bind(operation, Vec::new(), &fields)?.remove(0);
+    P::batch(value, batch_axis)
+}
+
+/// Indexed identities whose associations a representation-level operation may omit from its outputs. A dimension
 /// item's represented identity is indexed data too, even when the representation has no ragged storage axes.
 fn indexed_identities(r#type: &RaggedType) -> Vec<DimensionVariable> {
     let mut identities = Vec::with_capacity(r#type.ragged_dimensions().len() + 1);
@@ -1792,6 +1863,50 @@ mod tests {
         assert_eq!(program.type_identity_signature().internal_identities(), &[rows]);
         let inputs = (storage(&r#type), ArrayIrValue::Array(Array::vector(vec![1i64, 3]).unwrap()));
         assert_eq!(program.interpret(inputs.clone()), Ok(inputs));
+    }
+
+    #[test]
+    fn test_ragged_operation_identity_declarations() -> Result<(), TypeError> {
+        let representation = nested_type(2);
+        let identities = representation
+            .ragged_dimensions()
+            .iter()
+            .map(|descriptor| descriptor.dimension().clone())
+            .collect::<Vec<_>>();
+        let mut fields = std::iter::once(representation.storage_type().clone().into())
+            .chain(representation.extent_types().iter().cloned().map(Into::into))
+            .collect::<Vec<ArrayIrType>>();
+        let fresh = RaggedNewOperation::new(representation.clone());
+        assert_eq!(fresh.defined_type_identities().as_ref(), &identities);
+        assert_eq!(fresh.consumed_type_identities(&fields)?, Vec::new());
+
+        fields.push(representation.clone().into());
+        let reconstruction = RaggedNewOperation::with_identity_source(representation.clone());
+        assert_eq!(reconstruction.consumed_type_identities(&fields)?, identities);
+        let source = [ArrayIrType::Ragged(representation.clone())];
+        let operations = [
+            ArrayIrOperation::<Array>::from(RaggedStorageOperation),
+            ArrayIrOperation::from(RaggedExtentsOperation::new(-1)),
+            ArrayIrOperation::from(RaggedZeroOperation::new(representation)),
+        ];
+        for operation in operations {
+            assert_eq!(operation.consumed_type_identities(&source)?, identities);
+            assert_eq!(Box::new(operation).consumed_type_identities(&source)?, identities);
+        }
+
+        // A dimension item's represented identity is consumed even when there are no ragged storage axes.
+        let item = DimensionVariable::new("item", DimensionBounds::unbounded());
+        let dimension = RaggedType::new(
+            ArrayType::new_static(DataType::I64, [2]),
+            RaggedValueKind::Dimension(item.clone().into()),
+            Vec::new(),
+        )?;
+        assert_eq!(RaggedStorageOperation.consumed_type_identities(&[dimension.into()])?, vec![item]);
+        assert_eq!(
+            RaggedStorageOperation.consumed_type_identities(&[]),
+            Err(TypeError::invalid("expected 1 input but got 0"))
+        );
+        Ok(())
     }
 
     #[test]
@@ -2631,13 +2746,17 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
         assert_eq!(
             batch(
-                |(storage, extents): (Batched, Batched)| storage.ragged_new(item_type.clone(), &[extents]),
+                |(storage, extents): (Batched, Batched)| {
+                    let value = storage.ragged_new(item_type.clone(), &[extents])?;
+                    assert_eq!(value.batch().value().r#type().as_ref(), &ArrayIrType::Ragged(leading_type.clone()));
+                    Ok((value.ragged_storage()?, value.ragged_extents(0)?))
+                },
                 (ArrayIrValue::Array(storage.clone()), ArrayIrValue::Array(extents.clone())),
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 BatchAxis::new(0),
                 BatchAxisSpecification::default(),
             ),
-            Ok(ArrayIrValue::Ragged(RaggedValue::new(leading_type.clone(), storage, vec![extents.clone()]).unwrap())),
+            Ok((ArrayIrValue::Array(storage), ArrayIrValue::Array(extents.clone()))),
         );
 
         // Replicated storage with mapped extents denotes the same padded storage for every batch item, so it is
@@ -2647,13 +2766,17 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 1., 2., 3.]).unwrap();
         assert_eq!(
             batch(
-                |(storage, extents): (Batched, Batched)| storage.ragged_new(item_type.clone(), &[extents]),
+                |(storage, extents): (Batched, Batched)| {
+                    let value = storage.ragged_new(item_type.clone(), &[extents])?;
+                    assert_eq!(value.batch().value().r#type().as_ref(), &ArrayIrType::Ragged(leading_type.clone()));
+                    Ok((value.ragged_storage()?, value.ragged_extents(0)?))
+                },
                 (ArrayIrValue::Array(shared.clone()), ArrayIrValue::Array(extents.clone())),
                 (BatchAxis::replicated(), BatchAxis::new(0)),
                 BatchAxis::new(0),
                 BatchAxisSpecification::default(),
             ),
-            Ok(ArrayIrValue::Ragged(RaggedValue::new(leading_type, broadcast, vec![extents.clone()]).unwrap())),
+            Ok((ArrayIrValue::Array(broadcast), ArrayIrValue::Array(extents.clone()))),
         );
 
         // A mapped identity source places broadcast storage at its own batch axis, and the rule reports the source's
@@ -2684,14 +2807,16 @@ mod tests {
             batch(
                 |(storage, source): (Batched, Batched)| {
                     let extents = source.ragged_extents(0)?;
-                    storage.ragged_new_with_identity_source(item_type.clone(), &[extents], &source)
+                    let value = storage.ragged_new_with_identity_source(item_type.clone(), &[extents], &source)?;
+                    assert_eq!(value.batch().value().r#type().as_ref(), &ArrayIrType::Ragged(trailing_type.clone()));
+                    Ok((value.ragged_storage()?, value.ragged_extents(0)?))
                 },
                 (ArrayIrValue::Array(shared), ArrayIrValue::Ragged(source)),
                 (BatchAxis::replicated(), BatchAxis::new(1)),
-                BatchAxis::new(1),
+                (BatchAxis::new(1), BatchAxis::new(0)),
                 BatchAxisSpecification::default(),
             ),
-            Ok(ArrayIrValue::Ragged(RaggedValue::new(trailing_type, transposed, vec![extents]).unwrap())),
+            Ok((ArrayIrValue::Array(transposed), ArrayIrValue::Array(extents))),
         );
 
         // A non-leading storage batch axis shifts the occurrence's storage axis, and an extent payload mapped at a
@@ -2714,13 +2839,17 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::I64, [2, 4]), &[0i64, 1, 2, 3, 3, 2, 1, 0]).unwrap();
         assert_eq!(
             batch(
-                |(storage, extents): (Batched, Batched)| storage.ragged_new(item_type.clone(), &[extents]),
+                |(storage, extents): (Batched, Batched)| {
+                    let value = storage.ragged_new(item_type.clone(), &[extents])?;
+                    assert_eq!(value.batch().value().r#type().as_ref(), &ArrayIrType::Ragged(packed_type.clone()));
+                    Ok((value.ragged_storage()?, value.ragged_extents(1)?))
+                },
                 (ArrayIrValue::Array(storage.clone()), ArrayIrValue::Array(extents.clone())),
                 (BatchAxis::new(1), BatchAxis::new(1)),
                 BatchAxis::new(1),
                 BatchAxisSpecification::default(),
             ),
-            Ok(ArrayIrValue::Ragged(RaggedValue::new(packed_type, storage, vec![extents]).unwrap())),
+            Ok((ArrayIrValue::Array(storage), ArrayIrValue::Array(extents))),
         );
     }
 
@@ -3436,7 +3565,27 @@ mod tests {
     fn test_ragged_storage_reverse_accumulation_and_disconnected_zero() {
         use crate::differentiation::differentiate_at;
         let first = differential_value();
-        let disconnected = differential_value();
+        // This independent family has different extents, so borrowing the active input's zero source would be wrong.
+        let ArrayIrValue::Ragged(value) = &first else { unreachable!() };
+        let disconnected_type = RaggedType::new(
+            value.storage().r#type().into_owned(),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(
+                1,
+                DimensionVariable::new("disconnected_rows", value.r#type().ragged_dimensions()[0].dimension().bounds()),
+                vec![0],
+            )],
+        )
+        .unwrap();
+        let disconnected = ArrayIrValue::Ragged(
+            RaggedValue::new(
+                disconnected_type,
+                Array::from_elements(value.storage().r#type().into_owned(), &[5f32; 6]).unwrap(),
+                vec![Array::vector(vec![3i64, 0]).unwrap()],
+            )
+            .unwrap(),
+        );
+        assert_ne!(disconnected.ragged_extents(1), first.ragged_extents(1));
         let (_, pullback) = differentiate_at((first.clone(), disconnected.clone()))
             .vjp(|(first, _)| first.ragged_storage()?.add(&first.ragged_storage()?))
             .unwrap();
@@ -3638,7 +3787,6 @@ mod tests {
         use crate::arrays::{ArrayIrBatch, ArrayIrBatchingPolicy};
         use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
         use crate::differentiation::differentiate_at;
-        use crate::operations::arithmetic::Mul;
 
         type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
@@ -3686,7 +3834,7 @@ mod tests {
         let doubled_seed =
             Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[2f32, 4., 6., 2., 4., 6.]).unwrap();
         for (uses, storage) in [(1, broadcast_seed.clone()), (2, doubled_seed)] {
-            let expected = RaggedValue::new(value.r#type().into_owned(), storage, value.extents().to_vec()).unwrap();
+            let expected = (ArrayIrValue::Array(storage), ArrayIrValue::Array(value.extents()[0].clone()));
             assert_eq!(
                 batch(
                     |item: Batched| {
@@ -3700,54 +3848,18 @@ mod tests {
                             item.domain(),
                             ArrayIrBatch::new(ArrayIrValue::Array(seed.clone()), BatchAxis::replicated())?,
                         );
-                        pullback.apply_materialized(seed).map_err(ProgramError::from)
+                        let cotangent = pullback.apply_materialized(seed).map_err(ProgramError::from)?;
+                        // Keep the ragged cotangent internal; public batching returns ordinary storage and extents.
+                        Ok((cotangent.ragged_storage()?, cotangent.ragged_extents(0)?))
                     },
                     primal.clone(),
                     BatchAxis::new(0),
                     BatchAxis::new(0),
                     BatchAxisSpecification::default(),
                 ),
-                Ok(ArrayIrValue::Ragged(expected)),
+                Ok(expected),
             );
         }
-
-        // Batched reverse mode over a replicated ragged input and a mapped weight: the weighted storage projection
-        // contributes a mapped cotangent and the unweighted one a replicated cotangent, so accumulating them through
-        // `ragged_add` broadcasts the replicated contribution onto the mapped one.
-        let shared = RaggedValue::new(item_type.clone(), seed.clone(), vec![Array::scalar(2i64).unwrap()]).unwrap();
-        let weights =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
-        let mixed_type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, item_type.ragged_dimensions()[0].dimension().clone(), vec![])],
-        )
-        .unwrap();
-        let mixed_storage =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[2f32, 3., 4., 5., 6., 7.]).unwrap();
-        assert_eq!(
-            batch(
-                |(item, weights): (Batched, Batched)| {
-                    let (_, pullback) = differentiate_at(item.clone())
-                        .with_captures(weights)
-                        .vjp(|input, weights| input.ragged_storage()?.mul(&weights)?.add(&input.ragged_storage()?))
-                        .map_err(ProgramError::from)?;
-                    let ones = Array::vector(vec![1f32, 1., 1.]).unwrap();
-                    let seed = BatchingTracer::new(
-                        item.domain(),
-                        ArrayIrBatch::new(ArrayIrValue::Array(ones), BatchAxis::replicated())?,
-                    );
-                    pullback.apply_materialized(seed).map_err(ProgramError::from)
-                },
-                (ArrayIrValue::Ragged(shared), ArrayIrValue::Array(weights)),
-                (BatchAxis::replicated(), BatchAxis::new(0)),
-                BatchAxis::new(0),
-                BatchAxisSpecification::default(),
-            ),
-            Ok(ArrayIrValue::Ragged(
-                RaggedValue::new(mixed_type, mixed_storage, vec![Array::scalar(2i64).unwrap()]).unwrap()
-            )),
-        );
 
         // Reverse mode around batching: the packed cotangent of the whole batched ragged input is the packed seed with
         // the primal's extents.
@@ -3771,92 +3883,6 @@ mod tests {
                 RaggedValue::new(value.r#type().into_owned(), packed_seed, value.extents().to_vec()).unwrap()
             )),
         );
-    }
-
-    #[test]
-    fn tmp_mixed_debug() {
-        use crate::arrays::{ArrayIrBatch, ArrayIrBatchingPolicy};
-        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-        use crate::differentiation::differentiate_at;
-        use crate::operations::arithmetic::Mul;
-        type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type Batched = BatchingTracer<Eager, ArrayIrBatchingPolicy>;
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        let item_type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, rows, vec![])],
-        )
-        .unwrap();
-        let shared = RaggedValue::new(
-            item_type.clone(),
-            Array::vector(vec![1f32, 2., 3.]).unwrap(),
-            vec![Array::scalar(2i64).unwrap()],
-        )
-        .unwrap();
-        let weights =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
-        for variant in 0..4 {
-            let result = batch(
-                |(item, weights): (Batched, Batched)| {
-                    if variant == 0 {
-                        let extents = item.ragged_extents(0)?;
-                        return weights.ragged_new_with_identity_source(item_type.clone(), &[extents], &item);
-                    }
-                    if variant == 1 {
-                        let tangent = item.clone();
-                        return differentiate_at(item.clone())
-                            .with_captures(weights)
-                            .jvp(tangent, |input, weights| input.ragged_storage()?.mul(&weights))
-                            .map(|(_, tangent)| tangent)
-                            .map_err(ProgramError::from);
-                    }
-                    if variant == 3 {
-                        let (_, pullback) = differentiate_at(item.clone())
-                            .with_captures(weights)
-                            .vjp(|input, weights| input.ragged_storage()?.mul(&weights))
-                            .map_err(ProgramError::from)?;
-                        println!("PULLBACK BUILT");
-                        let ones =
-                            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32; 6]).unwrap();
-                        let seed = BatchingTracer::new(
-                            item.domain(),
-                            ArrayIrBatch::new(ArrayIrValue::Array(ones), BatchAxis::new(0))?,
-                        );
-                        return pullback.apply_materialized(seed).map_err(ProgramError::from);
-                    }
-                    let (_, pullback) = differentiate_at(item.clone())
-                        .with_captures(weights)
-                        .vjp(|input, weights| {
-                            println!("FORWARD");
-                            match variant {
-                                0 => input.ragged_storage()?.mul(&weights),
-                                1 => {
-                                    input.ragged_storage()?.mul(&weights)?.add(&input.ragged_storage()?.mul(&weights)?)
-                                }
-                                2 => input.ragged_storage(),
-                                _ => input.ragged_storage()?.mul(&weights)?.add(&input.ragged_storage()?),
-                            }
-                        })
-                        .map_err(ProgramError::from)?;
-                    println!("PULLBACK BUILT");
-                    let ones = Array::vector(vec![1f32, 1., 1.]).unwrap();
-                    let seed = BatchingTracer::new(
-                        item.domain(),
-                        ArrayIrBatch::new(
-                            ArrayIrValue::Array(ones),
-                            if variant == 2 { BatchAxis::replicated() } else { BatchAxis::replicated() },
-                        )?,
-                    );
-                    pullback.apply_materialized(seed).map_err(ProgramError::from)
-                },
-                (ArrayIrValue::Ragged(shared.clone()), ArrayIrValue::Array(weights.clone())),
-                (BatchAxis::replicated(), BatchAxis::new(0)),
-                if variant == 2 { BatchAxis::replicated() } else { BatchAxis::new(0) },
-                BatchAxisSpecification::default(),
-            );
-            println!("VARIANT {variant}: {result:?}");
-        }
     }
 
     #[test]
@@ -3909,6 +3935,49 @@ mod tests {
         assert_eq!(
             program.interpret((storage.clone().into(), Array::scalar(2i64).unwrap().into())),
             Ok(storage.into())
+        );
+    }
+
+    #[test]
+    fn test_ragged_new_differentiation_linearize_retains_shape_carrier() {
+        use crate::differentiation::differentiate_at;
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
+        let representation = RaggedType::new(
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            RaggedValueKind::Array,
+            vec![RaggedDimension::new(1, rows, vec![0])],
+        )
+        .unwrap();
+        let storage =
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
+        let extents = Array::vector(vec![1i64, 2]).unwrap();
+        let (output, pushforward) = differentiate_at(ArrayIrValue::Array(storage.clone()))
+            .with_captures(ArrayIrValue::Array(extents.clone()))
+            .linearize(|storage, extents| storage.ragged_new(representation.clone(), &[extents])?.ragged_storage())
+            .unwrap();
+        assert_eq!(output, storage.into());
+        let tangent =
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[7f32, 8., 9., 10., 11., 12.]).unwrap();
+        assert_eq!(pushforward.apply(tangent.clone().into()), Ok(tangent.into()));
+
+        // Only the extents and a Zero-storage shape carrier are retained; the numerical primal storage is not.
+        let (_, linear, residuals, _, _, _) = pushforward.into_parts();
+        assert_eq!(
+            residuals.iter().map(|residual| residual.r#type().to_string()).collect::<Vec<_>>(),
+            vec!["i64[2]".to_owned(), "ragged<zero[2, 3]; 1:rows over [0]>".to_owned()],
+        );
+        assert_eq!(residuals[0], ArrayIrValue::Array(extents.clone()));
+        let ArrayIrValue::Ragged(carrier) = &residuals[1] else { panic!("expected a ragged shape carrier") };
+        assert!(carrier.storage().storage_bytes().is_empty());
+        assert_eq!(carrier.extents(), &[extents]);
+        assert_eq!(
+            linear.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:i64[2], %2:ragged<zero[2, 3]; 1:rows over [0]> .
+                let %3:ragged<f32[2, 3]; 1:rows over [0]> = ragged_new \
+                        [output_type=ragged<f32[2, 3]; 1:rows over [0]>, identity_source=true] %0 %1 %2
+                    %4:f32[2, 3] = ragged_storage %3
+                in (%4)"},
         );
     }
 }

@@ -524,10 +524,11 @@ pub trait Operation: Clone {
     /// omit from its outputs. An empty declaration requires transforms to preserve every identity-bearing carrier
     /// unless their rule supplies separate evidence that it consumed the information correctly.
     ///
-    /// `input_types` describes the original logical application. Batching queries this method with per-item types
+    /// `input_types` describes the original logical application. Batching queries this function with per-item types
     /// excluding its mapped dimension, so the declaration cannot accidentally consume identities introduced by the
-    /// transform. Each returned identity must occur in an input type; an identity may still occur in outputs.
-    /// The declaration must follow [`Self::rename_type_identities`] when operation-owned identities are renamed.
+    /// transform. Implementations validate their declaration against these types and must reject any returned identity
+    /// absent from them. An identity may still occur in outputs. The declaration must follow
+    /// [`Self::rename_type_identities`] when operation-owned identities are renamed.
     ///
     /// Consumption permits an output to discard an association, such as projecting padded storage out of a ragged
     /// value. It neither removes the identity from its enclosing scope nor proves numerical relationships between
@@ -539,7 +540,8 @@ pub trait Operation: Clone {
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] if the input types do not admit this operation's consumption declaration.
+    /// Returns a [`TypeError`] if the input types do not admit this operation's consumption declaration,
+    /// including when a declared identity does not occur in an input type.
     #[inline]
     fn consumed_type_identities(
         &self,
