@@ -6,11 +6,10 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiableOperation, LinearizationContext, LinearizationTracer};
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
-use crate::differentiation::metadata::DifferentialMetadataProvider;
-use crate::differentiation::reverse::{SupportsCotangentAdd, TransposableOperation};
+use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
-use crate::operations::{ReferenceAddUpdateOperation, ReferenceNewOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -263,7 +262,6 @@ where
                            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
                            + TransposableOperation<C::Constant, C::Operation>
                            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + DifferentialMetadataProvider<C::Type>
                            + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -278,7 +276,7 @@ where
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         >,
     Input: Parameterized<
             C::Value,

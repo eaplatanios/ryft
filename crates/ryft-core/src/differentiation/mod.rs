@@ -154,11 +154,6 @@
 //! member-typed data inputs, wherever they sit in its input list, to that same homogeneous rule. Higher-order
 //! [`Operation`] logic belongs with the operation whose instruction attaches to the nested [`Region`](crate::Region).
 //! Wrapper operation enums should provide family dispatch and forward to those payload rules.
-//!
-//! Implement [`DifferentialMetadataProvider`] on operation families whose differential values need runtime validation
-//! or reconstruction data beyond their type descriptors. [`DifferentialMetadataPurpose`] selects the required uses;
-//! reusable callables retain that metadata independently of numerical derivative residuals. [`ResidualZeroProvider`]
-//! consumes reconstruction sources through its zero residual protocol and does not own differential validation.
 
 use std::fmt::{Debug, Display, Formatter};
 
@@ -170,7 +165,8 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
 use crate::operations::{
-    OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero, ZeroLikeOperation,
+    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
+    ZeroLikeOperation,
 };
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -186,7 +182,6 @@ pub mod elementwise;
 pub mod forward;
 pub mod hessian;
 pub mod jacobian;
-pub mod metadata;
 pub mod rematerialization;
 pub mod reverse;
 pub mod types;
@@ -205,7 +200,6 @@ pub use forward::{
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
-pub use metadata::{DifferentialBoundaryMetadata, DifferentialMetadataProvider, DifferentialMetadataPurpose};
 pub use rematerialization::{
     DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
     DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
@@ -220,8 +214,8 @@ pub use rematerialization::{
 pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
     CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,
-    SupportsCotangentAdd, TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext,
-    TranspositionDriver, transpose_mixed_operation, transpose_projected_operation,
+    TransposableOperation, TransposedProgram, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    transpose_mixed_operation, transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 pub use zeros::ResidualZeroProvider;
@@ -925,9 +919,7 @@ impl<Input, ContextState>
         C: Context<
                 Type = V::Type,
                 Value = V,
-                Operation: DifferentiableOperation<C>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                Operation: DifferentiableOperation<C> + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<
@@ -979,8 +971,7 @@ impl<Input, ContextState>
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<C>
                                + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1170,8 +1161,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<C>
                                + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -1230,7 +1220,6 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1245,7 +1234,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1311,7 +1300,6 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1326,7 +1314,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1492,8 +1480,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<C>
                                + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -1546,7 +1533,6 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1561,7 +1547,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1617,7 +1603,6 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1632,7 +1617,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1697,9 +1682,7 @@ impl<Input, Capture, ContextState>
         C: Context<
                 Type = V::Type,
                 Value = V,
-                Operation: DifferentiableOperation<C>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                Operation: DifferentiableOperation<C> + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<
@@ -1745,8 +1728,7 @@ impl<Input, Capture, ContextState>
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<C>
                                + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1909,8 +1891,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<C>
                                + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -1966,7 +1947,6 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1981,7 +1961,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -2040,7 +2020,6 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -2055,7 +2034,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -2237,8 +2216,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<C>
                                + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                               + ResidualZeroProvider<V::Type, Operation = C::Operation>
-                               + DifferentialMetadataProvider<V::Type>,
+                               + ResidualZeroProvider<V::Type, Operation = C::Operation>,
             >,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -2295,7 +2273,6 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -2310,7 +2287,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -2371,7 +2348,6 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<V::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -2386,7 +2362,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = C::Operation>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,

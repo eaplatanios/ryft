@@ -11,7 +11,6 @@ pub mod elements;
 pub mod ir;
 pub mod macros;
 pub mod operations;
-pub mod ragged;
 pub mod references;
 pub mod sharding;
 pub mod types;
@@ -20,8 +19,7 @@ pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySl
 pub use arrays::Array;
 pub use batching::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, DimensionSource,
-    DynamicArrayExtentBatchingPolicy, RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity,
-    StaticArrayExtentBatchingPolicy, ThreadedExtentBatchedProgram,
+    DynamicArrayExtentBatchingPolicy, StaticArrayExtentBatchingPolicy, ThreadedExtentBatchedProgram,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals, materialize_array_tangent};
@@ -37,7 +35,6 @@ pub use macros::dispatch_on_array_element_type;
 pub use operations::{
     ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, DimensionOperation, DimensionOperations,
 };
-pub use ragged::RaggedValue;
 pub use references::{
     ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayReferenceViewError,
@@ -49,7 +46,6 @@ pub use sharding::{
 pub use types::{
     ArrayIrType, ArrayIrTypeRefinements, ArrayType, ArrayTypeRefinements, AsArrayType, AsDimensionType, DataType,
     DataTypeError, Dimension, DimensionBounds, DimensionError, DimensionRefinements, DimensionType,
-    DimensionTypeRefinements, DimensionVariable, Layout, LayoutError, MAX_DIMENSION_EXTENT, Memory, RaggedDimension,
-    RaggedType, RaggedTypeRefinements, RaggedValueKind, Shape, StaticShape, StridedLayout, Tile, TileDimension,
-    TiledLayout,
+    DimensionTypeRefinements, DimensionVariable, Layout, LayoutError, MAX_DIMENSION_EXTENT, Memory, Shape, StaticShape,
+    StridedLayout, Tile, TileDimension, TiledLayout,
 };

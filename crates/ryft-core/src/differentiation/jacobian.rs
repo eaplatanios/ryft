@@ -4,15 +4,12 @@ use ryft_macros::Parameterized;
 
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
-use crate::differentiation::metadata::DifferentialMetadataProvider;
-use crate::differentiation::reverse::{
-    ReverseModeDifferentiate, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
-};
+use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation, TransposedProgramCotangent};
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::{ReferenceAddUpdateOperation, ReferenceNewOperation, ZeroOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ZeroOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -225,8 +222,7 @@ where
     C::Type: DenseDifferentiableType<C>,
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + DifferentialMetadataProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
@@ -295,7 +291,7 @@ where
 
     // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
     // Verify that the derived program still satisfies this contract before constructing its packed inputs.
-    let (_, program, residuals, ..) = pushforward.into_parts();
+    let (_, program, residuals, _, _, _) = pushforward.into_parts();
     let program_input_types = program.input_types();
     let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(
@@ -429,7 +425,6 @@ where
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + DifferentialMetadataProvider<C::Type>
         + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>>
         + OperationProvider<
             C::Type,
@@ -443,7 +438,7 @@ where
                 <C::Operation as ReferenceAccessOperation>::Transform,
             >,
             Operation = C::Operation,
-        > + SupportsCotangentAdd,
+        > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {

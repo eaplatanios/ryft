@@ -159,7 +159,7 @@ impl Array {
     /// operation. Taking the payload as an [`Arc`] also lets kernels that only retype a value (such as a memory
     /// transfer or a reshard kernel) share the original payload instead of copying it.
     #[inline]
-    pub(crate) fn new_unchecked(r#type: ArrayType, bytes: Arc<Vec<u8>>) -> Self {
+    pub fn new_unchecked(r#type: ArrayType, bytes: Arc<Vec<u8>>) -> Self {
         Self { r#type, bytes }
     }
 

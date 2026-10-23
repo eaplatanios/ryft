@@ -1,6 +1,5 @@
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, RaggedType, RaggedValueKind, Shape,
-    Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::{Context, StagingContext};
@@ -158,10 +157,6 @@ impl DifferentiableType for ArrayIrType {
             Self::Array(r#type) => r#type.is_zero_space(),
             Self::Dimension(_) => true,
             Self::Reference(r#type) => r#type.is_zero_space(),
-            Self::Ragged(r#type) => match r#type.value_kind() {
-                RaggedValueKind::Array => r#type.storage_type().is_zero_space(),
-                RaggedValueKind::Dimension(_) => true,
-            },
         }
     }
 
@@ -176,14 +171,6 @@ impl DifferentiableType for ArrayIrType {
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
             Self::Reference(r#type) => Ok(Self::Reference(r#type.tangent()?)),
-            Self::Ragged(r#type) => match r#type.value_kind() {
-                RaggedValueKind::Dimension(_) => Ok(Self::Array(ArrayType::scalar(DataType::Zero))),
-                RaggedValueKind::Array => Ok(Self::Ragged(RaggedType::new(
-                    r#type.storage_type().tangent()?,
-                    RaggedValueKind::Array,
-                    r#type.ragged_dimensions().to_vec(),
-                )?)),
-            },
         }
     }
 
@@ -197,26 +184,6 @@ impl DifferentiableType for ArrayIrType {
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
             Self::Reference(r#type) => Ok(Self::Reference(r#type.cotangent()?)),
-            Self::Ragged(r#type) => match r#type.value_kind() {
-                RaggedValueKind::Dimension(_) => Ok(Self::Array(ArrayType::scalar(DataType::Zero))),
-                RaggedValueKind::Array => {
-                    if r#type.storage_type().sharding().is_some_and(|sharding| {
-                        !sharding.reduced_axes().is_empty() || !sharding.unreduced_axes().is_empty()
-                    }) {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: "ragged cotangents cannot change reduced or unreduced placement of indexed \
-                                      extent arrays"
-                                .to_owned(),
-                        }
-                        .into());
-                    }
-                    Ok(Self::Ragged(RaggedType::new(
-                        r#type.storage_type().cotangent()?,
-                        RaggedValueKind::Array,
-                        r#type.ragged_dimensions().to_vec(),
-                    )?))
-                }
-            },
         }
     }
 }
@@ -880,9 +847,9 @@ mod tests {
 
     use crate::arrays::DataType::*;
     use crate::arrays::{
-        Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
-        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedDimension, RaggedType, RaggedValueKind, Shape,
-        Sharding, ShardingDimension, StridedLayout, f6e2m3fn, f8e8m0fnu,
+        Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f6e2m3fn,
+        f8e8m0fnu,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
@@ -1046,44 +1013,6 @@ mod tests {
         assert!(!zero_reference.is_zero_space());
         assert_eq!(non_differentiable.tangent(), Ok(zero_reference.clone()));
         assert_eq!(non_differentiable.cotangent(), Ok(zero_reference));
-    }
-
-    #[test]
-    fn test_array_ir_type_ragged_differential_representations() {
-        // Array items keep their descriptors and extent axes; only the storage element type changes.
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        for data_type in [F32, C64, I64, Zero, F8E8M0FNU] {
-            let r#type = ArrayIrType::Ragged(
-                RaggedType::new(
-                    ArrayType::new_static(data_type, [2, 3]),
-                    RaggedValueKind::Array,
-                    vec![RaggedDimension::new(1, rows.clone(), vec![0])],
-                )
-                .unwrap(),
-            );
-            let expected = ArrayIrType::Ragged(
-                RaggedType::new(
-                    ArrayType::new_static(data_type.tangent().unwrap(), [2, 3]),
-                    RaggedValueKind::Array,
-                    vec![RaggedDimension::new(1, rows.clone(), vec![0])],
-                )
-                .unwrap(),
-            );
-            assert_eq!(r#type.is_zero_space(), data_type.is_zero_space());
-            assert_eq!(r#type.tangent(), Ok(expected.clone()));
-            assert_eq!(r#type.cotangent(), Ok(expected));
-        }
-        let dimension = ArrayIrType::Ragged(
-            RaggedType::new(
-                ArrayType::new_static(I64, [2]),
-                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
-                Vec::new(),
-            )
-            .unwrap(),
-        );
-        assert!(dimension.is_zero_space());
-        assert_eq!(dimension.tangent(), Ok(ArrayType::scalar(Zero).into()));
-        assert_eq!(dimension.cotangent(), Ok(ArrayType::scalar(Zero).into()));
     }
 
     #[test]

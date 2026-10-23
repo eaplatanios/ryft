@@ -6,12 +6,10 @@ use ryft_macros::Parameter;
 
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::operations::ArrayIrOperation;
-use crate::arrays::ragged::RaggedValue;
 use crate::arrays::references::ArrayReference;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
-use crate::arrays::types::ragged::RaggedType;
 use crate::contexts::{Context, EagerContext};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
@@ -22,9 +20,9 @@ use crate::programs::{
 
 // TODO(eaplatanios): Do we have a problem here with the sizes of the variants?
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
-/// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, [`ArrayReference`]s, and [`RaggedValue`]s. `A` is the array
-/// value representation, which can be a backend array or a context-carrying value such as a tracer. Dimensions use
-/// the common [`DimensionValue`], a checked host representation, so eager dimension arithmetic remains host integer
+/// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the array value representation,
+/// which can be a backend array or a context-carrying value such as a tracer. Dimensions use the common
+/// [`DimensionValue`], a checked host representation, so eager dimension arithmetic remains host integer
 /// work and does not allocate arrays or dispatch to device backends.
 ///
 /// This type lets arrays, checked host-side dimensions, and array references share one storage universe, while
@@ -41,9 +39,6 @@ pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
 
     /// [`ArrayReference`] to an ordinary backend [`ArrayType`]-typed [`Value`].
     Reference(ArrayReference<A>),
-
-    /// Padded storage and full indexed extent payloads transported as one logical value.
-    Ragged(RaggedValue<A>),
 }
 
 impl<A: Value<Type = ArrayType>> ArrayIrValue<A> {
@@ -53,7 +48,6 @@ impl<A: Value<Type = ArrayType>> ArrayIrValue<A> {
             Self::Array(_) => "array",
             Self::Dimension(_) => "dimension",
             Self::Reference(_) => "reference",
-            Self::Ragged(_) => "ragged",
         }
     }
 }
@@ -65,7 +59,6 @@ impl<A: Value<Type = ArrayType>> Display for ArrayIrValue<A> {
             Self::Array(value) => Display::fmt(value, formatter),
             Self::Dimension(value) => Display::fmt(value, formatter),
             Self::Reference(value) => Display::fmt(value, formatter),
-            Self::Ragged(value) => Display::fmt(value, formatter),
         }
     }
 }
@@ -78,7 +71,6 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayIrValue<A> {
             Self::Array(value) => ArrayIrType::Array(value.r#type().into_owned()),
             Self::Dimension(value) => ArrayIrType::Dimension(value.r#type().into_owned()),
             Self::Reference(value) => ArrayIrType::Reference(value.r#type().into_owned()),
-            Self::Ragged(value) => ArrayIrType::Ragged(value.r#type().into_owned()),
         })
     }
 }
@@ -100,7 +92,6 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
             Self::Array(value) => Ok(Self::Array(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
             Self::Reference(value) => Ok(Self::Reference(value.rename_type_identities(renaming)?)),
-            Self::Ragged(value) => Ok(Self::Ragged(value.rename_type_identities(renaming)?)),
         }
     }
 
@@ -117,10 +108,6 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
                      inputs or captures instead",
                 ))
             }
-            Self::Ragged(_) => Err(TypeError::invalid(
-                "ragged values cannot be stored as program constants; pass them through program \
-                 inputs or captures instead",
-            )),
         }
     }
 
@@ -128,7 +115,7 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
     fn is_zero(&self) -> bool {
         match self {
             Self::Array(value) => value.is_zero(),
-            Self::Dimension(_) | Self::Reference(_) | Self::Ragged(_) => false,
+            Self::Dimension(_) | Self::Reference(_) => false,
         }
     }
 
@@ -138,14 +125,14 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
         // and a reference type never determines the allocation that it names.
         match r#type {
             ArrayIrType::Dimension(r#type) => DimensionValue::singleton(r#type).map(Self::Dimension),
-            ArrayIrType::Array(_) | ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => None,
+            ArrayIrType::Array(_) | ArrayIrType::Reference(_) => None,
         }
     }
 
     #[inline]
     fn reference_id(&self) -> Option<ReferenceId> {
         match self {
-            Self::Array(_) | Self::Dimension(_) | Self::Ragged(_) => None,
+            Self::Array(_) | Self::Dimension(_) => None,
             Self::Reference(value) => Some(value.id()),
         }
     }
@@ -157,7 +144,6 @@ impl<A: Value<Type = ArrayType> + LiteralIdentity> LiteralIdentity for ArrayIrVa
             (Self::Array(left), Self::Array(right)) => left.literal_eq(right),
             (Self::Dimension(left), Self::Dimension(right)) => left.literal_eq(right),
             (Self::Reference(left), Self::Reference(right)) => left == right,
-            (Self::Ragged(left), Self::Ragged(right)) => left.literal_eq(right),
             _ => false,
         }
     }
@@ -168,7 +154,6 @@ impl<A: Value<Type = ArrayType> + LiteralIdentity> LiteralIdentity for ArrayIrVa
             Self::Array(array) => array.literal_hash(state),
             Self::Dimension(dimension) => dimension.literal_hash(state),
             Self::Reference(reference) => reference.hash(state),
-            Self::Ragged(value) => value.literal_hash(state),
         }
     }
 }
@@ -269,38 +254,6 @@ impl<A: Value<Type = ArrayType>> ValueProjection<ReferenceType<ArrayType>> for A
     }
 }
 
-impl<A: Value<Type = ArrayType>> ValueProjection<RaggedType> for ArrayIrValue<A> {
-    type Projected = RaggedValue<A>;
-    type ProjectedRef<'v>
-        = &'v RaggedValue<A>
-    where
-        Self: 'v;
-
-    #[inline]
-    fn from_projected(value: RaggedValue<A>) -> Self {
-        Self::Ragged(value)
-    }
-
-    #[inline]
-    fn projected<'v>(&'v self) -> Result<&'v RaggedValue<A>, TypeError>
-    where
-        RaggedType: 'v,
-    {
-        match self {
-            Self::Ragged(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected ragged type but got {} type", other.kind_name()))),
-        }
-    }
-
-    #[inline]
-    fn into_projected(self) -> Result<RaggedValue<A>, TypeError> {
-        match self {
-            Self::Ragged(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected ragged type but got {} type", other.kind_name()))),
-        }
-    }
-}
-
 impl<A: Value<Type = ArrayType>> From<A> for ArrayIrValue<A> {
     #[inline]
     fn from(value: A) -> Self {
@@ -322,13 +275,6 @@ impl<A: Value<Type = ArrayType>> From<ArrayReference<A>> for ArrayIrValue<A> {
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<RaggedValue<A>> for ArrayIrValue<A> {
-    #[inline]
-    fn from(value: RaggedValue<A>) -> Self {
-        Self::Ragged(value)
-    }
-}
-
 impl<A: Concretizable<bool> + Value<Type = ArrayType>> Concretizable<bool> for ArrayIrValue<A> {
     fn concretize(&self) -> Result<bool, ProgramError> {
         match self {
@@ -338,9 +284,6 @@ impl<A: Concretizable<bool> + Value<Type = ArrayType>> Concretizable<bool> for A
             }),
             Self::Reference(value) => Err(ProgramError::Concretization {
                 message: format!("cannot extract a concrete boolean from reference `{value}`"),
-            }),
-            Self::Ragged(_) => Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from a ragged value".to_string(),
             }),
         }
     }
@@ -411,7 +354,6 @@ mod tests {
     use crate::arrays::operations::ArrayIrOperation;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::arrays::types::ragged::{RaggedDimension, RaggedValueKind};
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, StagingContext};
     use crate::differentiation::DifferentiationTracer;
@@ -568,60 +510,6 @@ mod tests {
             .map(|_| ()),
             expected_error,
         );
-    }
-
-    #[test]
-    fn test_array_ir_ragged_projection() {
-        let dimension = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
-        let storage = Array::matrix(2, 3, vec![2.0f32, 99.0, 99.0, 3.0, 4.0, 5.0]).unwrap();
-        let r#type = RaggedType::new(
-            storage.r#type().into_owned(),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, dimension, vec![0])],
-        )
-        .unwrap();
-        let value = RaggedValue::new(r#type.clone(), storage, vec![Array::vector(vec![1i64, 3]).unwrap()]).unwrap();
-        let composite = ArrayIrValue::from(value.clone());
-        assert_eq!(composite.r#type().into_owned(), ArrayIrType::Ragged(r#type));
-        assert_eq!(ValueProjection::<RaggedType>::projected(&composite), Ok(&value));
-        assert_eq!(ValueProjection::<RaggedType>::into_projected(composite.clone()), Ok(value.clone()));
-        assert_eq!(
-            ValueProjection::<ArrayType>::into_projected(composite.clone()),
-            Err(TypeError::invalid("expected array type but got ragged type")),
-        );
-        assert_eq!(
-            ValueProjection::<DimensionType>::into_projected(composite.clone()),
-            Err(TypeError::invalid("expected dimension type but got ragged type")),
-        );
-        assert_eq!(
-            ValueProjection::<ReferenceType<ArrayType>>::into_projected(composite.clone()),
-            Err(TypeError::invalid("expected reference type but got ragged type")),
-        );
-        assert!(!composite.is_zero());
-        assert_eq!(composite.reference_id(), None);
-        assert_eq!(ArrayIrValue::<Array>::singleton(composite.r#type().as_ref()), None);
-        assert_eq!(composite, composite.clone());
-        assert_eq!(literal_hash_of(&composite), literal_hash_of(&composite.clone()));
-        assert!(composite.literal_eq(&composite.clone()));
-
-        let (r#type, storage, _) = value.into_parts();
-        let different = ArrayIrValue::Ragged(
-            RaggedValue::new(r#type, storage, vec![Array::vector(vec![2i64, 3]).unwrap()]).unwrap(),
-        );
-        assert_ne!(composite, different);
-        assert!(!composite.literal_eq(&different));
-
-        let expected = TypeError::invalid(
-            "ragged values cannot be stored as program constants; pass them through program inputs or captures instead",
-        );
-        assert_eq!(composite.validate_as_constant(), Err(expected.clone()));
-        let region = Region::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(
-            vec![Atom::Constant(composite)],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert_eq!(RegionArena::from_regions(vec![region]).map(|_| ()), Err(expected.into()));
     }
 
     #[test]

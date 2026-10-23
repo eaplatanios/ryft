@@ -11,8 +11,8 @@ use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{
-    Dimension, DimensionComparison, DimensionError, DimensionRefinementFact, DimensionRefinements, DimensionVariable,
-    Shape, StaticShape,
+    Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionVariable, Shape,
+    StaticShape,
 };
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
@@ -896,7 +896,7 @@ mod tests {
     use crate::arrays::sharding::meshes::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
-    use crate::arrays::types::dimensions::{DimensionBounds, DimensionType, DimensionVariable};
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 

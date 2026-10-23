@@ -1430,6 +1430,13 @@ pub(crate) enum DimensionComparison {
     IdentityRenaming,
 }
 
+// TODO(eaplatanios): If padded, explicitly masked workloads justify revisiting ragged arrays, describe indexed
+//  extents in `Shape` and ordinary `ArrayType` rather than adding a separate array kind or batching carrier. Bounded
+//  nominal dynamic dimensions would record their extent axes in an acyclic graph, independently of physical axis
+//  order; ordinary integer extent arrays would name the quantity they witness. Derive padded storage and extent
+//  leaves from that single type. Classified operations must preserve these dependencies or expand to masked dense
+//  operations through existing interpretation; reject other operations before reading padding.
+
 /// Represents an array's ordered [`Dimension`]s. Note that the [`Display`] implementation of [`Shape`] renders shapes
 /// as the rendered dimension sizes in a comma-separated list surrounded by square brackets.
 ///

@@ -12,9 +12,6 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::forward::{
     DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer, Pushforward, linearize_for_rule,
 };
-use crate::differentiation::metadata::{
-    DifferentialBoundaryMetadata, DifferentialMetadataProvider, DifferentialMetadataPurpose,
-};
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
@@ -35,37 +32,6 @@ use crate::programs::{
     ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-
-/// Constructs operations that add differential contributions in this operation family's type universe. Reverse
-/// accumulation and custom derivative propagation use this contract so that each family selects its own addition
-/// primitive without enabling general arithmetic capabilities on contribution values.
-///
-/// Families supporting conversions from [`AddOperation<Self::Type>`](AddOperation) use those conversions. Composite
-/// array families select ordinary array addition for dense inputs and [`RaggedAddOperation`](crate::RaggedAddOperation)
-/// for ragged inputs, preserving and checking their indexed extents. Custom families can implement this trait directly
-/// when they have no `From<AddOperation<Self::Type>>` conversion. The selected operation owns signature validation and
-/// runtime checks, which binding performs.
-pub trait SupportsCotangentAdd: Operation {
-    /// Constructs an operation that adds the two differential contributions described by `input_types`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Exactly two logical contribution types, in addition order.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] if the input count is not two or this family cannot select an addition operation
-    /// for these input types. The selected operation validates its complete signature when bound.
-    fn cotangent_add_operation(input_types: &[&Self::Type]) -> Result<Self, ProgramError>;
-}
-
-impl<T: Type, O: Operation<Type = T> + From<AddOperation<T>>> SupportsCotangentAdd for O {
-    #[inline]
-    fn cotangent_add_operation(input_types: &[&T]) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(Self::from(AddOperation::new()))
-    }
-}
 
 /// Cotangent seed for one flattened primal output leaf of a [`Pullback`] application, aligned leaf-for-leaf with
 /// the differentiated closure's output structure. Non-reference output leaves are seeded with a [`Value`](Self::Value)
@@ -443,7 +409,10 @@ impl CotangentAccumulator {
     /// is changed, including contributions to ignored inputs. Live reference-state cotangents cannot use this additive
     /// interface. The first value is reused directly; subsequent additions preserve submission order and combine the
     /// provenance of their contributions.
-    pub fn accumulate<V: Value, O: Operation<Type = V::Type> + SupportsCotangentAdd>(
+    pub fn accumulate<
+        V: Value,
+        O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    >(
         &self,
         context: &mut TranspositionContext<V, O>,
         contribution: MaybeZero<Tracer<TracingContext<V, O>>>,
@@ -491,10 +460,8 @@ impl CotangentAccumulator {
                     provenance = Provenance::fused([existing_provenance.clone(), provenance]);
                     let output = {
                         let mut builder = context.builder().borrow_mut();
-                        let operation =
-                            O::cotangent_add_operation(&[existing.r#type().as_ref(), contribution.r#type().as_ref()])?;
                         let outputs = builder.add_instruction(
-                            operation,
+                            O::provide(AddOperation::<V::Type>::new(), &[&cotangent_type, &cotangent_type])?,
                             Vec::new(),
                             vec![existing.atom_id()?, contribution.atom_id()?],
                             Some(provenance.clone()),
@@ -1355,15 +1322,15 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// cotangents and destination references when interpreting its transpose.
     residuals: Vec<C::Value>,
 
-    /// Runtime metadata for non-reference primal inputs, captured once for both compatibility checks and structural
-    /// zero reconstruction. Indexed families retain metadata-only carriers; ordinary symbolic families can retain
-    /// exemplars for deferred zero construction. Static boundaries capture nothing. These values remain outside the
-    /// transposed program's numerical residuals and are indexed by the complete public input boundary.
-    input_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
-
-    /// Runtime metadata for supplied cotangent seeds at the complete public output boundary, including zero-space
-    /// indexed seeds before compact-slot omission. These are callable checks, separate from program residuals.
-    output_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
+    /// Zero sources for structural input cotangents, one slot per primal input leaf, aligned with
+    /// [`primal_input_types`](Self::primal_input_types). A slot holds its primal input leaf only when a zero of the
+    /// leaf's cotangent type cannot be constructed from the type alone, because the type references runtime quantities
+    /// that only a value defines (e.g., the extent of a symbolic array dimension, which a composite family reads
+    /// through a first-class dimension and a homogeneous family takes from an exact-type exemplar), as decided by
+    /// [`ResidualZeroProvider::requires_zero_source`]. Every other slot is [`None`] because such zeros come from their
+    /// types, and reference-typed leaves are always [`None`]. The slots exist solely so that a consumer can materialize
+    /// the corresponding structural zero on request, and are never spent as residuals of the transposed program.
+    zero_sources: Vec<Option<C::Value>>,
 
     /// Complete public primal input boundary, including leaves whose tangent spaces contain only zero and which are
     /// consequently absent from [`linear_program`](Self::linear_program)'s inputs.
@@ -1395,29 +1362,20 @@ impl<
 > Pullback<C, Input, Output>
 {
     /// Converts a validated [`Pushforward`] into a [`Pullback`], retaining its linear program, residuals, and primal
-    /// boundary without repeating their validation, together with metadata captured from the same primal inputs.
-    /// The pushforward's output tangent reconstruction is discarded.
+    /// boundary without repeating their validation, together with the `zero_sources` selected from the same primal
+    /// inputs. The pushforward's output tangent reconstruction is discarded.
     fn from_pushforward(
         pushforward: Pushforward<C, Input, Output>,
         input_structure: Input::ParameterStructure,
-        input_boundary_metadata: DifferentialBoundaryMetadata<C::Value>,
+        zero_sources: Vec<Option<C::Value>>,
     ) -> Self {
-        let (
-            context,
-            linear_program,
-            residuals,
-            _,
-            output_boundary_metadata,
-            primal_input_types,
-            primal_output_types,
-            primal_references,
-        ) = pushforward.into_parts();
+        let (context, linear_program, residuals, primal_input_types, primal_output_types, primal_references) =
+            pushforward.into_parts();
         Self {
             context,
             linear_program,
             residuals,
-            input_boundary_metadata,
-            output_boundary_metadata,
+            zero_sources,
             primal_input_types,
             primal_output_types,
             primal_references,
@@ -1455,7 +1413,6 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1470,7 +1427,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1489,8 +1446,7 @@ impl<
     /// r) ↦ live(ẏ)` and the linearization-point residuals `r` its trailing inputs consume, in that order). The
     /// returned linear program omits public leaves whose differential spaces contain only zero from its Single Static
     /// Assignment (SSA) boundary. [`into_transposed_parts`](Self::into_transposed_parts) returns its transpose with
-    /// metadata describing disconnected input cotangents. The callable's runtime input and output boundary metadata
-    /// is omitted; replaying these open parts directly does not enforce its differential compatibility checks.
+    /// metadata describing disconnected input cotangents.
     #[inline]
     pub fn into_linear_parts(
         self,
@@ -1503,9 +1459,8 @@ impl<
     /// all-[`Return`](CotangentDestinationKind::Return) transposition served from the linear program's retained
     /// transform cache, so it is valid only for a reference-free boundary and, like
     /// [`into_linear_parts`](Self::into_linear_parts), it omits zero-space leaves from its Single Static Assignment
-    /// (SSA) boundary. Disconnected cotangents also have no executable output; their slots are recorded in the returned
-    /// metadata. The callable's runtime input and output boundary metadata is omitted, so directly replaying these open
-    /// parts requires the caller to validate the runtime differential boundary.
+    /// (SSA) boundary. Disconnected cotangents also have no executable output; their slots are recorded in the
+    /// returned metadata.
     ///
     /// # Errors
     ///
@@ -1519,7 +1474,6 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
@@ -1534,7 +1488,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1544,23 +1498,22 @@ impl<
     }
 
     /// Materializes structured input `cotangents`, such as those returned by [`Self::apply`], in this pullback's
-    /// context. Live values must have the required cotangent type and pass the family's runtime shape checks against
-    /// the retained input evidence. Each structural zero is constructed from its type alone when that suffices, and
-    /// otherwise from the zero source that this pullback retained for the corresponding primal input
-    /// leaf (refer to the [`Pullback`] documentation). Neither the linearization nor the caller needs to supply a
-    /// value from which to materialize a disconnected input's zero.
+    /// context. Live values must have the required cotangent type. Each structural zero is constructed from its type
+    /// alone when that suffices, and otherwise from the zero source that this pullback retained for the corresponding
+    /// primal input leaf (refer to the [`Pullback`] documentation). Neither the linearization nor the caller needs to
+    /// supply a value from which to materialize a disconnected input's zero.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] for a leaf-count mismatch or a cotangent whose type differs from its
-    /// primal input's cotangent type, and propagates runtime shape validation and zero-provider errors.
+    /// primal input's cotangent type, and propagates zero-provider errors.
     pub fn materialize_cotangents(
         &self,
         cotangents: Input::To<MaybeZero<C::Value>>,
     ) -> Result<Input::To<C::Value>, ProgramError>
     where
         C: Zero<C::Value>,
-        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + DifferentialMetadataProvider<C::Type>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
     {
         let cotangents = cotangents.into_parameters().collect::<Vec<_>>();
@@ -1598,23 +1551,9 @@ impl<
         }
         let values = cotangents
             .into_iter()
-            .zip(&self.primal_input_types)
-            .enumerate()
-            .map(|(index, (cotangent, primal_type))| {
-                let cotangent = match cotangent {
-                    MaybeZero::Value(value) => MaybeZero::Value(self.input_boundary_metadata.validate(
-                        &self.context,
-                        index,
-                        value,
-                        primal_type,
-                    )?),
-                    cotangent => cotangent,
-                };
-                C::Operation::materialize_zero_from_residual_sources(
-                    &self.context,
-                    cotangent,
-                    self.input_boundary_metadata.sources(index),
-                )
+            .zip(&self.zero_sources)
+            .map(|(cotangent, source)| {
+                C::Operation::materialize_zero_from_residual_sources(&self.context, cotangent, source.iter())
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), values)?)
@@ -1632,7 +1571,6 @@ impl<
         C: Zero<C::Value>,
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1647,7 +1585,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1672,7 +1610,6 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1687,7 +1624,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1755,7 +1692,6 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1770,7 +1706,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         Input::Family:
             ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<MaybeZero<C::Value>>>,
         Output::Family: ParameterizedFamily<CotangentSeed<C::Value>>,
@@ -1801,7 +1737,6 @@ impl<
                 Operation = C::Operation,
             > + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1816,7 +1751,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1824,8 +1759,8 @@ impl<
         let gradients = destinations
             .into_iter()
             .zip(cotangents)
-            .enumerate()
-            .map(|(index, (destination, cotangent))| match destination {
+            .zip(&self.zero_sources)
+            .map(|((destination, cotangent), source)| match destination {
                 CotangentDestination::Reference(reference) => {
                     let reference_type = reference.r#type();
                     reference_type.referent().ok_or_else(|| {
@@ -1844,7 +1779,7 @@ impl<
                     C::Operation::materialize_zero_from_residual_sources(
                         &self.context,
                         cotangent.unwrap(),
-                        self.input_boundary_metadata.sources(index),
+                        source.iter(),
                     )
                 }
                 CotangentDestination::Ignore => {
@@ -1870,7 +1805,6 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + DifferentialMetadataProvider<C::Type>
             + ReferenceAccessOperation<
                 Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
@@ -1885,7 +1819,7 @@ impl<
                     <C::Operation as ReferenceAccessOperation>::Transform,
                 >,
                 Operation = C::Operation,
-            > + SupportsCotangentAdd,
+            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1920,7 +1854,6 @@ impl<
                             cotangent_type,
                         )));
                     }
-                    let value = self.output_boundary_metadata.validate(&self.context, index, value, primal_type)?;
                     if !cotangent_type.is_zero_space() {
                         program_inputs.push(value);
                     }
@@ -2033,25 +1966,19 @@ impl<
             .iter()
             .zip(&self.primal_input_types)
             .zip(cotangent_types)
-            .enumerate()
-            .map(|(index, ((destination, primal_type), cotangent_type))| {
+            .map(|((destination, primal_type), cotangent_type)| {
                 let cotangent = if cotangent_type.is_zero_space() {
                     Some(MaybeZero::Zero(cotangent_type))
                 } else {
                     program_input_cotangents.next().unwrap()
                 };
                 if !primal_type.is_reference() && matches!(destination, CotangentDestination::Return) {
-                    match cotangent {
-                        Some(MaybeZero::Value(value)) => Ok(Some(MaybeZero::Value(
-                            self.input_boundary_metadata.validate(&self.context, index, value, primal_type)?,
-                        ))),
-                        cotangent => Ok(cotangent),
-                    }
+                    cotangent
                 } else {
-                    Ok(None)
+                    None
                 }
             })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
+            .collect();
 
         Ok(input_cotangents)
     }
@@ -2191,7 +2118,7 @@ impl<
                 <O as ReferenceAccessOperation>::Transform,
             >,
             Operation = O,
-        > + SupportsCotangentAdd,
+        > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -2450,7 +2377,7 @@ impl<
                 <O as ReferenceAccessOperation>::Transform,
             >,
             Operation = O,
-        > + SupportsCotangentAdd,
+        > + OperationProvider<T, AddOperation<T>, Operation = O>,
 > RegionRef<'_, V, O>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -3366,7 +3293,6 @@ where
             output_cotangent_inputs.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(input_indices.len());
         let mut cotangents = Vec::with_capacity(input_indices.len());
-        let mut zero_sources_validated = false;
         for (output_index, &index) in input_indices.iter().enumerate() {
             let input = self.input_ids()[index];
             let input_atom = self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
@@ -3398,17 +3324,6 @@ where
                     cotangents.push(TransposedProgramCotangent::Output);
                 }
                 MaybeZero::Zero(r#type) if materialize_zeros[output_index] => {
-                    // A dense transpose does not retain each input occurrence's primal extent metadata. Repeated
-                    // indexed identities require runtime equality checks that its signature alone cannot establish;
-                    // reject them before the zero provider can select an unrelated occurrence as its extent source.
-                    if !zero_sources_validated
-                        && r#type.identities().next().is_some()
-                        && O::requires_zero_source(&r#type)
-                    {
-                        let input_types = self.input_types();
-                        T::derive_identity_renaming(input_types.iter(), input_types.iter())?;
-                        zero_sources_validated = true;
-                    }
                     let zero = O::materialize_zero_from_residual_sources(
                         &*context,
                         MaybeZero::Zero(r#type),
@@ -3576,7 +3491,7 @@ where
                 <O as ReferenceAccessOperation>::Transform,
             >,
             Operation = O,
-        > + SupportsCotangentAdd,
+        > + OperationProvider<T, AddOperation<T>, Operation = O>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -3615,11 +3530,8 @@ where
     ///
     /// Disconnected primal input cotangents are materialized through [`ResidualZeroProvider`] using the runtime extent
     /// sources available to the transposed program. Static types use a nullary [`ZeroOperation`](crate::ZeroOperation);
-    /// symbolic types require sources that supply their extents. Using those sources rejects repeated indexed input
-    /// identities, whose independent payloads would require equality checks unavailable from the linear signature
-    /// alone. Compact pullbacks keep such zeros structural and materialize them from their own primal sources.
-    /// Interpreting the resulting program over outer-trace [`Tracer`]s stages those zero-producing operations
-    /// into the surrounding trace.
+    /// symbolic types require sources that supply their extents. Interpreting the resulting program over outer-trace
+    /// [`Tracer`]s stages those zero-producing operations into the surrounding trace.
     ///
     /// `input_indices` selects the inputs to transpose with respect to, while the remaining inputs are held as constant
     /// parameters of the linear map. The program must be linear in the selected inputs, but it can depend arbitrarily
@@ -3792,7 +3704,6 @@ pub trait ReverseModeDifferentiate:
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
-                       + DifferentialMetadataProvider<Self::Type>
                        + ReferenceAccessOperation<
             Transform: ReferenceTransform<Referent = <Self::Type as ReferenceMemberType>::Referent>,
         > + OperationProvider<
@@ -3807,7 +3718,7 @@ pub trait ReverseModeDifferentiate:
                 <Self::Operation as ReferenceAccessOperation>::Transform,
             >,
             Operation = Self::Operation,
-        > + SupportsCotangentAdd,
+        > + OperationProvider<Self::Type, AddOperation<Self::Type>, Operation = Self::Operation>,
     >
 {
     /// Reverse-mode-differentiates `function` at `primal`, returning the primal output and a reusable [`Pullback`],
@@ -3837,25 +3748,23 @@ pub trait ReverseModeDifferentiate:
         primal: Input,
         capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError> {
-        // Capture non-reference input metadata before linearization consumes `primal`. The same capture validates
-        // live cotangents and supplies deferred zero reconstruction, without adding numerical derivative residuals.
+        // Retain, as zero sources, only the non-reference primal leaves whose structural zero cotangents cannot be
+        // constructed from their types alone. Linearization consumes `primal`, so the sources are selected first.
         let input_structure = primal.parameter_structure();
-        let mut input_boundary_metadata = DifferentialBoundaryMetadata::default();
-        for (index, primal) in primal.parameters().enumerate() {
-            let primal_type = primal.r#type();
-            if !primal_type.is_reference() {
-                input_boundary_metadata.capture(
-                    self,
-                    index,
-                    primal,
-                    &primal_type.cotangent()?,
-                    DifferentialMetadataPurpose::ValidationAndReconstruction,
-                )?;
-            }
-        }
+        let zero_sources = primal
+            .parameters()
+            .map(|primal| {
+                let primal_type = primal.r#type();
+                if primal_type.is_reference() {
+                    return Ok(None);
+                }
+                let cotangent_type = primal_type.cotangent()?;
+                Ok(Self::Operation::requires_zero_source(&cotangent_type).then(|| primal.clone()))
+            })
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         let (output, pushforward) =
             linearize_for_rule(self, function, primal, capture, DifferentiationRule::JvpForTranspose)?;
-        let pullback = Pullback::from_pushforward(pushforward, input_structure, input_boundary_metadata);
+        let pullback = Pullback::from_pushforward(pushforward, input_structure, zero_sources);
         Ok((output, pullback))
     }
 
@@ -3910,7 +3819,6 @@ where
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + DifferentialMetadataProvider<C::Type>
         + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>>
         + OperationProvider<
             C::Type,
@@ -3924,7 +3832,7 @@ where
                 <C::Operation as ReferenceAccessOperation>::Transform,
             >,
             Operation = C::Operation,
-        > + SupportsCotangentAdd,
+        > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
@@ -4062,7 +3970,9 @@ pub fn transpose_projected_operation<
     T: DifferentiableType,
     P: Operation<Type = T> + TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
     V: Value<Type: DifferentiableType + From<T>> + ValueProjection<T, Projected: Value<Type = T>>,
-    O: Operation<Type = V::Type> + OperationProjection<T, Projected = P> + SupportsCotangentAdd,
+    O: Operation<Type = V::Type>
+        + OperationProjection<T, Projected = P>
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
 >(
     context: &mut TranspositionContext<V, O>,
     operation: &P,
@@ -4206,7 +4116,9 @@ pub fn transpose_mixed_operation<
     T: DifferentiableType,
     P: Operation<Type = T>,
     V: Value<Type: DifferentiableType + From<T>> + ValueProjection<T, Projected: Value<Type = T>>,
-    O: Operation<Type = V::Type> + OperationProjection<T> + SupportsCotangentAdd,
+    O: Operation<Type = V::Type>
+        + OperationProjection<T>
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
 >(
     context: &mut TranspositionContext<V, O>,
     operation: &P,
@@ -4438,8 +4350,7 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
-        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedDimension, RaggedType,
-        RaggedValueKind, Shape, Sharding,
+        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -4849,19 +4760,6 @@ pub(crate) mod tests {
                 other => panic!("expected an array output but got {other:?}"),
             })
             .collect()
-    }
-
-    #[test]
-    fn test_array_operation_cotangent_add_operation() {
-        let input_type = ArrayType::scalar(DataType::F32);
-        assert_eq!(
-            ArrayOperation::<Array>::cotangent_add_operation(&[&input_type, &input_type]),
-            Ok(ArrayOperation::Add(AddOperation::new())),
-        );
-        assert_eq!(
-            ArrayOperation::<Array>::cotangent_add_operation(&[]),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
-        );
     }
 
     #[test]
@@ -5750,8 +5648,7 @@ pub(crate) mod tests {
         assert_eq!(pullback.residuals(), &[]);
 
         // Exact eager types construct their zeros alone, so the pullback retains no zero source.
-        assert!(pullback.input_boundary_metadata.sources(0).is_empty());
-        assert!(pullback.input_boundary_metadata.sources(1).is_empty());
+        assert_eq!(pullback.zero_sources, [None, None]);
         assert_eq!(
             cotangents,
             vec![MaybeZero::Zero(primals[0].r#type().into_owned()), MaybeZero::Value(Array::scalar(4.0f32).unwrap()),],
@@ -5773,6 +5670,24 @@ pub(crate) mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == "pullback structural zero 0 has type f32[] but its primal input requires cotangent type f32[2]",
         ));
+        assert_eq!(
+            pullback
+                .materialize_cotangents(vec![MaybeZero::Value(Array::scalar(0f32).unwrap()), cotangents[1].clone(),]),
+            Err(ProgramError::InvalidArgument {
+                message: "pullback cotangent 0 has type f32[] but its primal input requires cotangent type f32[2]"
+                    .to_owned(),
+            }),
+        );
+        assert_eq!(
+            pullback.materialize_cotangents(vec![
+                MaybeZero::Value(Array::vector(vec![0f64, 0.0]).unwrap()),
+                cotangents[1].clone(),
+            ]),
+            Err(ProgramError::InvalidArgument {
+                message: "pullback cotangent 0 has type f64[2] but its primal input requires cotangent type f32[2]"
+                    .to_owned(),
+            }),
+        );
     }
 
     #[test]
@@ -5837,8 +5752,7 @@ pub(crate) mod tests {
         let seed = context.input(scalar_type.clone().into());
         let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![x.clone(), y], ()).unwrap();
         assert!(pullback.residuals().is_empty());
-        assert_eq!(pullback.input_boundary_metadata.sources(0), std::slice::from_ref(&x));
-        assert!(pullback.input_boundary_metadata.sources(1).is_empty());
+        assert_eq!(pullback.zero_sources, [Some(x), None]);
         assert_eq!(
             pullback.apply(seed.clone()),
             Ok(vec![MaybeZero::Zero(vector_type.clone().into()), MaybeZero::Value(seed.clone())]),
@@ -5873,8 +5787,7 @@ pub(crate) mod tests {
         let seed = context.input(scalar_type);
         let (_, pullback) = context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![x.clone(), y], ()).unwrap();
         assert!(pullback.residuals().is_empty());
-        assert_eq!(pullback.input_boundary_metadata.sources(0), std::slice::from_ref(&x));
-        assert!(pullback.input_boundary_metadata.sources(1).is_empty());
+        assert_eq!(pullback.zero_sources, [Some(x), None]);
         assert_eq!(
             pullback.apply(seed.clone()),
             Ok(vec![MaybeZero::Zero(vector_type), MaybeZero::Value(seed.clone())])
@@ -6223,8 +6136,7 @@ pub(crate) mod tests {
             |inputs: Vec<_>| {
                 let (_, pullback) =
                     differentiate_at((inputs[0].clone(), inputs[2].clone())).vjp(|(reference, _)| reference.read())?;
-                assert!(pullback.input_boundary_metadata.sources(0).is_empty());
-                assert_eq!(pullback.input_boundary_metadata.sources(1), std::slice::from_ref(&inputs[2]));
+                assert_eq!(pullback.zero_sources, [None, Some(inputs[2].clone())]);
                 let cotangents = pullback.apply_with_destinations(
                     CotangentSeed::Value(inputs[3].clone()),
                     (CotangentDestination::Reference(inputs[1].clone()), CotangentDestination::Return),
@@ -7357,45 +7269,6 @@ pub(crate) mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 1 appears more than once",
         ));
-    }
-
-    #[test]
-    fn test_program_transpose_with_respect_to_rejects_ambiguous_indexed_zero() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        let representation = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, rows, vec![0])],
-        )
-        .unwrap();
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let first = builder.add_input(representation.clone().into());
-        builder.add_input(representation.into());
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![first],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-            lambda %0:ragged<f32[2, 3]; 1:rows over [0]>, %1:ragged<f32[2, 3]; 1:rows over [0]> .
-            in (%0)"}
-        );
-        assert!(matches!(program.transpose_with_respect_to(&[0, 1], &[]),
-            Err(error) if error == DifferentiationError::from(TypeError::invalid(
-                "indexed dimension `rows` has repeated extent occurrences whose equality requires runtime checking"))));
-        // Compact transposition preserves structural zeros so a pullback can materialize each from its input metadata.
-        let compact = program.entry_region_ref().transpose(&[0, 1], &[], &[]).unwrap();
-        assert_eq!(compact.cotangents(), &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero]);
-        assert_eq!(
-            compact.program().to_string(),
-            indoc! {"
-            lambda %0:ragged<f32[2, 3]; 1:rows over [0]> .
-            in (%0)"}
-        );
     }
 
     #[test]
