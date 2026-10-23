@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_macros::Parameter;
@@ -14,7 +15,7 @@ use crate::differentiation::zeros::{
 };
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, Zero};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::residuals::ResidualPlacement;
 use crate::partial::{
@@ -91,6 +92,34 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     pub fn new_with_zero_tangent(primal: V) -> Result<Self, DifferentiationError> {
         let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
         Ok(Self { primal, tangent })
+    }
+
+    /// Pairs every value in `primals` with its tangent according to `tangent_liveness`, which has one flag per primal.
+    /// Each set flag consumes the next value from `tangents`, which contains only live tangents in primal order. An
+    /// unset flag produces a structural-zero tangent whose type is derived from the corresponding primal, preserving
+    /// its runtime identities. Every primal contributes one dual.
+    ///
+    /// Differentiation rules use this to assemble dual outputs from a derived program's compact tangent outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidOutputCount`] when the number of primals differs from the number of flags or the
+    /// number of tangents differs from the number of set flags, and the errors of pairing a primal with its tangent.
+    pub fn from_live_tangents(
+        primals: Vec<V>,
+        tangents: Vec<V>,
+        tangent_liveness: &[bool],
+    ) -> Result<Vec<Self>, DifferentiationError> {
+        check_count!("output", primals, tangent_liveness.len(), ProgramError);
+        check_count!("output", tangents, tangent_liveness.iter().filter(|&&is_live| is_live).count(), ProgramError);
+        let mut tangents = tangents.into_iter();
+        primals
+            .into_iter()
+            .zip(tangent_liveness)
+            .map(|(primal, &is_live)| {
+                if is_live { Self::new(primal, tangents.next().unwrap()) } else { Self::new_with_zero_tangent(primal) }
+            })
+            .collect()
     }
 
     /// Returns whether this [`DifferentiationDual`] has an _active tangent_ when handed to a differentiated child
@@ -1778,6 +1807,37 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             .collect()
     }
 
+    /// Returns the tangent of `input` as a value of the [tangent context](Self::tangent): a live tangent unchanged, and
+    /// a structural zero materialized there. A rule needs this for a tangent that it passes into a derived region as a
+    /// real input (e.g., the initial tangent of a loop carry that only later iterations make live). The zero takes the
+    /// runtime extents that its type names from the input's own primal, which carries every such extent because the
+    /// tangent type derivation preserves dimensions exactly, so the primal is transferred to the tangent context only
+    /// for a structural zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of transferring the primal and of materializing the zero.
+    pub(crate) fn materialize_dual_tangent(
+        &self,
+        input: &DifferentiationDual<C::Value>,
+    ) -> Result<C::Value, DifferentiationError>
+    where
+        C: Zero<C::Value>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    {
+        match input.tangent() {
+            MaybeZero::Value(tangent) => Ok(tangent.clone()),
+            zero => {
+                let primal = self.primal_to_tangent(input.primal().clone())?;
+                Ok(C::Operation::materialize_zero_from_residual_sources(
+                    self.tangent(),
+                    zero.clone(),
+                    std::iter::once(&primal),
+                )?)
+            }
+        }
+    }
+
     /// Binds an operation to the provided dual inputs using the same dispatch as [`Context::bind`]. Ordinary binding
     /// unwraps tracers before calling this function. Recursive differentiation instead passes its duals directly.
     /// Keeping the structural zero checks here ensures that both paths run reference and runtime extent rules when
@@ -3351,6 +3411,129 @@ where
 
 impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 
+/// Forward-mode activity of one application of a region that a region-carrying operation differentiates through its
+/// [`DifferentiationDriver`] (e.g., the body of a `scan` or `while` operation or a branch of a `condition` operation).
+/// [`Self::new`] selects the region inputs whose tangents are live and marks an output tangent live when it has a
+/// tangent slot (refer to [`RegionRef::tangent_output_mask`]) and depends on a selected input tangent in the region's
+/// fused forward-mode program (refer to [`Program::output_dependence`]). Other output tangents are structural zeros,
+/// so rules that rebind the derived tangents in a context that partial evaluation inspects project the derived program
+/// to the live output tangents, as [`DifferentiationDriver::jvp_program`] requires.
+///
+/// Custom region-carrying operations use this analysis to derive compact tangent boundaries through their rule's
+/// differentiation driver. For loops, [`Self::from_loop_body`] also propagates activity across iterations and retains
+/// the resulting carry tangent slots when the body resets a live carry.
+pub struct TangentActivity<C: Context> {
+    /// Indices of the region inputs whose tangents are live, in order.
+    input_indices: Vec<usize>,
+
+    /// Fused forward-mode program of the region with respect to `input_indices`, whose outputs are the primal outputs
+    /// followed by one tangent output per tangent slot.
+    jvp_program: Arc<FlatProgram<C>>,
+
+    /// Whether each region output has a tangent slot.
+    tangent_slot_mask: Vec<bool>,
+
+    /// Whether the tangent of each region output is live.
+    output_tangent_liveness: Vec<bool>,
+}
+
+impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
+    /// Analyzes the forward-mode activity of an application of `region` whose inputs have live tangents exactly where
+    /// `input_live` is set (one flag per region input), differentiating the region through `driver`, and returning a
+    /// new [`TangentActivity`] instance.
+    pub fn new<D: DifferentiationDriver<C>>(
+        driver: &D,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_live: &[bool],
+    ) -> Result<Self, DifferentiationError> {
+        let input_indices =
+            input_live.iter().enumerate().filter_map(|(index, &live)| live.then_some(index)).collect::<Vec<_>>();
+        let tangent_slot_mask = region.tangent_output_mask(&input_indices)?;
+        let jvp_program = driver.jvp_program(region, &input_indices)?;
+        let tangent_inputs = (input_live.len()..jvp_program.input_count()).collect::<Vec<_>>();
+        let mut depends = jvp_program.output_dependence(&tangent_inputs)?.into_iter().skip(tangent_slot_mask.len());
+
+        // The derived program has one tangent output per tangent slot, so only outputs with a slot consume a flag.
+        let output_tangent_liveness =
+            tangent_slot_mask.iter().map(|&has_slot| has_slot && depends.next().unwrap()).collect();
+        Ok(Self { input_indices, jvp_program, tangent_slot_mask, output_tangent_liveness })
+    }
+
+    /// Analyzes the forward-mode activity of a loop whose `body` region receives its carried state at the region inputs
+    /// `carry_inputs` and returns the next state at the region outputs `carry_outputs`, which pair with them in order,
+    /// starting from the live input tangents `input_live` (one flag per region input). Returns the converged input
+    /// liveness together with the activity of the body under it.
+    ///
+    /// The carry ranges must have equal lengths and lie within the body's input and output boundaries. Empty ranges
+    /// are supported. The operation's rule remains responsible for validating the loop's state boundary.
+    ///
+    /// A carry whose initial tangent is a structural zero can still acquire a live tangent from the other tangents
+    /// on a later iteration, in which case it needs a tangent slot from the first iteration on, so carry liveness is a
+    /// monotone fixed point over the body. Every round that does not converge enlivens at least one carry, so it takes
+    /// at most one more round than there are carries. Carries that stay inactive keep structural-zero tangents, so
+    /// linearization never sees a tangent that depends on no tangent input. A live carry keeps its tangent output even
+    /// when the body resets it to a value that depends on no tangent, because carry tangent slots must pair across
+    /// iterations. This is the carry fixed point of the forward-mode rules of JAX's
+    /// [`scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html) and
+    /// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html).
+    pub fn from_loop_body<D: DifferentiationDriver<C>>(
+        driver: &D,
+        body: RegionRef<'_, C::Constant, C::Operation>,
+        mut input_live: Vec<bool>,
+        carry_inputs: Range<usize>,
+        carry_outputs: Range<usize>,
+    ) -> Result<(Vec<bool>, Self), DifferentiationError> {
+        loop {
+            let mut activity = Self::new(driver, body, &input_live)?;
+            let mut converged = true;
+            for (input, output) in carry_inputs.clone().zip(carry_outputs.clone()) {
+                if activity.output_tangent_liveness[output] && !input_live[input] {
+                    input_live[input] = true;
+                    converged = false;
+                }
+            }
+            if converged {
+                for (input, output) in carry_inputs.zip(carry_outputs) {
+                    activity.output_tangent_liveness[output] = input_live[input];
+                }
+                return Ok((input_live, activity));
+            }
+        }
+    }
+
+    /// Returns the indices of the region inputs whose tangents are live, in order.
+    #[inline]
+    pub fn input_indices(&self) -> &[usize] {
+        &self.input_indices
+    }
+
+    /// Returns the fused forward-mode program of the region with respect to [`Self::input_indices`].
+    #[inline]
+    pub fn jvp_program(&self) -> &Arc<FlatProgram<C>> {
+        &self.jvp_program
+    }
+
+    /// Returns whether the tangent of each region output is live.
+    #[inline]
+    pub fn output_tangent_liveness(&self) -> &[bool] {
+        &self.output_tangent_liveness
+    }
+
+    /// Returns the positions, among the tangent outputs of [`Self::jvp_program`], of the outputs that
+    /// `output_tangent_liveness` marks, in output order. The mask has one flag per region output, set
+    /// only for outputs with a tangent slot.
+    #[inline]
+    pub fn live_tangent_slots(&self, output_tangent_liveness: &[bool]) -> Vec<usize> {
+        self.tangent_slot_mask
+            .iter()
+            .zip(output_tangent_liveness)
+            .filter(|(has_slot, _)| **has_slot)
+            .enumerate()
+            .filter_map(|(slot, (_, live))| live.then_some(slot))
+            .collect()
+    }
+}
+
 /// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
 /// differentiation context. Use this function from a composite operation dispatcher when the operation is
 /// [`Region`]-free and every input and output belongs to the same projectable member type `T`. It projects primal
@@ -4383,6 +4566,43 @@ pub(crate) mod tests {
         assert!(
             matches!(zero_space.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
+    }
+
+    #[test]
+    fn test_differentiation_dual_from_live_tangents() {
+        let primals = vec![Array::scalar(2f32).unwrap(), Array::scalar(true).unwrap(), Array::scalar(4f32).unwrap()];
+        let duals = DifferentiationDual::from_live_tangents(
+            primals.clone(),
+            vec![Array::scalar(3f32).unwrap(), Array::scalar(5f32).unwrap()],
+            &[true, false, true],
+        )
+        .unwrap();
+        assert_eq!(
+            duals.iter().map(DifferentiationDual::primal).collect::<Vec<_>>(),
+            primals.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(duals[0].tangent().as_value(), Some(&Array::scalar(3f32).unwrap()));
+        assert!(matches!(duals[1].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero)));
+        assert_eq!(duals[2].tangent().as_value(), Some(&Array::scalar(5f32).unwrap()));
+        assert!(DifferentiationDual::<Array>::from_live_tangents(Vec::new(), Vec::new(), &[]).unwrap().is_empty());
+
+        assert!(matches!(
+            DifferentiationDual::from_live_tangents(primals.clone(), Vec::new(), &[false]),
+            Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 3 })),
+        ));
+        assert!(matches!(
+            DifferentiationDual::from_live_tangents(primals, vec![Array::scalar(3f32).unwrap()], &[true, false, true]),
+            Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 1 })),
+        ));
+
+        // An inactive output keeps the runtime dimension identity of its actual primal.
+        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let primal = context.input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::unbounded()).into()]),
+        ));
+        let duals = DifferentiationDual::from_live_tangents(vec![primal.clone()], Vec::new(), &[false]).unwrap();
+        assert!(matches!(duals[0].tangent(), MaybeZero::Zero(r#type) if r#type == primal.r#type().as_ref()));
     }
 
     #[test]
@@ -5517,6 +5737,52 @@ pub(crate) mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), input.primal());
         assert_eq!(outputs[0].tangent().as_value(), input.tangent().as_value());
+    }
+
+    #[test]
+    fn test_differentiation_context_materialize_dual_tangent() {
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let primal = parent.input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::unbounded()).into()]),
+        ));
+        let context = DifferentiationContext::fused(parent.clone());
+        let zero = context
+            .materialize_dual_tangent(&DifferentiationDual::new_with_zero_tangent(primal.clone()).unwrap())
+            .unwrap();
+        let live = context.materialize_dual_tangent(&DifferentiationDual::new(primal, zero.clone()).unwrap()).unwrap();
+        assert_eq!(live.atom_id(), zero.atom_id());
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![zero.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[extent] .
+                let %1:f32[extent] = zero_like %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![1f32, 2f32, 3f32]).unwrap()]),
+            Ok(vec![Array::vector(vec![0f32; 3]).unwrap()]),
+        );
+
+        // Partitioned differentiation transfers a known primal before constructing its tangent zero.
+        let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
+            Array,
+            TestArrayOperation,
+        >::new()));
+        let primal = context.primal().lift(Array::scalar(2f32).unwrap()).unwrap();
+        let zero = context
+            .materialize_dual_tangent(&DifferentiationDual::new_with_zero_tangent(primal).unwrap())
+            .unwrap();
+        assert!(matches!(context.tangent().resolve(&zero), ValueResolution::Constant(value)
+            if value == Array::scalar(0f32).unwrap()));
     }
 
     #[test]
@@ -8155,6 +8421,90 @@ pub(crate) mod tests {
             differentiate_at(Vec::<Array>::new()).linearize(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err(),
             DifferentiationError::EmptyInput
         );
+    }
+
+    #[test]
+    fn test_tangent_activity_new() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let first = builder.add_input(ArrayType::scalar(DataType::F32));
+        let second = builder.add_input(ArrayType::scalar(DataType::F32));
+        let metadata = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![second, metadata, first], vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
+        let activity = TangentActivity::<EagerContext<Array, TestArrayOperation>>::new(
+            &driver,
+            program.entry_region_ref(),
+            &[true, false, false],
+        )
+        .unwrap();
+        assert_eq!(activity.input_indices(), &[0]);
+        assert_eq!(activity.output_tangent_liveness(), &[false, false, true]);
+        assert_eq!(activity.live_tangent_slots(activity.output_tangent_liveness()), vec![1]);
+        assert_eq!(
+            activity.jvp_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:bool[], %3:f32[] .
+                let %4:f32[] = zero [type=f32[]]
+                in (%1, %2, %0, %4, %3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tangent_activity_from_loop_body() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let first = builder.add_input(ArrayType::scalar(DataType::F32));
+        let second = builder.add_input(ArrayType::scalar(DataType::F32));
+        let source = builder.add_input(ArrayType::scalar(DataType::F32));
+        let reset = builder.add_constant(Array::scalar(0f32).unwrap());
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![source, first, reset, second],
+                vec![Placeholder; 3],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
+
+        // Activity reaches the two inactive carries on successive iterations. The source carry resets to a constant
+        // but must retain its tangent slot, while the extra output follows the newly active second carry.
+        let (inputs, activity) = TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
+            &driver,
+            body.entry_region_ref(),
+            vec![false, false, true],
+            0..3,
+            0..3,
+        )
+        .unwrap();
+        assert_eq!(inputs, vec![true; 3]);
+        assert_eq!(activity.input_indices(), &[0, 1, 2]);
+        assert_eq!(activity.output_tangent_liveness(), &[true; 4]);
+        assert_eq!(activity.live_tangent_slots(activity.output_tangent_liveness()), vec![0, 1, 2, 3]);
+        assert_eq!(
+            activity.jvp_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[], %3:f32[], %4:f32[], %5:f32[] .
+                let %6:f32[] = const 0.0
+                    %7:f32[] = zero [type=f32[]]
+                in (%2, %0, %6, %1, %5, %3, %7, %4)
+            "}
+            .trim_end(),
+        );
+
+        let (inputs, activity) = TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
+            &driver,
+            body.entry_region_ref(),
+            vec![false; 3],
+            0..3,
+            0..3,
+        )
+        .unwrap();
+        assert_eq!(inputs, vec![false; 3]);
+        assert_eq!(activity.output_tangent_liveness(), &[false; 4]);
+        assert!(activity.live_tangent_slots(activity.output_tangent_liveness()).is_empty());
     }
 
     #[test]
