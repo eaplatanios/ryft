@@ -89,8 +89,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::kernels::BoundaryPolicy;
     use ryft_core::{
-        Array, ArrayIrType, ConstantOperation, DimensionAddOperation, DimensionBounds, DimensionSaturatingSubOperation,
-        DimensionSubOperation, DimensionType, Placeholder, ProgramBuilder,
+        Array, ArrayIrType, ConstantOperation, DimensionAddOperation, DimensionBounds, DimensionSubOperation,
+        DimensionType, Placeholder, ProgramBuilder, SaturatingSubOperation,
     };
     use ryft_mlir::{Block, Context, Operation as MlirOperation, Value};
 
@@ -121,8 +121,7 @@ mod tests {
         let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(4)).unwrap());
         let add = DimensionOperation::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap());
         assert_eq!(lowering.dimension(&mut block, &add, &[left, right]).unwrap().len(), 1);
-        let sub =
-            DimensionOperation::SaturatingSub(DimensionSaturatingSubOperation::new(&left_type, &right_type).unwrap());
+        let sub = DimensionOperation::SaturatingSub(SaturatingSubOperation::new());
         assert_eq!(lowering.dimension(&mut block, &sub, &[left, right]).unwrap().len(), 1);
         let constant = DimensionOperation::Constant(ConstantOperation::new(DimensionValue::constant(3).unwrap()));
         assert_eq!(lowering.dimension(&mut block, &constant, &[]).unwrap().len(), 1);

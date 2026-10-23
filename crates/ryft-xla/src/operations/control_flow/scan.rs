@@ -639,7 +639,7 @@ impl LowerableOperation for ScanOperation<ArrayType> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "higher-order self `{}` must be stored directly in the enclosing backend self family",
+                "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
                 self.name(),
             ),
         }

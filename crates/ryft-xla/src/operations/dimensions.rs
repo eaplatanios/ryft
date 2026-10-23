@@ -1,9 +1,9 @@
 use ryft_core::{
     ArrayIrType, ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension, DimensionAddOperation,
     DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
-    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, EffectClass, Operation, ProgramError,
+    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionSizeOperation,
+    DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, EffectClass, Operation,
+    ProgramError, SaturatingSubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -231,7 +231,7 @@ impl LowerableOperation for DimensionSubOperation {
     }
 }
 
-impl LowerableOperation for DimensionSaturatingSubOperation {
+impl LowerableOperation for SaturatingSubOperation<DimensionType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
@@ -382,13 +382,61 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType, DimensionBounds, DimensionVariable, Placeholder};
 
+    use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
     use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
     use super::*;
+
+    #[test]
+    fn test_saturating_sub_operation_lower() {
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let left = builder.add_input(DimensionType::new("left", DimensionBounds::non_negative(None).unwrap()).into());
+        let right = builder.add_input(DimensionType::new("right", DimensionBounds::non_negative(None).unwrap()).into());
+        let output = builder
+            .add_instruction(SaturatingSubOperation::<DimensionType>::new(), Vec::new(), vec![left, right], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let boundary_type = ArrayType::scalar(DataType::I64);
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &[boundary_type.clone(), boundary_type.clone()],
+                &[boundary_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                    %0 = stablehlo.subtract %arg0, %arg1 : tensor<i64>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %1 = stablehlo.maximum %0, %c : tensor<i64>
+                    return %1 : tensor<i64>
+                  }
+                }
+            "#},
+        );
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), MixedValue::Dimension(5)], &[]),
+            Ok(vec![MixedValue::Dimension(0)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(i64::MAX), MixedValue::Dimension(0)], &[],),
+            Ok(vec![MixedValue::Dimension(i64::MAX)]),
+        );
+    }
 
     #[test]
     fn test_to_mlir_module_for_program_clamps_unproven_dimension_arithmetic_data_paths() {

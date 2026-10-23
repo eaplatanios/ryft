@@ -597,6 +597,9 @@ impl Lowering {
             }
             ArrayOperation::Add(_) => format!("({} + {})", inputs[0], inputs[1]),
             ArrayOperation::Sub(_) => format!("({} - {})", inputs[0], inputs[1]),
+            ArrayOperation::SaturatingSub(_) => {
+                return Err(unsupported(operation.name(), "integer saturation has no qualified cuTile implementation"));
+            }
             ArrayOperation::Mul(_) => format!("({} * {})", inputs[0], inputs[1]),
             ArrayOperation::Div(_) if matches!(output.data_type(), DataType::F16 | DataType::F32 | DataType::F64) => {
                 format!("ct.truediv({}, {})", inputs[0], inputs[1])

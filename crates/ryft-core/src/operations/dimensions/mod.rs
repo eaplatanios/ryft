@@ -96,7 +96,6 @@ pub mod dimension_rem;
 pub mod dimension_size;
 pub mod dimension_sub;
 pub mod dimension_to_scalar;
-mod saturating_sub;
 
 pub use dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
 pub use dimension_div::{DIMENSION_DIV_OPERATION_NAME, DimensionDivOperation};

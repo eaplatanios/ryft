@@ -82,6 +82,9 @@ pub(super) fn validate(
         return Err(unsupported(operation, "arithmetic operand element types must agree"));
     }
     match operation {
+        ArrayOperation::SaturatingSub(_) => {
+            Err(unsupported(operation, "integer saturation has no baseline scalar implementation"))
+        }
         ArrayOperation::Zero(_)
         | ArrayOperation::ZeroLike(_)
         | ArrayOperation::One(_)
@@ -617,7 +620,7 @@ mod tests {
     };
     use ryft_core::{
         AddOperation, ArrayIrOperation, Context, ConvertElementTypeOperation, DotDimensionNumbers, DotOperation,
-        ExpOperation, ReduceOperation, ReferenceRead, ReferenceWrite,
+        ExpOperation, ReduceOperation, ReferenceRead, ReferenceWrite, SaturatingSubOperation,
     };
     use ryft_mlir::{Context as MlirContext, Operation as MlirOperation, WalkOrder, WalkResult};
 
@@ -685,6 +688,17 @@ mod tests {
             ),
             Err(Error::Unsupported { operation: "add", reason })
                 if reason == "arithmetic operand element types must agree",
+        ));
+    }
+
+    #[test]
+    fn test_validate_saturating_sub() {
+        let operation = ArrayOperation::SaturatingSub(SaturatingSubOperation::new());
+        let r#type = ArrayType::scalar(DataType::I32);
+        assert!(matches!(
+            validate(&operation, &[r#type.clone(), r#type.clone()], &r#type),
+            Err(Error::Unsupported { operation: "saturating_sub", reason })
+                if reason == "integer saturation has no baseline scalar implementation",
         ));
     }
 

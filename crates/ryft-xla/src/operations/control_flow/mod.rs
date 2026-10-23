@@ -79,7 +79,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 /// [`EffectClass::OrderedAssertion`] when lowering synthesizes an assertion anywhere in it, at any depth. Lowering
 /// synthesizes the input relationship guard of a nested `condition`, `while`, or `scan` whose inputs leave
 /// relationships of its region inputs unproven (refer to [`lower_region_guard`]), and the validation of the extent
-/// operands that a dynamic array constructor (`zero`, `one`, or `iota`), a random bit generator, or a custom call
+/// inputs that a dynamic array constructor (`zero`, `one`, or `iota`), a random bit generator, or a custom call
 /// consumes for output axes that type inference refined to static extents (refer to `validates_output_extents`). A
 /// region that contains such an assertion must thread its tokens out (refer to `token_threaded_effects`) even when its
 /// source program is pure, so that later assertions and I/O follow it: a region input guard joins its assertion token
@@ -347,7 +347,10 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
 /// StableHLO's implicit region capture (the same mechanism that feeds `input_values` into `stablehlo.if` branches).
 /// Ordinary results are converted to `output_types` before the region returns one trailing token for each class in
 /// `threaded_effects`, in canonical effect order. A branch that is pure for one of those classes returns that class's
-/// incoming token unchanged.
+/// incoming token unchanged. `threaded_effects` must cover every ordered class whose token the lowering of `program`
+/// advances (refer to [`lowered_effect_classes`]): the region cannot return the token of any other class, so an
+/// advanced token of such a class is reported as a [`ProgramError::MalformedProgram`] instead of being dropped, which
+/// would leave later effects of that class unordered with respect to the effects of the region.
 pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatXlaProgram<O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -377,6 +380,16 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
             collective_state,
             &mut region_effect_tokens,
         )?;
+        for effect in [EffectClass::OrderedAssertion, EffectClass::OrderedIo] {
+            if !token_threaded_effects(threaded_effects).any(|threaded| threaded == effect)
+                && region_effect_tokens.get(effect) != entry_effect_tokens.get(effect)
+            {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "control-flow region lowering advanced the `{effect}` token, which the region does not thread",
+                ))
+                .into());
+            }
+        }
         // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
         // common refined shapes even when their declared dynamic and static result types differ.
         outputs = lower_refined_region_outputs(
@@ -405,8 +418,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, CompareOperation, ComparisonDirection, ConditionOperation, Placeholder,
-        ScanOperation, WhileOperation,
+        PrintOperation, ScanOperation, WhileOperation,
     };
+    use ryft_mlir::Location;
 
     use crate::experimental::lowering::tests::test_vector_type;
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
@@ -569,5 +583,46 @@ mod tests {
         assert_eq!(pullback.instructions().len(), 1);
         assert!(pullback_stablehlo.contains("\"stablehlo.if\""), "{pullback_stablehlo}");
         assert!(pullback_stablehlo.contains("stablehlo.while"), "{pullback_stablehlo}");
+    }
+
+    #[test]
+    fn test_lower_control_flow_region_rejects_unthreaded_token_advances() {
+        // A print advances the ordered I/O token. A region whose threaded classes include ordered I/O returns the
+        // advanced token, whereas a region that threads no class could not return it, so lowering it would leave later
+        // I/O unordered with respect to the print.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(scalar_type.clone().into());
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block(&[(lower_tensor_type(&scalar_type, &context, location).unwrap(), location)]);
+        let input = block.as_ref().argument(0).unwrap().as_ref();
+        let lower = |threaded_effects| {
+            lower_control_flow_region(
+                &program,
+                &[input],
+                &[scalar_type.clone().into()],
+                &context,
+                location,
+                &[],
+                None,
+                &CollectiveLoweringState::new(),
+                EffectTokens::default(),
+                threaded_effects,
+            )
+        };
+        assert!(lower(EffectClasses::single(EffectClass::OrderedIo)).is_ok());
+        let expected_message =
+            "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
+        assert!(matches!(
+            lower(EffectClasses::NONE),
+            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message))) if message == expected_message,
+        ));
     }
 }

@@ -1116,6 +1116,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Neg(_)
                 | ArrayOperation::Add(_)
                 | ArrayOperation::Sub(_)
+                | ArrayOperation::SaturatingSub(_)
                 | ArrayOperation::Mul(_)
                 | ArrayOperation::Div(_)
                 | ArrayOperation::Abs(_)

@@ -913,6 +913,9 @@ impl<'c, 't> Lowering<'c, 't> {
             ArrayOperation::Sub(_) if output.data_type() == DataType::F32 => {
                 append(block, arith::subf(values[0], values[1], location)?)?
             }
+            ArrayOperation::SaturatingSub(_) => {
+                return Err(unsupported(operation.name(), "integer saturation has no portable Triton implementation"));
+            }
             ArrayOperation::Mul(_) if output.data_type() == DataType::F32 => {
                 append(block, arith::mulf(values[0], values[1], location)?)?
             }

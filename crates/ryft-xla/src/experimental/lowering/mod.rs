@@ -696,8 +696,9 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
         // `validate_local_output_placement`).
         lower_operation_variants!(
             self, ArrayOperation, lowerer, input_values, input_types, output_types;
-            Zero, ZeroLike, One, OneLike, Constant, Iota, Min, Max, Clamp, Sign, Neg, Add, Sub, Mul, Div, Rem, Pow, Sqrt,
-            Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, Log, Ln1p, LogAddExp, Logistic, Erf, Floor, Ceil, Round, Not,
+            Zero, ZeroLike, One, OneLike, Constant, Iota, Min, Max, Clamp, Sign, Neg, Add, Sub, SaturatingSub,
+            Mul, Div, Rem, Pow, Sqrt, Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, Log, Ln1p, LogAddExp, Logistic, Erf,
+            Floor, Ceil, Round, Not,
             And, Or, Xor, Complex, Real, Imaginary, Conjugate, Reduce, ArgMax, ArgMin, Cumulative, Sort, Dot, RaggedDot,
             ScaledDot, DotProductAttention, DotProductAttentionBackward, AxisIndex, ParallelReduce, ParallelVary,
             ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelAllToAll, ParallelRaggedAllToAll, Compare,

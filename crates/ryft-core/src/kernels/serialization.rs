@@ -6,10 +6,11 @@
 //! ordinary programs; they are never interpreted. Decoding revalidates the region DAG and kernel boundary. Executable
 //! initialization and adapter admission remain separate requirements, just as for an explicitly built definition.
 //!
-//! The array subset is constant, zero, add/subtract/multiply/divide/remainder, negate/absolute/minimum/maximum,
-//! exp/log/sqrt/rsqrt/tanh, Boolean not/and/or/xor, select, compare and dot. Dimension arithmetic supports add,
-//! subtract, multiply, floor division and remainder when canonical reconstruction preserves its complete cached
-//! metadata; scalar conversions, conditions and while loops are also supported. Reference allocation/read/write/swap,
+//! The array subset is constant, zero, add/subtract/saturating subtract/multiply/divide/remainder,
+//! negate/absolute/minimum/maximum, exp/log/sqrt/rsqrt/tanh, Boolean not/and/or/xor, select, compare and dot. Dimension
+//! arithmetic supports add, subtract, saturating subtract, multiply, floor division and remainder when canonical
+//! reconstruction preserves its complete cached metadata; scalar conversions, conditions and while loops are also
+//! supported. Reference allocation/read/write/swap,
 //! freeze/add-update/atomic-add-update, scratch, tile load, masked load/store/swap and async copy/wait are supported.
 //! Folded reference paths retain their canonical trailing bindings. Other operation payloads, distributed metadata
 //! and dynamically shaped explicit layouts report eligibility errors. Sequence sizes are bounded before allocation
@@ -45,8 +46,8 @@ use crate::operations::{
     DotDimensionNumbers, DotOperation, ExpOperation, LogOperation, MaxOperation, MinOperation, MulOperation,
     NegOperation, NotOperation, OrOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
     ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-    ReferenceWriteOperation, RemOperation, RsqrtOperation, SelectOperation, SqrtOperation, SubOperation, TanhOperation,
-    WhileOperation, XorOperation, ZeroOperation,
+    ReferenceWriteOperation, RemOperation, RsqrtOperation, SaturatingSubOperation, SelectOperation, SqrtOperation,
+    SubOperation, TanhOperation, WhileOperation, XorOperation, ZeroOperation,
 };
 use crate::parameters::Placeholder;
 use crate::programs::{
@@ -564,6 +565,8 @@ enum WireOperation {
         left: WireDimension,
         right: WireDimension,
     },
+    SaturatingSub,
+    SaturatingSubDimension,
 }
 
 /// Explicit comparison predicate.
@@ -859,6 +862,7 @@ impl Encoder {
                     }
                     ArrayOperation::Add(_) => WireOperation::Add,
                     ArrayOperation::Sub(_) => WireOperation::Sub,
+                    ArrayOperation::SaturatingSub(_) => WireOperation::SaturatingSub,
                     ArrayOperation::Mul(_) => WireOperation::Mul,
                     ArrayOperation::Div(_) => WireOperation::Div,
                     ArrayOperation::Rem(_) => WireOperation::Rem,
@@ -920,6 +924,7 @@ impl Encoder {
                             right: self.dimension(operation.right_type().dimension()),
                         }
                     }
+                    DimensionOperation::SaturatingSub(_) => WireOperation::SaturatingSubDimension,
                     DimensionOperation::Mul(operation) => {
                         // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
                         let reconstructed =
@@ -1154,6 +1159,9 @@ impl Decoder {
             WireOperation::DimensionToScalar => ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation).into(),
             WireOperation::Add => ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())).into(),
             WireOperation::Sub => ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())).into(),
+            WireOperation::SaturatingSub => {
+                ArrayIrOperation::Array(ArrayOperation::SaturatingSub(SaturatingSubOperation::new())).into()
+            }
             WireOperation::Mul => ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())).into(),
             WireOperation::Div => ArrayIrOperation::Array(ArrayOperation::Div(DivOperation::new())).into(),
             WireOperation::Rem => ArrayIrOperation::Array(ArrayOperation::Rem(RemOperation::new())).into(),
@@ -1193,6 +1201,9 @@ impl Decoder {
                     .map_err(ProgramError::from)?,
             ))
             .into(),
+            WireOperation::SaturatingSubDimension => {
+                ArrayIrOperation::Dimension(DimensionOperation::SaturatingSub(SaturatingSubOperation::new())).into()
+            }
             WireOperation::DimensionMul { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Mul(
                 DimensionMulOperation::new(&self.dimension_type(left)?, &self.dimension_type(right)?)
                     .map_err(ProgramError::from)?,
@@ -1595,6 +1606,77 @@ mod tests {
         let decoded = roundtrip(&definition);
         let output = decoded.interpret(vec![], DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS).unwrap();
         assert_eq!(output[0].logical_bytes(), value.logical_bytes());
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_saturating_sub() {
+        let r#type = ArrayType::new_static(DataType::I8, [4]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let left = context.bind(ReferenceReadOperation::new(), vec![], &[references[0].clone()])?.remove(0);
+            let right = context.bind(ReferenceReadOperation::new(), vec![], &[references[1].clone()])?.remove(0);
+            let difference = context
+                .bind(
+                    ArrayIrOperation::Array(ArrayOperation::SaturatingSub(SaturatingSubOperation::new())),
+                    vec![],
+                    &[left, right],
+                )?
+                .remove(0);
+            context.bind(ReferenceWriteOperation::new(), vec![], &[references[2].clone(), difference])?;
+            Ok(())
+        })
+        .unwrap();
+        let decoded = roundtrip(&definition);
+        let left = Array::from_elements(r#type.clone(), &[i8::MIN, i8::MAX, 3, -3]).unwrap();
+        let right = Array::from_elements(r#type.clone(), &[1i8, -1, 7, -7]).unwrap();
+        let expected = Array::from_elements(r#type, &[i8::MIN, i8::MAX, -4, 4]).unwrap();
+        assert_eq!(decoded.interpret(vec![left, right], 1), Ok(vec![expected]));
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_saturating_sub_mapping() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let coordinate =
+            builder.add_input(DimensionType::new("coordinate", DimensionBounds::non_negative(Some(4)).unwrap()).into());
+        let one = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
+        let difference = builder
+            .add_instruction(
+                ArrayIrOperation::Dimension(DimensionOperation::SaturatingSub(SaturatingSubOperation::new())),
+                vec![],
+                vec![coordinate, one],
+                None,
+            )
+            .unwrap()[0];
+        let mapping = BlockMapping::new(
+            builder.build(vec![difference], vec![Placeholder], vec![Placeholder]).unwrap(),
+            vec![1],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let parameter =
+            KernelParameter::new(ArrayType::new_static(DataType::I32, [4]), KernelParameterAccess::ReadOnly, mapping)
+                .unwrap();
+        let call = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(4), GridExecution::Parallel)]).unwrap(),
+            vec![parameter],
+        )
+        .unwrap();
+        let decoded = roundtrip(&KernelDefinition::trace(call, |_| Ok(())).unwrap());
+        let mapping = decoded.operation().parameters()[0].mapping();
+        for (coordinate, expected) in [(0, 0), (1, 0), (3, 2)] {
+            let ArrayIrType::Dimension(input_type) = mapping.program().input_types()[0].clone() else { unreachable!() };
+            let input = DimensionValue::new(input_type, coordinate).unwrap();
+            assert_eq!(mapping.evaluate(&[input], &[4]).unwrap().starts(), &[expected]);
+        }
     }
 
     #[test]

@@ -5728,6 +5728,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Neg(_)
         | ArrayOperation::Add(_)
         | ArrayOperation::Sub(_)
+        | ArrayOperation::SaturatingSub(_)
         | ArrayOperation::Mul(_)
         | ArrayOperation::Div(_)
         | ArrayOperation::Sin(_)
