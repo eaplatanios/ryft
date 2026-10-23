@@ -10,8 +10,7 @@ use crate::arrays::{
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -264,7 +263,7 @@ impl<C: Context<Type = ArrayType, Value: Transpose>, P: ArrayExtentBatchingPolic
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validate logical axes before shifting them around the mapped axis. Invalid indices must not overflow
         // or wrap into a valid physical permutation during lifting.
@@ -291,24 +290,7 @@ impl<C: Context<Type = ArrayType, Value: Transpose>, P: ArrayExtentBatchingPolic
             inputs,
             &[BatchAxis::from_optional_position(output_axis)],
         )?;
-        let output_axes = lifted_operation
-            .permutation()
-            .inverse()?
-            .normalize(lifted_operation.permutation().len())?
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>();
-        let ragged_axes = inputs[0]
-            .ragged_axes()
-            .iter()
-            .cloned()
-            .map(|ragged_axis| {
-                // `output_axes` is the total inverse of a validated permutation, so every stored input axis survives.
-                ragged_axis.relocated(output_axes.as_slice()).unwrap()
-            })
-            .collect();
-        let output = outputs.remove(0).with_ragged_axes(ragged_axes)?;
-        Ok(vec![output].into())
+        Ok(vec![outputs.remove(0)])
     }
 }
 
@@ -635,8 +617,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
-        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
-        Tile, TileDimension, TiledLayout, f8e8m0fnu,
+        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, Tile,
+        TileDimension, TiledLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -1054,6 +1036,29 @@ mod tests {
     }
 
     #[test]
+    fn test_transpose_batching_rank_mismatch() {
+        // The permutation must match the per-item rank, which excludes the mapped batch axis.
+        let input = ArrayBatch::new(
+            Array::from_elements::<f64>(
+                ArrayType::new_static(DataType::F64, [2, 2, 3, 4]),
+                &(0..48).map(f64::from).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            BatchAxis::new(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            TransposeOperation::new([0, 1]).batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "permutation has length 2 but input has rank 3",
+        ));
+    }
+
+    #[test]
     fn test_transpose_batching_nonleading_axis() {
         // The batch axis may occupy any physical position. The lifted permutation leaves it in that position while
         // applying the logical rank-3 cycle around it.
@@ -1103,49 +1108,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_batching_ragged_axes() {
-        // Ragged metadata names physical packed axes, so the lifted transpose must apply its inverse axis map to the
-        // ragged dimension and every extent axis while preserving the mapped batch axis.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let extents = Array::matrix(2, 2, vec![1_i32, 4, 2, 3]).unwrap();
-        let packed = Array::from_elements::<f64>(
-            ArrayType::new_static(DataType::F64, [2, 2, 3, 4]),
-            &(0..48).map(f64::from).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let expected_value = packed.transpose([3, 1, 0, 2]).unwrap();
-        let input = ArrayBatch::new(packed, BatchAxis::new(1))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(3, extents.clone(), length.clone(), vec![0, 1])])
-            .unwrap();
-        assert!(matches!(
-            TransposeOperation::new([0, 1]).batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &EmptyRegionDriver,
-                std::slice::from_ref(&input),
-            ),
-            Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "permutation has length 2 but input has rank 3",
-        ));
-        let output = TransposeOperation::new([2, 0, 1])
-            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts()
-            .0
-            .remove(0);
-        assert_eq!(output.value(), &expected_value);
-        assert_eq!(output.batch_axis(), BatchAxis::new(1));
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(0, extents, length.clone(), vec![2, 1])]);
-        assert_eq!(
-            output.unbatched_type(),
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Dimension::Dynamic(length), Dimension::Static(2), Dimension::Static(3)]),
-            ),
-        );
-    }
-
-    #[test]
     fn test_transpose_batching_symbolic_axis() {
         // Transpose only reorders axes, so its batching rule also works when the mapped dimension is symbolic. It
         // stages the physical permutation [3, 1, 0, 2] without demanding a concrete batch size from the input type.
@@ -1160,8 +1122,6 @@ mod tests {
         let symbolic_output = TransposeOperation::new([2, 0, 1])
             .batch(&BatchingContext::new(context.clone(), 2), &EmptyRegionDriver, &[symbolic_input])
             .unwrap()
-            .into_parts()
-            .0
             .remove(0);
         assert_eq!(symbolic_output.batch_axis(), BatchAxis::new(1));
         assert_eq!(

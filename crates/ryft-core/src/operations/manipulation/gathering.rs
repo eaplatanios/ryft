@@ -12,8 +12,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -689,17 +688,16 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Batching lifts the dimension numbers into one gather. A mapped input alone becomes a full-window offset axis,
         // mapped indices alone add an output batch axis, and jointly mapped inputs gain a paired input/indices batching
         // axis.
         check_count!("input", inputs, 2, ProgramError);
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         let mapped_input = inputs[0].batch_axis_position().is_some();
         let mapped_indices = inputs[1].batch_axis_position().is_some();
         if !mapped_input && !mapped_indices {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         }
 
         // Put each mapped axis first so all three lifting cases produce one leading mapped output axis. Unlike
@@ -792,7 +790,7 @@ where
                 Some(output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
 
-        Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?.into())
+        Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?)
     }
 }
 
@@ -2085,7 +2083,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout,
@@ -2139,13 +2136,11 @@ mod tests {
                 );
                 let input = ValueProjection::<ArrayType>::into_projected(input)?;
                 let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
-                let (outputs, _) = operation
-                    .batch(
-                        &context,
-                        &EmptyRegionDriver,
-                        &[ArrayBatch::new(input, BatchAxis::new(0))?, ArrayBatch::new(indices, BatchAxis::new(0))?],
-                    )?
-                    .into_parts();
+                let outputs = operation.batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::new(input, BatchAxis::new(0))?, ArrayBatch::new(indices, BatchAxis::new(0))?],
+                )?;
                 assert_eq!(outputs.len(), 1);
                 assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
                 let output = outputs.into_iter().next().unwrap().into_value();
@@ -3741,24 +3736,6 @@ mod tests {
             operation.batch(&context, &EmptyRegionDriver, &[]).unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
-
-        // Ragged input extents must never be replaced with packed storage extents while selecting windows.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let ragged = ragged_array_batch(
-            Array::matrix(2, 3, vec![1_f64, 2., 3., 4., 5., 6.]).unwrap(),
-            Array::vector(vec![1_i32, 3]).unwrap(),
-            &variable,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[ragged, indices]).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{GATHER_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-            },
-        );
     }
 
     #[test]
@@ -3850,14 +3827,13 @@ mod tests {
             extent,
         );
         let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]);
-        let (outputs, _) = operation
+        let outputs = operation
             .batch(
                 &context,
                 &EmptyRegionDriver,
                 &[ArrayBatch::replicated(input.clone()), ArrayBatch::new(indices, BatchAxis::new(0)).unwrap()],
             )
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(
             outputs[0].r#type().shape(),

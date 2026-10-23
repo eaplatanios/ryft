@@ -10,15 +10,14 @@ use crate::arrays::{
     ArrayType, DimensionType, DimensionValue, Sharding,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy, batch_projected_operation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -79,8 +78,7 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// Batching a mapped predicate evaluates both pure branches and selects their outputs per item. The primal computations
 /// of inactive branches still execute and can fail, but gradient propagation into their inputs is stopped before branch
 /// evaluation so inactive non-finite derivatives do not contaminate the selected derivative. The selected branch must
-/// still have a defined derivative. With a replicated predicate, structural branch batching does not carry bounded
-/// ragged extents across its branch boundaries, so bounded ragged inputs are rejected before either branch is batched.
+/// still have a defined derivative.
 /// Composite staging with a mapped predicate also rejects branch-local type identities. Replaying both branches into
 /// one parent trace loses their separate definition scopes, and freshening those definitions alone would leave any
 /// dependent array shapes needing a runtime join. Dimension identities established by branch inputs remain supported.
@@ -585,20 +583,16 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let Some((predicate_batch, branch_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("cannot batch a `{CONDITION_OPERATION_NAME}` operation with no predicate input"),
             });
         };
-        if predicate_batch.batch_axis().is_replicated() {
-            // Structural branch replay has no carrier for per-item extents, including on unused inputs.
-            ArrayBatch::reject_ragged_inputs(self, inputs)?;
-        }
         let true_region = driver.region(0)?;
         let false_region = driver.region(1)?;
         // Validate the original logical boundary after input refinement, before either lowering rewrites the branches.
-        // Carrier types restore ragged dimensions and remove the mapped axis while retaining input refinements.
+        // Per-item types remove the mapped axis while retaining input refinements.
         let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
         self.infer_output_types(&input_types, &[true_region.interface(), false_region.interface()])?;
         if !predicate_batch.batch_axis().is_replicated() {
@@ -622,10 +616,7 @@ where
             // branch outputs would send zero cotangents through inactive non-finite derivatives and produce NaNs.
             let stopped_inputs = branch_inputs
                 .iter()
-                .map(|input| {
-                    ArrayBatch::new(input.value().stop_gradient()?, input.batch_axis())?
-                        .with_ragged_axes(input.ragged_axes().to_vec())
-                })
+                .map(|input| ArrayBatch::new(input.value().stop_gradient()?, input.batch_axis()))
                 .collect::<Result<Vec<_>, BatchingError>>()?;
             // `Context::bind` does not align manual variation, so each selection first aligns the predicate with its
             // candidates, which may vary over manual mesh axes that the predicate does not vary over. This stages
@@ -638,13 +629,10 @@ where
                 let aligned_inputs = ManualVariationAlignment::align_manual_variation(&values)?
                     .into_iter()
                     .zip(candidates)
-                    .map(|(value, batch)| {
-                        ArrayBatch::new(value, batch.batch_axis())?.with_ragged_axes(batch.ragged_axes().to_vec())
-                    })
+                    .map(|(value, batch)| ArrayBatch::new(value, batch.batch_axis()))
                     .collect::<Result<Vec<_>, BatchingError>>()?;
-                let (mut selected, _) = SelectOperation::<ArrayType>::new()
-                    .batch(context, &EmptyRegionDriver, &aligned_inputs)?
-                    .into_parts();
+                let mut selected =
+                    SelectOperation::<ArrayType>::new().batch(context, &EmptyRegionDriver, &aligned_inputs)?;
                 check_count!("output", selected, 1, ProgramError);
                 Ok::<_, BatchingError>(selected.remove(0))
             };
@@ -666,8 +654,7 @@ where
                 .iter()
                 .zip(&false_outputs)
                 .map(|(true_output, false_output)| select(true_output, false_output))
-                .collect::<Result<Vec<_>, BatchingError>>()?
-                .into());
+                .collect::<Result<Vec<_>, BatchingError>>()?);
         }
 
         // Replicated (abstract) predicate: batch both branches at the batch axes of the non-predicate inputs with
@@ -721,8 +708,7 @@ where
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| ArrayBatch::new(output, axis))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -766,17 +752,13 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((predicate, branch_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("cannot batch a `{CONDITION_OPERATION_NAME}` operation with no predicate input"),
             });
         };
         <&ArrayType>::try_from(&predicate.unbatched_type())?;
-        if predicate.batch_axis().is_replicated() {
-            // Structural branch replay has no carrier for per-item extents, including on unused inputs.
-            ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
-        }
         let true_region = driver.region(0)?;
         let false_region = driver.region(1)?;
         // Validate the complete per-item boundary before structural batching or per-item selection rewrites it.
@@ -834,8 +816,7 @@ where
                 .into_iter()
                 .zip(output_axes)
                 .map(|(output, axis)| ArrayIrBatch::new(output, axis))
-                .collect::<Result<Vec<_>, _>>()?
-                .into());
+                .collect::<Result<Vec<_>, _>>()?);
         }
 
         // A batch-varying predicate lowers to running both branches and selecting per item, so no branch may touch a
@@ -897,8 +878,7 @@ where
                 if matches!(input.unbatched_type(), ArrayIrType::Array(_)) {
                     let stopped =
                         ValueProjection::<ArrayType>::into_projected(input.value().clone())?.stop_gradient()?;
-                    ArrayIrBatch::new(ValueProjection::<ArrayType>::from_projected(stopped), input.batch_axis())?
-                        .with_ragged_axes(input.ragged_axes().to_vec())
+                    ArrayIrBatch::new(ValueProjection::<ArrayType>::from_projected(stopped), input.batch_axis())
                 } else {
                     Ok(input.clone())
                 }
@@ -915,12 +895,10 @@ where
             let aligned_inputs = ManualVariationAlignment::<ArrayIrType>::align_manual_variation(&values)?
                 .into_iter()
                 .zip(candidates)
-                .map(|(value, batch)| {
-                    ArrayIrBatch::new(value, batch.batch_axis())?.with_ragged_axes(batch.ragged_axes().to_vec())
-                })
+                .map(|(value, batch)| ArrayIrBatch::new(value, batch.batch_axis()))
                 .collect::<Result<Vec<_>, BatchingError>>()?;
-            let (mut selected, _) =
-                batch_projected_operation(context, &SelectOperation::<ArrayType>::new(), &aligned_inputs)?.into_parts();
+            let mut selected =
+                batch_projected_operation(context, &SelectOperation::<ArrayType>::new(), &aligned_inputs)?;
             check_count!("output", selected, 1, ProgramError);
             Ok::<_, BatchingError>(selected.remove(0))
         };
@@ -946,9 +924,6 @@ where
             .zip(false_outputs)
             .enumerate()
             .map(|(index, (true_output, false_output))| match true_output.unbatched_type() {
-                ArrayIrType::Ragged(_) => Err(BatchingError::UnsupportedOperation {
-                    message: "first-class ragged condition batching is not yet supported".to_owned(),
-                }),
                 ArrayIrType::Array(_) => {
                     <&ArrayType>::try_from(&false_output.unbatched_type())?;
                     select(&true_output, &false_output)
@@ -996,25 +971,7 @@ where
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
 
-        // Region replay validates ragged extents at every branch instruction, and selection preserves compatible output
-        // carriers. An input dimension absent from all selected outputs was therefore consumed inside the branches or
-        // belonged to an unused input. Attest to that consumption at the enclosing condition boundary, where the
-        // instruction-local evidence of the branch reductions is no longer available.
-        let mut consumed_dimensions = Vec::new();
-        for dimension in inputs.iter().flat_map(ArrayIrBatch::ragged_axes).map(|axis| axis.dimension()) {
-            let preserved = outputs.iter().any(|output| {
-                output.ragged_axes().iter().any(|axis| axis.dimension() == dimension)
-                    || (output.mapped_dimension_extents().is_some()
-                        && matches!(
-                            output.unbatched_type(),
-                            ArrayIrType::Dimension(r#type) if r#type.variable() == Some(dimension)
-                        ))
-            });
-            if !preserved && !consumed_dimensions.contains(dimension) {
-                consumed_dimensions.push(dimension.clone());
-            }
-        }
-        Ok(BatchedOutputs::new(outputs, consumed_dimensions))
+        Ok(outputs)
     }
 }
 
@@ -1335,7 +1292,7 @@ where
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
-        + SupportsCotangentAdd
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ConditionOperation<ArrayIrType>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
@@ -1436,7 +1393,7 @@ impl ConditionType for ArrayIrType {
     fn predicate_sharding(&self) -> Option<&Sharding> {
         match self {
             Self::Array(r#type) => r#type.predicate_sharding(),
-            Self::Dimension(_) | Self::Reference(_) | Self::Ragged(_) => None,
+            Self::Dimension(_) | Self::Reference(_) => None,
         }
     }
 
@@ -1447,9 +1404,6 @@ impl ConditionType for ArrayIrType {
         match self {
             Self::Array(output) => output.validate_condition_output(predicate),
             Self::Reference(output) => output.referent().validate_condition_output(predicate),
-            Self::Ragged(_) => Err(TypeError::invalid(format!(
-                "`{CONDITION_OPERATION_NAME}` does not support first-class ragged output `{self}`",
-            ))),
             Self::Dimension(_) => {
                 if predicate.sharding().is_none_or(|sharding| sharding.varying_manual_axes().is_empty()) {
                     return Ok(());
@@ -2433,12 +2387,11 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
         DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
@@ -2465,7 +2418,6 @@ mod tests {
     use crate::operations::dimensions::DimensionAddOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
     use crate::operations::manipulation::conversions::Cast;
-    use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
@@ -8172,7 +8124,7 @@ mod tests {
                     "`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]",
                 ));
                 if extent == 3 {
-                    let output = output.unwrap().into_parts().0;
+                    let output = output.unwrap();
                     assert_eq!(output.len(), 1);
                     assert_eq!(output[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 3]));
                     assert_eq!(output[0].batch_axis(), BatchAxis::new(0));
@@ -8203,7 +8155,7 @@ mod tests {
                     ],
                 );
                 if extent == 3 {
-                    let output = output.unwrap().into_parts().0;
+                    let output = output.unwrap();
                     assert_eq!(output.len(), 1);
                     assert_eq!(
                         output[0].value().r#type().as_ref(),
@@ -8248,7 +8200,7 @@ mod tests {
         ];
         let regions = vec![branch.clone(), branch];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = ConditionOperation::new().batch(&context, &driver, &inputs).unwrap().into_parts().0;
+        let outputs = ConditionOperation::new().batch(&context, &driver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].value(), &array(values.clone()));
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -8256,96 +8208,18 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_rejects_ragged_inputs_under_replicated_predicate() {
-        // Structural batching sees only the mapped axis. The bounded storage must not become the branch's logical
-        // shape, even for a branch that only forwards its input. An empty driver also proves rejection precedes any
-        // branch transformation.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ragged_array_batch(
-            Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
-            Array::vector(vec![1i64, 2]).unwrap(),
-            &dimension,
-            1,
-        )
-        .unwrap();
-        let inputs = [ArrayBatch::replicated(Array::scalar(true).unwrap()), input];
-        assert_eq!(
-            ConditionOperation::new().batch(&context, &EmptyRegionDriver, &inputs).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: "`condition` does not support bounded ragged dimension `length` on input 1".to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_composite_condition_batching_rejects_ragged_inputs_under_replicated_predicate() {
-        // Composite carriers store the same per-item extents outside the packed array type, so their structural
-        // branch batching must reject them before a branch can observe the finite storage bound as a logical extent.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestValue, TestOperation>::new(),
-            TestValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ragged_batch(
-            array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            array(Array::vector(vec![1i64, 2]).unwrap()),
-            &dimension,
-            1,
-        )
-        .unwrap();
-        let inputs = [ArrayIrBatch::replicated(array(Array::scalar(true).unwrap())), input];
-        assert_eq!(
-            ConditionOperation::new().batch(&context, &EmptyRegionDriver, &inputs).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: "`condition` does not support bounded ragged dimension `length` on input 1".to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_composite_condition_batching_selects_fresh_ragged_extents_under_mapped_predicate()
+    fn test_composite_condition_batching_rejects_mapped_shape_computation_under_mapped_predicate()
     -> Result<(), ProgramError> {
-        // Under a batch-varying predicate both branches run, so they must be pure. Branches that broadcast to a mapped
-        // dimension input produce fresh ragged outputs of that input's extents, and each item selects its own branch's
-        // payload. Branches that compute their own lengths with `dimension_from_scalar` check those lengths against the
-        // dimension's bounds, which is an effect, so they are rejected rather than run for every item.
+        // Computing a first-class output extent from mapped scalar data cannot produce a rectangular array.
+        // The ordered scalar-to-dimension gateway makes the branch effectful, so mapped selection rejects it before
+        // either branch is transformed.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
         type Branch = Tracer<TracingContext<TestValue, TestOperation>>;
-        let broadcast_branch = |use_second: bool| -> Result<_, ProgramError> {
-            let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
-                |(first, second, extent): (Branch, Branch, Branch)| {
-                    if use_second { second } else { first }.dynamic_broadcast_to(&[extent])
-                },
-                (
-                    ArrayIrType::from(ArrayType::scalar(DataType::F64)),
-                    ArrayIrType::from(ArrayType::scalar(DataType::F64)),
-                    ArrayIrType::from(DimensionType::from(length.clone())),
-                ),
-            )?;
-            Ok(program.into_flat_program())
-        };
-        let regions = vec![broadcast_branch(false)?, broadcast_branch(true)?];
-        let driver = CountingBatchingDriver::new(&regions);
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<TestValue, TestOperation>::new(),
             TestValue::Dimension(DimensionValue::constant(2)?),
         );
         let predicate = ArrayIrBatch::new(array(Array::vector(vec![true, false])?), BatchAxis::new(0))?;
-        let extents = array(Array::vector(vec![1i64, 3])?);
-        let inputs = [
-            predicate.clone(),
-            ArrayIrBatch::new(array(Array::vector(vec![5.0f64, 6.0])?), BatchAxis::new(0))?,
-            ArrayIrBatch::new(array(Array::vector(vec![7.0f64, 8.0])?), BatchAxis::new(0))?,
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(length.clone()))?,
-        ];
-        let (outputs, _) = ConditionOperation::new().batch(&context, &driver, &inputs)?.into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].value(), &array(Array::matrix(2, 3, vec![5.0f64, 5.0, 5.0, 8.0, 8.0, 8.0])?));
-        assert_eq!(outputs[0].ragged_axes().len(), 1);
-        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
-        assert_eq!(outputs[0].ragged_axes()[0].extents(), &extents);
-
         let computed_branch = |use_second: bool| -> Result<_, ProgramError> {
             let (_, program) = TracingContext::<TestValue, TestOperation>::trace(
                 |(value, first, second): (Branch, Branch, Branch)| {
@@ -8378,110 +8252,6 @@ mod tests {
             },
         );
         Ok(())
-    }
-
-    #[test]
-    fn test_composite_condition_batching_forwards_ragged_inputs_under_mapped_predicate() {
-        // The mapped-predicate path replays each branch with complete carriers, rather than structurally batching
-        // its boundary. Selection must retain the shared per-item extents alongside the packed forwarded values.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestValue, TestOperation>::new(),
-            TestValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ragged_batch(
-            array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            array(Array::vector(vec![1i64, 2]).unwrap()),
-            &dimension,
-            1,
-        )
-        .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let forwarded = builder.add_input(input.unbatched_type());
-        let branch = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![forwarded], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            branch.to_string(),
-            indoc! {"
-            lambda %0:f64[length] .
-            in (%0)"}
-        );
-        let regions = vec![branch.clone(), branch];
-        let driver = CountingBatchingDriver::new(&regions);
-        let inputs = [
-            ArrayIrBatch::new(array(Array::vector(vec![true, false]).unwrap()), BatchAxis::new(0)).unwrap(),
-            input.clone(),
-        ];
-        let outputs = ConditionOperation::new().batch(&context, &driver, &inputs).unwrap().into_parts().0;
-        assert_eq!(driver.batch_program_calls(), 0);
-        assert_eq!(outputs, vec![input]);
-    }
-
-    #[test]
-    fn test_composite_condition_batching_consumes_ragged_inputs_under_mapped_predicate() {
-        // Both branches consume the logical ragged axis with their own padding identities. The condition must carry
-        // that consumption evidence through its checked binding, so its dense scalar outputs remain valid.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestValue, TestOperation>::new(),
-            TestValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let dimension = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ragged_batch(
-            array(Array::matrix(2, 3, vec![1.0f64, 900.0, 800.0, 4.0, 5.0, 700.0]).unwrap()),
-            array(Array::vector(vec![1i64, 2]).unwrap()),
-            &dimension,
-            1,
-        )
-        .unwrap();
-        let branch = |kind| {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let argument = builder.add_input(input.unbatched_type());
-            let output = builder
-                .add_instruction(
-                    TestOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
-                    Vec::new(),
-                    vec![argument],
-                    None,
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let true_branch = branch(ReductionKind::Sum);
-        let false_branch = branch(ReductionKind::Product);
-        assert_eq!(
-            true_branch.to_string(),
-            indoc! {"
-            lambda %0:f64[length] .
-            let %1:f64[] = reduce [kind=sum, axes=[0]] %0
-            in (%1)"}
-        );
-        assert_eq!(
-            false_branch.to_string(),
-            indoc! {"
-            lambda %0:f64[length] .
-            let %1:f64[] = reduce [kind=product, axes=[0]] %0
-            in (%1)"}
-        );
-        let outputs = context
-            .bind(
-                TestOperation::Condition(ConditionOperation::new()),
-                vec![true_branch, false_branch],
-                &[
-                    BatchingTracer::new(
-                        context.clone(),
-                        ArrayIrBatch::new(array(Array::vector(vec![true, false]).unwrap()), BatchAxis::new(0)).unwrap(),
-                    ),
-                    BatchingTracer::new(context.clone(), input.clone()),
-                ],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch().value(), &array(Array::vector(vec![1.0f64, 20.0]).unwrap()));
-        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
-        assert!(outputs[0].batch().ragged_axes().is_empty());
     }
 
     #[test]
@@ -8553,7 +8323,7 @@ mod tests {
         let inputs = vec![ArrayBatch::replicated(predicate), ArrayBatch::new(branch_input, BatchAxis::new(0)).unwrap()];
         let regions = vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
+        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
         assert_eq!(driver.batch_program_calls(), 2);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -8609,7 +8379,7 @@ mod tests {
         let inputs = vec![ArrayBatch::replicated(predicate), ArrayBatch::new(branch_input, BatchAxis::new(0)).unwrap()];
         let regions = vec![vector_scale_branch(3, 2.0), constant_vector_branch(vec![10.0, 20.0, 30.0])];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
+        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
         assert_eq!(driver.batch_program_calls(), 3);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -13458,22 +13228,6 @@ mod tests {
                  produced under the varying predicate \
                  `bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]`",
             )),
-        );
-    }
-
-    #[test]
-    fn test_condition_type_validate_condition_output_rejects_first_class_ragged() {
-        let output = ArrayIrType::Ragged(
-            RaggedType::new(
-                ArrayType::new_static(DataType::I64, [2]),
-                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
-                Vec::new(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            output.validate_condition_output(&ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))),
-            Err(TypeError::invalid(format!("`condition` does not support first-class ragged output `{output}`",))),
         );
     }
 

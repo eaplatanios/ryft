@@ -88,18 +88,18 @@ use crate::arrays::{
     Layout, MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f16,
 };
 use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    InterpretableBatchableOperation,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    SupportsCotangentAdd, TransposableOperation, TranspositionContext, TranspositionDriver,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
@@ -108,9 +108,9 @@ use crate::partial::{
     PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter, ProgramError,
-    RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value,
-    ValueDomainDispatch,
+    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFoldOutput, OperationFormatter,
+    OperationProvider, ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -259,23 +259,13 @@ impl<C: Context<Type = ArrayType, Value: ConvertElementType + Transpose>, P: Arr
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
 
         // Numerical conversion and equal-width bitcasts keep the mapped axis in place. A widening bitcast consumes
-        // the packed trailing axis, so a bounded ragged axis in that position cannot be consumed at all, because its
-        // padding would be folded into the wider elements, and a mapped axis in that position moves to the front first.
+        // the packed trailing axis, so a mapped axis in that position moves to the front first.
         let widening = self.bitcast && inputs[0].value().r#type().data_type().bit_width() < self.data_type.bit_width();
         let rank = inputs[0].value().r#type().rank();
-        if widening && inputs[0].ragged_axes().iter().any(|axis| axis.axis() + 1 == rank) {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode does not support consuming a bounded \
-                     ragged trailing dimension",
-                ),
-            });
-        }
-
         self.infer_output_types(&[inputs[0].unbatched_type()], &[])?;
 
         let input = if widening && inputs[0].batch_axis_position() == Some(rank - 1) {
@@ -287,7 +277,7 @@ impl<C: Context<Type = ArrayType, Value: ConvertElementType + Transpose>, P: Arr
         let mut outputs =
             self.interpret_with_batch_axes(context, std::slice::from_ref(&input), &[input.batch_axis()])?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![outputs.remove(0).with_ragged_axes(input.ragged_axes().to_vec())?].into())
+        Ok(vec![outputs.remove(0)])
     }
 }
 
@@ -804,14 +794,14 @@ impl<C: Context<Type = ArrayType, Value: ReducePrecision>, P: ArrayExtentBatchin
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Precision reduction is elementwise, so it applies to the packed value directly, keeping the mapped axis and
-        // any ragged axes in place. Rounding padding elements is harmless because they remain padding.
+        // all per-item axes in place.
         check_count!("input", inputs, 1, ProgramError);
         self.infer_output_types(&[inputs[0].unbatched_type()], &[])?;
         let mut outputs = self.interpret_with_batch_axes(context, inputs, &[inputs[0].batch_axis()])?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![outputs.remove(0).with_ragged_axes(inputs[0].ragged_axes().to_vec())?].into())
+        Ok(vec![outputs.remove(0)])
     }
 }
 
@@ -1060,11 +1050,8 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 ///     also make it depend on the primal output, so that it stays behind the primal check.
 ///
 /// Batching lifts the declared types by the mapped axis and binds the cast over the packed values. A proven one-input
-/// identity keeps its carrier unchanged, including any bounded ragged axes. Every other cast over a bounded ragged
-/// carrier is rejected, because the carrier's per-item extents live outside the packed types that the lifted cast
-/// relates. For the same reason, the composite [`ArrayIrType`] policy rejects every other cast with a mapped
-/// first-class dimension input (i.e., a source or witness holding one extent per batch item), since a lifted
-/// dimension type cannot state per-item extents.
+/// identity keeps its carrier unchanged. A first-class dimension input must be replicated, because a lifted
+/// dimension type cannot state a different extent for each batch item.
 ///
 /// Raw transposition rejects conditional checked casts whose check needs an unavailable linear primal value or witness,
 /// including cases whose shapes could be checked using known witnesses, because preserving assertion order requires
@@ -1566,7 +1553,7 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // Validate the original declaration before lifting can erase its layout constraints. Reconstructed per-item
         // types have already lost layout and may carry manual variation introduced by the batch axis, so they are not
         // the original invocation's representations. The parent validates the supplied values against the lifted
@@ -1577,14 +1564,13 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
 
-        // An exact one-input identity has no relationship left to check. Keep its original carrier, including physical
-        // layout and ragged extents that are absent from the logical per-item type. Witnesses or different declarations
-        // can impose additional relationships, so they must continue through the lifted primitive.
+        // An exact one-input identity has no relationship left to check. Keep its physical layout. Witnesses or
+        // different declarations can impose additional relationships, so they continue through the lifted primitive.
         if let [input] = inputs
             && self.input_types[0] == self.output_type
             && P::unbatched_type(input).as_ref() == &self.output_type
         {
-            return Ok(vec![input.clone()].into());
+            return Ok(vec![input.clone()]);
         }
 
         let input_types = self
@@ -1599,7 +1585,7 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
             .normalized(&values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>());
         let mut outputs = context.parent().bind(operation, Vec::new(), &values)?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![P::batch(outputs.remove(0), P::batch_axis(&inputs[0]))?].into())
+        Ok(vec![P::batch(outputs.remove(0), P::batch_axis(&inputs[0]))?])
     }
 }
 
@@ -1637,7 +1623,7 @@ where
 impl<
     T: DifferentiableType + CastType,
     V: Value<Type = T>,
-    O: Operation<Type = T> + SupportsCotangentAdd + From<CastOperation<T>>,
+    O: Operation<Type = T> + OperationProvider<T, AddOperation<T>, Operation = O> + From<CastOperation<T>>,
 > TransposableOperation<V, O> for CastOperation<T>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1875,16 +1861,6 @@ impl CastType for ArrayIrType {
         operation: &CastOperation<Self>,
         input_types: &[Self],
     ) -> Result<(Self, Option<Self>), TypeError> {
-        if let Some(r#type) = input_types
-            .iter()
-            .chain(&operation.input_types)
-            .chain([&operation.output_type])
-            .find(|r#type| matches!(r#type, Self::Ragged(_)))
-        {
-            return Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` does not support first-class ragged type `{type}`",
-            )));
-        }
         let preserved = operation.validate_declaration(input_types)?;
         match (&input_types[0], &operation.output_type) {
             (Self::Array(input), Self::Array(output)) => {
@@ -2227,7 +2203,7 @@ impl CastType for ArrayIrType {
         let represent = |dimensions: Vec<Dimension>| match &operation.output_type {
             Self::Array(output) => Self::Array(output.clone().with_shape(Shape::new(dimensions))),
             Self::Dimension(_) => Self::Dimension(DimensionType::from(dimensions.into_iter().next().unwrap())),
-            Self::Reference(_) | Self::Ragged(_) => unreachable!(),
+            Self::Reference(_) => unreachable!(),
         };
 
         Ok((represent(dimensions), interpreted.map(represent)))
@@ -2413,11 +2389,6 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
             .filter_map(|witness| match witness {
                 ArrayIrValue::Array(value) => Some(Ok(value.clone())),
                 ArrayIrValue::Dimension(_) => None,
-                ArrayIrValue::Ragged(_) => Some(Err(TypeError::invalid(format!(
-                    "`{}` does not support first-class ragged type `{}`",
-                    CAST_OPERATION_NAME,
-                    witness.r#type(),
-                )))),
                 ArrayIrValue::Reference(_) => Some(Err(TypeError::invalid(format!(
                     "`{}` does not support reference type `{}`",
                     CAST_OPERATION_NAME,
@@ -2465,13 +2436,12 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, RaggedAxis,
-        RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension,
-        TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
+        DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2,
+        u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -2903,34 +2873,6 @@ mod tests {
                     &[0x5678u16, 0x1234, 0xcdef, 0x89ab],
                 ).unwrap())],
             }],
-        );
-
-        // Widening consumes the trailing axis, so a bounded ragged axis in that position cannot be batched, whereas a
-        // ragged axis elsewhere carries over to the output.
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
-        let array = Array::from_elements(ArrayType::new_static(DataType::U16, [2, 3, 2]), &[0u16; 12]).unwrap();
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
-        let input = ragged_array_batch(array.clone(), extents.clone(), &variable, 1).unwrap();
-        let ragged_axes = input.ragged_axes().to_vec();
-        let (outputs, _) = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
-            .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::new_static(DataType::U32, [2, 3]));
-        assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
-        let input = ragged_array_batch(array, extents, &variable, 2).unwrap();
-        assert_eq!(
-            ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode does not support consuming a bounded \
-                     ragged trailing dimension",
-                ),
-            },
         );
     }
 
@@ -6234,7 +6176,6 @@ mod tests {
                         &EmptyRegionDriver,
                         &[ArrayIrBatch::new(mapped, BatchAxis::new(0))?, ArrayIrBatch::replicated(witness)],
                     )?;
-                    let outputs = outputs.into_parts().0;
                     assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
                     Ok(outputs[0].value().clone())
                 },
@@ -6269,18 +6210,15 @@ mod tests {
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, mapped, witness)| {
                 let batching = BatchingContext::new(extent.domain(), extent);
-                let outputs = CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()])
-                    .unwrap()
-                    .batch(
+                let outputs =
+                    CastOperation::unchecked(exact.clone(), vec![symbolic.clone(), symbolic.clone()]).unwrap().batch(
                         &batching,
                         &EmptyRegionDriver,
                         &[
                             ArrayIrBatch::new(mapped, BatchAxis::new(0))?,
                             ArrayIrBatch::new(witness, BatchAxis::new(1))?,
                         ],
-                    )?
-                    .into_parts()
-                    .0;
+                    )?;
                 assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
                 Ok(outputs[0].value().clone())
             },
@@ -6361,187 +6299,6 @@ mod tests {
                 "`cast` output identity `n` is not carried by a declared input",
             ))),
         );
-    }
-
-    #[test]
-    fn test_cast_batching_identity_ragged() {
-        // A one-input identity keeps its original ragged carrier, including its storage, in both modes and universes.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        for lengths in [vec![], vec![0], vec![1, 3]] {
-            let size = lengths.len();
-            let value = Array::matrix(size, 3, vec![1f32; size * 3]).unwrap();
-            let extents = Array::vector(lengths).unwrap();
-            let input = ragged_array_batch(value.clone(), extents.clone(), &variable, 1).unwrap();
-            let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), size);
-            let tracer = BatchingTracer::new(context, input.clone());
-            let output_type = tracer.r#type().into_owned();
-            let output = tracer.cast(output_type.clone(), &[]).unwrap().into_batch();
-            assert_eq!(output, input);
-            assert!(Arc::ptr_eq(output.value().shared_storage_bytes(), value.shared_storage_bytes()));
-            let output = tracer.cast_unchecked(output_type, &[]).unwrap().into_batch();
-            assert_eq!(output, input);
-            assert!(Arc::ptr_eq(output.value().shared_storage_bytes(), value.shared_storage_bytes()));
-            let composite =
-                ragged_batch(ArrayIrValue::Array(value.clone()), ArrayIrValue::Array(extents), &variable, 1).unwrap();
-            let context = BatchingContext::new(
-                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                ArrayIrValue::Dimension(DimensionValue::constant(size).unwrap()),
-            );
-            let composite_tracer = BatchingTracer::new(context, composite.clone());
-            let output_type = composite_tracer.r#type().into_owned();
-            assert_eq!(composite_tracer.cast(output_type.clone(), &[]).unwrap().into_batch(), composite);
-            assert_eq!(composite_tracer.cast_unchecked(output_type, &[]).unwrap().into_batch(), composite);
-        }
-    }
-
-    #[test]
-    fn test_cast_batching_identity_ragged_staging() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        for checked in [true, false] {
-            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-                |(value, extents)| {
-                    let context = BatchingContext::new(value.domain(), 2);
-                    let input = ragged_array_batch(value, extents.clone(), &variable, 1)?;
-                    let tracer = BatchingTracer::new(context, input.clone());
-                    let output_type = tracer.r#type().into_owned();
-                    let output = if checked {
-                        tracer.cast(output_type, &[])?
-                    } else {
-                        tracer.cast_unchecked(output_type, &[])?
-                    }
-                    .into_batch();
-                    assert_eq!(output, input);
-                    Ok(vec![output.into_value(), extents])
-                },
-                (ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::I32, [2])),
-            )
-            .unwrap();
-            assert_eq!(
-                program.to_string(),
-                indoc! {"
-                    lambda %0:f32[2, 3], %1:i32[2] .
-                    in (%0, %1)"},
-            );
-            let value = Array::matrix(2, 3, vec![1f32; 6]).unwrap();
-            let extents = Array::vector(vec![1i32, 3]).unwrap();
-            assert_eq!(program.interpret((value.clone(), extents.clone())), Ok(vec![value, extents]));
-        }
-    }
-
-    #[test]
-    fn test_cast_batching_identity_validates_contract() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let logical = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let input = ragged_array_batch(
-            Array::matrix(2, 3, vec![1f32; 6]).unwrap(),
-            Array::vector(vec![1i32, 3]).unwrap(),
-            &variable,
-            1,
-        )
-        .unwrap();
-        let other = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
-                "other",
-                DimensionBounds::new(0, Some(4)).unwrap(),
-            ))]),
-        );
-        let exact = ArrayType::new_static(DataType::F32, [3]);
-        let ragged = Err(BatchingError::UnsupportedOperation {
-            message: "cannot batch ragged array type `f32[length]`".to_owned(),
-        });
-        for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            // A different declaration or a narrowing is not an identity of this carrier's logical type. A foreign
-            // declaration does not describe the carrier at all, and a narrowing would have to check the per-item
-            // extents, which lifting the declarations cannot express, so batching rejects the ragged carrier.
-            assert_eq!(
-                constructor(other.clone(), vec![other.clone()]).unwrap().batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[input.clone()]
-                ),
-                Err(BatchingError::Type(TypeError::invalid(
-                    "type f32[length] does not refine declared type f32[other]"
-                ))),
-            );
-            assert_eq!(
-                constructor(exact.clone(), vec![logical.clone()]).unwrap().batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[input.clone()]
-                ),
-                ragged,
-            );
-            // The witness would require every item to have length 3. Matching source and output declarations must not
-            // erase that additional relationship, even though the first input otherwise looks like an identity.
-            let witness = ArrayBatch::replicated(Array::vector(vec![1f32; 3]).unwrap());
-            assert_eq!(
-                constructor(logical.clone(), vec![logical.clone(), logical.clone()]).unwrap().batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[input.clone(), witness],
-                ),
-                ragged,
-            );
-        }
-
-        // The composite policy rejects a non-identity cast over a ragged array carrier in the same way.
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
-            &variable,
-            1,
-        )
-        .unwrap();
-        for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            assert_eq!(
-                constructor(exact.clone().into(), vec![logical.clone().into()]).unwrap().batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    std::slice::from_ref(&input),
-                ),
-                Err(BatchingError::UnsupportedOperation {
-                    message: "cannot batch ragged array type `f32[length]`".to_owned(),
-                }),
-            );
-        }
-    }
-
-    #[test]
-    fn test_cast_batching_replicated_ragged_source() {
-        // A replicated carrier holds the same ragged item for every batch item, here with packed storage `[1, 2, 99]`
-        // and live extent 2. Narrowing it to `f32[3]` would read the padding as data, so the composite policy rejects
-        // it like a mapped ragged carrier rather than returning the padded storage.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let logical = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2f32, 99f32]).unwrap()))
-            .with_ragged_axes(vec![RaggedAxis::new(
-                0,
-                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
-                variable,
-                vec![],
-            )])
-            .unwrap();
-        for constructor in [CastOperation::checked, CastOperation::unchecked] {
-            assert_eq!(
-                constructor(ArrayType::new_static(DataType::F32, [3]).into(), vec![logical.clone().into()])
-                    .unwrap()
-                    .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-                    .map(|outputs| outputs.into_parts().0),
-                Err(BatchingError::UnsupportedOperation {
-                    message: "cannot batch ragged array type `f32[length]`".to_owned(),
-                }),
-            );
-        }
     }
 
     #[test]
@@ -6677,9 +6434,7 @@ mod tests {
                     &batching,
                     &EmptyRegionDriver,
                     &[ArrayIrBatch::new(mapped, BatchAxis::new(0))?, ArrayIrBatch::replicated(witness_value)],
-                )?
-                .into_parts()
-                .0;
+                )?;
                 Ok(outputs[0].value().clone())
             },
             (
@@ -6751,9 +6506,7 @@ mod tests {
                             ArrayIrBatch::new(mapped, BatchAxis::new(0))?,
                             ArrayIrBatch::new(witness, BatchAxis::new(0))?,
                         ],
-                    )?
-                    .into_parts()
-                    .0;
+                    )?;
                     Ok(outputs[0].value().clone())
                 },
                 (
@@ -8505,24 +8258,6 @@ mod tests {
                 &[ArrayType::new_static(DataType::F32, [2, 3]).into(), reference],
             ),
             Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
-        );
-    }
-
-    #[test]
-    fn test_cast_type_infer_cast_output_type_rejects_first_class_ragged_witnesses() {
-        let witness = ArrayIrType::Ragged(
-            RaggedType::new(
-                ArrayType::new_static(DataType::I64, [2]),
-                RaggedValueKind::Dimension(DimensionType::from(Dimension::Static(3))),
-                Vec::new(),
-            )
-            .unwrap(),
-        );
-        let array = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let operation = CastOperation::checked(array.clone(), vec![array.clone(), witness.clone()]).unwrap();
-        assert_eq!(
-            operation.infer_output_types(&[array, witness.clone()], &[]),
-            Err(TypeError::invalid(format!("`cast` does not support first-class ragged type `{witness}`",))),
         );
     }
 

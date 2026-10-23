@@ -8,8 +8,7 @@ use crate::arrays::{
 };
 use crate::axes::Axes;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -113,19 +112,17 @@ impl<C: Context<Type = ArrayType, Value: Reverse>, P: ArrayExtentBatchingPolicy<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let axes = self
             .axes
             .normalize(inputs[0].unbatched_type().rank())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
 
-        // Identity reversal preserves the packed value and all ragged extents without reindexing storage.
+        // Identity reversal preserves the packed value without reindexing storage.
         if axes.is_empty() {
-            return Ok(vec![inputs[0].clone()].into());
+            return Ok(vec![inputs[0].clone()]);
         }
-
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         // The mapped axis indexes independent arrays and must never be reversed with their logical axes.
         let batch_axis = inputs[0].batch_axis_position();
@@ -189,8 +186,6 @@ impl_differentiable_operation! {
 /// exactly, including NaN payloads. An empty axis list returns the input unchanged. A non-empty reversal clears the
 /// physical layout, since its result may use different storage. This operation supports symbolic extents and is
 /// linear and self-adjoint. Batching preserves the mapped axis and reverses only the selected per-item axes.
-/// Non-empty reversals of bounded ragged batches are rejected because reversing their padded storage would move
-/// padding into valid data. Empty axis lists preserve the ragged batch unchanged.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
@@ -279,11 +274,10 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
     };
-    use crate::contexts::{EagerContext, StagingContext};
+    use crate::contexts::StagingContext;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, TransposableOperation, TranspositionContext,
     };
@@ -405,30 +399,23 @@ mod tests {
                 },
             ],
         );
+    }
 
-        // Only identity reversal can preserve ragged extents without moving padded elements into valid data.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ragged_array_batch(
-            Array::matrix(2, 3, vec![1.0, 2.0, 0.0, 3.0, 0.0, 0.0]).unwrap(),
-            Array::vector(vec![2_i32, 1]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
-        assert!(matches!(
-            ReverseOperation::new([0]).batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == format!(
-                    "`{REVERSE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-        ));
-        let outputs = ReverseOperation::new(Vec::<usize>::new())
-            .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs, vec![input]);
+    #[test]
+    fn test_reverse_batching_identity() {
+        // Identity reversal returns the mapped input unchanged and stages nothing, even at a nonleading batch axis.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input =
+            ArrayBatch::new(context.input(ArrayType::new_static(DataType::F64, [3, 2])), BatchAxis::new(1)).unwrap();
+        assert_eq!(
+            ReverseOperation::new(Vec::<usize>::new()).batch(
+                &BatchingContext::new(context.clone(), 2),
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Ok(vec![input]),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]

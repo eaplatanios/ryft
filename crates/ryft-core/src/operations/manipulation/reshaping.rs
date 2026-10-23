@@ -11,8 +11,7 @@ use crate::arrays::{
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -195,13 +194,12 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         let Some(_) = inputs[0].batch_axis_position() else {
             // Replicated input meaning there is no batch axis to thread through the reshape, so interpret it as given
             // and report the output replicated.
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         };
         let Dimension::Static(axis_size) = P::axis_dimension(context)? else {
             return Err(BatchingError::UnsupportedOperation {
@@ -827,7 +825,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Explicit output extents remain replicated shape values. A mapped input is canonicalized to a leading batch
         // axis, and that axis is inserted into both the target shape and the output sharding before the mixed
         // operation is replayed.
@@ -836,8 +834,6 @@ where
         };
 
         <&ArrayType>::try_from(&input.unbatched_type())?;
-
-        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
 
         for extent in output_extents {
             extent.validate_replicated_dimension()?;
@@ -849,8 +845,7 @@ where
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>()
-                .into());
+                .collect::<Vec<_>>());
         }
 
         let moved_input = ArrayBatch::new(
@@ -879,8 +874,7 @@ where
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(0)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -1702,7 +1696,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
         DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis,
@@ -2152,10 +2145,9 @@ mod tests {
             Dimension::Static(1),
             Dimension::Static(2),
         ]));
-        let (outputs, _) = operation
+        let outputs = operation
             .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(1)).unwrap()])
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(
@@ -2194,24 +2186,6 @@ mod tests {
 
     #[test]
     fn test_reshape_batching_unsupported_extents() {
-        // Packed padding remains inaccessible: a reshape without a ragged contract must reject the input rather
-        // than return a dense batch that forgets its per-item extents.
-        let array =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
-        let input = ragged_array_batch(array, extents, &variable, 1).unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
-        let operation = ReshapeOperation::new(Shape::new(vec![Dimension::Static(3)]));
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{RESHAPE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-            },
-        );
-
         // A first-class mapped extent cannot be embedded into the homogeneous operation's static result shape. The
         // diagnostic directs this case to the mixed operation, which carries that extent as an input.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3820,9 +3794,7 @@ mod tests {
             ArrayIrBatch::replicated(three.clone()),
         ];
         let batched = DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &inputs).unwrap();
-        let (outputs, evidence) = batched.into_parts();
-        assert_eq!(outputs, vec![expected_output.clone()]);
-        assert_eq!(evidence, Vec::<DimensionVariable>::new());
+        assert_eq!(batched, vec![expected_output.clone()]);
 
         // A non-leading mapped axis is moved to the front before the per-item shape is lifted.
         let transposed = ArrayIrBatch::new(
@@ -3834,8 +3806,7 @@ mod tests {
         .unwrap();
         let inputs = [transposed, ArrayIrBatch::replicated(two), ArrayIrBatch::replicated(three)];
         let batched = DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &inputs).unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs, vec![expected_output]);
+        assert_eq!(batched, vec![expected_output]);
     }
 
     #[test]
@@ -3852,9 +3823,8 @@ mod tests {
             ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
         ];
         let batched = DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &inputs).unwrap();
-        let (outputs, _) = batched.into_parts();
         assert_eq!(
-            outputs,
+            batched,
             vec![ArrayIrBatch::replicated(ArrayIrValue::Array(
                 Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
             ))],
@@ -3862,55 +3832,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_reshape_batching_rejects_ragged_input() {
-        // Packed padding remains inaccessible: a reshape without a ragged contract must reject the input rather
-        // than return a dense batch that forgets its per-item extents.
+    fn test_dynamic_reshape_batching_rejects_array_extent() {
+        // A rectangular integer array is ordinary data, even when mapped; it cannot supply one shared shape extent.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
         );
-        let array = ArrayIrValue::Array(
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap(),
-        );
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents =
-            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap());
-        let input = ragged_batch(array, extents, &variable, 1).unwrap();
-        let three = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let input = ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::F64, [2, 6]).into()), 0).unwrap();
+        let extent = ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::I32, [2]).into()), 0).unwrap();
         assert_eq!(
-            DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &[input, three]).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{RESHAPE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-            },
+            DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &[input, extent]),
+            Err(BatchingError::Type(TypeError::invalid("expected dimension type but got array type"))),
         );
-    }
-
-    #[test]
-    fn test_dynamic_reshape_batching_rejects_mapped_extent() {
-        // Output extents are replicated shape values; a mapped per-item dimension cannot describe one output shape.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let input = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 6, (0..12).map(|value| value as f64).collect()).unwrap()),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let mapped_extent = ArrayIrBatch::mapped_dimension(
-            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[6_i32, 6]).unwrap()),
-            BatchAxis::new(0),
-            extent_type.clone(),
-        )
-        .unwrap();
-        assert!(matches!(
-            DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &[input, mapped_extent]),
-            Err(BatchingError::MappedDimension { r#type, axis })
-                if *r#type == extent_type && axis == BatchAxis::new(0),
-        ));
+        assert!(trace.builder().borrow().instructions().is_empty());
     }
 
     #[test]
@@ -3973,9 +3908,8 @@ mod tests {
             .with_output_sharding(Sharding::replicated(mesh, 2))
             .batch(&context, &EmptyRegionDriver, &[input, two, three])
             .unwrap();
-        let (outputs, _) = batched.into_parts();
         assert_eq!(
-            outputs,
+            batched,
             vec![
                 ArrayIrBatch::new(
                     ArrayIrValue::Array(Array::from_elements::<f64>(output_type, &values).unwrap()),
@@ -4014,8 +3948,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(batched.len(), 1);
         let program = parent
             .builder()
             .borrow()
@@ -4057,8 +3990,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(batched.len(), 1);
         let program = parent
             .builder()
             .borrow()

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -9,12 +9,11 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionOperation,
-    DimensionType, DimensionValue, LinearResiduals, RaggedAxis, Shape, Sharding, materialize_array_tangent,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -171,14 +170,11 @@ impl ConcatenateOperation<ArrayIrType> {
         };
         if inputs.is_empty() {
             return match result_extent {
-                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
                 ))),
                 ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
-                ))),
-                ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
                 ))),
             };
         }
@@ -376,7 +372,7 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Align all inputs on one physical batch axis (replicated inputs are broadcast to gain it via
         // `ArrayBatch::match_axis`, so each batch item concatenates its own inputs), and shift the concatenated
         // axis past the inserted batch axis when the batch axis sits at or before it. When no input is batched,
@@ -388,25 +384,17 @@ where
             .into());
         }
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            let ragged_axes = validate_concatenation_ragged_axes(
-                &inputs.iter().map(ArrayBatch::ragged_axes).collect::<Vec<_>>(),
-                self.axis(),
-            )?;
             let mut outputs = self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?;
-            return Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into());
+            return Ok(vec![outputs.remove(0)]);
         };
         let materialized = inputs
             .iter()
             .map(|input| P::match_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        let ragged_axes = validate_concatenation_ragged_axes(
-            &materialized.iter().map(ArrayBatch::ragged_axes).collect::<Vec<_>>(),
-            lifted_axis,
-        )?;
         let mut outputs = ConcatenateOperation::<ArrayType>::new(lifted_axis, materialized[0].r#type().rank())?
             .interpret_with_batch_axes(context, materialized.as_slice(), &[BatchAxis::from_position(batch_axis)])?;
-        Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into())
+        Ok(vec![outputs.remove(0)])
     }
 }
 
@@ -425,7 +413,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Batching rule for mixed `ConcatenateOperation<ArrayIrType>` instructions. The trailing result extent
         // stays replicated, while array inputs are aligned on one physical mapped axis before concatenation.
         let Some((result_extent, inputs)) = inputs.split_last() else {
@@ -437,7 +425,7 @@ where
 
         if inputs.is_empty() {
             return match result_extent.unbatched_type() {
-                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
                 ))
                 .into()),
@@ -445,22 +433,14 @@ where
                     "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
                 ))
                 .into()),
-                ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
-                ))
-                .into()),
             };
         }
 
-        // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
-        // representation. Concatenate therefore accepts only one replicated result extent.
+        // A mapped extent would authorize a different output shape for each batch item, which rectangular batching
+        // cannot represent. Concatenate therefore accepts only one replicated result extent.
         result_extent.validate_replicated_dimension()?;
 
         let Some(batch_axis) = inputs.iter().find_map(ArrayIrBatch::batch_axis_position) else {
-            let ragged_axes = validate_concatenation_ragged_axes(
-                &inputs.iter().map(ArrayIrBatch::ragged_axes).collect::<Vec<_>>(),
-                self.axis(),
-            )?;
             let mut outputs = context.parent().bind(
                 self.clone(),
                 Vec::new(),
@@ -471,7 +451,7 @@ where
                     .collect::<Vec<_>>(),
             )?;
             check_count!("output", outputs, 1, ProgramError);
-            return Ok(vec![ArrayIrBatch::replicated(outputs.remove(0)).with_ragged_axes(ragged_axes)?].into());
+            return Ok(vec![ArrayIrBatch::replicated(outputs.remove(0))]);
         };
 
         // Align every packed array on one mapped axis. Replicated inputs gain that axis using the transform's
@@ -482,21 +462,13 @@ where
             .map(|input| driver.align_batch_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        let ragged_axes = validate_concatenation_ragged_axes(
-            &aligned_inputs.iter().map(ArrayIrBatch::ragged_axes).collect::<Vec<_>>(),
-            lifted_axis,
-        )?;
         let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>();
         lifted_inputs.push(result_extent.value().clone());
         let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = ConcatenateOperation::<ArrayIrType>::new(lifted_axis, &input_types)?;
         let mut outputs = context.parent().bind(operation, Vec::new(), lifted_inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![
-            ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(batch_axis))?
-                .with_ragged_axes(ragged_axes)?,
-        ]
-        .into())
+        Ok(vec![ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(batch_axis))?])
     }
 }
 
@@ -617,17 +589,13 @@ impl_differentiable_operation! {
 
             if array_inputs.is_empty() {
                 return match result_extent.primal().r#type().as_ref() {
-                    ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                    ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
                         "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
                     ))
                     .into()),
                     ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                         "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array before its result \
                          extent",
-                    ))
-                    .into()),
-                    ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
-                        "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
                     ))
                     .into()),
                 };
@@ -792,16 +760,12 @@ impl_differentiable_operation! {
 
             if array_inputs.is_empty() {
                 return match result_extent.r#type().as_ref() {
-                    ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                    ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
                         "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
                     ))
                     .into()),
                     ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                         "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array before its result extent",
-                    ))
-                    .into()),
-                    ArrayIrType::Reference(_) | ArrayIrType::Ragged(_) => Err(TypeError::invalid(format!(
-                        "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
                     ))
                     .into()),
                 };
@@ -1485,54 +1449,6 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         })
 }
 
-/// Preserves shared ragged axes whose values and extent arrays are unaffected by concatenating `axis`.
-/// Callers must provide at least one input and validate its concatenated axis before invoking this function.
-fn validate_concatenation_ragged_axes<V: Value>(
-    inputs: &[&[RaggedAxis<V>]],
-    axis: usize,
-) -> Result<Vec<RaggedAxis<V>>, BatchingError> {
-    let first = inputs[0];
-    let first_by_axis = first.iter().map(|ragged_axis| (ragged_axis.axis(), ragged_axis)).collect::<BTreeMap<_, _>>();
-    for ragged_axes in inputs {
-        if ragged_axes
-            .iter()
-            .any(|ragged_axis| ragged_axis.axis() == axis || ragged_axis.extent_axes().contains(&axis))
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an axis \
-                     indexing its extents",
-                ),
-            }
-            .into());
-        }
-
-        // Matching dimension identities denote the same per-item extents; comparing the runtime array values would
-        // require executing tracers. Their coordinate axes must also agree after batch-axis alignment. Metadata order
-        // is not semantic, so inputs are compared as maps from physical axis to entry, which also rejects duplicate
-        // entries on one axis, and the first input's presentation order is retained.
-        let by_axis =
-            ragged_axes.iter().map(|ragged_axis| (ragged_axis.axis(), ragged_axis)).collect::<BTreeMap<_, _>>();
-        if by_axis.len() != ragged_axes.len()
-            || by_axis.len() != first_by_axis.len()
-            || by_axis.iter().any(|(physical_axis, ragged_axis)| {
-                first_by_axis.get(physical_axis).is_none_or(|candidate| {
-                    candidate.dimension() != ragged_axis.dimension()
-                        || candidate.extent_axes() != ragged_axis.extent_axes()
-                })
-            })
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{CONCATENATE_OPERATION_NAME}` batching requires matching ragged dimensions and extent axes",
-                ),
-            }
-            .into());
-        }
-    }
-    Ok(first.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1543,7 +1459,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingDriver};
     use crate::contexts::{EagerContext, StagingContext};
@@ -2056,45 +1972,6 @@ mod tests {
                 }],
             );
         }
-    }
-
-    #[test]
-    fn test_concatenate_batching_preserves_ragged_dimensions() {
-        let context =
-            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap();
-        let values =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1, 3]), &[1_f32, 0., 0., 2., 3., 4.])
-                .unwrap();
-        let ragged = RaggedAxis::new(2, extents.clone(), size.clone(), vec![0]);
-        let input = ArrayBatch::new(values.clone(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![ragged.clone()])
-            .unwrap();
-        let (outputs, _) = ConcatenateOperation::<ArrayType>::new(0, 2)
-            .unwrap()
-            .batch(&context, &EmptyRegionDriver, &[input.clone(), input.clone()])
-            .unwrap()
-            .into_parts();
-        let [output] = outputs.try_into().unwrap();
-        assert_eq!(output.ragged_axes(), &[ragged]);
-        assert_eq!(
-            output.value(),
-            &Array::from_elements(
-                ArrayType::new_static(DataType::F32, [2, 2, 3]),
-                &[1_f32, 0., 0., 1., 0., 0., 2., 3., 4., 2., 3., 4.],
-            )
-            .unwrap()
-        );
-        assert!(matches!(
-            ConcatenateOperation::<ArrayType>::new(1, 2)
-                .unwrap()
-                .batch(&context, &EmptyRegionDriver, &[input.clone(), input]),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!("`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an \
-                                       axis indexing its extents"),
-        ));
     }
 
     #[test]
@@ -2886,10 +2763,9 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let (outputs, _) = operation
+        let outputs = operation
             .batch(&context, &driver, &[left, right, ArrayIrBatch::replicated(extent.clone())])
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -2919,10 +2795,8 @@ mod tests {
         let replicated = ArrayIrBatch::replicated(ArrayIrValue::Array(
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[5.0_f32]).unwrap(),
         ));
-        let (outputs, _) = operation
-            .batch(&context, &driver, &[mapped, replicated, ArrayIrBatch::replicated(extent)])
-            .unwrap()
-            .into_parts();
+        let outputs =
+            operation.batch(&context, &driver, &[mapped, replicated, ArrayIrBatch::replicated(extent)]).unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -3042,46 +2916,6 @@ mod tests {
             .trim_end(),
         );
         Ok(())
-    }
-
-    #[test]
-    fn test_array_ir_concatenate_batching_preserves_ragged_dimensions() {
-        // The mixed operation preserves the same ragged metadata as the homogeneous one while treating its result
-        // extent as a shape input.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents =
-            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap());
-        let values = ArrayIrValue::Array(
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1, 3]), &[1_f32, 0., 0., 2., 3., 4.])
-                .unwrap(),
-        );
-        let ragged = RaggedAxis::new(2, extents, size, vec![0]);
-        let input = ArrayIrBatch::new(values, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![ragged.clone()])
-            .unwrap();
-        let extent = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let operation =
-            ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::<ArrayType>::new(0, 2).unwrap());
-        let (outputs, _) =
-            operation.batch(&context, &EmptyRegionDriver, &[input.clone(), input, extent]).unwrap().into_parts();
-        let [output] = outputs.try_into().unwrap();
-        assert_eq!(output.ragged_axes(), &[ragged]);
-        assert_eq!(output.batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            output.value(),
-            &ArrayIrValue::Array(
-                Array::from_elements(
-                    ArrayType::new_static(DataType::F32, [2, 2, 3]),
-                    &[1_f32, 0., 0., 1., 0., 0., 2., 3., 4., 2., 3., 4.],
-                )
-                .unwrap(),
-            ),
-        );
     }
 
     #[test]
@@ -4020,61 +3854,5 @@ mod tests {
                 ),
             })
         );
-    }
-
-    #[test]
-    fn test_validate_concatenation_ragged_axes() {
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap();
-        let rows = RaggedAxis::new(
-            1,
-            extents.clone(),
-            DimensionVariable::new("rows", DimensionBounds::new(0, Some(4)).unwrap()),
-            vec![0],
-        );
-        let columns = RaggedAxis::new(
-            2,
-            extents,
-            DimensionVariable::new("columns", DimensionBounds::new(0, Some(4)).unwrap()),
-            vec![0],
-        );
-        let first = [rows.clone(), columns.clone()];
-        let second = [columns, rows.clone()];
-        assert_eq!(validate_concatenation_ragged_axes(&[&first, &second], 3), Ok(first.to_vec()));
-
-        // Two entries on one physical axis are rejected even when every entry matches one in the first input.
-        let duplicated = [rows.clone(), rows];
-        assert!(matches!(
-            validate_concatenation_ragged_axes(&[&first, &duplicated], 3),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "`{CONCATENATE_OPERATION_NAME}` batching requires matching ragged dimensions and extent axes",
-                ),
-        ));
-
-        // An axis cannot be concatenated when it stores ragged data or indexes that data's extent array.
-        assert!(matches!(
-            validate_concatenation_ragged_axes(&[&first, &second], 1),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an \
-                     axis indexing its extents",
-                ),
-        ));
-        assert!(matches!(
-            validate_concatenation_ragged_axes(&[&first, &second], 0),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an \
-                     axis indexing its extents",
-                ),
-        ));
-        // Missing metadata cannot be interpreted as an ordinary dense shape for the other input.
-        assert!(matches!(
-            validate_concatenation_ragged_axes(&[&first, &second[..1]], 3),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "`{CONCATENATE_OPERATION_NAME}` batching requires matching ragged dimensions and extent axes",
-                ),
-        ));
     }
 }

@@ -12,15 +12,14 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    MemberDifferentiableOperation, MemberTransposableOperation, SupportsCotangentAdd, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
+    MemberDifferentiableOperation, MemberTransposableOperation, TransposableOperation, TranspositionContext,
+    TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -228,17 +227,14 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-
-        // Static or clamped windows cannot describe a changed ragged extent.
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         // A batched input keeps its batch axis by slicing it whole, so the lifted operation inserts start index `0`,
         // the batch axis's own extent as its limit (which keeps a dynamic mapped extent whole too), and stride `1` at
         // the batch axis position.
         match inputs[0].batch_axis_position() {
-            None => Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into()),
+            None => Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?),
             Some(batch_axis) => {
                 let mut start_indices = self.start_indices().to_vec();
                 start_indices.insert(batch_axis, 0);
@@ -247,7 +243,7 @@ where
                 let mut strides = self.strides().to_vec();
                 strides.insert(batch_axis, 1);
                 let lifted = SliceOperation::new(start_indices, limits).with_strides(strides)?;
-                Ok(lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])?.into())
+                Ok(lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])?)
             }
         }
     }
@@ -506,7 +502,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
     for SliceOperation
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: SupportsCotangentAdd
+    O: OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<
             ArrayType,
@@ -936,14 +932,12 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // The input and update inputs are aligned on one physical batch axis (replicated inputs are broadcast to gain
         // it), and the lifted operation inserts start index `0` at that axis so each batch item updates its own block.
-        // Static or clamped windows cannot describe a changed ragged extent.
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         check_count!("input", inputs, 2, ProgramError);
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         };
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
         let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
@@ -1671,7 +1665,7 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Batched starts are packed into one gather index vector per item. Mapped sources use paired gather batch
         // dimensions so each item reads only its own source. Explicit-layout inputs retain per-item expansion, which
         // extracts each input/start tuple and stacks its slice along a leading batch axis. Both paths use existing
@@ -1681,10 +1675,8 @@ where
         // fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for
         // it, derived from an existing index input via `ZeroLike` so the inserted index carries the same scalar integer
         // type. Rank-0 inputs have no index inputs to donate a zero index, but a rank-0 dynamic slice is the identity
-        // map, so the batched input passes through unchanged. Static or clamped windows cannot describe a changed
-        // ragged extent.
+        // map, so the batched input passes through unchanged.
         check_count!("input", inputs, 1 + self.sizes().len(), ProgramError);
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         let batch_axes = inputs.iter().map(|input| input.batch_axis_position()).collect::<Vec<_>>();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
@@ -1796,7 +1788,7 @@ where
                     .with_mode(GatherMode::Clip)
                     .with_output_sharding(output_type.sharding().cloned());
                 let output = source.gather(&indices, &dimensions, &sizes, &options)?;
-                return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?].into());
+                return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?]);
             }
 
             return Ok(batch_by_item_expansion(
@@ -1814,14 +1806,14 @@ where
         }
 
         let Some(batch_axis) = batch_axes[0] else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         };
 
         if self.sizes().is_empty() {
             // An empty size list is an identity only for a scalar per-item input. The shortcut bypasses the
             // parent bind, so validate the original unbatched call before returning its input unchanged.
             self.infer_output_types(&inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>(), &[])?;
-            return Ok(vec![inputs[0].clone()].into());
+            return Ok(vec![inputs[0].clone()]);
         }
 
         let axis_size = axis_size.ok_or_else(|| ProgramError::UnsupportedOperation {
@@ -2033,7 +2025,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
     for DynamicSliceOperation<ArrayType>
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: SupportsCotangentAdd
+    O: OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<
@@ -2251,14 +2243,13 @@ impl<
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        // This rule currently supports replicated first-class starts and sizes. Different sizes can require ragged
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // This rule supports replicated first-class starts and sizes. Different sizes can produce nonrectangular
         // output. Different starts with shared sizes would remain rectangular but need a separate reindexing rule.
         // Insert a mapped array axis with start zero, the transform's exact extent, and unit stride. The payload's
         // stride count and the input's rank bound the arity independently as a payload built for another rank must
         // be rejected rather than indexed.
         check_count!("input", inputs, 1 + 2 * self.strides.len(), ProgramError);
-        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
 
         let (input, bounds) = inputs.split_first().unwrap();
         let unbatched_type = input.unbatched_type();
@@ -2275,8 +2266,7 @@ impl<
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>()
-                .into());
+                .collect::<Vec<_>>());
         }
 
         let batch_axis = input.batch_axis_position().unwrap();
@@ -2313,8 +2303,7 @@ impl<
             .bind(operation, Vec::new(), packed_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -3313,7 +3302,7 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Replicated start indices keep the structural fast path where the input and update inputs are aligned on one
         // physical batch axis (replicated inputs are broadcast to gain it), and the lifted operation inserts a zero
         // start index for that axis, derived from an existing index input via `ZeroLike` so the inserted index carries
@@ -3328,8 +3317,6 @@ where
         // The expansion stages `O(batch_size)` operations and behaves identically in eager and tracing contexts because
         // it only goes through the value capability traits.
         //
-        // Static or clamped windows cannot describe a changed ragged extent.
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
@@ -3353,14 +3340,14 @@ where
         }
 
         let Some(batch_axis) = batch_axes[..2].iter().copied().flatten().next() else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         };
 
         if inputs.len() == 2 {
             // No start indices means scalar replacement only after validating rank, data type, memory, and
             // placement. Otherwise, this shortcut would silently accept malformed calls that the parent rejects.
             self.infer_output_types(&inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>(), &[])?;
-            return Ok(vec![P::match_axis(context, &inputs[1], Axis::from(batch_axis))?].into());
+            return Ok(vec![P::match_axis(context, &inputs[1], Axis::from(batch_axis))?]);
         }
 
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
@@ -4407,11 +4394,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayReferenceDischarge, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
+        DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension, StridedLayout, f8e8m0fnu, i4,
     };
     use crate::axes::{AxisError, NamedAxis};
@@ -4440,19 +4426,6 @@ mod tests {
     use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;
-
-    /// Returns a `[2, 4]` batch mapped at axis `0` whose data axis is declared bounded-ragged, which no slicing rule
-    /// supports.
-    fn ragged_batch() -> ArrayBatch<Array> {
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        ragged_array_batch(
-            Array::matrix(2, 4, vec![1.0; 8]).unwrap(),
-            Array::vector(vec![1_i64, 3]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap()
-    }
 
     /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
     fn index_constant<V>(exemplar: &V, value: i32) -> V
@@ -4834,15 +4807,8 @@ mod tests {
             ],
         );
 
-        // Bounded ragged inputs are rejected before any window arithmetic, and the arity is validated right after.
+        // Invalid input counts are rejected before alignment.
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
-        assert!(matches!(
-            SliceOperation::new(vec![1], vec![3]).batch(&context, &EmptyRegionDriver, &[ragged_batch()]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == format!(
-                    "`{SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-        ));
         assert_eq!(
             SliceOperation::new(vec![1], vec![3]).batch(&context, &EmptyRegionDriver, &[]).unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -4865,17 +4831,15 @@ mod tests {
             ProjectedContext::new(trace),
             extent,
         );
-        let (outputs, evidence) = SliceOperation::new(vec![0], vec![2])
+        let outputs = SliceOperation::new(vec![0], vec![2])
             .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0)).unwrap()])
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(
             outputs[0].r#type().into_owned(),
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items), Dimension::Static(2)])),
         );
-        assert!(evidence.is_empty());
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
 
@@ -5680,16 +5644,9 @@ mod tests {
             ],
         );
 
-        // Bounded ragged inputs are rejected before any alignment, and the arity is validated right after.
+        // Invalid input counts are rejected before alignment.
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         let update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]).unwrap());
-        assert!(matches!(
-            UpdateSliceOperation::new(vec![1]).batch(&context, &EmptyRegionDriver, &[ragged_batch(), update.clone()]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == format!(
-                    "`{UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-        ));
         assert_eq!(
             UpdateSliceOperation::new(vec![1]).batch(&context, &EmptyRegionDriver, &[update]).unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
@@ -5718,11 +5675,7 @@ mod tests {
         )
         .unwrap();
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
-        let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&context, &EmptyRegionDriver, &[input, update])
-            .unwrap()
-            .into_parts()
-            .0;
+        let outputs = UpdateSliceOperation::new(vec![1]).batch(&context, &EmptyRegionDriver, &[input, update]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
@@ -5746,11 +5699,7 @@ mod tests {
         )
         .unwrap();
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
-        let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&context, &EmptyRegionDriver, &[input, update])
-            .unwrap()
-            .into_parts()
-            .0;
+        let outputs = UpdateSliceOperation::new(vec![1]).batch(&context, &EmptyRegionDriver, &[input, update]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&manual_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
@@ -6460,17 +6409,9 @@ mod tests {
             }],
         );
 
-        // Bounded ragged inputs are rejected before any window arithmetic, and a missing or extra start index is
-        // rejected against the operation's own size count right after.
+        // Invalid input counts are rejected before alignment.
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         let start = ArrayBatch::replicated(start);
-        assert!(matches!(
-            DynamicSliceOperation::new(vec![2]).batch(&context, &EmptyRegionDriver, &[ragged_batch(), start.clone()]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-        ));
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(
             DynamicSliceOperation::new(vec![2])
@@ -6491,7 +6432,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         let operation = DynamicSliceOperation::new(vec![]);
         let scalars = ArrayBatch::new(Array::vector(vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[scalars.clone()]).unwrap().into_parts().0;
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[scalars.clone()]).unwrap();
         assert_eq!(outputs, vec![scalars]);
 
         // An empty size list cannot turn a per-item vector into a scalar identity operation.
@@ -6517,9 +6458,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0, 2])],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(2)]);
@@ -6619,9 +6558,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(&BatchingContext::new(EagerContext::<Array>::new(), 0), &EmptyRegionDriver, &[input, indices])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(
             outputs[0].value(),
@@ -6693,9 +6630,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1, 3])],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
 
@@ -6712,9 +6647,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1, 2])],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
     }
@@ -6741,9 +6674,7 @@ mod tests {
         let shared = ArrayBatch::replicated(Array::from_elements(shared_type, &[0_f64, 1.0, 2.0, 3.0]).unwrap());
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(&context, &EmptyRegionDriver, &[shared, indices.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].r#type().memory(), Memory::Host { pinned: true });
         assert_eq!(outputs[0].r#type().sharding(), Some(&mapped_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
@@ -6756,11 +6687,8 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&context, &EmptyRegionDriver, &[paired, indices])
-            .unwrap()
-            .into_parts()
-            .0;
+        let outputs =
+            DynamicSliceOperation::new(vec![2]).batch(&context, &EmptyRegionDriver, &[paired, indices]).unwrap();
         assert_eq!(outputs[0].r#type().memory(), Memory::Host { pinned: true });
         assert_eq!(outputs[0].r#type().sharding(), Some(&mapped_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
@@ -6782,14 +6710,11 @@ mod tests {
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.domain(), 2);
-                let outputs = DynamicSliceOperation::new(vec![2])
-                    .batch(
-                        &context,
-                        &EmptyRegionDriver,
-                        &[ArrayBatch::replicated(source), ArrayBatch::new(starts, BatchAxis::new(0))?],
-                    )?
-                    .into_parts()
-                    .0;
+                let outputs = DynamicSliceOperation::new(vec![2]).batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::replicated(source), ArrayBatch::new(starts, BatchAxis::new(0))?],
+                )?;
                 Ok(outputs.into_iter().next().unwrap().into_value())
             },
             (varying(DataType::F64, &[4]), varying(DataType::I32, &[2])),
@@ -6830,14 +6755,11 @@ mod tests {
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.domain(), 2);
-                let outputs = DynamicSliceOperation::new(vec![2])
-                    .batch(
-                        &context,
-                        &EmptyRegionDriver,
-                        &[ArrayBatch::new(source, BatchAxis::new(0))?, ArrayBatch::new(starts, BatchAxis::new(0))?],
-                    )?
-                    .into_parts()
-                    .0;
+                let outputs = DynamicSliceOperation::new(vec![2]).batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::new(source, BatchAxis::new(0))?, ArrayBatch::new(starts, BatchAxis::new(0))?],
+                )?;
                 Ok(outputs.into_iter().next().unwrap().into_value())
             },
             (varying(DataType::F64, &[2, 4]), varying(DataType::I32, &[2])),
@@ -8290,9 +8212,7 @@ mod tests {
 
         let outputs = DynamicSliceOperation::<ArrayIrType>::from_rank(1)
             .batch(&context, &EmptyRegionDriver, &[input, start.clone(), size.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(
@@ -8306,9 +8226,7 @@ mod tests {
             ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 1.0, 2.0, 3.0]).unwrap()));
         let outputs = DynamicSliceOperation::<ArrayIrType>::from_rank(1)
             .batch(&context, &EmptyRegionDriver, &[replicated, start.clone(), size.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
@@ -8335,7 +8253,7 @@ mod tests {
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 3, actual: 5 }),
         );
 
-        // First-class starts and sizes must remain replicated because per-item slice extents would be ragged.
+        // First-class starts and sizes remain replicated so every batch item has the same output shape.
         let mapped_size =
             ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![1_i64, 2]).unwrap()), BatchAxis::new(0)).unwrap();
         assert!(matches!(
@@ -8363,32 +8281,6 @@ mod tests {
             Err(BatchingError::MisalignedBatchAxes { message })
                 if message == format!(
                     "`{DYNAMIC_SLICE_OPERATION_NAME}` mapped input extent 3 does not match batching extent 2",
-                ),
-        ));
-
-        // A rectangular result must not silently discard a per-item extent contract.
-        let ragged = RaggedAxis::new(
-            1,
-            ArrayIrValue::Array(Array::vector(vec![1_i64, 3]).unwrap()),
-            DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap()),
-            vec![0],
-        );
-        let input =
-            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1_f32; 8]).unwrap()), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![ragged])
-                .unwrap();
-        let start = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
-        let size = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
-        assert!(matches!(
-            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(
-                &context,
-                &EmptyRegionDriver,
-                &[input, start, size],
-            ),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
                 ),
         ));
     }
@@ -9119,21 +9011,8 @@ mod tests {
             }],
         );
 
-        // Bounded ragged inputs are rejected before any alignment, and a missing update is rejected right after.
+        // Invalid input counts are rejected before alignment.
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
-        let update = ArrayBatch::replicated(Array::vector(vec![8.0, 9.0]).unwrap());
-        assert!(matches!(
-            DynamicUpdateSliceOperation::new().batch(
-                &context,
-                &EmptyRegionDriver,
-                &[ragged_batch(), update.clone(), ArrayBatch::replicated(Array::scalar(1_i32).unwrap())],
-            ),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == format!(
-                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on \
-                     input 0",
-                ),
-        ));
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(
             DynamicUpdateSliceOperation::new().batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
@@ -9148,9 +9027,7 @@ mod tests {
         let updates = ArrayBatch::new(Array::vector(vec![7.0, 8.0]).unwrap(), BatchAxis::new(0)).unwrap();
         let outputs = DynamicUpdateSliceOperation::new()
             .batch(&context, &EmptyRegionDriver, &[scalars.clone(), updates.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs, vec![updates]);
 
         // A replicated scalar update is repeated across the mapped scalar inputs it replaces.
@@ -9160,9 +9037,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[scalars.clone(), ArrayBatch::replicated(Array::scalar(9.0_f64).unwrap())],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![9.0, 9.0]).unwrap());
 
@@ -9205,9 +9080,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0, 2])],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(4)]);
@@ -9226,9 +9099,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1, 0])],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 9.0, 9.0, 6.0, 7.0]);
     }
@@ -9258,9 +9129,7 @@ mod tests {
         let start = ArrayBatch::replicated(Array::scalar(1_i32).unwrap());
         let outputs = DynamicUpdateSliceOperation::new()
             .batch(&context, &EmptyRegionDriver, &[input, update, start.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
@@ -9295,9 +9164,7 @@ mod tests {
         );
         let outputs = DynamicUpdateSliceOperation::new()
             .batch(&context, &EmptyRegionDriver, &[input, update, start])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&manual_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);

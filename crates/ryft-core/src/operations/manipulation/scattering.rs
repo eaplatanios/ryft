@@ -10,8 +10,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -1065,15 +1064,14 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Lift window and batching dimensions to carry one leading mapped axis. The input and updates acquire that
         // axis. Mapped indices use an explicit paired batching dimension, while replicated indices keep it in the
         // update window.
         check_count!("input", inputs, 3, ProgramError);
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         if inputs.iter().all(|input| input.batch_axis_position().is_none()) {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
         }
 
         let axis_dimension = P::axis_dimension(context)?;
@@ -2342,7 +2340,6 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout,
@@ -2442,7 +2439,7 @@ mod tests {
         let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
         let indices = ValueProjection::<ArrayType>::into_projected(indices).unwrap();
         let updates = ValueProjection::<ArrayType>::into_projected(updates).unwrap();
-        let (outputs, _) = operation
+        let outputs = operation
             .batch(
                 &context,
                 &EmptyRegionDriver,
@@ -2452,8 +2449,7 @@ mod tests {
                     ArrayBatch::new(updates, BatchAxis::new(mapped_axis)).unwrap(),
                 ],
             )
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         let output = <IrTracer as ValueProjection<ArrayType>>::from_projected(outputs[0].value().clone());
@@ -4005,25 +4001,6 @@ mod tests {
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[]).unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
-        );
-
-        // Ragged input extents must never be replaced with packed storage extents while selecting windows.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let ragged = ragged_array_batch(
-            Array::matrix(2, 3, vec![1_f64, 2., 3., 4., 5., 6.]).unwrap(),
-            Array::vector(vec![1_i32, 3]).unwrap(),
-            &variable,
-            1,
-        )
-        .unwrap();
-        let updates = ArrayBatch::new(Array::matrix(2, 1, vec![1.0; 2]).unwrap(), BatchAxis::new(0)).unwrap();
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[ragged, indices, updates]).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{SCATTER_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
-                ),
-            },
         );
 
         // Mapped axes away from position zero are moved to the front first, and a requested output placement gains a

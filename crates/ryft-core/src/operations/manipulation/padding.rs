@@ -8,13 +8,12 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, AsArrayType,
-    AsDimensionType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
-    RaggedAxis, Shape, materialize_array_tangent,
+    AsDimensionType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
+    materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -494,7 +493,7 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // A batched input with a replicated padding value keeps its batch axis by padding it with zero amounts (i.e.,
         // the lifted operation inserts `0` into all three padding vectors at the batch axis position). A batch-varying
         // (i.e., batched) padding value is vectorized with a constant-size mask construction (i.e., pad the input with
@@ -502,10 +501,8 @@ where
         // over the padded result, and select those values at padding positions).
         check_count!("input", inputs, 2, ProgramError);
 
-        // Validate the padding contract first so that the ragged-axis check indexes the amounts with a known arity, and
-        // reject unsupported ragged axes before ordinary shape inference, which cannot express a changed ragged extent.
-        // The amounts are indexed physically after inserting the mapped batch axis, and the lifted vectors are reused
-        // by every branch below.
+        // Validate the padding contract before lifting the amounts across the mapped batch axis. The lifted vectors
+        // are reused by every branch below.
         validate_pad_inputs(
             &inputs[0].unbatched_type(),
             &inputs[1].unbatched_type(),
@@ -521,23 +518,17 @@ where
             edge_padding_high.insert(axis, 0);
             interior_padding.insert(axis, 0);
         }
-        let ragged_axes = validate_padding_ragged_axes(
-            inputs[0].ragged_axes(),
-            &edge_padding_low,
-            &edge_padding_high,
-            &interior_padding,
-        )?;
 
         self.infer_output_types(&inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>(), &[])?;
         if inputs[1].batch_axis_position().is_none() {
             let Some(batch_axis) = inputs[0].batch_axis_position() else {
                 let mut outputs = self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?;
-                return Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into());
+                return Ok(vec![outputs.remove(0)]);
             };
             let lifted = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
             let mut outputs =
                 lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])?;
-            return Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into());
+            return Ok(vec![outputs.remove(0)]);
         }
 
         // A replicated input is aligned to a batch axis at position zero, so its amounts are lifted there as well.
@@ -548,12 +539,6 @@ where
             edge_padding_high.insert(0, 0);
             interior_padding.insert(0, 0);
         }
-        let ragged_axes = validate_padding_ragged_axes(
-            input.ragged_axes(),
-            &edge_padding_low,
-            &edge_padding_high,
-            &interior_padding,
-        )?;
         let padding_type = inputs[1].unbatched_type();
         let placeholder_padding = context.parent().one(&padding_type)?;
         let padded = input.value().pad(
@@ -574,7 +559,7 @@ where
         )?;
         let broadcasted_padding = inputs[1].value().broadcast(padded.r#type().into_owned(), &[batch_axis])?;
         let output = mask.select(&padded, &broadcasted_padding)?;
-        Ok(vec![ArrayBatch::new(output, BatchAxis::from_position(batch_axis))?.with_ragged_axes(ragged_axes)?].into())
+        Ok(vec![ArrayBatch::new(output, BatchAxis::from_position(batch_axis))?])
     }
 }
 
@@ -601,7 +586,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Explicit result extents remain replicated. When the scalar padding value varies across the batch, the rule
         // pads with a representable placeholder and uses a padded mask to select the broadcast per-item padding value
         // without changing `pad`'s scalar input contract.
@@ -632,23 +617,16 @@ where
             .batch_axis_position()
             .or(Some(0).filter(|_| !padding_value_batch.batch_axis().is_replicated()))
         else {
-            let ragged_axes = validate_padding_ragged_axes(
-                input.ragged_axes(),
-                self.edge_padding_low(),
-                self.edge_padding_high(),
-                self.interior_padding(),
-            )?;
             let mut outputs = context.parent().bind(
                 self.clone(),
                 Vec::new(),
                 &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
             )?;
             check_count!("output", outputs, 1, ProgramError);
-            return Ok(vec![ArrayIrBatch::replicated(outputs.remove(0)).with_ragged_axes(ragged_axes)?].into());
+            return Ok(vec![ArrayIrBatch::replicated(outputs.remove(0))]);
         };
 
         let aligned_batch = driver.align_batch_axis(context, input.clone(), Axis::from(batch_axis))?;
-        let aligned_ragged_axes = aligned_batch.ragged_axes().to_vec();
         let input_batch = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(aligned_batch.into_value())?,
             BatchAxis::from_position(batch_axis),
@@ -659,12 +637,6 @@ where
         edge_padding_high.insert(batch_axis, 0);
         let mut interior_padding = self.interior_padding().to_vec();
         interior_padding.insert(batch_axis, 0);
-        let ragged_axes = validate_padding_ragged_axes(
-            &aligned_ragged_axes,
-            &edge_padding_low,
-            &edge_padding_high,
-            &interior_padding,
-        )?;
         let operation = PadOperation::<ArrayIrType>::new(edge_padding_low, edge_padding_high, interior_padding)?;
         let mut lifted_output_extents = Vec::with_capacity(output_extents.len() + 1);
         lifted_output_extents.extend(output_extents[..batch_axis].iter().map(|extent| extent.value().clone()));
@@ -683,11 +655,7 @@ where
                 .with_input_types(&lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
             let mut outputs = context.parent().bind(operation, Vec::new(), lifted_inputs.as_slice())?;
             check_count!("output", outputs, 1, ProgramError);
-            return Ok(vec![
-                ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(batch_axis))?
-                    .with_ragged_axes(ragged_axes)?,
-            ]
-            .into());
+            return Ok(vec![ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(batch_axis))?]);
         }
 
         // `pad` requires a scalar padding input. Pad with a representable placeholder, build a Boolean mask for its
@@ -761,14 +729,10 @@ where
         let mut output =
             array_context.bind(SelectOperation::new(), Vec::new(), &[mask, padded, broadcasted_padding])?;
         check_count!("output", output, 1, ProgramError);
-        Ok(vec![
-            ArrayIrBatch::new(
-                <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
-                BatchAxis::from_position(batch_axis),
-            )?
-            .with_ragged_axes(ragged_axes)?,
-        ]
-        .into())
+        Ok(vec![ArrayIrBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
+            BatchAxis::from_position(batch_axis),
+        )?])
     }
 }
 
@@ -2172,43 +2136,6 @@ fn is_effective_identity(
         })
 }
 
-/// Validates that padding can preserve the existing [`RaggedAxis`] metadata without updating its extent values or
-/// their indexing. Each ragged data axis and every axis indexing its extents must have zero low, high, and interior
-/// padding; other axes may be padded normally. The function rejects axes outside the padding vectors and unsupported
-/// changes to ragged axes, otherwise returning a clone of the unchanged metadata for the batching rule to retain.
-fn validate_padding_ragged_axes<V: Value>(
-    ragged_axes: &[RaggedAxis<V>],
-    edge_padding_low: &[i64],
-    edge_padding_high: &[i64],
-    interior_padding: &[usize],
-) -> Result<Vec<RaggedAxis<V>>, BatchingError> {
-    for ragged_axis in ragged_axes {
-        for axis in std::iter::once(ragged_axis.axis()).chain(ragged_axis.extent_axes().iter().copied()) {
-            let (Some(low), Some(high), Some(interior)) =
-                (edge_padding_low.get(axis), edge_padding_high.get(axis), interior_padding.get(axis))
-            else {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: format!(
-                        "`{}` batching found ragged axis {} outside the padded rank {}",
-                        PAD_OPERATION_NAME,
-                        axis,
-                        edge_padding_low.len(),
-                    ),
-                });
-            };
-            if *low != 0 || *high != 0 || *interior != 0 {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "`{PAD_OPERATION_NAME}` batching cannot change a ragged axis or an axis indexing its extents",
-                    ),
-                }
-                .into());
-            }
-        }
-    }
-    Ok(ragged_axes.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -2218,7 +2145,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
@@ -2687,8 +2614,7 @@ mod tests {
     #[test]
     fn test_pad_batching_sharding() {
         // The transform-owned mapped axis sharding rides along the batch axis, while the padded axis keeps its
-        // replicated sharding, both for explicit mesh axes and for varying manual ones. `into_parts` splits the
-        // batched-output carrier into the outputs and the ragged evidence, which padding never produces.
+        // replicated sharding, both for explicit mesh axes and for varying manual ones.
         let operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap();
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let explicit_sharding = Sharding::new(
@@ -2717,8 +2643,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let (outputs, _) =
-            operation.batch(&explicit_context, &EmptyRegionDriver, &[input, padding]).unwrap().into_parts();
+        let outputs = operation.batch(&explicit_context, &EmptyRegionDriver, &[input, padding]).unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -2766,8 +2691,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let (outputs, _) =
-            operation.batch(&manual_context, &EmptyRegionDriver, &[input, padding]).unwrap().into_parts();
+        let outputs = operation.batch(&manual_context, &EmptyRegionDriver, &[input, padding]).unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -2804,8 +2728,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let (outputs, _) =
-            operation.batch(&explicit_context, &EmptyRegionDriver, &[input, padding]).unwrap().into_parts();
+        let outputs = operation.batch(&explicit_context, &EmptyRegionDriver, &[input, padding]).unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -2840,8 +2763,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let (outputs, _) =
-            operation.batch(&manual_context, &EmptyRegionDriver, &[input, padding]).unwrap().into_parts();
+        let outputs = operation.batch(&manual_context, &EmptyRegionDriver, &[input, padding]).unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -2856,46 +2778,6 @@ mod tests {
                 .unwrap()
             ],
         );
-    }
-
-    #[test]
-    fn test_pad_batching_preserves_ragged_dimensions() {
-        // Ragged axes survive padding of an unrelated axis, while padding the ragged axis or an axis indexing its
-        // extents is rejected before shape inference.
-        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap();
-        let ragged = RaggedAxis::new(1, extents, size, vec![0]);
-        let input = ArrayBatch::new(
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3, 1]), &[1_f32, 0., 0., 2., 3., 4.])
-                .unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(vec![ragged.clone()])
-        .unwrap();
-        let padding = ArrayBatch::replicated(Array::from_elements(ArrayType::scalar(DataType::F32), &[9_f32]).unwrap());
-        let context =
-            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let batched = PadOperation::new(vec![0, 1], vec![0, 1], vec![0, 0])
-            .unwrap()
-            .batch(&context, &EmptyRegionDriver, &[input.clone(), padding.clone()])
-            .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].ragged_axes(), &[ragged]);
-        assert_eq!(
-            outputs[0].value().elements::<f32>(),
-            Ok(vec![9., 1., 9., 9., 0., 9., 9., 0., 9., 9., 2., 9., 9., 3., 9., 9., 4., 9.])
-        );
-        assert!(matches!(
-            PadOperation::new(vec![1, 0], vec![0, 0], vec![0, 0])
-                .unwrap()
-                .batch(&context, &EmptyRegionDriver, &[input, padding]),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "`{PAD_OPERATION_NAME}` batching cannot change a ragged axis or an axis indexing its extents",
-                ),
-        ));
     }
 
     #[test]
@@ -2918,10 +2800,9 @@ mod tests {
             .unwrap()
             .batch(&context, &EmptyRegionDriver, &[input, padding])
             .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().storage_bytes(), &[129, 127, 130, 128]);
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(batched[0].value().storage_bytes(), &[129, 127, 130, 128]);
     }
 
     #[test]
@@ -4406,9 +4287,8 @@ mod tests {
         let batched = operation
             .batch(&context, &EmptyRegionDriver, &[input, padding_value.clone(), extent.clone()])
             .unwrap();
-        let (outputs, _) = batched.into_parts();
         assert_eq!(
-            outputs,
+            batched,
             vec![
                 ArrayIrBatch::new(
                     ArrayIrValue::Array(
@@ -4436,9 +4316,8 @@ mod tests {
         let batched = operation
             .batch(&context, &EmptyRegionDriver, &[input, padding_value.clone(), extent.clone()])
             .unwrap();
-        let (outputs, _) = batched.into_parts();
         assert_eq!(
-            outputs,
+            batched,
             vec![
                 ArrayIrBatch::new(
                     ArrayIrValue::Array(
@@ -4459,9 +4338,8 @@ mod tests {
             Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap(),
         ));
         let batched = operation.batch(&context, &EmptyRegionDriver, &[input, padding_value, extent]).unwrap();
-        let (outputs, _) = batched.into_parts();
         assert_eq!(
-            outputs,
+            batched,
             vec![ArrayIrBatch::replicated(ArrayIrValue::Array(
                 Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[9.0, 1.0, 2.0]).unwrap(),
             ))],
@@ -4495,9 +4373,8 @@ mod tests {
         .unwrap();
         let extent = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         let batched = operation.batch(&context, &EmptyRegionDriver, &[input, padding_value, extent]).unwrap();
-        let (outputs, _) = batched.into_parts();
         assert_eq!(
-            outputs,
+            batched,
             vec![
                 ArrayIrBatch::new(
                     ArrayIrValue::Array(
@@ -4599,8 +4476,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(batched.len(), 1);
         let program = parent
             .builder()
             .borrow()
@@ -4645,8 +4521,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(batched.len(), 1);
         let program = parent
             .builder()
             .borrow()
@@ -4710,8 +4585,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (outputs, _) = batched.into_parts();
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(batched.len(), 1);
         let program = parent
             .builder()
             .borrow()
@@ -4769,7 +4643,8 @@ mod tests {
 
     #[test]
     fn test_array_ir_pad_batching_rejects_malformed_inputs() {
-        // The array inputs are mandatory and must be arrays, and every explicit extent must stay replicated.
+        // The array inputs are mandatory and must be arrays, and every explicit extent must be a dimension,
+        // even when an integer array supplies the same extent for every item.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -4797,16 +4672,14 @@ mod tests {
         let padding_value = ArrayIrBatch::replicated(ArrayIrValue::Array(
             Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[9.0]).unwrap(),
         ));
-        let extent_type = DimensionValue::constant(3).unwrap().r#type().into_owned();
-        let mapped_extent = ArrayIrBatch::mapped_dimension(
+        let array_extent = ArrayIrBatch::new(
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[3_i64, 3]).unwrap()),
             BatchAxis::new(0),
-            extent_type.clone(),
         )
         .unwrap();
         assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input, padding_value, mapped_extent]).unwrap_err(),
-            BatchingError::MappedDimension { r#type: Box::new(extent_type), axis: BatchAxis::new(0) },
+            operation.batch(&context, &EmptyRegionDriver, &[input, padding_value, array_extent]).unwrap_err(),
+            BatchingError::Type(TypeError::invalid("expected dimension type but got array type")),
         );
     }
 
@@ -6388,35 +6261,6 @@ mod tests {
             })
         );
         assert_eq!(padding.dynamic_pad(&padding, &[], &[], &[], &[]), Ok(padding));
-    }
-
-    #[test]
-    fn test_validate_padding_ragged_axes() {
-        let ragged = RaggedAxis::new(
-            1,
-            Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 2]).unwrap(),
-            DimensionVariable::new("size", DimensionBounds::new(0, Some(3)).unwrap()),
-            vec![0],
-        );
-        assert_eq!(
-            validate_padding_ragged_axes(std::slice::from_ref(&ragged), &[0, 0, 1], &[0, 0, 1], &[0, 0, 0]),
-            Ok(vec![ragged.clone()])
-        );
-        assert!(matches!(
-            validate_padding_ragged_axes(std::slice::from_ref(&ragged), &[1, 0, 0], &[0, 0, 0], &[0, 0, 0]),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "`{PAD_OPERATION_NAME}` batching cannot change a ragged axis or an axis indexing its extents",
-                ),
-        ));
-
-        // `ArrayBatch::with_ragged_axes` validates real inputs against the carrier rank, so an axis outside the padding
-        // vectors is helper-level hardening rather than a reachable operation error.
-        assert!(matches!(
-            validate_padding_ragged_axes(&[ragged], &[0], &[0], &[0]),
-            Err(BatchingError::InvalidBatchMetadata { message })
-                if message == format!("`{PAD_OPERATION_NAME}` batching found ragged axis 1 outside the padded rank 1"),
-        ));
     }
 
     #[test]
