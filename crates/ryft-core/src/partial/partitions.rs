@@ -361,6 +361,27 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         &self.metadata.residual_inputs
     }
 
+    /// Returns the type of each residual edge of this [`PartitionedProgram`] together with the position of its value
+    /// among the outputs of the [`known_program`](Self::known_program), in edge ordinal order. If there are `k` fully
+    /// known original outputs, edge `e` is at known-program output position `k + e`. Operation split rules use this
+    /// mapping to route known-program outputs into the residual programs that they build.
+    ///
+    /// Each edge is listed once, even when [`residual_inputs`](Self::residual_inputs) reads it repeatedly,
+    /// out of order, or not at all. Forwarded [`KnownInput`](ResidualInputSource::KnownInput) and
+    /// [`KnownOutput`](ResidualInputSource::KnownOutput) sources are not residual edges; inspect `residual_inputs`
+    /// to resolve those sources and to determine which edge feeds each residual-program input.
+    #[inline]
+    pub fn residual_edges(&self) -> Vec<(V::Type, usize)> {
+        let known_output_count = self.metadata.outputs.iter().filter(|output| output.is_known()).count();
+        self.known_program
+            .output_types()
+            .into_iter()
+            .enumerate()
+            .skip(known_output_count)
+            .map(|(output, output_type)| (output_type, output))
+            .collect()
+    }
+
     /// Returns the source of each original (i.e., pre-partitioning) [`Program`] output, in original output order.
     /// This is the callee's [`PartialEvaluation::outputs`] with each folded *value* erased to a position/index:
     /// [`Known`](PartialEvaluationOutput::Known) entries carry the output's position among the known-side operation's
@@ -599,6 +620,37 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         self,
     ) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, PartitionMetadata) {
         (self.known_program, self.residual_program, self.metadata)
+    }
+
+    /// Validates the stricter layout required by operation split rules: residual inputs consume every edge exactly
+    /// once, in ordinal order. General partitions need not follow this layout; [`residual_edges`](Self::residual_edges)
+    /// lists their edges independently of how their residual inputs consume them. Forwarded input and output sources
+    /// are ignored here, so consumers that require unforwarded wiring must reject those separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the residual edge sources are reordered, repeated, or missing.
+    pub(crate) fn validate_canonical_residual_edges(&self) -> Result<(), ProgramError> {
+        let mut edge_count = 0;
+        for source in &self.metadata.residual_inputs {
+            if let ResidualInputSource::ResidualEdge(edge) = source {
+                if *edge != edge_count {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "partition residual input names residual edge {edge} where edge {edge_count} is expected",
+                    )));
+                }
+                edge_count += 1;
+            }
+        }
+        let known_output_count = self.metadata.outputs.iter().filter(|output| output.is_known()).count();
+        let known_program_output_count = self.known_program.output_ids().len();
+        if known_program_output_count != known_output_count + edge_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "partition known program has {known_program_output_count} outputs but its partition declares \
+                 {known_output_count} known outputs and {edge_count} residual edges",
+            )));
+        }
+        Ok(())
     }
 
     /// Validates that the boundary wiring of this [`PartitionedProgram`] addresses its two programs and its original
@@ -1304,6 +1356,109 @@ mod tests {
         // Cache reassembly preserves the original input count.
         let (known, residual, metadata) = forwarded.into_programs_and_metadata();
         assert_eq!(PartitionedProgram::from_programs_and_metadata(known, residual, metadata).original_input_count(), 4);
+    }
+
+    #[test]
+    fn test_partitioned_program_residual_edges() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let scalar = builder.add_input(scalar_type.clone());
+        let vector = builder.add_input(vector_type.clone());
+        let known = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![scalar, vector, scalar], vec![Placeholder; 2], vec![Placeholder; 3])
+            .unwrap();
+        let partition = |sources: Vec<ResidualInputSource>, outputs: Vec<PartialEvaluationOutput<usize>>| {
+            let known_output_count = outputs.iter().filter(|output| output.is_known()).count();
+            let output_types = known.output_types();
+            let input_types = known.input_types();
+            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let inputs = sources
+                .iter()
+                .map(|source| {
+                    builder.add_input(match *source {
+                        ResidualInputSource::UnknownInput(_) => scalar_type.clone(),
+                        ResidualInputSource::KnownInput(input) => input_types[input].clone(),
+                        ResidualInputSource::KnownOutput(output) => output_types[output].clone(),
+                        ResidualInputSource::ResidualEdge(edge) => output_types[known_output_count + edge].clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let residual = builder
+                .build::<Vec<Array>, Vec<Array>>(vec![inputs[0]], vec![Placeholder; sources.len()], vec![Placeholder])
+                .unwrap();
+            PartitionedProgram::from_parts(known.clone(), residual, 4, vec![0, 1], sources, outputs).unwrap()
+        };
+        let outputs = vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)];
+
+        // Unknown inputs may surround the edges; positions refer to known outputs after the fully known prefix.
+        let sources = vec![
+            ResidualInputSource::UnknownInput(2),
+            ResidualInputSource::ResidualEdge(0),
+            ResidualInputSource::UnknownInput(3),
+            ResidualInputSource::ResidualEdge(1),
+        ];
+        let expected_edges = vec![(vector_type.clone(), 1), (scalar_type.clone(), 2)];
+        let canonical = partition(sources.clone(), outputs.clone());
+        assert_eq!(canonical.residual_edges(), expected_edges);
+        assert_eq!(canonical.validate_canonical_residual_edges(), Ok(()));
+        let mut reordered = sources.clone();
+        reordered.swap(1, 3);
+        let reordered = partition(reordered, outputs.clone());
+        assert_eq!(reordered.residual_edges(), expected_edges);
+        assert_eq!(
+            reordered.validate_canonical_residual_edges(),
+            Err(ProgramError::MalformedProgram(
+                "partition residual input names residual edge 1 where edge 0 is expected".to_string(),
+            )),
+        );
+        let mut repeated = sources.clone();
+        repeated[2] = ResidualInputSource::ResidualEdge(0);
+        let repeated = partition(repeated, outputs.clone());
+        assert_eq!(repeated.residual_edges(), expected_edges);
+        assert_eq!(
+            repeated.validate_canonical_residual_edges(),
+            Err(ProgramError::MalformedProgram(
+                "partition residual input names residual edge 0 where edge 1 is expected".to_string(),
+            )),
+        );
+        let mut missing = sources;
+        missing[3] = ResidualInputSource::UnknownInput(3);
+        let missing = partition(missing, outputs.clone());
+        assert_eq!(missing.residual_edges(), expected_edges);
+        assert_eq!(
+            missing.validate_canonical_residual_edges(),
+            Err(ProgramError::MalformedProgram(
+                "partition known program has 3 outputs but its partition declares 1 known outputs and 1 residual edges"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(
+            partition(
+                vec![
+                    ResidualInputSource::UnknownInput(2),
+                    ResidualInputSource::KnownInput(1),
+                    ResidualInputSource::KnownOutput(0),
+                    ResidualInputSource::ResidualEdge(1),
+                ],
+                outputs,
+            )
+            .residual_edges(),
+            expected_edges,
+        );
+        assert_eq!(
+            partition(vec![ResidualInputSource::UnknownInput(2)], vec![PartialEvaluationOutput::Unknown(0)])
+                .residual_edges(),
+            vec![(scalar_type.clone(), 0), (vector_type, 1), (scalar_type.clone(), 2)],
+        );
+        assert_eq!(
+            partition(
+                vec![ResidualInputSource::UnknownInput(2); 4],
+                (0..3).map(PartialEvaluationOutput::Known).collect(),
+            )
+            .residual_edges(),
+            Vec::new(),
+        );
     }
 
     #[test]

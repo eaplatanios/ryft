@@ -2879,7 +2879,7 @@ mod tests {
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::control_flow::condition::{ConditionOperation, transpose_primal_condition};
+    use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::custom_functions::functions::custom_function;
     use crate::operations::custom_functions::rules::{CustomRuleDefinition, CustomRuleRegistration, CustomRuleSource};
@@ -3897,16 +3897,7 @@ mod tests {
             accumulators: &[CotangentAccumulator],
         ) -> Result<(), DifferentiationError> {
             match self {
-                Self::Condition(_) => {
-                    // Use the production branch transform with the same destination construction as its type-family
-                    // rule.
-                    let destinations = context.cotangent_destinations(driver, inputs, accumulators)?;
-                    let contributions = transpose_primal_condition(context, driver, inputs, outputs, &destinations)?;
-                    for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-                        accumulator.accumulate(context, contribution)?;
-                    }
-                    Ok(())
-                }
+                Self::Condition(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
                 Self::LinearCall(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
                 Self::CustomFunctionTranspose(operation) => {
                     operation.transpose(context, driver, inputs, outputs, accumulators)

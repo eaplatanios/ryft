@@ -177,7 +177,7 @@ pub use operations::{
     XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation, associative_scan, check_batching_rule_consistency, custom_function, shard_map,
     shard_map_in_context, shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes,
-    trace_shard_map_with_options, transpose_primal_condition,
+    trace_shard_map_with_options,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

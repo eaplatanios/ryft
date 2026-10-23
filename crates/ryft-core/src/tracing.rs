@@ -2491,22 +2491,12 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 );
-                let expected_error = if static_member.is_reference() {
-                    let input_index = if reversed { 1 } else { 2 };
-                    TypeError::invalid(format!(
-                        "`condition` input {input_index} has type `ref<f32[3]>`, \
-                         which does not equal its branch input type `ref<f32[n]>`",
-                    ))
-                } else {
-                    TypeError::custom(DimensionError::InputDimensionMismatch {
-                        dimension: "n".to_string(),
-                        expected: if reversed { 3 } else { 4 },
-                        actual: if reversed { 4 } else { 3 },
-                    })
-                };
+
+                // A reference input refines its region input by its referent like an array input,
+                // so both members report the same conflict.
                 assert_eq!(
                     operation.infer_output_types(&input_types, &[body.interface(), body.interface()]),
-                    Err(expected_error),
+                    Err(error),
                 );
             }
         }
