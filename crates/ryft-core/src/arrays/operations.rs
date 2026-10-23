@@ -248,6 +248,9 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Min(DimensionMinOperation),
     Add(DimensionAddOperation),
     Sub(DimensionSubOperation),
+    // Saturating subtraction is total over valid dimension extents, so it uses the shared stateless operation.
+    // Checked dimension operations such as `DimensionAddOperation` instead store input-dependent assertion metadata:
+    // `Operation::effects(&self)` has no input types from which to decide whether an ordered runtime check is needed.
     SaturatingSub(SaturatingSubOperation<DimensionType>),
     Mul(DimensionMulOperation),
     Div(DimensionDivOperation),

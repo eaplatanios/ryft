@@ -2218,7 +2218,9 @@ mod tests {
         MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::NamedAxis;
-    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::batching::{
+        BatchAxis, BatchedProgram, BoundaryPreservingBatchedProgram, ProgramBatchingOutputAxesPolicy, batch,
+    };
     use crate::contexts::{DomainProjection, EagerContext};
     use crate::macros::check_operation_type_inference;
     use crate::operations::control_flow::ConditionOperation;
@@ -2228,46 +2230,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
     use crate::programs::{EmptyRegionDriver, OperationProjection, ProgramBuilder, ReferenceType};
-    use crate::tests::{CustomArrayExtent, CustomArrayExtentBatchingPolicy};
 
     use super::*;
-
-    impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Transpose, Operation: From<IotaOperation<ArrayType>>>>
-        ArrayAssertionBatchingPolicy<C, Self> for CustomArrayExtentBatchingPolicy
-    {
-        #[inline]
-        fn batch_item_indices(
-            context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-            r#type: &ArrayType,
-        ) -> Result<C::Value, ProgramError> {
-            <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::batch_item_indices(
-                context, r#type,
-            )
-        }
-
-        #[inline]
-        fn mask_empty_batch_condition(
-            context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-            condition: C::Value,
-        ) -> Result<C::Value, ProgramError> {
-            <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::mask_empty_batch_condition(
-                context, condition,
-            )
-        }
-
-        #[inline]
-        fn pad_empty_batch_observation(
-            context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-            observation: C::Value,
-            padded_extent: &mut Option<CustomArrayExtent>,
-        ) -> Result<C::Value, ProgramError> {
-            <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::pad_empty_batch_observation(
-                context,
-                observation,
-                padded_extent,
-            )
-        }
-    }
 
     /// Returns the `[f32[n], f32[n]]` input signature shared by the guard tests.
     fn guard_signature() -> (DimensionType, Vec<ArrayIrType>) {
@@ -2812,6 +2776,143 @@ mod tests {
 
     #[test]
     fn test_assert_batching_custom_static_policy() {
+        // Extents need only `Clone + Debug`; their representation need not be `usize`, `Copy`, or an array IR value.
+        #[derive(Clone, Debug)]
+        struct HostExtent {
+            size: usize,
+            metadata: String,
+        }
+
+        #[derive(Copy, Clone, Debug)]
+        struct CustomExtent;
+
+        impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for CustomExtent {
+            type Batch = ArrayBatch<C::Value>;
+            type Extent = HostExtent;
+            type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
+
+            fn batch(value: C::Value, axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::batch(value, axis)
+            }
+
+            fn replicated(value: C::Value) -> Self::Batch {
+                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::replicated(value)
+            }
+
+            fn value(batch: &Self::Batch) -> &C::Value {
+                batch.value()
+            }
+
+            fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+                batch.batch_axis()
+            }
+
+            fn batched_type(
+                context: &BatchingContext<C, Self>,
+                input: &Self::Batch,
+                declared: &ArrayType,
+            ) -> Result<ArrayType, BatchingError> {
+                let context = BatchingContext::<C, StaticArrayExtentBatchingPolicy>::with_policy(
+                    context.parent().clone(),
+                    context.axis_extent().size,
+                )
+                .with_axis_sharding(context.axis_sharding().clone());
+                StaticArrayExtentBatchingPolicy::batched_type(&context, input, declared)
+            }
+
+            fn unbatched_type(batch: &Self::Batch) -> Cow<'_, ArrayType> {
+                Cow::Owned(batch.unbatched_type())
+            }
+
+            fn adapt_batched_program<
+                CollapseFn: Fn(
+                    &TracingContext<C::Constant, C::Operation>,
+                    Tracer<TracingContext<C::Constant, C::Operation>>,
+                    Axis,
+                ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+            >(
+                program: Self::BatchedProgram,
+                required_output_axes: Option<&[BatchAxis]>,
+                collapse_fn: CollapseFn,
+            ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
+                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
+                    program,
+                    required_output_axes,
+                    collapse_fn,
+                )
+            }
+        }
+
+        impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayExtentBatchingPolicy<C> for CustomExtent {
+            fn axis_dimension(
+                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+            ) -> Result<Dimension, BatchingError> {
+                Ok(Dimension::Static(context.axis_extent().size))
+            }
+
+            fn match_axis(
+                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+                batch: &ArrayBatch<C::Value>,
+                axis: Axis,
+            ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+                batch.match_axis(axis, context.axis_extent().size, context.axis_sharding().clone())
+            }
+
+            fn broadcast_input(
+                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+                input: &ArrayBatch<C::Value>,
+                target: ArrayType,
+                axes: Vec<usize>,
+                batch_axis: Axis,
+                sources: Vec<DimensionSource<C::Value>>,
+            ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+                let context = BatchingContext::<C, ArrayBatchingPolicy>::new(
+                    context.parent().clone(),
+                    context.axis_extent().size,
+                )
+                .with_axis_sharding(context.axis_sharding().clone());
+                StaticArrayExtentBatchingPolicy::broadcast_input(&context, input, target, axes, batch_axis, sources)
+            }
+        }
+
+        impl<
+            C: Context<Type = ArrayType, Value: Broadcast + Reduce + Transpose, Operation: From<IotaOperation<ArrayType>>>,
+        > ArrayAssertionBatchingPolicy<C, Self> for CustomExtent
+        {
+            #[inline]
+            fn batch_item_indices(
+                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+                r#type: &ArrayType,
+            ) -> Result<C::Value, ProgramError> {
+                <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::batch_item_indices(
+                    context, r#type,
+                )
+            }
+
+            #[inline]
+            fn mask_empty_batch_condition(
+                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+                condition: C::Value,
+            ) -> Result<C::Value, ProgramError> {
+                <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::mask_empty_batch_condition(
+                    context, condition,
+                )
+            }
+
+            #[inline]
+            fn pad_empty_batch_observation(
+                context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+                observation: C::Value,
+                padded_extent: &mut Option<HostExtent>,
+            ) -> Result<C::Value, ProgramError> {
+                <StaticArrayExtentBatchingPolicy as ArrayAssertionBatchingPolicy<C, Self>>::pad_empty_batch_observation(
+                    context,
+                    observation,
+                    padded_extent,
+                )
+            }
+        }
+
         // This family omits assertions and their diagnostic primitives. The custom preparation impl above does
         // not apply to its context, but generated dispatch must still support guards, casts, and ordinary batching.
         #[derive(Clone, Debug, Operation)]
@@ -2826,13 +2927,9 @@ mod tests {
         // A distinct public extent policy must retain all three rules. Built-in policies alone cannot catch
         // an implementation that accidentally specializes on their concrete types.
         for extent in [0, 1, 3] {
-            let context = BatchingContext::<_, ArrayBatchingPolicy<CustomArrayExtentBatchingPolicy>>::with_policy(
+            let context = BatchingContext::<_, ArrayBatchingPolicy<CustomExtent>>::with_policy(
                 EagerContext::<Array, ArrayOperation<Array>>::new(),
-                CustomArrayExtent {
-                    size: extent,
-                    metadata: "custom host extent".to_owned(),
-                    axis_size_queries: Default::default(),
-                },
+                HostExtent { size: extent, metadata: "custom host extent".to_owned() },
             );
             assert_eq!(context.axis_extent().metadata, "custom host extent");
             let failing_index = extent / 2;
@@ -2892,7 +2989,7 @@ mod tests {
             let casted = cast.batch(&context, &EmptyRegionDriver, &[input.clone(), input.clone()]).unwrap();
             assert_eq!(casted, vec![input.clone()]);
 
-            let context = BatchingContext::<_, ArrayBatchingPolicy<CustomArrayExtentBatchingPolicy>>::with_policy(
+            let context = BatchingContext::<_, ArrayBatchingPolicy<CustomExtent>>::with_policy(
                 EagerContext::<Array, MinimalOperation<Array>>::new(),
                 context.axis_extent().clone(),
             );

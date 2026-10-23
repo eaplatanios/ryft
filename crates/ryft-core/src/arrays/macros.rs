@@ -374,11 +374,13 @@ macro_rules! dispatch_on_array_element_type {
 ///     `sin_with_accuracy(_accuracy)`). The reference kernels provide one implementation, so they ignore it.
 ///   - `operation = $operation`: Name used in diagnostics, such as `"min"`.
 ///   - `inputs = $(@selector)+`: Composable predicates over numeric elements, using the same intersection rules as
-///     [`check_types!`](crate::check_types). `@numeric` accepts all numeric types, `@float` excludes integers, and
-///     `@real` excludes complex values. For example, `@float @real` accepts only real floating-point values and
-///     `@numeric @real` also accepts integers. Order and repetition do not change the accepted types. This macro's
-///     numeric base universe excludes Booleans and payload-free types, including for empty arrays, unless the sole
-///     selector is `@boolean_or_numeric`, which extends it with Booleans.
+///     [`check_types!`](crate::check_types). `@numeric` accepts all numeric types, `@integer` accepts signed and
+///     unsigned integers, `@float` excludes integers, and `@real` excludes complex values. For example, `@float @real`
+///     accepts only real floating-point values and `@numeric @real` also accepts integers. Order and repetition do not
+///     change the accepted types. An intersection of `@integer` and `@float` rejects every type. Integer kernels also
+///     reject promotion to a floating-point result, including when the result is empty. This macro's numeric base
+///     universe excludes Booleans and payload-free types, including for empty arrays, unless the sole selector is
+///     `@boolean_or_numeric`, which extends it with Booleans.
 ///   - `checks = $checks`: Ordered list of array metadata checks from [`check_types!`](crate::check_types), typically
 ///     `@no_unreduced`, `@same_unreduced_axes`, or `@same_reduced_axes`. An empty list applies no additional checks.
 ///   - `|input| body` or `|lhs, rhs| body`: Names for decoded scalar inputs, followed by an expression returning their
@@ -396,12 +398,31 @@ macro_rules! impl_array_elementwise_operation {
         $crate::macros::check_types!(@numeric $(@$selector)+, $operation, $data_types);
     };
 
+    // Integer inputs can promote outside the integer class, so reject that result before allocating or dispatching.
+    (@check_output [@integer $($rest:tt)*] $operation:expr, $data_type:expr $(,)?) => {
+        if !$data_type.is_integer() {
+            return Err($crate::programs::TypeError::invalid(format!(
+                "`{}` requires an integer result data type", $operation,
+            )).into());
+        }
+    };
+
+    // Other selectors preserve their accepted class under promotion; scan for an integer restriction.
+    (@check_output [@$selector:ident $($rest:tt)*] $operation:expr, $data_type:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @check_output [$($rest)*] $operation, $data_type,
+        );
+    };
+
+    // Selector lists without an integer restriction need no additional result check.
+    (@check_output [] $operation:expr, $data_type:expr $(,)?) => {};
+
     // Booleans extend the numeric base universe, so their kernels dispatch over every element type.
     (@dispatch [@boolean_or_numeric] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!($data_type, |$element| $body)
     };
 
-    // Intersect selectors for dispatch. Numeric is the base universe; float and real each narrow it independently.
+    // Intersect selectors for dispatch. Integer, float, and real independently narrow the numeric base universe.
     (@dispatch [$(@$selector:ident)+] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::impl_array_elementwise_operation!(
             @select [numeric complex] [$(@$selector)+] $data_type, |$element| $body,
@@ -412,6 +433,32 @@ macro_rules! impl_array_elementwise_operation {
     (@select [$base:ident $kind:ident] [@numeric $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::impl_array_elementwise_operation!(
             @select [$base $kind] [$($rest)*] $data_type, |$element| $body,
+        )
+    };
+
+    // Disjoint selectors leave no valid dispatch arm, regardless of subsequent refinements.
+    (@select [empty $kind:ident] [$($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        unreachable!("incompatible element data type selectors")
+    };
+
+    // Integer and float classes are disjoint, irrespective of selector order.
+    (@select [integer $kind:ident] [@float $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [empty real] [$($rest)*] $data_type, |$element| $body,
+        )
+    };
+
+    // Applying an integer restriction after float also produces an empty intersection.
+    (@select [float $kind:ident] [@integer $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [empty real] [$($rest)*] $data_type, |$element| $body,
+        )
+    };
+
+    // Integers are real, and repeated integer selectors preserve the restricted class.
+    (@select [$base:ident $kind:ident] [@integer $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [integer real] [$($rest)*] $data_type, |$element| $body,
         )
     };
 
@@ -437,6 +484,11 @@ macro_rules! impl_array_elementwise_operation {
     // The real numeric class excludes complex values.
     (@select [numeric real] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@real $data_type, |$element| $body)
+    };
+
+    // Integer kernels instantiate the scalar calculation only for signed and unsigned integer elements.
+    (@select [integer real] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@integer $data_type, |$element| $body)
     };
 
     // Float capabilities include complex values, which is the storage dispatcher's transcendental class.
@@ -529,6 +581,10 @@ macro_rules! impl_array_elementwise_operation {
                 // Infer the common element type and broadcast result metadata without materializing broadcasts.
                 let output_type = lhs_type.as_ref().broadcast(rhs_type.as_ref())
                     .map_err(|error| $crate::programs::TypeError::invalid(error.to_string()))?;
+
+                $crate::arrays::macros::impl_array_elementwise_operation!(
+                    @check_output [$(@$selector)+] operation, output_type.data_type(),
+                );
 
                 // Empty results need only layout-sized, zero-initialized storage. Skip input conversions and scalar
                 // evaluation, since neither contributes any result elements.
@@ -828,6 +884,110 @@ mod tests {
     }
 
     #[test]
+    fn test_impl_array_elementwise_operation_unary_integer() -> Result<(), ProgramError> {
+        /// Identity restricted to integer inputs.
+        trait TestIntegerIdentity: Sized {
+            /// Preserves each signed or unsigned integer element.
+            fn integer_identity(&self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @unary
+            TestIntegerIdentity, integer_identity,
+            operation = "integer_identity",
+            inputs = @numeric @integer @real @integer,
+            checks = [],
+            |input| Ok(input),
+        );
+
+        // The integer selector covers both signedness classes, including every sub-byte format.
+        for data_type in [
+            DataType::I1,
+            DataType::I2,
+            DataType::I4,
+            DataType::I8,
+            DataType::I16,
+            DataType::I32,
+            DataType::I64,
+            DataType::U1,
+            DataType::U2,
+            DataType::U4,
+            DataType::U8,
+            DataType::U16,
+            DataType::U32,
+            DataType::U64,
+        ] {
+            let input = dispatch_on_array_element_type!(@integer data_type, |Element| {
+                Array::from_elements(
+                    ArrayType::new_static(data_type, [2]),
+                    &[Element::zero()?, Element::min_identity()],
+                )
+            })?;
+            assert_eq!(input.integer_identity()?, input);
+        }
+
+        assert!(matches!(
+            Array::scalar(1f32)?.integer_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_identity` does not support input data type `f32`",
+        ));
+        let input = Array::from_elements(ArrayType::new_static(DataType::Boolean, [0]), &[] as &[bool])?;
+        assert!(matches!(
+            input.integer_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_identity` does not support input data type `bool`",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_unary_disjoint_selectors() -> Result<(), ProgramError> {
+        /// Identity with disjoint integer and float restrictions.
+        trait TestIntegerFloatIdentity: Sized {
+            /// Rejects every input because its selectors have no common element type.
+            fn integer_float_identity(&self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @unary
+            TestIntegerFloatIdentity, integer_float_identity,
+            operation = "integer_float_identity",
+            inputs = @integer @float @numeric @integer,
+            checks = [],
+            |input| Ok(input),
+        );
+
+        /// Identity with the disjoint selectors written in the opposite order.
+        trait TestFloatIntegerIdentity: Sized {
+            /// Rejects every input independently of selector ordering.
+            fn float_integer_identity(&self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @unary
+            TestFloatIntegerIdentity, float_integer_identity,
+            operation = "float_integer_identity",
+            inputs = @float @integer @real @float,
+            checks = [],
+            |input| Ok(input),
+        );
+
+        assert!(matches!(
+            Array::scalar(1i32)?.integer_float_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_float_identity` does not support input data type `i32`",
+        ));
+
+        assert!(matches!(
+            Array::scalar(1f32)?.float_integer_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`float_integer_identity` does not support input data type `f32`",
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_impl_array_elementwise_operation_unary_empty_invalid_metadata() -> Result<(), ProgramError> {
         // Validate reduction metadata before skipping evaluation of an empty buffer.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -887,6 +1047,56 @@ mod tests {
         let output = lhs.minimum(&rhs)?;
         assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::I32, [2, 3]));
         assert_eq!(output.elements::<i32>()?, vec![1, 2, 2, 1, 3, 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_binary_integer() -> Result<(), ProgramError> {
+        /// Minimum restricted to integer inputs and results.
+        trait TestIntegerMinimum: Sized {
+            /// Computes the minimum after integer promotion and broadcasting.
+            fn integer_minimum(&self, rhs: &Self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @binary
+            TestIntegerMinimum, integer_minimum,
+            operation = "integer_minimum",
+            inputs = @real @integer @numeric @integer,
+            checks = [],
+            |lhs, rhs| Ok(ArrayElement::min(&lhs, &rhs)),
+        );
+
+        let lhs = Array::from_elements(ArrayType::new_static(DataType::I16, [2]), &[-2i16, 5])?;
+        let output = lhs.integer_minimum(&Array::scalar(3u8)?)?;
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::I16, [2]));
+        assert_eq!(output.elements::<i16>()?, vec![-2, 3]);
+
+        // Validate original inputs before promotion can turn Boolean values into integers.
+        assert!(matches!(
+            Array::scalar(true)?.integer_minimum(&Array::scalar(1i32)?),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_minimum` does not support input data type `bool`",
+        ));
+        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [0]), &[] as &[f32])?;
+        assert!(matches!(
+            input.integer_minimum(&Array::scalar(1i32)?),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_minimum` does not support input data type `f32`",
+        ));
+
+        // Signed and unsigned 64-bit inputs promote to f64, which cannot be dispatched as an integer result.
+        assert!(matches!(
+            Array::scalar(1i64)?.integer_minimum(&Array::scalar(1u64)?),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_minimum` requires an integer result data type",
+        ));
+        let input = Array::from_elements(ArrayType::new_static(DataType::I64, [0]), &[] as &[i64])?;
+        assert!(matches!(
+            input.integer_minimum(&Array::scalar(1u64)?),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`integer_minimum` requires an integer result data type",
+        ));
         Ok(())
     }
 
