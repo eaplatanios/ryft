@@ -3,8 +3,8 @@
 //! [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending on the
 //! value it runs on. The operations fall into three groups:
 //!
-//!   - **Sign and Magnitude:** [`Neg`] negates a value, [`Abs`] computes its absolute value (i.e., the real magnitude
-//!     `|z|` for a complex value), and [`Sign`] maps it to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
+//!   - **Sign and Magnitude:** [`Sign`] maps a value to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
+//!     value), [`Neg`] negates it, and [`Abs`] computes its absolute value (i.e., the real magnitude `|z|` for a complex
 //!     value).
 //!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`SaturatingSub`], [`Mul`], and [`Div`] compute sums, differences,
 //!     products, and quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated
@@ -71,6 +71,111 @@ use crate::programs::{
     Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
+
+/// Canonical operation name for [`SignOperation`].
+pub const SIGN_OPERATION_NAME: &str = "sign";
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that computes the elementwise sign of one value while preserving its array metadata. Matching
+    /// the input constraints of StableHLO's [`sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
+    /// floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token, and structural-zero
+    /// inputs are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to `-1`, `0`, or `1`,
+    /// floating-point values map to `-1.0` or `1.0` away from zero while signed zeros and NaNs pass through unchanged,
+    /// and complex values map to `z / |z|`, with `0` mapping to `0`. Inputs that still carry partial sums are rejected
+    /// because the sign of a partial sum is not the sign of the total.
+    SignOperation,
+    SIGN_OPERATION_NAME,
+    Sign,
+    sign,
+    infer_data_types = |input_types: &[DataType]| {
+        let input_type = input_types[0];
+        if input_type.is_signed() || input_type.is_floating_point() || input_type.is_complex() {
+            Ok(vec![input_type])
+        } else {
+            Err(TypeError::invalid(format!("cannot compute the sign of a value of data type `{input_type}`")))
+        }
+    },
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_elementwise_operation!(@constant SignOperation);
+
+define_elementwise_capability!(
+    @unary
+    /// Value capability for elementwise signs, preserving floating-point signed zeros and NaNs. Eager values compute
+    /// directly while contextual values bind [`SignOperation`]. Failures are returned as [`ProgramError`]s.
+    Sign,
+    /// Computes [`SignOperation`] elementwise for this value.
+    sign,
+    SignOperation,
+);
+
+impl Sign for Array {
+    fn sign(&self) -> Result<Self, ProgramError> {
+        SignOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
+        if Self::element_count(self.r#type().as_ref())? == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
+        }
+        let data_type = self.r#type().data_type();
+        if data_type.is_signed() {
+            dispatch_on_array_element_type!(@signed data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as NumericArrayElement>::sign(value)
+                })
+            })
+        } else if data_type.is_complex() {
+            dispatch_on_array_element_type!(@complex data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as NumericArrayElement>::sign(value)
+                })
+            })
+        } else {
+            dispatch_on_array_element_type!(@float data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as NumericArrayElement>::sign(value)
+                })
+            })
+        }
+    }
+}
+
+/// Implements [`Sign`] for one host primitive type.
+macro_rules! impl_sign_for_primitive {
+    // Signed integer primitives use the ordinary integer signum, which cannot fail.
+    (@signed $type:ty) => {
+        impl Sign for $type {
+            #[inline]
+            fn sign(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::signum(*self))
+            }
+        }
+    };
+
+    // Floating-point primitives mirror the reference backends. Signed zeros and NaNs are preserved,
+    // and every other value maps to `1.0` or `-1.0`.
+    (@float $type:ty) => {
+        impl Sign for $type {
+            #[inline]
+            fn sign(&self) -> Result<Self, ProgramError> {
+                Ok(if self.is_nan() || *self == 0.0 { *self } else { <$type>::signum(*self) })
+            }
+        }
+    };
+}
+
+impl_sign_for_primitive!(@signed i8);
+impl_sign_for_primitive!(@signed i16);
+impl_sign_for_primitive!(@signed i32);
+impl_sign_for_primitive!(@signed i64);
+impl_sign_for_primitive!(@signed i128);
+impl_sign_for_primitive!(@signed isize);
+impl_sign_for_primitive!(@float f32);
+impl_sign_for_primitive!(@float f64);
 
 /// Canonical operation name for [`NegOperation`].
 pub const NEG_OPERATION_NAME: &str = "neg";
@@ -175,6 +280,199 @@ impl_neg_for_primitive!(@signed i128);
 impl_neg_for_primitive!(@signed isize);
 impl_neg_for_primitive!(@float f32);
 impl_neg_for_primitive!(@float f64);
+
+/// Canonical operation name for [`AbsOperation`].
+pub const ABS_OPERATION_NAME: &str = "abs";
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that computes the elementwise absolute value of a value (i.e., `x ↦ |x|` and the magnitude `|z|`
+    /// for complex inputs with a real result) while preserving all other type metadata. Inputs that still represent
+    /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial
+    /// sum semantics. Matching the input constraints of StableHLO's [`abs`](https://openxla.org/stablehlo/spec#abs),
+    /// signed-integer (including the sub-byte [`DataType::I2`] and [`DataType::I4`] types, with the minimum value
+    /// wrapping to itself), floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token,
+    /// structural-zero, and single-bit [`DataType::I1`] inputs (whose only negative value `-1` has no representable
+    /// absolute value) are rejected.
+    AbsOperation,
+    ABS_OPERATION_NAME,
+    Abs,
+    abs,
+    infer_data_types = |input_types: &[DataType]| {
+        let input_type = input_types[0];
+        let output_type = if input_type == DataType::C64 {
+            DataType::F32
+        } else if input_type == DataType::C128 {
+            DataType::F64
+        } else if (input_type.is_signed() && input_type != DataType::I1) || input_type.is_floating_point() {
+            input_type
+        } else {
+            return Err(TypeError::invalid(format!(
+                "cannot compute the absolute value of a value of data type `{input_type}`",
+            )));
+        };
+        Ok(vec![output_type])
+    },
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_operation! {
+    <T> AbsOperation<T>,
+    jvp<C>
+    where
+        T: Type,
+        C::Type: DifferentiableType,
+        C::Value: ZeroLike
+            + OneLike
+            + Neg
+            + Mul
+            + Div
+            + Abs
+            + Complex
+            + Conjugate
+            + Imaginary
+            + Real
+            + Compare<C::Value>
+            + Select
+            + ElementwiseDerivativeAlignment<C::Type>,
+    {
+        |_operation, context, _driver, inputs| {
+            // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ map
+            // with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`. At the
+            // complex origin, replace the zero denominator with one so the zero numerator yields zero. These
+            // conventions keep the rule finite and stable under higher-order transforms. A structural zero
+            // tangent stays symbolic, retyped to the real output's tangent type.
+            check_count!("input", inputs, 1, ProgramError);
+            let input = &inputs[0];
+            let primal = input.primal().abs()?;
+            let primal_tangent_type = primal.r#type().tangent()?;
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal_tangent_type),
+                MaybeZero::Value(_) if primal_tangent_type.is_zero_space() => {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "`{}` output type `{}` has no tangent space",
+                            ABS_OPERATION_NAME,
+                            primal.r#type(),
+                        ),
+                    }
+                    .into());
+                }
+                MaybeZero::Value(tangent) => {
+                    let primal = context.primal_to_tangent(primal.clone())?;
+                    let input_primal = context.primal_to_tangent(input.primal().clone())?;
+                    if input.primal().r#type().is_complex() {
+                        let denominator = primal.align_tangent(&primal_tangent_type, &primal)?;
+                        let zero = denominator.zero_like()?;
+                        let one = denominator.one_like()?;
+                        let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
+                        let denominator = denominator_is_zero.select(&one, &denominator)?;
+
+                        // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
+                        // algebraically equivalent but can overflow even when the final directional derivative is
+                        // finite.
+                        let conjugate = input_primal.conjugate()?;
+                        let real = conjugate.real()?.div(&denominator)?;
+                        let imaginary = conjugate.imaginary()?.div(&denominator)?;
+                        let coefficient = real.complex(&imaginary)?;
+                        let input_tangent_type = input.primal().r#type().tangent()?;
+                        let tangent = tangent.align_tangent(&input_tangent_type, &input_primal)?;
+                        MaybeZero::Value(
+                            tangent.mul(&coefficient)?.real()?.align_tangent(&primal_tangent_type, &primal)?,
+                        )
+                    } else {
+                        let input = input_primal.align_tangent(&primal_tangent_type, &primal)?;
+                        let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
+                        let zero = input.zero_like()?;
+                        let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
+                        MaybeZero::Value(non_negative.select(&tangent, &tangent.neg()?)?)
+                    }
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @unary
+    /// Value capability for elementwise absolute values, returning real magnitudes for complex inputs. Eager values
+    /// compute directly while contextual values bind [`AbsOperation`]. Failures are returned as [`ProgramError`]s.
+    Abs,
+    /// Computes elementwise absolute values, returning real magnitudes for complex inputs.
+    /// Unsupported input types, such as Boolean arrays, return a [`ProgramError`].
+    abs,
+    AbsOperation,
+);
+
+impl Abs for Array {
+    fn abs(&self) -> Result<Self, ProgramError> {
+        let output_type =
+            AbsOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?.remove(0);
+        if Self::element_count(&output_type)? == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let input_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric input_type, |Element| {
+            self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
+                <Element as NumericArrayElement>::abs(value)
+            })
+        })
+    }
+}
+
+/// Implements [`Abs`] for one host primitive type.
+macro_rules! impl_abs_for_primitive {
+    // Signed integer primitives use checked absolute values so that the `MIN` overflow reports an error instead of
+    // wrapping like the XLA-mirroring reference backends do on devices.
+    (@signed $type:ty) => {
+        impl Abs for $type {
+            #[inline]
+            fn abs(&self) -> Result<Self, ProgramError> {
+                self.checked_abs().ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", ABS_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Unsigned integer primitives are their own absolute values.
+    (@unsigned $type:ty) => {
+        impl Abs for $type {
+            #[inline]
+            fn abs(&self) -> Result<Self, ProgramError> {
+                Ok(*self)
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 absolute values, which cannot fail.
+    (@float $type:ty) => {
+        impl Abs for $type {
+            #[inline]
+            fn abs(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::abs(*self))
+            }
+        }
+    };
+}
+
+impl_abs_for_primitive!(@signed i8);
+impl_abs_for_primitive!(@signed i16);
+impl_abs_for_primitive!(@signed i32);
+impl_abs_for_primitive!(@signed i64);
+impl_abs_for_primitive!(@signed i128);
+impl_abs_for_primitive!(@signed isize);
+impl_abs_for_primitive!(@unsigned u8);
+impl_abs_for_primitive!(@unsigned u16);
+impl_abs_for_primitive!(@unsigned u32);
+impl_abs_for_primitive!(@unsigned u64);
+impl_abs_for_primitive!(@unsigned u128);
+impl_abs_for_primitive!(@unsigned usize);
+impl_abs_for_primitive!(@float f32);
+impl_abs_for_primitive!(@float f64);
 
 /// Canonical operation name for [`AddOperation`].
 pub const ADD_OPERATION_NAME: &str = "add";
@@ -1118,304 +1416,6 @@ impl_rem_for_primitive!(@integer usize);
 impl_rem_for_primitive!(@float f32);
 impl_rem_for_primitive!(@float f64);
 
-/// Canonical operation name for [`AbsOperation`].
-pub const ABS_OPERATION_NAME: &str = "abs";
-
-define_elementwise_operation!(
-    @unary
-    /// [`Operation`] that computes the elementwise absolute value of a value (i.e., `x ↦ |x|` and the magnitude `|z|`
-    /// for complex inputs with a real result) while preserving all other type metadata. Inputs that still represent
-    /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial
-    /// sum semantics. Matching the input constraints of StableHLO's [`abs`](https://openxla.org/stablehlo/spec#abs),
-    /// signed-integer (including the sub-byte [`DataType::I2`] and [`DataType::I4`] types, with the minimum value
-    /// wrapping to itself), floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token,
-    /// structural-zero, and single-bit [`DataType::I1`] inputs (whose only negative value `-1` has no representable
-    /// absolute value) are rejected.
-    AbsOperation,
-    ABS_OPERATION_NAME,
-    Abs,
-    abs,
-    infer_data_types = |input_types: &[DataType]| {
-        let input_type = input_types[0];
-        let output_type = if input_type == DataType::C64 {
-            DataType::F32
-        } else if input_type == DataType::C128 {
-            DataType::F64
-        } else if (input_type.is_signed() && input_type != DataType::I1) || input_type.is_floating_point() {
-            input_type
-        } else {
-            return Err(TypeError::invalid(format!(
-                "cannot compute the absolute value of a value of data type `{input_type}`",
-            )));
-        };
-        Ok(vec![output_type])
-    },
-    check_array_types = [@no_unreduced],
-);
-
-impl_differentiable_operation! {
-    <T> AbsOperation<T>,
-    jvp<C>
-    where
-        T: Type,
-        C::Type: DifferentiableType,
-        C::Value: ZeroLike
-            + OneLike
-            + Neg
-            + Mul
-            + Div
-            + Abs
-            + Complex
-            + Conjugate
-            + Imaginary
-            + Real
-            + Compare<C::Value>
-            + Select
-            + ElementwiseDerivativeAlignment<C::Type>,
-    {
-        |_operation, context, _driver, inputs| {
-            // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ map
-            // with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`. At the
-            // complex origin, replace the zero denominator with one so the zero numerator yields zero. These
-            // conventions keep the rule finite and stable under higher-order transforms. A structural zero
-            // tangent stays symbolic, retyped to the real output's tangent type.
-            check_count!("input", inputs, 1, ProgramError);
-            let input = &inputs[0];
-            let primal = input.primal().abs()?;
-            let primal_tangent_type = primal.r#type().tangent()?;
-            let tangent = match input.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal_tangent_type),
-                MaybeZero::Value(_) if primal_tangent_type.is_zero_space() => {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "`{}` output type `{}` has no tangent space",
-                            ABS_OPERATION_NAME,
-                            primal.r#type(),
-                        ),
-                    }
-                    .into());
-                }
-                MaybeZero::Value(tangent) => {
-                    let primal = context.primal_to_tangent(primal.clone())?;
-                    let input_primal = context.primal_to_tangent(input.primal().clone())?;
-                    if input.primal().r#type().is_complex() {
-                        let denominator = primal.align_tangent(&primal_tangent_type, &primal)?;
-                        let zero = denominator.zero_like()?;
-                        let one = denominator.one_like()?;
-                        let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
-                        let denominator = denominator_is_zero.select(&one, &denominator)?;
-
-                        // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
-                        // algebraically equivalent but can overflow even when the final directional derivative is
-                        // finite.
-                        let conjugate = input_primal.conjugate()?;
-                        let real = conjugate.real()?.div(&denominator)?;
-                        let imaginary = conjugate.imaginary()?.div(&denominator)?;
-                        let coefficient = real.complex(&imaginary)?;
-                        let input_tangent_type = input.primal().r#type().tangent()?;
-                        let tangent = tangent.align_tangent(&input_tangent_type, &input_primal)?;
-                        MaybeZero::Value(
-                            tangent.mul(&coefficient)?.real()?.align_tangent(&primal_tangent_type, &primal)?,
-                        )
-                    } else {
-                        let input = input_primal.align_tangent(&primal_tangent_type, &primal)?;
-                        let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
-                        let zero = input.zero_like()?;
-                        let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
-                        MaybeZero::Value(non_negative.select(&tangent, &tangent.neg()?)?)
-                    }
-                }
-            };
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
-        }
-    },
-    transpose = @nonlinear,
-}
-
-define_elementwise_capability!(
-    @unary
-    /// Value capability for elementwise absolute values, returning real magnitudes for complex inputs. Eager values
-    /// compute directly while contextual values bind [`AbsOperation`]. Failures are returned as [`ProgramError`]s.
-    Abs,
-    /// Computes elementwise absolute values, returning real magnitudes for complex inputs.
-    /// Unsupported input types, such as Boolean arrays, return a [`ProgramError`].
-    abs,
-    AbsOperation,
-);
-
-impl Abs for Array {
-    fn abs(&self) -> Result<Self, ProgramError> {
-        let output_type =
-            AbsOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?.remove(0);
-        if Self::element_count(&output_type)? == 0 {
-            let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-        }
-        let input_type = self.r#type().data_type();
-        dispatch_on_array_element_type!(@numeric input_type, |Element| {
-            self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
-                <Element as NumericArrayElement>::abs(value)
-            })
-        })
-    }
-}
-
-/// Implements [`Abs`] for one host primitive type.
-macro_rules! impl_abs_for_primitive {
-    // Signed integer primitives use checked absolute values so that the `MIN` overflow reports an error instead of
-    // wrapping like the XLA-mirroring reference backends do on devices.
-    (@signed $type:ty) => {
-        impl Abs for $type {
-            #[inline]
-            fn abs(&self) -> Result<Self, ProgramError> {
-                self.checked_abs().ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("`{}` output does not fit in `{}`", ABS_OPERATION_NAME, stringify!($type)),
-                })
-            }
-        }
-    };
-
-    // Unsigned integer primitives are their own absolute values.
-    (@unsigned $type:ty) => {
-        impl Abs for $type {
-            #[inline]
-            fn abs(&self) -> Result<Self, ProgramError> {
-                Ok(*self)
-            }
-        }
-    };
-
-    // Floating-point primitives use ordinary IEEE 754 absolute values, which cannot fail.
-    (@float $type:ty) => {
-        impl Abs for $type {
-            #[inline]
-            fn abs(&self) -> Result<Self, ProgramError> {
-                Ok(<$type>::abs(*self))
-            }
-        }
-    };
-}
-
-impl_abs_for_primitive!(@signed i8);
-impl_abs_for_primitive!(@signed i16);
-impl_abs_for_primitive!(@signed i32);
-impl_abs_for_primitive!(@signed i64);
-impl_abs_for_primitive!(@signed i128);
-impl_abs_for_primitive!(@signed isize);
-impl_abs_for_primitive!(@unsigned u8);
-impl_abs_for_primitive!(@unsigned u16);
-impl_abs_for_primitive!(@unsigned u32);
-impl_abs_for_primitive!(@unsigned u64);
-impl_abs_for_primitive!(@unsigned u128);
-impl_abs_for_primitive!(@unsigned usize);
-impl_abs_for_primitive!(@float f32);
-impl_abs_for_primitive!(@float f64);
-
-/// Canonical operation name for [`SignOperation`].
-pub const SIGN_OPERATION_NAME: &str = "sign";
-
-define_elementwise_operation!(
-    @unary
-    /// [`Operation`] that computes the elementwise sign of one value while preserving its array metadata. Matching
-    /// the input constraints of StableHLO's [`sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
-    /// floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token, and structural-zero
-    /// inputs are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to `-1`, `0`, or `1`,
-    /// floating-point values map to `-1.0` or `1.0` away from zero while signed zeros and NaNs pass through unchanged,
-    /// and complex values map to `z / |z|`, with `0` mapping to `0`. Inputs that still carry partial sums are rejected
-    /// because the sign of a partial sum is not the sign of the total.
-    SignOperation,
-    SIGN_OPERATION_NAME,
-    Sign,
-    sign,
-    infer_data_types = |input_types: &[DataType]| {
-        let input_type = input_types[0];
-        if input_type.is_signed() || input_type.is_floating_point() || input_type.is_complex() {
-            Ok(vec![input_type])
-        } else {
-            Err(TypeError::invalid(format!("cannot compute the sign of a value of data type `{input_type}`")))
-        }
-    },
-    check_array_types = [@no_unreduced],
-);
-
-impl_differentiable_elementwise_operation!(@constant SignOperation);
-
-define_elementwise_capability!(
-    @unary
-    /// Value capability for elementwise signs, preserving floating-point signed zeros and NaNs. Eager values compute
-    /// directly while contextual values bind [`SignOperation`]. Failures are returned as [`ProgramError`]s.
-    Sign,
-    /// Computes [`SignOperation`] elementwise for this value.
-    sign,
-    SignOperation,
-);
-
-impl Sign for Array {
-    fn sign(&self) -> Result<Self, ProgramError> {
-        SignOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
-        if Self::element_count(self.r#type().as_ref())? == 0 {
-            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-            return Ok(Self::new_unchecked(
-                self.r#type().into_owned(),
-                Arc::new(vec![0; addressing.storage_byte_len()]),
-            ));
-        }
-        let data_type = self.r#type().data_type();
-        if data_type.is_signed() {
-            dispatch_on_array_element_type!(@signed data_type, |Element| {
-                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as NumericArrayElement>::sign(value)
-                })
-            })
-        } else if data_type.is_complex() {
-            dispatch_on_array_element_type!(@complex data_type, |Element| {
-                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as NumericArrayElement>::sign(value)
-                })
-            })
-        } else {
-            dispatch_on_array_element_type!(@float data_type, |Element| {
-                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as NumericArrayElement>::sign(value)
-                })
-            })
-        }
-    }
-}
-
-/// Implements [`Sign`] for one host primitive type.
-macro_rules! impl_sign_for_primitive {
-    // Signed integer primitives use the ordinary integer signum, which cannot fail.
-    (@signed $type:ty) => {
-        impl Sign for $type {
-            #[inline]
-            fn sign(&self) -> Result<Self, ProgramError> {
-                Ok(<$type>::signum(*self))
-            }
-        }
-    };
-
-    // Floating-point primitives mirror the reference backends. Signed zeros and NaNs are preserved,
-    // and every other value maps to `1.0` or `-1.0`.
-    (@float $type:ty) => {
-        impl Sign for $type {
-            #[inline]
-            fn sign(&self) -> Result<Self, ProgramError> {
-                Ok(if self.is_nan() || *self == 0.0 { *self } else { <$type>::signum(*self) })
-            }
-        }
-    };
-}
-
-impl_sign_for_primitive!(@signed i8);
-impl_sign_for_primitive!(@signed i16);
-impl_sign_for_primitive!(@signed i32);
-impl_sign_for_primitive!(@signed i64);
-impl_sign_for_primitive!(@signed i128);
-impl_sign_for_primitive!(@signed isize);
-impl_sign_for_primitive!(@float f32);
-impl_sign_for_primitive!(@float f64);
-
 /// Canonical operation name for [`PowOperation`].
 pub const POW_OPERATION_NAME: &str = "pow";
 
@@ -1650,6 +1650,7 @@ pub trait ArithmeticOperations<T = <Self as Capability>::Universe>:
     + Sign<T>
     + Neg<T>
     + std::ops::Neg<Output = Self>
+    + Abs<T>
     + Add<T>
     + std::ops::Add<Output = Self>
     + Sub<T>
@@ -1662,7 +1663,6 @@ pub trait ArithmeticOperations<T = <Self as Capability>::Universe>:
     + Pow<T>
     + Sqrt<T>
     + Rsqrt<T>
-    + Abs<T>
 {
 }
 
@@ -1671,6 +1671,7 @@ impl<
     V: Sign<T>
         + Neg<T>
         + std::ops::Neg<Output = V>
+        + Abs<T>
         + Add<T>
         + std::ops::Add<Output = V>
         + Sub<T>
@@ -1682,8 +1683,7 @@ impl<
         + Rem<T>
         + Pow<T>
         + Sqrt<T>
-        + Rsqrt<T>
-        + Abs<T>,
+        + Rsqrt<T>,
 > ArithmeticOperations<T> for V
 {
 }
@@ -1727,6 +1727,194 @@ mod tests {
     use crate::tracing::Trace;
 
     use super::*;
+
+    #[test]
+    fn test_sign_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = SignOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::U8],
+                    error = "cannot compute the sign of a value of data type `u8`",
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the sign of a value of data type `bool`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SignOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_sign_interpretation() {
+        assert_eq!(
+            SignOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(-3.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(-1.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_sign_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SignOperation::new(),
+            inputs = [Array::scalar(-0.7).unwrap()],
+            expected = Array::scalar(-1.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_sign_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = SignOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sign_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = SignOperation::new(),
+            cases = [{
+                primals = [Array::scalar(-2.0).unwrap()],
+                tangents = [Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(-1.0).unwrap()],
+                tangent_outputs = [Array::scalar(0.0).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_sign_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = SignOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_sign() {
+        assert_eq!(Array::scalar(-3i32).unwrap().sign().unwrap(), Array::scalar(-1i32).unwrap());
+        assert_eq!(Array::scalar(0i32).unwrap().sign().unwrap(), Array::scalar(0i32).unwrap());
+        assert_eq!(Array::scalar(5i64).unwrap().sign().unwrap(), Array::scalar(1i64).unwrap());
+        assert_eq!(Array::scalar(-2.5f32).unwrap().sign().unwrap(), Array::scalar(-1.0f32).unwrap());
+        assert_eq!(Array::scalar(2.5f64).unwrap().sign().unwrap(), Array::scalar(1.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(-4.0)).unwrap().sign().unwrap(),
+            Array::scalar(bf16::from_f32(-1.0)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(4.0)).unwrap().sign().unwrap(),
+            Array::scalar(f16::from_f32(1.0)).unwrap(),
+        );
+
+        // Complex signs normalize to `z / |z|` and map the origin to itself.
+        let input = ComplexNumber::new(3.0f64, -4.0f64);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.6, -0.8)).unwrap(),
+            epsilon = 1e-12,
+        );
+        assert_eq!(
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap().sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap(),
+        );
+
+        assert_eq!(
+            Array::vector(vec![-0.7, 0.0, 2.0]).unwrap().sign().unwrap(),
+            Array::vector(vec![-1.0, 0.0, 1.0]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_sign_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(
+            invalid.sign(),
+            Err(TypeError::invalid("cannot compute the sign of a value of data type `bool`").into()),
+        );
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.sign(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_sign_unreduced() {
+        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
+        assert_eq!(input.sign(), Err(TypeError::invalid("`sign` does not support unreduced inputs").into()));
+    }
+
+    #[test]
+    fn test_array_sign_special_values() {
+        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
+        let signs = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [4]),
+            &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
+        )
+        .unwrap()
+        .sign()
+        .unwrap()
+        .elements::<f64>()
+        .unwrap();
+        assert_eq!(signs[0], -1.0);
+        assert_eq!(signs[1].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
+        assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
+        let narrow =
+            Array::from_elements(ArrayType::new_static(DataType::I2, [3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX])
+                .unwrap();
+        assert_eq!(
+            narrow.sign().unwrap().elements::<i2>(),
+            Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
+        );
+        assert!(matches!(
+            Array::scalar(1u8).unwrap().sign(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute the sign of a value of data type `u8`",
+        ));
+    }
+
+    #[test]
+    fn test_sign_primitives() {
+        assert_eq!(Sign::sign(&-5i32), Ok(-1));
+        assert_eq!(Sign::sign(&0i32), Ok(0));
+        assert_eq!(Sign::sign(&-2.5f64), Ok(-1.0));
+        assert_eq!(Sign::sign(&-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!(Sign::sign(&f64::NAN).unwrap().is_nan());
+    }
 
     #[test]
     fn test_neg_type_inference() {
@@ -1948,6 +2136,307 @@ mod tests {
 
         // The `-` operator negates every parameter.
         assert_eq!((-model).into_inner(), (vec![-10, -20], -30));
+    }
+
+    #[test]
+    fn test_abs_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::I2],
+                    output_data_types = [DataType::I2],
+                },
+                {
+                    input_data_types = [DataType::I4],
+                    output_data_types = [DataType::I4],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::C128],
+                    output_data_types = [DataType::F64],
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::Token],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Token),
+                },
+                {
+                    input_data_types = [DataType::Zero],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Zero),
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the absolute value of a value of data type `bool`",
+                },
+                {
+                    input_data_types = [DataType::I1],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::I1),
+                },
+                {
+                    input_data_types = [DataType::U32],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::U32),
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = AbsOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F32)],
+        );
+    }
+
+    #[test]
+    fn test_abs_interpretation() {
+        let operation = AbsOperation::new();
+
+        assert_eq!(
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(-2.0).unwrap()]),
+            Ok(vec![Array::scalar(2.0).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
+            ),
+            Ok(vec![Array::scalar(5.0).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_abs_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = AbsOperation::new(),
+            inputs = [Array::scalar(-2.0).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_abs_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = AbsOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = AbsOperation::new(),
+            cases = [
+                {
+                    primals = [Array::scalar(0.7).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap()],
+                    primal_outputs = [Array::scalar(0.7).unwrap()],
+                    tangent_outputs = [Array::scalar(3.0).unwrap()],
+                    jvp = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = abs %0
+                            %3:f64[] = zero_like %0
+                            %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
+                            %5:f64[] = neg %1
+                            %6:f64[] = select %4 %1 %5
+                        in (%2, %6)
+                    "},
+                },
+                {
+                    primals = [Array::scalar(-2.5).unwrap()],
+                    tangents = [Array::scalar(2.0).unwrap()],
+                    primal_outputs = [Array::scalar(2.5).unwrap()],
+                    tangent_outputs = [Array::scalar(-2.0).unwrap()],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_at_zero() {
+        // The real rule chooses the right derivative at zero and remains constant under another derivative.
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(0.0f64).unwrap()).gradient(|x| x.abs().unwrap()).unwrap(),
+            Array::scalar(1.0).unwrap(),
+            epsilon = 1e-9,
+        );
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(0.0f64).unwrap())
+                .gradient(|x| { differentiate_at(x).gradient(|x| x.abs().unwrap()).unwrap() })
+                .unwrap(),
+            Array::scalar(0.0).unwrap(),
+            epsilon = 1e-9,
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_complex() {
+        // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
+        // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
+        // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
+        let z = ComplexNumber::new(0.7f64, -0.3f64);
+        let (value, gradient_value) =
+            differentiate_at(Array::scalar(z).unwrap()).value_and_gradient(|z| z.abs().unwrap()).unwrap();
+        assert_eq!(value, Array::scalar(z.norm()).unwrap());
+        let expected = z.conj() / z.norm();
+        assert_abs_diff_eq!(gradient_value, Array::scalar(expected).unwrap(), epsilon = 1e-12);
+
+        // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
+        // finite-difference oracle perturbs each element's real and imaginary parts independently.
+        check_gradient!(
+            |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum).unwrap()),
+            at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+
+        // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
+        // zero tangent and gradient at the origin.
+        assert_eq!(
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap())
+                .jvp(Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)).unwrap(), |z| z.abs()),
+            Ok((Array::scalar(0.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()).gradient(|z| z.abs().unwrap()),
+            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_complex_avoids_overflow() {
+        // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
+        // directional derivative `Re((conj(z) / |z|) * dz)`.
+        assert_eq!(
+            differentiate_at(Array::scalar(ComplexNumber::new(1e308f64, 0.0)).unwrap())
+                .jvp(Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap(), |z| z.abs()),
+            Ok((Array::scalar(1e308f64).unwrap(), Array::scalar(2.0f64).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_abs_differentiation_low_precision_uses_widened_tangents() {
+        // The coefficient and tangent are computed in the widened differential representation.
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(tangent.elements::<f32>(), Ok(vec![3.0]));
+    }
+
+    #[test]
+    fn test_abs_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = AbsOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_abs() {
+        assert_eq!(Array::vector(vec![-1.5, 2.5]).unwrap().abs().unwrap(), Array::vector(vec![1.5, 2.5]).unwrap());
+
+        // The absolute value of a complex array is its elementwise magnitude with a real element data type.
+        let complex = Array::vector(vec![3.0]).unwrap().complex(&Array::vector(vec![4.0]).unwrap()).unwrap();
+        let magnitude = complex.abs().unwrap();
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
+        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]).unwrap(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_array_abs_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(
+            invalid.abs(),
+            Err(TypeError::invalid("cannot compute the absolute value of a value of data type `bool`").into()),
+        );
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.abs(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_abs_unreduced() {
+        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
+        assert_eq!(input.abs(), Err(TypeError::invalid("`abs` does not support unreduced inputs").into()));
+    }
+
+    #[test]
+    fn test_array_abs_low_precision() {
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let negative = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[-1.0, -2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(negative.abs().unwrap(), left);
+    }
+
+    #[test]
+    fn test_array_abs_complex() {
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+
+        // The absolute value is the elementwise magnitude with a real element data type.
+        let magnitude = left.abs().unwrap();
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
+        assert_abs_diff_eq!(
+            magnitude,
+            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_array_abs_integers() {
+        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
+    }
+
+    #[test]
+    fn test_abs_primitives() {
+        assert_eq!(Abs::abs(&-5i32), Ok(5));
+        assert_eq!(
+            Abs::abs(&i8::MIN),
+            Err(ProgramError::InvalidArgument { message: "`abs` output does not fit in `i8`".to_string() }),
+        );
+        assert_eq!(Abs::abs(&5usize), Ok(5));
+        assert_eq!(Abs::abs(&-2.5f64), Ok(2.5));
     }
 
     #[test]
@@ -4146,495 +4635,6 @@ mod tests {
         assert_eq!(Rem::rem(&model, &divisor).map(Parameterwise::into_inner), Ok((vec![1, 2], 2)));
         assert_eq!((model.clone() % divisor).into_inner(), (vec![1, 2], 2));
         assert_eq!((model % 4).into_inner(), (vec![2, 0], 2));
-    }
-
-    #[test]
-    fn test_abs_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = AbsOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::I32],
-                    output_data_types = [DataType::I32],
-                },
-                {
-                    input_data_types = [DataType::I2],
-                    output_data_types = [DataType::I2],
-                },
-                {
-                    input_data_types = [DataType::I4],
-                    output_data_types = [DataType::I4],
-                },
-                {
-                    input_data_types = [DataType::C64],
-                    output_data_types = [DataType::F32],
-                },
-                {
-                    input_data_types = [DataType::C128],
-                    output_data_types = [DataType::F64],
-                },
-            ],
-        );
-
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = AbsOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::Token],
-                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Token),
-                },
-                {
-                    input_data_types = [DataType::Zero],
-                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Zero),
-                },
-                {
-                    input_data_types = [DataType::Boolean],
-                    error = "cannot compute the absolute value of a value of data type `bool`",
-                },
-                {
-                    input_data_types = [DataType::I1],
-                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::I1),
-                },
-                {
-                    input_data_types = [DataType::U32],
-                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::U32),
-                },
-            ],
-        );
-
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = AbsOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F32)],
-        );
-    }
-
-    #[test]
-    fn test_abs_interpretation() {
-        let operation = AbsOperation::new();
-
-        assert_eq!(
-            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(-2.0).unwrap()]),
-            Ok(vec![Array::scalar(2.0).unwrap()]),
-        );
-        assert_eq!(
-            operation.interpret(
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
-            ),
-            Ok(vec![Array::scalar(5.0).unwrap()]),
-        );
-    }
-
-    #[test]
-    fn test_abs_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = AbsOperation::new(),
-            inputs = [Array::scalar(-2.0).unwrap()],
-            expected = Array::scalar(2.0).unwrap(),
-        );
-    }
-
-    #[test]
-    fn test_abs_batching() {
-        check_operation_batching!(
-            @approx(epsilon = 1e-9),
-            operation = AbsOperation::new(),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_abs_differentiation() {
-        check_operation_differentiation!(
-            @approx(step = 1e-6, epsilon = 1e-6),
-            operation = AbsOperation::new(),
-            cases = [
-                {
-                    primals = [Array::scalar(0.7).unwrap()],
-                    tangents = [Array::scalar(3.0).unwrap()],
-                    primal_outputs = [Array::scalar(0.7).unwrap()],
-                    tangent_outputs = [Array::scalar(3.0).unwrap()],
-                    jvp = indoc! {"
-                        lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = abs %0
-                            %3:f64[] = zero_like %0
-                            %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
-                            %5:f64[] = neg %1
-                            %6:f64[] = select %4 %1 %5
-                        in (%2, %6)
-                    "},
-                },
-                {
-                    primals = [Array::scalar(-2.5).unwrap()],
-                    tangents = [Array::scalar(2.0).unwrap()],
-                    primal_outputs = [Array::scalar(2.5).unwrap()],
-                    tangent_outputs = [Array::scalar(-2.0).unwrap()],
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_abs_differentiation_at_zero() {
-        // The real rule chooses the right derivative at zero and remains constant under another derivative.
-        assert_abs_diff_eq!(
-            differentiate_at(Array::scalar(0.0f64).unwrap()).gradient(|x| x.abs().unwrap()).unwrap(),
-            Array::scalar(1.0).unwrap(),
-            epsilon = 1e-9,
-        );
-        assert_abs_diff_eq!(
-            differentiate_at(Array::scalar(0.0f64).unwrap())
-                .gradient(|x| { differentiate_at(x).gradient(|x| x.abs().unwrap()).unwrap() })
-                .unwrap(),
-            Array::scalar(0.0).unwrap(),
-            epsilon = 1e-9,
-        );
-    }
-
-    #[test]
-    fn test_abs_differentiation_complex() {
-        // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
-        // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
-        // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
-        let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let (value, gradient_value) =
-            differentiate_at(Array::scalar(z).unwrap()).value_and_gradient(|z| z.abs().unwrap()).unwrap();
-        assert_eq!(value, Array::scalar(z.norm()).unwrap());
-        let expected = z.conj() / z.norm();
-        assert_abs_diff_eq!(gradient_value, Array::scalar(expected).unwrap(), epsilon = 1e-12);
-
-        // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
-        // finite-difference oracle perturbs each element's real and imaginary parts independently.
-        check_gradient!(
-            |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum).unwrap()),
-            at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]).unwrap(),
-            step = 1e-6,
-            tolerance = 1e-6,
-        );
-
-        // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
-        // zero tangent and gradient at the origin.
-        assert_eq!(
-            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap())
-                .jvp(Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)).unwrap(), |z| z.abs()),
-            Ok((Array::scalar(0.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
-        );
-        assert_eq!(
-            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()).gradient(|z| z.abs().unwrap()),
-            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()),
-        );
-    }
-
-    #[test]
-    fn test_abs_differentiation_complex_avoids_overflow() {
-        // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
-        // directional derivative `Re((conj(z) / |z|) * dz)`.
-        assert_eq!(
-            differentiate_at(Array::scalar(ComplexNumber::new(1e308f64, 0.0)).unwrap())
-                .jvp(Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap(), |z| z.abs()),
-            Ok((Array::scalar(1e308f64).unwrap(), Array::scalar(2.0f64).unwrap())),
-        );
-    }
-
-    #[test]
-    fn test_abs_differentiation_low_precision_uses_widened_tangents() {
-        // The coefficient and tangent are computed in the widened differential representation.
-        let primal = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::scalar(DataType::F8E8M0FNU),
-            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
-        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
-        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_eq!(tangent.elements::<f32>(), Ok(vec![3.0]));
-    }
-
-    #[test]
-    fn test_abs_transposition() {
-        check_operation_transposition!(
-            @rejected,
-            operation = AbsOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64)],
-        );
-    }
-
-    #[test]
-    fn test_array_abs() {
-        assert_eq!(Array::vector(vec![-1.5, 2.5]).unwrap().abs().unwrap(), Array::vector(vec![1.5, 2.5]).unwrap());
-
-        // The absolute value of a complex array is its elementwise magnitude with a real element data type.
-        let complex = Array::vector(vec![3.0]).unwrap().complex(&Array::vector(vec![4.0]).unwrap()).unwrap();
-        let magnitude = complex.abs().unwrap();
-        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
-        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]).unwrap(), epsilon = 1e-12);
-    }
-
-    #[test]
-    fn test_array_abs_empty() {
-        // Empty arrays still obey the operation's element-type contract.
-        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
-        assert_eq!(
-            invalid.abs(),
-            Err(TypeError::invalid("cannot compute the absolute value of a value of data type `bool`").into()),
-        );
-        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
-        assert_eq!(valid.abs(), Ok(valid));
-    }
-
-    #[test]
-    fn test_array_abs_unreduced() {
-        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::scalar(DataType::F32)
-            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
-        assert_eq!(input.abs(), Err(TypeError::invalid("`abs` does not support unreduced inputs").into()));
-    }
-
-    #[test]
-    fn test_array_abs_low_precision() {
-        let left = Array::from_elements::<f8e4m3fn>(
-            ArrayType::new_static(DataType::F8E4M3FN, [2]),
-            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let negative = Array::from_elements::<f8e4m3fn>(
-            ArrayType::new_static(DataType::F8E4M3FN, [2]),
-            &[-1.0, -2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        assert_eq!(negative.abs().unwrap(), left);
-    }
-
-    #[test]
-    fn test_array_abs_complex() {
-        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
-        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
-
-        // The absolute value is the elementwise magnitude with a real element data type.
-        let magnitude = left.abs().unwrap();
-        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
-        assert_abs_diff_eq!(
-            magnitude,
-            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]).unwrap(),
-            epsilon = 1e-12,
-        );
-    }
-
-    #[test]
-    fn test_array_abs_integers() {
-        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
-        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
-        assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
-    }
-
-    #[test]
-    fn test_abs_primitives() {
-        assert_eq!(Abs::abs(&-5i32), Ok(5));
-        assert_eq!(
-            Abs::abs(&i8::MIN),
-            Err(ProgramError::InvalidArgument { message: "`abs` output does not fit in `i8`".to_string() }),
-        );
-        assert_eq!(Abs::abs(&5usize), Ok(5));
-        assert_eq!(Abs::abs(&-2.5f64), Ok(2.5));
-    }
-
-    #[test]
-    fn test_sign_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = SignOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::I32],
-                    output_data_types = [DataType::I32],
-                },
-                {
-                    input_data_types = [DataType::C64],
-                    output_data_types = [DataType::C64],
-                },
-                {
-                    input_data_types = [DataType::U8],
-                    error = "cannot compute the sign of a value of data type `u8`",
-                },
-                {
-                    input_data_types = [DataType::Boolean],
-                    error = "cannot compute the sign of a value of data type `bool`",
-                },
-            ],
-        );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = SignOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64)],
-        );
-    }
-
-    #[test]
-    fn test_sign_interpretation() {
-        assert_eq!(
-            SignOperation::<ArrayType>::new().interpret(
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(-3.0f64).unwrap()],
-            ),
-            Ok(vec![Array::scalar(-1.0f64).unwrap()]),
-        );
-    }
-
-    #[test]
-    fn test_sign_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = SignOperation::new(),
-            inputs = [Array::scalar(-0.7).unwrap()],
-            expected = Array::scalar(-1.0).unwrap(),
-        );
-    }
-
-    #[test]
-    fn test_sign_batching() {
-        check_operation_batching!(
-            @exact,
-            operation = SignOperation::new(),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]).unwrap())],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_sign_differentiation() {
-        check_operation_differentiation!(
-            @approx(step = 1e-6, epsilon = 1e-6),
-            operation = SignOperation::new(),
-            cases = [{
-                primals = [Array::scalar(-2.0).unwrap()],
-                tangents = [Array::scalar(1.0).unwrap()],
-                primal_outputs = [Array::scalar(-1.0).unwrap()],
-                tangent_outputs = [Array::scalar(0.0).unwrap()],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_sign_transposition() {
-        check_operation_transposition!(
-            @exact,
-            operation = SignOperation::<ArrayType>::new(),
-            cases = [{
-                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0).unwrap()],
-                input_cotangents = [Array::scalar(0.0).unwrap()],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_array_sign() {
-        assert_eq!(Array::scalar(-3i32).unwrap().sign().unwrap(), Array::scalar(-1i32).unwrap());
-        assert_eq!(Array::scalar(0i32).unwrap().sign().unwrap(), Array::scalar(0i32).unwrap());
-        assert_eq!(Array::scalar(5i64).unwrap().sign().unwrap(), Array::scalar(1i64).unwrap());
-        assert_eq!(Array::scalar(-2.5f32).unwrap().sign().unwrap(), Array::scalar(-1.0f32).unwrap());
-        assert_eq!(Array::scalar(2.5f64).unwrap().sign().unwrap(), Array::scalar(1.0f64).unwrap());
-        assert_eq!(
-            Array::scalar(bf16::from_f32(-4.0)).unwrap().sign().unwrap(),
-            Array::scalar(bf16::from_f32(-1.0)).unwrap(),
-        );
-        assert_eq!(
-            Array::scalar(f16::from_f32(4.0)).unwrap().sign().unwrap(),
-            Array::scalar(f16::from_f32(1.0)).unwrap(),
-        );
-
-        // Complex signs normalize to `z / |z|` and map the origin to itself.
-        let input = ComplexNumber::new(3.0f64, -4.0f64);
-        assert_abs_diff_eq!(
-            Array::scalar(input).unwrap().sign().unwrap(),
-            Array::scalar(ComplexNumber::new(0.6, -0.8)).unwrap(),
-            epsilon = 1e-12,
-        );
-        assert_eq!(
-            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap().sign().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap(),
-        );
-
-        assert_eq!(
-            Array::vector(vec![-0.7, 0.0, 2.0]).unwrap().sign().unwrap(),
-            Array::vector(vec![-1.0, 0.0, 1.0]).unwrap(),
-        );
-    }
-
-    #[test]
-    fn test_array_sign_empty() {
-        // Empty arrays still obey the operation's element-type contract.
-        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
-        assert_eq!(
-            invalid.sign(),
-            Err(TypeError::invalid("cannot compute the sign of a value of data type `bool`").into()),
-        );
-        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
-        assert_eq!(valid.sign(), Ok(valid));
-    }
-
-    #[test]
-    fn test_array_sign_unreduced() {
-        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::scalar(DataType::F32)
-            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
-        assert_eq!(input.sign(), Err(TypeError::invalid("`sign` does not support unreduced inputs").into()));
-    }
-
-    #[test]
-    fn test_array_sign_special_values() {
-        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
-        let signs = Array::from_elements(
-            ArrayType::new_static(DataType::F64, [4]),
-            &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
-        )
-        .unwrap()
-        .sign()
-        .unwrap()
-        .elements::<f64>()
-        .unwrap();
-        assert_eq!(signs[0], -1.0);
-        assert_eq!(signs[1].to_bits(), (-0.0f64).to_bits());
-        assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
-        assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
-        let narrow =
-            Array::from_elements(ArrayType::new_static(DataType::I2, [3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX])
-                .unwrap();
-        assert_eq!(
-            narrow.sign().unwrap().elements::<i2>(),
-            Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
-        );
-        assert!(matches!(
-            Array::scalar(1u8).unwrap().sign(),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute the sign of a value of data type `u8`",
-        ));
-    }
-
-    #[test]
-    fn test_sign_primitives() {
-        assert_eq!(Sign::sign(&-5i32), Ok(-1));
-        assert_eq!(Sign::sign(&0i32), Ok(0));
-        assert_eq!(Sign::sign(&-2.5f64), Ok(-1.0));
-        assert_eq!(Sign::sign(&-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
-        assert!(Sign::sign(&f64::NAN).unwrap().is_nan());
     }
 
     #[test]

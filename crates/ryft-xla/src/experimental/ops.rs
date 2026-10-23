@@ -691,7 +691,7 @@ where
             ArrayIrOperation::Scan(operation) => Self::Scan(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
-            ArrayIrOperation::ShardMap(operation) => Self::ShardMap(operation),
+            ArrayIrOperation::ShardMap(operation) => Self::from(operation),
             // Custom function calls and carriers with attached rules follow their regions into the native variants.
             // Converted member calls keep their member definition. Calls registered in the array IR family itself
             // cannot follow their program, because constants of this family cannot represent array IR values, so their

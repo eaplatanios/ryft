@@ -1986,7 +1986,7 @@ mod tests {
                 vec!["x".to_string()],
             );
             let operation = ShardMapOperation::from_boundary(shard_map, vec![scalar_type.clone()], vec![scalar_type]);
-            (KernelOperation::Portable(ArrayIrOperation::ShardMap(Box::new(operation))), body)
+            (KernelOperation::Portable(ArrayIrOperation::ShardMap(operation)), body)
         }
 
         // Copy kernel `output = f(input)`, where `apply` stages `f` and returns the written value.

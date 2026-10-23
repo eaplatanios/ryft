@@ -1079,6 +1079,7 @@ where
         )?;
         context.inline_partitioned_program(
             partition,
+            &callee.input_types(),
             inputs,
             |known_program| (XlaOperation::JitCall(known_call), vec![known_program]),
             |residual_program| (XlaOperation::JitCall(residual_call), vec![residual_program]),

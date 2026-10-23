@@ -67,6 +67,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Clamp(ClampOperation<ArrayType>),
     Sign(SignOperation<ArrayType>),
     Neg(NegOperation<ArrayType>),
+    Abs(AbsOperation<ArrayType>),
     Add(AddOperation<ArrayType>),
     Sub(SubOperation<ArrayType>),
     SaturatingSub(SaturatingSubOperation<ArrayType>),
@@ -76,7 +77,6 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Pow(PowOperation<ArrayType>),
     Sqrt(SqrtOperation<ArrayType>),
     Rsqrt(RsqrtOperation<ArrayType>),
-    Abs(AbsOperation<ArrayType>),
     Sin(SinOperation<ArrayType>),
     Cos(CosOperation<ArrayType>),
     Tan(TanOperation<ArrayType>),
@@ -436,6 +436,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed slice whose starts and output sizes are first-class dimension inputs.
     DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
+    /// Composite manual SPMD computation whose local body runs once per device coordinate along its active manual
+    /// axes, with array and reference boundaries and first-class dimensions inside the body (refer to the documentation
+    /// of [`ShardMapOperation`]).
+    ShardMap(ShardMapOperation),
+
     /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
     /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
     /// remain unsupported until discharge.
@@ -452,13 +457,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Composite rematerialized call whose body uses the complete array IR storage universe.
     Rematerialize(RematerializeOperation<ArrayIrType>),
-
-    // TODO(eaplatanios): Why is the payload here boxed?
-    /// Composite manual SPMD computation whose local body runs once per device coordinate along its active manual
-    /// axes, with array and reference boundaries and first-class dimensions inside the body (refer to the documentation
-    /// of [`ShardMapOperation`]). The payload is boxed because its boundary metadata is much larger than the other
-    /// payloads of this family.
-    ShardMap(Box<ShardMapOperation>),
 
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
     LinearCall(LinearCallOperation<ArrayIrType>),
@@ -3783,7 +3781,7 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
+                ArrayIrOperation::ShardMap(ShardMapOperation::from_boundary(
                     ShardMap::from_shardings(
                         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
                         Vec::new(),
@@ -3792,7 +3790,7 @@ mod tests {
                     ),
                     Vec::<ArrayIrType>::new(),
                     Vec::<ArrayIrType>::new(),
-                ))),
+                )),
                 MemberKindSignature::RegionForwarding,
             ),
             (

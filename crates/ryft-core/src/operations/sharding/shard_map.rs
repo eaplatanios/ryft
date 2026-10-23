@@ -3720,9 +3720,11 @@ where
     let residual_body = reshape_program_boundary(&residual_program, residual_input_types, residual_output_types)?;
 
     // Bind the known-side `shard_map` into the enclosing known-side context, emit the residual `shard_map` over its
-    // residual sources, and reassemble the original outputs.
+    // residual sources, and reassemble the original outputs. The two maps replace the entry of `operation`, whose
+    // declared types are the global types rather than the local types of the body.
     context.inline_partitioned_program(
         partition,
+        &operation.input_types,
         inputs,
         |_known_program| {
             let known_shard_map = ShardMap::from_shardings(
@@ -5369,7 +5371,7 @@ mod tests {
         let inputs = inputs.collect::<Vec<_>>();
         let body_region = builder.import_program(body);
         let outputs = builder
-            .add_instruction(TestOperation::ShardMap(Box::new(operation)), vec![body_region], inputs.clone(), None)?
+            .add_instruction(TestOperation::ShardMap(operation), vec![body_region], inputs.clone(), None)?
             .to_vec();
         let output_count = outputs.len();
         builder.build::<Vec<TestValue>, Vec<TestValue>>(
@@ -5489,7 +5491,7 @@ mod tests {
         let inputs = operation.global_input_types().iter().cloned().map(|r#type| builder.add_input(r#type));
         let inputs = inputs.collect::<Vec<_>>();
         let body = builder.import_program(body);
-        let operation = TestOperation::ShardMap(Box::new(operation));
+        let operation = TestOperation::ShardMap(operation);
         builder.add_instruction(operation, vec![body], inputs.clone(), None).unwrap();
         builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![inputs[1]], vec![Placeholder; 2], vec![Placeholder])
@@ -5845,7 +5847,7 @@ mod tests {
                 ShardMapOperation::from_program(&body, vec![ReferenceType::new(global_type).into()], shard_map)
                     .unwrap();
             let body = builder.import_program(body);
-            let operation = TestOperation::ShardMap(Box::new(operation));
+            let operation = TestOperation::ShardMap(operation);
             builder.add_instruction(operation, vec![body], vec![reference], None).unwrap();
         } else {
             update(&mut builder, reference);
@@ -8413,7 +8415,7 @@ mod tests {
             let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())));
             let update = builder.add_input(ArrayIrType::Array(sharded_type.clone()));
             let body_region = builder.import_program(body);
-            let operation = TestOperation::ShardMap(Box::new(operation));
+            let operation = TestOperation::ShardMap(operation);
             let outputs = builder
                 .add_instruction(operation, vec![body_region], vec![reference, update], None)
                 .unwrap()
@@ -8673,7 +8675,7 @@ mod tests {
         assert_eq!(
             program.clone().discharge_references(0).map(|_| ()),
             Err(TypeError::invalid(
-                "`condition` branch 0 mutates reference input 1 of type \
+                "`condition` `true` branch mutates instruction input 1 of type \
                  `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
                  axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
                  over, so devices that take different branches would leave it different across devices; vary the \
@@ -8735,7 +8737,7 @@ mod tests {
             let body = builder.import_program(body);
             let outputs = builder
                 .add_instruction(
-                    TestOperation::ShardMap(Box::new(operation)),
+                    TestOperation::ShardMap(operation),
                     vec![body],
                     vec![reference, reference, update],
                     None,
@@ -8815,12 +8817,7 @@ mod tests {
             let update = builder.add_input(value_type);
             let body = builder.import_program(body);
             let outputs = builder
-                .add_instruction(
-                    TestOperation::ShardMap(Box::new(operation)),
-                    vec![body],
-                    vec![reference, update],
-                    None,
-                )
+                .add_instruction(TestOperation::ShardMap(operation), vec![body], vec![reference, update], None)
                 .unwrap()
                 .to_vec();
             let state =
@@ -8935,7 +8932,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let body_region = builder.import_program(capturing_body);
             let outputs = builder
-                .add_instruction(CapturedOperation::ShardMap(Box::new(operation)), vec![body_region], inputs, None)
+                .add_instruction(CapturedOperation::ShardMap(operation), vec![body_region], inputs, None)
                 .unwrap()
                 .to_vec();
             builder
@@ -8997,7 +8994,7 @@ mod tests {
             let body_region = builder.import_program(forwarding_body.clone());
             let outputs = builder
                 .add_instruction(
-                    TestOperation::ShardMap(Box::new(forwarding_operation(sharded.clone()))),
+                    TestOperation::ShardMap(forwarding_operation(sharded.clone())),
                     vec![body_region],
                     vec![reference, update],
                     None,
@@ -14777,7 +14774,7 @@ mod tests {
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             let output = if mapped {
                 let body = builder.import_program(body.clone());
-                let operation = TestOperation::ShardMap(Box::new(operation.clone()));
+                let operation = TestOperation::ShardMap(operation.clone());
                 builder.add_instruction(operation, vec![body], vec![reference], None).unwrap()[0]
             } else {
                 // The unmapped program reads the same two rows through a static slice and flattens them.
@@ -15027,7 +15024,7 @@ mod tests {
         let mut transposition_context = TranspositionContext::new(context.clone());
         let inputs = [PartialValue::Unknown(ArrayIrType::Array(tangent_type))];
         let accumulators = transposition_context.cotangent_accumulators(&inputs, &[]).unwrap();
-        TestOperation::ShardMap(Box::new(operation))
+        TestOperation::ShardMap(operation)
             .transpose(
                 &mut transposition_context,
                 &driver,
