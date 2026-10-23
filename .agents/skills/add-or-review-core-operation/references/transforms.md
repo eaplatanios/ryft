@@ -1,7 +1,7 @@
 # Transform Invariants
 
-Read this reference before changing transform rules, replay, reference validation, sharding/manual variation, or dynamic
-and ragged extents. Use the owning transform's current contracts as the source of truth.
+Read this reference before changing transform rules, replay, reference validation, sharding/manual variation, dynamic
+extents, or explicit dense-buffer kernel contracts. Use the owning transform's current contracts as the source of truth.
 
 ## Replay and Validation Ownership
 
@@ -15,9 +15,6 @@ and ragged extents. Use the owning transform's current contracts as the source o
 - Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
   diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
   differentiation.
-- `Operation::consumed_type_identities` owns validation of its input-dependent declaration. Batching supplies logical
-  per-item types and validates preservation and rule evidence; do not add a separate wrapper that rechecks the returned
-  identities against those inputs.
 
 ## Batching and Manual Variation
 
@@ -34,33 +31,15 @@ and ragged extents. Use the owning transform's current contracts as the source o
 
 ## Ordered Checks and Extent Dependencies
 
-- When a transformation rule stages standalone assertions (e.g., `assert` over per-item extents) and then returns values
-  those assertions validate, transport the dependency through a value-producing ordered operation that every later
-  transform preserves (a `GuardOperation` bound after the lifted operation, over its outputs and every per-item extent
-  array the outputs carry or a check consumed, whose outputs the rule returns and records in batch metadata), never
-  through a flag such as a cast's checked mode or through witness inputs alone: partial evaluation, differentiation,
-  nested batching, and identity folding erase proven checked modes on purpose. When no check is needed, keep the data
-  dependencies anyway (an unchecked cast of the metadata witnessed by the outputs), so extents never depend on whether a
-  check happened to be necessary. Keep batch metadata values together with their coordinates: key substitutions by the
-  carrier storage they came from, never by dimension identity alone, and build relationship checks from the carrier
-  occurrences a declaration actually names, each at its own coordinates (an identity-level provider only decides which
-  storage an acquiring axis takes). Identify the coordinates of per-item metadata by the per-item dimensions of the axes
-  it varies over (the identity a declaration names, or the static extent), never by logical positions, because carriers
-  lay their axes out differently (a member and its per-item transpose). Define once when two occurrences denote the same
-  extents (one identity at identical coordinates) and apply that definition in every check, placement and consumer,
-  rejecting a coordinate that does not identify exactly one axis instead of guessing a correspondence. Give every
-  consumer of a new batch representation one consistent policy through one helper (e.g.,
-  `ArrayIrBatch::replicated_dimension_value`) before adding branches elsewhere, and validate per-item
-  extents at the declared physical representation so dense and ragged paths admit the same declarations.
-- Inspect both producers and consumers of these dependencies, including later partial evaluation, differentiation,
-  transposition, nested batching, identity folding, and backend lowering. The detailed review inventory is in [Coverage
-  and final review](review.md).
-- A structurally batched region must receive every extent value and coordinate descriptor needed by its body, and retain
-  the corresponding output extents. Reconstructing output metadata from input identities cannot recover checks or masks
-  that the body omitted. If the region boundary does not carry this information, validate and reject the unsupported
-  carriers before erasing them, including replicated carriers with outer ragged coordinates. Direct region replay may
-  remain supported when it transports complete carriers. Do not inline rematerialization or custom derivative regions
-  merely to bypass a boundary limitation: their execution and derivative contracts must survive the transform too.
+- Preserve ordered runtime checks and the values that depend on them across partial evaluation, differentiation,
+  transposition, nested batching, identity folding, and lowering. A guard whose own type relationships are proven can
+  still carry an earlier assertion's ordering dependency; local type equality does not make that dependency redundant.
+- Standalone transformed regions must receive every shared dynamic extent they reference, including bookkeeping inputs
+  required by the batching policy. Preserve the corresponding output identities and checks when adapting their boundary.
+  Do not inline rematerialization or custom derivative regions merely to bypass a boundary limitation.
+- Arrays remain rectangular. Reject a shape that depends on mapped data before staging operations that would need
+  per-item extents. Explicit kernels may consume dense padded buffers and ordinary size arrays under their own contracts;
+  those size arrays do not become type-system or batching-carrier metadata.
 
 For generic transform-policy changes, also apply the custom-policy and operation-family compatibility checks in
 [Capabilities and providers](capabilities.md#domain-dispatch).

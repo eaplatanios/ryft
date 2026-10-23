@@ -45,7 +45,8 @@ Load the references that apply before editing:
   composite projections, dispatch, generic transform-policy bounds, or backend value integration, including work
   outside operation modules.
 - [Transform Invariants](references/transforms.md): Used for operation replay, reference validation, partial evaluation,
-  batching, differentiation, transposition, sharding/manual variation, or dynamic/ragged extents.
+  batching, differentiation, transposition, sharding/manual variation, dynamic extents, or explicit dense-buffer kernel
+  contracts.
 - [Coverage and Final Review](references/review.md): Used for every operation addition or review, and for the affected
   behaviors of a scoped follow-up. Full operation reviews require the complete inventory, not just the reported bug.
 

@@ -319,13 +319,6 @@ trait Operation: Clone {
         std::borrow::Cow::Borrowed(&[])
     }
 
-    fn consumed_type_identities(
-        &self,
-        _input_types: &[Self::Type],
-    ) -> Result<Vec<<Self::Type as Type>::Identity>, TypeError> {
-        Ok(Vec::new())
-    }
-
     fn region_slots(&self) -> &'static [RegionSlot] {
         &[]
     }
@@ -1257,10 +1250,6 @@ impl Operation for PrintOperation {
         std::borrow::Cow::Owned(vec![NoIdentity])
     }
 
-    fn consumed_type_identities(&self, input_types: &[DataType]) -> Result<Vec<NoIdentity>, TypeError> {
-        Ok(input_types.iter().map(|_| NoIdentity).collect())
-    }
-
     fn name(&self) -> &'static str {
         "print"
     }
@@ -1491,13 +1480,6 @@ impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
         "projected"
     }
 
-    fn consumed_type_identities(
-        &self,
-        input_types: &[ProjectedMemberType<MEMBER>],
-    ) -> Result<Vec<NoIdentity>, TypeError> {
-        Ok(input_types.iter().map(|_| NoIdentity).collect())
-    }
-
     fn infer_output_types(
         &self,
         input_types: &[ProjectedMemberType<MEMBER>],
@@ -1574,12 +1556,6 @@ fn test_operation_generates_projected_member_dispatch() {
     // and lift results back into the composite family.
     assert_eq!(first.name(), "projected");
     assert_eq!(first.to_string(), "projected");
-    assert_eq!(first.consumed_type_identities(std::slice::from_ref(&first_type)).unwrap().len(), 1);
-    assert_eq!(third.consumed_type_identities(std::slice::from_ref(&third_type)).unwrap().len(), 1);
-    assert_eq!(
-        first.consumed_type_identities(std::slice::from_ref(&third_type)).err(),
-        Some(TypeError::invalid("wrong projected member type")),
-    );
     assert_eq!(first.infer_output_types(std::slice::from_ref(&first_type), &[]), Ok(vec![first_type.clone()]));
     assert_eq!(
         first.infer_output_types(std::slice::from_ref(&third_type), &[]),
@@ -1793,8 +1769,6 @@ fn test_operation_generates_operation_forwarding() {
 
     assert_eq!(add.defined_type_identities().len(), 0);
     assert_eq!(print.defined_type_identities().len(), 1);
-    assert_eq!(add.consumed_type_identities(&[DataType]).unwrap().len(), 0);
-    assert_eq!(print.consumed_type_identities(&[DataType, DataType]).unwrap().len(), 2);
 
     assert_eq!(add.effects().into_owned(), Effects::Pure);
     assert_eq!(print.effects().into_owned(), Effects::Read);
@@ -2073,7 +2047,7 @@ mod structural_batching {
         type Context = EagerContext<ArrayIrValue<Array>, StructuralBatchingOperation>;
 
         // Replicated dimension inputs are bound once through the parent context, and the result is rebuilt as a
-        // replicated composite carrier with default evidence.
+        // replicated composite carrier.
         let three = DimensionValue::constant(3).unwrap();
         let four = DimensionValue::constant(4).unwrap();
         let operation = StructuralBatchingOperation::from(DimensionOperation::Add(
@@ -2085,11 +2059,10 @@ mod structural_batching {
             ArrayIrBatch::replicated(ArrayIrValue::Dimension(three)),
             ArrayIrBatch::replicated(ArrayIrValue::Dimension(four)),
         ];
-        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &inputs).unwrap().into_parts();
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].batch_axis().is_replicated());
         assert!(matches!(outputs[0].value(), ArrayIrValue::Dimension(value) if value.extent() == 7));
-        assert!(evidence.is_empty());
     }
 }
 
@@ -2136,19 +2109,6 @@ mod mixed_members {
     }
 
     impl MemberOperation<ArrayIrType> for InterleavedOperation {
-        fn parent_consumed_type_identities(
-            &self,
-            input_types: &[ArrayIrType],
-        ) -> Result<Vec<DimensionVariable>, TypeError> {
-            Ok(input_types
-                .iter()
-                .filter_map(|r#type| match r#type {
-                    ArrayIrType::Dimension(dimension) => dimension.variable().cloned(),
-                    _ => None,
-                })
-                .collect())
-        }
-
         fn infer_parent_region_input_types(
             &self,
             _input_types: &[ArrayIrType],
@@ -2539,22 +2499,6 @@ mod mixed_members {
         let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent().unwrap();
         assert_eq!(second_cotangent_type, &dimension_cotangent_type);
         assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
-    }
-
-    #[test]
-    fn test_operation_generates_member_identity_consumption() {
-        type Operation = MixedProgramOperation<Array>;
-        let dimension = DimensionVariable::new("length", DimensionBounds::unbounded());
-        let inputs = [ArrayIrType::Dimension(dimension.clone().into())];
-        let mixed = Operation::from(InterleavedOperation);
-        assert_eq!(mixed.consumed_type_identities(&inputs).unwrap(), vec![dimension]);
-
-        // Projecting a homogeneous member must reject this parent-only input instead of invoking the mixed adapter.
-        let projected = Operation::Array(MixedMemberOperation::Interleaved(InterleavedOperation));
-        assert_eq!(
-            projected.consumed_type_identities(&inputs).unwrap_err(),
-            <&ArrayType>::try_from(&inputs[0]).unwrap_err()
-        );
     }
 
     #[test]
@@ -3274,25 +3218,6 @@ impl<V> ArrayBatch<V> {
     }
 }
 
-/// Stand-in for `ryft_core::BatchedOutputs`. These fixtures observe payload dispatch only, so the stand-in carries a
-/// rule's batches without the real type's operation-local validation evidence.
-struct BatchedOutputs<C: Context, P: BatchingPolicy<C>> {
-    batches: Vec<P::Batch>,
-    marker: PhantomData<fn() -> C>,
-}
-
-impl<C: Context, P: BatchingPolicy<C>> BatchedOutputs<C, P> {
-    fn into_batches(self) -> Vec<P::Batch> {
-        self.batches
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C>> From<Vec<P::Batch>> for BatchedOutputs<C, P> {
-    fn from(batches: Vec<P::Batch>) -> Self {
-        Self { batches, marker: PhantomData }
-    }
-}
-
 /// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] and its optional
 /// instruction-scoped [`BatchingDriver`] while physical values remain owned by the parent context `C`.
 trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::Type> {
@@ -3301,7 +3226,7 @@ trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError>;
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 }
 
 /// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
@@ -3422,10 +3347,10 @@ impl<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>> BatchableOpe
         context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Ordinary rules execute their lifted work through the parent context.
         let _ = context.parent();
-        Ok(vec![ArrayBatch::labeled("zero")].into())
+        Ok(vec![ArrayBatch::labeled("zero")])
     }
 }
 
@@ -3437,8 +3362,8 @@ impl<Constant: Clone, C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy
         _context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("constant")].into())
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("constant")])
     }
 }
 
@@ -3454,8 +3379,8 @@ where
         _context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("dot")].into())
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("dot")])
     }
 }
 
@@ -3504,14 +3429,13 @@ impl<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>> BatchableOpe
         context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // The rule observes the active frame's axis metadata directly.
         Ok(vec![ArrayBatch::labeled(if context.axis_name().is_some() {
             "collective_like_named"
         } else {
             "collective_like_unnamed"
-        })]
-        .into())
+        })])
     }
 }
 
@@ -3569,8 +3493,8 @@ where
         _context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("batch_recursive")].into())
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("batch_recursive")])
     }
 }
 
@@ -3598,26 +3522,23 @@ fn test_batchable_operation_dispatches_batching_to_payloads() {
     };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    assert_eq!(
-        zero.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
-        vec![ArrayBatch::labeled("zero")]
-    );
+    assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
 
     // The `Dot` rule requires `SpecialBatchValue` on the flowing value, transported to this use site by the
     // generated per-variant `BatchableOperation` predicate.
     let dot = Operation::from(DotOperation);
-    assert_eq!(dot.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(), vec![ArrayBatch::labeled("dot")]);
+    assert_eq!(dot.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("dot")]);
 
     // The collective-like rule observes the active frame's axis metadata without any variant-level marker.
     let collective = Operation::from(CollectiveLikeOperation);
     assert_eq!(
-        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
         vec![ArrayBatch::labeled("collective_like_named")],
     );
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
     assert_eq!(
-        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
         vec![ArrayBatch::labeled("batch_recursive")],
     );
 }
@@ -3635,20 +3556,17 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
     };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    assert_eq!(
-        zero.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
-        vec![ArrayBatch::labeled("zero")]
-    );
+    assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
 
     let collective = Operation::from(CollectiveLikeOperation);
     assert_eq!(
-        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
         vec![ArrayBatch::labeled("collective_like_unnamed")],
     );
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
     assert_eq!(
-        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
         vec![ArrayBatch::labeled("batch_recursive")],
     );
 }
@@ -3944,10 +3862,7 @@ fn test_operation_generates_all_selected_dispatchers() {
         axis_name: None,
         policy: PhantomData,
     };
-    assert_eq!(
-        operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
-        vec![ArrayBatch::labeled("zero")],
-    );
+    assert_eq!(operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")],);
 
     let discharge_context = ReferenceDischargeContext::<Context, TestReferenceDischargePolicy> {
         parent: Context { marker: PhantomData },
@@ -3974,13 +3889,17 @@ fn test_operation_generates_all_selected_dispatchers() {
 
 #[test]
 fn test_operation_cotangent_add_operation_without_conversion() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use ryft::{
-        AddOperation, Array, ArrayType, DataType, MaybeZero, Placeholder, ProgramError, StagingContext,
-        SupportsCotangentAdd, TracingContext, TranspositionContext, check_count,
+        AddOperation, Array, ArrayType, DataType, MaybeZero, OperationProvider, Placeholder, ProgramError,
+        StagingContext, TracingContext, TranspositionContext, check_count,
     };
+
+    static PROVIDED: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone, Debug, ryft::Operation)]
     #[ryft(type(ArrayType), constant(Array))]
@@ -3989,19 +3908,25 @@ fn test_operation_cotangent_add_operation_without_conversion() {
         Add(AddOperation<ArrayType>),
     }
 
-    impl SupportsCotangentAdd for CustomOperation {
-        fn cotangent_add_operation(input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+    impl OperationProvider<ArrayType, AddOperation<ArrayType>> for CustomOperation {
+        type Operation = Self;
+
+        fn provide(_request: AddOperation<ArrayType>, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
             check_count!("input", input_types, 2, ProgramError);
+            PROVIDED.fetch_add(1, Ordering::Relaxed);
             Ok(Self::Add(AddOperation::new()))
         }
     }
 
+    // The first contribution is stored as is, and the second one is added to it through the family's provider.
     let mut context = TranspositionContext::new(TracingContext::<Array, CustomOperation>::new());
     let input_type = ArrayType::scalar(DataType::F32);
     let accumulator = context.cotangent_accumulator(input_type.clone(), true);
     let contribution = context.input(input_type);
     accumulator.accumulate(&mut context, MaybeZero::Value(contribution.clone())).unwrap();
+    assert_eq!(PROVIDED.load(Ordering::Relaxed), 0);
     accumulator.accumulate(&mut context, MaybeZero::Value(contribution)).unwrap();
+    assert_eq!(PROVIDED.load(Ordering::Relaxed), 1);
     let builder = context.builder().borrow().clone();
     let outputs = builder.instructions()[0].outputs().to_vec();
     let program = builder.build::<Array, Array>(outputs, Placeholder, Placeholder).unwrap();
@@ -4013,62 +3938,6 @@ fn test_operation_cotangent_add_operation_without_conversion() {
             in (%1)"},
     );
     assert_eq!(program.interpret(Array::scalar(3f32).unwrap()), Ok(Array::scalar(6f32).unwrap()));
-}
-
-#[test]
-fn test_operation_differential_metadata_without_zero_provider() {
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
-    use ryft::{
-        Array, ArrayType, ConstantOperation, Context, DataType, DifferentialMetadataProvider,
-        DifferentialMetadataPurpose, Placeholder, ProgramError, StagingContext, TracingContext,
-    };
-
-    #[derive(Clone, Debug, ryft::Operation)]
-    #[ryft(type(ArrayType), constant(Array))]
-    enum MetadataOperation {
-        Constant(ConstantOperation<Array>),
-    }
-
-    impl DifferentialMetadataProvider<ArrayType> for MetadataOperation {
-        fn capture_differential_metadata<C: Context<Type = ArrayType, Operation = Self>>(
-            _context: &C,
-            primal: &C::Value,
-            _differential_type: &ArrayType,
-            _purpose: DifferentialMetadataPurpose,
-        ) -> Result<Vec<C::Value>, ProgramError> {
-            Ok(vec![primal.clone(), primal.clone()])
-        }
-    }
-
-    let context = TracingContext::<Array, MetadataOperation>::new();
-    let differential_type = ArrayType::scalar(DataType::F32);
-    let primal = context.input(differential_type.clone());
-    let metadata = MetadataOperation::capture_differential_metadata(
-        &context,
-        &primal,
-        &differential_type,
-        DifferentialMetadataPurpose::Reconstruction,
-    )
-    .unwrap();
-    let program = context
-        .builder()
-        .borrow()
-        .clone()
-        .build::<Array, Vec<Array>>(
-            metadata.iter().map(|value| value.atom_id().unwrap()).collect(),
-            Placeholder,
-            vec![Placeholder; 2],
-        )
-        .unwrap();
-    assert_eq!(
-        program.to_string(),
-        indoc! {"
-        lambda %0:f32[] .
-        in (%0, %0)"}
-    );
-    assert_eq!(program.interpret(Array::scalar(3f32).unwrap()), Ok(vec![Array::scalar(3f32).unwrap(); 2]));
 }
 
 #[test]

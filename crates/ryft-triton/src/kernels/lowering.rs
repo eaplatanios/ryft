@@ -636,9 +636,6 @@ impl<'c, 't> Lowering<'c, 't> {
                     ArrayIrValue::Reference(_) => {
                         return Err(unsupported("constant", "captured references are unsupported"));
                     }
-                    ArrayIrValue::Ragged(_) => {
-                        return Err(unsupported("constant", "ragged values are not supported in Triton kernels"));
-                    }
                 }));
             }
         }
@@ -690,18 +687,6 @@ impl<'c, 't> Lowering<'c, 't> {
             let location = self.location;
             let native = |position: usize| inputs[position].native();
             let results = match instruction.operation() {
-                KernelOperation::Portable(
-                    operation @ (ArrayIrOperation::RaggedNew(_)
-                    | ArrayIrOperation::RaggedStorage(_)
-                    | ArrayIrOperation::RaggedExtents(_)
-                    | ArrayIrOperation::RaggedAdd(_)
-                    | ArrayIrOperation::RaggedZero(_)),
-                ) => {
-                    return Err(unsupported(
-                        operation.name(),
-                        "first-class ragged operations are not supported in Triton kernels",
-                    ));
-                }
                 KernelOperation::Portable(ArrayIrOperation::Assert(_))
                 | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(_))) => {
                     return Err(unsupported("assert", "runtime assertions require native failure propagation"));

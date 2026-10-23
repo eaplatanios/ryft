@@ -411,18 +411,6 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
     )?;
     for (instruction_id, instruction) in kernel.definition().body().entry_region_ref().instructions_in_closure() {
         let supported = match instruction.operation() {
-            KernelOperation::Portable(
-                operation @ (ArrayIrOperation::RaggedNew(_)
-                | ArrayIrOperation::RaggedStorage(_)
-                | ArrayIrOperation::RaggedExtents(_)
-                | ArrayIrOperation::RaggedAdd(_)
-                | ArrayIrOperation::RaggedZero(_)),
-            ) => {
-                return Err(Error::Unsupported {
-                    operation: operation.name(),
-                    reason: "first-class ragged operations are not supported in GPU kernels".to_owned(),
-                });
-            }
             KernelOperation::Portable(ArrayIrOperation::Guard(_))
             | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Guard(_))) => {
                 return Err(Error::Unsupported {
@@ -481,7 +469,6 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                             ryft_core::ArrayIrType::Array(_) => true,
                             ryft_core::ArrayIrType::Reference(_) => input == output,
                             ryft_core::ArrayIrType::Dimension(_) => input == output,
-                            ryft_core::ArrayIrType::Ragged(_) => false,
                         }
                     });
                 operation.iteration_bound().is_some_and(|bound| bound <= i64::MAX as usize)
@@ -957,12 +944,6 @@ impl<'c, 't> Lowering<'c, 't> {
                         return Err(Error::Unsupported {
                             operation: "constant",
                             reason: "captured references are not kernel arguments".to_owned(),
-                        });
-                    }
-                    ArrayIrValue::Ragged(_) => {
-                        return Err(Error::Unsupported {
-                            operation: "constant",
-                            reason: "ragged values are not supported in GPU kernels".to_owned(),
                         });
                     }
                 });

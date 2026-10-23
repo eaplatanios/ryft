@@ -139,12 +139,6 @@ impl Plan {
             work = checked_work(work, region.instructions().len(), options.maximum_instructions())?;
             for (atom_index, atom) in region.atoms().iter().enumerate() {
                 let atom_type = atom.r#type();
-                if matches!(atom_type.as_ref(), ArrayIrType::Ragged(_)) {
-                    return Err(Error::Unsupported {
-                        operation: "kernel_call",
-                        reason: "ragged values are not supported in GPU kernels".to_owned(),
-                    });
-                }
                 if let Some(constant) = atom.as_constant() {
                     let count = match constant {
                         ArrayIrValue::Array(value) => {
@@ -152,12 +146,6 @@ impl Plan {
                         }
                         ArrayIrValue::Dimension(_) => 1,
                         ArrayIrValue::Reference(_) => 0,
-                        ArrayIrValue::Ragged(_) => {
-                            return Err(Error::Unsupported {
-                                operation: "constant",
-                                reason: "ragged values are not supported in GPU kernels".to_owned(),
-                            });
-                        }
                     };
                     work = checked_work(work, count, options.maximum_instructions())?;
                 }
