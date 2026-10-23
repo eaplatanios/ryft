@@ -24,7 +24,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
-use crate::operations::arithmetic::{Add, AddOperation, Mul};
+use crate::operations::arithmetic::{Add, AddOperation, Mul, SaturatingSub};
 use crate::operations::assertions::GuardOperation;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
@@ -36,7 +36,6 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_min::DimensionMin;
-use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSub;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
 use crate::operations::manipulation::broadcasting::Broadcast;
@@ -1489,7 +1488,7 @@ impl DynamicSliceOperation<ArrayIrType> {
             + DimensionSize
             + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
+            + ValueProjection<DimensionType, Projected: Add + SaturatingSub + Mul + DimensionMin>,
     >(
         &self,
         zeros: &V,
@@ -1526,14 +1525,12 @@ impl DynamicSliceOperation<ArrayIrType> {
                 // `min(size, 1)` makes the span zero for empty windows without a data-dependent branch.
                 let dimension = ValueProjection::<DimensionType>::into_projected(dimensions[axis].clone())?;
                 let span = dimension
-                    .dimension_saturating_sub(&one)?
+                    .saturating_sub(&one)?
                     .mul(&ValueProjection::<DimensionType>::into_projected(step.clone())?)?
                     .add(&dimension.dimension_min(&one)?)?;
                 let start = ValueProjection::<DimensionType>::into_projected(starts[axis].clone())?;
                 let size = ValueProjection::<DimensionType>::into_projected(zeros.dimension_size(axis)?)?;
-                ValueProjection::<DimensionType>::from_projected(
-                    start.dimension_min(&size.dimension_saturating_sub(&span)?)?,
-                )
+                ValueProjection::<DimensionType>::from_projected(start.dimension_min(&size.saturating_sub(&span)?)?)
             } else {
                 starts[axis].clone()
             };
@@ -2317,7 +2314,7 @@ impl_differentiable_operation! {
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
         Tracer<NestedTracingContext<C>>: DimensionSize + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
+            + ValueProjection<DimensionType, Projected: Add + SaturatingSub + Mul + DimensionMin>,
         NestedTracingContext<C>: StagingContext<
                 Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation,
             > + DimensionConstant + DynamicIota<Tracer<NestedTracingContext<C>>>
@@ -2385,7 +2382,7 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayIrType>,
         Tracer<TracingContext<V, O>>: DimensionSize + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
+            + ValueProjection<DimensionType, Projected: Add + SaturatingSub + Mul + DimensionMin>,
         TracingContext<V, O>: DimensionConstant + DynamicIota<Tracer<TracingContext<V, O>>>
             + DynamicZero<Tracer<TracingContext<V, O>>>,
     {

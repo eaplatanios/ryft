@@ -27,24 +27,24 @@ use crate::operations::{
     CustomCallOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
     DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
-    DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
-    DotOperation, DotOperations, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
-    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation,
-    ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation,
-    IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
-    LogicalOperations, LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation,
-    NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
-    ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
-    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select,
-    SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Sort,
-    SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
+    DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
+    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DynamicBroadcastOperation,
+    DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation, ExponentialOperations, ExtremaOperations,
+    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules,
+    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation,
+    ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
+    OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
+    ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation,
+    ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation,
+    ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation,
+    ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations,
+    RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDot, ScaledDotOperation, ScanOperation,
+    ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation,
+    SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
+    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
     UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
@@ -72,6 +72,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Neg(NegOperation<ArrayType>),
     Add(AddOperation<ArrayType>),
     Sub(SubOperation<ArrayType>),
+    SaturatingSub(SaturatingSubOperation<ArrayType>),
     Mul(MulOperation<ArrayType>),
     Div(DivOperation<ArrayType>),
     Rem(RemOperation<ArrayType>),
@@ -177,6 +178,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + ConstantOperations<T>
     + ExtremaOperations<T>
     + ArithmeticOperations<T>
+    + SaturatingSub<T>
     + TrigonometricOperations<T>
     + ExponentialOperations<T>
     + Erf<T>
@@ -209,6 +211,7 @@ impl<
         + ConstantOperations<T>
         + ExtremaOperations<T>
         + ArithmeticOperations<T>
+        + SaturatingSub<T>
         + TrigonometricOperations<T>
         + ExponentialOperations<T>
         + Erf<T>
@@ -245,7 +248,7 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Min(DimensionMinOperation),
     Add(DimensionAddOperation),
     Sub(DimensionSubOperation),
-    SaturatingSub(DimensionSaturatingSubOperation),
+    SaturatingSub(SaturatingSubOperation<DimensionType>),
     Mul(DimensionMulOperation),
     Div(DimensionDivOperation),
     Rem(DimensionRemOperation),
@@ -255,10 +258,10 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
 /// Value-level capability bundle that groups every operation Ryft supports on first-class dimension values, so that
 /// generic first-class-dimension code can state one bound instead of listing each capability it uses. Its members are
 /// the capabilities through which values stage or execute [`DimensionOperation`] variants, listed in variant order.
-/// Checked arithmetic reuses the shared [`Add`], [`Sub`], [`Mul`], [`Div`] (flooring division), and [`Rem`]
-/// capabilities alongside the dedicated [`DimensionMin`], [`DimensionMax`], [`DimensionSaturatingSub`], and
-/// [`DimensionPow`]. It is implemented automatically for every value that implements all of its members, and so it
-/// must never be implemented manually.
+/// Checked arithmetic reuses the shared [`Add`], [`Sub`], [`SaturatingSub`], [`Mul`], [`Div`] (flooring division), and
+/// [`Rem`] capabilities, alongside the dedicated [`DimensionMin`], [`DimensionMax`], and [`DimensionPow`] capabilities.
+/// It is implemented automatically for every value that implements all of its members, and so it must never be
+/// implemented manually.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that first-class dimension values implement this bundle for [`DimensionType`].
@@ -268,8 +271,7 @@ pub trait DimensionOperations<T = <Self as Capability>::Universe>:
     + DimensionMin<T>
     + Add<T>
     + Sub<T>
-    // TODO(eaplatanios): Do we need a more general `SaturatingSub` operation type and capability trait as well?
-    + DimensionSaturatingSub<T>
+    + SaturatingSub<T>
     + Mul<T>
     + Div<T>
     + Rem<T>
@@ -284,7 +286,7 @@ impl<
         + DimensionMax<T>
         + Add<T>
         + Sub<T>
-        + DimensionSaturatingSub<T>
+        + SaturatingSub<T>
         + Mul<T>
         + Div<T>
         + Rem<T>
@@ -1211,7 +1213,7 @@ mod tests {
                 let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
                 let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
                 let padded = Add::add(&Mul::mul(&rows, &columns)?, &columns)?;
-                let trimmed = padded.dimension_saturating_sub(&rows)?;
+                let trimmed = padded.saturating_sub(&rows)?;
                 Ok((
                     Div::div(&trimmed, &columns)?.into_value(),
                     Rem::rem(&trimmed, &columns)?.into_value(),
@@ -1227,7 +1229,7 @@ mod tests {
             lambda %0:dimension<rows ∈ [5, 9)>, %1:dimension<columns ∈ [1, 5)> .
             let %2:dimension<rows * columns ∈ [5, 33)> = dimension_mul %0 %1
                 %3:dimension<rows * columns + columns ∈ [6, 37)> = dimension_add %2 %1
-                %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = dimension_saturating_sub %3 %0
+                %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = saturating_sub %3 %0
                 %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
                 %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
                 %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1

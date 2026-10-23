@@ -109,6 +109,8 @@ ownership, and synchronization. These shared rules also apply to test code; deta
     imports into one group, which conflicts with the import group order above.
 - At in-crate declarative macro call sites, import macros from `crate::macros` (grouping related macros where useful)
   and invoke them unqualified. Reserve `$crate::...` paths for hygienic references inside macro definitions.
+- For macros that generate per-type implementations, accept one type per invocation and invoke the macro separately
+  for each supported type instead of accepting a list of types.
 - Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical
   function names that Rust's own standard library uses (e.g., `abs` as in `f64::abs`) count as full names and are
   preferred over spelled-out variants such as `absolute_value`. This also applies to names borrowed from external APIs:

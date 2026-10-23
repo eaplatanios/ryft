@@ -23,7 +23,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
-use crate::operations::arithmetic::Add;
+use crate::operations::arithmetic::{Add, SaturatingSubOperation};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
@@ -36,7 +36,6 @@ use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
-use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
@@ -1116,12 +1115,8 @@ impl_differentiable_operation! {
                                     let one = one.remove(0);
                                     let input_type =
                                         <&DimensionType>::try_from(input_extent.r#type().as_ref())?.clone();
-                                    let one_type = <&DimensionType>::try_from(one.r#type().as_ref())?.clone();
                                     let mut less_one = transpose_context.bind(
-                                        DimensionOperation::SaturatingSub(DimensionSaturatingSubOperation::new(
-                                            &input_type,
-                                            &one_type,
-                                        )?),
+                                        DimensionOperation::SaturatingSub(SaturatingSubOperation::new()),
                                         Vec::new(),
                                         &[input_extent.clone(), one],
                                     )?;
@@ -4806,7 +4801,7 @@ mod tests {
                         lambda %0:dimension<result ∈ [3, 11)>, %1:dimension<source ∈ [0, 5)>, %2:f64[result] .
                         let %3:f64[] = zero [type=f64[]]
                             %4:dimension<1> = constant [value=1]
-                            %5:dimension<max(0, source - 1) ∈ [0, 4)> = dimension_saturating_sub %1 %4
+                            %5:dimension<max(0, source - 1) ∈ [0, 4)> = saturating_sub %1 %4
                             %6:dimension<source + max(0, source - 1) ∈ [0, 8)> = dimension_add %1 %5
                             %7:f64[source + max(0, source - 1)] = pad [edge_padding_low=[-1], \
                     edge_padding_high=[-2], interior_padding=[0]] %2 %3 %6
@@ -5313,7 +5308,7 @@ mod tests {
                         lambda %0:dimension<output_size ∈ [0, 9)>, %1:dimension<size ∈ [0, 5)>, %2:f32[output_size] .
                         let %3:f32[] = zero [type=f32[]]
                             %4:dimension<1> = constant [value=1]
-                            %5:dimension<max(0, size - 1) ∈ [0, 4)> = dimension_saturating_sub %1 %4
+                            %5:dimension<max(0, size - 1) ∈ [0, 4)> = saturating_sub %1 %4
                             %6:dimension<size + max(0, size - 1) ∈ [0, 8)> = dimension_add %1 %5
                             %7:f32[size + max(0, size - 1)] = pad [edge_padding_low=[0], edge_padding_high=[0], \
                     interior_padding=[0]] %2 %3 %6

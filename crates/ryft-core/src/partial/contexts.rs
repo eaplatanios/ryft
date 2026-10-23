@@ -1217,13 +1217,15 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// values that only that invocation supplies. The residual entry checks such a relationship, but only when the
     /// residual program runs, after any effect of the body that partial evaluation folds into the known side. When the
     /// body has effects, the guard therefore checks such relationships too, so that it defers those effects behind the
-    /// check. Its two callers, and [`prepare_root_inputs`](Self::prepare_root_inputs), which prepares a root entry
-    /// through the same contract, choose the flag as follows:
+    /// check. Its callers, and [`prepare_root_inputs`](Self::prepare_root_inputs), which prepares a root entry through
+    /// the same contract, choose the flag as follows:
     ///
     ///   - Attached-region inlining from an operation's partial-evaluation rule (i.e., through
     ///     [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)) passes `false`:
     ///     the region is inlined within one evaluation, whose unknown values were already checked where they entered
     ///     it, so the identities that they share with known inputs need no additional check.
+    ///   - Splitting a `condition` with a symbolic known predicate into a known and a residual condition passes `false`
+    ///     for the same reason (the split replaces the branch entries within one evaluation, like inlining a branch).
     ///   - [`inline_program`](Self::inline_program) passes `true`: it replays a program at the root of the residual
     ///     program, whose unknown inputs are the residual program's own inputs, supplied by a separate invocation.
     ///   - [`prepare_root_inputs`](Self::prepare_root_inputs) passes `true`: it prepares the replay of a program's own
@@ -1235,7 +1237,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// operation family cannot provide one (refer to [`OperationProvider`]): removing the entry would then
     /// drop the check of its unproven relationships.
     #[inline]
-    pub(super) fn guard_region_inputs(
+    pub(crate) fn guard_region_inputs(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<PartialEvaluationValue<C::Value>>,

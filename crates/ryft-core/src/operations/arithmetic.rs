@@ -48,7 +48,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, Broadcastable,
-    DataType, FloatingPointArrayElement, NumericArrayElement, RealArrayElement, i1, i2, i4, u1, u2, u4,
+    DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, FloatingPointArrayElement,
+    NumericArrayElement, RealArrayElement, i1, i2, i4, u1, u2, u4,
 };
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -65,7 +66,10 @@ use crate::operations::control_flow::select::Select;
 use crate::operations::exponential::Log;
 use crate::operations::rounding::Floor;
 use crate::operations::{Accuracy, Capability};
-use crate::programs::{MaybeZero, Operation, OperationProvider, ProgramError, Type, TypeError, Typed, Value};
+use crate::programs::{
+    MaybeZero, Operation, OperationFoldOutput, OperationProvider, ProgramError, RegionInterface, Type, TypeError,
+    Typed, Value,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`NegOperation`].
@@ -431,22 +435,77 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
+impl Operation for SaturatingSubOperation<DimensionType> {
+    type Type = DimensionType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        SATURATING_SUB_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[DimensionType],
+        region_interfaces: &[RegionInterface<DimensionType>],
+    ) -> Result<Vec<DimensionType>, TypeError> {
+        // Non-negative dimension subtraction saturates without runtime assertions.
+        // The stateless operation infers every bound from its input types.
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let [left, right] = input_types else { unreachable!() };
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+        let bounds = if left.extent() == Some(0) || right.extent() == Some(0) {
+            // Preserve the complete input bounds for identity folds, including an unbounded upper endpoint.
+            left.bounds()
+        } else {
+            DimensionBounds::new(
+                left_lower.saturating_sub(right_maximum),
+                left_maximum.saturating_sub(right_lower).checked_add(1),
+            )?
+        };
+        Ok(vec![match bounds.extent() {
+            Some(extent) => DimensionType::from(Dimension::Static(extent)),
+            None => DimensionType::new(format!("max(0, {} - {})", left.dimension(), right.dimension()), bounds),
+        }])
+    }
+
+    fn fold(
+        &self,
+        input_types: &[DimensionType],
+        region_interfaces: &[RegionInterface<DimensionType>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        input_types.iter().try_for_each(|input| input.bounds().representable_extent_range().map(|_| ()))?;
+        Ok((input_types[0].extent() == Some(0) || input_types[1].extent() == Some(0))
+            .then(|| vec![OperationFoldOutput::Input(0)]))
+    }
+}
+
 // Integer arrays and first-class dimensions have trivial differential spaces. Reuse the shared discrete-operation
 // rule so primal evaluation is preserved and tangents stay structural zeros without staging tangent arithmetic.
 impl_differentiable_elementwise_operation!(@non_differentiable SaturatingSubOperation);
+
+impl<A: Value<Type = ArrayType>> From<SaturatingSubOperation<DimensionType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: SaturatingSubOperation<DimensionType>) -> Self {
+        Self::Dimension(DimensionOperation::SaturatingSub(operation))
+    }
+}
 
 define_elementwise_capability!(
     @binary
     /// Value capability for integer subtraction that saturates at the numeric bounds instead of overflowing. Array
     /// values broadcast and promote their inputs to an integer result type before applying saturation. First-class
-    /// [`DimensionValue`](crate::DimensionValue)s clamp at zero while retaining inferred extent bounds, and host
-    /// integer primitives use their own numeric bounds. Floating-point, complex, and Boolean values are unsupported.
-    /// Integer values have structural-zero tangents and cotangents. Differentiation replays the primal subtraction
-    /// without staging tangent arithmetic; direct primitive transposition is unsupported.
+    /// [`DimensionValue`]s clamp at zero while retaining inferred extent bounds, and host integer primitives use
+    /// their own numeric bounds. Floating-point, complex, and Boolean values are unsupported. Integer values have
+    /// structural-zero tangents and cotangents. Differentiation replays the primal subtraction without staging
+    /// tangent arithmetic; direct primitive transposition is unsupported.
     ///
     /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array values
     /// implement this capability for [`ArrayType`] and [`ArrayIrType`], first-class dimensions implement it for
-    /// [`DimensionType`](crate::DimensionType), and host integers use their own universes.
+    /// [`DimensionType`], and host integers use their own universes.
     ///
     /// # Example
     ///
@@ -516,6 +575,14 @@ impl_saturating_sub_for_primitive!(@sub_byte i4);
 impl_saturating_sub_for_primitive!(@sub_byte u1);
 impl_saturating_sub_for_primitive!(@sub_byte u2);
 impl_saturating_sub_for_primitive!(@sub_byte u4);
+
+impl SaturatingSub for DimensionValue {
+    fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+        let inputs = [self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = SaturatingSubOperation::<DimensionType>::new().infer_output_types(&inputs, &[])?.remove(0);
+        Ok(Self::new(output_type, self.extent().saturating_sub(right.extent()))?)
+    }
+}
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
@@ -1633,8 +1700,9 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
-        Dimension, DimensionValue, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
+        Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, Layout,
+        LogicalMesh, MAX_DIMENSION_EXTENT, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
@@ -1653,7 +1721,9 @@ mod tests {
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::{Parameter, Parameterwise, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, TypeError, Typed};
+    use crate::programs::{
+        EffectClasses, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, Type, TypeError, Typed, ValueProjection,
+    };
     use crate::tracing::Trace;
 
     use super::*;
@@ -2724,6 +2794,40 @@ mod tests {
     }
 
     #[test]
+    fn test_saturating_sub_type_inference_dimensions() {
+        let operation = SaturatingSubOperation::<DimensionType>::new();
+        assert_eq!(operation.to_string(), SATURATING_SUB_OPERATION_NAME);
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+        let left = DimensionType::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(2, Some(9)).unwrap());
+        let output = operation.infer_output_types(&[left.clone(), right.clone()], &[]).unwrap().remove(0);
+        assert_eq!(output.bounds(), DimensionBounds::new(0, Some(3)).unwrap());
+        let repeated = operation.infer_output_types(&[left, right], &[]).unwrap().remove(0);
+        assert_ne!(output.identities().collect::<Vec<_>>(), repeated.identities().collect::<Vec<_>>());
+
+        // One stateless operation accepts both independently named inputs and exact refinements of earlier inputs.
+        let left = DimensionType::new("exact_left", DimensionBounds::new(6, Some(7)).unwrap());
+        let right = DimensionType::new("exact_right", DimensionBounds::new(2, Some(3)).unwrap());
+        assert_eq!(operation.infer_output_types(&[left, right], &[]).unwrap()[0].extent(), Some(4));
+        let zero = DimensionValue::constant(0).unwrap().r#type().into_owned();
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::at_least(1));
+        assert_eq!(
+            operation.infer_output_types(&[unbounded.clone(), zero.clone()], &[]).unwrap()[0].bounds(),
+            unbounded.bounds(),
+        );
+
+        // Identity folds still validate both inputs against the portable dimension range.
+        if let Some(invalid_extent) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let invalid = DimensionType::new("invalid", DimensionBounds::at_least(invalid_extent));
+            let expected =
+                DimensionError::ExtentExceedsBackendWidth { value: invalid_extent, maximum: MAX_DIMENSION_EXTENT };
+            let error = operation.infer_output_types(&[zero.clone(), invalid.clone()], &[]).unwrap_err();
+            assert_eq!(error, TypeError::from(expected.clone()));
+            assert_eq!(operation.fold(&[zero, invalid], &[]), Err(TypeError::from(expected)));
+        }
+    }
+
+    #[test]
     fn test_saturating_sub_interpretation() {
         assert_eq!(
             SaturatingSubOperation::<ArrayType>::new().interpret(
@@ -2736,11 +2840,93 @@ mod tests {
     }
 
     #[test]
+    fn test_saturating_sub_interpretation_dimensions() {
+        assert_eq!(
+            DimensionValue::constant(3)
+                .unwrap()
+                .saturating_sub(&DimensionValue::constant(7).unwrap())
+                .unwrap()
+                .extent(),
+            0,
+        );
+        assert_eq!(
+            DimensionValue::constant(MAX_DIMENSION_EXTENT)
+                .unwrap()
+                .saturating_sub(&DimensionValue::constant(0).unwrap())
+                .unwrap()
+                .extent(),
+            MAX_DIMENSION_EXTENT,
+        );
+    }
+
+    #[test]
     fn test_saturating_sub_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = SaturatingSubOperation::new(),
             inputs = [Array::scalar(i8::MIN).unwrap(), Array::scalar(1i8).unwrap()],
             expected = Array::scalar(i8::MIN).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_partial_evaluation_dimensions() {
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(9)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(9)).unwrap());
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = vec![builder.add_input(left.clone()), builder.add_input(right.clone())];
+        let outputs =
+            builder.add_instruction(SaturatingSubOperation::new(), Vec::new(), inputs, None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let expected = indoc! {"
+            lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+            let %2:dimension<max(0, left - right) ∈ [0, 9)> = saturating_sub %0 %1
+            in (%2)"};
+        assert_eq!(program.to_string(), expected);
+        let residual = program
+            .partially_evaluate(&[PartialValue::Unknown(left.clone()), PartialValue::Unknown(right)])
+            .unwrap();
+        assert_eq!(residual.program().to_string(), expected);
+        assert_eq!(
+            residual
+                .interpret(
+                    &EagerContext::new(),
+                    &[DimensionValue::constant(3).unwrap(), DimensionValue::constant(7).unwrap(),]
+                )
+                .unwrap()[0]
+                .extent(),
+            0,
+        );
+        let identity = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(left),
+                PartialValue::Known(DimensionValue::constant(0).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(
+            identity.program().to_string(),
+            indoc! {"
+            lambda %0:dimension<left ∈ [0, 9)> .
+            in (%0)"}
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_identity_dimensions() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(value, zero)| Ok(vec![value.saturating_sub(&zero)?, zero.saturating_sub(&value)?]),
+            (
+                DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+                DimensionValue::constant(0).unwrap().r#type().into_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0> .
+            in (%0, %1)"}
         );
     }
 
@@ -2830,6 +3016,32 @@ mod tests {
         assert_eq!(
             pullback.apply(Array::from_logical_bytes(zero_type.clone(), &[]).unwrap()),
             Ok((MaybeZero::Zero(zero_type), MaybeZero::Zero(ArrayType::scalar(DataType::Zero)))),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation_dimensions() {
+        // First-class dimensions use the same discrete rule through the composite family. No tangent slots or
+        // arithmetic are needed, and the primal result retains its inferred extent bounds.
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let left = ValueProjection::<DimensionType>::into_projected(inputs[0].clone())?;
+                let right = ValueProjection::<DimensionType>::into_projected(inputs[1].clone())?;
+                Ok(vec![left.saturating_sub(&right)?.into_value()])
+            },
+            vec![
+                ArrayIrType::from(DimensionType::new("left", bounds)),
+                ArrayIrType::from(DimensionType::new("right", bounds)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+                let %2:dimension<max(0, left - right) ∈ [0, 9)> = saturating_sub %0 %1
+                in (%2)"},
         );
     }
 

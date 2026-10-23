@@ -65,10 +65,11 @@ Group each operation in this order, omitting only implementations that do not ap
    `BatchingContext`, `DifferentiationContext`, and `TranspositionContext`.
 
 Keep shared blanket implementations and substantial helper submodules shared; do not duplicate them to reproduce
-this ordering. Reuse existing production and testing macros from `crate::macros` where applicable, following their
-current contracts and importing them unqualified as required by the Rust conventions. For example, elementwise
-operations can use `define_elementwise_operation!` and `define_elementwise_capability!` rather than restating shared
-boilerplate.
+this ordering. Keep additional universe-specific implementations of a shared operation type and their tests in its
+defining module rather than introducing a separate module solely for those implementations. Reuse existing production
+and testing macros from `crate::macros` where applicable, following their current contracts and importing them
+unqualified as required by the Rust conventions. For example, elementwise operations can use
+`define_elementwise_operation!` and `define_elementwise_capability!` rather than restating shared boilerplate.
 
 Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when constructing
 or updating operation output types, and propagate validation errors through existing conversions.
