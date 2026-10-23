@@ -1451,9 +1451,10 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 /// Batching lifts the declared types by the mapped axis and guards the packed values at once, freshening the guard's
 /// local identities so the inserted batch dimension cannot alias them. First-class dimensions remain replicated.
 ///
-/// The guarded type family owns the interpretation, batching, and differentiation semantics through
-/// [`GuardInterpretation`], [`GuardBatching`], and [`GuardDifferentiation`], so that one guard payload serves every
-/// family. Reference discharge, partial evaluation, and transposition are shared by every family.
+/// Interpretation, batching, and differentiation are generic over the guarded type family: interpretation checks the
+/// concrete types of its inputs, batching lifts the declaration by the mapped axis, and differentiation casts each
+/// tangent to its checked output's representation. Reference discharge, partial evaluation, and transposition are
+/// likewise shared by every family.
 ///
 /// The guard's stored state has three semantic roles:
 ///
@@ -1724,168 +1725,6 @@ impl<T: Type> GuardOperation<T> {
             ),
         }
     }
-
-    /// Interprets this guard over `inputs` whose types carry their complete runtime extents, which is the ordinary
-    /// [`GuardInterpretation`] semantics. Deriving refinements from those types performs the complete runtime check,
-    /// with the same diagnostics as program or region input validation, and the checked outputs are the non-reference
-    /// inputs themselves. [`GuardInterpretation`] implementations of type families that keep no runtime extents outside
-    /// their types delegate to this function.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of the program or region input checks that this guard preserves, and
-    /// [`ProgramError::Concretization`] when the input types leave a declared relationship symbolic (e.g., for
-    /// tracers interpreted through a program), in which case the guard must be bound through its context instead.
-    fn interpret_ordinary<V: Value<Type = T>>(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        // Interpreted values carry their concrete extents in their types, so deriving refinements from these types
-        // performs the complete runtime check, with the same diagnostics as program or region input validation, and
-        // the narrowed outputs are the non-reference inputs themselves. Interpreted types can still be symbolic (e.g.,
-        // tracers interpreted through a program), in which case a relationship the types do not prove has no
-        // interpretation here, exactly as for `cast`: such a guard must be bound through its context, whose
-        // rules stage the check.
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(&input_types, &[])?;
-        let refinements = T::Refinements::from_local_declarations(self.declared_types.iter(), input_types.iter())?;
-        if !refinements.identities_needing_runtime_checks().is_empty() {
-            return Err(ProgramError::Concretization {
-                message: format!(
-                    "`{GUARD_OPERATION_NAME}` cannot check symbolic type relationships during interpretation; \
-                     bind the operation through its context",
-                ),
-            });
-        }
-        Ok(self
-            .declared_types
-            .iter()
-            .zip(inputs)
-            .filter(|(declared_type, _)| !declared_type.is_reference())
-            .map(|(_, input)| input.clone())
-            .collect())
-    }
-
-    /// Batches this guard by checking the packed values at once against its declared types lifted by the mapped axis,
-    /// which is the ordinary [`GuardBatching`] semantics. The guard-local identities are freshened before the batch
-    /// dimension is inserted, so that the two scopes cannot alias. [`GuardBatching`] implementations of type families
-    /// whose packed values carry every per-item extent in their types delegate to this function.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the declaration is malformed, when the batching policy cannot lift a declared type by the
-    /// mapped axis, or when the parent rejects the lifted guard.
-    fn batch_ordinary<
-        C: Context<Type = T, Operation: From<GuardOperation<T>>>,
-        P: BatchingPolicy<C>,
-        D: BatchingDriver<C, P>,
-    >(
-        &self,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
-        // Every batch item enters with the same per-item shape, because mapped members are dense along the batch axis.
-        // Guarding the stacked values with the batch axis inserted into their declared types therefore checks every
-        // item at once. An empty batch still carries the extents of its non-batch axes, which the guard checks. Each
-        // output keeps the batch axis of its input, since narrowing never changes the position of an axis. Validate the
-        // original declaration before lifting erases layout and adds batch-axis variation. The parent validates the
-        // physical operands against the lifted contract, retaining every other input constraint.
-        check_count!("input", inputs, self.declared_types.len(), ProgramError);
-        self.infer_output_types(
-            &self.declared_types,
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
-        )?;
-
-        // The inserted batch dimension belongs to the surrounding program. Freshen the guard-local names together
-        // before inserting it, so reusing a nominal identity across those scopes cannot create an extra equality.
-        let mut renaming = TypeIdentityRenaming::new();
-        for (_, identity) in self.declared_types.iter().flat_map(|r#type| r#type.identities()) {
-            if renaming.target(identity).is_none() {
-                renaming.insert(identity.clone(), identity.fresh())?;
-            }
-        }
-
-        let declared_types = self
-            .declared_types
-            .iter()
-            .zip(inputs)
-            .map(|(declared_type, input)| {
-                let declared_type = declared_type.rename_identities(&renaming)?;
-                P::batched_type(context, input, &declared_type)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
-
-        let outputs = context.parent().bind(Self { declared_types, ..self.clone() }, Vec::new(), &values)?;
-        let inputs = self
-            .declared_types
-            .iter()
-            .zip(inputs)
-            .filter(|(declared_type, _)| !declared_type.is_reference())
-            .map(|(_, input)| input)
-            .collect::<Vec<_>>();
-        check_count!("output", outputs, inputs.len(), ProgramError);
-
-        outputs
-            .into_iter()
-            .zip(inputs)
-            .map(|(output, input)| P::batch(output, P::batch_axis(input)))
-            .collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Differentiates this guard by checking the primal inputs and casting each tangent to the representation of
-    /// its checked output, which is the ordinary [`GuardDifferentiation`] semantics. The check stays in the primal
-    /// computation and the tangents use the shared tangent cast of [`CastOperation`]. [`GuardDifferentiation`]
-    /// implementations of differentiable type families that support casts delegate to this function.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of the primal check and of the tangent casts.
-    fn jvp_ordinary<
-        C: Context<
-                Type = T,
-                Operation: From<GuardOperation<T>> + From<CastOperation<T>> + From<T::IdentityWitnessOperation>,
-            >,
-        P: DifferentiationPolicy<C>,
-    >(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        T: DifferentiableType + CastType,
-    {
-        // Tangents use the checked output's representation through the shared tangent cast of `CastOperation`, which
-        // witnesses only the identities lost from (or introduced by) that representation, each by a scalar read of its
-        // extent where the family has one (e.g., `dimension_size` for `ArrayIrType`) and by the whole value otherwise.
-        // Every fused tangent retains the guard's data dependency: even a proven guard orders its outputs after
-        // preceding standalone assertions. Partitioned tangents run after the primal completes and therefore
-        // retain only the identity witnesses they need.
-        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let outputs = context.primal().bind(self.clone(), Vec::new(), &primals)?;
-        let members = self
-            .declared_types
-            .iter()
-            .zip(inputs)
-            .filter(|(declared_type, _)| !declared_type.is_reference())
-            .collect::<Vec<_>>();
-        check_count!("output", outputs, members.len(), ProgramError);
-        outputs
-            .into_iter()
-            .zip(members)
-            .map(|(output, (_, input))| match input.tangent() {
-                MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(output),
-                MaybeZero::Value(tangent) => {
-                    let tangent = CastOperation::bind_tangent(
-                        context,
-                        input.primal(),
-                        &output,
-                        tangent,
-                        !P::PRIMAL_COMPLETES_BEFORE_TANGENT,
-                    )?;
-                    DifferentiationDual::new(output, tangent)
-                }
-            })
-            .collect()
-    }
 }
 
 impl<T: Type> Display for GuardOperation<T> {
@@ -2062,17 +1901,38 @@ impl<C: Context<Type: ReferenceMemberType, Operation: From<GuardOperation<C::Typ
     }
 }
 
-impl<T: GuardInterpretation<C>, C: Domain<Type = T>> InterpretableOperation<C> for GuardOperation<T> {
-    #[inline]
+impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for GuardOperation<T> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
-        context: &C,
+        _context: &C,
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Guards carry no regions, and the type family owns the check itself (refer to `GuardInterpretation`).
+        // Guards carry no regions. Interpreted values carry their concrete extents in their types, so deriving
+        // refinements from these types performs the complete runtime check, with the same diagnostics as program or
+        // region input validation, and the narrowed outputs are the non-reference inputs themselves. Interpreted types
+        // can still be symbolic (e.g., tracers interpreted through a program), in which case a relationship the types
+        // do not prove has no interpretation here, exactly as for `cast`: such a guard must be bound through its
+        // context, whose rules stage the check.
         self.validate_region_count(driver.region_count())?;
-        T::interpret_guard(self, context, inputs)
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
+        let refinements = T::Refinements::from_local_declarations(self.declared_types.iter(), input_types.iter())?;
+        if !refinements.identities_needing_runtime_checks().is_empty() {
+            return Err(ProgramError::Concretization {
+                message: format!(
+                    "`{GUARD_OPERATION_NAME}` cannot check symbolic type relationships during interpretation; \
+                     bind the operation through its context",
+                ),
+            });
+        }
+        Ok(self
+            .declared_types
+            .iter()
+            .zip(inputs)
+            .filter(|(declared_type, _)| !declared_type.is_reference())
+            .map(|(_, input)| input.clone())
+            .collect())
     }
 }
 
@@ -2096,29 +1956,110 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>> PartiallyEvaluatableO
     }
 }
 
-impl<T: GuardBatching<C, P>, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
+impl<T: Type, C: Context<Type = T, Operation: From<GuardOperation<T>>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
     for GuardOperation<T>
 {
-    #[inline]
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
-        T::batch_guard(self, context, driver, inputs)
+        // Every batch item enters with the same per-item shape, because mapped members are dense along the batch axis.
+        // Guarding the stacked values with the batch axis inserted into their declared types therefore checks every
+        // item at once. An empty batch still carries the extents of its non-batch axes, which the guard checks. Each
+        // output keeps the batch axis of its input, since narrowing never changes the position of an axis. Validate the
+        // original declaration before lifting erases layout and adds batch-axis variation. The parent validates the
+        // physical operands against the lifted contract, retaining every other input constraint.
+        check_count!("input", inputs, self.declared_types.len(), ProgramError);
+        self.infer_output_types(
+            &self.declared_types,
+            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+        )?;
+
+        // The inserted batch dimension belongs to the surrounding program. Freshen the guard-local names together
+        // before inserting it, so reusing a nominal identity across those scopes cannot create an extra equality.
+        let mut renaming = TypeIdentityRenaming::new();
+        for (_, identity) in self.declared_types.iter().flat_map(|r#type| r#type.identities()) {
+            if renaming.target(identity).is_none() {
+                renaming.insert(identity.clone(), identity.fresh())?;
+            }
+        }
+
+        let declared_types = self
+            .declared_types
+            .iter()
+            .zip(inputs)
+            .map(|(declared_type, input)| {
+                let declared_type = declared_type.rename_identities(&renaming)?;
+                P::batched_type(context, input, &declared_type)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
+
+        let outputs = context.parent().bind(Self { declared_types, ..self.clone() }, Vec::new(), &values)?;
+        let inputs = self
+            .declared_types
+            .iter()
+            .zip(inputs)
+            .filter(|(declared_type, _)| !declared_type.is_reference())
+            .map(|(_, input)| input)
+            .collect::<Vec<_>>();
+        check_count!("output", outputs, inputs.len(), ProgramError);
+
+        outputs
+            .into_iter()
+            .zip(inputs)
+            .map(|(output, input)| P::batch(output, P::batch_axis(input)))
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
-impl<T: GuardDifferentiation<C>, C: Context<Type = T>> DifferentiableOperation<C> for GuardOperation<T> {
-    #[inline]
+impl<T: DifferentiableType + CastType, C> DifferentiableOperation<C> for GuardOperation<T>
+where
+    C: Context<
+            Type = T,
+            Operation: From<GuardOperation<T>> + From<CastOperation<T>> + From<T::IdentityWitnessOperation>,
+        >,
+{
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
-        driver: &D,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        T::jvp_guard(self, context, driver, inputs)
+        // Tangents use the checked output's representation through the shared tangent cast of `CastOperation`, which
+        // witnesses only the identities lost from (or introduced by) that representation, each by a scalar read of its
+        // extent where the family has one (e.g., `dimension_size` for `ArrayIrType`) and by the whole value otherwise.
+        // Every fused tangent retains the guard's data dependency: even a proven guard orders its outputs after
+        // preceding standalone assertions. Partitioned tangents run after the primal completes and therefore
+        // retain only the identity witnesses they need.
+        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let outputs = context.primal().bind(self.clone(), Vec::new(), &primals)?;
+        let members = self
+            .declared_types
+            .iter()
+            .zip(inputs)
+            .filter(|(declared_type, _)| !declared_type.is_reference())
+            .collect::<Vec<_>>();
+        check_count!("output", outputs, members.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(members)
+            .map(|(output, (_, input))| match input.tangent() {
+                MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(output),
+                MaybeZero::Value(tangent) => {
+                    let tangent = CastOperation::bind_tangent(
+                        context,
+                        input.primal(),
+                        &output,
+                        tangent,
+                        !P::PRIMAL_COMPLETES_BEFORE_TANGENT,
+                    )?;
+                    DifferentiationDual::new(output, tangent)
+                }
+            })
+            .collect()
     }
 }
 
@@ -2264,212 +2205,31 @@ impl<T: Type, O: Operation<Type = T> + From<GuardOperation<T>>> OperationProvide
     }
 }
 
-// TODO(eaplatanios): Should this be renamed to `GuardInterpretationPolicy`?
-/// Type-family semantics of [`GuardOperation`] interpretation, to which the [`InterpretableOperation`]
-/// implementation of `GuardOperation<Self>` delegates after validating that the guard carries no regions. Every
-/// implementation upholds the [enforcement contract](GuardOperation#enforcement) of [`GuardOperation`].
-///
-/// Families whose values carry their runtime extents in their types delegate to
-/// `GuardOperation::interpret_ordinary`. Each family selects its semantics statically, so the guard stores no policy,
-/// and capability bounds live on the implementations, so interpretation requires only the capabilities that its
-/// family's checks use. A downstream universe opts in explicitly, so its enforcement rules remain family-owned.
-pub trait GuardInterpretation<C: Domain<Type = Self>>: Type {
-    /// Interprets `operation` over `inputs` and returns its checked outputs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the inputs violate the declared relationships, or when the family cannot check them (refer
-    /// to the [enforcement contract](GuardOperation#enforcement)).
-    fn interpret_guard(
-        operation: &GuardOperation<Self>,
-        context: &C,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError>;
-}
-
-impl<C: Domain<Type = DimensionType>> GuardInterpretation<C> for DimensionType {
-    #[inline]
-    fn interpret_guard(
-        operation: &GuardOperation<Self>,
-        _context: &C,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        operation.interpret_ordinary(inputs)
-    }
-}
-
-impl<C: Domain<Type = ArrayType>> GuardInterpretation<C> for ArrayType {
-    #[inline]
-    fn interpret_guard(
-        operation: &GuardOperation<Self>,
-        _context: &C,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        operation.interpret_ordinary(inputs)
-    }
-}
-
-impl<C: Domain<Type = ArrayIrType>> GuardInterpretation<C> for ArrayIrType {
-    #[inline]
-    fn interpret_guard(
-        operation: &GuardOperation<Self>,
-        _context: &C,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        operation.interpret_ordinary(inputs)
-    }
-}
-
-// TODO(eaplatanios): Should this be renamed to `GuardBatchingPolicy`?
-/// Type-family semantics of [`GuardOperation`] batching, to which the [`BatchableOperation`] implementation of
-/// `GuardOperation<Self>` delegates. Every implementation upholds the
-/// [enforcement contract](GuardOperation#enforcement) of [`GuardOperation`].
-///
-/// The built-in families delegate to `GuardOperation::batch_ordinary`, which freshens every guard-local identity
-/// before lifting the declarations by the mapped axis. As for [`GuardInterpretation`], the semantics are selected
-/// statically, so the guard stores no policy, and capability bounds live on the implementations. A downstream universe
-/// opts in explicitly.
-pub trait GuardBatching<C: Context<Type = Self>, P: BatchingPolicy<C>>: Type {
-    /// Batches `operation` over the packed `inputs` and returns its batched outputs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the inputs violate the declared relationships, or when the family or batching policy
-    /// cannot represent the check (refer to the [enforcement contract](GuardOperation#enforcement)).
-    fn batch_guard<D: BatchingDriver<C, P>>(
-        operation: &GuardOperation<Self>,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError>;
-}
-
-impl<C: Context<Type = DimensionType, Operation: From<GuardOperation<DimensionType>>>, P: BatchingPolicy<C>>
-    GuardBatching<C, P> for DimensionType
-{
-    #[inline]
-    fn batch_guard<D: BatchingDriver<C, P>>(
-        operation: &GuardOperation<Self>,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
-        operation.batch_ordinary(context, driver, inputs)
-    }
-}
-
-impl<C: Context<Type = ArrayType, Operation: From<GuardOperation<ArrayType>>>, P: BatchingPolicy<C>> GuardBatching<C, P>
-    for ArrayType
-{
-    #[inline]
-    fn batch_guard<D: BatchingDriver<C, P>>(
-        operation: &GuardOperation<Self>,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
-        operation.batch_ordinary(context, driver, inputs)
-    }
-}
-
-impl<C: Context<Type = ArrayIrType, Operation: From<GuardOperation<ArrayIrType>>>, P: BatchingPolicy<C>>
-    GuardBatching<C, P> for ArrayIrType
-{
-    #[inline]
-    fn batch_guard<D: BatchingDriver<C, P>>(
-        operation: &GuardOperation<Self>,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
-        operation.batch_ordinary(context, driver, inputs)
-    }
-}
-
-// TODO(eaplatanios): Should this be renamed to `GuardDifferentiationPolicy`?
-/// Type-family semantics of [`GuardOperation`] differentiation, to which the [`DifferentiableOperation`]
-/// implementation of `GuardOperation<Self>` delegates. Every implementation retains the check in the primal
-/// computation and upholds the [enforcement contract](GuardOperation#enforcement) of [`GuardOperation`].
-///
-/// Families that support casts delegate to `GuardOperation::jvp_ordinary`. Keeping this contract separate from
-/// [`GuardInterpretation`] means that interpretation never requires the capabilities that a family's derivative rule
-/// uses. As for [`GuardInterpretation`], the semantics are selected statically, so the guard stores no policy, and
-/// capability bounds live on the implementations. A downstream universe opts in explicitly with its derivative
-/// semantics and capability bounds.
-pub trait GuardDifferentiation<C: Context<Type = Self>>: Type {
-    /// Applies the forward-mode rule of `operation` to `inputs` (refer to [`DifferentiableOperation::jvp`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of the primal check and of the tangent computation.
-    fn jvp_guard<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        operation: &GuardOperation<Self>,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
-}
-
-impl<C: Context<Type = ArrayType>> GuardDifferentiation<C> for ArrayType
-where
-    C::Operation: From<GuardOperation<ArrayType>>
-        + From<CastOperation<ArrayType>>
-        + From<<ArrayType as CastType>::IdentityWitnessOperation>,
-{
-    #[inline]
-    fn jvp_guard<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        operation: &GuardOperation<Self>,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        operation.jvp_ordinary(context, inputs)
-    }
-}
-
-impl<C: Context<Type = ArrayIrType>> GuardDifferentiation<C> for ArrayIrType
-where
-    C::Operation: From<GuardOperation<ArrayIrType>>
-        + From<CastOperation<ArrayIrType>>
-        + From<<ArrayIrType as CastType>::IdentityWitnessOperation>,
-{
-    #[inline]
-    fn jvp_guard<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        operation: &GuardOperation<Self>,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        operation.jvp_ordinary(context, inputs)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::{formatdoc, indoc};
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use ryft_macros::Operation;
+
     use crate::arrays::{
-        ArrayBatch, ArrayIrOperation, ArrayOperation, ArrayReference, Dimension, DimensionBounds, DimensionError,
-        DimensionSource, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        StaticArrayExtentBatchingPolicy, StridedLayout,
+        ArrayIrOperation, ArrayOperation, ArrayReference, DimensionBounds, DimensionError, Layout, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{
         BatchAxis, BatchedProgram, BoundaryPreservingBatchedProgram, ProgramBatchingOutputAxesPolicy, batch,
     };
-    use crate::contexts::{DomainProjection, EagerContext, StagingContext};
+    use crate::contexts::{DomainProjection, EagerContext};
     use crate::macros::check_operation_type_inference;
-    use crate::operations::arithmetic::AddOperation;
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::broadcasting::Broadcast;
     use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
     use crate::operations::references::ReferenceReadOperation;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialTracer, PartialValue};
+    use crate::partial::PartialTracer;
     use crate::programs::{EmptyRegionDriver, OperationProjection, ProgramBuilder, ReferenceType};
-    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -2480,7 +2240,6 @@ mod tests {
         (n, vec![vector_type.clone(), vector_type])
     }
 
-    /// Creates an untrusted structural carrier so guard tests exercise numerical admission independently of New.
     #[test]
     fn test_assertion_error() {
         let failure = AssertionError::Failed {
@@ -2525,6 +2284,32 @@ mod tests {
         assert_eq!(
             bounded.to_string(),
             r#"assert [message="input must be \"valid\"\nnext", labels=["value"], failure_limit=3]"#,
+        );
+    }
+
+    #[test]
+    fn test_assert_for_array() {
+        // Eager arrays check the condition immediately and report the named observations of a failure.
+        let observations = [("value", Array::scalar(7i32).unwrap())];
+        assert_eq!(Array::scalar(true).unwrap().assert("valid", &observations), Ok(()));
+        let error = Array::scalar(false).unwrap().assert("valid", &observations).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "valid".to_owned(),
+                observations: vec![("value".to_owned(), "7".to_owned())],
+            }),
+        );
+        assert_eq!(error.to_string(), "assertion failed: valid; value=7");
+
+        // Observations are validated even when the condition holds, and the condition must be a scalar.
+        assert_eq!(
+            Array::scalar(true).unwrap().assert("invalid", &[("value", Array::vector(vec![1i32]).unwrap())]),
+            Err(TypeError::invalid("assertion observation `value` has unsupported type `i32[1]`").into()),
+        );
+        assert_eq!(
+            Array::vector(vec![true, true]).unwrap().assert("vector", &[]),
+            Err(TypeError::invalid("assertion condition must have type `bool[]` but has type `bool[2]`").into()),
         );
     }
 
@@ -2594,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_rejects_regions_before_folding() {
+    fn test_assert_type_inference_regions() {
         let (_, region) =
             TracingContext::<Array, ArrayOperation<Array>>::trace(Ok, ArrayType::scalar(DataType::Boolean)).unwrap();
         let region = region.to_flat_program();
@@ -2646,9 +2431,15 @@ mod tests {
         let program = program.to_flat_program();
         let residual =
             program.partially_evaluate(&[PartialValue::Unknown(ArrayType::scalar(DataType::Boolean))]).unwrap();
-        assert_eq!(residual.program().instructions().len(), 1);
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {r#"
+                lambda %0:bool[] .
+                let () = assert [message="condition must hold", labels=[]] %0
+                in ()"#},
+        );
         let folded = program.partially_evaluate(&[PartialValue::Known(Array::scalar(true).unwrap())]).unwrap();
-        assert!(folded.program().instructions().is_empty());
+        assert_eq!(folded.program().to_string(), "lambda  .\nin ()");
         let error = program.partially_evaluate(&[PartialValue::Known(Array::scalar(false).unwrap())]).unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
@@ -2678,8 +2469,14 @@ mod tests {
 
         let evaluation = partial.into_evaluation(Vec::new()).unwrap();
         assert!(parent.builder().borrow().instructions().is_empty());
-        assert_eq!(evaluation.program().instructions().len(), 1);
-        assert_eq!(evaluation.program().input_count(), 1);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:i32[] .
+                let %1:bool[] = const false
+                    () = assert [message="residual failure", labels=["value"]] %1 %0
+                in ()"#},
+        );
         let error = evaluation.program().interpret(vec![Array::scalar(7i32).unwrap()]).unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
@@ -2700,7 +2497,15 @@ mod tests {
         let program = builder.build::<Vec<Array>, Vec<Array>>(vec![], vec![Placeholder], vec![]).unwrap();
         let residual =
             program.partially_evaluate(&[PartialValue::Unknown(ArrayType::scalar(DataType::Boolean))]).unwrap();
-        assert_eq!(residual.program().instructions().len(), 2);
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {r#"
+                lambda %0:bool[] .
+                let %1:bool[] = const false
+                    () = assert [message="first", labels=[]] %0
+                    () = assert [message="second", labels=[]] %1
+                in ()"#},
+        );
 
         // An unresolved earlier failure must be observed before the later known-false assertion.
         let error = residual.program().interpret(vec![Array::scalar(false).unwrap()]).unwrap_err();
@@ -2725,24 +2530,26 @@ mod tests {
             bounded.clone().into(),
             ArrayType::scalar(DataType::I32).into(),
         ];
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let observations = input_types[1..].iter().map(|r#type| trace.input(r#type.clone())).collect::<Vec<_>>();
-        let condition = trace.constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
-        condition
-            .assert(
-                "dimension requirement",
-                &[
-                    ("exact", observations[0].clone()),
-                    ("bounded", observations[1].clone()),
-                    ("scalar", observations[2].clone()),
-                ],
-            )
-            .unwrap();
-        assert_eq!(trace.builder().borrow().instructions().len(), 1);
-        let expected = format!(
-            "assertion failed: dimension requirement; exact=4, bounded=<unknown: `{bounded}`>, scalar=<unknown>",
+
+        // Tracing stages a known failure together with its symbolic dimension and scalar observations.
+        let (_, staged) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(exact, bounded, scalar)| {
+                let condition = exact.domain().constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+                condition.assert("dimension requirement", &[("exact", exact), ("bounded", bounded), ("scalar", scalar)])
+            },
+            (input_types[1].clone(), input_types[2].clone(), input_types[3].clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            staged.to_string(),
+            indoc! {r#"
+                lambda %0:dimension<4>, %1:dimension<bounded ∈ [2, 8)>, %2:i32[] .
+                let %3:bool[] = const false
+                    () = assert [message="dimension requirement", labels=["exact", "bounded", "scalar"]] %3 %0 %1 %2
+                in ()"#},
         );
 
+        // Partial evaluation reports the observations that are known, and the bounds of those that are not.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         builder
@@ -2774,7 +2581,12 @@ mod tests {
                 ],
             }),
         );
-        assert_eq!(error.to_string(), expected);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "assertion failed: dimension requirement; exact=4, bounded=<unknown: `{bounded}`>, scalar=<unknown>"
+            ),
+        );
 
         // Concrete observations take precedence over their wider declared bounds.
         inputs[2] = PartialValue::Known(ArrayIrValue::Dimension(DimensionValue::new(bounded, 6).unwrap()));
@@ -2854,12 +2666,16 @@ mod tests {
 
         // Raw Boolean types carry no truth, so the raw assertion remains effectful until predicate folding.
         assert_eq!(
-            program
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction.operation().name() == ASSERT_OPERATION_NAME)
-                .count(),
-            3,
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
+                let %2:bool[] = compare [direction=Equal] %0 %0
+                    () = assert [message="self equality", labels=["left", "right"]] %2 %0 %1
+                    %3:bool[] = compare [direction=LessThanOrEqual] %0 %1
+                    () = assert [message="left <= right", labels=["left", "right"]] %3 %0 %1
+                    %4:bool[] = compare [direction=Equal] %0 %1
+                    () = assert [message="left == right", labels=["left", "right"]] %4 %0 %1
+                in ()"#},
         );
 
         // Dead-code elimination conservatively retains raw Boolean assertions. Partial evaluation first discovers
@@ -2872,16 +2688,14 @@ mod tests {
             .unwrap();
         let simplified = residual.program().simplified().unwrap();
         assert_eq!(
-            simplified
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction.operation().name() == ASSERT_OPERATION_NAME)
-                .map(|instruction| instruction.operation().to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                r#"assert [message="left <= right", labels=["left", "right"]]"#,
-                r#"assert [message="left == right", labels=["left", "right"]]"#,
-            ],
+            simplified.to_string(),
+            indoc! {r#"
+                lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
+                let %2:bool[] = compare [direction=LessThanOrEqual] %0 %1
+                    () = assert [message="left <= right", labels=["left", "right"]] %2 %0 %1
+                    %3:bool[] = compare [direction=Equal] %0 %1
+                    () = assert [message="left == right", labels=["left", "right"]] %3 %0 %1
+                in ()"#},
         );
         let error = simplified
             .interpret(vec![
@@ -2949,6 +2763,15 @@ mod tests {
             None,
         );
         assert_eq!(output, Ok(()));
+
+        // A replicated true condition folds without staging an assertion.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let condition = context.lift(Array::scalar(true).unwrap()).unwrap();
+        let batching = BatchingContext::new(context.clone(), 3);
+        AssertOperation::new("replicated true")
+            .batch(&batching, &EmptyRegionDriver, &[ArrayBatch::replicated(condition)])
+            .unwrap();
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]
@@ -3080,7 +2903,7 @@ mod tests {
 
         // This family omits assertions and their diagnostic primitives. The custom preparation impl above does
         // not apply to its context, but generated dispatch must still support guards, casts, and ordinary batching.
-        #[derive(Clone, Debug, ryft_macros::Operation)]
+        #[derive(Clone, Debug, Operation)]
         #[ryft(dispatch(batching))]
         enum MinimalOperation<V: Value<Type = ArrayType>> {
             Constant(ConstantOperation<V>),
@@ -3106,10 +2929,8 @@ mod tests {
                 }
                 let passing = ArrayBatch::new(Array::vector(vec![true; extent]).unwrap(), BatchAxis::new(0)).unwrap();
                 assert_eq!(
-                    operation
-                        .batch(&context, &EmptyRegionDriver, &[passing, observation.clone()])
-                        .map(|outputs| outputs.len()),
-                    Ok(0),
+                    operation.batch(&context, &EmptyRegionDriver, &[passing, observation.clone()]),
+                    Ok(Vec::new()),
                 );
                 let condition = ArrayBatch::new(
                     Array::vector((0..extent).map(|index| index != failing_index).collect::<Vec<_>>()).unwrap(),
@@ -3118,7 +2939,7 @@ mod tests {
                 .unwrap();
                 let failure = operation.batch(&context, &EmptyRegionDriver, &[condition, observation.clone()]);
                 if extent == 0 {
-                    assert_eq!(failure.map(|outputs| outputs.len()), Ok(0));
+                    assert_eq!(failure, Ok(Vec::new()));
                 } else {
                     let BatchingError::Program(error) = failure.unwrap_err() else {
                         panic!("expected a program error")
@@ -3195,17 +3016,6 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_batching_replicated_folding() {
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let condition = context.lift(Array::scalar(true).unwrap()).unwrap();
-        let batching = BatchingContext::new(context.clone(), 3);
-        AssertOperation::new("replicated true")
-            .batch(&batching, &EmptyRegionDriver, &[ArrayBatch::replicated(condition)])
-            .unwrap();
-        assert!(context.builder().borrow().instructions().is_empty());
-    }
-
-    #[test]
     fn test_assert_batching_nested() {
         let output: Result<(), BatchingError> = batch(
             |(condition, observation)| {
@@ -3264,11 +3074,28 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(!program.instructions().iter().any(|instruction| instruction.operation().name() == "sort"));
-        assert!(program.instructions().iter().any(|instruction| matches!(
-            instruction.operation(),
-            ArrayIrOperation::Array(ArrayOperation::Reduce(operation)) if operation.kind() == ReductionKind::Min,
-        )));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [0, 5)>, %1:bool[batch], %2:i32[batch] .
+                let %3:i32[batch] = iota [type=i32[batch], dimension=0] %0
+                    %4:i32[] = reduce [kind=max, axes=[0]] %3
+                    %5:i32[batch] = select %1 %4 %3
+                    %6:i32[] = reduce [kind=min, axes=[0]] %5
+                    %7:bool[] = reduce [kind=all, axes=[0]] %1
+                    %8:i32[] = zero_like %6
+                    %9:i32[] = select %7 %8 %6
+                    %10:i32[] = zero [type=i32[]]
+                    %11:dimension<1> = constant [value=1]
+                    %12:dimension<batch + 1 ∈ [1, 6)> = dimension_add %0 %11
+                    %13:i32[batch + 1] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[0]] \
+                        %2 %10 %12
+                    %14:i32[1] = dynamic_slice [sizes=[1], allow_negative_indices=false] %13 %9
+                    %15:i32[] = reshape [shape=[]] %14
+                    () = assert [message=\"dynamic\", labels=[\"value\", \"batch_index\"]] %7 %15 %9
+                in ()"
+            },
+        );
 
         // Empty, singleton, and larger successful batches all satisfy the assertion.
         assert_eq!(
@@ -3463,6 +3290,7 @@ mod tests {
 
     #[test]
     fn test_assert_batching_dynamic_replicated() {
+        // A replicated condition fails for every nonempty batch, reporting replicated observations without an index.
         let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, condition)| {
@@ -3493,7 +3321,7 @@ mod tests {
         );
         let error = program
             .interpret((
-                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap()),
                 ArrayIrValue::Array(Array::scalar(false).unwrap()),
             ))
             .unwrap_err();
@@ -3504,11 +3332,8 @@ mod tests {
                 observations: vec![("size".to_owned(), "3".to_owned())],
             }),
         );
-    }
 
-    #[test]
-    fn test_assert_batching_dynamic_replicated_predicate() {
-        let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+        // A mapped observation under a replicated condition reports the first batch item and its index.
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, condition, observation)| {
                 let batching = BatchingContext::new(extent.domain(), extent.clone());
@@ -3715,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_batching_projected_dynamic() {
+    fn test_assert_batching_dynamic_projected() {
         // Exercise the projected policy's independent mapped/replicated roles and both diagnostic modes. Empty
         // batches pass even with a replicated false predicate; nonempty failures retain exact indices and values.
         let extent_type = DimensionType::new("batch", DimensionBounds::non_negative(Some(5)).unwrap());
@@ -3888,8 +3713,6 @@ mod tests {
 
     #[test]
     fn test_assert_batching_with_limit_manual_variation() {
-        type ArrayTrace = TracingContext<Array, ArrayOperation<Array>>;
-
         // Inside a manual region, each device records its own observations, so an observation already laid out along
         // the batch axis reaches the assertion with its own manual variation rather than taking that of the condition.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3899,8 +3722,11 @@ mod tests {
         let observation_type = ArrayType::new_static(DataType::I32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
-        let (_, program) = ArrayTrace::trace_with_named_axes(
-            |(condition, observation): (Tracer<ArrayTrace>, Tracer<ArrayTrace>)| {
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(condition, observation): (
+                Tracer<TracingContext<Array, ArrayOperation<Array>>>,
+                Tracer<TracingContext<Array, ArrayOperation<Array>>>,
+            )| {
                 let batching = BatchingContext::<_, ArrayBatchingPolicy>::new(condition.domain(), 2);
                 AssertOperation::new("valid")
                     .with_labels(vec!["value".to_owned()])
@@ -4034,21 +3860,13 @@ mod tests {
         assert_eq!(differentiated.to_string(), program.to_string());
         let linearization = program.linearize().unwrap();
         assert_eq!(
-            linearization
-                .primal()
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction.operation().name() == ASSERT_OPERATION_NAME)
-                .count(),
-            1,
+            linearization.primal().to_string(),
+            indoc! {r#"
+                lambda %0:bool[] .
+                let () = assert [message="condition must hold", labels=[]] %0
+                in ()"#},
         );
-        assert!(
-            linearization
-                .tangent()
-                .instructions()
-                .iter()
-                .all(|instruction| instruction.operation().name() != ASSERT_OPERATION_NAME),
-        );
+        assert_eq!(linearization.tangent().to_string(), "lambda  .\nin ()");
     }
 
     #[test]
@@ -4067,9 +3885,15 @@ mod tests {
             in ()"#},
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(program.simplified().unwrap().instructions().len(), 1);
+        assert_eq!(
+            program.simplified().unwrap().to_string(),
+            indoc! {r#"
+                lambda %0:bool[] .
+                let () = assert [message="condition must hold", labels=[]] %0
+                in ()"#},
+        );
 
-        // A known success disappears during tracing.
+        // A known success stages no assertion, including through the projected array of a composite value.
         let (_, folded) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
                 let condition = input.domain().lift(Array::scalar(true).unwrap())?;
@@ -4078,7 +3902,28 @@ mod tests {
             ArrayType::scalar(DataType::Boolean),
         )
         .unwrap();
-        assert!(folded.instructions().is_empty());
+        assert_eq!(
+            folded.to_string(),
+            indoc! {"
+                lambda %0:bool[] .
+                let %1:bool[] = const true
+                in ()"},
+        );
+        let (_, projected) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| {
+                let condition = input.domain().lift(ArrayIrValue::Array(Array::scalar(true).unwrap()))?;
+                ValueProjection::<ArrayType>::into_projected(condition)?.assert("projected true", &[])
+            },
+            ArrayIrType::from(ArrayType::scalar(DataType::Boolean)),
+        )
+        .unwrap();
+        assert_eq!(
+            projected.to_string(),
+            indoc! {"
+                lambda %0:bool[] .
+                let %1:bool[] = const true
+                in ()"},
+        );
 
         // A known failure is staged and reported only when the program executes.
         let (_, failing) = TracingContext::<Array, ArrayOperation<Array>>::trace(
@@ -4089,52 +3934,19 @@ mod tests {
             ArrayType::scalar(DataType::Boolean),
         )
         .unwrap();
-        assert_eq!(failing.instructions().len(), 1);
+        assert_eq!(
+            failing.to_string(),
+            indoc! {r#"
+                lambda %0:bool[] .
+                let %1:bool[] = const false
+                    () = assert [message="always false", labels=[]] %1
+                in ()"#},
+        );
         let error = failing.interpret(Array::scalar(true).unwrap()).unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
             Some(&AssertionError::Failed { message: "always false".to_owned(), observations: vec![] }),
         );
-    }
-
-    #[test]
-    fn test_assert_staging_with_limit() {
-        // Tracing retains bounded reporting for execution.
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |condition| condition.assert_with_limit("valid", &[], NonZeroUsize::new(2).unwrap()),
-            ArrayType::new(DataType::Boolean, [3].into()),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-                lambda %0:bool[3] .
-                let () = assert [message="valid", labels=[], failure_limit=2] %0
-                in ()"#},
-        );
-        let error = program.interpret(Array::vector(vec![true, false, false]).unwrap()).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::FailedElements {
-                message: "valid".to_owned(),
-                failures: vec![
-                    AssertionFailure { index: vec![1], observations: vec![] },
-                    AssertionFailure { index: vec![2], observations: vec![] },
-                ],
-                omitted: 0,
-            }),
-        );
-    }
-
-    #[test]
-    fn test_assert_staging_projected() {
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let condition = context.lift(ArrayIrValue::Array(Array::scalar(true).unwrap())).unwrap();
-        ValueProjection::<ArrayType>::into_projected(condition)
-            .unwrap()
-            .assert("projected true", &[])
-            .unwrap();
-        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]
@@ -4202,6 +4014,35 @@ mod tests {
                     index: vec![1],
                     observations: vec![("value".to_owned(), "20".to_owned())],
                 }],
+                omitted: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_assert_with_limit_staging() {
+        // Tracing retains bounded reporting for execution.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |condition| condition.assert_with_limit("valid", &[], NonZeroUsize::new(2).unwrap()),
+            ArrayType::new(DataType::Boolean, [3].into()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:bool[3] .
+                let () = assert [message="valid", labels=[], failure_limit=2] %0
+                in ()"#},
+        );
+        let error = program.interpret(Array::vector(vec![true, false, false]).unwrap()).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::FailedElements {
+                message: "valid".to_owned(),
+                failures: vec![
+                    AssertionFailure { index: vec![1], observations: vec![] },
+                    AssertionFailure { index: vec![2], observations: vec![] },
+                ],
                 omitted: 0,
             }),
         );
@@ -4373,8 +4214,9 @@ mod tests {
             }),
         );
     }
+
     #[test]
-    fn test_guard_operation() {
+    fn test_guard() {
         let (n, declared) = guard_signature();
         let guard = GuardOperation::new("region", declared.clone());
         assert_eq!(guard.name(), GUARD_OPERATION_NAME);
@@ -4382,6 +4224,21 @@ mod tests {
         assert_eq!(guard.declared_types(), declared.as_slice());
         assert_eq!(guard.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(guard.to_string(), r#"guard [boundary="region", declared_types=[f32[n], f32[n]]]"#);
+
+        // A guard also reads each reference member, whose referent shape takes part in the declared relationships.
+        let declared_reference: ArrayIrType =
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]))).into();
+        let reference_guard = GuardOperation::new("region", vec![declared[0].clone(), declared_reference]);
+        assert_eq!(
+            reference_guard.effects().reference_effects(),
+            &[ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Read }],
+        );
+        assert!(reference_guard.effects().classes().contains(EffectClass::OrderedAssertion));
+    }
+
+    #[test]
+    fn test_guard_for_entry() {
+        let (n, declared) = guard_signature();
 
         // Proven entries need no guard, while mixed entries guard every member that carries an unproven identity.
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
@@ -4426,19 +4283,22 @@ mod tests {
         let vector = |dimension: &DimensionType| -> ArrayIrType {
             ArrayType::new(DataType::F32, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
+        let chained_declared = vec![p.clone().into(), vector(&p), vector(&q)];
         let chained_actual = vec![q.clone().into(), exact.clone(), vector(&q)];
-        let (chained_guard, members) =
-            GuardOperation::for_entry("region", &[p.clone().into(), vector(&p), vector(&q)], &chained_actual)
-                .unwrap()
-                .unwrap();
-        assert_eq!(members, vec![0, 1, 2]);
         assert_eq!(
-            chained_guard.infer_output_types(&chained_actual, &[]),
-            Ok(vec![DimensionType::from(Dimension::Static(3)).into(), exact.clone(), exact.clone()]),
+            GuardOperation::for_entry("region", &chained_declared, &chained_actual),
+            Ok(Some((GuardOperation::new("region", chained_declared.clone()), vec![0, 1, 2]))),
+        );
+        check_operation_type_inference!(
+            operation = GuardOperation::new("region", chained_declared),
+            cases = [{
+                input_types = [q.clone().into(), exact.clone(), vector(&q)],
+                output_types = [DimensionType::from(Dimension::Static(3)).into(), exact.clone(), exact.clone()],
+            }],
         );
 
         // Reference members take part in the relationships through their referents' shapes, which another member may
-        // contradict. The guard reads each reference member, and produces outputs only for the other members.
+        // contradict.
         let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into();
         let declared_reference: ArrayIrType =
             ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]))).into();
@@ -4451,77 +4311,18 @@ mod tests {
             ),
             Ok(Some((GuardOperation::new("region", declared_with_reference), vec![0, 1, 2]))),
         );
-        let (reference_guard, members) = GuardOperation::for_entry(
-            "region",
-            &[declared[0].clone(), declared_reference.clone()],
-            &[declared[0].clone(), reference.clone()],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(members, vec![0, 1]);
-        assert_eq!(reference_guard.declared_types(), &[declared[0].clone(), declared_reference]);
         assert_eq!(
-            reference_guard.effects().reference_effects(),
-            &[ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Read }],
-        );
-        assert!(reference_guard.effects().classes().contains(EffectClass::OrderedAssertion));
-        assert_eq!(reference_guard.infer_output_types(&[declared[0].clone(), reference], &[]), Ok(vec![exact.clone()]));
-
-        // The guard's declared identities are local, so a renaming of the surrounding program, here to an identity with
-        // narrower bounds, leaves them and the extents they admit unchanged.
-        let narrow = DimensionType::new("narrow", DimensionBounds::positive(Some(4)).unwrap());
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(n.variable().unwrap().clone(), narrow.variable().unwrap().clone()).unwrap();
-        let renamed = guard.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed, guard);
-        let five: ArrayIrType = ArrayType::new_static(DataType::F32, [5]).into();
-        assert_eq!(renamed.infer_output_types(&[five.clone(), five.clone()], &[]), Ok(vec![five.clone(), five]));
-    }
-
-    #[test]
-    fn test_guard_type_inference() {
-        let (_, declared) = guard_signature();
-        let guard = GuardOperation::new("region", declared.clone());
-        let symbolic = declared[0].clone();
-        let exact = |extent: usize| ArrayIrType::from(ArrayType::new_static(DataType::F32, [extent]));
-
-        // Mixed refinements are admitted exactly like the program or region call the guard replaces, and the outputs
-        // are the inputs narrowed by the facts that the declared relationships prove.
-        assert_eq!(guard.infer_output_types(&[symbolic.clone(), exact(3)], &[]), Ok(vec![exact(3), exact(3)]));
-        assert_eq!(guard.infer_output_types(&[symbolic.clone(), symbolic.clone()], &[]), Ok(declared.clone()));
-        assert_eq!(
-            guard.infer_output_types(&[exact(3), exact(4)], &[]),
-            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "n".to_string(),
-                expected: 3,
-                actual: 4,
-            })),
-        );
-        assert_eq!(
-            guard.infer_output_types(&[symbolic.clone()], &[]),
-            Err(TypeError::invalid("expected 2 inputs but got 1")),
-        );
-
-        // A reference member is checked through its referent's shape and produces no output.
-        let ArrayIrType::Array(symbolic_array) = &symbolic else { unreachable!() };
-        let declared_reference: ArrayIrType = ReferenceType::new(symbolic_array.clone()).into();
-        let reference = |extent: usize| -> ArrayIrType {
-            ReferenceType::new(ArrayType::new_static(DataType::F32, [extent])).into()
-        };
-        let reference_guard = GuardOperation::new("region", vec![declared_reference, symbolic.clone()]);
-        assert_eq!(reference_guard.infer_output_types(&[reference(3), exact(3)], &[]), Ok(vec![exact(3)]));
-        assert_eq!(
-            reference_guard.infer_output_types(&[reference(3), exact(2)], &[]),
-            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
-                dimension: "n".to_string(),
-                expected: 3,
-                actual: 2,
-            })),
+            GuardOperation::for_entry(
+                "region",
+                &[declared[0].clone(), declared_reference.clone()],
+                &[declared[0].clone(), reference],
+            ),
+            Ok(Some((GuardOperation::new("region", vec![declared[0].clone(), declared_reference]), vec![0, 1]))),
         );
     }
 
     #[test]
-    fn test_guard_retained_identities() {
+    fn test_guard_with_retained_identities() {
         // `[f32[p, q], f32[p], f32[q]]` entered with `[f32[a, b], f32[2], f32[3]]` fixes `a = 2` and `b = 3`. A guard
         // that retains `a` narrows only `b`, and gives the exact member of the class of `a` the identity `a` too, so
         // that its outputs agree. It renders its retained identities and renames them with the program, while its
@@ -4571,7 +4372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_retained_reference_anchors() {
+    fn test_guard_with_retained_identities_reference_anchors() {
         // Unknown dimension inputs join both reference classes, but each reference keeps its own nominal shape.
         // Guard-local declared names also survive an ambient renaming of the supplied reference identities.
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
@@ -4675,7 +4476,57 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_scoped_declarations() {
+    fn test_guard_type_inference() {
+        let (_, declared) = guard_signature();
+        let guard = GuardOperation::new("region", declared.clone());
+        let symbolic = declared[0].clone();
+        let exact = |extent: usize| ArrayIrType::from(ArrayType::new_static(DataType::F32, [extent]));
+
+        // Mixed refinements are admitted exactly like the program or region call the guard replaces, and the outputs
+        // are the inputs narrowed by the facts that the declared relationships prove.
+        check_operation_type_inference!(
+            operation = guard.clone(),
+            cases = [
+                { input_types = [symbolic.clone(), exact(3)], output_types = [exact(3), exact(3)] },
+                {
+                    input_types = [symbolic.clone(), symbolic.clone()],
+                    output_types = [symbolic.clone(), symbolic.clone()],
+                },
+                { input_types = [symbolic.clone()], error = "expected 2 inputs but got 1" },
+            ],
+        );
+        assert_eq!(
+            guard.infer_output_types(&[exact(3), exact(4)], &[]),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 3,
+                actual: 4,
+            })),
+        );
+
+        // A reference member is checked through its referent's shape and produces no output.
+        let ArrayIrType::Array(symbolic_array) = &symbolic else { unreachable!() };
+        let declared_reference: ArrayIrType = ReferenceType::new(symbolic_array.clone()).into();
+        let reference = |extent: usize| -> ArrayIrType {
+            ReferenceType::new(ArrayType::new_static(DataType::F32, [extent])).into()
+        };
+        let reference_guard = GuardOperation::new("region", vec![declared_reference, symbolic.clone()]);
+        check_operation_type_inference!(
+            operation = reference_guard.clone(),
+            cases = [{ input_types = [reference(3), exact(3)], output_types = [exact(3)] }],
+        );
+        assert_eq!(
+            reference_guard.infer_output_types(&[reference(3), exact(2)], &[]),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 3,
+                actual: 2,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_guard_type_inference_scoped_declarations() {
         // A guard's declared identities are local, so inputs whose identities a consistent renaming of the surrounding
         // program changed (here, from `n` to `m`) still enter them, while the declared bounds still bound the inputs.
         let (n, declared) = guard_signature();
@@ -4686,11 +4537,28 @@ mod tests {
         };
         let exact = |extent: usize| ArrayIrType::from(ArrayType::new_static(DataType::F32, [extent]));
         let guard = GuardOperation::new("region", declared.clone());
-        assert_eq!(guard.infer_output_types(&[vector(&m), exact(2)], &[]), Ok(vec![exact(2), exact(2)]));
-        assert_eq!(guard.infer_output_types(&[vector(&m), vector(&m)], &[]), Ok(vec![vector(&m), vector(&m)]));
-        assert_eq!(
-            guard.infer_output_types(&[vector(&wide), exact(2)], &[]),
-            Err(TypeError::invalid("dimension wide does not refine declared dimension n")),
+        check_operation_type_inference!(
+            operation = guard.clone(),
+            cases = [
+                { input_types = [vector(&m), exact(2)], output_types = [exact(2), exact(2)] },
+                { input_types = [vector(&m), vector(&m)], output_types = [vector(&m), vector(&m)] },
+                {
+                    input_types = [vector(&wide), exact(2)],
+                    error = "dimension wide does not refine declared dimension n",
+                },
+            ],
+        );
+
+        // Renaming the guard itself, here to an identity with narrower bounds, likewise leaves its declarations and the
+        // extents they admit unchanged.
+        let narrow = DimensionType::new("narrow", DimensionBounds::positive(Some(4)).unwrap());
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(n.variable().unwrap().clone(), narrow.variable().unwrap().clone()).unwrap();
+        let renamed = guard.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed, guard);
+        check_operation_type_inference!(
+            operation = renamed,
+            cases = [{ input_types = [exact(5), exact(5)], output_types = [exact(5), exact(5)] }],
         );
 
         // Renaming a program that contains a guard, and then replaying it at the renamed types, is valid.
@@ -4708,15 +4576,31 @@ mod tests {
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(n.variable().unwrap().clone(), m.variable().unwrap().clone()).unwrap();
         let renamed = program.rename_type_identities(&renaming).unwrap();
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let inputs = vec![context.input(vector(&m)), context.input(exact(2))];
-        assert!(renamed.interpret_in_context(&context, inputs).is_ok());
+        let (_, replayed) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(first, second)| renamed.interpret_in_context(&first.domain(), vec![first, second]),
+            (vector(&m), exact(2)),
+        )
+        .unwrap();
+        assert_eq!(
+            replayed.to_string(),
+            indoc! {r#"
+                lambda %0:f32[m], %1:f32[2] .
+                let %2:f32[2], %3:f32[2] = guard [boundary="region", declared_types=[f32[n], f32[n]]] %0 %1
+                in (%2, %3)"#},
+        );
         let vector_value = |extent: usize| ArrayIrValue::Array(Array::vector(vec![1f32; extent]).unwrap());
         assert_eq!(
             renamed.interpret(vec![vector_value(2), vector_value(2)]),
             Ok(vec![vector_value(2), vector_value(2)])
         );
-        assert!(renamed.interpret(vec![vector_value(3), vector_value(2)]).is_err());
+        assert_eq!(
+            renamed.interpret(vec![vector_value(3), vector_value(2)]),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_owned(),
+                expected: 3,
+                actual: 2,
+            }))),
+        );
     }
 
     #[test]
@@ -5176,7 +5060,27 @@ mod tests {
         let item = DimensionType::new("item", bounds);
         let declared =
             vec![ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]),)); 2];
-        for batch in [n.clone(), DimensionType::new("batch", bounds)] {
+        for (batch, expected) in [
+            (
+                n.clone(),
+                indoc! {"
+                    lambda %0:dimension<n ∈ [0, 8)>, %1:f32[n, 3], %2:f32[item] .
+                    let %3:f32[n, 3], %4:f32[3] = guard [boundary=\"region\", \
+                        declared_types=[f32[n, n], f32[n]], retained_identities=[n]] %1 %2
+                    in (%3, %4)"},
+            ),
+            (
+                DimensionType::new("batch", bounds),
+                indoc! {r#"
+                    lambda %0:dimension<batch ∈ [0, 8)>, %1:f32[batch, 3], %2:f32[item] .
+                    let %3:f32[batch, 3], %4:f32[3] = guard [
+                        boundary="region",
+                        declared_types=[f32[batch, n], f32[n]],
+                        retained_identities=[batch],
+                    ] %1 %2
+                    in (%3, %4)"#},
+            ),
+        ] {
             let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
                 |(extent, mapped, replicated)| {
                     let batching = BatchingContext::new(extent.domain(), extent);
@@ -5201,14 +5105,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            assert_eq!(
-                program.output_types(),
-                vec![
-                    ArrayType::new(DataType::F32, Shape::new(vec![batch.simplified_dimension(), Dimension::Static(3)]))
-                        .into(),
-                    ArrayType::new_static(DataType::F32, [3]).into(),
-                ],
-            );
+            assert_eq!(program.to_string(), expected);
             for extent in [0, 2, 4] {
                 let dimension = ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
                 let mapped = ArrayIrValue::Array(
@@ -5266,7 +5163,16 @@ mod tests {
                 packed.clone(),
             )
             .unwrap();
-            assert_eq!(program.output_types(), vec![packed.clone()]);
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {r#"
+                    lambda %0:{packed} .
+                    let %1:{packed} = guard [
+                        boundary="region",
+                        declared_types=[{packed}],
+                    ] %0
+                    in (%1)"#},
+            );
             for reference in [false, true] {
                 let declared = if reference {
                     ArrayIrType::Reference(ReferenceType::new(per_item.clone()))
@@ -5293,11 +5199,24 @@ mod tests {
                     (ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2))), actual.clone()),
                 )
                 .unwrap();
-                let ArrayIrOperation::Guard(guard) = program.instructions()[0].operation() else {
-                    panic!("expected a guard");
+                let expected = if reference {
+                    formatdoc! {r#"
+                        lambda %0:dimension<2>, %1:{actual} .
+                        let () = guard [
+                            boundary="region",
+                            declared_types=[{actual}],
+                        ] %1
+                        in ()"#}
+                } else {
+                    formatdoc! {r#"
+                        lambda %0:dimension<2>, %1:{actual} .
+                        let %2:{actual} = guard [
+                            boundary="region",
+                            declared_types=[{actual}],
+                        ] %1
+                        in (%2)"#}
                 };
-                assert_eq!(guard.declared_types(), &[actual.clone()]);
-                assert_eq!(program.output_types(), if reference { vec![] } else { vec![actual] });
+                assert_eq!(program.to_string(), expected);
             }
         }
     }
@@ -5327,26 +5246,26 @@ mod tests {
         };
         let dimension = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let guard = GuardOperation::new("region", declared);
-        let outputs = guard
-            .batch(
+        assert_eq!(
+            guard.batch(
                 &context,
                 &EmptyRegionDriver,
                 &[
                     ArrayIrBatch::replicated(dimension.clone()),
                     ArrayIrBatch::new(packed(2), BatchAxis::new(0)).unwrap(),
                 ],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].value(), &dimension);
-        assert!(
-            guard
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ArrayIrBatch::replicated(dimension), ArrayIrBatch::new(packed(4), BatchAxis::new(0)).unwrap()],
-                )
-                .is_err()
+            ),
+            Ok(vec![ArrayIrBatch::replicated(dimension.clone())]),
+        );
+        assert_eq!(
+            guard.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayIrBatch::replicated(dimension), ArrayIrBatch::new(packed(4), BatchAxis::new(0)).unwrap()],
+            ),
+            Err(BatchingError::Program(ProgramError::Type(TypeError::custom(
+                DimensionError::InputDimensionMismatch { dimension: "n".to_owned(), expected: 2, actual: 4 }
+            )))),
         );
     }
 
@@ -5394,11 +5313,6 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(program.output_types(), vec![vector(&a).into(), vector(&b).into(), a.into(), b.into()]);
-        let ArrayIrOperation::Guard(guard) = program.instructions()[0].operation() else {
-            panic!("expected a guard");
-        };
-        assert_eq!(guard.reference_anchor_inputs, vec![0, 1]);
         assert_eq!(
             program.to_string(),
             indoc! {r#"
@@ -5491,7 +5405,7 @@ mod tests {
         let second = builder.add_input(exact.clone());
         let outputs = builder
             .add_instruction(
-                GuardOperation::new("region", vec![symbolic.clone(), symbolic.clone()])
+                GuardOperation::new("region", vec![symbolic.clone(), symbolic])
                     .with_retained_identities(vec![n.to_variable()]),
                 Vec::new(),
                 vec![first, second],
@@ -5502,12 +5416,26 @@ mod tests {
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), outputs, None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-        assert_eq!(program.output_types(), vec![symbolic.clone()]);
-        let jvp = program.jvp().unwrap().to_string();
-        assert_eq!(jvp.matches("cast").count(), 2, "{jvp}");
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[2], %2:f32[n], %3:f32[2] .
+                let %4:f32[n], %5:f32[n] = guard [boundary=\"region\", \
+                    declared_types=[f32[n], f32[n]], retained_identities=[n]] %0 %1
+                    %6:f32[n] = cast [type=f32[n], inputs=[f32[n], f32[n]]] %2 %4
+                    %7:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]]] %3 %5
+                    %8:f32[n] = add %4 %5
+                    %9:f32[n] = add %6 %7
+                in (%8, %9)"},
+        );
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        let rendering = pullback.to_string();
-        assert!(rendering.contains("cast [type=f32[2]"), "{rendering}");
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[n] .
+                let %2:f32[2] = cast [type=f32[2], inputs=[f32[n], f32[n]]] %0 %1
+                in (%0, %2)"},
+        );
         let vector = |values: Vec<f32>| Array::vector(values).unwrap();
         let pullback_inputs = pullback
             .input_types()
@@ -5559,8 +5487,13 @@ mod tests {
                 in (%8, %9)"},
         );
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        let rendering = pullback.to_string();
-        assert!(rendering.contains("cast [type=f32[b]"), "{rendering}");
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[a], %1:f32[b], %2:f32[a] .
+                let %3:f32[b] = cast [type=f32[b], inputs=[f32[a], f32[b], f32[a]]] %0 %1 %2
+                in (%0, %3)"},
+        );
         let vector = |values: Vec<f32>| Array::vector(values).unwrap();
         let pullback_inputs = pullback
             .input_types()
@@ -5570,53 +5503,6 @@ mod tests {
             .collect::<Vec<_>>();
         let cotangent = pullback_inputs[0].clone();
         assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![cotangent.clone(), cotangent]));
-    }
-
-    #[test]
-    fn test_guard_operation_provider() {
-        let r#type = ArrayType::scalar(DataType::F32);
-        let guard = GuardOperation::new("region", vec![r#type.clone()]);
-        assert!(matches!(
-            ArrayOperation::<Array>::provide(guard.clone(), &[&r#type]),
-            Ok(ArrayOperation::Guard(actual)) if actual == guard,
-        ));
-        assert!(matches!(
-            ArrayOperation::<Array>::provide(guard.clone(), &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
-        let composite_type = ArrayIrType::from(r#type);
-        let composite_guard = GuardOperation::new("region", vec![composite_type.clone()]);
-        assert!(matches!(
-            ArrayIrOperation::<Array>::provide(composite_guard.clone(), &[&composite_type]),
-            Ok(ArrayIrOperation::Guard(actual)) if actual == composite_guard,
-        ));
-        assert!(matches!(
-            ConstantOperation::<Array>::provide(guard, &[]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "the input types of `region` leave identity relationships unproven, but the operation \
-                               family cannot represent the guard required to preserve these input checks",
-        ));
-    }
-
-    #[test]
-    fn test_guard_operation_provider_uses_ordinary_conversions() {
-        // The derive recognizes the guard payload by its `GuardOperation` path segment and then leaves provision to the
-        // blanket provider over the generated conversion. A payload that names the guard through a type alias is not
-        // recognized and fails to compile instead (refer to the `ryft-macros-tests` compile-fail snapshots).
-        #[derive(Clone, Debug, ryft_macros::Operation)]
-        #[ryft(type(ArrayType), constant(Array))]
-        enum Family {
-            Constant(ConstantOperation<Array>),
-            Checked(GuardOperation<ArrayType>),
-        }
-
-        let r#type = ArrayType::scalar(DataType::F32);
-        let guard = GuardOperation::new("region", vec![r#type.clone()]);
-        assert!(matches!(Family::from(guard.clone()), Family::Checked(actual) if actual == guard));
-        assert!(matches!(
-            Family::provide(guard.clone(), &[&r#type]),
-            Ok(Family::Checked(actual)) if actual == guard,
-        ));
     }
 
     #[test]
@@ -5647,5 +5533,47 @@ mod tests {
         );
         let seeds = vec![Array::vector(vec![2f32, 3.]).unwrap(), Array::vector(vec![5f32, 7.]).unwrap()];
         assert_eq!(transposed.interpret(seeds.clone()), Ok(seeds));
+    }
+
+    #[test]
+    fn test_guard_operation_provider() {
+        let r#type = ArrayType::scalar(DataType::F32);
+        let guard = GuardOperation::new("region", vec![r#type.clone()]);
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(guard.clone(), &[&r#type]),
+            Ok(ArrayOperation::Guard(actual)) if actual == guard,
+        ));
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(guard.clone(), &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+        let composite_type = ArrayIrType::from(r#type.clone());
+        let composite_guard = GuardOperation::new("region", vec![composite_type.clone()]);
+        assert!(matches!(
+            ArrayIrOperation::<Array>::provide(composite_guard.clone(), &[&composite_type]),
+            Ok(ArrayIrOperation::Guard(actual)) if actual == composite_guard,
+        ));
+        assert!(matches!(
+            ConstantOperation::<Array>::provide(guard.clone(), &[]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the input types of `region` leave identity relationships unproven, but the operation \
+                               family cannot represent the guard required to preserve these input checks",
+        ));
+
+        // The derive recognizes the guard payload by its `GuardOperation` path segment and then leaves provision to the
+        // blanket provider over the generated conversion. A payload that names the guard through a type alias is not
+        // recognized and fails to compile instead (refer to the `ryft-macros-tests` compile-fail snapshots).
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type(ArrayType), constant(Array))]
+        enum Family {
+            Constant(ConstantOperation<Array>),
+            Checked(GuardOperation<ArrayType>),
+        }
+
+        assert!(matches!(Family::from(guard.clone()), Family::Checked(actual) if actual == guard));
+        assert!(matches!(
+            Family::provide(guard.clone(), &[&r#type]),
+            Ok(Family::Checked(actual)) if actual == guard,
+        ));
     }
 }

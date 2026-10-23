@@ -48,7 +48,7 @@ pub use arithmetic::{
 };
 pub use assertions::{
     ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
-    AssertionValue, GUARD_OPERATION_NAME, GuardBatching, GuardDifferentiation, GuardInterpretation, GuardOperation,
+    AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveMode, CollectiveOperations, CollectiveOptions,
