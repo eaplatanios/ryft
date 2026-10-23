@@ -297,23 +297,24 @@ impl<
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Closed [`Operation`] family for Ryft's array IR, whose values include arrays, first-class dimensions, and array
-/// references. Homogeneous operations project their complete boundary into [`ArrayOperation`] or [`DimensionOperation`],
-/// delegate to that family's rule, and lift the result types back into [`ArrayIrType`]. Mixed signatures need explicit
-/// variants: for example, [`DimensionSizeOperation`] consumes an array and produces a dimension. Reference operations
-/// also stay composite-native so their array/reference boundaries, [`ArrayReferenceTransform`] access paths, and ordered
-/// effects remain visible to program passes.
+/// [`Operation`] family for Ryft's array Intermediate Representation (IR), whose values include arrays, first-class
+/// dimensions, and array references. Homogeneous operations project their complete boundary into [`ArrayOperation`] or
+/// [`DimensionOperation`], delegate to that family's rule, and lift the result types back into [`ArrayIrType`]. Mixed
+/// signatures need explicit variants. For example, [`DimensionSizeOperation`] consumes an array and produces a
+/// dimension. Reference operations also stay composite-native so that their array/reference boundaries,
+/// [`ArrayReferenceTransform`] access paths, and ordered effects remain visible to program passes.
 ///
 /// Mixed array constructors and shape-changing operations receive runtime extents as explicit first-class dimension
 /// inputs. Stored types carry their identities and bounds, but not the values of dynamic extents. [`Zero`](Self::Zero),
 /// [`One`](Self::One), and [`Iota`](Self::Iota) store the complete result [`ArrayType`] and take one extent per dynamic
-/// result axis, in axis order. Static result types need no inputs and remain valid, although canonical lifts prefer the
-/// homogeneous array encoding. [`ParallelAllGather`](Self::ParallelAllGather),
-/// [`ParallelSumScatter`](Self::ParallelSumScatter), and [`ParallelAllToAll`](Self::ParallelAllToAll) take trailing extent
-/// inputs for every result axis, in axis order. Other mixed variants describe their extent-input conventions below.
+/// result axis, in axis order. Static result types need no inputs and remain valid, although canonical lifts prefer
+/// the homogeneous array encoding. Collective operations like [`ParallelAllGather`](Self::ParallelAllGather),
+/// [`ParallelSumScatter`](Self::ParallelSumScatter), and [`ParallelAllToAll`](Self::ParallelAllToAll) take trailing
+/// extent inputs for every result axis, in axis order. Other mixed variants describe their extent-input conventions
+/// in their documentation.
 ///
-/// Attached regions use the full [`ArrayIrType`] universe. Refer to [`ConditionOperation`] and [`WhileOperation`] for
-/// reference-state validation and transform restrictions.
+/// Attached regions use the full [`ArrayIrType`] universe. Refer to the corresponding payload operation documentation
+/// for reference-state validation and transform restrictions.
 #[derive(Clone, Debug, Operation)]
 #[ryft(
     type(ArrayIrType),
@@ -335,14 +336,13 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Iota(IotaOperation<ArrayType>),
 
     /// Region-free [`ArrayOperation`] member, reached by projecting the complete instruction boundary to [`ArrayType`].
-    ///
     /// Attached regions belong to the composite universe and cannot pass through that projection. Lifting promotes
     /// region-carrying payloads to [`Condition`](Self::Condition), [`While`](Self::While), [`Scan`](Self::Scan),
-    /// [`LinearCall`](Self::LinearCall), [`Rematerialize`](Self::Rematerialize), and the explicit custom-function carriers:
-    /// [`CustomFunction`](Self::CustomFunction) / [`CustomFunctionTranspose`](Self::CustomFunctionTranspose) for attached
-    /// rules, or [`LiftedCustomFunction`](Self::LiftedCustomFunction) /
-    /// [`LiftedCustomFunctionTranspose`](Self::LiftedCustomFunctionTranspose) for retained member rules. Every transform
-    /// rejects a directly constructed region-carrying payload here with a diagnostic naming its operation.
+    /// [`LinearCall`](Self::LinearCall), [`Rematerialize`](Self::Rematerialize), and the explicit custom-function
+    /// carriers: [`CustomFunction`](Self::CustomFunction) / [`CustomFunctionTranspose`](Self::CustomFunctionTranspose)
+    /// for attached rules, or [`LiftedCustomFunction`](Self::LiftedCustomFunction) /
+    /// [`LiftedCustomFunctionTranspose`](Self::LiftedCustomFunctionTranspose) for retained member rules. Every
+    /// transform rejects a directly constructed region-carrying payload here with a diagnostic naming its operation.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
 
