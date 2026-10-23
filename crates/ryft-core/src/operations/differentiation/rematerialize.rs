@@ -1687,6 +1687,65 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialize_partial_evaluation_preserves_entry_relationships_across_the_split() {
+        // The body declares `[f64[n], f64[n]]` and returns `(sin(a), b · b)`. The call's input types must equal the
+        // body's, so `a` and `b` share `n` wherever the call is staged, and a known `a: f64[3]` next to an unknown
+        // `b: f64[n]` relates them where `n` enters the evaluation rather than at the call. The split hoists `sin(a)`
+        // out of the call and keeps `b · b` in the differentiated call, and the residual program must still reject a
+        // `b` of any other length, like the source program does.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = body.add_input(vector_type.clone());
+        let b = body.add_input(vector_type.clone());
+        let sine = body.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let square = body.add_instruction(MulOperation::new(), Vec::new(), vec![b, b], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![sine, square], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let a = builder.add_input(vector_type.clone());
+        let b = builder.add_input(vector_type.clone());
+        let outputs =
+            builder.add_instruction(rematerialize_operation(), vec![body], vec![a, b], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let known = Array::vector(vec![0.5f64; 3]).unwrap();
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(known.clone()), PartialValue::Unknown(vector_type)])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f64[n], %1:f64[3] .
+                let %2:f64[3], %3:f64[3] = guard [boundary="partial evaluation", declared_types=[f64[n], f64[n]]] %1 %0
+                    %4:f64[3] = rematerialize [differentiated=true] %3 [
+                        body={
+                            lambda %0:f64[3] .
+                            let %1:f64[3] = mul %0 %0
+                            in (%1)
+                        },
+                    ]
+                in (%4)"#},
+        );
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let conforming = Array::vector(vec![2.0f64; 3]).unwrap();
+        assert_eq!(
+            evaluation.interpret(&context, std::slice::from_ref(&conforming)),
+            program.interpret(vec![known.clone(), conforming]),
+        );
+        let nonconforming = Array::vector(vec![2.0f64; 4]).unwrap();
+        assert!(program.interpret(vec![known.clone(), nonconforming.clone()]).is_err());
+        assert_eq!(
+            evaluation.interpret(&context, std::slice::from_ref(&nonconforming)),
+            program.interpret(vec![known, nonconforming]),
+        );
+    }
+
+    #[test]
     fn test_rematerialize_partial_evaluation_pending_error() {
         // A partial evaluation that already retained a binding error reports that error before it hoists the known side
         // of a call into the known-side context, which would otherwise stage the dot product into the enclosing trace.

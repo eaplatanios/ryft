@@ -3720,11 +3720,12 @@ where
     let residual_body = reshape_program_boundary(&residual_program, residual_input_types, residual_output_types)?;
 
     // Bind the known-side `shard_map` into the enclosing known-side context, emit the residual `shard_map` over its
-    // residual sources, and reassemble the original outputs. The two maps replace the entry of `operation`, whose
-    // declared types are the global types rather than the local types of the body.
+    // residual sources, and reassemble the original outputs. The global inputs do not enter the body directly, whose
+    // declared types are local, and the static boundary types relate no inputs through identities (refer to the
+    // `# Static Boundaries` section of the documentation of `ShardMapOperation`), so there is no entry to guard.
     context.inline_partitioned_program(
         partition,
-        &operation.input_types,
+        None,
         inputs,
         |_known_program| {
             let known_shard_map = ShardMap::from_shardings(
@@ -8626,8 +8627,8 @@ mod tests {
     fn test_shard_map_rejects_writes_into_replicated_references_under_varying_predicates() {
         // A `condition` whose predicate varies along `x` lets the devices take different branches, so a branch that
         // writes a reference replicated along `x` would leave its copies different. The branches are well-typed on
-        // their own, so the write is rejected when the map is discharged, and the reference backend rejects the
-        // diverged copies after running the devices.
+        // their own, so the write is rejected when the map is discharged and when the `condition` is interpreted,
+        // before any device diverges.
         let mesh = manual_mesh();
         let shard_map =
             ShardMap::new(mesh.clone(), vec![Sharding::replicated(mesh, 1)], Vec::new(), Vec::new()).unwrap();
@@ -8672,27 +8673,17 @@ mod tests {
             ShardMapOperation::from_program(&body, vec![ReferenceType::new(f32_vector_type(2)).into()], shard_map)
                 .unwrap();
         let program = shard_map_program(operation, body).unwrap();
-        assert_eq!(
-            program.clone().discharge_references(0).map(|_| ()),
-            Err(TypeError::invalid(
-                "`condition` `true` branch mutates instruction input 1 of type \
-                 `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
-                 axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
-                 over, so devices that take different branches would leave it different across devices; vary the \
-                 referent over those axes",
-            )
-            .into()),
-        );
+        let expected = Err(ProgramError::from(TypeError::invalid(
+            "`condition` `true` branch mutates instruction input 1 of type \
+             `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual axis \
+             that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies over, so \
+             devices that take different branches would leave it different across devices; vary the referent over \
+             those axes",
+        )));
+        assert_eq!(program.clone().discharge_references(0).map(|_| ()), expected);
         let global_type = f32_vector_type(2).with_sharding(Sharding::replicated(manual_mesh(), 1)).unwrap();
         let reference = ArrayReference::new(Array::from_elements(global_type, &[10.0f32, 20.0]).unwrap());
-        assert_eq!(
-            program.interpret(vec![TestValue::Reference(reference)]),
-            Err(ProgramError::MalformedProgram(
-                "`shard_map` reference input #0 is replicated along manual axis `x`, but its devices along that axis \
-                 finished with different states"
-                    .to_string(),
-            )),
-        );
+        assert_eq!(program.interpret(vec![TestValue::Reference(reference)]).map(|_| ()), expected);
     }
 
     #[test]

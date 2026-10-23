@@ -5578,38 +5578,10 @@ mod tests {
                                         in (%1, %2)
                                     },
                                 ]
-                                %6:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %3 %5 [
-                                    true={
-                                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                                        in (%0)
-                                    },
-                                    false={
-                                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                                        let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = zero [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                                        in (%1)
-                                    },
-                                ]
-                            in (%4, %3, %6)
+                            in (%4, %3, %5)
                         },
                     ]
-                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %6 %7 [
-                        callee={
-                            lambda %0:bool[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                            let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %0 %1 [
-                                true={
-                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                                    in (%0)
-                                },
-                                false={
-                                    lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                                    let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = zero [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                                    in (%1)
-                                },
-                            ]
-                            in (%2)
-                        },
-                    ]
-                    %9:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 %8 [
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 %7 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:bool[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %1 %0 %2 [
@@ -5628,7 +5600,7 @@ mod tests {
                             in (%3)
                         },
                     ]
-                in (%3, %9)"#},
+                in (%3, %8)"#},
         );
         let concrete_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))

@@ -970,11 +970,22 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// ([`PartitionedProgram::from_parts`] already validates the wiring itself). Consuming the partitioned program
     /// in a single step keeps it whole until it is gone, so no partially moved partition state can ever be observed.
     ///
+    /// Partitioning seeds both programs at the declared input types of `region`, so neither side checks a relationship
+    /// that the region's entry checks between a known and an unknown input (e.g., a known `f32[3]` next to an unknown
+    /// `f32[n]`, both entering at `n`). This function therefore guards `inputs` through
+    /// [`guard_region_inputs`](Self::guard_region_inputs) (with `separate_invocation` unset, because both operations
+    /// are bound within this evaluation) before binding either operation, and both operations consume the guarded
+    /// values. A known input that the guard leaves unknown makes the known-side operation residual instead of folding
+    /// it.
+    ///
     /// # Parameters
     ///
     ///   - `program`: [`PartitionedProgram`] to inline, produced by [`Program::partition`] and typically forwarded
     ///     through [`PartitionedProgram::forward_residuals`], so that the known-side operation does not return the
     ///     same value twice or route its own inputs back out.
+    ///   - `region`: Region that `program` was partitioned from, whose entry the two operations replace, or [`None`]
+    ///     when `inputs` do not enter that region directly and the boundary that they enter relates no inputs through
+    ///     identities (e.g., the static global boundary of a `shard_map`, whose body declares local types).
     ///   - `inputs`: Input [`PartialEvaluationValue`]s in the order of the original program's input, pre-partitioning.
     ///   - `build_known_operation`: Wraps the provided known [`Program`] in the known-side boundary [`Operation`]
     ///     together with the owned [`Region`](crate::Region) programs (in region order) that the emitted instruction
@@ -990,11 +1001,18 @@ impl<C: Context> PartialEvaluationContext<C> {
     >(
         &self,
         program: PartitionedProgram<V, O>,
+        region: Option<RegionRef<'_, C::Constant, C::Operation>>,
         inputs: &[PartialEvaluationValue<C::Value>],
         build_known_operation: BuildKnownProgramOperation,
         build_residual_operation: BuildResidualProgramOperation,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         check_count!("input", inputs, program.original_input_count(), ProgramError);
+
+        // Guard the region's entry before either operation is bound, so that the guard precedes all known work.
+        let inputs = match region {
+            Some(region) => self.guard_region_inputs(region, inputs.to_vec(), false)?,
+            None => inputs.to_vec(),
+        };
 
         // Bind the known-side operation into the known-side context over the original known inputs that it uses.
         let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = program.into_parts();
@@ -1204,21 +1222,24 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// every consumer that removes a region's entry: when the types of `inputs` leave identity relationships of the
     /// entry unproven (refer to [`GuardOperation::for_entry`]), entry guards are staged before anything that the
     /// body stages, so that no known-side effect folds before them. The relationships among known inputs alone are
-    /// checked first, by a guard that folds into the known side and whose narrowed outputs replace the known inputs
-    /// (refer to [`Self::prepare_entry_inputs`]). The remaining relationships are checked by a guard whose narrowed
-    /// outputs replace unknown inputs and known inputs whose required representation changes. Reference identities
-    /// take precedence over known representations (refer to [`Self::pinned_identities`]). An unknown input can connect
-    /// otherwise independent known classes, so changing a known representation can require the residual check even
-    /// without references. A guard with an unknown input stays in the residual program together with its known
-    /// witnesses, and its ordered effect defers later ordered known effects.
+    /// checked first, by a guard that folds into the known side and whose narrowed outputs replace the known inputs.
+    /// The remaining relationships are checked by a guard whose narrowed outputs replace unknown inputs and known
+    /// inputs whose required representation changes. Reference identities take precedence over known representations.
+    /// An unknown input can connect otherwise independent known classes, so changing a known representation can require
+    /// the residual check even without references. A guard with an unknown input stays in the residual program together
+    /// with its known witnesses, and its ordered effect defers later ordered known effects. A partial-evaluation rule
+    /// that splits an attached region by knownness and binds operations that it rebuilds from the partitions itself
+    /// (i.e., neither through [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)
+    /// nor through [`inline_partitioned_program`](Self::inline_partitioned_program), which both guard their entries)
+    /// must call this function on the inputs that it binds those operations over, choosing `separate_invocation`
+    /// as described below.
     ///
     /// When `separate_invocation` is set, the unknown inputs are inputs of a residual program that is invoked
     /// separately from the known side, so that an identity which a known input and an unknown input share relates
     /// values that only that invocation supplies. The residual entry checks such a relationship, but only when the
     /// residual program runs, after any effect of the body that partial evaluation folds into the known side. When the
     /// body has effects, the guard therefore checks such relationships too, so that it defers those effects behind the
-    /// check. Its callers, and [`prepare_root_inputs`](Self::prepare_root_inputs), which prepares a root entry through
-    /// the same contract, choose the flag as follows:
+    /// check. Its callers choose the flag as follows:
     ///
     ///   - Attached-region inlining from an operation's partial-evaluation rule (i.e., through
     ///     [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)) passes `false`:
@@ -1226,18 +1247,18 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     it, so the identities that they share with known inputs need no additional check.
     ///   - Splitting a `condition` with a symbolic known predicate into a known and a residual condition passes `false`
     ///     for the same reason (the split replaces the branch entries within one evaluation, like inlining a branch).
+    ///   - [`inline_partitioned_program`](Self::inline_partitioned_program) passes `false` for the same reason (it
+    ///     binds both operations of a partitioned region within one evaluation).
     ///   - [`inline_program`](Self::inline_program) passes `true`: it replays a program at the root of the residual
     ///     program, whose unknown inputs are the residual program's own inputs, supplied by a separate invocation.
-    ///   - [`prepare_root_inputs`](Self::prepare_root_inputs) passes `true`: it prepares the replay of a program's own
-    ///     entry at the root of partial evaluation, whose unknown inputs are the residual program's inputs.
     ///
     /// # Errors
     ///
     /// Returns an error when the inputs do not refine the entry, or when the entry needs a guard but this context's
-    /// operation family cannot provide one (refer to [`OperationProvider`]): removing the entry would then
-    /// drop the check of its unproven relationships.
+    /// operation family cannot provide one (refer to [`OperationProvider`]): removing the entry would then drop the
+    /// check of its unproven relationships.
     #[inline]
-    pub(crate) fn guard_region_inputs(
+    pub fn guard_region_inputs(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<PartialEvaluationValue<C::Value>>,
@@ -3487,6 +3508,7 @@ mod tests {
         let outputs = context
             .inline_partitioned_program(
                 partition,
+                Some(program.entry_region_ref()),
                 &[
                     PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
                     context.unknown_input(ArrayType::scalar(DataType::F64), 0),
@@ -3533,6 +3555,7 @@ mod tests {
         let outputs = context
             .inline_partitioned_program(
                 partition,
+                Some(program.entry_region_ref()),
                 &[
                     PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
                     context.unknown_input(ArrayType::scalar(DataType::F64), 0),
@@ -3572,6 +3595,7 @@ mod tests {
         let outputs = context
             .inline_partitioned_program(
                 partition,
+                Some(program.entry_region_ref()),
                 &[PartialEvaluationValue::known(Array::scalar(2.0).unwrap())],
                 |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
                 |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
@@ -3627,6 +3651,7 @@ mod tests {
             let outputs = context
                 .inline_partitioned_program(
                     partition,
+                    Some(program.entry_region_ref()),
                     &inputs,
                     |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
                     |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
@@ -3665,6 +3690,7 @@ mod tests {
             context
                 .inline_partitioned_program(
                     program.partition(&[true, false]).unwrap(),
+                    Some(program.entry_region_ref()),
                     &[PartialEvaluationValue::known(Array::scalar(2.0).unwrap())],
                     |_| {
                         built.set(true);
@@ -3676,6 +3702,60 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert!(!built.get());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_partitioned_program_guards_boundary_entry() {
+        // Partition `x - -a` over `[f64[n], f64[n]]` with `a` known as an exact `f64[3]` and `x` unknown at `f64[n]`.
+        // Both partitions are seeded at the declared types, so neither checks that `x` has length `3`. The boundary's
+        // entry check must survive as a residual guard, so that the residual program rejects every input that the
+        // source program rejects.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(vector_type.clone());
+        let x = builder.add_input(vector_type.clone());
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, negated], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap().forward_residuals().unwrap();
+        let known = Array::vector(vec![2.0f64; 3]).unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let outputs = context
+            .inline_partitioned_program(
+                partition,
+                Some(program.entry_region_ref()),
+                &[PartialEvaluationValue::known(known.clone()), context.unknown_input(vector_type, 0)],
+                |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
+                |_| (ArrayOperation::Sub(SubOperation::new()), Vec::new()),
+            )
+            .unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:f64[n], %1:f64[3], %2:f64[3] .
+                let %3:f64[3], %4:f64[3] = guard [boundary="partial evaluation", declared_types=[f64[n], f64[n]]] %1 %0
+                    %5:f64[3] = sub %4 %2
+                in (%5)"#},
+        );
+        let conforming = Array::vector(vec![1.0f64; 3]).unwrap();
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&conforming)),
+            Ok(vec![Array::vector(vec![3.0f64; 3]).unwrap()]),
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&conforming)),
+            program.interpret(vec![known.clone(), conforming]),
+        );
+        let nonconforming = Array::vector(vec![1.0f64; 4]).unwrap();
+        assert!(program.interpret(vec![known.clone(), nonconforming.clone()]).is_err());
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&nonconforming)),
+            program.interpret(vec![known, nonconforming]),
+        );
     }
 
     #[test]

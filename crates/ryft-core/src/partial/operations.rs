@@ -45,7 +45,11 @@ pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Oper
 
     /// Builds separate known and residual programs for `region`, treating input `i` as known when `input_known[i]`
     /// is `true`. Both programs are constructed in a fresh staging context, so even known operations are recorded
-    /// rather than executed through the active context.
+    /// rather than executed through the active context. Partitioning performs an analysis where both programs are
+    /// seeded at the declared input types of `region`, without checking the relationships that its entry checks
+    /// between the actual inputs. A rule binds a partition's known program over the evaluation's inputs only after
+    /// guarding them, which [`PartialEvaluationContext::inline_partitioned_program`] does (refer to
+    /// [`PartialEvaluationContext::guard_region_inputs`] for rules that bind operations they rebuild from partitions).
     ///
     /// The new evaluation uses `context`'s execution configuration but tracks effect ordering and pending errors
     /// separately. For example, a loop rule can try a partition, discover that a loop-carried value must be unknown,

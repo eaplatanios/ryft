@@ -5568,6 +5568,8 @@ pub(crate) mod tests {
     #[test]
     fn test_differentiation_context_bind_region_reference_outputs() {
         // Both branches allocate a local reference from the numeric input and return it: `f(p, x) = new(x)`.
+        // A `condition` output must denote the same reference in both branches, which two branch-local
+        // allocations never do, so no region rule can return such an allocation.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let branch = || {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -5588,15 +5590,15 @@ pub(crate) mod tests {
             context.clone(),
         );
 
-        // Every input tangent is a structural zero, but the branches allocate a reference, so the all-zero fast path
-        // defers to the `condition` rule and the escaping allocation carries a tangent reference holding zero instead
-        // of a symbolic zero that no later store could land in.
-        let outputs = context.bind(ConditionOperation::new(), vec![branch(), branch()], &[predicate, value]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].primal(), TestValue::Reference(reference)
-            if reference.read().unwrap() == Array::scalar(2.0_f32).unwrap()));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(TestValue::Reference(reference))
-            if reference.read().unwrap() == Array::scalar(0.0_f32).unwrap()));
+        // Every input tangent is a structural zero, but the all-zero fast path must not give the escaping allocation
+        // a symbolic zero tangent that no later store could land in. Binding rejects the allocation instead.
+        assert_eq!(
+            context.bind(ConditionOperation::new(), vec![branch(), branch()], &[predicate, value]).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`condition` reference output 0 must denote the same reference in both branches, but the `true` branch \
+                 returns a reference that it allocates and the `false` branch returns a reference that it allocates",
+            ))),
+        );
     }
 
     #[test]

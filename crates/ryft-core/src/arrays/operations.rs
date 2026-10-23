@@ -297,16 +297,23 @@ impl<
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Closed [`Operation`] family for Ryft's array IR, whose values include ordinary arrays, first-class runtime
-/// dimensions, and references to arrays. This dispatcher preserves the homogeneous contracts of [`ArrayOperation`] and
-/// [`DimensionOperation`]: it selects the member family, projects the composite type boundary once, delegates to that
-/// family, and lifts the inferred result types back into [`ArrayIrType`]. Reference operations remain composite-native
-/// because their signatures cross the array/reference boundary and their ordered state semantics must remain visible
-/// to generic program passes.
+/// Closed [`Operation`] family for Ryft's array IR, whose values include arrays, first-class dimensions, and array
+/// references. Homogeneous operations project their complete boundary into [`ArrayOperation`] or [`DimensionOperation`],
+/// delegate to that family's rule, and lift the result types back into [`ArrayIrType`]. Mixed signatures need explicit
+/// variants: for example, [`DimensionSizeOperation`] consumes an array and produces a dimension. Reference operations
+/// also stay composite-native so their array/reference boundaries, [`ArrayReferenceTransform`] access paths, and ordered
+/// effects remain visible to program passes.
 ///
-/// Operations whose signatures mix arrays and dimensions are represented as explicit variants because no homogeneous
-/// member family can express such a signature. For example, [`DimensionSizeOperation`] consumes an array and produces
-/// a first-class dimension without changing either homogeneous family.
+/// Mixed array constructors and shape-changing operations receive runtime extents as explicit first-class dimension
+/// inputs. Stored types carry their identities and bounds, but not the values of dynamic extents. [`Zero`](Self::Zero),
+/// [`One`](Self::One), and [`Iota`](Self::Iota) store the complete result [`ArrayType`] and take one extent per dynamic
+/// result axis, in axis order. Static result types need no inputs and remain valid, although canonical lifts prefer the
+/// homogeneous array encoding. [`ParallelAllGather`](Self::ParallelAllGather),
+/// [`ParallelSumScatter`](Self::ParallelSumScatter), and [`ParallelAllToAll`](Self::ParallelAllToAll) take trailing extent
+/// inputs for every result axis, in axis order. Other mixed variants describe their extent-input conventions below.
+///
+/// Attached regions use the full [`ArrayIrType`] universe. Refer to [`ConditionOperation`] and [`WhileOperation`] for
+/// reference-state validation and transform restrictions.
 #[derive(Clone, Debug, Operation)]
 #[ryft(
     type(ArrayIrType),
@@ -315,190 +322,154 @@ impl<
     dispatch(identity, discharge, batching, differentiation, transposition),
 )]
 pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
-    /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are
-    /// consumed as explicit first-class dimension inputs, one per dynamic axis in axis order. A static stored type
-    /// therefore consumes no inputs and remains valid, although canonical lifts prefer the homogeneous
-    /// [`ArrayOperation`] encoding. This constructor lives at the composite-family level because its dynamic signature
-    /// crosses member kinds: a homogeneous [`ArrayOperation`] cannot consume dimension inputs, while the stored
-    /// structural type carries identities and bounds but not the concrete runtime extents required to materialize the
-    /// result.
+    /// Constructs a zero-filled array of the stored type using explicit runtime extents.
     #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
-    /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions are
-    /// consumed as explicit first-class dimension inputs, one per dynamic axis in axis order. A static stored type
-    /// consumes no inputs and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`]
-    /// encoding.
+    /// Constructs a one-filled array of the stored type using explicit runtime extents.
     #[ryft(mixed(structural), skip_from)]
     One(OneOperation<ArrayType>),
 
-    /// Mixed iota constructor whose stored [`ArrayType`] and iota axis define the complete output, and whose dynamic
-    /// dimensions are consumed as explicit first-class dimension inputs in axis order. A static stored type consumes no
-    /// inputs and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`] encoding.
+    /// Constructs an index array using the stored type, iota axis, and explicit runtime extents.
     #[ryft(mixed(structural), skip_from)]
     Iota(IotaOperation<ArrayType>),
 
-    /// Homogeneous array operation whose complete boundary is projected into the array member family. Every transform
-    /// reaches the member rule through that projection, which carries no region access: an operation's attached
-    /// regions are programs in the *composite* universe, and no projected view can present them in the member
-    /// universe. This variant therefore holds only region-free array operations: the array-operation lift promotes
-    /// every region-carrying member payload to its composite carrier — [`Condition`](Self::Condition),
-    /// [`While`](Self::While), [`Scan`](Self::Scan), [`LinearCall`](Self::LinearCall),
-    /// [`Rematerialize`](Self::Rematerialize), and the custom function calls and carriers
-    /// ([`CustomFunction`](Self::CustomFunction) and [`CustomFunctionTranspose`](Self::CustomFunctionTranspose)
-    /// with attached rules, and [`LiftedCustomFunction`](Self::LiftedCustomFunction) and
-    /// [`LiftedCustomFunctionTranspose`](Self::LiftedCustomFunctionTranspose) with retained rules).
+    /// Region-free [`ArrayOperation`] member, reached by projecting the complete instruction boundary to [`ArrayType`].
     ///
-    /// No region-carrying array payload therefore reaches this variant. Should one ever be constructed directly, it is
-    /// not silently mis-transformed: each transform rejects a region-carrying projected payload with an exact
-    /// diagnostic naming the operation.
+    /// Attached regions belong to the composite universe and cannot pass through that projection. Lifting promotes
+    /// region-carrying payloads to [`Condition`](Self::Condition), [`While`](Self::While), [`Scan`](Self::Scan),
+    /// [`LinearCall`](Self::LinearCall), [`Rematerialize`](Self::Rematerialize), and the explicit custom-function carriers:
+    /// [`CustomFunction`](Self::CustomFunction) / [`CustomFunctionTranspose`](Self::CustomFunctionTranspose) for attached
+    /// rules, or [`LiftedCustomFunction`](Self::LiftedCustomFunction) /
+    /// [`LiftedCustomFunctionTranspose`](Self::LiftedCustomFunctionTranspose) for retained member rules. Every transform
+    /// rejects a directly constructed region-carrying payload here with a diagnostic naming its operation.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
 
-    /// Homogeneous first-class-dimension operation.
+    /// Homogeneous [`DimensionOperation`] member.
     #[ryft(projected(DimensionType, structural))]
     Dimension(DimensionOperation<DimensionValue>),
 
-    /// Mixed operation that reads an array axis as a first-class dimension.
+    /// Reads an array axis extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
-    /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
+    /// Checks and converts scalar-array data into a first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
 
-    /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
+    /// Converts a first-class dimension into scalar-array data.
     DimensionToScalar(DimensionToScalarOperation),
 
-    /// Creates a new whole-array reference root.
+    /// Creates a whole-array reference root.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
-    /// Reads the array value addressed by a reference and the operation's transforms.
+    /// Reads the array addressed by a reference path.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Replaces the array value addressed by a reference and the operation's transforms without reading its previous
-    /// value.
+    /// Writes through a reference path without reading its previous value.
     ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Replaces the array value addressed by a reference and the operation's transforms and returns its previous
-    /// value.
+    /// Writes through a reference path and returns the previous value.
     ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Adds an array update through the operation's transforms of a reference, in program order.
+    /// Adds an update through a reference path in program order.
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Atomically adds an array update through the operation's transforms of a reference.
+    /// Atomically adds an update through a reference path.
     ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Consumes a whole-array reference and returns its final value.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
-    /// Mixed all-gather whose trailing dimension inputs define every result axis in axis order.
+    /// All-gather with explicit result extents.
     #[ryft(mixed)]
     ParallelAllGather(ParallelAllGatherOperation),
 
-    /// Mixed sum-scatter whose trailing dimension inputs define every result axis in axis order.
+    /// Sum-scatter with explicit result extents.
     #[ryft(mixed)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
-    /// Mixed all-to-all whose trailing dimension inputs define every result axis in axis order.
+    /// All-to-all with explicit result extents.
     #[ryft(mixed)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
-    /// Direct array-only ragged all-to-all carrier. It is explicit because the composite enum already has one
-    /// projected array-family variant and operation projection permits only one canonical member carrier.
+    /// Array-only ragged all-to-all. It needs an explicit carrier because [`Array`](Self::Array) is already the single
+    /// canonical projected carrier for [`ArrayType`].
     #[ryft(mixed)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
-    /// Mixed comparison of two first-class dimensions that produces ordinary rank-zero Boolean array data.
-    ///
-    /// This variant has the precise composite member signature
-    /// `(Dimension, Dimension) -> Array(Boolean scalar)`. It lives directly in [`ArrayIrOperation`] because
-    /// [`DimensionOperation`] is intentionally homogeneous: its inputs and outputs are all first-class dimensions.
-    /// Storing comparison there would break that invariant because a predicate is ordinary data rather than a
-    /// first-class dimension.
-    ///
-    /// Homogeneous array comparison remains [`ArrayIrOperation::Array`] wrapping [`ArrayOperation::Compare`]. This
-    /// variant does not permit array-dimension or dimension-array comparisons; it reuses [`CompareOperation`] for the
-    /// dimension-dimension signature whose result crosses from the dimension member kind to the array member kind.
+    /// Compares two dimensions, producing a rank-zero Boolean array: `(Dimension, Dimension) -> Array(Boolean scalar)`.
+    /// This crossing cannot belong to the homogeneous [`DimensionOperation`] family. Array comparisons use
+    /// [`ArrayOperation::Compare`] through [`Array`](Self::Array); array-dimension and dimension-array pairs are rejected.
     Compare(CompareOperation<ArrayIrType>),
 
-    /// Mixed operation that reshapes an array using one first-class dimension input per output axis.
+    /// Reshapes using one first-class dimension input per output axis.
     Reshape(DynamicReshapeOperation),
 
-    /// Mixed operation that broadcasts an array using one first-class dimension input per output axis.
+    /// Broadcasts using one first-class dimension input per output axis.
     Broadcast(DynamicBroadcastOperation),
 
-    /// Mixed padding operation with one explicit result-extent input per output axis.
+    /// Pads using one explicit result-extent input per output axis.
     Pad(PadOperation<ArrayIrType>),
 
-    /// Mixed operation that concatenates array inputs using one trailing result-extent input.
+    /// Concatenates arrays using one trailing result-extent input.
     Concatenate(ConcatenateOperation<ArrayIrType>),
 
-    /// Mixed slice whose starts and output sizes are first-class dimension inputs.
+    /// Slices using first-class dimension inputs for starts and output sizes.
     DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
-    /// Composite manual SPMD computation whose local body runs once per device coordinate along its active manual
-    /// axes, with array and reference boundaries and first-class dimensions inside the body (refer to the documentation
-    /// of [`ShardMapOperation`]).
+    /// Manual SPMD computation whose composite body runs once per device coordinate along its active manual axes.
+    /// Refer to [`ShardMapOperation`] for array/reference boundaries and first-class dimensions inside the body.
     ShardMap(ShardMapOperation),
 
-    /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
-    /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
-    /// remain unsupported until discharge.
+    /// Branches between composite regions.
     Condition(ConditionOperation<ArrayIrType>),
 
-    /// Composite while loop whose condition and body use the complete array IR storage universe. Validated local,
-    /// nonescaping reference state can execute eagerly; reference-valued carries/results and generic
-    /// transforms/backends remain unsupported until discharge.
+    /// Loops over composite condition and body regions.
     While(WhileOperation<ArrayIrType>),
 
-    /// Composite scan whose body uses the complete array IR storage universe, including first-class dimension carries,
-    /// dynamic trip counts, reference carries, and reference stacks (refer to the documentation of [`ScanOperation`]).
+    /// Scans a composite body, including first-class dimension carries, dynamic trip counts, reference carries, and
+    /// reference stacks; refer to [`ScanOperation`].
     Scan(ScanOperation<ArrayIrType>),
 
-    /// Composite rematerialized call whose body uses the complete array IR storage universe.
+    /// Rematerialized call with a composite body.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
     LinearCall(LinearCallOperation<ArrayIrType>),
 
-    /// Mixed bit generator whose trailing dimension inputs define its dynamic bits-output axes.
+    /// Bit generator with trailing dimension inputs for its dynamic bits-output axes.
     RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
 
     /// Asserts a Boolean array predicate with optional array or dimension diagnostics.
     Assert(AssertOperation<ArrayIrType>),
 
-    /// Checks at runtime the identity relationships of an entry that the actual input types do not prove, and returns
-    /// its inputs narrowed by the facts that those relationships prove.
+    /// Checks unproven entry identity relationships at runtime and returns inputs narrowed by those facts.
     Guard(GuardOperation<ArrayIrType>),
 
-    /// Returns its first input at a compatible array or first-class dimension type, using further inputs as
-    /// shape and proof witnesses.
+    /// Returns its first input at a compatible array or dimension type, using further shape and proof witnesses.
     Cast(CastOperation<ArrayIrType>),
 
-    /// Mixed foreign-kernel call whose trailing dimension inputs define its dynamic output axes.
+    /// Foreign-kernel call with trailing dimension inputs for its dynamic output axes.
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
 
-    /// Composite custom function call whose primal region uses the complete array IR storage universe, with either
-    /// attached rule regions in that universe or retained rules registered in this family. Generic differentiation
-    /// rejects reference members because they have no tangent or cotangent representation.
+    /// Custom function call with a composite primal region and attached rules or retained rules registered in this family.
+    /// Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are rejected.
     CustomFunction(CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Reverse-mode carrier of a [`CustomFunction`](Self::CustomFunction) call, which transposition replaces with
-    /// the call's backward rule.
+    /// Reverse-mode carrier of [`CustomFunction`](Self::CustomFunction), replaced by the call's backward rule during
+    /// transposition.
     CustomFunctionTranspose(CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Custom function call whose retained rules are registered in the [`ArrayOperation`] member family, promoted
-    /// from its member payload by the array-operation lift. Its derivative rules are specialized by the member
-    /// definition and converted into this family (refer to [`LiftedCustomRules`]). Conversions never produce such a
-    /// call with attached rules, which follow their call into the [`CustomFunction`](Self::CustomFunction)
-    /// variant instead.
+    /// Custom function call promoted from [`ArrayOperation`] with retained member-registered rules. [`LiftedCustomRules`]
+    /// specializes and converts those rules into this family. Calls with attached rules instead use
+    /// [`CustomFunction`](Self::CustomFunction).
     LiftedCustomFunction(
         CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
 
-    /// Reverse-mode carrier of a [`LiftedCustomFunction`](Self::LiftedCustomFunction) call, whose backward rule is
-    /// specialized by the member definition and converted into this family.
+    /// Reverse-mode carrier of [`LiftedCustomFunction`](Self::LiftedCustomFunction), whose backward rule is specialized
+    /// by its member definition and converted into this family.
     LiftedCustomFunctionTranspose(
         CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
