@@ -14,10 +14,6 @@ use crate::differentiation::{
     MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
     TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
-// TODO(eaplatanios): Import from `crate::operations` directly.
-use crate::operations::attention::{
-    DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
-};
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
     AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
@@ -28,7 +24,8 @@ use crate::operations::{
     DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DynamicBroadcastOperation,
+    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DotProductAttention,
+    DotProductAttentionBackwardOperation, DotProductAttentionOperation, DynamicBroadcastOperation,
     DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
     DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation, ExponentialOperations, ExtremaOperations,
     FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules,
