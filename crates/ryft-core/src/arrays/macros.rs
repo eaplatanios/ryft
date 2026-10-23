@@ -429,16 +429,16 @@ macro_rules! impl_array_elementwise_operation {
         )
     };
 
+    // Disjoint selectors leave no valid dispatch arm, regardless of subsequent refinements.
+    (@select [empty $kind:ident] [$($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        unreachable!("incompatible element data type selectors")
+    };
+
     // Numeric does not widen a class already restricted by another selector.
     (@select [$base:ident $kind:ident] [@numeric $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::impl_array_elementwise_operation!(
             @select [$base $kind] [$($rest)*] $data_type, |$element| $body,
         )
-    };
-
-    // Disjoint selectors leave no valid dispatch arm, regardless of subsequent refinements.
-    (@select [empty $kind:ident] [$($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
-        unreachable!("incompatible element data type selectors")
     };
 
     // Integer and float classes are disjoint, irrespective of selector order.

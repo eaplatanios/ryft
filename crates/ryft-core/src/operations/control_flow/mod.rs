@@ -257,9 +257,11 @@ pub(crate) fn refine_output_types<T: Type>(
 
 /// Validates that every type identity that one of the `output_types` of a control-flow operation refers to is either
 /// carried by one of its `input_types` or defined by one of its `output_types`, so that the instruction only produces
-/// types whose identities it consumes or defines. [`refine_output_types`] replaces an identity that the inputs refine
-/// away with its static extent, unless an output defines that identity, so this holds for the refined output types by
-/// construction and is checked as a final invariant of `while`, `scan`, and `condition` type inference.
+/// types whose identities it consumes or defines. [`refine_output_types`] substitutes only the exact facts that the
+/// inputs establish, so a refined output type can still refer to an identity that a region defines internally (e.g.,
+/// the extent of an array computed from a `dimension_from_scalar` result that the region does not return) or to a
+/// declared region identity that the inputs do not carry. This function rejects such an output as the final step of
+/// `while`, `scan`, and `condition` type inference.
 pub(crate) fn validate_output_identities<T: Type>(
     operation_name: &str,
     input_types: &[T],
