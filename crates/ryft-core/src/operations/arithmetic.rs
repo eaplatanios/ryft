@@ -45,7 +45,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayOperation, ArrayType, DataType,
+    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType,
     FloatingPointArrayElement, NumericArrayElement, RealArrayElement,
 };
 use crate::contexts::StagingContext;
@@ -63,7 +63,7 @@ use crate::operations::control_flow::select::Select;
 use crate::operations::exponential::Log;
 use crate::operations::rounding::Floor;
 use crate::operations::{Accuracy, Capability};
-use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
+use crate::programs::{MaybeZero, Operation, OperationProvider, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`NegOperation`].
@@ -191,6 +191,26 @@ impl_differentiable_elementwise_operation! {
     @linear
     AddOperation,
     rule = [@positive, @positive],
+}
+
+impl<T: Type, O: Operation<Type = T> + From<AddOperation<T>>> OperationProvider<T, AddOperation<T>> for O {
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: AddOperation<T>, input_types: &[&T]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(Self::from(request))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    type Operation = Self;
+
+    #[inline]
+    fn provide(_request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(Self::Array(ArrayOperation::Add(AddOperation::new())))
+    }
 }
 
 impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayType>> for ArrayIrOperation<A> {
@@ -1906,6 +1926,40 @@ mod tests {
                     "},
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_add_operation_provider() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let composite_type = ArrayIrType::from(array_type.clone());
+
+        // Ordinary constructors retain their unique homogeneous conversion into a composite family.
+        let direct: ArrayIrOperation<Array> = AddOperation::new().into();
+        assert_eq!(direct.to_string(), "add");
+        assert_eq!(
+            direct.infer_output_types(&[composite_type.clone(), composite_type.clone()], &[]),
+            Ok(vec![composite_type.clone()]),
+        );
+
+        // Generic cotangent requests select that same array member without a competing owned conversion.
+        let provided =
+            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&composite_type, &composite_type])
+                .unwrap();
+        assert_eq!(provided.to_string(), "add");
+        assert_eq!(
+            provided.infer_output_types(&[composite_type.clone(), composite_type.clone()], &[]),
+            Ok(vec![composite_type]),
+        );
+        let provided = ArrayOperation::<Array>::provide(AddOperation::new(), &[&array_type, &array_type]).unwrap();
+        assert_eq!(provided.to_string(), "add");
+        assert_eq!(
+            provided.infer_output_types(&[array_type.clone(), array_type], &[]),
+            Ok(vec![ArrayType::scalar(DataType::F32)])
+        );
+        assert_eq!(
+            ArrayOperation::<Array>::provide(AddOperation::new(), &[]).unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 2, actual: 0 },
         );
     }
 

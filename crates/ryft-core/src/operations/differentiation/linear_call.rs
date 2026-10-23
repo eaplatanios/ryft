@@ -2,22 +2,24 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy, reject_ragged_carriers,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
-    SupportsCotangentAdd, TransposableOperation, TranspositionContext, TranspositionDriver,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError,
-    RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
+    ProgramError, RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -239,12 +241,6 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             .into());
         }
         check_count!("input", input_axes, inputs.len(), ProgramError);
-
-        // Both paths below pass only the packed values (and, structurally, their batch axes) into the attached regions,
-        // so carriers with per-item extents are rejected before either path. Otherwise, the regions would compute over
-        // the padding of a bounded ragged axis as if it were live data (e.g., `x + sum(x)` would sum the padding too).
-        reject_ragged_carriers::<C, P>(LINEAR_CALL_OPERATION_NAME, inputs)?;
-
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
 
         // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
@@ -302,19 +298,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         // (e.g., `f64[batch, n]`) that the packed inputs refine to a concrete one (e.g., `f64[batch, 3]`). Both regions
         // are therefore specialized to the packed input types (which is a no-op whenever the boundaries already agree),
         // and the transpose's cotangent inputs derive from the specialized forward's physical outputs for the same
-        // reason. The bound call's results are plain values that cannot carry batch metadata, so each output carrier is
-        // restored through the driver from the source region's per-item logical output type and the input carriers.
+        // reason. Each returned packed value is wrapped with the output axis reported by structural batching.
         let mut packed_inputs = P::boundary_inputs(context.axis_extent());
         let boundary_input_count = packed_inputs.len();
         packed_inputs.extend(input_values);
         let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-
-        // Refine the logical boundary using the carriers' per-item types before restoring output metadata. For example,
-        // a retained source extent `n` may now be 3 for every mapped item. Using the old `f64[n]` declaration with a
-        // concrete `f64[batch, 3]` result would incorrectly demand ragged extent metadata. Ragged carriers were
-        // rejected above, so no input carries per-item extents that its packed value does not name.
-        let logical_input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
-        let forward_output_types = driver.region(0)?.to_program().specialize(&logical_input_types)?.output_types();
         let forward = forward.specialize(forward_input_types.as_slice())?;
         let physical_output_types = forward.output_types();
         let mut transpose_input_types = packed_inputs[..boundary_input_count + self.residual_count]
@@ -335,12 +323,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             packed_inputs.as_slice(),
         )?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        check_count!("output", forward_output_types, outputs.len(), ProgramError);
-        outputs
-            .into_iter()
-            .zip(output_axes.into_iter().zip(forward_output_types))
-            .map(|(output, (axis, logical_type))| driver.restore_batch(output, axis, &logical_type, inputs))
-            .collect()
+        check_count!("output", driver.region(0)?.output_ids(), outputs.len(), ProgramError);
+        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
     }
 }
 
@@ -502,9 +486,9 @@ impl<
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
-        Ok(self.batch_regions(context, driver, inputs, input_axes)?.into())
+        self.batch_regions(context, driver, inputs, input_axes)
     }
 }
 
@@ -622,7 +606,7 @@ where
 impl<
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>
-        + SupportsCotangentAdd
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
         + ResidualZeroProvider<V::Type, Operation = O>
         + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
@@ -753,11 +737,9 @@ pub(crate) mod tests {
 
     use ryft_macros::Operation;
 
-    use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-        ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Shape, ShardingDimension,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -768,16 +750,13 @@ pub(crate) mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::constants::zero::ZeroOperation;
-    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
-    use crate::operations::manipulation::broadcasting::DynamicBroadcast;
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
-    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType,
-        RegionDriver, RegionRef, RegionSlot, ValueProjection,
+        EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef,
+        RegionSlot,
     };
     use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
     use crate::tracing::TracingContext;
@@ -1084,9 +1063,7 @@ pub(crate) mod tests {
         // "`axis_index` for the device mesh axis `items` has no eager value").
         let outputs = LinearCallOperation::new(0)
             .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0).unwrap())])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]).unwrap());
@@ -1160,67 +1137,10 @@ pub(crate) mod tests {
                     ArrayBatch::replicated(Array::scalar(4.0).unwrap()),
                 ],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &Array::scalar(8.0).unwrap());
-    }
-
-    #[test]
-    fn test_linear_call_operation_batching_rejects_ragged_carriers() -> Result<(), ProgramError> {
-        // The attached regions receive only packed values, so a carrier with the per-item extents of a bounded ragged
-        // axis is rejected before both the replicated shortcut and structural region batching; otherwise, a region
-        // such as `x + sum(x)` would compute over the padding as if it were live data. An empty driver proves that the
-        // rejection precedes any region transformation.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
-        let rejection = BatchingError::UnsupportedOperation {
-            message: "`linear_call` does not support bounded ragged dimension `length` on input 0".to_owned(),
-        };
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
-        );
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![1i64, 2]).unwrap()),
-            &length,
-            1,
-        )?;
-        assert_eq!(
-            LinearCallOperation::<ArrayIrType>::new(0)
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .unwrap_err(),
-            rejection,
-        );
-
-        // A mapped `dimension_from_scalar` gives each batch item its own extent, so the value entering the call from
-        // outside its regions is a ragged carrier, which staging rejects in the same way.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let values = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
-        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])).into());
-        let output = batch(
-            |(value, extent)| {
-                let extent = extent.to_dimension(length.clone())?;
-                let repeated = value.dynamic_broadcast_to(&[extent])?;
-                let mut repeated = LinearCallOperation::stage(
-                    repeated.context(),
-                    Vec::new(),
-                    vec![repeated.clone()],
-                    |_, inputs| Ok(inputs.to_vec()),
-                    |_, cotangents| Ok(cotangents.to_vec()),
-                )?;
-                let repeated = ValueProjection::<ArrayType>::into_projected(repeated.remove(0))?;
-                Ok(repeated.reduce(&[0], ReductionKind::Sum)?.into_value())
-            },
-            (values, extents),
-            (BatchAxis::new(0), BatchAxis::new(0)),
-            BatchAxis::new(0),
-            None,
-        );
-        assert_eq!(output.err(), Some(rejection));
-        Ok(())
     }
 
     #[test]

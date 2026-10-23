@@ -11,7 +11,7 @@ use ryft_core::kernels::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation, Context,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, ConstantOperation, Context,
     CotangentAccumulator, CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     DifferentiationPolicy, Domain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
@@ -466,7 +466,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let KernelOperation::Call(call) = &self.0 else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("kernel operation `{}` must be batched through its complete kernel call", self.name()),
@@ -575,11 +575,6 @@ fn stage_body<Extension: KernelExtension + Into<XlaKernelExtension>>(
                         Atom::Constant(ArrayIrValue::Reference(_)) => {
                             return Err(ProgramError::MalformedProgram(
                                 "kernel body cannot capture a literal reference".to_owned(),
-                            ));
-                        }
-                        Atom::Constant(ArrayIrValue::Ragged(_)) => {
-                            return Err(ProgramError::MalformedProgram(
-                                "kernel body cannot capture a ragged value".to_owned(),
                             ));
                         }
                     })
@@ -790,9 +785,6 @@ fn definition_from_body(
                         }
                         Atom::Constant(XlaConstant::Boolean(value)) => {
                             Atom::Constant(ArrayIrValue::Array(Array::scalar(*value)?))
-                        }
-                        Atom::Constant(XlaConstant::Literal(value)) => {
-                            Atom::Constant(ArrayIrValue::Array(value.array().clone()))
                         }
                         Atom::Constant(XlaConstant::Captured(_)) => {
                             return Err(ProgramError::MalformedProgram(
@@ -1543,10 +1535,9 @@ pub(crate) mod tests {
                 let parent = inputs[0].context();
                 let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-                let (outputs, _) =
+                let outputs =
                     XlaKernelOperation::new(KernelOperation::<NoKernelExtension>::Call(definition.operation().clone()))
-                        .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])?
-                        .into_parts();
+                        .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])?;
                 Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
             },
             vec![vector.clone()],

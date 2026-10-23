@@ -4,27 +4,21 @@ use std::fmt::Display;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
-    DimensionValue, DimensionVariable,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DimensionType, DimensionValue,
+    DimensionVariable,
 };
-use crate::axes::Axis;
-use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
-use crate::operations::{
-    Capability, ConstantOperation, DimensionSize, DimensionSizeOperation, DimensionToScalarOperation,
-    DynamicBroadcastOperation, ScanOperation, Transpose, TransposeOperation,
-};
-use crate::parameters::Placeholder;
+use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Concretizable, EffectClass, EffectClasses, Effects, Operation, OperationFormatter, OperationProjection,
-    ProgramBuilder, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueDomainDispatch, ValueProjection,
+    Concretizable, EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ProjectedValue,
+    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
@@ -131,73 +125,32 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
 {
 }
 
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionFromScalarOperation
-where
-    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Transpose>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<DimensionFromScalarOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + From<DimensionToScalarOperation>
-        + From<DynamicBroadcastOperation>
-        + From<ScanOperation<C::Type>>
-        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionFromScalarOperation
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        driver: &D,
+        _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        // Batching converts a mapped scalar array into one checked extent per batch item. The extents remain ordinary
-        // packed integer Single Static Assignment (SSA) data and are exposed as a mapped dimension only through
-        // `ArrayIrBatch`; no raggedness is added to `ArrayIrType`. A carry-free scan applies this ordered-assertion
-        // gateway to every scalar and converts each checked dimension back to scalar data for packing, so the
-        // gateway's bounds diagnostics remain exact.
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // Batching rejects mapped scalar inputs because converting one scalar per batch item would produce a different
+        // first-class dimension for each item. A replicated scalar is converted once and remains replicated.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
-        let unbatched_type = input.unbatched_type();
-        let input_type = <&ArrayType>::try_from(&unbatched_type)?.clone();
-        Self::validate_input_type(&input_type)?;
-        if input.batch_axis().is_replicated() {
-            return Ok(context
-                .parent()
-                .bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?
-                .into_iter()
-                .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>()
-                .into());
+        <&ArrayType>::try_from(&input.unbatched_type())?;
+        if !input.batch_axis().is_replicated() {
+            return Err(BatchingError::MappedDimension {
+                r#type: Box::new(self.output_type().clone()),
+                axis: input.batch_axis(),
+            });
         }
-
-        let input = driver.align_batch_axis(context, input.clone(), Axis::from(0))?;
-        let scan_extent = input.value().dimension_size(0)?;
-        let scan_extent_type = scan_extent.r#type();
-        let length = <&DimensionType>::try_from(scan_extent_type.as_ref())?.simplified_dimension();
-        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-        builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let scalar = builder.add_input(ArrayIrType::Array(input_type.clone()));
-        let dimension = builder.add_instruction(self.clone(), Vec::new(), vec![scalar], None)?[0];
-        let scalar = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None)?[0];
-        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-            vec![scalar],
-            vec![Placeholder; 2],
-            vec![Placeholder],
-        )?;
-
-        let scan = ScanOperation::<C::Type>::new(0, length.clone());
-        let mut packed_inputs = vec![input.into_value()];
-        if length.variable().is_some() {
-            packed_inputs.push(scan_extent);
-        }
-
-        let mut outputs = context.parent().bind(scan, vec![body], packed_inputs.as_slice())?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![ArrayIrBatch::mapped_dimension(
-            outputs.remove(0),
-            BatchAxis::from_position(0),
-            self.output_type().clone(),
-        )?]
-        .into())
+        Ok(context
+            .parent()
+            .bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?
+            .into_iter()
+            .map(ArrayIrBatch::replicated)
+            .collect())
     }
 }
 
@@ -211,8 +164,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
 ///
 /// The input may use any signed or unsigned integer element type. It must be rank zero. Under batching, a mapped
-/// scalar produces one checked extent per item. Those extents remain packed scalar-array data on the transform-owned
-/// batch carrier and become ragged extents only when a shape-consuming batching rule accepts them.
+/// scalar is rejected because array shapes must be shared by every batch item.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
@@ -322,11 +274,10 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionError, DimensionValue,
         MAX_DIMENSION_EXTENT, Shape, i1, i2, i4, u1, u2, u4,
     };
-    use crate::batching::batch;
+    use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface, ValueProjection};
     use crate::tracing::TracingContext;
@@ -582,30 +533,66 @@ mod tests {
     #[test]
     fn test_dimension_from_scalar_batching() {
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+        let operation = DimensionFromScalarOperation::new(variable.clone().into());
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        );
+        let input = ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::I32, [2]).into()), BatchAxis::new(0))
+            .unwrap();
+        assert_eq!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(operation.output_type().clone()),
+                axis: BatchAxis::new(0),
+            }),
+        );
+        assert!(trace.builder().borrow().instructions().is_empty());
+
+        // Empty batches cannot make data-dependent dimensions representable either.
+        let empty_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap())),
+        );
+        let empty = ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::I32, [0]).into()), BatchAxis::new(0))
+            .unwrap();
+        assert_eq!(
+            operation.batch(&empty_context, &EmptyRegionDriver, &[empty]).map(|_| ()),
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(operation.output_type().clone()),
+                axis: BatchAxis::new(0),
+            }),
+        );
+        assert!(trace.builder().borrow().instructions().is_empty());
+
+        let eager = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(3i32).unwrap()));
+        let outputs = operation.batch(&eager, &EmptyRegionDriver, &[input]).unwrap();
+        assert_eq!(
+            outputs,
+            vec![ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::new(variable.into(), 3).unwrap(),))],
+        );
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_batching_rejects_mapped_input() {
+        // The public entry point surfaces the same rejection for a scalar that varies across batch items.
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
         let output: Result<ArrayIrValue<Array>, BatchingError> = batch(
-            |input| input.to_dimension(variable.clone())?.to_scalar(),
+            |input| input.to_dimension(variable.clone()),
             ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
             BatchAxis::new(0),
-            BatchAxis::new(0),
+            BatchAxis::replicated(),
             None,
         );
-        assert_eq!(output, Ok(ArrayIrValue::Array(Array::vector(vec![1_i64, 3]).unwrap())));
-
-        let output: Result<ArrayIrValue<Array>, BatchingError> = batch(
-            |input| input.to_dimension(variable.clone())?.to_scalar(),
-            ArrayIrValue::Array(Array::vector(vec![1_i32, 4]).unwrap()),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
+        assert_eq!(
+            output,
+            Err(BatchingError::MappedDimension { r#type: Box::new(variable.into()), axis: BatchAxis::new(0) }),
         );
-        let BatchingError::Program(error) = output.unwrap_err() else {
-            panic!("expected a dimension bounds error from the batched operation");
-        };
-        assert!(matches!(
-            error.downcast_custom::<DimensionError>(),
-            Some(DimensionError::BindingOutOfBounds { variable, value: 4, bounds })
-                if variable == "extent" && *bounds == DimensionBounds::new(1, Some(4)).unwrap(),
-        ));
     }
 
     #[test]

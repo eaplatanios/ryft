@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use ryft_core::kernels::KernelReferenceOperation;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
@@ -22,53 +21,21 @@ use ryft_core::{
     MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationProvider,
     OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
-    Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError, ProjectedValue, RaggedAddOperation,
-    RaggedDotOperation, RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation, RaggedZeroOperation,
+    Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation,
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
     ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
-    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, SupportsCotangentAdd, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming,
-    Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
+    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
+    TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming, Typed,
+    UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
     XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_macros::Parameter;
 
 use crate::kernels::XlaKernelOperation;
 use crate::operations::jit_call::JitCallOperation;
-
-/// Exact host array literal embedded by backend legalization, shared without device allocation.
-#[derive(Clone, Debug, Parameter)]
-pub struct XlaArrayLiteral(Arc<Array>);
-
-impl XlaArrayLiteral {
-    /// Returns the complete host literal, including its physical layout and exact element encodings.
-    pub fn array(&self) -> &Array {
-        &self.0
-    }
-}
-impl PartialEq for XlaArrayLiteral {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.literal_eq(&other.0)
-    }
-}
-impl Eq for XlaArrayLiteral {}
-impl Hash for XlaArrayLiteral {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.literal_hash(state);
-    }
-}
-impl Display for XlaArrayLiteral {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "literal<{}>[", self.array().r#type())?;
-        for byte in self.array().storage_bytes() {
-            write!(formatter, "{byte:02x}")?;
-        }
-        formatter.write_str("]")
-    }
-}
 
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
 /// literals preserve dimension-comparison proofs without allocating device storage or introducing a capture.
@@ -79,9 +46,6 @@ pub enum XlaArrayConstant {
 
     /// An immediate scalar Boolean predicate.
     Boolean(bool),
-
-    /// Exact ordinary host array data introduced by backend legalization.
-    Literal(XlaArrayLiteral),
 }
 
 impl From<CaptureReference<ArrayType>> for XlaArrayConstant {
@@ -103,7 +67,6 @@ impl Display for XlaArrayConstant {
         match self {
             Self::Captured(value) => Display::fmt(value, formatter),
             Self::Boolean(value) => Display::fmt(value, formatter),
-            Self::Literal(value) => Display::fmt(value, formatter),
         }
     }
 }
@@ -115,7 +78,6 @@ impl Typed for XlaArrayConstant {
         match self {
             Self::Captured(value) => value.r#type(),
             Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean)),
-            Self::Literal(value) => value.array().r#type(),
         }
     }
 }
@@ -135,16 +97,13 @@ impl Value for XlaArrayConstant {
         match self {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
             Self::Boolean(value) => Ok(Self::Boolean(*value)),
-            Self::Literal(value) => {
-                Ok(Self::Literal(XlaArrayLiteral(Arc::new(value.array().rename_type_identities(renaming)?))))
-            }
         }
     }
 
     fn capture_index(&self) -> Option<usize> {
         match self {
             Self::Captured(value) => Some(value.index()),
-            Self::Boolean(_) | Self::Literal(_) => None,
+            Self::Boolean(_) => None,
         }
     }
 }
@@ -154,7 +113,6 @@ impl CaptureConstant for XlaArrayConstant {
         match self {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
             Self::Boolean(value) => Self::Boolean(*value),
-            Self::Literal(value) => Self::Literal(value.clone()),
         }
     }
 }
@@ -164,7 +122,6 @@ impl Concretizable<bool> for XlaArrayConstant {
         match self {
             Self::Captured(value) => value.concretize(),
             Self::Boolean(value) => Ok(*value),
-            Self::Literal(value) => value.array().concretize(),
         }
     }
 }
@@ -174,7 +131,6 @@ impl AssertionValue for XlaArrayConstant {
         match self {
             Self::Captured(value) => value.assertion_array(),
             Self::Boolean(value) => Ok(Some(Array::scalar(*value)?)),
-            Self::Literal(value) => Ok(Some(value.array().clone())),
         }
     }
 
@@ -182,14 +138,13 @@ impl AssertionValue for XlaArrayConstant {
         match self {
             Self::Captured(value) => value.assertion_observation(),
             Self::Boolean(value) => Ok(value.to_string()),
-            Self::Literal(value) => value.array().assertion_observation(),
         }
     }
 }
 
 /// Constant payload stored in the atom table of a staged XLA [`Program`].
 ///
-/// Staged XLA programs keep the following kinds of constants apart, and this sum is the staged counterpart of the eager
+/// Staged XLA programs keep three kinds of constants apart, and this sum is the staged counterpart of the eager
 /// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
 ///
 ///   - **Captured runtime values:** array buffers and external references stay in the surrounding
@@ -203,8 +158,6 @@ impl AssertionValue for XlaArrayConstant {
 ///     against a manual region's shard-local values.
 ///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
 ///     composition, and assertion folding without requiring a captured device buffer.
-///   - **Exact ordinary host literals:** constants introduced by backend checking retain their complete bytes and
-///     physical type, shared by `Arc` until dense literal lowering. Ragged aggregates remain excluded from literals.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum XlaConstant {
     /// Reference to a value held in the surrounding compiled function's capture table.
@@ -215,9 +168,6 @@ pub enum XlaConstant {
 
     /// Immediate scalar Boolean predicate.
     Boolean(bool),
-
-    /// Exact ordinary host array data introduced by backend legalization.
-    Literal(XlaArrayLiteral),
 }
 
 impl Display for XlaConstant {
@@ -227,12 +177,12 @@ impl Display for XlaConstant {
             Self::Captured(value) => Display::fmt(value, formatter),
             Self::Dimension(value) => Display::fmt(value, formatter),
             Self::Boolean(value) => Display::fmt(value, formatter),
-            Self::Literal(value) => Display::fmt(value, formatter),
         }
     }
 }
 
-// Literal wrappers use exact bytes, so ordinary equality is already literal identity for this complete sum.
+// XLA program constants carry only immediate scalars and typed capture slots, so their ordinary equality is already
+// exact and serves as their literal identity.
 impl LiteralIdentity for XlaConstant {
     #[inline]
     fn literal_eq(&self, other: &Self) -> bool {
@@ -254,7 +204,6 @@ impl Typed for XlaConstant {
             Self::Captured(value) => value.r#type(),
             Self::Dimension(value) => Cow::Owned(ArrayIrType::Dimension(value.r#type().into_owned())),
             Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean).into()),
-            Self::Literal(value) => Cow::Owned(value.array().r#type().into_owned().into()),
         }
     }
 }
@@ -277,9 +226,6 @@ impl Value for XlaConstant {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
             Self::Boolean(value) => Ok(Self::Boolean(*value)),
-            Self::Literal(value) => {
-                Ok(Self::Literal(XlaArrayLiteral(Arc::new(value.array().rename_type_identities(renaming)?))))
-            }
         }
     }
 
@@ -287,7 +233,7 @@ impl Value for XlaConstant {
     fn capture_index(&self) -> Option<usize> {
         match self {
             Self::Captured(value) => Some(value.index()),
-            Self::Dimension(_) | Self::Boolean(_) | Self::Literal(_) => None,
+            Self::Dimension(_) | Self::Boolean(_) => None,
         }
     }
 }
@@ -299,7 +245,6 @@ impl CaptureConstant for XlaConstant {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
             Self::Dimension(value) => Self::Dimension(value.clone()),
             Self::Boolean(value) => Self::Boolean(*value),
-            Self::Literal(value) => Self::Literal(value.clone()),
         }
     }
 }
@@ -313,7 +258,6 @@ impl ValueProjection<ArrayType> for XlaConstant {
         match value {
             XlaArrayConstant::Captured(value) => Self::Captured(ValueProjection::<ArrayType>::from_projected(value)),
             XlaArrayConstant::Boolean(value) => Self::Boolean(value),
-            XlaArrayConstant::Literal(value) => Self::Literal(value),
         }
     }
 
@@ -330,7 +274,6 @@ impl ValueProjection<ArrayType> for XlaConstant {
         match self {
             Self::Captured(value) => value.into_projected().map(XlaArrayConstant::Captured),
             Self::Boolean(value) => Ok(XlaArrayConstant::Boolean(value)),
-            Self::Literal(value) => Ok(XlaArrayConstant::Literal(value)),
             Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
         }
     }
@@ -353,7 +296,6 @@ impl ValueProjection<DimensionType> for XlaConstant {
         match self {
             Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
             Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
-            Self::Literal(_) => Err(TypeError::invalid("expected a dimension but got an array literal")),
             Self::Dimension(value) => Ok(value),
         }
     }
@@ -363,7 +305,6 @@ impl ValueProjection<DimensionType> for XlaConstant {
         match self {
             Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
             Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
-            Self::Literal(_) => Err(TypeError::invalid("expected a dimension but got an array literal")),
             Self::Dimension(value) => Ok(value),
         }
     }
@@ -391,22 +332,10 @@ impl TryFrom<bool> for XlaConstant {
     }
 }
 
-impl From<Array> for XlaConstant {
-    fn from(value: Array) -> Self {
-        Self::Literal(XlaArrayLiteral(Arc::new(value)))
-    }
-}
-impl From<Array> for XlaArrayConstant {
-    fn from(value: Array) -> Self {
-        Self::Literal(XlaArrayLiteral(Arc::new(value)))
-    }
-}
-
 impl Concretizable<bool> for XlaConstant {
     fn concretize(&self) -> Result<bool, ProgramError> {
         match self {
             Self::Boolean(value) => Ok(*value),
-            Self::Literal(value) => value.array().concretize(),
             _ => Err(ProgramError::Concretization {
                 message: format!("cannot extract a concrete boolean from the staged xla constant `{self}`"),
             }),
@@ -419,7 +348,6 @@ impl AssertionValue for XlaConstant {
         match self {
             Self::Dimension(_) => Ok(None),
             Self::Boolean(value) => Ok(Some(Array::scalar(*value)?)),
-            Self::Literal(value) => Ok(Some(value.array().clone())),
             Self::Captured(_) => Err(ProgramError::Concretization {
                 message: "cannot read an assertion array from a captured constant reference".to_owned(),
             }),
@@ -430,7 +358,6 @@ impl AssertionValue for XlaConstant {
         match self {
             Self::Dimension(value) => Ok(value.extent().to_string()),
             Self::Boolean(value) => Ok(value.to_string()),
-            Self::Literal(value) => value.array().assertion_observation(),
             Self::Captured(_) => Err(ProgramError::Concretization {
                 message: "cannot read an assertion observation from a captured constant reference".to_owned(),
             }),
@@ -531,21 +458,6 @@ where
 
     /// Converts a first-class dimension into scalar array data.
     DimensionToScalar(DimensionToScalarOperation),
-
-    /// Checked first-class ragged construction, legalized into guarded dense payloads before lowering.
-    RaggedNew(RaggedNewOperation),
-
-    /// Explicit ragged storage projection, resolved through the canonical grouped value layout.
-    RaggedStorage(RaggedStorageOperation),
-
-    /// Explicit ragged extent projection, resolved through the canonical grouped value layout.
-    RaggedExtents(RaggedExtentsOperation),
-
-    /// Shape-dependent ragged zero, expanded through the shared grouped replay before MLIR lowering.
-    RaggedZero(RaggedZeroOperation),
-
-    /// Ragged cotangent accumulation, retaining extent equality checks through grouped replay.
-    RaggedAdd(RaggedAddOperation),
 
     /// Reshapes an array using explicit dimension operands.
     Reshape(DynamicReshapeOperation),
@@ -763,11 +675,6 @@ where
             ArrayIrOperation::ReferenceFreeze(operation) => Self::ReferenceFreeze(operation),
             ArrayIrOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
             ArrayIrOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
-            ArrayIrOperation::RaggedNew(operation) => Self::RaggedNew(operation),
-            ArrayIrOperation::RaggedStorage(operation) => Self::RaggedStorage(operation),
-            ArrayIrOperation::RaggedExtents(operation) => Self::RaggedExtents(operation),
-            ArrayIrOperation::RaggedZero(operation) => Self::RaggedZero(operation),
-            ArrayIrOperation::RaggedAdd(operation) => Self::RaggedAdd(operation),
             ArrayIrOperation::Reshape(operation) => Self::Reshape(operation),
             ArrayIrOperation::Broadcast(operation) => Self::Broadcast(operation),
             ArrayIrOperation::Concatenate(operation) => Self::Concatenate(operation),
@@ -989,12 +896,16 @@ where
     }
 }
 
-impl<Constant> SupportsCotangentAdd for XlaOperation<Constant>
+// Generic cotangent addition requests the dense array member without adding a second Add conversion.
+impl<Constant> OperationProvider<ArrayIrType, AddOperation<ArrayIrType>> for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn cotangent_add_operation(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::cotangent_add_operation(input_types)?.into())
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
     }
 }
 
@@ -1063,8 +974,7 @@ pub(crate) mod tests {
         Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ErasedOperation,
         ExternalReferenceBinding, MaybeZero, Memory, MulOperation, Operation, OperationPayloadProjection,
-        OperationProvider, PartialValue, Placeholder, ProgramBuilder, ProgramError, RaggedExtentsOperation,
-        RaggedNewOperation, RaggedStorageOperation, RaggedType, RaggedValueKind, ReferenceAccessOperation,
+        OperationProvider, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
         ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
         ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
@@ -1083,22 +993,6 @@ pub(crate) mod tests {
 
     pub(crate) fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
-    }
-
-    #[test]
-    fn test_array_literals_keep_exact_bits_and_strict_projection() {
-        let positive = XlaConstant::try_from(ryft_core::Array::scalar(0.0f32).unwrap()).unwrap();
-        let negative = XlaConstant::try_from(ryft_core::Array::scalar(-0.0f32).unwrap()).unwrap();
-        let nan = XlaConstant::try_from(ryft_core::Array::scalar(f32::from_bits(0x7fc00001)).unwrap()).unwrap();
-        let other_nan = XlaConstant::try_from(ryft_core::Array::scalar(f32::from_bits(0x7fc00002)).unwrap()).unwrap();
-        assert_ne!(positive, negative);
-        assert_ne!(positive.to_string(), negative.to_string());
-        assert_eq!(nan, nan.clone());
-        assert_ne!(nan, other_nan);
-        assert_ne!(nan.to_string(), other_nan.to_string());
-        let projected = <XlaConstant as ValueProjection<ArrayType>>::into_projected(nan.clone()).unwrap();
-        assert_eq!(<XlaConstant as ValueProjection<ArrayType>>::from_projected(projected), nan);
-        assert!(<XlaConstant as ValueProjection<DimensionType>>::into_projected(positive).is_err());
     }
 
     #[test]
@@ -1220,15 +1114,12 @@ pub(crate) mod tests {
                     &dividend_type,
                     &divisor_type,
                 )?));
-                let (outputs, evidence) = operation
-                    .batch(
-                        &context,
-                        &EmptyRegionDriver,
-                        &[ArrayIrBatch::replicated(inputs[0].clone()), ArrayIrBatch::replicated(inputs[1].clone())],
-                    )?
-                    .into_parts();
+                let outputs = operation.batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayIrBatch::replicated(inputs[0].clone()), ArrayIrBatch::replicated(inputs[1].clone())],
+                )?;
                 assert!(outputs.iter().all(|output| output.batch_axis().is_replicated()));
-                assert!(evidence.is_empty());
                 Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
             },
             vec![ArrayIrType::Dimension(dividend_type.clone()), ArrayIrType::Dimension(divisor_type.clone())],
@@ -1362,27 +1253,6 @@ pub(crate) mod tests {
         let freeze: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::ReferenceFreeze(ReferenceFreezeOperation::new()).into();
         assert!(matches!(&freeze, XlaOperation::ReferenceFreeze(_)));
-    }
-
-    #[test]
-    fn test_core_ragged_operations_promote_to_xla_ragged_operations() {
-        let r#type = RaggedType::new(
-            ArrayType::new_static(DataType::I64, [2]),
-            RaggedValueKind::Dimension(Dimension::Static(3).into()),
-            Vec::new(),
-        )
-        .unwrap();
-        let construct: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::RaggedNew(RaggedNewOperation::new(r#type.clone())).into();
-        assert!(matches!(&construct, XlaOperation::RaggedNew(operation) if operation.output_type() == &r#type));
-
-        let storage: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::RaggedStorage(RaggedStorageOperation).into();
-        assert!(matches!(&storage, XlaOperation::RaggedStorage(_)));
-
-        let extents: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::RaggedExtents(RaggedExtentsOperation::new(-1)).into();
-        assert!(matches!(&extents, XlaOperation::RaggedExtents(operation) if operation.axis() == (-1).into()));
     }
 
     #[test]

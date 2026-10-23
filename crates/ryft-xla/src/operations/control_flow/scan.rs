@@ -202,7 +202,7 @@ pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamil
     // types carry unchanged next to the leading length axis. Guarding the original carries and stacks therefore checks
     // what eager entry validation checks, which happens whatever the trip count is, so the guard precedes the
     // zero-length and the fully unrolled paths too.
-    let entry_types = scan.declared_input_types(&body_input_types, input_types).map_err(ProgramError::from)?;
+    let entry_types = scan.declared_input_types(&body_input_types).map_err(ProgramError::from)?;
     lower_region_guard(
         SCAN_OPERATION_NAME,
         &entry_types,

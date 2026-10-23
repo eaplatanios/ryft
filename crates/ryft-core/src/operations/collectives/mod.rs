@@ -146,11 +146,11 @@ use std::fmt::Debug;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy,
-    LinearResiduals, LogicalMesh, MeshAxisType, Shape, Sharding, StaticArrayExtentBatchingPolicy,
+    ArrayType, Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy, LinearResiduals,
+    LogicalMesh, MeshAxisType, Shape, Sharding, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes};
-use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
+use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -192,9 +192,7 @@ pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, Par
 pub use parallel_ragged_all_to_all::{
     PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
 };
-pub use parallel_reduce::{
-    PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation, RaggedArrayExtentAggregationBatchingPolicy,
-};
+pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 
@@ -582,20 +580,6 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     /// Returns a [`TypeError`] if the inputs violate the collective's shape, extent, or mesh contract.
     fn infer_array_ir_output_types(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError>;
 
-    /// Returns the error that the provided batching rules raise for a bounded ragged `dimension` on input
-    /// `input_index`, which these collectives cannot route because one extent per item does not describe how
-    /// the participants partition their live elements.
-    fn unsupported_ragged_input_error(&self, dimension: &DimensionVariable, input_index: usize) -> BatchingError {
-        BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{}` does not support bounded ragged dimension `{}` on input {}",
-                self.name(),
-                dimension,
-                input_index,
-            ),
-        }
-    }
-
     /// Implements [`interpret_in_parent`](crate::MemberInterpretableOperation::interpret_in_parent) for this
     /// collective. Outside any binder, only a collective whose instances each combine a single participant has defined
     /// semantics: a tiled one leaves the array unchanged, and an untiled one only removes or inserts a size-one axis.
@@ -734,9 +718,9 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     }
 
     /// Implements [`BatchableOperation::batch`](crate::BatchableOperation::batch) for this collective in the
-    /// homogeneous array family. Bounded ragged inputs are rejected. A `batch` level that does not bind the
-    /// collective's axis forwards it to its parent with its array axes moved past the mapped axis, while a level that
-    /// binds the axis consumes it through [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis).
+    /// homogeneous array family. A `batch` level that does not bind the collective's axis forwards it to its parent
+    /// with its array axes moved past the mapped axis, while a level that binds the axis consumes it through
+    /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis).
     fn shape_changing_collective_batch<
         C: Context<Type = ArrayType, Operation: From<Self>>,
         P: CollectiveArrayExtentBatchingPolicy<C>,
@@ -744,18 +728,10 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
     where
         Self: ShapeChangingCollectiveBatching<C>,
     {
-        if let Some((index, ragged_axis)) = inputs
-            .iter()
-            .enumerate()
-            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
-        {
-            return Err(self.unsupported_ragged_input_error(ragged_axis.dimension(), index));
-        }
-
         if context.axis_name() != Some(self.axis_name()) {
             return context.forward_collective(self, inputs);
         }
@@ -767,16 +743,15 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
         let (output_type, output_extents) =
             context.infer_collective_output_type_and_extents(self, &input.unbatched_type())?;
-        Ok(vec![self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?].into())
+        Ok(vec![self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?])
     }
 
     /// Implements [`batch_in_parent`](crate::MemberBatchableOperation::batch_in_parent) for this collective in the
     /// composite array/dimension family, whose explicit result extents remain the only source of dynamic reshape
-    /// extents. Bounded ragged inputs are rejected, and the result extents, which describe the shape shared by every
-    /// batch item, must be replicated. A `batch` level that does not bind the collective's axis forwards it to its
-    /// parent, while a level that binds the axis consumes it through
-    /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis)
-    /// over the array projection of its parent.
+    /// extents. The result extents, which describe the shape shared by every batch item, must be replicated. A `batch`
+    /// level that does not bind the collective's axis forwards it to its parent, while a level that binds the axis
+    /// consumes it through [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis) over the
+    /// array projection of its parent.
     fn shape_changing_collective_batch_in_parent<
         C: ContextProjection<
                 ArrayType,
@@ -801,7 +776,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError>
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
     where
         Self: ShapeChangingCollectiveBatching<ProjectedContext<C, ArrayType>>,
     {
@@ -809,14 +784,6 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         <&ArrayType>::try_from(&array.unbatched_type())?;
-        if let Some((index, ragged_axis)) = inputs
-            .iter()
-            .enumerate()
-            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
-        {
-            return Err(self.unsupported_ragged_input_error(ragged_axis.dimension(), index));
-        }
-
         for output_extent in output_extents {
             output_extent.validate_replicated_dimension()?;
         }
@@ -828,7 +795,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
         if context.axis_name() != Some(self.axis_name()) {
-            return Ok(context.forward_collective(self, array, output_extents)?.into());
+            return Ok(context.forward_collective(self, array, output_extents)?);
         }
 
         self.reject_mesh_form()?;
@@ -852,9 +819,10 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
         // Embed the array result back into the composite family without changing the batch axis that the kernel chose.
         let batch_axis = output.batch_axis();
-        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
-            .map(|output| vec![output])?
-            .into())
+        Ok(vec![ArrayIrBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()),
+            batch_axis,
+        )?])
     }
 }
 
@@ -1377,7 +1345,7 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingCont
         &self,
         operation: &O,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
     where
         C::Operation: From<O>,
     {
@@ -1385,13 +1353,13 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingCont
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
         let Some(batch_axis) = input.batch_axis_position() else {
-            return Ok(self.forward_to_parent(C::Operation::from(operation.clone()), inputs)?.into());
+            return Ok(self.forward_to_parent(C::Operation::from(operation.clone()), inputs)?);
         };
         let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
         let mut outputs =
             self.parent().bind(C::Operation::from(operation), Vec::new(), std::slice::from_ref(input.value()))?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(output_batch_axis))?].into())
+        Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(output_batch_axis))?])
     }
 
     /// Infers the output type of a shape-changing collective for the logical (i.e., unbatched) `input_type` of a level
@@ -1435,7 +1403,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
     /// # Parameters
     ///
     ///   - `operation`: Collective over the logical (i.e., unbatched) array.
-    ///   - `array`: Array input whose ragged axes have already been rejected by the caller.
+    ///   - `array`: Packed array input and its mapped batch-axis declaration.
     ///   - `output_extents`: Validated replicated dimension inputs describing the per-item result shape.
     ///
     /// # Errors
@@ -1574,7 +1542,7 @@ mod tests {
         O: BatchableOperation<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
     {
         let context = eager_collective_context(axis_name, axis_size);
-        Ok(operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0)
+        operation.batch(&context, &EmptyRegionDriver, &[input])
     }
 
     /// Creates an eager composite batching level that binds the axis `"x"` and whose mapped extent is a first-class
@@ -1942,24 +1910,6 @@ mod tests {
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_permute` over a manual mesh axis cannot bind a named batch axis".to_string(),
             }),
-        );
-    }
-
-    #[test]
-    fn test_shape_changing_collective_operation_unsupported_ragged_input_error() {
-        let operation = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-        let dimension = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
-        assert_eq!(
-            operation.unsupported_ragged_input_error(&dimension, 1),
-            BatchingError::UnsupportedOperation {
-                message: "`parallel_all_gather` does not support bounded ragged dimension `n` on input 1".to_string(),
-            },
         );
     }
 
@@ -2610,7 +2560,7 @@ mod tests {
         // A replicated input forwards the collective unchanged, and its result stays replicated.
         let input = ArrayBatch::replicated(Array::vector(vec![1f32, 2.0]).unwrap());
         assert_eq!(
-            context.forward_collective(&operation, &[input]).unwrap().into_parts().0,
+            context.forward_collective(&operation, &[input]).unwrap(),
             vec![ArrayBatch::replicated(Array::matrix(1, 2, vec![1f32, 2.0]).unwrap())],
         );
 
@@ -2618,7 +2568,7 @@ mod tests {
         // gathered axis in front of the mapped axis, which moves one position to the right.
         let input = ArrayBatch::new(Array::vector(vec![1f32, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
-            context.forward_collective(&operation, &[input]).unwrap().into_parts().0,
+            context.forward_collective(&operation, &[input]).unwrap(),
             vec![ArrayBatch::new(Array::matrix(1, 2, vec![1f32, 2.0]).unwrap(), BatchAxis::new(1)).unwrap()],
         );
     }

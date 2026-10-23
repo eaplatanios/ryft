@@ -5,7 +5,7 @@ use crate::arrays::{
     Sharding,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
@@ -180,7 +180,7 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         _inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if self.mesh.is_none() && context.axis_name() == Some(self.axis_name.as_str()) {
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped packed `[size]` dimension is then stripped
@@ -190,14 +190,14 @@ impl<
             let operation = IotaOperation::new(r#type.clone(), 0)?;
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
-            Ok(vec![ArrayBatch::new(index.remove(0), Some(0))?].into())
+            Ok(vec![ArrayBatch::new(index.remove(0), Some(0))?])
         } else {
             // The axis is bound by an outer `batch` level or a device mesh. Re-bind into the parent, which repeats the
             // resolution and present the forwarded index as replicated across this level.
             let operation = self.clone();
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
-            Ok(vec![ArrayBatch::replicated(index.remove(0))].into())
+            Ok(vec![ArrayBatch::replicated(index.remove(0))])
         }
     }
 }
@@ -415,9 +415,7 @@ mod tests {
         let outputs = AxisIndexOperation::new("devices".to_string())
             .with_mesh(mesh)
             .batch(&context, &EmptyRegionDriver, &[])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         let builder = trace.builder().borrow().clone();
         let program = builder

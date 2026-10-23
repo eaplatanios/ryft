@@ -5,10 +5,10 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
+    ArrayType, LogicalMesh, MeshAxisType, ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
@@ -68,9 +68,7 @@ pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
 /// A matching `batch` level consumes the mapped batch axis of an ordinary permutation by reassembling it in target
 /// order from per-item slices, with zero slices at untargeted positions, and passes a replicated input through
 /// unchanged when every position is targeted. Unlike JAX's batching rule, which requires a full permutation, partial
-/// permutations are supported. Bounded ragged extents follow the same source-to-target routing as their packed values,
-/// and untargeted positions receive zero extents together with their zero-filled values. A permutation over a manual
-/// mesh axis cannot be consumed by a `batch` level.
+/// permutations are supported. A permutation over a manual mesh axis cannot be consumed by a `batch` level.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelPermuteOperation {
     /// Axis name referenced by this collective.
@@ -305,12 +303,11 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // A matching `batch` level consumes the mapped batch axis by reassembling it in target order: for each position
         // `t` along the batch axis, the output receives the slice of the source item that sends to `t`, or a zero slice
         // when no pair targets `t`. A non-matching level forwards the collective untouched to the parent context.
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return context.forward_collective(self, inputs);
         }
 
@@ -344,47 +341,12 @@ impl<
 
         // A replicated input holds the same value for every batch item, so a full permutation leaves it unchanged.
         if !has_untargeted_participant && input.batch_axis_position().is_none() {
-            return Ok(vec![input.clone()].into());
-        }
-
-        if has_untargeted_participant
-            && let Some(ragged_axis) =
-                input.ragged_axes().iter().find(|ragged_axis| ragged_axis.dimension().bounds().lower() != 0)
-        {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{}` cannot assign a zero extent to bounded ragged dimension `{}` whose lower bound is {}",
-                    PARALLEL_PERMUTE_OPERATION_NAME,
-                    ragged_axis.dimension(),
-                    ragged_axis.dimension().bounds().lower(),
-                ),
-            });
+            return Ok(vec![input.clone()]);
         }
 
         let input = P::match_axis(context, input, 0.into())?;
         let permuted = route_axis_slices(input.value(), 0, sources.as_slice())?;
-        let ragged_axes = input
-            .ragged_axes()
-            .iter()
-            .map(|ragged_axis| {
-                // Extents that do not already vary over the participant axis must first acquire that axis so an
-                // untargeted participant receives zero metadata together with its zero-filled packed value.
-                let mut extent_axes = ragged_axis.extent_axes().to_vec();
-                let extents = if let Some(extent_axis) = extent_axes.iter().position(|axis| *axis == 0) {
-                    route_axis_slices(ragged_axis.extents(), extent_axis, sources.as_slice())?
-                } else if has_untargeted_participant {
-                    let extents =
-                        P::match_axis(context, &ArrayBatch::replicated(ragged_axis.extents().clone()), 0.into())?
-                            .into_value();
-                    extent_axes.insert(0, 0);
-                    route_axis_slices(&extents, 0, sources.as_slice())?
-                } else {
-                    ragged_axis.extents().clone()
-                };
-                Ok(RaggedAxis::new(ragged_axis.axis(), extents, ragged_axis.dimension().clone(), extent_axes))
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        Ok(vec![ArrayBatch::new(permuted, Some(0))?.with_ragged_axes(ragged_axes)?].into())
+        Ok(vec![ArrayBatch::new(permuted, Some(0))?])
     }
 }
 
@@ -602,8 +564,7 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Parall
 /// For example, routing the rows `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
 ///
 /// The batching rule of [`ParallelPermuteOperation`] applies this function along the batch axis, where every slice is
-/// one batch item, both to the packed values and to the extents of their bounded ragged axes, so that the extents move
-/// together with their values and untargeted items receive zero extents together with their zero-filled values.
+/// one batch item and untargeted items receive zero-filled values.
 ///
 /// # Errors
 ///
@@ -617,9 +578,7 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
     let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
     let Some(shape) = value.r#type().static_shape() else {
         return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{PARALLEL_PERMUTE_OPERATION_NAME}` batching requires statically shaped inputs and ragged extents",
-            ),
+            message: format!("`{PARALLEL_PERMUTE_OPERATION_NAME}` batching requires statically shaped inputs"),
         });
     };
     let dimensions = shape.dimensions().to_vec();
@@ -681,16 +640,15 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionValue,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, Memory, MeshAxis, Shape, Sharding, StridedLayout,
+        DimensionVariable, Layout, Memory, MeshAxis, Shape, Sharding, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
-    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::operations::collectives::tests::{batch_collective, collective_program, eager_collective_context};
+    use crate::operations::collectives::tests::{batch_collective, collective_program};
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
@@ -1138,7 +1096,7 @@ mod tests {
         assert!(matches!(
             swap.batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "`parallel_permute` batching requires statically shaped inputs and ragged extents",
+                if message == "`parallel_permute` batching requires statically shaped inputs",
         ));
 
         // A level that binds another axis forwards the permutation to its parent and preserves its mapped axis.
@@ -1146,7 +1104,7 @@ mod tests {
         let input =
             ArrayBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 3])), BatchAxis::new(1)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 3).with_axis_name("y".to_string());
-        let outputs = swap.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
+        let outputs = swap.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
         let program = trace
@@ -1171,133 +1129,21 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_permute_batching_ragged() {
-        // Bounded ragged extents follow the same routing as their packed values, and an untargeted item receives a zero
-        // extent together with its zero-filled value.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged = |values: Vec<f64>, extents: Array, extent_axes: Vec<usize>| {
-            ArrayBatch::new(Array::matrix(2, 3, values).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), extent_axes)])
-                .unwrap()
-        };
-        let swap = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
-        let send = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
-        let input = ragged(vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0], Array::vector(vec![1i32, 3]).unwrap(), vec![0]);
-        assert_eq!(
-            batch_collective(&swap, "x", 2, input.clone()),
-            Ok(vec![ragged(vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0], Array::vector(vec![3i32, 1]).unwrap(), vec![0])]),
-        );
-        assert_eq!(
-            batch_collective(&send, "x", 2, input),
-            Ok(vec![ragged(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0], Array::vector(vec![0i32, 1]).unwrap(), vec![0])]),
-        );
-
-        // Extents that are the same for every item stay replicated under a full permutation, but must vary over the
-        // batch axis before a partial permutation can zero the extent of an untargeted item.
-        let input = ragged(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0], Array::scalar(1i32).unwrap(), Vec::new());
-        assert_eq!(
-            batch_collective(&swap, "x", 2, input.clone()),
-            Ok(vec![ragged(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0], Array::scalar(1i32).unwrap(), Vec::new())]),
-        );
-        assert_eq!(
-            batch_collective(&send, "x", 2, input),
-            Ok(vec![ragged(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0], Array::vector(vec![0i32, 1]).unwrap(), vec![0])]),
-        );
-
-        // The dynamic batching policy of the composite family materializes replicated extents in the same way.
-        let input =
-            ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1i32).unwrap(), length.clone(), Vec::new())])
-                .unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("x".to_string());
-        assert_eq!(
-            send.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0,
-            vec![
-                ragged_array_batch(
-                    Array::matrix(2, 3, vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(),
-                    Array::vector(vec![0i32, 1]).unwrap(),
-                    &length,
-                    1
-                )
-                .unwrap(),
-            ],
-        );
-
-        // A zero extent is not representable for a dimension whose lower bound is positive, which only a partial
-        // permutation can require, and a level that binds another axis cannot route the extents of its own items.
-        let positive_length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let input = ragged_array_batch(
-            Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(),
-            Array::vector(vec![1i32, 3]).unwrap(),
-            &positive_length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            batch_collective(&swap, "x", 2, input.clone()),
-            Ok(vec![
-                ragged_array_batch(
-                    Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0]).unwrap(),
-                    Array::vector(vec![3i32, 1]).unwrap(),
-                    &positive_length,
-                    1
-                )
-                .unwrap()
-            ]),
-        );
-        assert_eq!(
-            batch_collective(&send, "x", 2, input.clone()),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_permute` cannot assign a zero extent to bounded ragged dimension `length` whose \
-                          lower bound is 1"
-                    .to_string(),
-            }),
-        );
-        let context = eager_collective_context("y", 2);
-        assert_eq!(
-            swap.batch(&context, &EmptyRegionDriver, &[input]).map(|outputs| outputs.into_parts().0),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_permute` does not support bounded ragged dimension `length` on input 0".to_string(),
-            }),
-        );
-    }
-
-    #[test]
     fn test_parallel_permute_batching_sharding() {
         // Route explicitly sharded participants using replicated singleton slices, restoring their original placement
-        // on the complete output. Ragged extents with the same placement must follow that routing too.
+        // on the complete output.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["devices"]), ShardingDimension::Replicated])
-                .unwrap();
-        let extent_sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap();
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged = |values: Vec<f64>, extents: Vec<i32>| {
-            ragged_array_batch(
-                Array::matrix(2, 3, values).unwrap().reshard(&sharding).unwrap(),
-                Array::vector(extents).unwrap().reshard(&extent_sharding).unwrap(),
-                &length,
-                1,
-            )
-            .unwrap()
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"]), ShardingDimension::Replicated]).unwrap();
+        let batch = |values: Vec<f64>| {
+            ArrayBatch::new(Array::matrix(2, 3, values).unwrap().reshard(&sharding).unwrap(), BatchAxis::new(0))
+                .unwrap()
         };
-        let input = ragged(vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0], vec![1, 3]);
-        let swap = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
-        let send = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
-        assert_eq!(
-            batch_collective(&swap, "x", 2, input.clone()),
-            Ok(vec![ragged(vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0], vec![3, 1])]),
-        );
-        assert_eq!(
-            batch_collective(&send, "x", 2, input),
-            Ok(vec![ragged(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0], vec![0, 1])]),
-        );
+        let input = batch(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let swap = ParallelPermuteOperation::new("x".to_owned(), 2, vec![(0, 1), (1, 0)]);
+        let send = ParallelPermuteOperation::new("x".to_owned(), 2, vec![(0, 1)]);
+        assert_eq!(batch_collective(&swap, "x", 2, input.clone()), Ok(vec![batch(vec![4.0, 5.0, 6.0, 1.0, 2.0, 3.0])]));
+        assert_eq!(batch_collective(&send, "x", 2, input), Ok(vec![batch(vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0])]));
     }
 
     #[test]

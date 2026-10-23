@@ -177,18 +177,17 @@ use crate::arrays::{
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -1244,12 +1243,6 @@ impl ShardMap {
                         ArrayIrType::Array(array_type) => array_type.sharding(),
                         ArrayIrType::Reference(reference_type) => reference_type.referent().sharding(),
                         ArrayIrType::Dimension(_) => None,
-                        ArrayIrType::Ragged(_) => {
-                            return Err(ProgramError::UnsupportedOperation {
-                                message: "first-class ragged values are not supported in `shard_map` bodies".to_owned(),
-                            }
-                            .into());
-                        }
                     };
                     let varying_axes = sharding.map(Sharding::varying_manual_axes);
                     if let Some(axis_name) = released_axes
@@ -2317,11 +2310,7 @@ where
 // bodies that write through references would observe, and JAX also supports only static batch sizes here (its
 // `_shard_map_batch` computes them with integer arithmetic). The structurally batched body receives the extent as a
 // leading dimension input (refer to `ArrayIrBatchingPolicy`), which the rule replaces by a constant of the same static
-// type inside the body (or drops when the body does not use it), so that no dimension crosses the boundary. Ragged
-// inputs are rejected because their per-item extents would be lost at the boundary. Supporting them needs ragged-aware
-// structural program batching that threads the per-item lengths through the boundary as inputs, which `scan`,
-// `condition`, and kernels need as well and which should therefore be shared among them rather than built for this rule
-// alone.
+// type inside the body (or drops when the body does not use it), so that no dimension crosses the boundary.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation
 where
     C: Context<
@@ -2334,7 +2323,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, self.input_types.len(), ProgramError);
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
 
@@ -2343,11 +2332,9 @@ where
         let input_positions = inputs.iter().map(ArrayIrBatch::batch_axis_position).collect::<Vec<_>>();
         if context.axis_name().is_none() && input_positions.iter().all(Option::is_none) {
             let outputs = context.parent().bind(self.clone(), vec![driver.region(0)?.to_program()], &input_values)?;
-            return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>().into());
+            return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>());
         }
-        // Ragged batching needs ragged-aware structural program batching shared with `scan`, `condition`, and kernels,
-        // and dynamic extents are rejected deliberately (refer to the rationale above).
-        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
+        // Dynamic extents are rejected deliberately (refer to the rationale above).
         let extent_type = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.clone();
         let static_extent = || {
             extent_type.extent().ok_or_else(|| {
@@ -2524,8 +2511,7 @@ where
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| ArrayIrBatch::new(output, axis))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -2693,7 +2679,7 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
-        + SupportsCotangentAdd
+        + OperationProvider<ArrayIrType, AddOperation<ArrayIrType>, Operation = O>
         + From<ShardMapOperation>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
         + OperationProjection<
@@ -5156,7 +5142,6 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex,
         ArraySliceAxis, DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable,
@@ -5195,8 +5180,7 @@ mod tests {
         PartialEvaluationInput, PartialEvaluationOutput, PartitionedProgram, ResidualPolicyReference,
     };
     use crate::programs::{
-        AtomId, EmptyRegionDriver, InstructionId, ReferenceAnalysisError, ReferenceDischargeTarget, ReferenceSource,
-        RegionDriver,
+        AtomId, InstructionId, ReferenceAnalysisError, ReferenceDischargeTarget, ReferenceSource, RegionDriver,
     };
 
     use super::*;
@@ -11232,38 +11216,6 @@ mod tests {
         let y = array(global_type, &[5.0, 6.0, 7.0, 8.0]);
         let outputs = batched_program.interpret(vec![extent, array(batched_type(4), &elements), y]).unwrap();
         assert_eq!(outputs[1..], [array(batched_type(4), &elements.map(|element| element * element))]);
-    }
-
-    #[test]
-    fn test_shard_map_batching_rejects_ragged_inputs() {
-        // A bounded ragged batch would lose its per-item extents at the static boundary, so it is rejected.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let operation = ShardMapOperation::from_boundary(
-            ShardMap::from_shardings(
-                manual_mesh(),
-                vec![Sharding::replicated(manual_mesh(), 1)],
-                vec![Sharding::replicated(manual_mesh(), 1)],
-                vec!["x".to_string()],
-            ),
-            vec![f32_vector_type(3)],
-            vec![f32_vector_type(3)],
-        );
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![2.0f32, 1.0, 0.0, 3.0, 0.0, 0.0]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![2i32, 1]).unwrap()),
-            &length,
-            1,
-        )
-        .unwrap();
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            TestEagerContext::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "`shard_map` does not support bounded ragged dimension `length` on input 0",
-        ));
     }
 
     #[test]

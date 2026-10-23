@@ -8,18 +8,19 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, BatchAxis,
-    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    CalleeRegionDriver, CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinations,
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, Dimension, InputRegionProvenance, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter, OperationProvider,
-    OutputRegionProvenance, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
-    PartialValue, PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
+    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CalleeRegionDriver,
+    CaptureConstant, CompiledCallOperation, Concretizable, Context, CotangentDestinations, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Dimension, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero,
+    Operation, OperationBoundaryPruning, OperationFormatter, OperationProvider, OutputRegionProvenance, Parameterized,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionSlot,
     RematerializationOptimizationBarrier, ShardMapOperation, StagingContext, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value, ValueProjection, ValueResolution, Zero, ZeroOperation, discharge_positional_region_operation,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueProjection, ValueResolution, Zero, ZeroOperation,
+    discharge_positional_region_operation,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -48,9 +49,6 @@ pub(crate) struct JitCallProgramKey {
     /// Canonical [`Program`](ryft_core::Program) rendering (operation names, all bracketed attributes, and attached
     /// region bodies).
     rendered: String,
-
-    /// Original logical group signature retained when the callee is legalized to dense leaves.
-    logical_signature: Option<Arc<(Vec<ArrayIrType>, Vec<ArrayIrType>)>>,
 
     /// Flat input types, which together with the rendering pin the full callee signature.
     pub(crate) input_types: Vec<ArrayIrType>,
@@ -104,13 +102,9 @@ fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionR
 /// structural deduplication (see [`supports_structural_dedup`]) and therefore always inline. The key is generic over
 /// the program's constant universe so that lookups from the value-generic lowering path type-check; the map itself is
 /// only ever populated from the staged [`XlaConstant`]-keyed pipeline.
-fn jit_call_program_key<O: LowerableOperationFamily>(
-    program: &FlatXlaProgram<O>,
-    operation: &JitCallOperation<ArrayIrType>,
-) -> Option<JitCallProgramKey> {
+fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatXlaProgram<O>) -> Option<JitCallProgramKey> {
     supports_structural_dedup(program).then(|| JitCallProgramKey {
         rendered: program.to_string(),
-        logical_signature: operation.logical_signature.clone(),
         input_types: program.input_types(),
         output_types: program.output_types(),
     })
@@ -119,13 +113,11 @@ fn jit_call_program_key<O: LowerableOperationFamily>(
 /// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
 fn jit_call_region_key<O: LowerableOperationFamily>(
     region: RegionRef<'_, XlaConstant, O>,
-    operation: &JitCallOperation<ArrayIrType>,
 ) -> Option<JitCallProgramKey> {
     supports_structural_dedup_region(region).then(|| {
         let program = region.to_program();
         JitCallProgramKey {
             rendered: program.to_string(),
-            logical_signature: operation.logical_signature.clone(),
             input_types: program.input_types(),
             output_types: program.output_types(),
         }
@@ -169,12 +161,8 @@ impl<O> Default for JitCallFunctionMap<O> {
 
 impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     /// Returns the shared function for `program`, if one was emitted for its identity.
-    pub(crate) fn get(
-        &self,
-        program: &FlatXlaProgram<O>,
-        operation: &JitCallOperation<ArrayIrType>,
-    ) -> Option<&JitCallFunction<O>> {
-        self.functions.get(&jit_call_program_key(program, operation)?)
+    pub(crate) fn get(&self, program: &FlatXlaProgram<O>) -> Option<&JitCallFunction<O>> {
+        self.functions.get(&jit_call_program_key(program)?)
     }
 }
 
@@ -220,7 +208,7 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
             for &nested in instruction.regions() {
                 walk(program, nested, counts, order, memo, visited);
             }
-            if let Some(operation) = instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>() {
+            if instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>().is_some() {
                 let Some(&callee_region) = instruction.regions().first() else {
                     continue;
                 };
@@ -230,13 +218,12 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
                         let callee = program
                             .region_ref(callee_region)
                             .expect("jit_call callee regions are validated at build time");
-                        jit_call_region_key(callee, operation)
+                        jit_call_region_key(callee)
                     })
                     .clone();
-                let Some(mut key) = key else {
+                let Some(key) = key else {
                     continue;
                 };
-                key.logical_signature = operation.logical_signature.clone();
                 let entry = counts.entry(key.clone()).or_insert_with(|| {
                     order.push(key.clone());
                     (
@@ -378,7 +365,7 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
 /// independent capture namespaces of nested calls inside the callee arena.
 pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatXlaProgram<O>,
-    operation: &JitCallOperation<ArrayIrType>,
+    capture_count: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -391,7 +378,7 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     // shared-function path below never interacts with the caller's effect tokens; effectful callees always take the
     // inline path, which threads the caller's per-class tokens through the callee body in program order.
     if let Some(map) = nested_functions {
-        if let Some(function) = map.get(program, operation) {
+        if let Some(function) = map.get(program) {
             // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
             // matching arity is the only guard needed before emitting the symbol call; anything else inlines.
             if input_values.len() == function.input_types.len() {
@@ -423,7 +410,6 @@ pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
             }
         }
     }
-    let capture_count = operation.capture_count();
     if input_values.len() < capture_count {
         return Err(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
     }
@@ -458,6 +444,10 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// [`Operation::region_data_flow`] declares ordinary callee data flow: callee inputs receive instruction inputs
 /// positionally and instruction outputs originate from the corresponding callee outputs. Capture-prefix retention
 /// remains an independent boundary-pruning requirement.
+///
+/// Declare callee-local result identities through [`with_callee_type_signature`](Self::with_callee_type_signature)
+/// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
+/// while separate calls receive independent local result identities.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JitCallOperation<T: Type> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
@@ -466,14 +456,8 @@ pub struct JitCallOperation<T: Type> {
     /// Type universe of the callee boundary.
     marker: PhantomData<fn() -> T>,
 
-    /// Logical signature before backend grouping; dense calls retain no extra metadata.
-    logical_signature: Option<Arc<(Vec<T>, Vec<T>)>>,
-
-    /// Caller-owned result types instantiating identities defined inside the callee.
-    output_types: Option<Arc<[T]>>,
-
-    /// Formal input scope used to preserve forwarded names when an attached callee is instantiated for new operands.
-    input_types: Option<Arc<[T]>>,
+    /// Caller-owned result identities and the formal input scope used to instantiate forwarded names.
+    output_types: Option<CallTypeBindings<T>>,
 }
 
 impl<T: Type> JitCallOperation<T> {
@@ -481,7 +465,7 @@ impl<T: Type> JitCallOperation<T> {
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
     pub(crate) fn new(capture_count: usize) -> Self {
-        Self { capture_count, marker: PhantomData, logical_signature: None, output_types: None, input_types: None }
+        Self { capture_count, marker: PhantomData, output_types: None }
     }
 
     /// Instantiates every callee-local result identity freshly for this call. Input identities continue to name the
@@ -493,61 +477,18 @@ impl<T: Type> JitCallOperation<T> {
     /// Returns a type error for an oversized capture prefix or a type that cannot rename its local identities.
     pub fn with_callee_type_signature(mut self, input_types: &[T], output_types: &[T]) -> Result<Self, TypeError> {
         self.validate_capture_prefix(input_types.len())?;
-        if !output_types
-            .iter()
-            .flat_map(Type::identities)
-            .any(|(_, identity)| !input_types.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
-        {
-            self.output_types = None;
-            self.input_types = None;
-            return Ok(self);
-        }
-        let mut unavailable = input_types
-            .iter()
-            .chain(output_types)
-            .flat_map(Type::identities)
-            .map(|(_, identity)| identity.clone())
-            .collect::<Vec<_>>();
-        let mut renaming = TypeIdentityRenaming::new();
-        for (_, identity) in output_types.iter().flat_map(Type::identities) {
-            if renaming.target(identity).is_none()
-                && !input_types.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
-            {
-                let fresh = renaming.insert_fresh(identity.clone(), &unavailable)?;
-                unavailable.push(fresh);
-            }
-        }
-        self.output_types = if renaming.replacements().is_empty() {
-            None
-        } else {
-            Some(
-                output_types
-                    .iter()
-                    .map(|r#type| r#type.rename_identities(&renaming))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into(),
-            )
-        };
-        self.input_types = self.output_types.as_ref().map(|_| input_types.into());
+        self.output_types = CallTypeBindings::fresh(input_types, output_types)?;
         Ok(self)
     }
 
-    /// Retains already-owned scalar result identities when aggregate fields are legalized to dense values.
+    /// Retains caller-owned result identities after a callee boundary rewrite, including reference discharge.
     pub(crate) fn with_result_type_signature(
         mut self,
         input_types: &[T],
         callee_outputs: &[T],
         outputs: Vec<T>,
     ) -> Result<Self, TypeError> {
-        if callee_outputs == outputs {
-            self.output_types = None;
-            self.input_types = None;
-            self.output_renaming(input_types, callee_outputs)?;
-            return Ok(self);
-        }
-        self.output_types = Some(outputs.into());
-        self.input_types = Some(input_types.into());
-        self.output_renaming(input_types, callee_outputs)?;
+        self.output_types = CallTypeBindings::with_outputs(input_types, callee_outputs, outputs)?;
         Ok(self)
     }
 
@@ -564,17 +505,7 @@ impl<T: Type> JitCallOperation<T> {
 
     /// Rebinds forwarded result names from the retained formal input scope to this callee instantiation.
     fn instantiated_output_types(&self, inputs: &[T]) -> Result<Option<Vec<T>>, TypeError> {
-        let Some(outputs) = &self.output_types else { return Ok(None) };
-        let declared = self.input_types.as_deref().expect("result declarations retain their formal input scope");
-        if declared == inputs {
-            return Ok(Some(outputs.to_vec()));
-        }
-        let renaming = T::derive_scope_identity_renaming(declared, inputs)?;
-        outputs
-            .iter()
-            .map(|r#type| r#type.rename_identities(&renaming))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+        self.output_types.as_ref().map(|types| types.instantiated(inputs)).transpose()
     }
 
     /// Validates exact local-result instantiation and returns the callee-to-caller result correspondence.
@@ -583,58 +514,234 @@ impl<T: Type> JitCallOperation<T> {
         inputs: &[T],
         callee_outputs: &[T],
     ) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
-        if self.output_types.is_none() {
-            if callee_outputs
-                .iter()
-                .flat_map(Type::identities)
-                .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
-            {
-                return Err(TypeError::invalid(
-                    "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
-                ));
-            }
-            return Ok(TypeIdentityRenaming::new());
+        if let Some(types) = &self.output_types {
+            return types.renaming(inputs, callee_outputs);
         }
-        let locals = callee_outputs
+        if callee_outputs
             .iter()
             .flat_map(Type::identities)
-            .filter_map(|(_, identity)| {
-                (!inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)).then_some(identity)
-            })
-            .collect::<Vec<_>>();
-        let outputs = self.instantiated_output_types(inputs)?.expect("local result declarations were checked above");
-        let renaming = T::derive_scope_identity_renaming(callee_outputs, &outputs)?;
-        for (_, identity) in callee_outputs.iter().flat_map(Type::identities) {
-            let target = renaming.target(identity).unwrap_or(identity);
-            if locals.contains(&identity) {
-                if target == identity
-                    || inputs
-                        .iter()
-                        .chain(callee_outputs)
-                        .flat_map(Type::identities)
-                        .any(|(_, original)| original == target)
-                {
-                    return Err(TypeError::invalid("`jit_call` local result declarations must use fresh identities"));
-                }
-            } else if target != identity {
-                return Err(TypeError::invalid(
-                    "`jit_call` result declarations must preserve forwarded input identities",
-                ));
-            }
+            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+        {
+            return Err(TypeError::invalid(
+                "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
+            ));
         }
-        Ok(renaming)
-    }
-
-    /// Retains the original aggregate signature in call identity after backend legalization.
-    pub(crate) fn with_logical_signature(mut self, inputs: Vec<T>, outputs: Vec<T>) -> Self {
-        self.logical_signature = Some(Arc::new((inputs, outputs)));
-        self
+        Ok(TypeIdentityRenaming::new())
     }
 
     /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
     #[inline]
     pub(crate) fn capture_count(&self) -> usize {
         self.capture_count
+    }
+}
+
+/// Formal callee input types and caller result types that bind [`TypeIdentity`](ryft_core::TypeIdentity)s across one
+/// sealed call boundary. The bindings are encoded in these two type signatures; the stored metadata contains no runtime
+/// values.
+///
+/// An output identity present in the callee inputs is forwarded from the corresponding caller input. An identity
+/// defined inside the callee receives one fresh caller identity shared by every corresponding result occurrence.
+/// Separate calls receive independent local identities, because their results can have different extents even when
+/// their input shapes agree. [`Self::fresh`] allocates those identities once during call construction, before
+/// interpretation, so repeated type inference returns the same identities. Calls whose results only forward input
+/// identities retain no instance of this metadata.
+///
+/// The formal input types allow [`Self::instantiated`] to specialize forwarded dimensions to actual inputs without
+/// replacing the call's local result identities. When a transformation already owns the caller result names,
+/// [`Self::with_outputs`] preserves them and validates their correspondence to the callee's output types.
+/// [`Self::renaming`] recovers that correspondence from the current callee output types to the stored caller types.
+///
+/// For example, suppose a callee accepts a dimension with identity `n` and returns three dimensions with identities
+/// `n`, `m`, and `m`, where `m` is defined inside the callee. The first result forwards `n`; the other two share one
+/// fresh caller identity. Another call receives a different identity for `m`, even though its diagnostic name can
+/// remain `m`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CallTypeBindings<T: Type> {
+    /// Formal input namespace used when instantiating forwarded result identities.
+    inputs: Arc<[T]>,
+
+    /// Caller result types, with callee-local identities already freshly bound.
+    outputs: Arc<[T]>,
+}
+
+impl<T: Type> CallTypeBindings<T> {
+    /// Freshens callee-local result identities, returning no metadata when all result identities are forwarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error when a result type cannot preserve its structure under identity renaming.
+    fn fresh(inputs: &[T], outputs: &[T]) -> Result<Option<Self>, TypeError> {
+        if !outputs
+            .iter()
+            .flat_map(Type::identities)
+            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+        {
+            return Ok(None);
+        }
+        let mut unavailable = inputs
+            .iter()
+            .chain(outputs)
+            .flat_map(Type::identities)
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>();
+        let mut renaming = TypeIdentityRenaming::new();
+        for (_, identity) in outputs.iter().flat_map(Type::identities) {
+            if renaming.target(identity).is_none()
+                && !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+            {
+                unavailable.push(renaming.insert_fresh(identity.clone(), &unavailable)?);
+            }
+        }
+        let outputs =
+            outputs.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Self { inputs: inputs.into(), outputs: outputs.into() }))
+    }
+
+    /// Records caller result types whose local identities have already been chosen, validating their exact
+    /// correspondence to the callee's output types. Unlike [`Self::fresh`], this function allocates no identities.
+    /// Forwarded identities must stay unchanged, and callee-local identities must have fresh caller counterparts.
+    /// Returns no metadata when both output signatures agree and only forward input identities.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Callee input types. Both output signatures use this input scope for forwarded identities.
+    ///   - `callee_outputs`: Output types of the attached callee, using its local result identities.
+    ///   - `outputs`: Result types retained by the caller, using the existing caller-owned result identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for changed result structure, captured local names, or renamed forwarded identities.
+    fn with_outputs(inputs: &[T], callee_outputs: &[T], outputs: Vec<T>) -> Result<Option<Self>, TypeError> {
+        if callee_outputs == outputs {
+            if callee_outputs
+                .iter()
+                .flat_map(Type::identities)
+                .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+            {
+                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
+            }
+            return Ok(None);
+        }
+        let signature = Self { inputs: inputs.into(), outputs: outputs.into() };
+        signature.renaming(inputs, callee_outputs)?;
+        Ok(Some(signature))
+    }
+
+    /// Returns caller result types with forwarded names and ordinary shape refinements instantiated at `inputs`.
+    /// Local result identities remain symbolic even when the input facts determine an exact extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the input-scope correspondence or type-renaming error when the call signature is incompatible.
+    fn instantiated(&self, inputs: &[T]) -> Result<Vec<T>, TypeError> {
+        if self.inputs.as_ref() == inputs {
+            return Ok(self.outputs.to_vec());
+        }
+        let renaming = T::derive_identity_renaming(self.inputs.as_ref(), inputs)?;
+        let refinements = T::Refinements::from_local_declarations(self.inputs.iter(), inputs)?;
+        let local = self.definitions();
+        self.outputs
+            .iter()
+            .map(|r#type| refinements.refine_declared(r#type, &local)?.rename_identities(&renaming))
+            .collect()
+    }
+
+    /// Returns the validated renaming from the current callee output types to this call's instantiated result types.
+    /// The source types are supplied in `callee_outputs`; the target types come from [`Self::instantiated`]. For the
+    /// type-level example, this maps the callee's local `m` to the caller's fresh identity while preserving forwarded
+    /// `n`. Caller result types alone cannot recover the callee's original local identities.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Input types of the current callee instantiation, used to instantiate forwarded result identities.
+    ///   - `callee_outputs`: Output types of that callee instantiation, before renaming its local identities into the
+    ///     caller's scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error when local names are not fresh, forwarded names change, or result structure differs.
+    fn renaming(&self, inputs: &[T], callee_outputs: &[T]) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
+        let outputs = self.instantiated(inputs)?;
+        let renaming = T::derive_identity_renaming(callee_outputs, &outputs)?;
+        for (_, identity) in callee_outputs.iter().flat_map(Type::identities) {
+            let target = renaming.target(identity).unwrap_or(identity);
+            let forwarded = inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity);
+            if forwarded && target != identity {
+                return Err(TypeError::invalid("call result declarations must preserve forwarded input identities"));
+            }
+            if !forwarded
+                && (target == identity
+                    || inputs
+                        .iter()
+                        .chain(callee_outputs)
+                        .flat_map(Type::identities)
+                        .any(|(_, original)| original == target))
+            {
+                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
+            }
+        }
+        Ok(renaming)
+    }
+
+    /// Returns the formal result types retained by the caller.
+    fn outputs(&self) -> &[T] {
+        &self.outputs
+    }
+
+    /// Returns the caller-owned identities defined by this call, once each in result occurrence order.
+    fn definitions(&self) -> Vec<T::Identity> {
+        let mut definitions = Vec::new();
+        for (_, identity) in self.outputs.iter().flat_map(Type::identities) {
+            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+                && !definitions.contains(identity)
+            {
+                definitions.push(identity.clone());
+            }
+        }
+        definitions
+    }
+
+    /// Renames caller-owned definitions while retaining the callee's formal input namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity conflict or type-renaming error.
+    fn renamed(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let mut owned = TypeIdentityRenaming::new();
+        for (source, target) in renaming.replacements() {
+            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == source) {
+                owned.insert(source.clone(), target.clone())?;
+            }
+        }
+        let outputs =
+            self.outputs.iter().map(|r#type| r#type.rename_identities(&owned)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { inputs: self.inputs.clone(), outputs: outputs.into() })
+    }
+
+    /// Retains the indicated input and result positions after ordinary call-boundary pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error when a positional mask has the wrong arity.
+    fn pruned(&self, inputs: &[bool], outputs: &[bool]) -> Result<Self, TypeError> {
+        if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
+            return Err(TypeError::invalid("call result declaration pruning masks have incompatible arity"));
+        }
+        Ok(Self {
+            inputs: self
+                .inputs
+                .iter()
+                .zip(inputs)
+                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
+                .collect(),
+            outputs: self
+                .outputs
+                .iter()
+                .zip(outputs)
+                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
+                .collect(),
+        })
     }
 }
 
@@ -695,56 +802,12 @@ impl<T: Type> Operation for JitCallOperation<T> {
     }
 
     fn defined_type_identities(&self) -> Cow<'_, [T::Identity]> {
-        let Some(outputs) = &self.output_types else { return Cow::Borrowed(&[]) };
-        let mut definitions = Vec::new();
-        for (_, identity) in outputs.iter().flat_map(Type::identities) {
-            let forwarded = self
-                .input_types
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .flat_map(Type::identities)
-                .any(|(_, input)| input == identity);
-            if !forwarded && !definitions.contains(identity) {
-                definitions.push(identity.clone());
-            }
-        }
-        Cow::Owned(definitions)
+        self.output_types.as_ref().map_or(Cow::Borrowed(&[]), |types| Cow::Owned(types.definitions()))
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
         let mut renamed = self.clone();
-        if let Some(signature) = &self.logical_signature {
-            let inputs =
-                signature.0.iter().map(|r#type| r#type.rename_identities(renaming)).collect::<Result<Vec<_>, _>>()?;
-            let outputs =
-                signature.1.iter().map(|r#type| r#type.rename_identities(renaming)).collect::<Result<Vec<_>, _>>()?;
-            renamed.logical_signature = Some(Arc::new((inputs, outputs)));
-        }
-        let mut local_renaming = TypeIdentityRenaming::new();
-        for (source, target) in renaming.replacements() {
-            if !self
-                .input_types
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .flat_map(Type::identities)
-                .any(|(_, input)| input == source)
-            {
-                local_renaming.insert(source.clone(), target.clone())?;
-            }
-        }
-        renamed.output_types = self
-            .output_types
-            .as_ref()
-            .map(|types| {
-                types
-                    .iter()
-                    .map(|r#type| r#type.rename_identities(&local_renaming))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(Arc::from)
-            })
-            .transpose()?;
+        renamed.output_types = self.output_types.as_ref().map(|types| types.renamed(renaming)).transpose()?;
         Ok(renamed)
     }
 
@@ -784,7 +847,7 @@ impl<T: Type> Operation for JitCallOperation<T> {
         if declared == input_types {
             return Ok(vec![None]);
         }
-        let renaming = T::derive_scope_identity_renaming(declared, input_types)?;
+        let renaming = T::derive_identity_renaming(declared, input_types)?;
         let renamed =
             declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
         ensure_call_input_types(self.name(), &renamed, input_types)?;
@@ -821,22 +884,8 @@ impl<T: Type> Operation for JitCallOperation<T> {
         kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
         check_count!("input", kept_inputs, input_count, ProgramError);
         let mut operation = self.clone();
-        operation.output_types = self.output_types.as_ref().map(|types| {
-            types
-                .iter()
-                .zip(used_outputs)
-                .filter_map(|(r#type, used)| used.then_some(r#type.clone()))
-                .collect::<Vec<_>>()
-                .into()
-        });
-        operation.input_types = self.input_types.as_ref().map(|types| {
-            types
-                .iter()
-                .zip(&kept_inputs)
-                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
-                .collect::<Vec<_>>()
-                .into()
-        });
+        operation.output_types =
+            self.output_types.as_ref().map(|types| types.pruned(&kept_inputs, used_outputs)).transpose()?;
         Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
     }
 
@@ -847,19 +896,15 @@ impl<T: Type> Operation for JitCallOperation<T> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
-        if self.capture_count == 0 && self.logical_signature.is_none() && self.output_types.is_none() {
+        if self.capture_count == 0 && self.output_types.is_none() {
             Ok(())
         } else {
             operation.bracketed(|operation| {
                 if self.capture_count != 0 {
                     operation.field("capture_count", self.capture_count)?;
                 }
-                if let Some(signature) = &self.logical_signature {
-                    operation.list("logical_inputs", &signature.0)?;
-                    operation.list("logical_outputs", &signature.1)?;
-                }
                 if let Some(outputs) = &self.output_types {
-                    operation.list("output_types", outputs.iter())?;
+                    operation.list("output_types", outputs.outputs())?;
                 }
                 Ok(())
             })
@@ -901,7 +946,7 @@ where
                 .iter()
                 .map(|r#type| r#type.rename_identities(&result_renaming))
                 .collect::<Result<Vec<_>, _>>()?;
-            let operation = Self { output_types: None, input_types: None, ..self.clone() };
+            let operation = Self { output_types: None, ..self.clone() };
             Ok(operation.with_result_type_signature(&input_types, &callee_outputs, outputs)?)
         })
     }
@@ -1057,23 +1102,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        // The batched callee receives only packed values and their batch axes, so the per-item extents of bounded
-        // ragged axes and of mapped dimensions cannot cross its boundary and are rejected before it is batched.
-        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
-        if let Some((index, r#type)) = inputs
-            .iter()
-            .enumerate()
-            .find_map(|(index, input)| input.mapped_dimension_type().map(|r#type| (index, r#type)))
-        {
-            let dimension = r#type.variable().map_or_else(|| r#type.to_string(), ToString::to_string);
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{}` does not support bounded ragged dimension `{dimension}` on input {index}",
-                    self.name(),
-                ),
-            });
-        }
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
         if axes.iter().all(BatchAxis::is_replicated) {
             return Ok(context
@@ -1085,8 +1114,7 @@ where
                 )?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>()
-                .into());
+                .collect::<Vec<_>>());
         }
         // The canonical composite transform threads one leading dimension through the callee. Treat it as an
         // additional explicit capture and remove only its bookkeeping output; the original capture order remains.
@@ -1104,8 +1132,7 @@ where
             .into_iter()
             .zip(axes)
             .map(|(value, axis)| ArrayIrBatch::new(value, axis))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -1119,13 +1146,10 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy>, BatchingError> {
-        // The batched callee receives only packed values and their batch axes, so the per-item extents of bounded
-        // ragged axes cannot cross its boundary and are rejected before it is batched.
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        // Rebatch the callee region over the mapped input axes when any input carries the batch axis; an
-        // all-replicated call binds its original callee unchanged.
+        // Rebatch the callee when inputs are mapped or when it can address the batching level by name. Only an
+        // all-replicated call at an anonymous level can bind its original callee unchanged.
         //
         // Unlike the forward-mode and transpose rules below, this rebatching is deliberately not served from the
         // callee region's retained transform cache: the batched program depends on live `BatchingContext` state (the
@@ -1136,28 +1160,24 @@ where
         // joins the region transform cache behind a gate measurement, through a batching-policy hook returning
         // `Option<key>` where `None` keeps a policy uncached, so soundness stays opt-in per policy. See
         // `.tasks/plan_general_transform_caching_analysis.md`.
-        let (batched_callee, output_axes) = match ArrayBatch::common_batch_size(inputs)? {
-            Some(_) => {
-                let input_batch_axes = inputs
-                    .iter()
-                    .map(|input| batch_axis_from_position(input.batch_axis_position()))
-                    .collect::<Vec<_>>();
-                let (batched_callee, output_axes) = driver
-                    .batch_program(
-                        context,
-                        driver.region(0)?,
-                        input_batch_axes.as_slice(),
-                        ProgramBatchingOutputAxesPolicy::Natural,
-                    )?
-                    .into_parts();
-                let output_axes = output_axes.iter().map(batch_axis_position).collect::<Vec<_>>();
-                (batched_callee.into_simplified()?, output_axes)
-            }
-            None => {
-                let callee = driver.region(0)?;
-                let output_axes = vec![None; callee.output_types().len()];
-                (callee.to_program(), output_axes)
-            }
+        let batch_callee = ArrayBatch::common_batch_size(inputs)?.is_some() || context.axis_name().is_some();
+        let (batched_callee, output_axes) = if batch_callee {
+            let input_batch_axes =
+                inputs.iter().map(|input| batch_axis_from_position(input.batch_axis_position())).collect::<Vec<_>>();
+            let (batched_callee, output_axes) = driver
+                .batch_program(
+                    context,
+                    driver.region(0)?,
+                    input_batch_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?
+                .into_parts();
+            let output_axes = output_axes.iter().map(batch_axis_position).collect::<Vec<_>>();
+            (batched_callee.into_simplified()?, output_axes)
+        } else {
+            let callee = driver.region(0)?;
+            let output_axes = vec![None; callee.output_types().len()];
+            (callee.to_program(), output_axes)
         };
         let operation = Self::new(self.capture_count())
             .with_callee_type_signature(&batched_callee.input_types(), &batched_callee.output_types())?;
@@ -1169,8 +1189,7 @@ where
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| ArrayBatch::new(output, batch_axis_from_position(axis)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -1621,7 +1640,7 @@ impl LowerableOperation for JitCallOperation<ArrayIrType> {
         };
         lower_jit_call(
             callee,
-            self,
+            self.capture_count(),
             input_values,
             &mut lowerer.block,
             lowerer.context,
@@ -1640,18 +1659,21 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId, CaptureReference,
-        ConditionOperation, Context, CosOperation, CotangentDestinationKind, CotangentDestinations, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, DotDimensionNumbers, DotOperation, EffectClasses, InputRegionProvenance, LogicalMesh,
+        AddOperation, Array, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId, AxisIndexOperation,
+        BroadcastOperation, CaptureReference, ConditionOperation, Context, CosOperation, CotangentDestinationKind,
+        CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
+        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DotDimensionNumbers,
+        DotOperation, DynamicBroadcastOperation, EffectClasses, InputRegionProvenance, IotaOperation, LogicalMesh,
         MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage, Operation, OutputRegionProvenance, PartialValue,
-        Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
-        RegionDataFlow, RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualCandidate,
-        ResidualDecision, ResidualPolicy, ResidualPolicyReference, ResidualRejection, Shape, Sharding,
-        ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer, TracingContext, TransposedProgram,
-        TransposedProgramCotangent, TranspositionDriver, TypeError, Typed, Value, ZeroOperation,
+        Placeholder, ProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
+        ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
+        RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
+        ResidualRejection, Shape, Sharding, ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer,
+        TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver,
+        TypeError, TypeIdentity, Typed, Value, ZeroOperation,
     };
+    use ryft_macros::Operation;
 
     use crate::experimental::lowering::tests::{
         XlaProgramBuilder, add_xla_jit_call, lower_replicated_shard_map_body, test_vector_type,
@@ -2408,6 +2430,80 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_operation_batch_homogeneous_named_axis() {
+        /// Array-only family for exercising the homogeneous JIT batching rule without composite carriers.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(crate = "ryft_core", type(ArrayType), constant(Array), dispatch(batching))]
+        enum NamedAxisCallOperation {
+            AxisIndex(AxisIndexOperation),
+            Iota(IotaOperation<ArrayType>),
+            Broadcast(BroadcastOperation),
+            Transpose(TransposeOperation),
+            Zero(ZeroOperation<ArrayType>),
+            Call(JitCallOperation<ArrayType>),
+        }
+
+        for replicated in [false, true] {
+            let mut builder = ProgramBuilder::<Array, NamedAxisCallOperation>::new();
+            let input = replicated.then(|| builder.add_input(ArrayType::scalar(DataType::F32)));
+            let index =
+                builder.add_instruction(AxisIndexOperation::new("items".to_owned()), vec![], vec![], None).unwrap()[0];
+            let outputs = std::iter::once(index).chain(input).collect::<Vec<_>>();
+            let callee = builder
+                .build::<Vec<Array>, Vec<Array>>(
+                    outputs,
+                    vec![Placeholder; usize::from(replicated)],
+                    vec![Placeholder; 1 + usize::from(replicated)],
+                )
+                .unwrap();
+            let callees = [Arc::new(callee)];
+            let regions = CalleeRegionDriver::new(&callees);
+            let driver = RecursiveBatchingDriver::new(&regions);
+            let (_, program) = TracingContext::<Array, NamedAxisCallOperation>::trace_with_context_and_named_axes(
+                |parent, inputs: Vec<Tracer<TracingContext<Array, NamedAxisCallOperation>>>| {
+                    let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 3)
+                        .with_axis_name("items".to_owned());
+                    let inputs = inputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>();
+                    let outputs = JitCallOperation::<ArrayType>::new(0).batch(&context, &driver, &inputs)?;
+                    assert_eq!(outputs[0].batch_axis_position(), Some(0));
+                    if replicated {
+                        assert_eq!(outputs[1].batch_axis_position(), None);
+                    }
+                    Ok::<_, ProgramError>(outputs.into_iter().map(ArrayBatch::into_value).collect::<Vec<_>>())
+                },
+                vec![ArrayType::scalar(DataType::F32); usize::from(replicated)],
+                vec![],
+            )
+            .unwrap();
+            let expected = if replicated {
+                indoc! {"
+                    lambda %0:f32[] .
+                    let %1:u64[3], %2:f32[] = jit_call %0 [
+                        callee={
+                            lambda %0:f32[] .
+                            let %1:u64[3] = iota [type=u64[3], dimension=0]
+                            in (%1, %0)
+                        },
+                    ]
+                    in (%1, %2)"}
+            } else {
+                indoc! {"
+                    lambda  .
+                    let %0:u64[3] = jit_call [
+                        callee={
+                            lambda  .
+                            let %0:u64[3] = iota [type=u64[3], dimension=0]
+                            in (%0)
+                        },
+                    ]
+                    in (%0)"}
+            };
+            assert_eq!(program.to_string(), expected);
+            assert_eq!(program.output_types()[0], ArrayType::new_static(DataType::U64, [3]));
+        }
+    }
+
+    #[test]
     fn test_jit_call_operation_batch() {
         use ryft_core::{
             ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, CalleeRegionDriver,
@@ -2428,9 +2524,11 @@ mod tests {
                 let parent = inputs[0].context();
                 let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-                let (outputs, _) = JitCallOperation::<ArrayIrType>::new(0)
-                    .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])?
-                    .into_parts();
+                let outputs = JitCallOperation::<ArrayIrType>::new(0).batch(
+                    &context,
+                    &driver,
+                    &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?],
+                )?;
                 Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
             },
             vec![vector.clone()],
@@ -2445,52 +2543,6 @@ mod tests {
         let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
         assert_eq!(body.input_types().len(), 2);
         assert_eq!(body.output_ids()[0], body.input_ids()[0]);
-    }
-
-    #[test]
-    fn test_jit_call_operation_batch_rejects_ragged_and_mapped_dimension_inputs() {
-        use ryft_core::{
-            ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, BatchingError, DimensionVariable,
-            EmptyRegionDriver, RaggedAxis,
-        };
-
-        // The callee boundary carries only packed values and batch axes, so the per-item extents of a bounded ragged
-        // input and of a mapped dimension input are rejected before the callee is batched. An empty driver also proves
-        // that the rejection precedes any callee transformation.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let errors = std::cell::RefCell::new(Vec::new());
-        TracingContext::<XlaConstant, XlaOperation>::trace(
-            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
-                let parent = inputs[0].context();
-                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(2).unwrap()));
-                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-                let ragged = ArrayIrBatch::new(inputs[0].clone(), Some(0))?.with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    inputs[1].clone(),
-                    length.clone(),
-                    vec![0],
-                )])?;
-                let mapped_dimension =
-                    ArrayIrBatch::mapped_dimension(inputs[1].clone(), Some(0), DimensionType::from(length.clone()))?;
-                for input in [ragged, mapped_dimension] {
-                    errors.borrow_mut().push(
-                        JitCallOperation::<ArrayIrType>::new(0)
-                            .batch(&context, &EmptyRegionDriver, &[input])
-                            .unwrap_err(),
-                    );
-                }
-                Ok::<_, ProgramError>(vec![inputs[0].clone()])
-            },
-            vec![
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3])),
-                ArrayIrType::Array(ArrayType::new_static(DataType::I64, [2])),
-            ],
-        )
-        .unwrap();
-        let expected = BatchingError::UnsupportedOperation {
-            message: "`jit_call` does not support bounded ragged dimension `length` on input 0".to_string(),
-        };
-        assert_eq!(errors.into_inner(), vec![expected.clone(), expected]);
     }
 
     #[test]
@@ -2903,6 +2955,46 @@ mod tests {
                     %4:f64[4] = zero [type=f64[4]]
                 in (%3, %4)"},
         );
+    }
+
+    #[test]
+    fn test_jit_call_jvp_preserves_local_result_shape_relationships() {
+        // `f(x, size) = broadcast(x, [dimension_from_scalar(size)])` is linear in `x` and returns an array whose extent
+        // the callee defines itself. The JVP rule binds separate primal and tangent calls, so the output tangent shares
+        // the primal output's extent only if that extent reaches the tangent call through a residual.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 0);
+        let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap());
+        let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
+        let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
+        let callee = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let value = builder.add_input(value_type.clone());
+            let size = builder.add_input(size_type.clone());
+            let dimension = builder
+                .add_instruction(DimensionFromScalarOperation::new(rows), Vec::new(), vec![size], None)
+                .unwrap()[0];
+            let broadcast = builder
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![broadcast], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let operation = JitCallOperation::new(0)
+            .with_callee_type_signature(&callee.input_types(), &callee.output_types())
+            .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
+        let output = builder.add_instruction(XlaOperation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let outputs = program.jvp().unwrap().output_types();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[1], outputs[0].tangent().unwrap());
     }
 
     #[test]
@@ -4474,5 +4566,135 @@ mod tests {
         assert_eq!(values_from_bytes::<f32>(&read(&previous)), vec![3f32]);
         assert_eq!(values_from_bytes::<i64>(&read(&extent)), vec![5i64]);
         assert_eq!(values_from_bytes::<f32>(&read(&state)), vec![4f32]);
+    }
+
+    #[test]
+    fn test_jit_call_operation_dense_result_bindings() {
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let input = DimensionType::new("input", bounds);
+        let local = DimensionType::new("local", bounds);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone()]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone(), local.dimension().clone()]));
+        let output_types = vec![output_type.clone(), output_type];
+        let operation = JitCallOperation::<ArrayType>::new(0)
+            .with_callee_type_signature(std::slice::from_ref(&input_type), &output_types)
+            .unwrap();
+        let other = JitCallOperation::<ArrayType>::new(0)
+            .with_callee_type_signature(std::slice::from_ref(&input_type), &output_types)
+            .unwrap();
+        let interface = RegionInterface::new(vec![input_type.clone()], output_types.clone(), EffectClasses::NONE);
+        let outputs = operation
+            .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
+            .unwrap();
+        assert_eq!(outputs[0], outputs[1]);
+        assert_ne!(outputs, output_types);
+        assert_eq!(
+            operation
+                .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
+                .unwrap(),
+            outputs
+        );
+        assert_ne!(other.infer_output_types(&[input_type.clone()], &[interface]).unwrap(), outputs);
+        let actual = ArrayType::new_static(DataType::F32, [2]);
+        let callee_outputs = output_types
+            .iter()
+            .map(|output| {
+                ArrayType::new(DataType::F32, Shape::new(vec![2usize.into(), output.shape().dimensions()[1].clone()]))
+            })
+            .collect::<Vec<_>>();
+        let actual_interface = RegionInterface::new(vec![actual.clone()], callee_outputs, EffectClasses::NONE);
+        let instantiated = operation.infer_output_types(&[actual], &[actual_interface]).unwrap();
+        assert_eq!(instantiated[0].shape().dimensions()[0], 2usize.into());
+        assert_eq!(instantiated[0].shape().dimensions()[1], outputs[0].shape().dimensions()[1]);
+        assert_eq!(instantiated[0], instantiated[1]);
+        assert_eq!(operation.defined_type_identities().len(), 1);
+        let retained = JitCallOperation::<ArrayType>::new(0)
+            .with_result_type_signature(std::slice::from_ref(&input_type), &output_types, outputs.clone())
+            .unwrap();
+        assert_eq!(retained.instantiated_output_types(&[input_type]).unwrap(), Some(outputs));
+    }
+
+    #[test]
+    fn test_call_type_bindings() {
+        let bounds = DimensionBounds::new(0, Some(4)).unwrap();
+        let input = ArrayIrType::from(DimensionType::new("input", bounds));
+        let local = ArrayIrType::from(DimensionType::new("local", bounds));
+        let inputs = vec![input.clone()];
+        let outputs = vec![input.clone(), local.clone(), local.clone()];
+        assert_eq!(CallTypeBindings::fresh(&inputs, &inputs), Ok(None));
+
+        // One local family is exported once even when several results share it. Separate calls allocate separate
+        // families, while forwarded input names stay shared.
+        let first = CallTypeBindings::fresh(&inputs, &outputs).unwrap().unwrap();
+        let second = CallTypeBindings::fresh(&inputs, &outputs).unwrap().unwrap();
+        assert_eq!(first.outputs()[0], input);
+        assert_eq!(first.outputs()[1], first.outputs()[2]);
+        assert_ne!(first.outputs()[1], local);
+        assert_ne!(first.outputs()[1], second.outputs()[1]);
+        assert_eq!(first.definitions().len(), 1);
+        assert_eq!(first.instantiated(&inputs).unwrap(), first.outputs());
+        let renaming = first.renaming(&inputs, &outputs).unwrap();
+        assert_eq!(local.rename_identities(&renaming).unwrap(), first.outputs()[1]);
+        assert_eq!(input.rename_identities(&renaming).unwrap(), input);
+
+        // Instantiating a forwarded input in another namespace must not rename the call's local result.
+        let actual = ArrayIrType::from(DimensionType::new("actual", bounds));
+        let instantiated = first.instantiated(&[actual.clone()]).unwrap();
+        assert_eq!(instantiated[0], actual);
+        assert_eq!(&instantiated[1..], &first.outputs()[1..]);
+        let retained = first.pruned(&[true], &[true, false, true]).unwrap();
+        assert_eq!(retained.outputs(), &[input.clone(), first.outputs()[2].clone()]);
+        assert_eq!(retained.definitions(), first.definitions());
+        assert!(first.pruned(&[], &[true; 3]).is_err());
+
+        // A declaration cannot export the callee's private name verbatim or rename a forwarded input.
+        assert_eq!(
+            CallTypeBindings::with_outputs(&inputs, &outputs, outputs.clone()),
+            Err(TypeError::invalid("call local result declarations must use fresh identities")),
+        );
+        let other = ArrayIrType::from(DimensionType::new("other", bounds));
+        assert!(CallTypeBindings::with_outputs(&inputs, &inputs, vec![other]).is_err());
+        assert!(CallTypeBindings::with_outputs(&inputs, &outputs, first.outputs().to_vec()).is_ok());
+    }
+
+    #[test]
+    fn test_call_type_bindings_instantiated_dense_static_input() {
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let input = DimensionType::new("input", bounds);
+        let local = DimensionType::new("local", bounds);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone()]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone(), local.dimension().clone()]));
+        let outputs = [output_type.clone(), output_type];
+        let first = CallTypeBindings::fresh(std::slice::from_ref(&input_type), &outputs).unwrap().unwrap();
+        let second = CallTypeBindings::fresh(std::slice::from_ref(&input_type), &outputs).unwrap().unwrap();
+        assert_ne!(first.outputs(), second.outputs());
+        assert_eq!(first.outputs()[0], first.outputs()[1]);
+        let actual_input = ArrayType::new_static(DataType::F32, [2]);
+        let actual = first.instantiated(std::slice::from_ref(&actual_input)).unwrap();
+        assert_eq!(actual[0].shape().dimensions()[0], 2usize.into());
+        assert_eq!(actual[0].shape().dimensions()[1], first.outputs()[0].shape().dimensions()[1]);
+        assert_eq!(actual[0], actual[1]);
+        let callee_outputs = outputs
+            .iter()
+            .map(|output| {
+                ArrayType::new(DataType::F32, Shape::new(vec![2usize.into(), output.shape().dimensions()[1].clone()]))
+            })
+            .collect::<Vec<_>>();
+        let renaming = first.renaming(std::slice::from_ref(&actual_input), &callee_outputs).unwrap();
+        assert_eq!(callee_outputs[0].rename_identities(&renaming).unwrap(), actual[0]);
+        assert_eq!(first.definitions().len(), 1);
+        let retained =
+            CallTypeBindings::with_outputs(std::slice::from_ref(&input_type), &outputs, first.outputs().to_vec())
+                .unwrap()
+                .unwrap();
+        assert_eq!(retained.instantiated(&[actual_input]).unwrap(), actual);
+        let mut renamed = TypeIdentityRenaming::new();
+        let local = first.definitions()[0].fresh();
+        renamed.insert(first.definitions()[0].clone(), local.clone()).unwrap();
+        let rebound = first.renamed(&renamed).unwrap();
+        assert_eq!(rebound.definitions(), vec![local]);
+        assert_ne!(rebound.outputs(), first.outputs());
     }
 }

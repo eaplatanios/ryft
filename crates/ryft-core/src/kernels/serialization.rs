@@ -712,7 +712,6 @@ impl Encoder {
             ArrayIrType::Array(r#type) => WireType::Array(self.array_type(r#type)?),
             ArrayIrType::Dimension(r#type) => WireType::Dimension(self.dimension(r#type.dimension())),
             ArrayIrType::Reference(r#type) => WireType::Reference(self.array_type(r#type.referent())?),
-            ArrayIrType::Ragged(_) => return Err(unsupported("first-class ragged type")),
         })
     }
 
@@ -732,7 +731,6 @@ impl Encoder {
             }
             ArrayIrValue::Dimension(value) => WireValue::Dimension { extent: value.extent() },
             ArrayIrValue::Reference(_) => return Err(unsupported("reference literal")),
-            ArrayIrValue::Ragged(_) => return Err(unsupported("first-class ragged literal")),
         })
     }
 

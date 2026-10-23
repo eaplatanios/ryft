@@ -6,8 +6,7 @@ use crate::arrays::{
     ShardingDimension,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -256,7 +255,7 @@ impl<C: Context<Type = ArrayType, Value: Reshard>, P: ArrayExtentBatchingPolicy<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // The lifted reshard's target sharding gains the mapped axis's sharding (derived from the batched inputs via
         // `ArrayBatch::sharding_for_inputs`) at the new batch dimension. Lifting needs only the batch axis's position
         // and placement, never its extent, so mapped axes with dynamic extents lift as well.
@@ -266,14 +265,13 @@ impl<C: Context<Type = ArrayType, Value: Reshard>, P: ArrayExtentBatchingPolicy<
             None => self.sharding().clone(),
         };
 
-        // Sharding changes preserve the packed shape, so the batch axis and ragged-axis metadata carry over unchanged.
+        // Sharding changes preserve the packed shape and mapped batch axis.
         let batch_axis = BatchAxis::from_optional_position(inputs[0].batch_axis_position());
         let mut outputs =
             ReshardOperation::new(lifted_sharding).interpret_with_batch_axes(context, inputs, &[batch_axis])?;
         check_count!("output", outputs, 1, ProgramError);
-        let output = ArrayBatch::new(outputs.remove(0).into_value(), batch_axis)?
-            .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
-        Ok(vec![output].into())
+        let output = ArrayBatch::new(outputs.remove(0).into_value(), batch_axis)?;
+        Ok(vec![output])
     }
 }
 
@@ -465,7 +463,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
@@ -860,28 +857,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reshard_batching_ragged() {
-        // Resharding preserves the packed shape, so a bounded ragged axis on the input carries over to the output.
-        let target = Sharding::new(mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
-        let array =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
-        let input = ragged_array_batch(array, extents, &variable, 1).unwrap();
-        let ragged_axes = input.ragged_axes().to_vec();
-        let (outputs, _) = ReshardOperation::new(target.clone())
-            .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis_position(), Some(0));
-        assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
-        assert_eq!(outputs[0].r#type().sharding(), Some(&expected_lifted));
-    }
-
-    #[test]
     fn test_reshard_batching_dynamic() {
         // Lifting needs only the batch axis's position and placement, so a mapped axis with a dynamic extent lifts.
         let target = Sharding::new(mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -897,8 +872,7 @@ mod tests {
             extent,
         );
         let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
-        let (outputs, _) =
-            ReshardOperation::new(target).batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts();
+        let outputs = ReshardOperation::new(target).batch(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis_position(), Some(0));
         assert_eq!(outputs[0].r#type().shape(), &shape);
@@ -912,13 +886,9 @@ mod tests {
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
         let array = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let input = ArrayBatch::new(array.clone(), BatchAxis::replicated()).unwrap();
-        let (outputs, _) = ReshardOperation::new(target.clone())
-            .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts();
+        let outputs = ReshardOperation::new(target.clone()).batch(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis_position(), None);
-        assert!(outputs[0].ragged_axes().is_empty());
         assert_eq!(
             outputs[0].value(),
             &Array::from_elements(

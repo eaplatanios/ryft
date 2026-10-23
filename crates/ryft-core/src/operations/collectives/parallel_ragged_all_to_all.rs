@@ -9,10 +9,10 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    MemberBatchableOperation, batch_projected_operation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
+    batch_projected_operation,
 };
-use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
@@ -112,17 +112,10 @@ pub const PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_ragged_all
 /// level whose axis name shadows a manual mesh axis may bind it instead, and a matching `batch` level rejects an
 /// exchange over a manual mesh axis.
 ///
-/// [`RaggedAxis`](crate::RaggedAxis) is batching-time metadata and does not participate in this explicitly packed
-/// operation contract. Batching rejects inputs that carry it because one per-item logical extent does not determine
-/// the per-source/per-destination sizes and two coordinate-frame offset vectors required by this operation. A future
-/// adapter must therefore accept an explicit routing descriptor; it cannot infer routing from
-/// [`RaggedAxis`](crate::RaggedAxis) alone. The two representations also describe different frames:
-/// `ParallelRaggedAllToAllOperation` metadata describes participant chunks, whereas a `RaggedAxis` describes packed
-/// batch items and has no carrier outside a batching transform. A batch transform whose named axis matches this
-/// operation executes concrete array metadata eagerly. Unresolved non-constant metadata are deliberately gated:
-/// dynamic-length copies cannot use [`DynamicSliceOperation`](crate::DynamicSliceOperation), whose slice sizes are
-/// static payload fields. A future staged implementation can express the copies with iota-based index arithmetic,
-/// gather, and `select` masking at `O(group_size × M)` staged work.
+/// A batch transform whose named axis matches this operation binds the internal physical form. A concrete parent
+/// executes the exchange immediately; a staging parent retains it with ordinary runtime metadata, and eager replay
+/// validates those metadata before copying. The internal physical form has no XLA lowering, so a program that retains
+/// it can currently execute only through core interpretation.
 ///
 /// The transpose stages additional collectives rather than performing a local rewrite, and its metadata inputs are
 /// primal residuals: ordinary runtime values retained by linearization, not compile-time constants. Participant groups
@@ -893,19 +886,18 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // A matching named batch axis is the eager reference implementation's participant axis. All inputs are aligned
-        // to physical axis zero before one parent bind executes the complete exchange. Unresolved non-constant metadata
-        // are gated because no existing slicing primitive carries a dynamic segment length. An exchange over a manual
-        // mesh axis belongs to its manual region and requires devices, so a matching level, which can only shadow that
-        // mesh axis, rejects it. A non-matching mapped axis merges its batch into the packed leading data and metadata
-        // axes with sender/receiver offsets rebased by the mapped item index. The rebasing offsets are created with the
-        // placement and manual variation of the metadata that they rebase, so a merge inside a manual region needs no
-        // variation transition. An all-replicated application can be forwarded unchanged. The physical form has no
-        // backend lowering, so a matching level under a staging parent stages it only for eager interpretation of
-        // the staged program.
+        // to physical axis zero before one parent bind executes or stages the complete exchange. Metadata remain
+        // runtime inputs, which the physical interpreter validates before copying. An exchange over a manual mesh axis
+        // belongs to its manual region and requires devices, so a matching level, which can only shadow that mesh axis,
+        // rejects it. A non-matching mapped axis merges its batch into the packed leading data and metadata axes with
+        // sender/receiver offsets rebased by the mapped item index. The rebasing offsets are created with the placement
+        // and manual variation of the metadata that they rebase, so a merge inside a manual region needs no variation
+        // transition. An all-replicated application can be forwarded unchanged. The physical form has no backend
+        // lowering, so a matching level under a staging parent stages it only for eager interpretation of the
+        // staged program.
         check_count!("input", inputs, 6, ProgramError);
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         // A physical operation has already consumed its named axis at an inner level, which shadows every outer level
         // with the same name, so every level that it reaches is unrelated to it.
@@ -914,7 +906,7 @@ impl<
                 let parent_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
                 let mut outputs = context.parent().bind(self.clone(), Vec::new(), parent_inputs.as_slice())?;
                 check_count!("output", outputs, 1, ProgramError);
-                return Ok(vec![ArrayBatch::replicated(outputs.remove(0))].into());
+                return Ok(vec![ArrayBatch::replicated(outputs.remove(0))]);
             }
 
             // An unrelated mapped axis is merged into the exchange: the batch items share the participants
@@ -946,7 +938,7 @@ impl<
 
                             if batch_size == 0 {
                                 let output = P::match_axis(context, &inputs[1], output_batch_axis.into())?;
-                                return Ok(vec![output].into());
+                                return Ok(vec![output]);
                             }
 
                             let static_extent = |r#type: &ArrayType, axis: usize, name: &str| {
@@ -1140,7 +1132,7 @@ impl<
                                 restored_extents.as_slice(),
                                 restored_output_sharding,
                             )?;
-                            Ok(vec![ArrayBatch::new(output, BatchAxis::from_position(output_batch_axis))?].into())
+                            Ok(vec![ArrayBatch::new(output, BatchAxis::from_position(output_batch_axis))?])
                         },
                     )
                 })
@@ -1165,18 +1157,6 @@ impl<
 
         let inputs =
             inputs.iter().map(|input| P::match_axis(context, input, 0.into())).collect::<Result<Vec<_>, _>>()?;
-        if inputs[2..]
-            .iter()
-            .any(|input| !matches!(context.parent().resolve(input.value()), ValueResolution::Constant(_)))
-        {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` cannot materialize a batch-bound collective with \
-                     staged metadata",
-                ),
-            });
-        }
-
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let mut outputs = context.parent().bind(
             self.with_physical_representation(self.mesh.clone()),
@@ -1184,7 +1164,7 @@ impl<
             physical_inputs.as_slice(),
         )?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(0))?].into())
+        Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(0))?])
     }
 }
 
@@ -1521,7 +1501,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         batch_projected_operation(context, self, inputs)
     }
 }
@@ -1772,7 +1752,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, MeshAxis, MeshAxisType,
     };
@@ -1787,7 +1766,7 @@ mod tests {
     use crate::operations::manipulation::transposition::Transpose;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer};
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialTracer};
     use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode};
 
     use super::*;
@@ -1880,10 +1859,11 @@ mod tests {
                     .enumerate()
                     .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    inputs.as_slice(),
+                )?;
                 Ok(outputs.remove(0).into_value())
             },
             input_types,
@@ -2918,35 +2898,6 @@ mod tests {
         let item = |value: Array| ArrayBatch::new(value, BatchAxis::new(0)).unwrap();
         let metadata = || item(Array::matrix(2, 2, vec![0i32; 4]).unwrap());
 
-        // One per-item logical extent does not determine the per-peer sizes and offsets of an explicitly packed
-        // exchange, so batching rejects inputs that carry a `RaggedAxis` before choosing any batching path.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged_operand = ragged_array_batch(
-            Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(),
-            Array::vector(vec![1i32, 3]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    ragged_operand,
-                    item(Array::matrix(2, 4, vec![0.0f32; 8]).unwrap()),
-                    metadata(),
-                    metadata(),
-                    metadata(),
-                    metadata(),
-                ],
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_ragged_all_to_all` does not support bounded ragged dimension `length` on input 0"
-                    .to_string(),
-            }),
-        );
-
         // An exchange over the manual mesh axis itself belongs to its manual region and requires devices, so a
         // matching `batch` level, which can only shadow that axis, rejects it.
         assert_eq!(
@@ -2970,10 +2921,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_batching_requires_constant_metadata() {
-        // A matching `batch` level executes the exchange eagerly, so it rejects metadata that do not resolve to
-        // constants, whether they are staged in a trace or unknown during partial evaluation, while unknown data
-        // inputs with known constant metadata are accepted.
+    fn test_parallel_ragged_all_to_all_batching_stages_runtime_metadata() {
+        // A matching batch level stages one physical exchange without reading its metadata. Eager replay performs
+        // the copies and validates the runtime metadata, including when partial evaluation leaves them unknown.
         let input_types = vec![
             ArrayType::new_static(DataType::F32, [2, 3]),
             ArrayType::new_static(DataType::F32, [2, 4]),
@@ -2982,87 +2932,110 @@ mod tests {
             ArrayType::new_static(DataType::I32, [2, 2]),
             ArrayType::new_static(DataType::I32, [2, 2]),
         ];
-        let error = TracingContext::<Array, ArrayOperation<Array>>::trace(
+        let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("x".to_string());
                 let inputs = inputs
                     .into_iter()
                     .map(|input| ArrayBatch::new(input, BatchAxis::new(0)))
                     .collect::<Result<Vec<_>, _>>()?;
-                let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
-                Ok(outputs[0].value().clone())
+                let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    inputs.as_slice(),
+                )?;
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+                Ok(vec![outputs[0].value().clone()])
             },
             input_types.clone(),
         )
-        .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message:
-                    "`parallel_ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
-                        .to_string(),
-            },
-        );
-
-        // Metadata that are unknown during partial evaluation are rejected as well.
-        let partial_context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let partial_inputs = input_types
-            .into_iter()
-            .enumerate()
-            .map(|(index, r#type)| {
-                let value = partial_context.unknown_input(r#type, index);
-                ArrayBatch::new(PartialTracer::new(partial_context.clone(), value), BatchAxis::new(0)).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let batching_context = BatchingContext::new(partial_context, 2).with_axis_name("x".to_string());
-        assert_eq!(
-            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
-                &batching_context,
-                &EmptyRegionDriver,
-                partial_inputs.as_slice(),
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message:
-                    "`parallel_ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
-                        .to_string(),
-            }),
-        );
-
-        // Unknown data inputs with known constant metadata are accepted, and the exchange of unknown data is itself
-        // unknown, so partial evaluation residualizes it with the batch axis in front.
-        let partial_context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let operand = PartialTracer::new(
-            partial_context.clone(),
-            partial_context.unknown_input(ArrayType::new_static(DataType::F32, [2, 3]), 0),
-        );
-        let output = PartialTracer::new(
-            partial_context.clone(),
-            partial_context.unknown_input(ArrayType::new_static(DataType::F32, [2, 4]), 1),
-        );
-        let metadata = || {
-            PartialTracer::new(
-                partial_context.clone(),
-                PartialEvaluationValue::known_constant(Array::matrix(2, 2, vec![0i32; 4]).unwrap()),
-            )
+        .unwrap();
+        assert_eq!(output_types, vec![ArrayType::new_static(DataType::F32, [2, 4])]);
+        let expected_program = indoc! {"
+            lambda %0:f32[2, 3], %1:f32[2, 4], %2:i32[2, 2], %3:i32[2, 2], %4:i32[2, 2], %5:i32[2, 2] .
+            let %6:f32[2, 4] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, representation=Physical] \
+                %0 %1 %2 %3 %4 %5
+            in (%6)"
         };
-        let inputs = [operand, output, metadata(), metadata(), metadata(), metadata()]
-            .into_iter()
-            .map(|input| ArrayBatch::new(input, BatchAxis::new(0)).unwrap())
-            .collect::<Vec<_>>();
-        let batching_context = BatchingContext::new(partial_context, 2).with_axis_name("x".to_string());
-        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-            .batch(&batching_context, &EmptyRegionDriver, inputs.as_slice())
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().r#type().into_owned(), ArrayType::new_static(DataType::F32, [2, 4]));
-        assert!(outputs[0].value().value().unwrap().is_unknown());
+        assert_eq!(program.to_string(), expected_program);
+
+        let inputs = vec![
+            Array::matrix(2, 3, vec![1.0f32, 2.0, 2.0, 3.0, 4.0, 0.0]).unwrap(),
+            Array::matrix(2, 4, vec![9.0f32; 8]).unwrap(),
+            Array::matrix(2, 2, vec![0i32, 1, 0, 1]).unwrap(),
+            Array::matrix(2, 2, vec![1i32, 2, 1, 1]).unwrap(),
+            Array::matrix(2, 2, vec![0i32, 0, 1, 2]).unwrap(),
+            Array::matrix(2, 2, vec![1i32, 1, 2, 1]).unwrap(),
+        ];
+        let expected = vec![Array::matrix(2, 4, vec![1.0f32, 3.0, 9.0, 9.0, 2.0, 2.0, 4.0, 9.0]).unwrap()];
+        assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
+
+        let partial_context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let partial_outputs = {
+            let context = BatchingContext::new(partial_context.clone(), 2).with_axis_name("x".to_string());
+            let inputs = input_types
+                .into_iter()
+                .enumerate()
+                .map(|(index, r#type)| {
+                    let value = partial_context.unknown_input(r#type, index);
+                    ArrayBatch::new(PartialTracer::new(partial_context.clone(), value), BatchAxis::new(0)).unwrap()
+                })
+                .collect::<Vec<_>>();
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
+                .batch(&context, &EmptyRegionDriver, inputs.as_slice())
+                .unwrap()
+                .into_iter()
+                .map(|output| output.into_value().into_value())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let evaluation = partial_context.into_evaluation(partial_outputs).unwrap();
+        assert_eq!(
+            evaluation.inputs(),
+            &[
+                PartialEvaluationInput::<Array>::Unknown(0),
+                PartialEvaluationInput::<Array>::Unknown(1),
+                PartialEvaluationInput::<Array>::Unknown(2),
+                PartialEvaluationInput::<Array>::Unknown(3),
+                PartialEvaluationInput::<Array>::Unknown(4),
+                PartialEvaluationInput::<Array>::Unknown(5),
+            ],
+        );
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::<Array>::Unknown(0)]);
+        assert_eq!(evaluation.program().to_string(), expected_program);
+        assert_eq!(evaluation.program().interpret(inputs.clone()), Ok(expected.clone()));
+
+        // Unknown data with known metadata residualize the same exchange. Known metadata remain ordinary residual
+        // inputs instead of being inspected by the batching rule or embedded in the operation payload.
+        let known_metadata = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(inputs[0].r#type().into_owned()),
+                PartialValue::Unknown(inputs[1].r#type().into_owned()),
+                PartialValue::Known(inputs[2].clone()),
+                PartialValue::Known(inputs[3].clone()),
+                PartialValue::Known(inputs[4].clone()),
+                PartialValue::Known(inputs[5].clone()),
+            ])
+            .unwrap();
+        assert_eq!(known_metadata.program().to_string(), expected_program);
+        let residual_inputs = known_metadata
+            .inputs()
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Known(value) => value.clone(),
+                PartialEvaluationInput::Unknown(index) => inputs[*index].clone(),
+            })
+            .collect();
+        assert_eq!(known_metadata.program().interpret(residual_inputs), Ok(expected));
+
+        // The staged and residual physical operations still reject malformed runtime metadata before copying.
+        let mut invalid_inputs = inputs;
+        invalid_inputs[2] = Array::matrix(2, 2, vec![-1i32, 1, 0, 1]).unwrap();
+        let expected_error =
+            ProgramError::InvalidArgument { message: "`input_offsets[0]` must be non-negative but got -1".to_string() };
+        assert_eq!(program.interpret(invalid_inputs.clone()), Err(expected_error.clone()));
+        assert_eq!(evaluation.program().interpret(invalid_inputs), Err(expected_error));
     }
 
     #[test]
@@ -3469,9 +3442,7 @@ mod tests {
         ];
         let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
             .batch(&context, &EmptyRegionDriver, inputs.as_slice())
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(
             outputs,
             vec![ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 4])), BatchAxis::new(0)).unwrap()],

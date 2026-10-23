@@ -7,7 +7,7 @@ use crate::arrays::{
     DimensionType, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 use crate::axes::Axis;
-use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -215,11 +215,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        // Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary
-        // static or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead
-        // returns its per-item extent array as the mapped dimension carrier, preserving the logical dimension identity
-        // rather than exposing its packed storage bound.
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // A rectangular array has the same per-item axis extent for every item, even when its batch axis is mapped.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         self.validate_input_type(&input.unbatched_type())?;
@@ -232,49 +229,13 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
             }
             None => self.axis(),
         };
-
-        if let Some(ragged_axis) = input.ragged_axes().iter().find(|ragged_axis| ragged_axis.axis() == packed_axis) {
-            let Some(batch_axis) = input.batch_axis_position() else {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: format!("ragged axis {packed_axis} has no mapped batch axis"),
-                });
-            };
-
-            let Some(extent_axis) = ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis) else {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: format!(
-                        "ragged axis {packed_axis} does not carry extents for mapped batch axis {batch_axis}",
-                    ),
-                });
-            };
-
-            // A mapped dimension carries one extent per batch item. Extents that also vary over other axes (e.g., an
-            // outer batch axis that is an ordinary axis at this level) would need coordinates that it cannot record.
-            if ragged_axis.extent_axes().len() != 1 {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "`{DIMENSION_SIZE_OPERATION_NAME}` cannot extract a mapped dimension whose per-item extents \
-                         vary over axes other than the batch axis",
-                    ),
-                });
-            }
-
-            return Ok(vec![ArrayIrBatch::mapped_dimension(
-                ragged_axis.extents().clone(),
-                BatchAxis::from_position(extent_axis),
-                self.output_type().clone(),
-            )?]
-            .into());
-        }
-
         let operation = Self::new(batched_type, packed_axis)?;
         Ok(context
             .parent()
             .bind(operation, Vec::new(), std::slice::from_ref(input.value()))?
             .into_iter()
             .map(ArrayIrBatch::replicated)
-            .collect::<Vec<_>>()
-            .into())
+            .collect::<Vec<_>>())
     }
 }
 
@@ -300,8 +261,7 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
 ///
-/// During batching, a bounded ragged axis produces a mapped dimension carrying its per-item extents. Reading a ragged
-/// axis whose per-item extents vary over axes other than the batch axis is not supported.
+/// During batching, each item shares the array axis extent, so the resulting dimension remains replicated.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
@@ -411,12 +371,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue,
-        RaggedAxis, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
     };
-    use crate::batching::BatchingTracer;
+    use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;
@@ -766,22 +724,13 @@ mod tests {
 
     #[test]
     fn test_dimension_size_batching() -> Result<(), ProgramError> {
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+        // A rectangular mapped array still has one shared extent for its per-item axis.
+        let eager = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2)?),
         );
-        let extents = ArrayIrValue::Array(Array::vector(vec![1i64, 3])?);
-        let input =
-            ragged_batch(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), extents.clone(), &length, 1)?;
-
-        // A bounded ragged axis produces a mapped dimension that carries its per-item extents.
-        let output = BatchingTracer::new(context.clone(), input).dimension_size(0)?.into_batch();
-        assert_eq!(output, ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), length.into())?);
-
-        // An ordinary axis produces a replicated dimension.
         let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), BatchAxis::new(0))?;
-        let output = BatchingTracer::new(context, input).dimension_size(0)?.into_batch();
+        let output = BatchingTracer::new(eager, input).dimension_size(0)?.into_batch();
         assert_eq!(output, ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3)?)));
         Ok(())
     }
@@ -797,36 +746,6 @@ mod tests {
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
             Err(TypeError::invalid("`dimension_size` axis 1 is out of bounds for rank 1").into()),
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_dimension_size_batching_rejects_nested_extents() -> Result<(), ProgramError> {
-        // Extents that also vary over an outer axis cannot be carried by a mapped dimension.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
-        );
-        let input = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 3]), &[1f32; 12])?),
-            BatchAxis::new(0),
-        )?
-        .with_ragged_axes(vec![RaggedAxis::new(
-            2,
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1i64, 2, 3, 1])?),
-            length,
-            vec![0, 1],
-        )])?;
-        let operation = DimensionSizeOperation::new(<&ArrayType>::try_from(&input.unbatched_type())?, 1)?;
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`dimension_size` cannot extract a mapped dimension whose per-item extents vary over axes \
-                          other than the batch axis"
-                    .to_string(),
-            }),
         );
         Ok(())
     }

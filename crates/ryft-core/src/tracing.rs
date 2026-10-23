@@ -1253,7 +1253,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         declared: &[V::Type],
         requested: &[V::Type],
     ) -> Result<Option<TypeIdentityRenaming<<V::Type as Type>::Identity>>, TypeError> {
-        match V::Type::derive_scope_identity_renaming(declared, requested) {
+        match V::Type::derive_identity_renaming(declared, requested) {
             Ok(renaming) => Ok(Some(renaming)),
             Err(error) => match <V::Type as Type>::Refinements::new(declared.iter(), requested.iter()) {
                 Ok(_) => Ok(None),

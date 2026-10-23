@@ -8,7 +8,7 @@ use crate::arrays::{
     ArrayType, DataType, DimensionType, LogicalMesh, MeshAxisType, Sharding,
 };
 use crate::axes::{NamedAxes, NamedAxis};
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -162,7 +162,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelVaryOperation>>, P: Ar
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         if context.axis_name() == Some(self.axis_name.as_str()) {
             return Err(ProgramError::UnsupportedOperation {
@@ -170,7 +170,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelVaryOperation>>, P: Ar
             }
             .into());
         }
-        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into())
+        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?)
     }
 }
 
@@ -277,7 +277,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 /// the gradient of a replicated parameter needs. Without the explicit transition, each device would report only its
 /// own contribution. The other transforms keep the transition intact: forward-mode differentiation repeats it on the
 /// tangent (a structural-zero tangent still receives the varying output type), partial evaluation retains it for the
-/// backend that owns the mesh, and batching over an unrelated named axis preserves the mapped and ragged axes.
+/// backend that owns the mesh, and batching over an unrelated named axis preserves the mapped axis.
 ///
 /// Users rarely call this directly. Multi-input capabilities (e.g., arithmetic, comparison, selection, slicing,
 /// gathering, dots, sorts, etc.) insert it on whichever inputs lack the variation of their peers, and the XLA
@@ -646,7 +646,6 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
         ArrayIrValue, Dimension, DimensionBounds, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy,
         MeshAxis, Shape,
@@ -899,24 +898,19 @@ mod tests {
     #[test]
     fn test_parallel_vary_batching() {
         // A `batch` level that does not bind the axis name forwards the transition to its parent, preserving the
-        // mapped and ragged axes of the input.
+        // mapped axis of the input.
         let (invariant, _) = scalar_types();
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(invariant.sharding().unwrap().mesh().clone(), 2))
             .unwrap();
         let packed = trace.input(packed_type);
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ragged_array_batch(packed, extents, &length, 1).unwrap();
+        let input = ArrayBatch::new(packed, BatchAxis::new(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
         let outputs = ParallelVaryOperation::new("m".to_string())
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), input.batch_axis());
-        assert_eq!(outputs[0].ragged_axes(), input.ragged_axes());
         assert_eq!(
             outputs[0].value().r#type().sharding().unwrap().varying_manual_axes(),
             &BTreeSet::from(["m".to_string()]),
@@ -926,17 +920,17 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
                 vec![outputs[0].value().atom_id().unwrap()],
-                vec![Placeholder; 2],
+                vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[2, 3][sharding={mesh<['m'=2:manual]>, [{}, {}]}], %1:i32[2] .
-                let %2:f32[2, 3][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = \
+                lambda %0:f32[2, 3][sharding={mesh<['m'=2:manual]>, [{}, {}]}] .
+                let %1:f32[2, 3][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = \
                         parallel_vary [axis_name=\"m\"] %0
-                in (%2)"
+                in (%1)"
             },
         );
     }
@@ -959,9 +953,7 @@ mod tests {
         );
         let outputs = ParallelVaryOperation::new("m".to_string())
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), input.batch_axis());
         assert_eq!(
             outputs[0].value().r#type().sharding().unwrap().varying_manual_axes(),
@@ -996,9 +988,7 @@ mod tests {
         let input = ArrayBatch::replicated(trace.input(invariant));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2).with_axis_name("m".to_string());
         assert_eq!(
-            ParallelVaryOperation::new("m".to_string())
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|outputs| outputs.into_parts().0),
+            ParallelVaryOperation::new("m".to_string()).batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation {
                 message: "`parallel_vary` requires a manual mesh axis, not a named batch axis".to_string(),
             })),

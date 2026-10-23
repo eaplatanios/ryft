@@ -1087,8 +1087,8 @@ mod tests {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` (the padding of ragged
-        // complex reductions) contributes a zero exponential.
+        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
+        // zero exponential.
         let first = num_complex::Complex::new(1.0f32, 0.5);
         let second = num_complex::Complex::new(3.0f32, -2.0);
         let shift = num_complex::Complex::new(3.0f32, 0.0);
@@ -2486,85 +2486,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_f32s(&sequential), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
-    }
-
-    /// A declared ragged custom-call contract reaches the registered FFI handler with its existing extent operand,
-    /// preserves the result's ragged metadata, and lets a downstream sum mask the padded suffix.
-    #[test]
-    fn test_eager_ragged_custom_call_contract_composes_with_masked_reduction() {
-        use ryft_core::{
-            ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, CustomCallBatching,
-            CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding, CustomCallRaggedOutputBinding,
-            DimensionValue, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, RaggedAxis, ReduceOperation,
-        };
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        ensure_add_one_handler_registered(&client).unwrap();
-        let domain = XlaSession::new(&client).domain();
-        let mesh = cpu_mesh(&client);
-        let row_type = replicated_type(&mesh, DataType::F32, &[4]);
-        let input = XlaArray::from_host_buffer(
-            &domain,
-            replicated_type(&mesh, DataType::F32, &[3, 4]),
-            mesh.clone(),
-            values_to_bytes::<f32>(&[1.0, 2.0, 99.0, 99.0, 3.0, 4.0, 5.0, 99.0, 7.0, 99.0, 99.0, 99.0]),
-        )
-        .unwrap();
-        let invalid_input = input.clone();
-        let extents = XlaArray::from_host_buffer(
-            &domain,
-            replicated_type(&mesh, DataType::I32, &[3]),
-            mesh.clone(),
-            values_to_bytes::<i32>(&[2, 3, 1]),
-        )
-        .unwrap();
-        let invalid_extents = XlaArray::from_host_buffer(
-            &domain,
-            replicated_type(&mesh, DataType::I32, &[3]),
-            mesh,
-            values_to_bytes::<i32>(&[2, 5, 1]),
-        )
-        .unwrap();
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            input.domain(),
-            crate::XlaValue::Dimension(crate::XlaDimension::new(
-                DimensionValue::constant(3).unwrap(),
-                input.xla_domain().clone(),
-            )),
-        );
-        let data = ArrayBatch::new(input, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), length.clone(), vec![0])])
-            .unwrap();
-        let extent_operand = ArrayBatch::new(extents, BatchAxis::new(0)).unwrap();
-        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![row_type])
-            .with_batching(CustomCallBatching::BroadcastAll)
-            .with_ragged_contract(CustomCallRaggedContract::new(
-                vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, length.clone())],
-                vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "data".to_string(), axis: 0 }],
-            ));
-        let (mut outputs, evidence) =
-            operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts();
-        assert!(evidence.is_empty());
-        assert_eq!(outputs[0].ragged_axes().len(), 1);
-        let (outputs, evidence) = ReduceOperation::new(vec![0], ReductionKind::Sum)
-            .batch(&context, &EmptyRegionDriver, &[outputs.remove(0)])
-            .unwrap()
-            .into_parts();
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(read_f32s(outputs[0].value()), vec![5.0, 15.0, 8.0]);
-
-        let invalid_data = ArrayBatch::new(invalid_input, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, invalid_extents.clone(), length, vec![0])])
-            .unwrap();
-        let invalid_extent_operand = ArrayBatch::new(invalid_extents, BatchAxis::new(0)).unwrap();
-        let error = operation.batch(&context, &EmptyRegionDriver, &[invalid_data, invalid_extent_operand]).unwrap_err();
-        assert!(error.to_string().contains("extent 5 at batch item 1 lies outside the packed bound 4"), "{error}");
     }
 
     /// A custom call wrapped in a custom function with reverse-mode rules differentiates through the user-provided

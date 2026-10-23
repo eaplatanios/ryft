@@ -122,8 +122,8 @@ pub use effects::{
     ReferenceAccessMode, ReferenceEffect,
 };
 pub use identities::{
-    CallTypeBindings, NoIdentity, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition,
-    TypeIdentityRenaming, TypeIdentitySignature,
+    NoIdentity, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeIdentitySignature,
 };
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{

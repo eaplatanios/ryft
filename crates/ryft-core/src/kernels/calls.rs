@@ -185,7 +185,7 @@ impl KernelParameter {
     }
 
     /// Specializes declared full array shapes before constructing parameters or tracing a body. Canonical
-    /// [`ArrayTypeRefinements`](crate::ArrayTypeRefinements) checks enforce bounds and agreement of repeated dimension
+    /// [`ArrayTypeRefinements`] checks enforce bounds and agreement of repeated dimension
     /// identities across all parameters, including outputs. Every supplied actual shape must be static; unresolved
     /// output dimensions are rejected rather than inferred from unrelated inputs or runtime contents.
     ///
@@ -948,9 +948,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 Atom::Constant(ArrayIrValue::Reference(_)) => {
                     return Err(TypeError::invalid("reference constants have no persistent kernel semantic identity"));
                 }
-                Atom::Constant(ArrayIrValue::Ragged(_)) => {
-                    return Err(TypeError::invalid("ragged constants have no persistent kernel semantic identity"));
-                }
             }
         }
         Self::semantic_field(key, "end atoms");
@@ -1199,15 +1196,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::LinearCall(_) => {}
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-            ArrayIrOperation::RaggedNew(_)
-            | ArrayIrOperation::RaggedStorage(_)
-            | ArrayIrOperation::RaggedExtents(_)
-            | ArrayIrOperation::RaggedAdd(_)
-            | ArrayIrOperation::RaggedZero(_) => {
-                return Err(TypeError::invalid(
-                    "first-class ragged operations have no kernel semantic descriptor encoding",
-                ));
-            }
             ArrayIrOperation::CustomFunction(operation) if operation.rules().is_some() => {
                 return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
             }

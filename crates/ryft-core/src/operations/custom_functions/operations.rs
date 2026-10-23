@@ -11,18 +11,18 @@ use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy, reject_ragged_carriers,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_non_transposable_operation};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::custom_functions::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey,
@@ -33,11 +33,11 @@ use crate::operations::custom_functions::rules::{
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance,
-    ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow,
-    RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
-    discharge_local_reference_operation, discharge_reference_free_operation,
+    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider,
+    OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    RegionDataFlow, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements,
+    Typed, Value, discharge_local_reference_operation, discharge_reference_free_operation,
 };
 use crate::tracing::TracingContext;
 
@@ -872,10 +872,8 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // The batched regions and rule programs receive only the packed values and their batch axes, so carriers with
-        // per-item extents are rejected before any region is batched.
-        reject_ragged_carriers::<C, P>(self.name(), inputs)?;
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        // Structurally batch the attached regions and rule programs over the packed inputs and their batch axes.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let primal_region = driver.region(0)?;
         let boundary_inputs = P::boundary_inputs(context.axis_extent());
@@ -1105,8 +1103,7 @@ where
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| P::batch(output, axis))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -2042,7 +2039,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         check_count!("input", inputs, self.leading_input_count + self.input_tangent_types.len(), ProgramError);
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (rules, batching, discharged) = match &self.rules {
@@ -2059,7 +2056,7 @@ where
                         driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
                         inputs.iter().map(P::value).cloned().collect::<Vec<_>>().as_slice(),
                     )?;
-                    return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>().into());
+                    return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>());
                 }
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
@@ -2143,8 +2140,7 @@ where
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| P::batch(output, axis))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -2174,7 +2170,7 @@ where
     O: Operation<Type = V::Type>
         + From<CustomFunctionTransposeOperation<V, O>>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + SupportsCotangentAdd,
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
     S: CustomRuleSpecializer<V, O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -2862,10 +2858,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType,
-        ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, DataType,
+        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{
         BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch,
@@ -2908,10 +2904,9 @@ mod tests {
         PartialValue, PartiallyEvaluatableOperation,
     };
     use crate::programs::{
-        AtomId, EffectClass, EffectClasses, Effects, EmptyRegionDriver, FlatProgram, InputRegionProvenance, MaybeZero,
-        OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ReferenceAccessDescriptor,
-        ReferenceAccessOperation, ReferenceType, RegionDriver, RegionInterface, RegionRole, RegionSlot,
-        ValueProjection,
+        AtomId, EffectClass, EffectClasses, Effects, FlatProgram, InputRegionProvenance, MaybeZero, OperationProvider,
+        OutputRegionProvenance, Program, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation,
+        ReferenceType, RegionDriver, RegionInterface, RegionRole, RegionSlot, ValueProjection,
     };
     use crate::tests::{TestArrayOperation, hash_of};
     use crate::tracing::{DomainTracer, Trace, TracingContext};
@@ -3765,12 +3760,6 @@ mod tests {
                 Self::LinearCall(operation) => operation.render(formatter, indentation),
                 Self::CustomFunctionTranspose(operation) => operation.render(formatter, indentation),
             }
-        }
-    }
-
-    impl SupportsCotangentAdd for ReferenceTestOperation {
-        fn cotangent_add_operation(input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-            ArrayIrOperation::<Array>::cotangent_add_operation(input_types).map(Self::Base)
         }
     }
 
@@ -5405,38 +5394,6 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_batching_rejects_ragged_inputs() {
-        // Structural region batching sees only the packed values and their batch axes, so a bounded ragged input is
-        // rejected before any region is batched. An empty driver also proves that the rejection precedes any region
-        // transformation.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerArrayIrContext::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            ArrayIrValue::Array(Array::vector(vec![1i64, 2]).unwrap()),
-            length,
-            vec![0],
-        )])
-        .unwrap();
-        let operation: CustomFunctionOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>> =
-            CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Explicit, false);
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: "`custom_function` does not support bounded ragged dimension `length` on input 0".to_string(),
-            },
-        );
-    }
-
-    #[test]
     fn test_custom_function_batching_jvp_rule() {
         let output: Array = batch(
             |x| {
@@ -5659,9 +5616,7 @@ mod tests {
         // that all-replicated call inputs imply all-replicated call outputs.
         let outputs = CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Explicit, false)
             .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(1.0).unwrap())])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![0u64, 1, 2]).unwrap());

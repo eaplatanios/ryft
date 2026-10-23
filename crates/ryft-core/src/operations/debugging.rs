@@ -62,7 +62,7 @@ use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayType,
 };
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -214,7 +214,7 @@ impl<C: Context<Type = ArrayType, Operation: From<PrintOperation<ArrayType>>>, P
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Batching re-binds the print through the parent context over the packed value and keeps the input's batch
         // metadata, so the whole batch is printed at once. Interpreting the print against the parent instead would
         // print the parent's input at transformation time and drop the instruction and its effect from the programs

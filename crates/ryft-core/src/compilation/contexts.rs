@@ -1237,7 +1237,7 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
     fn add_duration(counter: &AtomicU64, duration: Duration) {
         let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         let _previous =
-            counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(nanoseconds)));
+            counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(nanoseconds)));
     }
 
     /// Accumulates `duration` into `duration_counter` and records one structured event for the operation.

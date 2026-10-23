@@ -6,9 +6,7 @@ use std::sync::LazyLock;
 use ryft_macros::capability;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ResidualZeroProvider};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -268,7 +266,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
         let binding_axes = inputs[2..].iter().map(P::batch_axis).collect::<Vec<_>>();
         let (transforms, output_axis) = batch_reference_transforms(
@@ -295,7 +293,7 @@ where
         let mut values = vec![P::value(&inputs[0]).clone(), P::value(&replacement).clone()];
         values.extend(inputs[2..].iter().map(|input| P::value(input).clone()));
         let previous = context.parent().bind(self.clone().with_transforms(transforms), Vec::new(), &values)?.remove(0);
-        Ok(vec![P::batch(previous, output_axis)?].into())
+        Ok(vec![P::batch(previous, output_axis)?])
     }
 }
 

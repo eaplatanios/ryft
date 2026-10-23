@@ -1065,7 +1065,7 @@ mod tests {
             .unwrap();
         assert_eq!(operation.effects().classes(), EffectClasses::NONE);
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), two.clone());
-        let (outputs, _) = operation
+        let outputs = operation
             .batch(
                 &context,
                 &EmptyRegionDriver,
@@ -1075,8 +1075,7 @@ mod tests {
                     ArrayIrBatch::replicated(three),
                 ],
             )
-            .unwrap()
-            .into_parts();
+            .unwrap();
         let program = parent
             .builder()
             .borrow()
@@ -1135,14 +1134,13 @@ mod tests {
             .unwrap();
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), two);
-        let (outputs, _) = operation
+        let outputs = operation
             .batch(
                 &context,
                 &EmptyRegionDriver,
                 &[ArrayIrBatch::new(input.clone(), BatchAxis::new(0)).unwrap(), ArrayIrBatch::replicated(dimension)],
             )
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(outputs[0].value().r#type().to_string(), "f64[2, output]");
         let program = parent
             .builder()

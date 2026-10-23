@@ -36,13 +36,6 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// same mapped extent; for dynamic extents, they must share the same
 /// [`DimensionVariable`](crate::arrays::DimensionVariable).
 ///
-/// Every bounded ragged axis is either contracted or free. A contracted axis is zero-padded and consumed, and its
-/// dimension variable is reported as [`BatchedOutputs`] evidence so carrier validation
-/// can distinguish deliberate consumption from a missing extent. Each input is padded along only its own contracted
-/// ragged axes because zeroing either factor removes the corresponding product. A free ragged axis propagates to the
-/// result through the dot output layout: batching dimensions, then LHS free axes, then RHS free axes. A bounded ragged
-/// axis on a batching dimension or a replicated input is unsupported because no shared per-item extent identity exists.
-/// Inputs without bounded ragged axes use the dense path unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotOperation {
     /// Contracting and batching dimension specification.
@@ -346,9 +339,8 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// defined only in non-contracting mode and applies another grouped dot followed by the inverse adjoint-axis
 /// permutation.
 ///
-/// Batching accepts either three replicated inputs or three inputs mapped over leading axis zero. It rejects
-/// [`RaggedAxis`](crate::arrays::RaggedAxis) metadata because `group_sizes` is the sole source of ragged extents for
-/// this operation.
+/// Batching accepts either three replicated inputs or three inputs mapped over leading axis zero. `group_sizes`
+/// is the sole source of the group extents for this explicitly packed operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotOperation {
     /// Grouped-dot dimension-number specification.

@@ -2050,7 +2050,11 @@ macro_rules! impl_differentiable_operation {
         impl<
             $value: $crate::Value,
             $operations: $crate::Operation<Type = <$value as $crate::Typed>::Type>
-                + $crate::SupportsCotangentAdd,
+                + $crate::OperationProvider<
+                    <$value as $crate::Typed>::Type,
+                    $crate::AddOperation<<$value as $crate::Typed>::Type>,
+                    Operation = $operations,
+                >,
             $($generic,)*
         > $crate::TransposableOperation<$value, $operations> for $operation
         where
@@ -2283,7 +2287,11 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<
             $type: $crate::Type,
             __V: $crate::Value<Type = $type>,
-            __O: $crate::Operation<Type = $type> + $crate::SupportsCotangentAdd,
+            __O: $crate::Operation<Type = $type> + $crate::OperationProvider<
+                $type,
+                $crate::AddOperation<$type>,
+                Operation = __O,
+            >,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = $type>,
@@ -2786,7 +2794,11 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $($transpose_type_bound)+,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<Type = __T> + $crate::SupportsCotangentAdd $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T> + $crate::OperationProvider<
+                __T,
+                $crate::AddOperation<__T>,
+                Operation = __O,
+            > $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
@@ -2909,7 +2921,11 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $crate::DifferentiableType,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<Type = __T> + $crate::SupportsCotangentAdd $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T> + $crate::OperationProvider<
+                __T,
+                $crate::AddOperation<__T>,
+                Operation = __O,
+            > $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
@@ -3669,7 +3685,7 @@ macro_rules! impl_nullary_batchable_operation {
                 context: &$crate::BatchingContext<__C, $policy>,
                 _driver: &__D,
                 inputs: &[<$policy as $crate::BatchingPolicy<__C>>::Batch],
-            ) -> Result<$crate::BatchedOutputs<__C, $policy>, $crate::BatchingError> {
+            ) -> Result<Vec<<$policy as $crate::BatchingPolicy<__C>>::Batch>, $crate::BatchingError> {
                 for (index, input) in inputs.iter().enumerate() {
                     let axis = <$policy as $crate::BatchingPolicy<__C>>::batch_axis(input);
                     if !axis.is_replicated() {
@@ -3692,8 +3708,7 @@ macro_rules! impl_nullary_batchable_operation {
                     .bind(self.clone(), Vec::new(), inputs.as_slice())?
                     .into_iter()
                     .map(<$policy as $crate::BatchingPolicy<__C>>::replicated)
-                    .collect::<Vec<_>>()
-                    .into())
+                    .collect::<Vec<_>>())
             }
         }
     };
@@ -3728,7 +3743,7 @@ macro_rules! impl_nullary_batchable_operation {
                 context: &$crate::BatchingContext<__C, __P>,
                 _driver: &__D,
                 inputs: &[__P::Batch],
-            ) -> Result<$crate::BatchedOutputs<__C, __P>, $crate::BatchingError> {
+            ) -> Result<Vec<__P::Batch>, $crate::BatchingError> {
                 $crate::check_count!("input", inputs, 0, ProgramError);
                 Ok($crate::InterpretableOperation::interpret(
                     self,
@@ -3738,8 +3753,7 @@ macro_rules! impl_nullary_batchable_operation {
                 )?
                 .into_iter()
                 .map(__P::replicated)
-                .collect::<Vec<_>>()
-                .into())
+                .collect::<Vec<_>>())
             }
         }
     };
@@ -4809,14 +4823,12 @@ macro_rules! check_operation_batching {
         $(
             let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
             let expected_outputs = vec![$($crate::check_operation_batching!(@batch_value $output)),*];
-            let (actual_outputs, _) = $crate::batching::BatchableOperation::batch(
+            let actual_outputs = $crate::batching::BatchableOperation::batch(
                 &operation,
                 &context,
                 driver,
                 inputs.as_slice(),
-            )
-            .unwrap()
-            .into_parts();
+            ).unwrap();
             $crate::check_operation_batching!(@compare_batches $comparison, actual_outputs, expected_outputs);
         )*
     }};
@@ -7379,9 +7391,7 @@ mod tests {
             EagerContext<Array, TestNullaryOperation<ArrayType>>,
             ArrayBatchingPolicy,
         >>::batch(&operation, &context, &EmptyRegionDriver, &[])
-        .unwrap()
-        .into_parts()
-        .0;
+        .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].value(), &Array::scalar(3.0).unwrap());
         assert_eq!(outputs[1].value(), &Array::scalar(4.0).unwrap());

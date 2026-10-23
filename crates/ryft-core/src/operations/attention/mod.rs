@@ -7,8 +7,7 @@ use crate::arrays::{
     Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy, Shape, StaticArrayExtentBatchingPolicy,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiableType;

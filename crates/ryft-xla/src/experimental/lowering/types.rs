@@ -444,7 +444,6 @@ where
     match value {
         XlaConstant::Captured(value) => lower_captured_constant(value, captured_values),
         XlaConstant::Dimension(value) => lower_dimension_extent(value, block, context, location),
-        XlaConstant::Literal(value) => lower_literal_value(value.array(), block, context, location),
         XlaConstant::Boolean(value) => {
             lower_literal_value(&XlaArrayConstant::Boolean(*value), block, context, location)
         }
@@ -780,7 +779,6 @@ pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
         ArrayIrType::Array(r#type) => lower_tensor_type(r#type, context, location),
         ArrayIrType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
         ArrayIrType::Reference(_) => Err(LoweringError::UnresolvedReference { construct: r#type.to_string() }),
-        ArrayIrType::Ragged(r#type) => Err(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() }),
     }
 }
 

@@ -9,8 +9,7 @@ use crate::arrays::{
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
@@ -85,7 +84,7 @@ pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
 /// A matching `batch` level consumes the mapped batch axis of an ordinary sum-scatter by summing over it and mapping
 /// the scattered chunks back onto it, so that batch item `i` receives chunk `i` of the sum and a value that is the
 /// same for every item counts once per item. A matching level rejects participant groups and sum-scatters over a
-/// manual mesh axis, and every `batch` level rejects bounded ragged inputs.
+/// manual mesh axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelSumScatterOperation {
     /// Axis name referenced by this collective.
@@ -603,7 +602,7 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // A matching `batch` level consumes the mapped batch axis by summing over it and re-mapping the chunks of the
         // per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into `(b, d_s / b)` chunks and the new
         // chunk axis becomes the output batch axis, so batch item `i` receives chunk `i` of the sum. A non-matching
@@ -724,7 +723,7 @@ impl<
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         self.shape_changing_collective_batch_in_parent(context, inputs)
     }
 }
@@ -1041,7 +1040,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension,
         StridedLayout,
@@ -1721,9 +1719,7 @@ mod tests {
             ArrayBatch::new(trace.input(ArrayType::new_static(DataType::F32, [3, 4])), BatchAxis::new(0)).unwrap();
         let outputs = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled())
             .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         let program = trace
             .builder()
             .borrow()
@@ -1752,9 +1748,7 @@ mod tests {
             ArrayBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 3])), BatchAxis::new(1)).unwrap();
         let outputs = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
             .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         let program = trace
             .builder()
             .borrow()
@@ -1812,46 +1806,6 @@ mod tests {
                 message: "`parallel_sum_scatter` over a manual mesh axis cannot bind a named batch axis".to_string(),
             }),
         );
-
-        // A matching level rejects bounded ragged inputs in both families, and the composite family does so before it
-        // reads the mapped extents.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged = ragged_array_batch(
-            Array::matrix(2, 4, vec![1.0; 8]).unwrap(),
-            Array::vector(vec![2i32, 4]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            batch_collective(&tiled, "x", 2, ragged),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_sum_scatter` does not support bounded ragged dimension `length` on input 0"
-                    .to_string(),
-            }),
-        );
-        let extents = ArrayIrValue::Array(Array::vector(vec![2i32, 4]).unwrap());
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap()),
-            extents.clone(),
-            &length,
-            1,
-        )
-        .unwrap();
-        let output_extent =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(length)).unwrap();
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("x".to_string());
-        assert_eq!(
-            tiled.batch_in_parent(&context, &EmptyRegionDriver, &[input, output_extent]),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_sum_scatter` does not support bounded ragged dimension `length` on input 0"
-                    .to_string(),
-            }),
-        );
     }
 
     #[test]
@@ -1889,7 +1843,7 @@ mod tests {
                     BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
-                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?;
                 Ok(outputs.remove(0).into_value())
             },
             input_type.clone(),
@@ -1959,7 +1913,7 @@ mod tests {
                     BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
-                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?;
                 Ok(outputs.remove(0).into_value())
             },
             input_type.clone(),

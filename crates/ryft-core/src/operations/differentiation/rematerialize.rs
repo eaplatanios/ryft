@@ -2,18 +2,19 @@ use std::fmt::Display;
 
 use crate::arrays::{ArrayType, DataType};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    BatchingPolicy, ProgramBatchingOutputAxesPolicy, reject_ragged_carriers,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    NOTHING_SAVABLE_POLICY_NAME, ResidualZeroProvider, SupportsCotangentAdd, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    NOTHING_SAVABLE_POLICY_NAME, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::manipulation::conversions::ReducePrecisionOperation;
 use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::references::ReferenceNewOperation;
@@ -496,25 +497,17 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // Batching batches the body with its natural output axes and binds the same call over the batched body.
-        // Any aBatchingPolicy::boundary_inputs` (e.g., the first-class mapped extent of a composite program) become
-        // additional leading instruction inputs, and therefore leading body inputs, of the batched call, whose tangents
-        // are zero-space. As for `linear_call`, a completely replicated call at an unnamed batching level is bound
-        // unchanged, and the body is specialized to the packed input types, so that type views that agree only for
-        // dense batches (e.g., ragged inputs packed at their declared bounds) reconcile with the exact interface that
-        // inference requires.
-
-        // The batched body receives only the packed values and their batch axes, so carriers with per-item extents
-        // are rejected before the body is batched.
-        reject_ragged_carriers::<C, P>(self.name(), inputs)?;
-
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        // Batch the body at its natural output axes and bind the call over the resulting packed values. Policy
+        // boundary inputs (e.g., a first-class mapped extent) become additional leading call and body inputs with
+        // zero-space tangents. A completely replicated call at an unnamed level stays unchanged. Otherwise, specialize
+        // the batched body to the packed input types so that symbolic extents agree with the call's exact interface.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
         if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
             let regions = driver.regions().map(|region| region.to_program()).collect::<Vec<_>>();
             let outputs = context.parent().bind(self.clone(), regions, input_values.as_slice())?;
-            return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>().into());
+            return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>());
         }
         let body = driver.region(0)?;
         let batched_body =
@@ -531,21 +524,14 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
         let boundary_input_count = packed_inputs.len();
         packed_inputs.extend(input_values);
         let packed_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let logical_input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
-        let logical_output_types = body.to_program().specialize(&logical_input_types)?.output_types();
         let batched_body = batched_body.specialize(packed_input_types.as_slice())?;
         let operation = self.with_remapped_optimization_barrier(|selected| {
             std::iter::repeat_n(false, boundary_input_count).chain(selected.iter().copied()).collect()
         });
         let outputs = context.parent().bind(operation, vec![batched_body], packed_inputs.as_slice())?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        check_count!("output", logical_output_types, outputs.len(), ProgramError);
-        Ok(outputs
-            .into_iter()
-            .zip(output_axes.into_iter().zip(logical_output_types))
-            .map(|(output, (axis, logical_type))| driver.restore_batch(output, axis, &logical_type, inputs))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+        check_count!("output", body.output_ids(), outputs.len(), ProgramError);
+        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
     }
 }
 
@@ -656,7 +642,7 @@ where
 impl<
     V: Value<Type: 'static + DifferentiableType + ReferenceMemberType>,
     O: Operation<Type = V::Type>
-        + SupportsCotangentAdd
+        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>
         + From<RematerializeOperation<V::Type>>
         + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<
@@ -768,11 +754,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_batch;
     use crate::arrays::{
-        Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        DimensionBounds, DimensionType, DimensionValue, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::captures::{CaptureReference, ClosedProgram};
@@ -806,8 +791,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicy;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource,
-        ReferenceType, RegionDriver, RegionRef,
+        EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType, RegionDriver,
+        RegionRef,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -1907,32 +1892,6 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 3);
         assert_eq!(counter.read(), Ok(Array::vector(vec![11.0f32, 22.0, 33.0]).unwrap()));
-    }
-
-    #[test]
-    fn test_rematerialize_batching_rejects_ragged_inputs() {
-        // Structural body batching sees only the packed values and their batch axes, so a bounded ragged input is
-        // rejected before the body is batched. An empty driver also proves that the rejection precedes any body
-        // transformation.
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestIrValue, TestIrOperation>::new(),
-            TestIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ragged_batch(
-            TestIrValue::Array(Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            TestIrValue::Array(Array::vector(vec![1i64, 2]).unwrap()),
-            &length,
-            1,
-        )
-        .unwrap();
-        let operation = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable));
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: "`rematerialize` does not support bounded ragged dimension `length` on input 0".to_string(),
-            },
-        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::arrays::{
     DimensionValue,
 };
 use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, BatchingTracer,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, BatchingTracer,
 };
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -156,7 +156,7 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // This rule is handwritten instead of using `impl_nullary_batchable_operation!(@replicated ...)` because that
         // macro derives its bounds from `InterpretableOperation<C>`, which for constants requires the batching context
         // to implement `Constant<C::Value, Stored>`. Downstream backends batch constants through projected contexts
@@ -169,8 +169,7 @@ impl<
             .bind(self.clone(), Vec::new(), &[])?
             .into_iter()
             .map(ArrayBatch::replicated)
-            .collect::<Vec<_>>()
-            .into())
+            .collect::<Vec<_>>())
     }
 }
 

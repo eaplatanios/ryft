@@ -917,9 +917,7 @@ mod tests {
         let batching_context = BatchingContext::new(context.clone(), 2).with_axis_name("x".to_string());
         let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
             .batch(&batching_context, &EmptyRegionDriver, inputs.as_slice())
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
 
         let builder = context.builder();

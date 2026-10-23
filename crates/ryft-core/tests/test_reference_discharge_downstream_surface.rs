@@ -43,7 +43,7 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::{
     AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AtomId, BatchAxis, BatchAxisSpecification,
-    BatchableOperation, BatchableReferenceTransform, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver,
+    BatchableOperation, BatchableReferenceTransform, BatchableType, BatchingContext, BatchingDriver,
     BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
     BoundReferenceTransform, BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation,
     Context, ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
@@ -1289,7 +1289,7 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>, P: B
         context: &BatchingContext<C, P>,
         _driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         match self {
             Self::Call => {
                 return Err(BatchingError::UnsupportedOperation {
@@ -1327,7 +1327,7 @@ impl BatchableType for RegisterIrType {
 impl<C: Context<Type = RegisterIrType>> BatchingPolicy<C> for RegisterBatching {
     type Batch = C::Value;
     type Extent = usize;
-    type Evidence = ();
+
     type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
 
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -3216,7 +3216,7 @@ mod custom_array_transforms {
             context: &BatchingContext<C, P>,
             driver: &D,
             inputs: &[P::Batch],
-        ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        ) -> Result<Vec<P::Batch>, BatchingError> {
             match self {
                 Self::Read(operation) => operation.batch(context, driver, inputs),
                 Self::AddUpdate(operation) => operation.batch(context, driver, inputs),
@@ -3318,7 +3318,7 @@ mod custom_array_transforms {
                     CustomOperation::Read(ReferenceReadOperation::new().with_transforms(vec![CustomTransform(
                         ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
                     )]));
-                let (outputs, _) = operation.batch(&context, &EmptyRegionDriver, &[root, index])?.into_parts();
+                let outputs = operation.batch(&context, &EmptyRegionDriver, &[root, index])?;
                 assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
                 Ok(outputs[0].value().clone())
             },

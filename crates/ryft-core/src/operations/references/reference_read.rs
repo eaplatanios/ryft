@@ -7,9 +7,7 @@ use std::sync::LazyLock;
 use ryft_macros::capability;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, Sharding};
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
@@ -261,7 +259,7 @@ where
         context: &BatchingContext<C, P>,
         _driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // A read yields the selected referent, carrying the batch axis through every transform.
         check_count!("input", inputs, 1 + self.binding_count(), ProgramError);
         let binding_axes = inputs[1..].iter().map(P::batch_axis).collect::<Vec<_>>();
@@ -273,7 +271,7 @@ where
         )?;
         let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
         let value = context.parent().bind(self.clone().with_transforms(transforms), Vec::new(), &values)?.remove(0);
-        Ok(vec![P::batch(value, output_axis)?].into())
+        Ok(vec![P::batch(value, output_axis)?])
     }
 }
 

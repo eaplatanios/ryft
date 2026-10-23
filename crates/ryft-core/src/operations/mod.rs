@@ -29,7 +29,6 @@ pub mod extrema;
 pub mod logical;
 pub mod manipulation;
 pub mod quantization;
-pub mod ragged;
 pub mod random;
 pub mod reductions;
 pub mod references;
@@ -59,7 +58,7 @@ pub use collectives::{
     ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelPermute,
     ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelReduce,
     ParallelReduceOperation, ParallelSumScatter, ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation,
-    RaggedArrayExtentAggregationBatchingPolicy, ShapeChangingCollectiveValue,
+    ShapeChangingCollectiveValue,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use complex::{
@@ -81,8 +80,7 @@ pub use control_flow::{
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_call::{
     CUSTOM_CALL_OPERATION_NAME, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
-    CustomCallInputOutputAlias, CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding,
-    CustomCallRaggedOutputBinding,
+    CustomCallInputOutputAlias, CustomCallOperation,
 };
 pub use custom_functions::{
     BatchingRuleConsistencyError, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
@@ -145,11 +143,6 @@ pub use manipulation::{
     UpdateSliceOperation,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
-pub use ragged::{
-    RAGGED_ADD_OPERATION_NAME, RAGGED_EXTENTS_OPERATION_NAME, RAGGED_NEW_OPERATION_NAME, RAGGED_STORAGE_OPERATION_NAME,
-    RAGGED_ZERO_OPERATION_NAME, RaggedAddOperation, RaggedExtents, RaggedExtentsOperation, RaggedNew,
-    RaggedNewOperation, RaggedStorage, RaggedStorageOperation, RaggedZeroOperation,
-};
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
     RngBitGenerator, RngBitGeneratorOperation,

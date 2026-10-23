@@ -43,7 +43,7 @@ use crate::arrays::{
     DimensionRefinements, DimensionType, DimensionValue, DimensionVariable, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
-use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -423,7 +423,7 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
 
         // Every batch item of a replicated state computes the same function of the same state, so generating the
@@ -434,7 +434,7 @@ impl<
             check_count!("output", outputs, 2, ProgramError);
             let bits = outputs.remove(1);
             let state = outputs.remove(0);
-            return Ok(vec![ArrayBatch::replicated(state), ArrayBatch::replicated(bits)].into());
+            return Ok(vec![ArrayBatch::replicated(state), ArrayBatch::replicated(bits)]);
         }
 
         // A mapped state is realigned to batch axis 0 and one carry-free scan is staged over it, whose body applies
@@ -454,7 +454,7 @@ impl<
         check_count!("output", outputs, 2, ProgramError);
         let bits = outputs.remove(1);
         let states = outputs.remove(0);
-        Ok(vec![ArrayBatch::new(states, BatchAxis::new(0))?, ArrayBatch::new(bits, BatchAxis::new(0))?].into())
+        Ok(vec![ArrayBatch::new(states, BatchAxis::new(0))?, ArrayBatch::new(bits, BatchAxis::new(0))?])
     }
 }
 
@@ -475,7 +475,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((state, output_dimensions)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -492,7 +492,7 @@ where
             check_count!("output", outputs, 2, ProgramError);
             let bits = outputs.remove(1);
             let state = outputs.remove(0);
-            return Ok(vec![ArrayIrBatch::replicated(state), ArrayIrBatch::replicated(bits)].into());
+            return Ok(vec![ArrayIrBatch::replicated(state), ArrayIrBatch::replicated(bits)]);
         }
 
         // A mapped state is realigned to batch axis 0 and consumed one row per iteration of a scan whose replicated
@@ -532,7 +532,7 @@ where
         check_count!("output", outputs, output_dimensions.len() + 2, ProgramError);
         let bits = outputs.remove(output_dimensions.len() + 1);
         let states = outputs.remove(output_dimensions.len());
-        Ok(vec![ArrayIrBatch::new(states, BatchAxis::new(0))?, ArrayIrBatch::new(bits, BatchAxis::new(0))?].into())
+        Ok(vec![ArrayIrBatch::new(states, BatchAxis::new(0))?, ArrayIrBatch::new(bits, BatchAxis::new(0))?])
     }
 }
 

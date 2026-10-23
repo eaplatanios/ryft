@@ -1,7 +1,5 @@
 /// Backend token used for traced XLA staging and PJRT-backed execution.
 pub mod domains;
-/// Canonical grouping and legalization of first-class backend values.
-pub(crate) mod grouping;
 /// StableHLO and Shardy lowering helpers for traced XLA programs.
 pub mod lowering;
 /// Backend-owned staged operation types for traced XLA programs.

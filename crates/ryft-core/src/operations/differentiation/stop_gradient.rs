@@ -7,7 +7,7 @@ use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayType,
 };
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -97,7 +97,7 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Batching preserves every input's batch metadata while recursively rebinding the gradient barrier through
         // the parent context. Rebinding is essential when a packed value is itself a differentiation or batching
         // tracer, because treating it as an interpreted identity would silently expose its tangent to an enclosing
@@ -105,14 +105,11 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let output_values = context.parent().bind(self.clone(), Vec::new(), input_values.as_slice())?;
         check_count!("output", output_values, inputs.len(), ProgramError);
-        let outputs = output_values
+        output_values
             .into_iter()
             .zip(inputs)
-            .map(|(output, input)| {
-                ArrayBatch::new(output, input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        Ok(outputs.into())
+            .map(|(output, input)| ArrayBatch::new(output, input.batch_axis()))
+            .collect()
     }
 }
 

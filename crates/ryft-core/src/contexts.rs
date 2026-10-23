@@ -267,11 +267,10 @@ pub trait Context:
     /// which, depending on the context, may interpret, transform, stage, or reject it. Refer to
     /// [`GuardOperation`'s enforcement contract](GuardOperation#enforcement) for more information. A context that is
     /// not eager always needs guards, because the body it stages is specialized to relationships that remain unproven
-    /// until runtime. An eager context needs them only when an input type is not fully static: concrete values carry
-    /// exact types, so a type that still names an identity marks a transform carrier riding over an eager parent (e.g.,
-    /// a bounded ragged batch or a mapped dimension) whose per-item extents live outside the type and which a boundary
-    /// refinement check alone cannot validate. Only the guard's transform rule reaches those per-item checks, and it
-    /// rejects carriers that it cannot relate. Exact static types keep guard planning off the eager hot path.
+    /// until runtime. An eager context needs them only when an input type still names an identity, as can happen in a
+    /// transform over an eager parent: the symbolic interface can carry relationships that its types alone do not
+    /// establish. Binding the guard lets that transform enforce or reject the relationship. Exact static types keep
+    /// guard planning off the eager hot path.
     #[inline]
     fn needs_guards(&self, input_types: &[Self::Type]) -> bool {
         !self.is_eager() || input_types.iter().any(|r#type| r#type.identities().next().is_some())

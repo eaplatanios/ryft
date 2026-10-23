@@ -7,9 +7,7 @@ use ryft_macros::capability;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType};
 use crate::axes::Axis;
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ResidualZeroProvider};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -167,7 +165,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // A reference may later receive a batched value, and its batch axis is fixed by the packed referent at
         // allocation time, so the allocation is always batched (a mapped initial value keeps its axis and a
         // replicated one is first broadcast along a new leading batch axis through the driver).
@@ -175,7 +173,7 @@ where
         let batch_axis = P::batch_axis(&inputs[0]).axis().unwrap_or(Axis::from(0));
         let initial = driver.align_batch_axis(context, inputs[0].clone(), batch_axis)?;
         let reference = context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&initial)))?.remove(0);
-        Ok(vec![P::batch(reference, P::batch_axis(&initial))?].into())
+        Ok(vec![P::batch(reference, P::batch_axis(&initial))?])
     }
 }
 

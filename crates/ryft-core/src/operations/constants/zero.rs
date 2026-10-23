@@ -17,7 +17,6 @@ use crate::macros::{
 use crate::operations::constants::{
     check_constructor_type_has_no_identity_references, validate_dynamic_constant_dimensions,
 };
-use crate::operations::ragged::RaggedZeroOperation;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface, Type,
@@ -182,12 +181,6 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, ZeroOperation<Ar
                     r#type,
                 ))
                 .into());
-            }
-            ArrayIrType::Ragged(r#type) => {
-                let operation = RaggedZeroOperation::new(r#type);
-                operation
-                    .infer_output_types(&input_types.iter().map(|r#type| (*r#type).clone()).collect::<Vec<_>>(), &[])?;
-                return Ok(Self::RaggedZero(operation));
             }
         };
         check_count!("input", input_types, 0, ProgramError);
@@ -651,9 +644,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);

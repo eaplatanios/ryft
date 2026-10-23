@@ -3,16 +3,14 @@ use std::fmt::Display;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
-    DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, RaggedArrayExtentBatchingPolicy, RaggedAxis,
-    RaggedMaskIdentity, StaticArrayExtentBatchingPolicy,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, LogicalMesh,
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
-use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext};
+use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, DivOperation, Sub};
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
@@ -26,14 +24,12 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::exponential::{Exp, Log};
-use crate::operations::extrema::Max;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
-    Value, ValueDomainDispatch, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Value, ValueDomainDispatch,
 };
 
 /// Name of [`ParallelReduceOperation`]. The operation's [`ReductionKind`] is rendered as its `kind` attribute.
@@ -64,19 +60,12 @@ pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 ///     as a cross-device all-reduce does, so unlike a [`ReductionKind::Sum`] across an array axis, it does not widen
 ///     floating-point inputs narrower than `f32` to `f32` (convert the input first where that precision matters). A
 ///     `batch` level that binds their axis name rejects them, and every other level forwards them to its parent with
-///     their mapped and ragged axes intact.
+///     their mapped axis intact.
 ///
 /// No form has per-item semantics, because the other participants exist only inside an enclosing binder. Interpreting
 /// the operation outside one is therefore an error, and partial evaluation preserves it for the binder or backend that
 /// owns the axis.
 ///
-/// A `batch` level that binds the axis of a reduction of any kind but a mean accepts bounded ragged inputs. Padding is
-/// replaced with the identity of the kind (e.g., zero for a sum, one for a product, and the lowest value of the element
-/// type for a maximum) before the participants are combined, and each surviving ragged extent is the elementwise
-/// maximum across the participants. Participants whose local extents exclude a position contribute the identity, so
-/// with multiple ragged axes, a position inside the coordinatewise-maximum output bounds that no participant covers
-/// holds the identity. A mean rejects ragged inputs, because its denominator has no single implied meaning as the
-/// participant count, the present-value count, and the logical-element count define different operations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelReduceOperation {
     /// Refer to the documentation of [`kind`](Self::kind) for more information.
@@ -325,7 +314,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>>> Par
 
 impl<
     C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>, Value: Reduce>,
-    P: RaggedArrayExtentAggregationBatchingPolicy<C>,
+    P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelReduceOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -333,7 +322,7 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // This rule owns named-axis resolution. A level whose axis name matches consumes its mapped axis, while every
         // other level forwards the reduction untouched to its parent, where the next level repeats the resolution.
         check_count!("input", inputs, 1, ProgramError);
@@ -345,14 +334,13 @@ impl<
                 });
             }
 
-            // A mesh reduction combines the local shards elementwise, so unrelated mapped and ragged axes pass through
+            // A mesh reduction combines the local shards elementwise, so unrelated mapped axes pass through
             // untouched, exactly as they do through its adjoint `parallel_vary`.
-            return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
+            return context.forward_to_parent(C::Operation::from(self.clone()), inputs);
         }
 
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            ArrayBatch::reject_ragged_inputs(self, inputs)?;
-            return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
+            return context.forward_to_parent(C::Operation::from(self.clone()), inputs);
         }
 
         if self.axis_index_groups.is_some() {
@@ -360,16 +348,6 @@ impl<
                 message: format!(
                     "`{}` axis index groups are not supported when a batch transform binds the collective axis",
                     self.name(),
-                ),
-            });
-        }
-
-        if self.kind == ReductionKind::Mean && !input.ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{}` with kind `{}` does not define a denominator for bounded ragged inputs",
-                    self.name(),
-                    self.kind,
                 ),
             });
         }
@@ -384,77 +362,14 @@ impl<
             ReductionKind::Mean | ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All,
         );
 
-        // Each surviving extent is aggregated by a maximum over the participants alone, which is only correct when the
-        // extents vary over nothing but the batch axis. Extents that vary over other axes would also need a mask over
-        // those coordinates (i.e., the nested-coordinates limitation of ragged batching), so they are rejected before
-        // anything executes. A replicated input of an idempotent kind passes through unchanged and needs no
-        // aggregation.
-        let input_batch_axis = input.batch_axis_position();
-        if input_batch_axis.is_some() || !idempotent {
-            let nested_ragged_axis = input
-                .ragged_axes()
-                .iter()
-                .find(|ragged_axis| ragged_axis.extent_axes().iter().any(|axis| Some(*axis) != input_batch_axis));
-            if let Some(ragged_axis) = nested_ragged_axis {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "`{}` does not support bounded ragged dimension `{}`, whose per-item extents vary over axes \
-                         other than the batch axis",
-                        self.name(),
-                        ragged_axis.dimension(),
-                    ),
-                });
-            }
-        }
-
         let input = match input.batch_axis_position() {
-            None if idempotent => return Ok(vec![input.clone()].into()),
+            None if idempotent => return Ok(vec![input.clone()]),
             None => P::match_axis(context, input, Axis::from(0usize))?,
             Some(_) => input.clone(),
         };
         let batch_axis = input.batch_axis_position().unwrap();
-
-        // Padding along every ragged axis is replaced with the reduction identity, so that it cannot contribute to the
-        // result, and each surviving ragged extent is the maximum of the participants' extents. A mean has no identity
-        // but never reaches this point with ragged axes, and a payload-free structural zero needs no masking, because
-        // every one of its elements, padding included, is the same zero.
-        let masked_axes = input.ragged_axes().iter().map(RaggedAxis::axis).collect::<Vec<_>>();
-        let input = match RaggedMaskIdentity::from_reduction_kind(self.kind) {
-            Some(identity) if !input.unbatched_type().data_type().is_zero() => {
-                P::mask_identity_input(context, &input, masked_axes.as_slice(), identity)?
-            }
-            _ => input,
-        };
         let output = input.value().reduce(&[batch_axis], self.kind)?;
-
-        // The policy aggregates the participants' extents and keeps the aggregate within the ragged dimension's
-        // bounds when the batch may be empty.
-        let ragged_axes = input
-            .ragged_axes()
-            .iter()
-            .map(|ragged_axis| {
-                let extents = match ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis) {
-                    None => ragged_axis.extents().clone(),
-                    Some(extent_batch_axis) => P::aggregate_participant_extents(
-                        context,
-                        ragged_axis.extents(),
-                        extent_batch_axis,
-                        ragged_axis.dimension(),
-                    )?,
-                };
-                Ok(RaggedAxis::new(
-                    ragged_axis.axis() - usize::from(batch_axis < ragged_axis.axis()),
-                    extents,
-                    ragged_axis.dimension().clone(),
-                    ragged_axis
-                        .extent_axes()
-                        .iter()
-                        .filter_map(|axis| (*axis != batch_axis).then_some(*axis - usize::from(batch_axis < *axis)))
-                        .collect(),
-                ))
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        Ok(vec![ArrayBatch::new(output, BatchAxis::replicated())?.with_ragged_axes(ragged_axes)?].into())
+        Ok(vec![ArrayBatch::new(output, BatchAxis::replicated())?])
     }
 }
 
@@ -803,126 +718,6 @@ impl<
     }
 }
 
-/// Optional extension of [`RaggedArrayExtentBatchingPolicy`] that combines per-participant ragged extents for
-/// [`ParallelReduceOperation`] batching. Aggregation retains the ragged axis after the participant axis is removed,
-/// whereas the masking policy supplies the reduction identity for each participant's padding.
-///
-/// Policies implement this capability when they support batching parallel reductions. Keeping it separate allows
-/// ordinary ragged masking rules to work without the maximum, reduction, and constant construction operations needed
-/// for extent aggregation. Custom policies may provide their own aggregation while preserving the dimension bounds.
-/// [`StaticArrayExtentBatchingPolicy`] rejects ragged aggregation; [`DynamicArrayExtentBatchingPolicy`] computes the
-/// maximum and supplies a valid extent for an empty set of participants.
-pub trait RaggedArrayExtentAggregationBatchingPolicy<C: Context<Type = ArrayType>>:
-    RaggedArrayExtentBatchingPolicy<C>
-{
-    /// Returns the aggregate extent of a bounded ragged axis over every participant of a collective, which is the
-    /// maximum of the per-participant `extents` along `extent_batch_axis`. A collective may run over no participants
-    /// when the mapped extent is zero, and a maximum over no values is not an extent, so the aggregate is raised to the
-    /// lower bound of `dimension`, which keeps it within the bounds that the surviving ragged axis declares. Every
-    /// actual extent already lies at or above that bound, so the clamp changes nothing for a non-empty batch.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
-    ///   - `extents`: Per-participant extents of the ragged axis, which vary over the mapped batch axis only.
-    ///   - `extent_batch_axis`: Axis of `extents` that indexes the participants.
-    ///   - `dimension`: Dynamic dimension that the extents instantiate, whose lower bound the aggregate must respect.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`BatchingError`] when the policy cannot aggregate ragged extents or the dimension's lower bound
-    /// cannot be represented, and propagates errors from the aggregation operations.
-    fn aggregate_participant_extents(
-        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-        extents: &C::Value,
-        extent_batch_axis: usize,
-        dimension: &DimensionVariable,
-    ) -> Result<C::Value, BatchingError>;
-}
-
-impl<C: Context<Type = ArrayType>> RaggedArrayExtentAggregationBatchingPolicy<C> for StaticArrayExtentBatchingPolicy
-where
-    Self: RaggedArrayExtentBatchingPolicy<C>,
-{
-    #[inline]
-    fn aggregate_participant_extents(
-        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-        _extents: &C::Value,
-        _extent_batch_axis: usize,
-        dimension: &DimensionVariable,
-    ) -> Result<C::Value, BatchingError> {
-        // Static array batching never creates bounded ragged axes, so it has no per-participant extents to aggregate.
-        // A ragged carrier reaching this hook through the public `ArrayBatch::with_ragged_axes` is rejected, like the
-        // masking hooks reject it, rather than aggregated without the dynamic policy's bounds reasoning.
-        Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "static array batching cannot aggregate the extents of bounded ragged dimension `{dimension}`"
-            ),
-        })
-    }
-}
-
-impl<C: ContextProjection<ArrayType, Type = ArrayIrType>>
-    RaggedArrayExtentAggregationBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
-where
-    C::Value: ValueProjection<ArrayType, Projected: Max + Reduce>,
-    C::Operation: OperationProjection<ArrayType, Projected: From<ConstantOperation<Array>>>,
-    Self: RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>,
-{
-    fn aggregate_participant_extents(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-        extents: &<C::Value as ValueProjection<ArrayType>>::Projected,
-        extent_batch_axis: usize,
-        dimension: &DimensionVariable,
-    ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
-        let aggregate = extents.reduce(&[extent_batch_axis], ReductionKind::Max)?;
-
-        // The mapped extent is a first-class dimension value, so the batch can be empty only when its bounds admit
-        // zero. The clamp is then staged against a constant of the extents' own data type.
-        if Self::axis_dimension(context)?.bounds().lower() > 0 {
-            return Ok(aggregate);
-        }
-
-        let lower = i64::try_from(dimension.bounds().lower()).map_err(|_| BatchingError::UnsupportedOperation {
-            message: format!("lower bound of bounded ragged dimension `{dimension}` exceeds the `i64` extent range"),
-        })?;
-
-        // The constant is built in the extents' data type, which must represent the lower bound exactly, and in the
-        // aggregate's memory space, so that the clamp never combines values that live in different spaces.
-        let aggregate_type = aggregate.r#type().into_owned();
-        let representable = dispatch_on_array_element_type!(aggregate_type.data_type(), |Element| {
-            <Element as ArrayElement>::from_signed(lower)?.convert_to::<i64>()? == lower
-        });
-        if !representable {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "lower bound {} of bounded ragged dimension `{}` is not representable \
-                     in the extents data type `{}`",
-                    lower,
-                    dimension,
-                    aggregate_type.data_type(),
-                ),
-            });
-        }
-
-        let lower = dispatch_on_array_element_type!(aggregate_type.data_type(), |Element| {
-            Array::scalar(<Element as ArrayElement>::from_signed(lower)?)?
-        });
-
-        let lower = Array::new(
-            lower.r#type().into_owned().with_memory(aggregate_type.memory()),
-            lower.storage_bytes().to_vec(),
-        )?;
-
-        let mut lower = context.parent().bind(ConstantOperation::new(lower), Vec::new(), &[])?;
-        check_count!("output", lower, 1, ProgramError);
-        Ok(aggregate.max(&lower.remove(0))?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -932,14 +727,12 @@ mod tests {
 
     use ryft_macros::Operation;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
-    use crate::arrays::types::memories::Memory;
     use crate::arrays::{
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
-    use crate::contexts::{EagerContext, StagingContext};
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
         TranspositionContext, differentiate_at,
@@ -949,7 +742,7 @@ mod tests {
     use crate::operations::reductions::ReduceOperation;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
-    use crate::programs::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, Typed, ValueProjection};
     use crate::tests::hash_of;
     use crate::tracing::TracingContext;
 
@@ -973,22 +766,6 @@ mod tests {
     /// Binds `"m"` as a manual axis of `mesh` for [`TracingContext::trace_with_named_axes`].
     fn manual_mesh_axes(mesh: &LogicalMesh) -> Vec<(String, NamedAxis)> {
         vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: mesh.axis_size("m").unwrap(), mesh: mesh.clone() })]
-    }
-
-    /// Packs `values` as two batch items of three elements each, along a bounded ragged axis of dimension `length`
-    /// whose extents are one and two, so that the last two elements of the first item and the last element of the
-    /// second item are padding.
-    fn ragged_batch<T: ArrayElement>(values: Vec<T>, length: &DimensionVariable) -> ArrayBatch<Array> {
-        ragged_array_batch(Array::matrix(2, 3, values).unwrap(), Array::vector(vec![1i32, 2]).unwrap(), length, 1)
-            .unwrap()
-    }
-
-    /// Wraps `values` as the replicated reduction of a [`ragged_batch`] across its batch items, whose ragged axis keeps
-    /// the largest extent of the two items.
-    fn ragged_reduction<T: ArrayElement>(values: Vec<T>, length: &DimensionVariable) -> ArrayBatch<Array> {
-        ArrayBatch::replicated(Array::vector(values).unwrap())
-            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i32).unwrap(), length.clone(), Vec::new())])
-            .unwrap()
     }
 
     #[test]
@@ -1690,7 +1467,7 @@ mod tests {
         let input =
             ArrayBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 3])), BatchAxis::new(1)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 3).with_axis_name("j".to_string());
-        let outputs = sum.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
+        let outputs = sum.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
         let program = trace
@@ -1729,16 +1506,14 @@ mod tests {
             DenseOperation::ParallelReduce(ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string()));
         let input = ArrayBatch::new(Array::vector(vec![2i32, 3]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|outputs| outputs.into_parts().0),
+            operation.batch(&context, &EmptyRegionDriver, &[input]),
             Ok(vec![ArrayBatch::replicated(Array::scalar(5i32).unwrap())]),
         );
     }
 
     #[test]
     fn test_parallel_reduce_batching_mesh() {
-        // A level that binds another axis forwards a mesh reduction to its parent with its mapped and ragged axes
-        // intact, exactly as it does its adjoint `parallel_vary`, while a level that binds the same name cannot stand
-        // in for the manual mesh axis.
+        // Dense mapped inputs keep their per-item shape when forwarded across a different named axis.
         let (mesh, _, _) = mesh_scalar_types();
         let operation = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh.clone());
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -1747,15 +1522,11 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["m"]).unwrap())
                 .unwrap(),
         );
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ragged_array_batch(packed, extents, &length, 1).unwrap();
+        let input = ArrayBatch::new(packed, BatchAxis::new(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2).with_axis_name("i".to_string());
-        let outputs =
-            operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
+        let outputs = operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), input.batch_axis());
-        assert_eq!(outputs[0].ragged_axes(), input.ragged_axes());
         assert_eq!(
             outputs[0].value().r#type().as_ref(),
             &ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(Sharding::replicated(mesh, 2)).unwrap(),
@@ -1766,7 +1537,7 @@ mod tests {
             .clone()
             .build::<Vec<Array>, Vec<Array>>(
                 vec![outputs[0].value().atom_id().unwrap()],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
@@ -1774,11 +1545,10 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda \
-                    %0:f32[2, 3][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [{}, {}], varying_manual={'m'}}], \
-                    %1:i32[2] .
-                let %2:f32[2, 3][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [{}, {}]}] = \
+                    %0:f32[2, 3][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [{}, {}], varying_manual={'m'}}] .
+                let %1:f32[2, 3][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [{}, {}]}] = \
                         parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
-                in (%2)"
+                in (%1)"
             },
         );
 
@@ -1786,9 +1556,7 @@ mod tests {
             BatchingContext::<_, ArrayBatchingPolicy>::new(TracingContext::<Array, ArrayOperation<Array>>::new(), 2)
                 .with_axis_name("m".to_string());
         assert_eq!(
-            operation
-                .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-                .map(|outputs| outputs.into_parts().0),
+            operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_reduce` over a manual mesh axis cannot bind a named batch axis".to_string(),
             }),
@@ -1830,337 +1598,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_reduce_batching_ragged() {
-        // Padding is replaced with the reduction identity before the participants are combined, and each surviving
-        // ragged extent is the maximum of the participants' extents, so positions that no participant covers hold the
-        // identity.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let sum = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
-        let max = ParallelReduceOperation::new(ReductionKind::Max, "i".to_string());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("i".to_string());
-        assert_eq!(
-            sum.batch(
-                &context,
-                &EmptyRegionDriver,
-                &[ragged_batch(vec![1.0f32, 100.0, 100.0, 2.0, 3.0, 100.0], &length)],
-            )
-            .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![3.0f32, 3.0, 0.0], &length)]),
-        );
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Product, "i".to_string())
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ragged_batch(vec![2.0f32, 100.0, 100.0, 3.0, 4.0, 100.0], &length)],
-                )
-                .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![6.0f32, 4.0, 1.0], &length)]),
-        );
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::LogSumExp, "i".to_string())
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ragged_batch(vec![5.0f32, 100.0, 100.0, f32::NEG_INFINITY, 4.0, 100.0], &length)],
-                )
-                .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![5.0f32, 4.0, f32::NEG_INFINITY], &length)]),
-        );
-        assert_eq!(
-            max.batch(
-                &context,
-                &EmptyRegionDriver,
-                &[ragged_batch(vec![-5.0f32, 100.0, 100.0, -3.0, -4.0, 100.0], &length)],
-            )
-            .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![-3.0f32, -4.0, f32::NEG_INFINITY], &length)]),
-        );
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Min, "i".to_string())
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ragged_batch(vec![5.0f32, -100.0, -100.0, 3.0, 4.0, -100.0], &length)],
-                )
-                .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![3.0f32, 4.0, f32::INFINITY], &length)]),
-        );
-
-        // Boolean padding is replaced with `false` for disjunctions and with `true` for conjunctions.
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Any, "i".to_string())
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ragged_batch(vec![false, true, true, false, false, true], &length)],
-                )
-                .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![false, false, false], &length)]),
-        );
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::All, "i".to_string())
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ragged_batch(vec![true, false, false, true, true, false], &length)],
-                )
-                .map(|outputs| outputs.into_parts().0),
-            Ok(vec![ragged_reduction(vec![true, true, true], &length)]),
-        );
-
-        // A mean has no single implied denominator for ragged inputs.
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string())
-                .batch(&context, &EmptyRegionDriver, &[ragged_batch(vec![1.0f32; 6], &length)])
-                .map(|outputs| outputs.into_parts().0),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_reduce` with kind `mean` does not define a denominator for bounded ragged inputs"
-                    .to_string(),
-            }),
-        );
-
-        // Static array batching never creates bounded ragged axes, so it rejects a ragged input instead of reducing its
-        // padding.
-        assert_eq!(
-            batch_collective(&sum, "i", 2, ragged_batch(vec![1.0f32; 6], &length)),
-            Err(BatchingError::UnsupportedOperation {
-                message: "static array batching cannot identity-mask bounded ragged dimension `length` on axis 1 with \
-                          `Zero`"
-                    .to_string(),
-            }),
-        );
-
-        // Under a staging parent with a dynamic extent, the masks and both reductions are staged. A sum masks padding
-        // with a zero of the input's own type.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
-        let packed = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
-                .into(),
-        );
-        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(trace.clone()),
-            batch_extent,
-        )
-        .with_axis_name("i".to_string());
-        let input = ragged_array_batch(packed.into_projected().unwrap(), extents.into_projected().unwrap(), &length, 1)
-            .unwrap();
-        let output = sum.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
-        assert_eq!(output.batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.ragged_axes().len(), 1);
-        let ragged_axis = &output.ragged_axes()[0];
-        assert_eq!((ragged_axis.axis(), ragged_axis.dimension(), ragged_axis.extent_axes()), (0, &length, &[][..]));
-        let extent = ragged_axis.extents().clone().into_value().atom_id().unwrap();
-        let value = output.into_value().into_value().atom_id().unwrap();
-        let program = trace
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![value, extent],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:i32[items] .
-                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
-                    %4:dimension<3> = constant [value=3]
-                    %5:i32[3] = iota [type=i32[3], dimension=0]
-                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4
-                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4
-                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7
-                    %9:f32[items, 3] = zero_like %1
-                    %10:f32[items, 3] = select %8 %1 %9
-                    %11:f32[3] = reduce [kind=sum, axes=[0]] %10
-                    %12:i32[] = reduce [kind=max, axes=[0]] %2
-                in (%11, %12)"
-            },
-        );
-
-        // A maximum masks padding with a broadcast negative infinity.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
-        let packed = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
-                .into(),
-        );
-        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(trace.clone()),
-            batch_extent,
-        )
-        .with_axis_name("i".to_string());
-        let input = ragged_array_batch(packed.into_projected().unwrap(), extents.into_projected().unwrap(), &length, 1)
-            .unwrap();
-        let output = max.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
-        assert_eq!(output.batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.ragged_axes().len(), 1);
-        let ragged_axis = &output.ragged_axes()[0];
-        assert_eq!((ragged_axis.axis(), ragged_axis.dimension(), ragged_axis.extent_axes()), (0, &length, &[][..]));
-        let extent = ragged_axis.extents().clone().into_value().atom_id().unwrap();
-        let value = output.into_value().into_value().atom_id().unwrap();
-        let program = trace
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![value, extent],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:i32[items] .
-                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
-                    %4:dimension<3> = constant [value=3]
-                    %5:i32[3] = iota [type=i32[3], dimension=0]
-                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4
-                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4
-                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7
-                    %9:f32[] = constant [value=-inf]
-                    %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4
-                    %11:f32[items, 3] = select %8 %1 %10
-                    %12:f32[3] = reduce [kind=max, axes=[0]] %11
-                    %13:i32[] = reduce [kind=max, axes=[0]] %2
-                in (%12, %13)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_parallel_reduce_batching_ragged_rejects_nested_extents() {
-        // The column extents vary over the rows as well as over the batch axis, and a maximum over the participants
-        // alone would mix live extents with those of padded rows, so the reduction is rejected before executing.
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(3)).unwrap());
-        let columns = DimensionVariable::new("columns", DimensionBounds::new(0, Some(4)).unwrap());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("i".to_string());
-        let input = ArrayBatch::new(
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 3]), &[1f32; 12]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(vec![
-            RaggedAxis::new(1, Array::vector(vec![1i64, 2]).unwrap(), rows, vec![0]),
-            RaggedAxis::new(2, Array::matrix(2, 2, vec![1i64, 3, 2, 1]).unwrap(), columns, vec![0, 1]),
-        ])
-        .unwrap();
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|outputs| outputs.into_parts().0),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_reduce` does not support bounded ragged dimension `columns`, whose per-item \
-                          extents vary over axes other than the batch axis"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_parallel_reduce_batching_ragged_empty_batch() {
-        // A maximum over no participants is not an extent, so the aggregate extent of an empty batch is the ragged
-        // dimension's lower bound, which keeps the surviving ragged axis within its declared bounds.
-        for lower in [0, 2] {
-            let length = DimensionVariable::new("length", DimensionBounds::new(lower, Some(4)).unwrap());
-            let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-                ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
-                ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()),
-            )
-            .with_axis_name("i".to_string());
-            let input = ragged_array_batch(
-                Array::matrix(0, 3, Vec::<f32>::new()).unwrap(),
-                Array::vector(Vec::<i64>::new()).unwrap(),
-                &length,
-                1,
-            )
-            .unwrap();
-            assert_eq!(
-                ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
-                    .batch(&context, &EmptyRegionDriver, &[input])
-                    .map(|outputs| outputs.into_parts().0),
-                Ok(vec![
-                    ArrayBatch::replicated(Array::vector(vec![0f32; 3]).unwrap())
-                        .with_ragged_axes(vec![RaggedAxis::new(
-                            0,
-                            Array::scalar(lower as i64).unwrap(),
-                            length,
-                            Vec::new(),
-                        )])
-                        .unwrap(),
-                ]),
-            );
-        }
-
-        // The lower-bound constant lives in the extents' memory space, so host-resident extents stay on the host.
-        let host = Memory::Host { pinned: false };
-        let length = DimensionVariable::new("length", DimensionBounds::new(2, Some(4)).unwrap());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
-            ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()),
-        )
-        .with_axis_name("i".to_string());
-        let input = ragged_array_batch(
-            Array::matrix(0, 3, Vec::<f32>::new()).unwrap().transfer_to_memory(host).unwrap(),
-            Array::vector(Vec::<i64>::new()).unwrap().transfer_to_memory(host).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|outputs| outputs.into_parts().0),
-            Ok(vec![
-                ArrayBatch::replicated(Array::vector(vec![0f32; 3]).unwrap().transfer_to_memory(host).unwrap())
-                    .with_ragged_axes(vec![RaggedAxis::new(
-                        0,
-                        Array::scalar(2i64).unwrap().transfer_to_memory(host).unwrap(),
-                        length,
-                        Vec::new(),
-                    )])
-                    .unwrap(),
-            ]),
-        );
-
-        // A lower bound that the extents' data type cannot represent is rejected rather than wrapped.
-        let length = DimensionVariable::new("length", DimensionBounds::new(128, Some(130)).unwrap());
-        let input = ragged_array_batch(
-            Array::matrix(0, 129, Vec::<f32>::new()).unwrap(),
-            Array::vector(Vec::<i8>::new()).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|outputs| outputs.into_parts().0),
-            Err(BatchingError::UnsupportedOperation {
-                message: "lower bound 128 of bounded ragged dimension `length` is not representable in the extents \
-                          data type `i8`"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
     fn test_parallel_reduce_batching_dynamic_extent() {
         // A mean over a dynamic mapped extent divides by the runtime extent through the staged reduction.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -2178,8 +1615,6 @@ mod tests {
         let output = ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string())
             .batch(&context, &EmptyRegionDriver, &[input])
             .unwrap()
-            .into_parts()
-            .0
             .remove(0);
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
         let value = output.into_value().into_value().atom_id().unwrap();
@@ -2216,8 +1651,6 @@ mod tests {
         let output = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
             .batch(&context, &EmptyRegionDriver, &[ArrayBatch::replicated(input.into_projected().unwrap())])
             .unwrap()
-            .into_parts()
-            .0
             .remove(0);
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
         let value = output.into_value().into_value().atom_id().unwrap();

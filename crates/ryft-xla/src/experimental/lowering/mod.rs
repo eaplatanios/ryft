@@ -8,10 +8,9 @@ use ryft_core::{
     CustomCallOperation, DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation,
     DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
     LogicalMesh, Memory, OneLikeOperation, Operation, OperationPayloadProjection, Parameterized, ProgramError,
-    Provenance, RaggedAddOperation, RaggedExtentsOperation, RaggedNewOperation, RaggedStorageOperation, RaggedType,
-    RaggedZeroOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation,
-    Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed,
-    Value, ZeroLikeOperation,
+    Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
+    ShardMap, ShardMapOperation, Sharding, ShardingDimension, ShardingError, Type as RyftType, TypeError, Typed, Value,
+    ZeroLikeOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -121,10 +120,6 @@ pub enum LoweringError {
     /// Error returned when lowering encounters a type that does not have StableHLO support yet.
     #[error("unsupported data type `{data_type}` during XLA lowering")]
     UnsupportedDataType { data_type: DataType },
-
-    /// Error returned when a first-class ragged value reaches the backend before grouped lowering is available.
-    #[error("ragged type `{}` is not supported during XLA lowering", .r#type)]
-    UnsupportedRaggedType { r#type: RaggedType },
 
     /// Error returned when MLIR rejects the constructed dense-elements attribute.
     #[error("invalid dense elements attribute for data type `{data_type}` during XLA lowering")]
@@ -729,35 +724,6 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
     }
 }
 
-macro_rules! impl_unsupported_ragged_lowering {
-    ($($operation:ty),+ $(,)?) => {
-        $(
-            impl LowerableOperation for $operation {
-                fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-                    &self,
-                    _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
-                    _input_values: &[ValueRef<'b, 'c, 't>],
-                    _input_types: &[ArrayIrType],
-                    _output_types: &[ArrayIrType],
-                ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-                    // The payload remains stageable, but one-value replay cannot preserve its aggregate fields.
-                    Err(ProgramError::UnsupportedOperation {
-                        message: format!("`{}` must pass through grouped ragged XLA replay before primitive lowering", self.name()),
-                    }.into())
-                }
-            }
-        )+
-    };
-}
-
-impl_unsupported_ragged_lowering!(
-    RaggedNewOperation,
-    RaggedStorageOperation,
-    RaggedExtentsOperation,
-    RaggedZeroOperation,
-    RaggedAddOperation
-);
-
 impl LowerableOperation for XlaOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -794,11 +760,6 @@ impl LowerableOperation for XlaOperation {
             ReferenceFreeze,
             DimensionFromScalar,
             DimensionToScalar,
-            RaggedNew,
-            RaggedStorage,
-            RaggedExtents,
-            RaggedZero,
-            RaggedAdd,
             Reshape,
             Broadcast,
             Concatenate,
@@ -835,20 +796,16 @@ fn validate_local_output_placement(
     output_types: &[ArrayIrType],
     bound_manual_axes: &[String],
 ) -> Result<(), LoweringError> {
-    let assigns_bound_manual_axis = output_types.iter().try_fold(false, |assigned, output_type| {
+    let assigns_bound_manual_axis = output_types.iter().any(|output_type| {
         let sharding = match output_type {
             ArrayIrType::Array(output_type) => output_type.sharding(),
             ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
-            ArrayIrType::Ragged(r#type) => {
-                return Err(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() });
-            }
         };
-        Ok(assigned
-            || sharding.into_iter().flat_map(Sharding::dimensions).any(|dimension| match dimension {
-                ShardingDimension::Sharded(axes) => axes.iter().any(|axis| bound_manual_axes.contains(axis)),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-            }))
-    })?;
+        sharding.into_iter().flat_map(Sharding::dimensions).any(|dimension| match dimension {
+            ShardingDimension::Sharded(axes) => axes.iter().any(|axis| bound_manual_axes.contains(axis)),
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+        })
+    });
     if assigns_bound_manual_axis {
         return Err(ProgramError::UnsupportedOperation {
             message: format!("`{operation_name}` cannot assign bound manual mesh axes to local output dimensions"),
@@ -1794,7 +1751,6 @@ impl MlirLowerableValue for XlaArrayConstant {
         match self {
             Self::Captured(value) => Err(LoweringError::MissingCapturedConstant { index: value.index() }),
             Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
-            Self::Literal(value) => value.array().to_dense_elements_attribute(tensor_type, context),
         }
     }
 
@@ -1811,7 +1767,7 @@ impl MlirLowerableValue for XlaArrayConstant {
     {
         match self {
             Self::Captured(value) => lower_captured_constant(value, captured_values),
-            Self::Boolean(_) | Self::Literal(_) => lower_literal_value(self, block, context, location),
+            Self::Boolean(_) => lower_literal_value(self, block, context, location),
         }
     }
 }
@@ -2037,12 +1993,6 @@ where
     // bounded-dynamic replica lowering retains that metadata without emitting Shardy operations.
     let mut mesh = existing;
     for region in program.regions().iter() {
-        // Reuse the complete-arena walk to reject even dead or transport-only aggregates before one-value replay.
-        for atom in region.atoms() {
-            if let ArrayIrType::Ragged(r#type) = atom.r#type().as_ref() {
-                return Err(LoweringError::UnsupportedRaggedType { r#type: r#type.clone() });
-            }
-        }
         for instruction in region.instructions() {
             // Payloads are recognized through their projections, so any family that embeds them declares their meshes.
             let operation = instruction.operation();

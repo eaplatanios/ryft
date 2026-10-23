@@ -52,7 +52,7 @@ use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayType,
 };
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -167,12 +167,12 @@ impl<C: Context<Type = ArrayType, Operation: From<TagOperation<ArrayType>>>, P: 
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Batching re-binds the tag through the parent context over the packed value and keeps the input's batch
         // metadata. Treating the tag as an interpreted identity would drop it from staged batched programs, where
         // key-based consumers such as rematerialization policies look for it.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into())
+        context.forward_to_parent(C::Operation::from(self.clone()), inputs)
     }
 }
 

@@ -71,7 +71,6 @@ fn attention_backward_batch_roles(
 /// attention instead folds `[v, B, T, N, H]` to `[v * B, T, N, H]`. Biases and masks are first materialized to
 /// `[v, B, N, T, S]`, which handles every broadcastable rank and preserves mapped bias and mask inputs. Results reverse
 /// the normalization, and a bias cotangent is reduced over precisely the axes broadcast by its logical bias input.
-/// Bounded ragged inputs are rejected because this normalization does not transport per-item extent metadata.
 fn batch_attention_static<C, O>(
     operation: &O,
     context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
@@ -85,7 +84,6 @@ where
         + InterpretableBatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
 {
     check_count!("input", input_roles, inputs.len(), ProgramError);
-    ArrayBatch::reject_ragged_inputs(operation, inputs)?;
     let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_count = operation.infer_output_types(input_types.as_slice(), &[])?.len();
@@ -278,7 +276,6 @@ where
 /// This is the dynamic counterpart of [`batch_attention_static`]. It stages the same prefix normalization using mixed
 /// `broadcast` and `reshape` operations that take their result dimensions as ordinary staged inputs. Consequently a
 /// dynamic mapped extent, logical batch, or sequence length never becomes host metadata or a specialization key.
-/// Bounded ragged inputs are rejected before normalization, as in the static adapter.
 fn batch_attention_dynamic<C, O>(
     operation: &O,
     context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
@@ -302,7 +299,6 @@ where
     O: Operation<Type = ArrayType>,
 {
     check_count!("input", input_roles, inputs.len(), ProgramError);
-    ArrayBatch::reject_ragged_inputs(operation, inputs)?;
     let outer_context = context.parent().parent();
     if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
         let values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -482,9 +478,9 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let (input_roles, output_roles) = attention_forward_batch_roles(self.signature(), self.configuration());
-        Ok(batch_attention_static(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
+        Ok(batch_attention_static(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?)
     }
 }
 
@@ -500,7 +496,7 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let (input_roles, mut output_roles, bias_index) = attention_backward_batch_roles(self.signature());
         if let Some(index) = bias_index {
             let cotangent_type = inputs[index].unbatched_type().cotangent().map_err(TypeError::from)?;
@@ -508,7 +504,7 @@ where
                 output_roles.push(AttentionBatchOutput::Score(index));
             }
         }
-        Ok(batch_attention_static(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
+        Ok(batch_attention_static(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?)
     }
 }
 
@@ -541,12 +537,9 @@ where
         >,
         _driver: &D,
         inputs: &[ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>],
-    ) -> Result<
-        BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
-        BatchingError,
-    > {
+    ) -> Result<Vec<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>>, BatchingError> {
         let (input_roles, output_roles) = attention_forward_batch_roles(self.signature(), self.configuration());
-        Ok(batch_attention_dynamic(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
+        Ok(batch_attention_dynamic(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?)
     }
 }
 
@@ -579,10 +572,7 @@ where
         >,
         _driver: &D,
         inputs: &[ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>],
-    ) -> Result<
-        BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
-        BatchingError,
-    > {
+    ) -> Result<Vec<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>>, BatchingError> {
         let (input_roles, mut output_roles, bias_index) = attention_backward_batch_roles(self.signature());
         if let Some(index) = bias_index {
             let cotangent_type = inputs[index].unbatched_type().cotangent().map_err(TypeError::from)?;
@@ -590,6 +580,6 @@ where
                 output_roles.push(AttentionBatchOutput::Score(index));
             }
         }
-        Ok(batch_attention_dynamic(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
+        Ok(batch_attention_dynamic(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?)
     }
 }

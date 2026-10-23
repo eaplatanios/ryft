@@ -263,24 +263,6 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
         }
     }
 
-    fn consumed_type_identities(
-        &self,
-        input_types: &[Self::Type],
-    ) -> Result<Vec<<Self::Type as Type>::Identity>, TypeError> {
-        match self {
-            Self::Portable(operation) => operation.consumed_type_identities(input_types),
-            Self::Call(operation) => operation.consumed_type_identities(input_types),
-            Self::Scratch(operation) => operation.consumed_type_identities(input_types),
-            Self::TileLoad(operation) => operation.consumed_type_identities(input_types),
-            Self::AsyncCopy(operation) => operation.consumed_type_identities(input_types),
-            Self::Wait(operation) => operation.consumed_type_identities(input_types),
-            Self::MaskedLoad(operation) => operation.consumed_type_identities(input_types),
-            Self::MaskedStore(operation) => operation.consumed_type_identities(input_types),
-            Self::MaskedSwap(operation) => operation.consumed_type_identities(input_types),
-            Self::Extension(operation) => operation.consumed_type_identities(input_types),
-        }
-    }
-
     fn region_slots(&self) -> &'static [RegionSlot] {
         match self {
             Self::Portable(operation) => operation.region_slots(),
@@ -862,20 +844,12 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        ArrayIrValue, ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionVariable, RaggedDimension,
-        RaggedType, RaggedValueKind,
-    };
+    use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionVariable};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{
-        AddOperation, RaggedNewOperation, RaggedStorageOperation, ReferenceRead, ReferenceSwap, ScanOperation,
-        TagOperation,
-    };
-    use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType};
+    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, ScanOperation, TagOperation};
+    use crate::programs::{EmptyRegionDriver, ReferenceType};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -890,41 +864,36 @@ mod tests {
 
     #[test]
     fn test_kernel_operation_identity_forwarding() {
+        #[derive(Clone)]
+        struct IdentityDefiningOperation {
+            identity: DimensionVariable,
+        }
+
+        impl Operation for IdentityDefiningOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "identity_defining"
+            }
+
+            fn defined_type_identities(&self) -> Cow<'_, [DimensionVariable]> {
+                Cow::Borrowed(std::slice::from_ref(&self.identity))
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(Vec::new())
+            }
+        }
+
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        let r#type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
-        )
-        .unwrap();
-        let payload = ArrayIrOperation::<Array>::RaggedNew(RaggedNewOperation::new(r#type.clone()));
-        let storage = ArrayIrOperation::<Array>::RaggedStorage(RaggedStorageOperation);
-        for operation in [KernelOperation::Portable(storage.clone()), KernelOperation::Extension(storage)] {
-            assert_eq!(operation.consumed_type_identities(&[r#type.clone().into()]).unwrap(), vec![rows.clone()]);
-        }
-        let input_types = vec![r#type.storage_type().clone().into(), r#type.extent_types()[0].clone().into()];
-        for operation in [KernelOperation::Portable(payload.clone()), KernelOperation::Extension(payload)] {
-            assert_eq!(operation.defined_type_identities().as_ref(), std::slice::from_ref(&rows));
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<ArrayIrOperation<Array>>>::new();
-            let fields = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect();
-            let outputs = builder.add_instruction(operation, Vec::new(), fields, None).unwrap().to_vec();
-            let program = builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    outputs,
-                    vec![Placeholder; 2],
-                    vec![Placeholder],
-                )
-                .unwrap();
-            assert_eq!(program.type_identity_signature().internal_identities(), std::slice::from_ref(&rows));
-            assert_eq!(
-                program.to_string(),
-                indoc! {"
-                    lambda %0:f32[2, 3], %1:i64[2] .
-                    let %2:ragged<f32[2, 3]; 1:rows over [0]> = ragged_new \
-                        [output_type=ragged<f32[2, 3]; 1:rows over [0]>] %0 %1
-                    in (%2)"},
-            );
-        }
+        let extension = KernelOperation::Extension(IdentityDefiningOperation { identity: rows.clone() });
+        assert_eq!(extension.defined_type_identities().as_ref(), std::slice::from_ref(&rows));
+        let portable = KernelOperation::<IdentityDefiningOperation>::from(ArrayOperation::Add(AddOperation::new()));
+        assert!(portable.defined_type_identities().is_empty());
     }
 
     #[test]

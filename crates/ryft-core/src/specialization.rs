@@ -149,35 +149,35 @@ impl SpecializationCacheStatisticsAccumulator {
     /// Records a lookup served by a retained artifact.
     fn increment_hits(&self) {
         self.hits
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
             .unwrap();
     }
 
     /// Records a lookup that found no retained artifact.
     fn increment_misses(&self) {
         self.misses
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
             .unwrap();
     }
 
     /// Records an artifact published through a producer.
     fn increment_productions(&self) {
         self.productions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
             .unwrap();
     }
 
     /// Records a producer dropped without publishing an artifact.
     fn increment_abandoned_productions(&self) {
         self.abandoned_productions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
             .unwrap();
     }
 
     /// Records an artifact evicted by the bounded Least Recently Used (LRU) cache.
     fn increment_evictions(&self) {
         self.evictions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
             .unwrap();
     }
 

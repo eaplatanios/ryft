@@ -44,7 +44,7 @@ use crate::arrays::{
     Array, ArrayAddressing, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Broadcastable,
     DataType, DimensionType, DimensionValue,
 };
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -308,7 +308,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CompareOperation<ArrayIrType
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Dimension inputs describe one shared array shape and must therefore remain replicated; their Boolean array
         // output is replicated ordinary data.
         check_count!("input", inputs, 2, ProgramError);
@@ -321,8 +321,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CompareOperation<ArrayIrType
             .bind(*self, Vec::new(), &[left.value().clone(), right.value().clone()])?
             .into_iter()
             .map(ArrayIrBatch::replicated)
-            .collect::<Vec<_>>()
-            .into())
+            .collect::<Vec<_>>())
     }
 }
 
@@ -1142,23 +1141,10 @@ mod tests {
         let left = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         let right = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap()));
         let operation = CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan);
-        let (outputs, _) = operation.batch(&context, &EmptyRegionDriver, &[left, right.clone()]).unwrap().into_parts();
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &ArrayIrValue::Array(Array::scalar(true).unwrap()));
-
-        // A mapped dimension carries one extent per batch item, so it cannot stand in for one shared shape extent.
-        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(8)).unwrap());
-        let mapped = ArrayIrBatch::mapped_dimension(
-            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
-            BatchAxis::new(0),
-            dimension_type.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            operation.batch(&context, &EmptyRegionDriver, &[mapped, right]).map(|_| ()),
-            Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type), axis: BatchAxis::new(0) }),
-        );
     }
 
     #[test]

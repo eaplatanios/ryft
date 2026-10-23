@@ -35,9 +35,8 @@
 //!
 //! [`BatchingContext`] is one active batching level. It wraps the parent [`Context`] and stores the mapped extent,
 //! optional name, and sharding placement. [`BatchingTracer`] is the flowing value stamped with that level.
-//! [`BatchingPolicy`] selects the batch carrier, extent representation, operation-local validation evidence, and
-//! structurally batched program boundary for one value universe. [`BatchableOperation`] owns the semantic rule for one
-//! operation payload.
+//! [`BatchingPolicy`] selects the batch carrier, extent representation, and structurally batched program boundary
+//! for one value universe. [`BatchableOperation`] owns the semantic rule for one operation payload.
 //!
 //! The array carrier [`ArrayBatch`](crate::ArrayBatch) pairs a packed array with its mapped-axis position and exposes
 //! shared alignment and broadcasting operations. Genuinely [`ElementwiseOperation`](crate::ElementwiseOperation)
@@ -51,10 +50,8 @@
 //! An eager parent executes that work; a staging parent records it. Nested batching works without a side table because
 //! each outer carrier remains part of the inner level's parent value.
 //!
-//! Every rule returns [`BatchedOutputs`], pairing carriers with operation-local [`BatchingPolicy::Evidence`]. The
-//! active context passes the operation and evidence to the policy's output validator. Policies that enforce identity
-//! conservation query [`Operation::consumed_type_identities`] against logical input types. Evidence is discarded
-//! before the next operation, preventing rule-specific claims from escaping their application boundary.
+//! Every rule returns its output carriers directly. Array shapes remain rectangular: a shared dynamic extent is
+//! supported, while an extent that depends on mapped data is rejected before it can define a per-item shape.
 //!
 //! # Nested Programs
 //!
@@ -78,9 +75,9 @@
 //! need no rules at all as [`batch_replicated_projected_operation`] binds them once in the parent context.
 //!
 //! A new value universe supplies a [`BatchingPolicy`] and, for the public entry point, a
-//! [`BatchingEntrypointPolicy`]. Add [`RecursiveBatchingPolicy`] only when its region programs can be transformed and
-//! their carrier metadata restored across opaque boundaries. Invalid axis, extent, metadata, projection, and region
-//! contracts must return an exact [`BatchingError`] rather than panic.
+//! [`BatchingEntrypointPolicy`]. Add [`RecursiveBatchingPolicy`] when its region programs support structural batching
+//! and return their output batch axes. Invalid axis, extent, metadata, projection, and region contracts must return an
+//! exact [`BatchingError`] rather than panic.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -597,9 +594,8 @@ pub trait BatchableType: Type {
 ///   - **The Batch Carrier (i.e., [`Self::Batch`]):** A batched value maintains a split between its unbatched per-item
 ///     type and the parent-owned packed value that stores the whole batch. How that split is represented is specific
 ///     to each value kind: an ordinary array gains a mapped axis in its packed shape (i.e.,
-///     [`ArrayBatch`](crate::ArrayBatch)), while a first-class dimension has no mapped representation at all (as a
-///     per-item extent would be a ragged shape), and so a composite carrier must keep dimension members replicated and
-///     reject mapped non-array members.
+///     [`ArrayBatch`](crate::ArrayBatch)), while a first-class dimension is shared shape metadata.
+///     A composite carrier therefore keeps dimension members replicated and rejects mapped dimension members.
 ///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while a
 ///     composite universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
 ///     remains a Single Static Assignment (SSA) value flowing through instruction inputs rather than being treated as
@@ -616,27 +612,12 @@ pub trait BatchableType: Type {
 /// an existing array rule). Batching nested [`Region`](crate::Region) support is provided separately by the
 /// [`RecursiveBatchingPolicy`] trait, allowing a batching carrier to support region-free operations without
 /// also supporting recursive transformation of nested programs.
-///
-/// Carrier metadata that is not represented by [`Type`] is guarded at the three boundaries where it could otherwise
-/// escape the policy's sight. Every rule application is checked by [`Self::validate_operation_outputs`] against the
-/// rule's [`Self::Evidence`], member projection transports it through [`BatchingPolicyProjection::project_batch`] and
-/// [`BatchingPolicyProjection::lift_batch`], and an opaque batched-region rebuild recovers it through
-/// [`RecursiveBatchingPolicy::restore_batch`].
 pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Batch-carrying representation for values owned by `C`.
     type Batch: Clone + Debug + Display + Parameter;
 
     /// Representation of the mapped-axis extent.
     type Extent: Clone + Debug;
-
-    /// Operation-local validation evidence produced by one [`BatchableOperation`] rule application and consumed by
-    /// [`Self::validate_operation_outputs`]. Evidence records what a rule did that its outputs alone cannot show, such
-    /// as that the rule deliberately consumed carrier metadata instead of dropping it. It is created by the rule, read
-    /// once at the validation boundary, and dropped there, so it must never outlive that rule invocation. Policies
-    /// whose carriers hold no metadata beyond [`Type`] use `()`. The [`Default`] bound is what lets the overwhelming
-    /// majority of rules return a plain [`Vec`] of carriers converted through [`BatchedOutputs`]'s [`From`]
-    /// implementation, without naming evidence they do not produce.
-    type Evidence: Default;
 
     /// Result of structurally batching a nested [`Program`], including any policy-owned bookkeeping widening of the
     /// program boundary. Refer to the documentation of [`Self::adapt_batched_program`] for how consumers shed that
@@ -682,67 +663,17 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ///
     /// # Errors
     ///
-    /// Returns a [`BatchingError`] when a mapped `input` has a type that cannot carry a batch axis, or when `input`
-    /// carries per-item metadata that a lifted declaration cannot relate (e.g., the per-item extents of a bounded
-    /// ragged axis). Implementations may also reject a `declared` type that does not describe `input`. Diagnostics
-    /// name the offending type rather than an operation, so callers that want to attribute an error to an operation
-    /// must map it themselves.
+    /// Returns a [`BatchingError`] when a mapped `input` has a type that cannot carry a batch axis. Implementations may
+    /// also reject a `declared` type that does not describe `input`. Diagnostics name the offending type rather than an
+    /// operation, so callers that want to attribute an error to an operation must map it themselves.
     fn batched_type(
         context: &BatchingContext<C, Self>,
         input: &Self::Batch,
         declared: &C::Type,
     ) -> Result<C::Type, BatchingError>;
 
-    /// Returns the per-item type represented by `batch` after removing its mapped batch axis, if any. The carrier's
-    /// packed value and metadata determine this type, so no separate declaration or batching context is needed.
+    /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type>;
-
-    /// Validates the batch carriers produced by one operation's batching rule against the carriers that rule consumed.
-    /// The batching transform calls this hook after every rule, including rules replayed directly inside a nested
-    /// region, and before exposing their outputs to subsequent operations. The default accepts every transition.
-    /// A policy whose carrier owns semantic metadata that is absent from [`Type`] overrides this method to reject
-    /// transitions that would silently drop that metadata. The operation's semantic declarations permit consumption;
-    /// `evidence` records additional facts specific to this batching rule application. Query
-    /// [`Operation::consumed_type_identities`] using the logical input types returned by [`Self::unbatched_type`],
-    /// and propagate errors from the operation's own validation of that declaration.
-    ///
-    /// This is a carrier-invariant boundary and not an additional batching rule. The outputs are borrowed immutably,
-    /// so an implementation can accept or reject a transition but cannot rewrite one. The evidence is owned by the
-    /// transform for the duration of this call alone and is dropped immediately afterward, so one rule's evidence can
-    /// never be observed by the operations that follow it.
-    ///
-    /// The division of labor is deliberate. This hook states the policy-owned conservation law once and applies it
-    /// uniformly to the open set of [`BatchableOperation`] rules, precisely because the rules cannot police that law
-    /// themselves: the defect class is a rule that is oblivious to the carrier metadata, and an oblivious rule does
-    /// not know it should check anything. Semantic permission to omit an input identity comes from
-    /// [`Operation::consumed_type_identities`]; additional transform-specific facts arrive as [`Self::Evidence`].
-    /// Implementations use these semantic hooks and evidence rather than matching concrete operation variants or
-    /// branching on [`Operation::name`], which is used only for diagnostics.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Original [`Operation`] whose batching rule produced `outputs`.
-    ///   - `inputs`: Batch carriers supplied to that rule.
-    ///   - `outputs`: Batch carriers produced by that rule.
-    ///   - `evidence`: Operation-local [`Self::Evidence`] that the rule returned alongside `outputs`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`BatchingError`] when the policy rejects the transition or a semantic declaration used to justify
-    /// it is invalid.
-    #[inline]
-    fn validate_operation_outputs(
-        operation: &C::Operation,
-        inputs: &[Self::Batch],
-        outputs: &[Self::Batch],
-        evidence: &Self::Evidence,
-    ) -> Result<(), BatchingError> {
-        let _ = operation;
-        let _ = inputs;
-        let _ = outputs;
-        let _ = evidence;
-        Ok(())
-    }
 
     /// Returns the parent-owned bookkeeping values that this policy's structurally batched programs require
     /// prepended to the instruction inputs that feed their source region inputs when they are rebound as ordinary
@@ -833,10 +764,9 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
 /// structurally batched program boundary. It cannot by itself determine how each member type of a composite context
 /// should represent those concepts. For example, an array member needs an [`ArrayBatch`](crate::ArrayBatch) carrier
 /// that may hold a mapped axis. Every projected policy must nevertheless preserve the outer policy's exact
-/// mapped-extent and validation-evidence representations. This type-indexed relation records that choice independently
-/// for every supported `(C, T)` pair. A member whose values are shared by every batch item (e.g., a first-class
-/// dimension, since a different dimension per batch item would require a ragged value model) needs no member policy
-/// at all and implements [`ReplicatedBatchingPolicyProjection`] instead.
+/// mapped-extent representation. This type-indexed relation records that choice independently for every supported
+/// `(C, T)` pair. A member whose values are shared by every batch item, such as a first-class dimension, needs no
+/// member policy and implements [`ReplicatedBatchingPolicyProjection`] instead.
 ///
 /// Note that this trait carries no runtime state. Implementing it only establishes the associated
 /// [`Projected`](Self::Projected) policy used by [`batch_projected_operation`]. Unsupported member projections simply
@@ -846,70 +776,9 @@ pub trait BatchingPolicyProjection<C: Context, T: Type>: BatchingPolicy<C>
 where
     ProjectedContext<C, T>: Context,
 {
-    /// [`BatchingPolicy`] used while applying the projected member operation's batching rule. Its extent and evidence
-    /// representations must be identical to the outer policy's, so projection never specializes or reconstructs the
-    /// mapped extent, and a member rule's validation evidence crosses the projection boundary unchanged on its way to
-    /// the outer policy's [`BatchingPolicy::validate_operation_outputs`].
-    type Projected: BatchingPolicy<ProjectedContext<C, T>, Extent = Self::Extent, Evidence = Self::Evidence>;
-
-    /// Converts one outer carrier into the member policy's carrier, at the boundary where a projected member-family
-    /// rule runs. The default preserves exactly the canonical pair, the packed value and the mapped [`BatchAxis`],
-    /// which is the complete conversion for a carrier that holds nothing else. A policy whose carrier owns additional
-    /// semantic metadata (e.g., bounded ragged axes and the logical unbatched type) must override this method so the
-    /// member rule observes that metadata, projecting any values embedded in it (e.g., per-item extent vectors) into
-    /// the member universe as well.
-    ///
-    /// Silently dropping carrier metadata here is equivalent to a rule dropping it, except that it also escapes
-    /// detection. The outer policy's [`BatchingPolicy::validate_operation_outputs`] sees only what survives this
-    /// conversion, so a narrowed input carrier makes the conservation check vacuous. A projection that cannot represent
-    /// some metadata in the member carrier must therefore fail with an exact diagnostic naming what it cannot carry,
-    /// rather than narrow the carrier and continue.
-    ///
-    /// The supplied parent context is the active context owning the packed value. An implementation may bind explicit
-    /// representation operations through it to project an opaque value while preserving its dependencies and enclosing
-    /// transforms. The default needs no additional context capabilities and ignores this argument.
-    ///
-    /// [`Self::lift_batch`] is the inverse boundary crossing.
-    #[inline]
-    fn project_batch(
-        _context: &C,
-        batch: &Self::Batch,
-    ) -> Result<<Self::Projected as BatchingPolicy<ProjectedContext<C, T>>>::Batch, BatchingError>
-    where
-        C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-        ProjectedContext<C, T>: Context<Value = <C::Value as ValueProjection<T>>::Projected>,
-    {
-        Self::Projected::batch(C::Value::into_projected(Self::value(batch).clone())?, Self::batch_axis(batch))
-    }
-
-    /// Converts one member-policy carrier back into the outer carrier, the inverse boundary crossing of
-    /// [`Self::project_batch`]. _Lift_ names the member-to-composite direction here, matching the member-lifting
-    /// [`From`] conversions between the two value families. The default restores the canonical pair, the packed value
-    /// and the mapped [`BatchAxis`]. A policy that overrode [`Self::project_batch`] must restore everything that
-    /// conversion carried down and map any values embedded in that metadata back into the outer universe.
-    ///
-    /// Projecting, applying the member rule, and lifting must present the member rule's outputs to the outer policy's
-    /// [`BatchingPolicy::validate_operation_outputs`] exactly as a native (i.e., unprojected) rule's outputs would be
-    /// presented. That round trip is what lets the conservation law judge member rules and native rules by one
-    /// standard instead of exempting whatever crossed a projection. The supplied parent context is the same active
-    /// context that [`Self::project_batch`] receives, so reconstruction can bind representation operations there. The
-    /// original invocation inputs let a policy preserve its composite representation choices without adding provenance
-    /// to the homogeneous carrier. They do not establish a positional correspondence between an output and any input.
-    /// The default ignores both the context and inputs and requires no additional context capabilities.
-    #[inline]
-    fn lift_batch(
-        context: &C,
-        batch: &<Self::Projected as BatchingPolicy<ProjectedContext<C, T>>>::Batch,
-        inputs: &[Self::Batch],
-    ) -> Result<Self::Batch, BatchingError>
-    where
-        C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-        ProjectedContext<C, T>: Context<Value = <C::Value as ValueProjection<T>>::Projected>,
-    {
-        let _ = context;
-        let _ = inputs;
-        Self::batch(C::Value::from_projected(Self::Projected::value(batch).clone()), Self::Projected::batch_axis(batch))
-    }
+    /// [`BatchingPolicy`] used while applying the projected member operation's batching rule. Its mapped extent
+    /// representation must be identical to the outer policy's, so projection never specializes that extent.
+    type Projected: BatchingPolicy<ProjectedContext<C, T>, Extent = Self::Extent>;
 }
 
 /// Projection of an outer [`BatchingPolicy`] `Self` onto member type `T` of composite [`Context`] `C` for members whose
@@ -917,18 +786,17 @@ where
 /// a region-free member operation by binding it once in the parent context instead of applying a member batching rule.
 /// This is the batching contract of shared bookkeeping values such as first-class dimensions: every batch item observes
 /// the same value, so evaluating the operation once yields the result for every batch item. A value that differs per
-/// batch item (e.g., one extent per batch item) cannot cross this projection and needs a mapped or ragged
-/// representation instead.
+/// batch item (e.g., one extent per batch item) cannot cross this replicated projection.
 ///
 /// Unlike [`BatchingPolicyProjection`], this projection selects no member [`BatchingPolicy`]: a replicated member
-/// value needs no batch axis, extent, evidence, or structurally batched program of its own, so the member side of the
-/// boundary is the bare projected value. Lifting a member result back is always [`BatchingPolicy::replicated`] applied
-/// to the embedded value, and so it needs no hook. An implementation explicitly promises that:
+/// value needs no batch axis, extent, or structurally batched program of its own, so the member side of the boundary
+/// is the bare projected value. Lifting a member result back is always [`BatchingPolicy::replicated`] applied to the
+/// embedded value, and so it needs no hook. An implementation explicitly promises that:
 ///
 ///   1. [`Self::project_replicated_batch`] returns the member value of a replicated carrier and rejects every carrier
 ///      that is mapped, or whose metadata the bare value cannot represent, with an exact [`BatchingError`].
-///   2. A region-free operation over such values may be bound unchanged, once, in the parent context. Its results are
-///      replicated, and default [`BatchingPolicy::Evidence`] suffices for output validation.
+///   2. A region-free operation over such values may be bound unchanged, once, in the parent context.
+///      Its results are replicated.
 ///
 /// Implement this trait only for member types whose values are genuinely shared by every batch item. A structural
 /// member's zero differential space does not imply this contract: differentiation and batching are independent
@@ -995,41 +863,6 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<Self::Batch>,
     ) -> Result<Vec<Self::Batch>, BatchingError>;
-
-    /// Restores the batch carrier for a value returned across an opaque batched-region boundary, which erases carrier
-    /// metadata because transform state cannot ride on program values. The carrier is rebuilt from the two sources that
-    /// survive the crossing (i.e., the region's declared per-item output type and the original input carriers) and
-    /// never from the packed physical representation.
-    ///
-    /// Ordinary carriers are completely determined by the packed parent-context value and mapped axis, so the default
-    /// delegates to [`BatchingPolicy::batch`]. A recursive policy whose carrier owns transform-only metadata that is
-    /// not represented by [`Type`] must override this method to rebuild that metadata from the surviving sources, and
-    /// must reject the boundary with an exact diagnostic when the required metadata cannot be recovered soundly.
-    ///
-    /// [`RecursiveBatchingDriver`] delegates its corresponding [`BatchingDriver::restore_batch`] request to this
-    /// method. Region-carrying operation rules use that driver method, rather than calling [`BatchingPolicy::batch`]
-    /// directly, when wrapping outputs of a rebuilt call whose attached batched region is opaque at the call boundary.
-    /// Rules that replay a region directly into batch carriers need no restoration because no carrier metadata is
-    /// erased at that boundary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `value`: Packed parent-context result produced by the rebuilt region-carrying operation.
-    ///   - `batch_axis`: Mapped axis inferred while structurally batching the source region.
-    ///   - `r#type`: Per-item output type declared by the unbatched source region.
-    ///   - `inputs`: Original batch carriers supplied to the region-carrying operation, from which
-    ///     an overriding policy may recover transform-only metadata referenced by `r#type`.
-    #[inline]
-    fn restore_batch(
-        value: C::Value,
-        batch_axis: BatchAxis,
-        r#type: &C::Type,
-        inputs: &[Self::Batch],
-    ) -> Result<Self::Batch, BatchingError> {
-        let _ = r#type;
-        let _ = inputs;
-        Self::batch(value, batch_axis)
-    }
 
     /// Aligns `batch` so that it carries the mapped batch axis at `axis`, broadcasting a replicated batch along the
     /// context's batch extent or moving an existing mapped axis. Reference rules use this to reconcile a value with the
@@ -1159,26 +992,6 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
         inputs: Vec<P::Batch>,
     ) -> Result<Vec<P::Batch>, BatchingError>;
 
-    /// Restores a batch carrier for an output returned by a rebuilt region-carrying operation. Recursive drivers
-    /// delegate to [`RecursiveBatchingPolicy::restore_batch`] so a policy can recover carrier-only metadata erased by
-    /// an opaque region boundary. A driver that cannot recursively batch regions must still implement this method,
-    /// normally by wrapping the packed value through [`BatchingPolicy::batch`]; its region operations will fail before
-    /// such an output can be produced.
-    ///
-    /// # Parameters
-    ///
-    ///   - `value`: Packed parent-context result produced by the rebuilt region-carrying operation.
-    ///   - `batch_axis`: Mapped axis inferred while batching the source region.
-    ///   - `r#type`: Per-item output type declared by the unbatched source region.
-    ///   - `inputs`: Original batch carriers supplied to the region-carrying operation.
-    fn restore_batch(
-        &self,
-        value: C::Value,
-        batch_axis: BatchAxis,
-        r#type: &C::Type,
-        inputs: &[P::Batch],
-    ) -> Result<P::Batch, BatchingError>;
-
     /// Aligns `batch` so that it carries the mapped batch axis at `axis`. Recursive drivers delegate to
     /// [`RecursiveBatchingPolicy::align_batch_axis`], which is how a rule written against the policy-neutral
     /// [`BatchingPolicy`] contract (e.g., the reference rules that reconcile a stored value with the fixed axis of the
@@ -1220,17 +1033,6 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDrive
         _inputs: Vec<P::Batch>,
     ) -> Result<Vec<P::Batch>, BatchingError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot batch a region".to_string()).into())
-    }
-
-    #[inline]
-    fn restore_batch(
-        &self,
-        value: C::Value,
-        batch_axis: BatchAxis,
-        _type: &C::Type,
-        _inputs: &[P::Batch],
-    ) -> Result<P::Batch, BatchingError> {
-        P::batch(value, batch_axis)
     }
 
     #[inline]
@@ -1322,17 +1124,6 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
     }
 
     #[inline]
-    fn restore_batch(
-        &self,
-        value: C::Value,
-        batch_axis: BatchAxis,
-        r#type: &C::Type,
-        inputs: &[P::Batch],
-    ) -> Result<P::Batch, BatchingError> {
-        P::restore_batch(value, batch_axis, r#type, inputs)
-    }
-
-    #[inline]
     fn align_batch_axis(
         &self,
         context: &BatchingContext<C, P>,
@@ -1340,61 +1131,6 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
         axis: Axis,
     ) -> Result<P::Batch, BatchingError> {
         P::align_batch_axis(context, batch, axis)
-    }
-}
-
-/// Represents the result of a [`BatchableOperation`] rule application which consists of the batch
-/// carriers it produced together with the operation-local [`BatchingPolicy::Evidence`] it produced for
-/// [`BatchingPolicy::validate_operation_outputs`]. A rule that has nothing to attest to converts its carriers directly
-/// (i.e., `Ok(batches.into())`), which pairs them with [`Default`] evidence, so only the rules that genuinely make a
-/// claim about what they did mention evidence at all. Because the evidence travels in the rule's return value rather
-/// than on the carriers, the transform reads it at the validation boundary and drops it there, and it therefore cannot
-/// reach the next operation.
-pub struct BatchedOutputs<C: Context, P: BatchingPolicy<C>> {
-    /// Batch carriers produced by the rule, in output order.
-    batches: Vec<P::Batch>,
-
-    /// Operation-local validation evidence produced by the rule.
-    evidence: P::Evidence,
-}
-
-impl<C: Context, P: BatchingPolicy<C>> BatchedOutputs<C, P> {
-    /// Creates a new [`BatchedOutputs`] instance.
-    #[inline]
-    pub fn new(batches: Vec<P::Batch>, evidence: P::Evidence) -> Self {
-        Self { batches, evidence }
-    }
-
-    /// Consumes this [`BatchedOutputs`] instance and returns the underlying batch carriers along with their
-    /// validation evidence.
-    #[inline]
-    pub fn into_parts(self) -> (Vec<P::Batch>, P::Evidence) {
-        (self.batches, self.evidence)
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C, Evidence: Debug>> Debug for BatchedOutputs<C, P> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BatchedOutputs")
-            .field("batches", &self.batches)
-            .field("evidence", &self.evidence)
-            .finish()
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C, Batch: PartialEq, Evidence: PartialEq>> PartialEq for BatchedOutputs<C, P> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.batches == other.batches && self.evidence == other.evidence
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C>> From<Vec<P::Batch>> for BatchedOutputs<C, P> {
-    #[inline]
-    fn from(batches: Vec<P::Batch>) -> Self {
-        Self::new(batches, P::Evidence::default())
     }
 }
 
@@ -1437,10 +1173,7 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
     /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
     /// current operation application's regions and has a region count of zero for region-free applications. Packed
-    /// values in `inputs` and the returned outputs are owned by `context.parent()`. Note that the resulting
-    /// [`BatchedOutputs`] instance contains the output carriers along with the validation [`BatchingPolicy::Evidence`]
-    /// that [`BatchingPolicy::validate_operation_outputs`] consumes. A rule that makes no claim about what it did with
-    /// its inputs' carrier metadata simply converts its carriers (i.e., `Ok(batches.into())`).
+    /// values in `inputs` and the returned outputs are owned by `context.parent()`.
     ///
     /// # Contract
     ///
@@ -1468,7 +1201,7 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError>
+    ) -> Result<Vec<P::Batch>, BatchingError>
     where
         Self: Operation<Type = C::Type>;
 }
@@ -1497,7 +1230,7 @@ pub trait MemberBatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation 
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError>;
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 }
 
 /// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over packed
@@ -1572,10 +1305,9 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
 }
 
 /// Active [`Context`] for one batching level, introducing exactly one logical mapped axis. Its [`BatchingPolicy`]
-/// selects the carrier, extent, validation evidence, and structural program-boundary representation. Operations bound
-/// through this context dispatch to their [`BatchableOperation`] rules, which ordinarily bind lifted packed work
-/// through the parent context. The active frame therefore owns transform metadata without pretending to be the backend
-/// that owns the packed values.
+/// selects the carrier, extent, and structural program-boundary representation. Operations bound through this context
+/// dispatch to their [`BatchableOperation`] rules, which ordinarily bind lifted packed work through the parent context.
+/// The active frame therefore owns transform metadata without pretending to be the backend that owns the packed values.
 ///
 /// # Value-Level Batching Pipeline
 ///
@@ -1583,7 +1315,7 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
 /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
 ///   inputs["Structured Inputs and Broadcast Input Axes"]
-///   prepare["BatchingContext &lt;code&gt;prepare_inputs&lt;/code&gt;"]
+///   prepare["Entrypoint Policy &lt;code&gt;pack_inputs&lt;/code&gt;"]
 ///   inputs --> prepare
 ///   specification["Extent and Optional Axis Name"] --> prepare
 ///   prepare --> context["Batching Context"]
@@ -1601,9 +1333,8 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
 ///   packed --> assemble["Rule Assembles Output Carriers"]
 ///   nested --> assemble
 ///   rule -->|"metadata-only or specialized result"| assemble
-///   assemble --> outputs["Batched Outputs: Carriers and Evidence"]
-///   outputs --> validate["Policy &lt;code&gt;validate_operation_outputs&lt;/code&gt;"]
-///   validate --> flowing["Flowing Batching Tracer Results"]
+///   assemble --> outputs["Output Carriers"]
+///   outputs --> flowing["Flowing Batching Tracer Results"]
 ///   flowing --> closure
 ///   closure -->|"returns"| closure_outputs["Structured Closure Outputs"]
 ///   closure_outputs --> materialize["Entrypoint Policy &lt;code&gt;materialize_output&lt;/code&gt;"]
@@ -1892,11 +1623,7 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
         operation.validate_region_interfaces(&driver.region_interfaces())?;
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
         let driver = RecursiveBatchingDriver::new(&driver);
-
-        // The rule's evidence is scoped to this one application. It is read by the validation boundary below and
-        // dropped at the end of this statement group, so it can never be observed by the next operation.
-        let (output_batches, evidence) = operation.batch(self, &driver, input_batches.as_slice())?.into_parts();
-        P::validate_operation_outputs(&operation, &input_batches, &output_batches, &evidence)?;
+        let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
         Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
     }
 
@@ -1913,6 +1640,10 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
 
     #[inline]
     fn resolve(&self, value: &BatchingTracer<C, P>) -> ValueResolution<C::Constant> {
+        if !P::batch_axis(value.batch()).is_replicated() {
+            // Parent constants and atom identities describe the packed batch, not one logical mapped item.
+            return ValueResolution::Opaque;
+        }
         self.parent().resolve(P::value(value.batch()))
     }
 
@@ -2174,9 +1905,9 @@ pub fn batch<
 /// this function from a composite operation dispatcher when the operation is [`Region`](crate::Region)-free and every
 /// input and result belongs to the same projectable member type `T`. It converts the packed input values to the
 /// member value family, preserves the outer batch axes and mapped extent, runs the member's existing batching rule,
-/// and converts the results back to the composite value family, relaying the member rule's validation evidence
-/// unchanged. [`BatchingPolicyProjection`] selects the member policy that represents that same extent and evidence for
-/// the specific projected type `T`. This keeps homogeneous member rules independent of the enclosing composite type.
+/// and converts the results back to the composite value family. [`BatchingPolicyProjection`] selects the member policy
+/// that represents the same extent for the specific projected type `T`. This keeps homogeneous member rules independent
+/// of the enclosing composite type.
 ///
 /// Operations with mixed member types or attached regions require an explicit composite batching rule instead. A
 /// member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an exact diagnostic naming it,
@@ -2198,7 +1929,7 @@ pub fn batch_projected_operation<
     context: &BatchingContext<C, P>,
     operation: &O,
     inputs: &[P::Batch],
-) -> Result<BatchedOutputs<C, P>, BatchingError> {
+) -> Result<Vec<P::Batch>, BatchingError> {
     if !operation.region_slots().is_empty() {
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
@@ -2216,18 +1947,15 @@ pub fn batch_projected_operation<
     .with_axis_sharding(context.axis_sharding().clone());
     let projected_inputs = inputs
         .iter()
-        .map(|input| P::project_batch(context.parent(), input))
+        .map(|input| P::Projected::batch(C::Value::into_projected(P::value(input).clone())?, P::batch_axis(input)))
         .collect::<Result<Vec<_>, BatchingError>>()?;
-
-    // `BatchingPolicyProjection` pins the member policy's evidence to the outer policy's, so the member rule's
-    // evidence reaches the composite validation boundary exactly as the member rule stated it.
-    let (outputs, evidence) =
-        operation.batch(&projected_context, &EmptyRegionDriver, projected_inputs.as_slice())?.into_parts();
-    let outputs = outputs
+    let outputs = operation.batch(&projected_context, &EmptyRegionDriver, projected_inputs.as_slice())?;
+    outputs
         .iter()
-        .map(|output| P::lift_batch(context.parent(), output, inputs))
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-    Ok(BatchedOutputs::new(outputs, evidence))
+        .map(|output| {
+            P::batch(C::Value::from_projected(P::Projected::value(output).clone()), P::Projected::batch_axis(output))
+        })
+        .collect()
 }
 
 /// Batches a region-free member [`Operation`] over replicated member values by binding the operation once in the parent
@@ -2252,9 +1980,6 @@ pub fn batch_projected_operation<
 ///   5. Every result is embedded back into the composite value family and wrapped with [`BatchingPolicy::replicated`],
 ///      preserving output count and order.
 ///
-/// The outputs are returned with default [`BatchingPolicy::Evidence`], which the active [`BatchingContext`] then
-/// validates through [`BatchingPolicy::validate_operation_outputs`] like the outputs of any other rule.
-///
 /// # Parameters
 ///
 ///   - `context`: Active composite [`BatchingContext`] whose parent context binds the operation.
@@ -2276,7 +2001,7 @@ pub fn batch_replicated_projected_operation<
     context: &BatchingContext<C, P>,
     operation: &<C::Operation as OperationProjection<T>>::Projected,
     inputs: &[P::Batch],
-) -> Result<BatchedOutputs<C, P>, BatchingError> {
+) -> Result<Vec<P::Batch>, BatchingError> {
     if !operation.region_slots().is_empty() {
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
@@ -2304,61 +2029,24 @@ pub fn batch_replicated_projected_operation<
     Ok(outputs
         .into_iter()
         .map(|output| P::replicated(<C::Value as ValueProjection<T>>::from_projected(output)))
-        .collect::<Vec<_>>()
-        .into())
-}
-
-/// Rejects the `inputs` of an operation named `operation_name` if any of them carries per-item extents that its
-/// packed value does not name (i.e., the extents of a bounded ragged axis or of a mapped dimension). Structural
-/// program batching passes only packed values and batch axes into a sealed region, so such a carrier cannot cross
-/// the region boundary, and a guard lifts declarations that cannot relate those extents. The check is stated over
-/// [`Type::identities`]: a carrier is rejected when its per-item type (i.e., its [`BatchingPolicy::unbatched_type`])
-/// names a dimension identity that the type of its packed value does not name.
-///
-/// # Errors
-///
-/// Returns [`BatchingError::UnsupportedOperation`] for the first such input, naming `operation_name`, the first such
-/// dimension identity, and the input's position.
-pub(crate) fn reject_ragged_carriers<C: Context, P: BatchingPolicy<C>>(
-    operation_name: &str,
-    inputs: &[P::Batch],
-) -> Result<(), BatchingError> {
-    for (index, input) in inputs.iter().enumerate() {
-        let packed_type = P::value(input).r#type();
-        let unbatched_type = P::unbatched_type(input);
-        if let Some((_, dimension)) = unbatched_type
-            .identities()
-            .find(|(_, identity)| packed_type.identities().all(|(_, packed)| packed != *identity))
-        {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{operation_name}` does not support bounded ragged dimension `{dimension}` on input {index}",
-                ),
-            });
-        }
-    }
-    Ok(())
+        .collect::<Vec<_>>())
 }
 
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
         ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, RaggedAxis, Shape, ShardingDimension, StaticArrayExtentBatchingPolicy,
+        DimensionVariable, Shape, ShardingDimension,
     };
     use crate::contexts::EagerContext;
-    use crate::operations::{
-        AddOperation, BroadcastOperation, NegOperation, Reduce, ReductionKind, TransposeOperation, ZeroOperation,
-    };
+    use crate::operations::{AddOperation, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, RegionInterface, Typed};
+    use crate::programs::{ProgramBuilder, Typed};
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue, TestArrayContext, TestArrayOperation,
@@ -2410,7 +2098,6 @@ mod tests {
     {
         type Batch = ProjectedBatch<C::Value>;
         type Extent = usize;
-        type Evidence = ();
         type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
 
         fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -2494,14 +2181,14 @@ mod tests {
             _context: &BatchingContext<C, ProjectedProgramBatching>,
             _driver: &D,
             inputs: &[ProjectedBatch<C::Value>],
-        ) -> Result<BatchedOutputs<C, ProjectedProgramBatching>, BatchingError>
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError>
         where
             Self: Operation<Type = C::Type>,
         {
             if inputs.len() != 1 {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             }
-            Ok(inputs.to_vec().into())
+            Ok(inputs.to_vec())
         }
     }
 
@@ -2514,7 +2201,6 @@ mod tests {
     {
         type Batch = ProjectedBatch<C::Value>;
         type Extent = usize;
-        type Evidence = ();
         type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
 
         fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -2580,9 +2266,9 @@ mod tests {
             _context: &BatchingContext<C, ProjectedMemberBatching<MEMBER>>,
             _driver: &D,
             inputs: &[ProjectedBatch<C::Value>],
-        ) -> Result<BatchedOutputs<C, ProjectedMemberBatching<MEMBER>>, BatchingError> {
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError> {
             check_count!("input", inputs, 1, ProgramError);
-            Ok(inputs.to_vec().into())
+            Ok(inputs.to_vec())
         }
     }
 
@@ -2792,7 +2478,7 @@ mod tests {
         assert_eq!(tracer.batch_extent(), &5);
 
         let operation = ProjectedProgramOperation::from(ProjectedMemberOperation::<2>::Identity);
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap().into_parts().0;
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap();
         assert_eq!(
             outputs,
             vec![ProjectedBatch {
@@ -3029,295 +2715,27 @@ mod tests {
     }
 
     #[test]
-    fn test_batching_policy_validate_operation_outputs_consumption() -> Result<(), BatchingError> {
-        /// Input-sensitive declaration that also detects accidental use of the packed signature.
-        #[derive(Clone, Debug)]
-        struct ConsumptionOperation {
-            input_type: ArrayType,
-            consumed: Vec<DimensionVariable>,
-            evidence: Vec<DimensionVariable>,
-        }
+    fn test_batching_context_resolve() {
+        let parent = TestArrayContext::new();
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::with_policy(parent, 2);
+        let packed = Array::vector(vec![2f64, 3f64]).unwrap();
+        let mapped = BatchingTracer::new(context.clone(), ArrayBatch::new(packed, Some(0)).unwrap());
+        assert_eq!(mapped.r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        assert_eq!(context.resolve(&mapped), ValueResolution::Opaque);
+        let constant = Array::scalar(7f64).unwrap();
+        let replicated = BatchingTracer::new(context.clone(), ArrayBatch::replicated(constant.clone()));
+        assert_eq!(context.resolve(&replicated), ValueResolution::Constant(constant));
 
-        impl Operation for ConsumptionOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "consume"
-            }
-
-            fn consumed_type_identities(&self, input_types: &[ArrayType]) -> Result<Vec<DimensionVariable>, TypeError> {
-                if input_types != std::slice::from_ref(&self.input_type) {
-                    return Err(TypeError::invalid("consumption requires the logical input signature"));
-                }
-
-                for identity in &self.consumed {
-                    if !input_types.iter().any(|r#type| r#type.identities().any(|(_, input)| input == identity)) {
-                        return Err(TypeError::invalid(format!(
-                            "operation `{}` declares consumption of identity `{}` absent from its logical inputs",
-                            self.name(),
-                            identity,
-                        )));
-                    }
-                }
-
-                Ok(self.consumed.clone())
-            }
-
-            fn infer_output_types(
-                &self,
-                _inputs: &[ArrayType],
-                _regions: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                Ok(Vec::new())
-            }
-        }
-
-        impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ConsumptionOperation {
-            fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
-                &self,
-                _context: &BatchingContext<C, ArrayBatchingPolicy>,
-                _driver: &D,
-                _inputs: &[ArrayBatch<C::Value>],
-            ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy>, BatchingError> {
-                Ok(BatchedOutputs::new(Vec::new(), self.evidence.clone()))
-            }
-        }
-
-        #[derive(Clone, Debug, ryft_macros::Operation)]
-        #[ryft(type(ArrayType), constant(Array), dispatch(batching))]
-        enum ConsumptionFamily {
-            Zero(ZeroOperation<ArrayType>),
-            Consume(ConsumptionOperation),
-            Broadcast(BroadcastOperation),
-            Transpose(TransposeOperation),
-        }
-
-        type Parent = TracingContext<Array, ConsumptionFamily>;
-        let parent = Parent::new();
-        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(3)).unwrap());
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        let packed_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]));
-        let input = ArrayBatch::new(parent.input(packed_type), Some(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            parent.input(ArrayType::new_static(DataType::I64, [2])),
-            rows.clone(),
-            vec![0],
-        )])?;
-        let operation = ConsumptionOperation {
-            input_type: input.unbatched_type(),
-            consumed: vec![rows.clone()],
-            evidence: Vec::new(),
-        };
-        assert_eq!(
-            ConsumptionFamily::from(operation.clone()).consumed_type_identities(&[input.unbatched_type()]),
-            Ok(vec![rows.clone()]),
-        );
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 2);
-        let tracer = BatchingTracer::new(context.clone(), input.clone());
-        assert_eq!(
-            <ArrayBatchingPolicy as BatchingPolicy<Parent>>::validate_operation_outputs(
-                &ConsumptionFamily::from(operation.clone()),
-                std::slice::from_ref(&input),
-                &[],
-                &Vec::new(),
-            ),
-            Ok(()),
-        );
-        assert!(context.bind(operation.clone(), Vec::new(), std::slice::from_ref(&tracer))?.is_empty());
-
-        // Direct region replay must query the same logical signature and honor the same declaration.
-        let mut builder = ProgramBuilder::<Array, ConsumptionFamily>::new();
-        let region_input = builder.add_input(operation.input_type.clone());
-        builder.add_instruction(operation.clone(), Vec::new(), vec![region_input], None)?;
-        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new())?;
-        assert!(
-            <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::batch_region(
-                &context,
-                program.entry_region_ref(),
-                vec![input],
-            )?
-            .is_empty()
-        );
-
-        let undeclared = ConsumptionOperation { consumed: Vec::new(), ..operation.clone() };
-        assert_eq!(
-            BatchingError::from(
-                context.bind(undeclared.clone(), Vec::new(), std::slice::from_ref(&tracer)).unwrap_err()
-            ),
-            BatchingError::UnsupportedOperation {
-                message: "operation `consume` neither preserves nor consumes bounded ragged dimension `rows`"
-                    .to_owned(),
-            }
-        );
-
-        // A batching rule can still supply its own evidence without an operation-level declaration.
-        let attested = ConsumptionOperation { evidence: vec![rows], ..undeclared };
-        assert!(context.bind(attested, Vec::new(), std::slice::from_ref(&tracer))?.is_empty());
-
-        // The mapped dimension occurs in packed storage, but is absent from the logical operation's input type.
-        let invalid = ConsumptionOperation { consumed: vec![batch], ..operation };
-        assert_eq!(
-            invalid.consumed_type_identities(std::slice::from_ref(&invalid.input_type)),
-            Err(TypeError::invalid(
-                "operation `consume` declares consumption of identity `batch` absent from its logical inputs",
-            )),
-        );
-        assert_eq!(
-            BatchingError::from(context.bind(invalid, Vec::new(), &[tracer]).unwrap_err()),
-            BatchingError::Type(TypeError::invalid(
-                "operation `consume` declares consumption of identity `batch` absent from its logical inputs",
-            ))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_batching_context_bind_validates_operation_evidence() {
-        /// Batching policy pinning the [`BatchedOutputs`] evidence lifecycle. Its carrier, extent, and batched-program
-        /// boundary are the ordinary array ones, but its validator accepts an operation only when that operation's own
-        /// rule attested to a claim naming it. Comparing the claim's subject with the operation being validated is what
-        /// makes both a missing claim and a claim leaking from a previous operation observable; it is not a
-        /// per-operation branch in the conservation law itself.
-        #[derive(Copy, Clone, Debug)]
-        struct EvidenceBatching;
-
-        impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for EvidenceBatching {
-            type Batch = ArrayBatch<C::Value>;
-            type Extent = usize;
-            type Evidence = Vec<&'static str>;
-            type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
-
-            fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
-                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::batch(value, batch_axis)
-            }
-
-            fn replicated(value: C::Value) -> Self::Batch {
-                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::replicated(value)
-            }
-
-            fn value(batch: &Self::Batch) -> &C::Value {
-                batch.value()
-            }
-
-            fn batch_axis(batch: &Self::Batch) -> BatchAxis {
-                batch.batch_axis()
-            }
-
-            fn batched_type(
-                context: &BatchingContext<C, Self>,
-                input: &Self::Batch,
-                declared: &ArrayType,
-            ) -> Result<ArrayType, BatchingError> {
-                let context = BatchingContext::<C, StaticArrayExtentBatchingPolicy>::with_policy(
-                    context.parent().clone(),
-                    *context.axis_extent(),
-                )
-                .with_axis_sharding(context.axis_sharding().clone());
-                StaticArrayExtentBatchingPolicy::batched_type(&context, input, declared)
-            }
-
-            fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
-                Cow::Owned(batch.unbatched_type())
-            }
-
-            fn validate_operation_outputs(
-                operation: &C::Operation,
-                _inputs: &[Self::Batch],
-                _outputs: &[Self::Batch],
-                evidence: &Self::Evidence,
-            ) -> Result<(), BatchingError> {
-                let operation_name = operation.name();
-                if evidence.contains(&operation_name) {
-                    Ok(())
-                } else {
-                    Err(BatchingError::UnsupportedOperation {
-                        message: format!("operation `{operation_name}` supplied no batching evidence"),
-                    })
-                }
-            }
-
-            fn adapt_batched_program<
-                CollapseFn: Fn(
-                    &TracingContext<C::Constant, C::Operation>,
-                    Tracer<TracingContext<C::Constant, C::Operation>>,
-                    Axis,
-                ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
-            >(
-                program: Self::BatchedProgram,
-                required_output_axes: Option<&[BatchAxis]>,
-                collapse_fn: CollapseFn,
-            ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
-                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
-                    program,
-                    required_output_axes,
-                    collapse_fn,
-                )
-            }
-        }
-
-        impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for EvidenceBatching {
-            fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<ArrayType> {
-                BatchingLevel::new(
-                    BatchingLevelExtent::Static(*context.axis_extent()),
-                    context.axis_name().map(str::to_string),
-                    context.axis_sharding().clone(),
-                )
-            }
-
-            fn batch_program_at_level(
-                _level: &BatchingLevel<ArrayType>,
-                _region: RegionRef<'_, C::Constant, C::Operation>,
-                _input_axes: &[BatchAxis],
-                _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-            ) -> Result<Self::BatchedProgram, BatchingError> {
-                Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
-            }
-
-            fn batch_region(
-                _context: &BatchingContext<C, Self>,
-                _region: RegionRef<'_, C::Constant, C::Operation>,
-                _inputs: Vec<Self::Batch>,
-            ) -> Result<Vec<Self::Batch>, BatchingError> {
-                Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
-            }
-        }
-
-        // Identity rule attesting to `add` alone, so one context exercises both the attested and the silent transition.
-        impl<C: Context<Type = ArrayType>> BatchableOperation<C, EvidenceBatching> for TestArrayOperation {
-            fn batch<D: BatchingDriver<C, EvidenceBatching>>(
-                &self,
-                _context: &BatchingContext<C, EvidenceBatching>,
-                _driver: &D,
-                inputs: &[ArrayBatch<C::Value>],
-            ) -> Result<BatchedOutputs<C, EvidenceBatching>, BatchingError>
-            where
-                Self: Operation<Type = C::Type>,
-            {
-                let evidence = match self.name() {
-                    name @ "add" => vec![name],
-                    _ => Vec::new(),
-                };
-                Ok(BatchedOutputs::new(inputs.to_vec(), evidence))
-            }
-        }
-
-        let context = BatchingContext::<TestArrayContext, EvidenceBatching>::with_policy(TestArrayContext::new(), 2);
-        let input = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(1.0_f32).unwrap()));
-
-        // An attesting rule's evidence reaches the validation boundary, which accepts the transition.
-        let outputs = context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input.clone()]).unwrap();
-        assert_eq!(outputs.len(), 2);
-
-        // That evidence dies with its rule: the very next operation is validated against its own (absent) claim
-        // rather than against the accepted one that immediately preceded it.
-        let silent = context.bind(NegOperation::new(), Vec::new(), std::slice::from_ref(&input)).unwrap_err();
-        assert_eq!(
-            BatchingError::from(silent),
-            BatchingError::UnsupportedOperation {
-                message: "operation `neg` supplied no batching evidence".to_string(),
-            },
-        );
+        let trace = TracingContext::<Array, TestArrayOperation>::new();
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::with_policy(trace.clone(), 2);
+        let packed = trace.input(ArrayType::new_static(DataType::F64, [2]));
+        let mapped = BatchingTracer::new(context.clone(), ArrayBatch::new(packed, Some(0)).unwrap());
+        assert_eq!(mapped.r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        assert_eq!(context.resolve(&mapped), ValueResolution::Opaque);
+        let input = trace.input(ArrayType::scalar(DataType::F64));
+        let replicated = BatchingTracer::new(context.clone(), ArrayBatch::replicated(input.clone()));
+        assert_eq!(context.resolve(&replicated), ValueResolution::Staged(input.atom_id().unwrap()));
+        assert!(trace.builder().borrow().instructions().is_empty());
     }
 
     #[test]
@@ -3369,10 +2787,7 @@ mod tests {
         let input = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
             ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
         );
-        let (outputs, evidence) =
-            batch_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, &[input])
-                .unwrap()
-                .into_parts();
+        let outputs = batch_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, &[input]).unwrap();
         assert_eq!(
             outputs,
             vec![ProjectedBatch {
@@ -3380,116 +2795,13 @@ mod tests {
                 batch_axis: BatchAxis::replicated(),
             }],
         );
-        assert_eq!(evidence, ());
-    }
-
-    #[test]
-    fn test_batch_projected_operation_supplies_active_parent_to_policy_hooks() {
-        /// Independent eager context whose shared state records the two carrier-boundary crossings.
-        #[derive(Clone)]
-        struct ProjectionContext {
-            /// Crossings observed by this active context and its clones.
-            crossings: Rc<RefCell<Vec<&'static str>>>,
-        }
-
-        impl Domain for ProjectionContext {
-            type Type = ProjectedProgramType;
-            type Value = ProjectedProgramValue;
-            type Constant = ProjectedProgramValue;
-            type Operation = ProjectedProgramOperation;
-        }
-
-        impl Context for ProjectionContext {
-            fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
-                Ok(constant)
-            }
-
-            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
-                &self,
-                operation: O,
-                driver: D,
-                inputs: &[Self::Value],
-            ) -> Result<Vec<Self::Value>, ProgramError> {
-                ProjectedProgramContext::new().bind(operation, driver, inputs)
-            }
-
-            fn is_eager(&self) -> bool {
-                true
-            }
-
-            fn provenance(&self) -> Provenance {
-                Provenance::unknown()
-            }
-
-            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-                ProjectedProgramContext::new().invoke_with_provenance_origin(origin, function)
-            }
-
-            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-                ProjectedProgramContext::new().invoke_with_provenance_scope(scope, function)
-            }
-        }
-
-        impl BatchingPolicyProjection<ProjectionContext, ProjectedMemberType<2>> for ProjectedProgramBatching {
-            type Projected = ProjectedMemberBatching<2>;
-
-            fn project_batch(
-                context: &ProjectionContext,
-                batch: &ProjectedBatch<ProjectedProgramValue>,
-            ) -> Result<ProjectedBatch<ProjectedMemberValue<2>>, BatchingError> {
-                context.crossings.borrow_mut().push("project");
-                Ok(ProjectedBatch {
-                    value: ValueProjection::<ProjectedMemberType<2>>::into_projected(batch.value.clone())?,
-                    batch_axis: batch.batch_axis,
-                })
-            }
-
-            fn lift_batch(
-                context: &ProjectionContext,
-                batch: &ProjectedBatch<ProjectedMemberValue<2>>,
-                inputs: &[ProjectedBatch<ProjectedProgramValue>],
-            ) -> Result<ProjectedBatch<ProjectedProgramValue>, BatchingError> {
-                assert_eq!(
-                    inputs,
-                    &[ProjectedBatch {
-                        value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
-                        batch_axis: BatchAxis::replicated(),
-                    }],
-                );
-                context.crossings.borrow_mut().push("lift");
-                Ok(ProjectedBatch {
-                    value: <ProjectedProgramValue as ValueProjection<ProjectedMemberType<2>>>::from_projected(
-                        batch.value.clone(),
-                    ),
-                    batch_axis: batch.batch_axis,
-                })
-            }
-        }
-
-        // Neither this policy nor its direct-dispatch values support ragged representation operations. The generic
-        // adapter supplies the active parent without imposing the array composite policy's provider requirements.
-        let crossings = Rc::new(RefCell::new(Vec::new()));
-        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(
-            ProjectionContext { crossings: crossings.clone() },
-            5,
-        );
-        let input = <ProjectedProgramBatching as BatchingPolicy<ProjectionContext>>::replicated(
-            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
-        );
-        let (outputs, evidence) =
-            batch_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, std::slice::from_ref(&input))
-                .unwrap()
-                .into_parts();
-        assert_eq!(outputs, vec![input]);
-        assert_eq!(evidence, ());
-        assert_eq!(*crossings.borrow(), ["project", "lift"]);
     }
 
     #[test]
     fn test_batch_replicated_projected_operation() {
         // The first fixture member is unrelated to arrays and has no member batching rule, so a successful application
         // proves that the operation is bound once through the parent context and that its results are rebuilt as
-        // replicated composite carriers with default evidence.
+        // replicated composite carriers.
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
         let left = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
             ProjectedProgramValue::First(ProjectedMemberValue::<0>(3)),
@@ -3497,13 +2809,12 @@ mod tests {
         let right = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
             ProjectedProgramValue::First(ProjectedMemberValue::<0>(4)),
         );
-        let (outputs, evidence) = batch_replicated_projected_operation::<ProjectedMemberType<0>, _, _>(
+        let outputs = batch_replicated_projected_operation::<ProjectedMemberType<0>, _, _>(
             &context,
             &ProjectedMemberOperation::<0>::Add,
             &[left.clone(), right],
         )
-        .unwrap()
-        .into_parts();
+        .unwrap();
         assert_eq!(
             outputs,
             vec![ProjectedBatch {
@@ -3511,7 +2822,6 @@ mod tests {
                 batch_axis: BatchAxis::replicated(),
             }],
         );
-        assert_eq!(evidence, ());
     }
 
     #[test]

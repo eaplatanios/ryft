@@ -420,7 +420,7 @@ impl DistributedRuntime {
         let sequence = self
             .state
             .kernel_sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
             .map_err(|_| ryft_pjrt::Error::invalid_argument("kernel coordinator sequence overflow"))?;
         Ok((self.state.launch_id, sequence, self.state.process_index, self.state.process_count))
     }

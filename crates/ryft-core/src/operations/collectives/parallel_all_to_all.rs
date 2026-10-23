@@ -8,8 +8,7 @@ use crate::arrays::{
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
@@ -22,7 +21,6 @@ use crate::macros::check_count;
 use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
-use crate::operations::collectives::parallel_ragged_all_to_all::PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
@@ -79,8 +77,7 @@ pub const PARALLEL_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_all_to_all";
 /// axis are unsupported at a matching level. Outside any binder, a single-participant tiled exchange is the identity;
 /// untiled mode relocates its size-one split axis to the concatenation position.
 ///
-/// Bounded ragged inputs are rejected. One extent per item does not determine how each sender partitions
-/// its live prefix among receivers; that requires the explicit offsets and per-destination sizes of
+/// Exchanges whose per-destination sizes vary use the explicit offsets and sizes of
 /// [`ParallelRaggedAllToAllOperation`](crate::ParallelRaggedAllToAllOperation).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelAllToAllOperation {
@@ -547,18 +544,6 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
 
         Ok(vec![self.finalize_output_type(input_type, output_type)?.into()])
     }
-
-    #[inline]
-    fn unsupported_ragged_input_error(&self, dimension: &DimensionVariable, _input_index: usize) -> BatchingError {
-        // One extent per item does not determine how each sender partitions its live prefix among the receivers,
-        // which requires the explicit offsets and per-destination sizes of a ragged all-to-all instead.
-        BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` cannot route bounded ragged dimension `{dimension}` \
-                 without explicit per-destination offsets and sizes; use `{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}`",
-            ),
-        }
-    }
 }
 
 impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatching<C> for ParallelAllToAllOperation {
@@ -710,7 +695,7 @@ impl<
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // A matching `batch` level consumes the mapped batch axis with a reshape/transpose block exchange: the per-item
         // `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis is swapped with the leading batch axis (so
         // the batch axis indexes the *receiving* item), and the sender axis is then merged item-major into the per-item
@@ -832,7 +817,7 @@ impl<
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         self.shape_changing_collective_batch_in_parent(context, inputs)
     }
 }
@@ -973,7 +958,7 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     /// Returns a [`ProgramError::Axis`] wrapping [`AxisError::UnboundAxisName`] when no binder binds `axis_name` or
     /// [`AxisError::OutOfBounds`] when an axis is out of bounds, and a [`ProgramError`] for invalid groups or split
     /// dimensions, pending cross-device sums, or an overflowing concatenation extent. A batch level that binds the
-    /// collective axis rejects participant groups and bounded ragged inputs.
+    /// collective axis rejects participant groups.
     fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
@@ -1258,7 +1243,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, DataType, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType,
         ShardingDimension, StridedLayout,
@@ -2152,61 +2136,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_to_all_batching_rejects_ragged_inputs() {
-        // A matching level rejects bounded ragged inputs in both array families, because one extent per item does not
-        // determine how each sender partitions its live prefix among the receivers.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ragged_array_batch(
-            Array::matrix(2, 4, vec![1.0f32; 8]).unwrap(),
-            Array::vector(vec![2i32, 4]).unwrap(),
-            &variable,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            batch_collective(
-                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
-                "x",
-                2,
-                input,
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_all_to_all` cannot route bounded ragged dimension `length` without explicit \
-                          per-destination offsets and sizes; use `parallel_ragged_all_to_all`"
-                    .to_string(),
-            }),
-        );
-
-        let extents = ArrayIrValue::Array(Array::vector(vec![2i32, 4]).unwrap());
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap()),
-            extents.clone(),
-            &variable,
-            1,
-        )
-        .unwrap();
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("x".to_string());
-        let output_extent =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(variable)).unwrap();
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch_in_parent(
-                &context,
-                &EmptyRegionDriver,
-                &[input, output_extent],
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_all_to_all` cannot route bounded ragged dimension `length` without explicit \
-                          per-destination offsets and sizes; use `parallel_ragged_all_to_all`"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
     fn test_parallel_all_to_all_batching_forwards_unbound_axis() {
         // A non-matching batch level shifts both array axes around its mapped dimension. Removing the split axis can
         // move that mapped dimension, and insertion at the concatenation axis can move it a second time: a leading
@@ -2260,10 +2189,11 @@ mod tests {
                     let operation =
                         ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
                             .with_mesh(mesh.clone());
-                    let mut outputs = operation
-                        .batch_in_parent(&context, &EmptyRegionDriver, &[input, split_extent, concatenation_extent])?
-                        .into_parts()
-                        .0;
+                    let mut outputs = operation.batch_in_parent(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[input, split_extent, concatenation_extent],
+                    )?;
                     Ok(outputs.remove(0).into_value())
                 },
                 ArrayIrType::Array(
@@ -2305,7 +2235,7 @@ mod tests {
                     BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
-                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?;
                 Ok(outputs.remove(0).into_value())
             },
             input_type.clone(),

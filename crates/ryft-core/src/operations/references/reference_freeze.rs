@@ -6,9 +6,7 @@ use std::sync::LazyLock;
 use ryft_macros::capability;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
@@ -154,14 +152,13 @@ where
         context: &BatchingContext<C, P>,
         _driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // Freezing yields the final packed referent, batched at the reference's own axis.
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![P::batch(
             context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&inputs[0])))?.remove(0),
             P::batch_axis(&inputs[0]),
-        )?]
-        .into())
+        )?])
     }
 }
 

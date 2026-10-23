@@ -26,8 +26,7 @@
 //!
 //! Every mapped input moves its batch axis to the leading position and every replicated input is broadcast to the
 //! batched shape, because all inputs of a sort must agree on shape. The sorted axis then lifts past the leading batch
-//! axis. Bounded ragged batches are rejected, because sorting an axis that carries padding would move that padding into
-//! valid data.
+//! axis. Each batch item sorts an array of the same rectangular shape.
 //!
 //! # Differentiation
 //!
@@ -78,8 +77,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -390,15 +388,10 @@ impl<C: Context<Type = ArrayType, Value: Sort + Broadcast + Transpose>, P: Array
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Every mapped input's batch axis moves to the leading physical position, replicated inputs broadcast to the
         // batched physical shape (because all sort inputs must agree on shape), and the sort axis lifts past the
         // inserted leading batch axis while the key count and ordering carry through unchanged.
-
-        // Sorting a padded ragged axis would move padding into valid data, and repacking the inputs would drop the
-        // ragged metadata of every other axis.
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
-
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return Ok(self
                 .interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()])?
@@ -941,10 +934,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::ragged_array_batch;
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, MeshAxis, MeshAxisType, Sharding, StridedLayout, i4,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType,
+        Sharding, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::contexts::EagerContext;
@@ -1441,25 +1433,6 @@ mod tests {
                 ],
             }],
         );
-    }
-
-    #[test]
-    fn test_sort_batching_ragged() {
-        // Sorting would move padding into valid data, so bounded ragged batches are rejected.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ragged_array_batch(
-            Array::matrix(2, 3, vec![2.0, 1.0, 0.0, 3.0, 0.0, 0.0]).unwrap(),
-            Array::vector(vec![2i32, 1]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
-        assert!(matches!(
-            SortOperation::new(0, SortDirection::Ascending).batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "`sort` does not support bounded ragged dimension `length` on input 0",
-        ));
     }
 
     #[test]

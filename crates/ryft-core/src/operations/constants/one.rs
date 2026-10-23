@@ -171,9 +171,6 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, OneOperation<Arr
                 ))
                 .into());
             }
-            ArrayIrType::Ragged(_) => {
-                return Err(TypeError::invalid("cannot materialize a one for a first-class ragged type").into());
-            }
         };
         check_constructor_type_has_no_identity_references(ONE_OPERATION_NAME, &r#type)?;
         Ok(Self::Array(ArrayOperation::One(OneOperation::new(r#type))))
@@ -588,9 +585,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);

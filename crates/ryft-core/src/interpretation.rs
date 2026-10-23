@@ -580,7 +580,7 @@ impl<T: Type> ReplayTypeIdentities<T> {
                         })
                         .map(|(declared, actual)| (declared, actual.clone()))
                         .unzip();
-                    for (source, target) in T::derive_scope_identity_renaming(&declared, &actual)?.replacements() {
+                    for (source, target) in T::derive_identity_renaming(&declared, &actual)?.replacements() {
                         if source != target && input_definitions.contains(source) {
                             renaming.insert(source.clone(), target.clone())?;
                         }
@@ -782,7 +782,7 @@ impl<T: Type> ReplayTypeIdentities<T> {
                 reified_inputs.iter().map(|(_, actual)| actual),
                 region.type_identity_signature().identities(),
             )?;
-            let local = T::derive_scope_identity_renaming(
+            let local = T::derive_identity_renaming(
                 reified_inputs.iter().map(|(declared, _)| declared),
                 reified_inputs.iter().map(|(_, actual)| actual),
             )?;

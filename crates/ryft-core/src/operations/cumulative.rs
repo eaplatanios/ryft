@@ -21,13 +21,8 @@
 //!
 //! # Batching
 //!
-//! The identity of each combining operator matters beyond the empty-prefix case: it is what the batching rule writes
-//! over the padding of every bounded ragged axis that is either the scanned axis itself or one whose extents vary
-//! along the scanned axis (refer to [`RaggedMaskIdentity`]), so that padded positions cannot contribute to any live
-//! prefix. Masking is where cumulative batching parts company with a reduction's: a prefix scan keeps every axis it
-//! touches, so it _consumes_ no bounded ragged axis. The input's ragged axes ride through onto the result unchanged and
-//! the rule reports no consumption evidence. A scan whose axis is neither ragged nor an extent axis of a ragged axis
-//! never reaches the masking hook at all, and so passes through exactly as it would with no ragged metadata.
+//! Batching shifts the per-item scan axis past the inserted batch axis. Each batch item is accumulated independently,
+//! and the mapped axis remains in the same position in the result.
 //!
 //! # Differentiation
 //!
@@ -59,14 +54,12 @@ use num_complex::Complex;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrType, ArrayType, DataType, Dimension,
-    FloatingPointArrayElement, NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity,
-    ShardingDimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType,
+    Dimension, FloatingPointArrayElement, NumericArrayElement, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -96,8 +89,7 @@ use crate::tracing::{Tracer, TracingContext};
 pub const CUMULATIVE_OPERATION_NAME: &str = "cumulative";
 
 /// Associative combining operator of a [`CumulativeOperation`]. Every kind accumulates in the input's own element data
-/// type, so each partial result is rounded to the input's element encoding (i.e., there is no widened accumulation),
-/// and each kind has an identity that neutralizes the padding that bounded ragged batching would otherwise scan.
+/// type, so each partial result is rounded to the input's element encoding (i.e., there is no widened accumulation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CumulativeKind {
     /// Prefix sum. The identity is `0` and the combiner is addition. Real and complex numeric inputs are supported,
@@ -129,15 +121,15 @@ pub enum CumulativeKind {
     /// elementwise combination instead, so under differentiation such complex prefixes are NaN, and the first prefix
     /// is the raw first input.
     ///
-    /// Padding is filled with the element data type's lowest real value (i.e., [`RaggedMaskIdentity::LowestReal`]),
-    /// which must be an identity of the rounded pairwise [`LogAddExp`] operation. True negative infinity satisfies this
-    /// contract (paired with a zero imaginary component for complex inputs), as do finite sentinels that round back to
-    /// the other input after each pairwise combination. A binary fold rounds after every pair, so once combining two
-    /// sentinel values returns the sentinel, an all-sentinel subtree of any size does too, and such sentinels therefore
-    /// remain neutral for any prefix length. [`DataType::F8E8M0FNU`] and [`DataType::F6E2M3FN`] have no suitable
-    /// identity and are rejected, as are all integer and Boolean inputs. This criterion intentionally differs from that
-    /// of the log-sum-exp reduction, whose padding must remain neutral after subtracting an arbitrary maximum and which
-    /// therefore requires a format that represents negative infinity.
+    /// The element data type must have a lowest real value that is an identity of the rounded pairwise [`LogAddExp`]
+    /// operation, because that value initializes the windowed reduction that computes every prefix and fills its padded
+    /// window positions. True negative infinity satisfies this contract (paired with a zero imaginary component for
+    /// complex inputs), as do finite sentinels that round back to the other input after each pairwise combination. A
+    /// binary fold rounds after every pair, so once combining two sentinel values returns the sentinel, an all-sentinel
+    /// subtree of any size does too, and such sentinels therefore remain neutral for any prefix length.
+    /// [`DataType::F8E8M0FNU`] and [`DataType::F6E2M3FN`] have no suitable identity and are rejected, as are all
+    /// integer and Boolean inputs. This criterion intentionally differs from that of the log-sum-exp reduction, which
+    /// requires a format that represents negative infinity because its maximum-shifted evaluation starts there.
     LogSumExp,
 
     /// Running maximum. The identity is the element data type's lowest value (i.e., negative infinity for the
@@ -287,7 +279,7 @@ impl<C: Context<Type = ArrayType, Operation: From<CumulativeOperation>>> Partial
 {
 }
 
-impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CumulativeOperation
 where
     CumulativeOperation: InterpretableOperation<C>,
@@ -297,12 +289,11 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // The scanned axis is expressed in the per-item coordinate system and therefore cannot name the inserted batch
         // dimension, so an axis at or after the batch axis shifts past it. A prefix scan preserves its input's rank,
         // and so the output batch axis is the input batch axis itself. A replicated input carries no inserted batch
-        // dimension, so its scanned axis needs no shift. Ragged axes are packed positions in both cases, and so the
-        // masking and rewrapping below use the lifted axis.
+        // dimension, so its scanned axis needs no shift.
         check_count!("input", inputs, 1, ProgramError);
         let (lifted_axis, output_batch_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
@@ -310,49 +301,8 @@ where
             }
             None => (self.axis, BatchAxis::replicated()),
         };
-
-        // A prefix along the scanned axis combines elements at different scanned positions, so padding must first be
-        // neutralized with the identity of the combining operator along every ragged axis whose padding can differ
-        // between those positions. That is the case both when the scanned axis is itself ragged and when it is one of
-        // the extent axes of a ragged axis (i.e., when the per-item extents of that ragged axis vary along the scanned
-        // axis). In the latter case, an element that is padding at one scanned position can share its ragged coordinate
-        // with a live element at a later position (or an earlier one, for a reverse scan), into whose prefix it would
-        // otherwise accumulate its stored value. A ragged axis whose extents do not vary along the scanned axis has the
-        // same live coordinates at every scanned position, so its padding only ever combines with other padding and
-        // needs no mask. A payload-free structural zero needs no masking either, because every element of it (padding
-        // included) is the same zero, whose every prefix sum or product is zero.
-        let masked_axes = inputs[0]
-            .ragged_axes()
-            .iter()
-            .filter(|ragged_axis| ragged_axis.axis() == lifted_axis || ragged_axis.extent_axes().contains(&lifted_axis))
-            .map(|ragged_axis| ragged_axis.axis())
-            .collect::<Vec<_>>();
-        let input = match !masked_axes.is_empty() && !inputs[0].r#type().data_type().is_zero() {
-            true => {
-                let identity = match self.kind {
-                    CumulativeKind::Sum => RaggedMaskIdentity::Zero,
-                    CumulativeKind::Product => RaggedMaskIdentity::One,
-                    CumulativeKind::LogSumExp => RaggedMaskIdentity::LowestReal,
-                    CumulativeKind::Max => RaggedMaskIdentity::Lowest,
-                    CumulativeKind::Min => RaggedMaskIdentity::Highest,
-                };
-                P::mask_identity_input(context, &inputs[0], &masked_axes, identity)?
-            }
-            false => inputs[0].clone(),
-        };
         let lifted = Self { axis: lifted_axis, ..self.clone() };
-        let mut outputs = lifted.interpret_with_batch_axes(
-            context,
-            std::slice::from_ref(&input),
-            std::slice::from_ref(&output_batch_axis),
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-
-        // Interpretation carries values rather than batch metadata, so the input's ragged axes are restored here.
-        // A scan consumes none of them, and so the rule reports no consumption evidence.
-        let output = ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?
-            .with_ragged_axes(input.ragged_axes().to_vec())?;
-        Ok(BatchedOutputs::new(vec![output], Vec::new()))
+        lifted.interpret_with_batch_axes(context, inputs, &[output_batch_axis])
     }
 }
 
@@ -753,9 +703,9 @@ impl ArrayType {
     ///     commutes with the pending cross-device sum of an unreduced value.
     ///
     /// A dynamically sized scanned axis could be supported in the future by physicalizing the scan at the dimension's
-    /// declared upper bound and masking the elements past each runtime extent with the kind's identity, which is the
-    /// same discipline that the ragged batching rule already uses. That extension is deliberately not implemented here
-    /// as it would silently change the operation's cost model, and so it belongs to an explicit dynamic-scan surface.
+    /// declared upper bound and masking the elements past each runtime extent with the kind's identity. That extension
+    /// is deliberately not implemented here as it would silently change the operation's cost model, and so it belongs
+    /// to an explicit dynamic-scan surface.
     fn cumulative(&self, axis: usize, kind: CumulativeKind) -> Result<Self, TypeError> {
         // The element data type is validated before the scanned axis, and the diagnostic names the kind, because the
         // supported data types differ across kinds (e.g., summation accepts the structural zero while extrema do not).
@@ -1256,13 +1206,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, StridedLayout, f4e2m1fn, f8e4m3fn, f8e4m3fnuz,
-        f8e5m2, f8e8m0fnu,
+        ArrayOperation, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
+        Sharding, StridedLayout, f4e2m1fn, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e8m0fnu,
     };
-    use crate::batching::{BatchingTracer, batch};
-    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::batching::batch;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
         TranspositionContext, differentiate_at,
@@ -1278,7 +1226,7 @@ mod tests {
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode, ValueProjection};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode};
 
     use super::*;
 
@@ -1442,226 +1390,6 @@ mod tests {
                 outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap())],
             }],
         );
-    }
-
-    #[test]
-    fn test_cumulative_batching_ragged_unscanned_axis() {
-        // Per item, a ragged `[length]` row is scanned along its dense trailing axis, so the ragged axis is not the
-        // scanned one: nothing needs masking, the axis rides through onto the result unchanged, and, because the scan
-        // consumes no axis, the rule claims no consumption evidence.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let ragged_axes = vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])];
-        let batch = |values: &[f32]| {
-            ArrayBatch::new(
-                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3, 2]), values).unwrap(),
-                BatchAxis::new(0),
-            )
-            .unwrap()
-            .with_ragged_axes(ragged_axes.clone())
-            .unwrap()
-        };
-        let (outputs, evidence) = CumulativeOperation::new(1, CumulativeKind::Sum)
-            .batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &EmptyRegionDriver,
-                &[batch(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])],
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(outputs, vec![batch(&[1.0, 3.0, 3.0, 7.0, 5.0, 11.0, 7.0, 15.0, 9.0, 19.0, 11.0, 23.0])]);
-        assert!(evidence.is_empty());
-    }
-
-    #[test]
-    fn test_cumulative_batching_ragged_scanned_axis() {
-        // Scanning a ragged axis would fold its padding into every later live prefix, so the rule asks the policy to
-        // neutralize that padding with the identity of the kind's combining operator first. Static array batching
-        // cannot, and says so (naming that identity) rather than silently scanning padding.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let ragged_axes = vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])];
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(ragged_axes.clone())
-            .unwrap();
-        for (kind, identity) in [
-            (CumulativeKind::Sum, "Zero"),
-            (CumulativeKind::Product, "One"),
-            (CumulativeKind::LogSumExp, "LowestReal"),
-            (CumulativeKind::Max, "Lowest"),
-            (CumulativeKind::Min, "Highest"),
-        ] {
-            assert_eq!(
-                CumulativeOperation::new(0, kind).batch(
-                    &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                    &EmptyRegionDriver,
-                    std::slice::from_ref(&input),
-                ),
-                Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "static array batching cannot identity-mask bounded ragged dimension `length` on axis 1 with \
-                         `{identity}`",
-                    ),
-                }),
-            );
-        }
-
-        // Every element of a payload-free structural zero, padding included, is the same zero, so its prefix sums and
-        // products need no mask at all (and there is no `one` of that type to write) and pass the ragged axis through.
-        let zero = ArrayBatch::new(
-            Array::new(ArrayType::new_static(DataType::Zero, [2, 3]), Vec::new()).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(ragged_axes)
-        .unwrap();
-        for kind in [CumulativeKind::Sum, CumulativeKind::Product] {
-            let (outputs, evidence) = CumulativeOperation::new(0, kind)
-                .batch(
-                    &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                    &EmptyRegionDriver,
-                    std::slice::from_ref(&zero),
-                )
-                .unwrap()
-                .into_parts();
-            assert_eq!(outputs, vec![zero.clone()]);
-            assert!(evidence.is_empty());
-        }
-
-        // The composite dynamic policy can, and stages the mask ahead of the scan: the padded positions of the scanned
-        // axis are selected away in favor of the identity, and the ragged axis survives on the result because a scan
-        // consumes no axis.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
-        let packed = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
-                .into(),
-        );
-        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(trace.clone()),
-            batch_extent,
-        );
-        let ragged_axes = vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length, vec![0])];
-        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(ragged_axes.clone())
-            .unwrap();
-
-        // The per-item scan of axis 0 is the packed axis 1 that carries the ragged extents.
-        let (outputs, evidence) = CumulativeOperation::new(0, CumulativeKind::LogSumExp)
-            .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
-        assert!(evidence.is_empty());
-
-        let output_id = outputs.into_iter().next().unwrap().into_value().into_value().atom_id().unwrap();
-        let program = trace
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output_id],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:i32[items] .
-                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
-                    %4:dimension<3> = constant [value=3]
-                    %5:i32[3] = iota [type=i32[3], dimension=0]
-                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4
-                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4
-                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7
-                    %9:f32[] = constant [value=-inf]
-                    %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4
-                    %11:f32[items, 3] = select %8 %1 %10
-                    %12:f32[items, 3] = cumulative [kind=log_sum_exp, axis=1] %11
-                in (%12)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_cumulative_batching_ragged_extent_axis() {
-        // Each item is a `[time, columns]` array whose ragged `columns` extents vary along `time`, so the two time
-        // steps of an item can have different live columns. A scan along `time` combines elements that share a column,
-        // and so padding at one time step would accumulate into a live element at another (a later one, or an earlier
-        // one for a reverse scan) unless the rule first masks `columns` with the identity of the kind's combining
-        // operator. Every padded element below stores `100`, which no live output may observe, and padded output
-        // elements hold prefixes of the masked input. Scanning `columns` itself masks the same ragged axis.
-        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let packed = |values: &[f32]| {
-            ArrayIrValue::Array(
-                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2, 3]), values).unwrap(),
-            )
-        };
-        let infinity = f32::INFINITY;
-        for (operation, extents, input, expected) in [
-            // The scanned axis is the ragged `columns` axis.
-            (
-                CumulativeOperation::new(1, CumulativeKind::Sum),
-                [1i64, 3, 2, 3],
-                [1.0, 100.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 1.0, 2.0, 2.0, 1.0, 2.0, 3.0],
-            ),
-            // The scanned axis is the `time` extent axis of the ragged `columns` axis.
-            (
-                CumulativeOperation::new(0, CumulativeKind::Sum),
-                [1, 3, 2, 3],
-                [1.0, 100.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 1.0, 1.0],
-                [1.0, 0.0, 0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 0.0, 2.0, 2.0, 1.0],
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Sum).with_reverse(true),
-                [3, 1, 3, 2],
-                [1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0],
-                [2.0, 1.0, 1.0, 1.0, 0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.0],
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Product),
-                [1, 3, 2, 3],
-                [2.0, 100.0, 100.0, 3.0, 3.0, 3.0, 2.0, 2.0, 100.0, 3.0, 3.0, 3.0],
-                [2.0, 1.0, 1.0, 6.0, 3.0, 3.0, 2.0, 2.0, 1.0, 6.0, 6.0, 3.0],
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Max),
-                [1, 3, 2, 3],
-                [1.0, 100.0, 100.0, 2.0, 2.0, 2.0, 1.0, 1.0, 100.0, 2.0, 2.0, 2.0],
-                [1.0, -infinity, -infinity, 2.0, 2.0, 2.0, 1.0, 1.0, -infinity, 2.0, 2.0, 2.0],
-            ),
-        ] {
-            // The `columns` extents are indexed by both the batch axis and the `time` axis of the packed array.
-            let extents = Array::from_elements::<i64>(ArrayType::new_static(DataType::I64, [2, 2]), &extents).unwrap();
-            let ragged_axes = vec![RaggedAxis::new(2, ArrayIrValue::Array(extents), columns.clone(), vec![0, 1])];
-            let batch = |values: &[f32]| {
-                ArrayIrBatch::new(packed(values), BatchAxis::new(0))
-                    .unwrap()
-                    .with_ragged_axes(ragged_axes.clone())
-                    .unwrap()
-            };
-            let [output] = context
-                .bind(
-                    ArrayIrOperation::Array(ArrayOperation::Cumulative(operation)),
-                    Vec::new(),
-                    &[BatchingTracer::new(context.clone(), batch(&input))],
-                )
-                .unwrap()
-                .try_into()
-                .unwrap();
-            assert_eq!(output.into_batch(), batch(&expected));
-        }
     }
 
     #[test]

@@ -6,9 +6,7 @@ use std::sync::LazyLock;
 use ryft_macros::capability;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType};
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -279,7 +277,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // Broadcast or move the stored value to the final selected referent's batch axis.
         check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
         let binding_axes = inputs[2..].iter().map(P::batch_axis).collect::<Vec<_>>();
@@ -306,7 +304,7 @@ where
         let mut values = vec![P::value(&inputs[0]).clone(), P::value(&update).clone()];
         values.extend(inputs[2..].iter().map(|input| P::value(input).clone()));
         context.parent().bind(self.clone().with_transforms(transforms), Vec::new(), &values)?;
-        Ok(Vec::new().into())
+        Ok(Vec::new())
     }
 }
 
