@@ -336,13 +336,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Iota(IotaOperation<ArrayType>),
 
     /// Region-free [`ArrayOperation`] member, reached by projecting the complete instruction boundary to [`ArrayType`].
-    /// Attached regions belong to the composite universe and cannot pass through that projection. Lifting promotes
-    /// region-carrying payloads to [`Condition`](Self::Condition), [`While`](Self::While), [`Scan`](Self::Scan),
-    /// [`LinearCall`](Self::LinearCall), [`Rematerialize`](Self::Rematerialize), and the explicit custom-function
-    /// carriers: [`CustomFunction`](Self::CustomFunction) / [`CustomFunctionTranspose`](Self::CustomFunctionTranspose)
-    /// for attached rules, or [`LiftedCustomFunction`](Self::LiftedCustomFunction) /
-    /// [`LiftedCustomFunctionTranspose`](Self::LiftedCustomFunctionTranspose) for retained member rules. Every
-    /// transform rejects a directly constructed region-carrying payload here with a diagnostic naming its operation.
+    /// Attached regions belong to the composite universe and cannot pass through this projection. Region-carrying
+    /// operations must instead use dedicated composite-family variants that retain access to their regions. Transforms
+    /// reject a region-carrying payload constructed here directly, with a diagnostic naming its operation.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
 

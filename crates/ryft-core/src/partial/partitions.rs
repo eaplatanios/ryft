@@ -451,6 +451,28 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
             .any(|source| matches!(source, ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_)))
     }
 
+    /// Returns whether the [`residual_program`](Self::residual_program) receives a known reference (i.e., whether
+    /// [`known_reference_inputs`](Self::known_reference_inputs) is nonempty), or either program embeds an executable
+    /// reference constant, including in nested computation regions.
+    ///
+    /// Split rules of custom region-carrying operations can use this query to detect reference identities that their
+    /// boundary must preserve. The split rules of `condition` and `scan` keep the partitioned computation whole in
+    /// this case, because neither an edge nor a captured constant may expose a reference without accounting for its
+    /// identity.
+    ///
+    /// A `false` result does not establish that splitting is safe. The caller must still validate effect ordering
+    /// (refer to [`has_effect_ordering_conflicts`](Self::has_effect_ordering_conflicts)) and the split's value and
+    /// region-boundary contracts. This query does not test whether the programs access overlapping allocations.
+    #[inline]
+    pub fn has_known_reference_inputs_or_constants(&self) -> bool {
+        self.known_reference_inputs().next().is_some()
+            || [&self.known_program, &self.residual_program].into_iter().any(|program| {
+                program.entry_region_ref().computation_regions().any(|region| {
+                    region.atoms().iter().any(|atom| atom.as_constant().is_some() && atom.r#type().is_reference())
+                })
+            })
+    }
+
     /// Consumes this [`PartitionedProgram`] and returns an equivalent partition in which the residual program reads
     /// the values that its residual edges merely repeat directly from where the caller of the partition already has
     /// them: the original known inputs and the fully known outputs. The residual program itself is unchanged; only its
@@ -621,6 +643,25 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         self,
     ) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, PartitionMetadata) {
         (self.known_program, self.residual_program, self.metadata)
+    }
+
+    /// Validates that [`known_input_indices`](Self::known_input_indices) selects exactly the original inputs marked
+    /// by `input_known`, in order. Split rules use this to check that a driver's partition matches their known inputs
+    /// before binding either program.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the selected known input indices differ from `input_known`.
+    pub(crate) fn validate_known_input_indices(&self, input_known: &[bool]) -> Result<(), ProgramError> {
+        let expected_known_input_indices =
+            (0..input_known.len()).filter(|&index| input_known[index]).collect::<Vec<_>>();
+        if self.metadata.known_input_indices != expected_known_input_indices {
+            return Err(ProgramError::MalformedProgram(format!(
+                "partition selects known input indices {:?} but its split expects {:?}",
+                self.metadata.known_input_indices, expected_known_input_indices,
+            )));
+        }
+        Ok(())
     }
 
     /// Validates the stricter layout required by operation split rules: residual inputs consume every edge exactly
@@ -947,14 +988,8 @@ where
             // Replay already kept aliased applications whole before nested input bindings could be lost. References
             // passed from known work to residual work, and executable reference constants, still require the
             // conservative global constraints established by `from_parts`.
-            let programs = [&partition.known_program, &partition.residual_program];
-            if partition.known_reference_inputs().next().is_none()
-                && !programs.into_iter().any(|program| {
-                    program.entry_region_ref().computation_regions().any(|region| {
-                        region.atoms().iter().any(|atom| atom.as_constant().is_some() && atom.r#type().is_reference())
-                    })
-                })
-            {
+            if !partition.has_known_reference_inputs_or_constants() {
+                let programs = [&partition.known_program, &partition.residual_program];
                 for (index, program) in programs.into_iter().enumerate() {
                     let analysis = program.entry_region_ref().reference_analysis_with_configuration(None, true, &[])?;
                     let roots = analysis.roots().filter_map(|root| match root {
