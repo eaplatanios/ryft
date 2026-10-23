@@ -451,7 +451,6 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
             .any(|source| matches!(source, ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_)))
     }
 
-    // TODO(eaplatanios): Review this.
     /// Consumes this [`PartitionedProgram`] and returns an equivalent partition in which the residual program reads
     /// the values that its residual edges merely repeat directly from where the caller of the partition already has
     /// them: the original known inputs and the fully known outputs. The residual program itself is unchanged; only its
@@ -477,10 +476,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// Each `ResidualEdge` source is classified by the atom that `K` returns for it:
     ///
     ///   - an edge that returns an input of `K` becomes a [`KnownInput`](ResidualInputSource::KnownInput) naming the
-    ///     corresponding original input (the analogue of the input forwarding of JAX's
-    ///     `trace_to_subjaxpr_nounits_fwd2`),
+    ///     corresponding original input (analogous to the input forwarding of JAX's `trace_to_subjaxpr_nounits_fwd2`),
     ///   - an edge that returns the same atom as a fully known output becomes a
-    ///     [`KnownOutput`](ResidualInputSource::KnownOutput) naming the first such output (the analogue of its output
+    ///     [`KnownOutput`](ResidualInputSource::KnownOutput) naming the first such output (analogous to its output
     ///     forwarding), and
     ///   - every other edge stays a [`ResidualEdge`](ResidualInputSource::ResidualEdge), renumbered in order of first
     ///     use, with edges that return the same atom sharing one edge.
@@ -509,23 +507,26 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     ///              x ← UnknownInput(3)   p ← KnownOutput(0)   q ← KnownInput(1)   r ← ResidualEdge(0)
     /// ```
     ///
-    /// After forwarding, `K` returns `a + a` once and no longer receives `b`, whose value the caller passes to `R`
-    /// directly. When no edge is forwarded or deduplicated, the partition is returned unchanged. Otherwise, the
-    /// effect-ordering constraints of the rebuilt `K` are conservatively reset to global ordering of its ordered
-    /// effects, because rebuilding renumbers the instructions that identify its reference allocations. The
-    /// constraints of `R` stay valid, because `R` is unchanged.
+    /// After forwarding, `K` returns `a + a` once and no longer receives `b`, whose value the caller passes to
+    /// `R` directly. The known program is rebuilt when its output list changes through forwarding, deduplication,
+    /// reordering, or removal of unused edges. An unchanged output list preserves `K` and its effect-ordering
+    /// constraints. Rebuilding conservatively resets those constraints to global ordering of its ordered effects,
+    /// because rebuilding renumbers the instructions that identify its reference allocations. The constraints of
+    /// `R` stay valid, because `R` is unchanged.
     ///
     /// # Usage
     ///
     /// Forwarding is a separate step, rather than part of [`Program::partition`], because an edge and the value it
     /// repeats are interchangeable only at the boundary of a single invocation. Residual placement (refer to
     /// [`with_residual_policy`](Self::with_residual_policy)), precision rounding, and the split rules of `condition`
-    /// and `scan` rely on the edges forming a contiguous suffix of the outputs of `K`, and they reject forwarded
-    /// partitions. In a `scan` body, for example, an edge that repeats a body input carries the value of one
-    /// iteration rather than the input of the enclosing `scan`. Boundary operations whose two halves become separate
-    /// operations (e.g., through [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls
-    /// forward residuals after placing and rounding them, so that their known half does not return the same value
-    /// twice and does not route its own inputs back out.
+    /// and `scan` require known feeders to pass through explicit residual edges. They reject forwarded `KnownInput`
+    /// and `KnownOutput` sources because those sources bypass the edges on which their storage, rounding, and boundary
+    /// rewrites operate. Retained edges still form a contiguous suffix of the outputs of `K` after forwarding. In a
+    /// `scan` body, for example, an edge that repeats a body input carries the value of one iteration rather than the
+    /// input of the enclosing `scan`. Boundary operations whose two halves become separate operations (e.g., through
+    /// [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls forward residuals after
+    /// placing and rounding them, so that their known half does not return the same value twice and does not route
+    /// its own inputs back out.
     ///
     /// # Errors
     ///
