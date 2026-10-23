@@ -3439,18 +3439,21 @@ pub struct TangentActivity<C: Context> {
 
 impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
     /// Analyzes the forward-mode activity of an application of `region` whose inputs have live tangents exactly where
-    /// `input_live` is set (one flag per region input), differentiating the region through `driver`, and returning a
-    /// new [`TangentActivity`] instance.
+    /// `input_tangent_liveness` is set (one flag per region input), differentiating the region through `driver`, and
+    /// returning a new [`TangentActivity`] instance.
     pub fn new<D: DifferentiationDriver<C>>(
         driver: &D,
         region: RegionRef<'_, C::Constant, C::Operation>,
-        input_live: &[bool],
+        input_tangent_liveness: &[bool],
     ) -> Result<Self, DifferentiationError> {
-        let input_indices =
-            input_live.iter().enumerate().filter_map(|(index, &live)| live.then_some(index)).collect::<Vec<_>>();
+        let input_indices = input_tangent_liveness
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &live)| live.then_some(index))
+            .collect::<Vec<_>>();
         let tangent_slot_mask = region.tangent_output_mask(&input_indices)?;
         let jvp_program = driver.jvp_program(region, &input_indices)?;
-        let tangent_inputs = (input_live.len()..jvp_program.input_count()).collect::<Vec<_>>();
+        let tangent_inputs = (input_tangent_liveness.len()..jvp_program.input_count()).collect::<Vec<_>>();
         let mut depends = jvp_program.output_dependence(&tangent_inputs)?.into_iter().skip(tangent_slot_mask.len());
 
         // The derived program has one tangent output per tangent slot, so only outputs with a slot consume a flag.
@@ -3461,8 +3464,8 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
 
     /// Analyzes the forward-mode activity of a loop whose `body` region receives its carried state at the region inputs
     /// `carry_inputs` and returns the next state at the region outputs `carry_outputs`, which pair with them in order,
-    /// starting from the live input tangents `input_live` (one flag per region input). Returns the converged input
-    /// liveness together with the activity of the body under it.
+    /// starting from `input_tangent_liveness` (one flag per region input). Returns the converged input tangent liveness
+    /// together with the activity of the body under it.
     ///
     /// The carry ranges must have equal lengths and lie within the body's input and output boundaries. Empty ranges
     /// are supported. The operation's rule remains responsible for validating the loop's state boundary.
@@ -3479,24 +3482,24 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
     pub fn from_loop_body<D: DifferentiationDriver<C>>(
         driver: &D,
         body: RegionRef<'_, C::Constant, C::Operation>,
-        mut input_live: Vec<bool>,
+        mut input_tangent_liveness: Vec<bool>,
         carry_inputs: Range<usize>,
         carry_outputs: Range<usize>,
     ) -> Result<(Vec<bool>, Self), DifferentiationError> {
         loop {
-            let mut activity = Self::new(driver, body, &input_live)?;
+            let mut activity = Self::new(driver, body, &input_tangent_liveness)?;
             let mut converged = true;
             for (input, output) in carry_inputs.clone().zip(carry_outputs.clone()) {
-                if activity.output_tangent_liveness[output] && !input_live[input] {
-                    input_live[input] = true;
+                if activity.output_tangent_liveness[output] && !input_tangent_liveness[input] {
+                    input_tangent_liveness[input] = true;
                     converged = false;
                 }
             }
             if converged {
                 for (input, output) in carry_inputs.zip(carry_outputs) {
-                    activity.output_tangent_liveness[output] = input_live[input];
+                    activity.output_tangent_liveness[output] = input_tangent_liveness[input];
                 }
-                return Ok((input_live, activity));
+                return Ok((input_tangent_liveness, activity));
             }
         }
     }
@@ -8471,15 +8474,16 @@ pub(crate) mod tests {
 
         // Activity reaches the two inactive carries on successive iterations. The source carry resets to a constant
         // but must retain its tangent slot, while the extra output follows the newly active second carry.
-        let (inputs, activity) = TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
-            &driver,
-            body.entry_region_ref(),
-            vec![false, false, true],
-            0..3,
-            0..3,
-        )
-        .unwrap();
-        assert_eq!(inputs, vec![true; 3]);
+        let (input_tangent_liveness, activity) =
+            TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
+                &driver,
+                body.entry_region_ref(),
+                vec![false, false, true],
+                0..3,
+                0..3,
+            )
+            .unwrap();
+        assert_eq!(input_tangent_liveness, vec![true; 3]);
         assert_eq!(activity.input_indices(), &[0, 1, 2]);
         assert_eq!(activity.output_tangent_liveness(), &[true; 4]);
         assert_eq!(activity.live_tangent_slots(activity.output_tangent_liveness()), vec![0, 1, 2, 3]);
@@ -8494,15 +8498,16 @@ pub(crate) mod tests {
             .trim_end(),
         );
 
-        let (inputs, activity) = TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
-            &driver,
-            body.entry_region_ref(),
-            vec![false; 3],
-            0..3,
-            0..3,
-        )
-        .unwrap();
-        assert_eq!(inputs, vec![false; 3]);
+        let (input_tangent_liveness, activity) =
+            TangentActivity::<EagerContext<Array, TestArrayOperation>>::from_loop_body(
+                &driver,
+                body.entry_region_ref(),
+                vec![false; 3],
+                0..3,
+                0..3,
+            )
+            .unwrap();
+        assert_eq!(input_tangent_liveness, vec![false; 3]);
         assert_eq!(activity.output_tangent_liveness(), &[false; 4]);
         assert!(activity.live_tangent_slots(activity.output_tangent_liveness()).is_empty());
     }

@@ -6,7 +6,7 @@
 
 **Architecture review:** 2026-09-10; includes a targeted substrate and primary-source refresh
 
-**Targeted research updates:** 2026-09-25, SkySynth and ZML/LLMD; 2026-10-20, DeepInfer
+**Targeted research updates:** 2026-09-25, SkySynth and ZML/LLMD; 2026-10-20, DeepInfer; 2026-10-23, MAX
 
 **Scope:** one inference system for agentic/RL rollouts, embedded use, and production online serving
 
@@ -1181,6 +1181,54 @@ Deliverables:
 Exit gate: disaggregation beats aggregated serving on a declared workload/SLO/fabric after charging transfer and control
 cost; otherwise aggregated mode remains the default.
 
+### Optional future extension — MAX backend evaluation
+
+Keep MAX as a potential backend alongside XLA, not a prerequisite for the phases above. XLA remains the primary
+implementation. The October 23 review inspected Modular revision `da0db31d422e19ad5952d8d106b6da1d6899cf0a`, following
+the MAX 26.7 source release. Native embedding is plausible through its C API; production integration and a performance
+advantage over Ryft/XLA remain unproven. A MAX Serve comparison can begin independently of any backend implementation.
+
+Distinguish three scopes: benchmarking the complete MAX server, executing MAX-compiled model steps under Ryft's
+scheduler, and compiling Ryft programs through a general MAX backend. Only the last preserves the shared model through
+Ryft's own lowering path. The inspected compiler accepts MAX's MEF/MO/MGP formats, not a documented StableHLO/PJRT
+interface. A general backend needs new operation lowering, buffer/runtime integration, and capability tests; shared
+MLIR infrastructure does not provide interchangeability. Reuse the existing backend-neutral compilation and inference
+contracts rather than introducing a second scheduler or duplicating model architecture code.
+
+Native execution also needs a physical proof. The inspected C header exposes synchronous execution and graph
+capture/replay, but not the asynchronous execution entry point mentioned by the API overview. A blocking call on a
+worker thread can overlap host work without establishing device-side chaining or completion-fence parity. Device-pointer
+borrowing does not by itself prove safe mutation, aliasing, or cross-runtime sharing. Compile/init separation exists,
+but Python weight-reload support does not establish an equivalent native refit path.
+
+Evaluate incrementally, without committing to broad backend coverage:
+
+- [ ] Benchmark pinned MAX Serve on the full Gemma workload using section 18's numerical, resource, and SLO contracts.
+      Attribute results to the complete engine; do not infer compiler superiority from server-level throughput.
+- [ ] Before adopting a distributable dependency, review the exact component licenses and native API stability.
+      Newly released internals use the source-available MAX License; separately licensed Apache components retain
+      their terms. Account for modified-source distribution, AI-assisted reimplementation, and applicable hosted-service
+      branding requirements. The license explicitly permits analysis and interoperability work.
+- [ ] If evidence justifies it, lower one small Ryft-generated model step and execute it through a native bridge.
+      Prove persistent KV mutation, buffer lifetimes, error/completion handling, scheduling overlap, and graph replay
+      under changing metadata before attempting full model coverage. Keep training/score operation support explicit.
+- [ ] Demonstrate weight rebinding without recompilation, safe old-version retirement, artifact compatibility, and
+      bounded compile/startup memory. Add sharding/collective proofs for each proposed multi-device deployment.
+- [ ] Promote the experiment only after matched end-to-end measurements show a material benefit or required hardware
+      coverage that justifies maintaining another lowering/runtime stack. Otherwise retain MAX as a comparison target.
+
+MAX's serving lessons also merit experiments within the XLA implementation:
+
+- Compare immediate mixed admission with bounded prefill coalescing/shared cadence when mixed steps lose graph replay;
+  measure TTFT, decode latency, and fairness together. Do not assume MAX's capture limitation also applies to Ryft.
+- Ablate graph replay and host/device overlap independently, and charge additional speculative-width captures to
+  startup time and graph memory, not only steady-state token throughput.
+- Evaluate compilation from weight metadata before full checkpoint transfer, with real-weight validation before
+  readiness. Extend hybrid-cache tests so KV blocks and recurrent checkpoints remain coherent across tier eviction.
+
+These experiments refine existing Phases 0–5; a second production backend is a separate future decision and does not
+expand their exit gates. No MAX performance result has been reproduced as part of this architecture review.
+
 ## 18. Benchmark and acceptance strategy
 
 ### Primary envelope and performance hypotheses
@@ -1474,3 +1522,12 @@ faster, more complete, and more production-proven is not.
 - [Verification budget and feedback semantics](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/mtp_varlen.hpp)
 - [Device-side verification metadata](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/tilelang_ops/cuda/schedule_mtp_varlen.py)
 - [Request-local random sampling](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/tilelang_ops/cuda/random_sampling.py)
+
+### MAX future-backend review (2026-10-23)
+
+- [MAX source release and licensing boundary](https://www.modular.com/blog/max-license)
+- [MAX License](https://www.modular.com/legal/max-license)
+- [Pinned 26.7 serving and compilation changes](https://github.com/modular/modular/blob/da0db31d422e19ad5952d8d106b6da1d6899cf0a/max/docs/site/releases/v26.7.md)
+- [Native model execution API](https://github.com/modular/modular/blob/da0db31d422e19ad5952d8d106b6da1d6899cf0a/max/include/max/c/model.h)
+- [Compiler input formats](https://github.com/modular/modular/blob/da0db31d422e19ad5952d8d106b6da1d6899cf0a/GraphCompiler/include/GraphCompiler/Driver/Common/DriverInputFormat.h)
+- [Native tensor ownership and borrowing API](https://max.modular.com/api/c/tensor/)
