@@ -85,19 +85,16 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionSource, DimensionType, DimensionValue,
-    DynamicArrayExtentBatchingPolicy, RaggedType, RaggedValue, StaticArrayExtentBatchingPolicy,
+    DynamicArrayExtentBatchingPolicy, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::Axis;
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    BatchingPolicyProjection, reject_ragged_carriers,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentialMetadataProvider, DifferentialMetadataPurpose,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -105,32 +102,26 @@ use crate::macros::{
     impl_reference_dischargeable_operation,
 };
 use crate::operations::Capability;
+use crate::operations::arithmetic::AddOperation;
 
-use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
+use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
-use crate::operations::constants::iota::{Iota, IotaOperation};
+use crate::operations::constants::iota::IotaOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
-use crate::operations::logical::{And, Not, Or};
-use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::conversions::{CastOperation, CastType, ConvertElementType};
-use crate::operations::manipulation::memory::TransferToMemory;
 
-use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::DynamicSlice;
-use crate::operations::ragged::{
-    RaggedExtents, RaggedExtentsOperation, RaggedNew, RaggedNewOperation, RaggedStorage, RaggedStorageOperation,
-    check_guard_ragged_inputs, guard_array_fields, guard_declared_array_fields,
-};
 use crate::operations::reductions::{Reduce, ReductionKind};
 
 use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
 };
 use crate::programs::{
     Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter,
@@ -140,7 +131,7 @@ use crate::programs::{
     TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
-use crate::tracing::TracingContext;
+use crate::tracing::{Tracer, TracingContext};
 
 /// Failure of a correctness assertion, including the named values observed at that assertion.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -282,8 +273,7 @@ pub const ASSERT_OPERATION_NAME: &str = "assert";
 /// conditions are handled by [`Assert`] and partial evaluation. Default mapped batching reports the first failing
 /// batch item at each batching level, with batch extents restricted to the `i32` index range, whereas bounded
 /// reporting preserves all logical elements and reports a row-major sample. Mixed array programs support dynamic
-/// extents, including empty batches, which pass vacuously. Materializing bounded element diagnostics rejects ragged
-/// inputs because their padding is not logical data. Observations with a potentially empty mapped axis receive
+/// extents, including empty batches, which pass vacuously. Observations with a potentially empty mapped axis receive
 /// one unused padding item so that diagnostic selection remains valid; the padded extent must also fit `i32`.
 ///
 /// Refer to the documentation of [`Assert`] for more information.
@@ -532,7 +522,7 @@ where
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Validate the per-item signature before eliminating an empty batch or changing the input shapes.
         self.infer_output_types(
             &inputs
@@ -543,7 +533,7 @@ where
         )?;
 
         let Some(assertion) = BatchedAssertion::from_inputs(self, context, inputs)? else {
-            return Ok(Vec::new().into());
+            return Ok(Vec::new());
         };
 
         // Delegate the assertion to the parent so any enclosing transforms apply their own rules.
@@ -554,7 +544,7 @@ where
             None => assertion.condition.assert(&self.message, &observations)?,
         }
 
-        Ok(Vec::new().into())
+        Ok(Vec::new())
     }
 }
 
@@ -571,7 +561,7 @@ where
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Validate the per-item signature before eliminating an empty batch or changing the input shapes.
         self.infer_output_types(
             &inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>(),
@@ -581,9 +571,7 @@ where
         // Run the shared rule over the array view of this batching level, which shares its first-class extent. A
         // replicated dimension has no array view, but it is shared by every batch item, so it is reinserted unchanged
         // at its own position. Every other input crosses into that view through the policy projection, which owns the
-        // array view of each carrier kind: a mapped dimension's packed value holds one extent per batch item and is
-        // selected or materialized like an integer observation, and bounded ragged axes are kept so that
-        // materialization still rejects them.
+        // array view of each input.
         let projected = inputs
             .iter()
             .map(|input| !matches!(input.value().r#type().as_ref(), ArrayIrType::Dimension(_)))
@@ -593,9 +581,9 @@ where
             .zip(&projected)
             .filter(|(_, projected)| **projected)
             .map(|(input, _)| {
-                <ArrayIrBatchingPolicy as BatchingPolicyProjection<C, ArrayType>>::project_batch(
-                    context.parent(),
-                    input,
+                ArrayBatch::new(
+                    <C::Value as ValueProjection<ArrayType>>::into_projected(input.value().clone())?,
+                    input.batch_axis(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -607,7 +595,7 @@ where
             .with_axis_name(context.axis_name().map(str::to_owned))
             .with_axis_sharding(context.axis_sharding().clone());
         let Some(assertion) = BatchedAssertion::from_inputs(self, &projected_context, &array_inputs)? else {
-            return Ok(Vec::new().into());
+            return Ok(Vec::new());
         };
         let mut array_observations = assertion.observations.into_iter().map(C::Value::from_projected);
         let mut observations = Vec::with_capacity(inputs.len());
@@ -624,7 +612,7 @@ where
             Some(limit) => condition.assert_with_limit(&self.message, &observations, limit)?,
             None => condition.assert(&self.message, &observations)?,
         }
-        Ok(Vec::new().into())
+        Ok(Vec::new())
     }
 }
 
@@ -650,8 +638,7 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// ordinary operation rules and guard/cast batching do not require this trait. An operation family's generated batching
 /// implementation still requires support for every variant, including assertions when present.
 ///
-/// Implementations must preserve logical extents, memory placement, and manual variation. They must reject unsupported
-/// ragged inputs rather than report padding as logical assertion elements.
+/// Implementations must preserve logical extents, memory placement, and manual variation.
 pub trait ArrayAssertionBatchingPolicy<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> {
     /// Returns an array of type `r#type` containing leading-axis coordinates: each element at `[i, ...]` has value
     /// `i` represented in the requested element data type. The leading dimension must match the logical batch extent.
@@ -1191,9 +1178,6 @@ impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
             Self::Reference(_) => {
                 Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() })
             }
-            Self::Ragged(_) => Err(ProgramError::UnsupportedOperation {
-                message: "assertion observations cannot be first-class ragged values".to_owned(),
-            }),
         }
     }
 
@@ -1204,9 +1188,6 @@ impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
             Self::Reference(_) => {
                 Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() })
             }
-            Self::Ragged(_) => Err(ProgramError::UnsupportedOperation {
-                message: "assertion observations cannot be first-class ragged values".to_owned(),
-            }),
         }
     }
 }
@@ -1272,9 +1253,6 @@ impl<V: Value<Type = ArrayType>> BatchedAssertion<V> {
         // Preserve individual conditions and observations so the parent can report multiple failing elements.
         // Materialization broadcasts replicated inputs and arranges mapped inputs along the batch axis.
         if operation.failure_limit.is_some() {
-            // Padding in bounded ragged inputs is not logical data and must not be reported as failed elements.
-            ArrayBatch::reject_ragged_inputs(&AssertOperation::<ArrayType>::new(""), inputs)?;
-
             // Move a mapped condition's batch axis to the front, or insert a leading batch axis for a replicated one.
             let condition = P::match_axis(context, &inputs[0], Axis::from(0))?.into_value();
             let condition_type = condition.r#type().into_owned();
@@ -1471,15 +1449,11 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 /// an ordinary value.
 ///
 /// Batching lifts the declared types by the mapped axis and guards the packed values at once, freshening the guard's
-/// local identities so the inserted batch dimension cannot alias them. Bounded ragged carriers and mapped first-class
-/// dimensions hold their per-item extents outside their packed types, which the lifted guard cannot relate, so
-/// batching rejects them.
+/// local identities so the inserted batch dimension cannot alias them. First-class dimensions remain replicated.
 ///
 /// The guarded type family owns the interpretation, batching, and differentiation semantics through
 /// [`GuardInterpretation`], [`GuardBatching`], and [`GuardDifferentiation`], so that one guard payload serves every
-/// family. For example, [`ArrayIrType`] checks ragged members numerically, because their live extents are kept in
-/// extent arrays rather than in their types. Reference discharge, partial evaluation, and transposition are shared by
-/// every family.
+/// family. Reference discharge, partial evaluation, and transposition are shared by every family.
 ///
 /// The guard's stored state has three semantic roles:
 ///
@@ -1522,9 +1496,9 @@ pub const GUARD_OPERATION_NAME: &str = "guard";
 ///   5. Success means that the check ran immediately or became a dependency that runs before the outputs are used.
 ///      Relationships that local types prove never permit dropping a guard, because its outputs may still transport
 ///      the ordering of an earlier ordered assertion.
-///   6. Under a transform, enforcement applies that transform's rule for this operation and validates its carriers
-///      (e.g., batching rejects bounded ragged carriers). A transform may forward the guard to its parent context only
-///      after its rule has transformed the request and the inputs.
+///   6. Under a transform, enforcement applies that transform's rule for this operation and validates its inputs.
+///      A transform may forward the guard to its parent context only after its rule has transformed the request and
+///      the inputs.
 ///   7. Errors keep their variants. Interpreting a relationship that symbolic types leave unproven fails with
 ///      [`ProgramError::Concretization`], and a family or carrier that cannot represent the check fails with an
 ///      explicit unsupported-operation error (e.g., [`unsupported_error`](Self::unsupported_error)). An unsupported
@@ -1604,8 +1578,7 @@ impl<T: Type> GuardOperation<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `actual` cannot satisfy the declared input types (refer to
-    /// [`TypeRefinements::new`](crate::TypeRefinements::new)).
+    /// Returns an error when `actual` cannot satisfy the declared input types (refer to [`TypeRefinements::new`]).
     pub fn for_entry<B: Into<String>>(
         boundary: B,
         declared: &[T],
@@ -1797,9 +1770,8 @@ impl<T: Type> GuardOperation<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the declaration is malformed, when an input is a bounded ragged carrier or a mapped
-    /// first-class dimension (whose per-item extents the lifted declarations cannot relate), or when the parent rejects
-    /// the lifted guard.
+    /// Returns an error when the declaration is malformed, when the batching policy cannot lift a declared type by the
+    /// mapped axis, or when the parent rejects the lifted guard.
     fn batch_ordinary<
         C: Context<Type = T, Operation: From<GuardOperation<T>>>,
         P: BatchingPolicy<C>,
@@ -1809,7 +1781,7 @@ impl<T: Type> GuardOperation<T> {
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // Every batch item enters with the same per-item shape, because mapped members are dense along the batch axis.
         // Guarding the stacked values with the batch axis inserted into their declared types therefore checks every
         // item at once. An empty batch still carries the extents of its non-batch axes, which the guard checks. Each
@@ -1821,10 +1793,6 @@ impl<T: Type> GuardOperation<T> {
             &self.declared_types,
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
-
-        // Bounded ragged carriers and mapped dimensions keep per-item extents outside their packed types, which the
-        // lifted declarations cannot relate. Reject them before freshening makes their identities look unrelated.
-        reject_ragged_carriers::<C, P>(GUARD_OPERATION_NAME, inputs)?;
 
         // The inserted batch dimension belongs to the surrounding program. Freshen the guard-local names together
         // before inserting it, so reusing a nominal identity across those scopes cannot create an extra equality.
@@ -1856,12 +1824,11 @@ impl<T: Type> GuardOperation<T> {
             .collect::<Vec<_>>();
         check_count!("output", outputs, inputs.len(), ProgramError);
 
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(inputs)
             .map(|(output, input)| P::batch(output, P::batch_axis(input)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// Differentiates this guard by checking the primal inputs and casting each tangent to the representation of
@@ -2138,7 +2105,7 @@ impl<T: GuardBatching<C, P>, C: Context<Type = T>, P: BatchingPolicy<C>> Batchab
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         T::batch_guard(self, context, driver, inputs)
     }
 }
@@ -2153,340 +2120,137 @@ impl<T: GuardDifferentiation<C>, C: Context<Type = T>> DifferentiableOperation<C
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         T::jvp_guard(self, context, driver, inputs)
     }
-
-    #[inline]
-    fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        T::jvp_guard_for_transpose(self, context, driver, inputs)
-    }
 }
 
-impl_non_transposable_operation!(<T> GuardOperation<T> where T: Type);
-
-// TODO(eaplatanios): Review from here onwards.
-
-impl GuardOperation<ArrayIrType> {
-    /// Executes an exact-schema ragged guard over ordinary array representations, including tracer arrays. This is
-    /// shared by eager array-IR interpretation and backend grouping. Numerical checks use array operations and return
-    /// guarded fields; no device payload is inspected on the host.
-    ///
-    /// # Errors
-    ///
-    /// Returns type and assertion errors for invalid representations or unequal live indexed occurrences. Returns
-    /// [`ProgramError::UnsupportedOperation`] for a nonidentity representation or a mixed structural dimension or
-    /// reference member. A signature without ragged inputs uses ordinary interpretation instead of this helper.
-    ///
-    /// The initial ragged contract accepts exact input and output representations consisting of arrays and ragged
-    /// values. Changing indexed identities, bounds, or representations, and mixing structural dimensions or references
-    /// with raw ragged members, require the later general ragged guard and cast protocol and return explicit
-    /// unsupported errors.
-    pub fn interpret_ragged<
-        A: Value<Type = ArrayType, Domain: Context<Constant: From<Array>> + Iota<A>>
-            + Compare
-            + And
-            + Or
-            + Not
-            + Broadcast
-            + Reduce
-            + Assert
-            + TransferToMemory,
-    >(
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T> + OperationProvider<T, AddOperation<T>, Operation = O>>
+    TransposableOperation<V, O> for GuardOperation<T>
+where
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        inputs: &[ArrayIrValue<A>],
-    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        let actual = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let declared = self.identity_preserving_declarations(&actual)?;
-        let ragged = inputs
-            .iter()
-            .filter_map(|input| match input {
-                ArrayIrValue::Ragged(value) => Some(value),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if ragged.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "indexed guard execution requires at least one ragged input".into(),
-            });
-        }
+        context: &mut TranspositionContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, self.declared_types.len(), ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = self.infer_output_types(&input_types, &[])?;
+        check_count!("output", outputs, output_types.len(), ProgramError);
+        let known = inputs.iter().filter_map(PartialValue::as_known).collect::<Vec<_>>();
+        let mut values = Vec::new();
+        let mut declarations = Vec::new();
+        let mut retained = self.retained_identities.clone();
+        let mut anchors = Vec::new();
+        let mut contributions = Vec::new();
+        let mut zeros = Vec::new();
+        let mut output = 0;
+        let mut checked_output = 0;
+        for (index, input) in inputs.iter().enumerate() {
+            let seed = if self.declared_types[index].is_reference() {
+                None
+            } else {
+                let seed = &outputs[output];
+                output += 1;
+                Some(seed)
+            };
 
-        let mut fields = Vec::new();
-        for input in inputs {
-            match input {
-                ArrayIrValue::Array(value) => fields.push(value.clone()),
-                ArrayIrValue::Ragged(value) => {
-                    fields.push(value.storage().clone());
-                    fields.extend_from_slice(value.extents());
-                }
-                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => unreachable!(),
-            }
-        }
-        let declared_fields = declared
-            .iter()
-            .flat_map(|r#type| match r#type {
-                ArrayIrType::Array(r#type) => vec![r#type.clone()],
-                ArrayIrType::Ragged(r#type) => std::iter::once(r#type.storage_type().clone())
-                    .chain(r#type.extent_types().iter().cloned())
-                    .collect(),
-                ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-
-        let mut guarded = guard_declared_array_fields(self.boundary(), declared_fields, &fields)?.into_iter();
-        let checked_inputs = inputs
-            .iter()
-            .map(|input| match input {
-                ArrayIrValue::Array(_) => Ok(ArrayIrValue::Array(guarded.next().unwrap())),
-                ArrayIrValue::Ragged(value) => Ok(ArrayIrValue::Ragged(RaggedValue::new(
-                    value.r#type().into_owned(),
-                    guarded.next().unwrap(),
-                    guarded.by_ref().take(value.extents().len()).collect(),
-                )?)),
-                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => unreachable!(),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        let ragged = checked_inputs
-            .iter()
-            .filter_map(|input| match input {
-                ArrayIrValue::Ragged(value) => Some(value),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        check_guard_ragged_inputs(&ragged)?;
-
-        let fields = checked_inputs
-            .iter()
-            .flat_map(|input| match input {
-                ArrayIrValue::Array(value) => vec![value.clone()],
-                ArrayIrValue::Ragged(value) => {
-                    std::iter::once(value.storage().clone()).chain(value.extents().iter().cloned()).collect()
-                }
-                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-        let mut fields = guard_array_fields(self.boundary(), &fields)?.into_iter();
-        checked_inputs
-            .iter()
-            .map(|input| match input {
-                ArrayIrValue::Array(_) => Ok(ArrayIrValue::Array(fields.next().unwrap())),
-                ArrayIrValue::Ragged(value) => Ok(ArrayIrValue::Ragged(RaggedValue::new(
-                    value.r#type().into_owned(),
-                    fields.next().unwrap(),
-                    fields.by_ref().take(value.extents().len()).collect(),
-                )?)),
-                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => unreachable!(),
-            })
-            .collect()
-    }
-
-    /// Returns `true` when the immutable declaration contains a ragged member, without obtaining or cloning any
-    /// runtime value's type.
-    #[inline]
-    fn has_ragged_declaration(&self) -> bool {
-        self.declared_types().iter().any(|r#type| matches!(r#type, ArrayIrType::Ragged(_)))
-    }
-
-    /// Admits one complete identity-preserving raw signature without treating its symbolic correspondence as a
-    /// numerical proof. Guard-local identities are aligned jointly, so shared occurrences stay shared across members.
-    fn identity_preserving_declarations(&self, actual: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, ProgramError> {
-        let outputs = self.infer_output_types(actual, &[])?;
-        if actual.iter().any(|r#type| matches!(r#type, ArrayIrType::Dimension(_) | ArrayIrType::Reference(_))) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "ragged guards cannot yet mix structural dimension or reference members".into(),
-            });
-        }
-
-        let raw_identities = self
-            .declared_types()
-            .iter()
-            .filter_map(|r#type| match r#type {
-                ArrayIrType::Ragged(r#type) => Some(r#type),
-                _ => None,
-            })
-            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()))
-            .collect::<Vec<_>>();
-        let refinements =
-            <ArrayIrType as Type>::Refinements::from_local_declarations(self.declared_types().iter(), actual.iter())?;
-        let mut renaming = TypeIdentityRenaming::new();
-        let mut unavailable = self
-            .declared_types()
-            .iter()
-            .chain(actual)
-            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()))
-            .collect::<Vec<_>>();
-
-        // Declared and actual names inhabit separate scopes. A raw target may equal an unrelated dense declaration
-        // name, so freshen those original dense-only names in the same simultaneous map used for raw alignment.
-        for (_, identity) in self.declared_types().iter().flat_map(Type::identities) {
-            if !raw_identities.contains(identity) && renaming.target(identity).is_none() {
-                let replacement = renaming.insert_fresh(identity.clone(), &unavailable)?;
-                unavailable.push(replacement);
-            }
-        }
-        let mut targets = Vec::new();
-        for class in refinements.identity_classes() {
-            for identity in class.declared().iter().filter(|identity| raw_identities.contains(identity)) {
-                let [target] = class.actual() else {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: "ragged guards require one unambiguous identity correspondence per raw declaration"
-                            .into(),
-                    });
-                };
-                if targets.contains(target) || identity.bounds() != target.bounds() {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: "ragged guards require one unambiguous identity correspondence per raw declaration"
-                            .into(),
-                    });
-                }
-                targets.push(target.clone());
-                renaming.insert(identity.clone(), target.clone())?;
-            }
-        }
-
-        // Guard declarations are local, so an ambient program rename changes actual identities alone. One complete
-        // bijection admits that unchanged schema; matching individual members could lose cross-carrier equalities.
-        let declared = self
-            .declared_types()
-            .iter()
-            .map(|r#type| r#type.rename_identities(&renaming))
-            .collect::<Result<Vec<_>, _>>()?;
-        for (declared, actual) in declared.iter().zip(actual) {
-            if matches!(actual, ArrayIrType::Ragged(_)) && declared != actual {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: "ragged guards require identity-preserving input and output representations".into(),
-                });
-            }
-        }
-
-        if outputs.as_slice() != actual {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "ragged guards require identity-preserving input and output representations".into(),
-            });
-        }
-
-        Ok(declared)
-    }
-
-    /// Keeps primal checks and uses checked ragged reconstruction in place of a general raw cast. Reverse
-    /// linearization captures only indexed shape and gives that identity map an explicit executable transpose.
-    fn jvp_ragged<C: Context<Type = ArrayIrType>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        inputs: &[DifferentiationDual<C::Value>],
-        shape_only: bool,
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
-            + From<GuardOperation<ArrayIrType>>
-            + From<RaggedNewOperation>
-            + From<RaggedStorageOperation>
-            + From<RaggedExtentsOperation>
-            + From<LinearCallOperation<ArrayIrType>>
-            + From<CastOperation<ArrayIrType>>
-            + From<<ArrayIrType as CastType>::IdentityWitnessOperation>,
-        TracingContext<C::Constant, C::Operation>:
-            StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-    {
-        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let outputs = context.primal().bind(self.clone(), Vec::new(), &primals)?;
-        check_count!("output", outputs, inputs.len(), ProgramError);
-        inputs
-            .iter()
-            .zip(outputs)
-            .map(|(input, output)| {
-                let tangent_type = output.r#type().tangent()?;
-                let tangent = match input.tangent() {
-                    _ if tangent_type.is_zero_space() => MaybeZero::Zero(tangent_type),
-                    MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
-                    MaybeZero::Value(tangent) => match &tangent_type {
-                        ArrayIrType::Ragged(target) => {
-                            // Forward linearization retains this value as a residual too. Both rules need only
-                            // indexed shape evidence, so neither may retain numerical primal storage for it.
-                            let mut metadata = C::Operation::capture_differential_metadata(
-                                context.primal(),
-                                &output,
-                                &tangent_type,
-                                DifferentialMetadataPurpose::Reconstruction,
-                            )?;
-                            check_count!("input", metadata, 1, ProgramError);
-                            let source = metadata.remove(0);
-                            let source = context.primal_to_tangent(source)?;
-                            let target = target.clone();
-                            let value = if shape_only {
-                                let transpose_target = <&RaggedType>::try_from(&tangent_type.cotangent()?)?.clone();
-                                LinearCallOperation::stage(
-                                    context.tangent(),
-                                    vec![source],
-                                    vec![tangent.clone()],
-                                    move |residuals, linear| {
-                                        let extents = target
-                                            .ragged_dimensions()
-                                            .iter()
-                                            .map(|descriptor| linear[0].ragged_extents(descriptor.axis()))
-                                            .collect::<Result<Vec<_>, _>>()?;
-                                        Ok(vec![linear[0].ragged_storage()?.ragged_new_with_identity_source(
-                                            target,
-                                            &extents,
-                                            &residuals[0],
-                                        )?])
-                                    },
-                                    move |residuals, cotangents| {
-                                        let extents = transpose_target
-                                            .ragged_dimensions()
-                                            .iter()
-                                            .map(|descriptor| cotangents[0].ragged_extents(descriptor.axis()))
-                                            .collect::<Result<Vec<_>, _>>()?;
-                                        Ok(vec![cotangents[0].ragged_storage()?.ragged_new_with_identity_source(
-                                            transpose_target,
-                                            &extents,
-                                            &residuals[0],
-                                        )?])
-                                    },
-                                )?
-                                .remove(0)
-                            } else {
-                                let mut extents = Vec::with_capacity(target.ragged_dimensions().len());
-                                for descriptor in target.ragged_dimensions() {
-                                    extents.push(
-                                        context
-                                            .tangent()
-                                            .bind(
-                                                RaggedExtentsOperation::new(descriptor.axis()),
-                                                Vec::new(),
-                                                &[tangent.clone()],
-                                            )?
-                                            .remove(0),
-                                    );
-                                }
-                                let storage = context
-                                    .tangent()
-                                    .bind(RaggedStorageOperation, Vec::new(), &[tangent.clone()])?
-                                    .remove(0);
-                                let mut fields = vec![storage];
-                                fields.extend(extents);
-                                fields.push(source);
-                                context
-                                    .tangent()
-                                    .bind(RaggedNewOperation::with_identity_source(target), Vec::new(), &fields)?
-                                    .remove(0)
-                            };
-                            MaybeZero::Value(value)
+            let value = match input {
+                PartialValue::Known(value) => value.clone(),
+                PartialValue::Unknown(_) => {
+                    let Some(seed) = seed else {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "cannot transpose a guard with an unknown reference input".into(),
                         }
-                        _ => MaybeZero::Value(CastOperation::bind_tangent(
-                            context,
-                            input.primal(),
-                            &output,
-                            tangent,
-                            !P::PRIMAL_COMPLETES_BEFORE_TANGENT,
-                        )?),
-                    },
-                };
-                DifferentiationDual::new(output, tangent)
-            })
-            .collect()
+                        .into());
+                    };
+
+                    if seed.r#type().as_ref() != &input_types[index] || output_types[output - 1] != input_types[index] {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "cannot transpose a guard that changes the declared type of an active input; \
+                                      linearize the guard first"
+                                .into(),
+                        }
+                        .into());
+                    }
+
+                    match seed {
+                        MaybeZero::Value(value) => value.clone(),
+                        MaybeZero::Zero(r#type) => {
+                            // A structural zero has no runtime value of its own. It can borrow the shape of the known
+                            // inputs only when the omitted slot adds no declaration constraint of its own. The known
+                            // shape witnesses remain in the executable guard below, including every dynamic dimension.
+                            if self.declared_types[index] != input_types[index]
+                                || r#type.identities().any(|(_, identity)| {
+                                    !known.iter().any(|value| {
+                                        value.r#type().identities().any(|(_, available)| available == identity)
+                                    })
+                                })
+                            {
+                                return Err(ProgramError::UnsupportedOperation {
+                                    message:
+                                        "guard transposition needs a known shape witness for a structural-zero input"
+                                            .into(),
+                                }
+                                .into());
+                            }
+                            zeros.push((index, seed.clone()));
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if self.reference_anchor_inputs.contains(&index) {
+                anchors.push(values.len());
+            }
+
+            if input.is_unknown() {
+                contributions.push((index, checked_output));
+            }
+
+            if !self.declared_types[index].is_reference() {
+                checked_output += 1;
+            }
+
+            for (_, identity) in value.r#type().identities() {
+                if !retained.contains(identity) {
+                    retained.push(identity.clone());
+                }
+            }
+
+            values.push(value);
+            declarations.push(self.declared_types[index].clone());
+        }
+
+        let operation = Self {
+            boundary: self.boundary.clone(),
+            declared_types: declarations,
+            retained_identities: retained,
+            reference_anchor_inputs: anchors,
+        };
+
+        let checked = if values.is_empty() {
+            Vec::new()
+        } else {
+            let types = values.iter().map(Typed::r#type).collect::<Vec<_>>();
+            let operation = O::provide(operation, &types.iter().map(AsRef::as_ref).collect::<Vec<_>>())?;
+            context.bind(operation, Vec::new(), &values)?
+        };
+        check_count!("output", checked, checked_output, ProgramError);
+
+        for (input, output) in contributions {
+            accumulators[input].accumulate(context, MaybeZero::Value(checked[output].clone()))?;
+        }
+
+        for (input, zero) in zeros {
+            accumulators[input].accumulate(context, zero)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2505,15 +2269,10 @@ impl<T: Type, O: Operation<Type = T> + From<GuardOperation<T>>> OperationProvide
 /// implementation of `GuardOperation<Self>` delegates after validating that the guard carries no regions. Every
 /// implementation upholds the [enforcement contract](GuardOperation#enforcement) of [`GuardOperation`].
 ///
-/// Families whose values carry their complete runtime extents in their types (e.g., [`ArrayType`] and
-/// [`DimensionType`]) delegate to [`GuardOperation::interpret_ordinary`]. [`ArrayIrType`] does the same for
-/// signatures without ragged members, but checks a signature with ragged members numerically through
-/// [`GuardOperation::interpret_ragged`], because ragged values keep their live extents in extent arrays rather than in
-/// their types. Each family selects its semantics statically, so the guard stores no policy, and capability bounds
-/// live on the implementations, so interpretation requires only the capabilities that its family's checks use. There
-/// is deliberately no blanket implementation, which would conflict with families that check runtime extents kept
-/// outside their types. A downstream type universe opts in with an implementation whose body calls
-/// [`GuardOperation::interpret_ordinary`].
+/// Families whose values carry their runtime extents in their types delegate to
+/// `GuardOperation::interpret_ordinary`. Each family selects its semantics statically, so the guard stores no policy,
+/// and capability bounds live on the implementations, so interpretation requires only the capabilities that its
+/// family's checks use. A downstream universe opts in explicitly, so its enforcement rules remain family-owned.
 pub trait GuardInterpretation<C: Domain<Type = Self>>: Type {
     /// Interprets `operation` over `inputs` and returns its checked outputs.
     ///
@@ -2550,54 +2309,14 @@ impl<C: Domain<Type = ArrayType>> GuardInterpretation<C> for ArrayType {
     }
 }
 
-impl<A, C> GuardInterpretation<C> for ArrayIrType
-where
-    C: Domain<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected = A> + ValueProjection<RaggedType, Projected = RaggedValue<A>>,
-    A: Value<Type = ArrayType, Domain: Context + Iota<A>>
-        + Compare
-        + And
-        + Or
-        + Not
-        + Broadcast
-        + Reduce
-        + Assert
-        + TransferToMemory,
-    <A::Domain as Domain>::Constant: From<Array>,
-{
+impl<C: Domain<Type = ArrayIrType>> GuardInterpretation<C> for ArrayIrType {
+    #[inline]
     fn interpret_guard(
         operation: &GuardOperation<Self>,
         _context: &C,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Ordinary signatures carry their complete runtime extents in their types. Ragged members keep their live
-        // extents in extent arrays instead, which only a numerical check over those arrays can relate.
-        if !operation.has_ragged_declaration() {
-            return operation.interpret_ordinary(inputs);
-        }
-        let values = inputs
-            .iter()
-            .map(|input| match input.r#type().as_ref() {
-                ArrayIrType::Array(_) => {
-                    Ok(ArrayIrValue::Array(<C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?))
-                }
-                ArrayIrType::Ragged(_) => {
-                    Ok(ArrayIrValue::Ragged(<C::Value as ValueProjection<RaggedType>>::into_projected(input.clone())?))
-                }
-                ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Err(ProgramError::UnsupportedOperation {
-                    message: "ragged guards cannot yet mix structural dimension or reference members".into(),
-                }),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        operation
-            .interpret_ragged(&values)?
-            .into_iter()
-            .map(|value| match value {
-                ArrayIrValue::Array(value) => Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(value)),
-                ArrayIrValue::Ragged(value) => Ok(<C::Value as ValueProjection<RaggedType>>::from_projected(value)),
-                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => unreachable!(),
-            })
-            .collect()
+        operation.interpret_ordinary(inputs)
     }
 }
 
@@ -2606,17 +2325,10 @@ where
 /// `GuardOperation<Self>` delegates. Every implementation upholds the
 /// [enforcement contract](GuardOperation#enforcement) of [`GuardOperation`].
 ///
-/// Families whose packed values carry every per-item extent in their types (e.g., [`ArrayType`] and [`DimensionType`])
-/// delegate to [`GuardOperation::batch_ordinary`], which freshens every guard-local identity before lifting the
-/// declarations by the mapped axis. Batching needs a per-type seam because that rule is wrong for ragged members:
-/// [`ArrayIrType`] lifts a signature with ragged members by first aligning its raw declarations with the actual
-/// per-item extent coordinates, keeping those identities nominal (the policy's
-/// [`batched_type`](BatchingPolicy::batched_type) requires each ragged declaration to be refined by its per-item
-/// type), freshening only the dense guard-local identities, and retaining the identities of the packed values, so that
-/// the lifted guard stays identity-preserving for the numerical check of the parent. As for [`GuardInterpretation`],
-/// the semantics are selected statically, capability bounds live on the implementations, and there is deliberately no
-/// blanket implementation. A downstream type universe opts in with an implementation whose body calls
-/// [`GuardOperation::batch_ordinary`].
+/// The built-in families delegate to `GuardOperation::batch_ordinary`, which freshens every guard-local identity
+/// before lifting the declarations by the mapped axis. As for [`GuardInterpretation`], the semantics are selected
+/// statically, so the guard stores no policy, and capability bounds live on the implementations. A downstream universe
+/// opts in explicitly.
 pub trait GuardBatching<C: Context<Type = Self>, P: BatchingPolicy<C>>: Type {
     /// Batches `operation` over the packed `inputs` and returns its batched outputs.
     ///
@@ -2629,7 +2341,7 @@ pub trait GuardBatching<C: Context<Type = Self>, P: BatchingPolicy<C>>: Type {
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError>;
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 }
 
 impl<C: Context<Type = DimensionType, Operation: From<GuardOperation<DimensionType>>>, P: BatchingPolicy<C>>
@@ -2641,7 +2353,7 @@ impl<C: Context<Type = DimensionType, Operation: From<GuardOperation<DimensionTy
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         operation.batch_ordinary(context, driver, inputs)
     }
 }
@@ -2655,7 +2367,7 @@ impl<C: Context<Type = ArrayType, Operation: From<GuardOperation<ArrayType>>>, P
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         operation.batch_ordinary(context, driver, inputs)
     }
 }
@@ -2663,102 +2375,14 @@ impl<C: Context<Type = ArrayType, Operation: From<GuardOperation<ArrayType>>>, P
 impl<C: Context<Type = ArrayIrType, Operation: From<GuardOperation<ArrayIrType>>>, P: BatchingPolicy<C>>
     GuardBatching<C, P> for ArrayIrType
 {
+    #[inline]
     fn batch_guard<D: BatchingDriver<C, P>>(
         operation: &GuardOperation<Self>,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        if !operation.has_ragged_declaration() {
-            return operation.batch_ordinary(context, driver, inputs);
-        }
-        let actual = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
-        let declared = operation.identity_preserving_declarations(&actual)?;
-        reject_ragged_carriers::<C, P>(GUARD_OPERATION_NAME, inputs)?;
-
-        // One lifted signature indexes each identity by one set of extent coordinates. A replicated ragged input that
-        // shares an indexed identity with another input whose extents vary over the mapped coordinate (e.g., a
-        // replicated tangent next to its mapped primal carrier) is therefore first aligned to that mapped
-        // representation through the policy, so the parent guard relates both occurrences item by item. Identities
-        // that occur only in replicated inputs, or whose mapped occurrences share one extent payload across the batch,
-        // keep their replicated inputs unchanged.
-        let mut mapped_identities = Vec::new();
-        for input in inputs {
-            let packed_type = P::value(input).r#type();
-            let (Some(axis), ArrayIrType::Ragged(packed_type)) = (P::batch_axis(input).axis(), packed_type.as_ref())
-            else {
-                continue;
-            };
-            let position = axis.normalize(packed_type.storage_type().rank())?;
-            for descriptor in packed_type.ragged_dimensions() {
-                if descriptor.extent_axes().contains(&position) {
-                    mapped_identities.push((descriptor.dimension().clone(), position));
-                }
-            }
-        }
-        let inputs = inputs
-            .iter()
-            .map(|input| {
-                let packed_type = P::value(input).r#type();
-                let ArrayIrType::Ragged(packed_type) = packed_type.as_ref() else {
-                    return Ok(input.clone());
-                };
-                let mapped_position = packed_type.ragged_dimensions().iter().find_map(|descriptor| {
-                    mapped_identities
-                        .iter()
-                        .find(|(identity, _)| identity == descriptor.dimension())
-                        .map(|(_, position)| *position)
-                });
-                match mapped_position {
-                    Some(position) if P::batch_axis(input).is_replicated() => {
-                        let axis = Axis::from(position.min(packed_type.storage_type().rank()));
-                        driver.align_batch_axis(context, input.clone(), axis)
-                    }
-                    _ => Ok(input.clone()),
-                }
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        let raw_identities = declared
-            .iter()
-            .filter_map(|r#type| match r#type {
-                ArrayIrType::Ragged(r#type) => Some(r#type),
-                _ => None,
-            })
-            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()))
-            .collect::<Vec<_>>();
-        let mut renaming = TypeIdentityRenaming::new();
-        for (_, identity) in declared.iter().flat_map(Type::identities) {
-            if !raw_identities.contains(identity) && renaming.target(identity).is_none() {
-                renaming.insert(identity.clone(), identity.fresh())?;
-            }
-        }
-        // Raw declarations now name the actual per-item coordinate system. Preserve those nominal identities while
-        // the strict policy inserts the ordinary mapped axis. Only independent dense guard-local names are freshened
-        // before insertion, so they cannot accidentally equal an ambient batch extent. Dense sibling relationships
-        // remain in the lifted declaration and are checked together with every raw occurrence by the parent guard.
-        let declared_types = declared
-            .iter()
-            .zip(&inputs)
-            .map(|(declared, input)| P::batched_type(context, input, &declared.rename_identities(&renaming)?))
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        let values = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
-        let parent_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        let mut retained_identities = operation.retained_identities().to_vec();
-        for (_, identity) in parent_types.iter().flat_map(Type::identities) {
-            if !retained_identities.contains(identity) {
-                retained_identities.push(identity.clone());
-            }
-        }
-        let guard = GuardOperation { declared_types, retained_identities, ..operation.clone() };
-        let lifted = C::Operation::provide(guard, &parent_types.iter().collect::<Vec<_>>())?;
-        let outputs = context.parent().bind(lifted, Vec::new(), &values)?;
-        check_count!("output", outputs, inputs.len(), ProgramError);
-        Ok(outputs
-            .into_iter()
-            .zip(&inputs)
-            .map(|(output, input)| P::batch(output, P::batch_axis(input)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        operation.batch_ordinary(context, driver, inputs)
     }
 }
 
@@ -2767,14 +2391,11 @@ impl<C: Context<Type = ArrayIrType, Operation: From<GuardOperation<ArrayIrType>>
 /// implementation of `GuardOperation<Self>` delegates. Every implementation retains the check in the primal
 /// computation and upholds the [enforcement contract](GuardOperation#enforcement) of [`GuardOperation`].
 ///
-/// Differentiable families that support casts (e.g., [`ArrayType`]) delegate to [`GuardOperation::jvp_ordinary`].
-/// [`ArrayIrType`] does the same for signatures without ragged members, but rebuilds each ragged tangent from its
-/// storage and extents with the checked output as its identity source instead of casting it, and for transposition
-/// captures only the indexed shape of that output. Keeping this contract separate from [`GuardInterpretation`] means
-/// that interpretation never requires the capabilities that a family's derivative rule uses (e.g., the linear calls
-/// and residual zeros of the [`ArrayIrType`] rule). As for [`GuardInterpretation`], the semantics are selected
-/// statically, capability bounds live on the implementations, and there is deliberately no blanket implementation. A
-/// downstream type universe opts in with an implementation whose body calls [`GuardOperation::jvp_ordinary`].
+/// Families that support casts delegate to `GuardOperation::jvp_ordinary`. Keeping this contract separate from
+/// [`GuardInterpretation`] means that interpretation never requires the capabilities that a family's derivative rule
+/// uses. As for [`GuardInterpretation`], the semantics are selected statically, so the guard stores no policy, and
+/// capability bounds live on the implementations. A downstream universe opts in explicitly with its derivative
+/// semantics and capability bounds.
 pub trait GuardDifferentiation<C: Context<Type = Self>>: Type {
     /// Applies the forward-mode rule of `operation` to `inputs` (refer to [`DifferentiableOperation::jvp`]).
     ///
@@ -2787,22 +2408,6 @@ pub trait GuardDifferentiation<C: Context<Type = Self>>: Type {
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
-
-    /// Applies the forward-mode rule of `operation` to `inputs` for subsequent transposition (refer to
-    /// [`DifferentiableOperation::jvp_for_transpose`]). The default delegates to [`Self::jvp_guard`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of the primal check and of the tangent computation.
-    #[inline]
-    fn jvp_guard_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        operation: &GuardOperation<Self>,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Self::jvp_guard(operation, context, driver, inputs)
-    }
 }
 
 impl<C: Context<Type = ArrayType>> GuardDifferentiation<C> for ArrayType
@@ -2822,42 +2427,20 @@ where
     }
 }
 
-impl<C> GuardDifferentiation<C> for ArrayIrType
+impl<C: Context<Type = ArrayIrType>> GuardDifferentiation<C> for ArrayIrType
 where
-    C: Context<Type = ArrayIrType>,
     C::Operation: From<GuardOperation<ArrayIrType>>
-        + From<RaggedNewOperation>
-        + From<RaggedStorageOperation>
-        + From<RaggedExtentsOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + From<CastOperation<ArrayIrType>>
         + From<<ArrayIrType as CastType>::IdentityWitnessOperation>,
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
+    #[inline]
     fn jvp_guard<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         operation: &GuardOperation<Self>,
         context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if !operation.has_ragged_declaration() {
-            return operation.jvp_ordinary(context, inputs);
-        }
-        operation.jvp_ragged(context, inputs, false)
-    }
-
-    fn jvp_guard_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        operation: &GuardOperation<Self>,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if !operation.has_ragged_declaration() {
-            return operation.jvp_ordinary(context, inputs);
-        }
-        operation.jvp_ragged(context, inputs, true)
+        operation.jvp_ordinary(context, inputs)
     }
 }
 
@@ -2867,26 +2450,21 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::tests::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         ArrayBatch, ArrayIrOperation, ArrayOperation, ArrayReference, Dimension, DimensionBounds, DimensionError,
-        DimensionSource, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, RaggedDimension,
-        RaggedType, RaggedValueKind, Shape, Sharding, ShardingDimension, StaticArrayExtentBatchingPolicy,
-        StridedLayout,
+        DimensionSource, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StaticArrayExtentBatchingPolicy, StridedLayout,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{
-        BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingTracer, BoundaryPreservingBatchedProgram,
-        ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch,
+        BatchAxis, BatchedProgram, BoundaryPreservingBatchedProgram, ProgramBatchingOutputAxesPolicy, batch,
     };
     use crate::contexts::{DomainProjection, EagerContext, StagingContext};
-    use crate::differentiation::differentiate_at;
     use crate::macros::check_operation_type_inference;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::broadcasting::Broadcast;
     use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-    use crate::operations::ragged::RaggedStorage;
     use crate::operations::references::ReferenceReadOperation;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialTracer, PartialValue};
@@ -2903,313 +2481,6 @@ mod tests {
     }
 
     /// Creates an untrusted structural carrier so guard tests exercise numerical admission independently of New.
-    fn raw_guard_value(r#type: RaggedType, extents: Vec<Array>) -> ArrayIrValue<Array> {
-        let storage = Array::from_fn_elements(r#type.storage_type().clone(), |_| Ok(7f32)).unwrap();
-        ArrayIrValue::Ragged(RaggedValue::new(r#type, storage, extents).unwrap())
-    }
-
-    #[test]
-    fn test_array_ir_guard_ragged() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
-        let r#type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, rows, Vec::new())],
-        )
-        .unwrap();
-        let declared = vec![ArrayIrType::Ragged(r#type.clone())];
-        let operation = GuardOperation::new("raw", declared.clone());
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input: Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
-                input.domain().bind(operation.clone(), Vec::new(), &[input.clone()])
-            },
-            ArrayIrType::Ragged(r#type.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {r#"
-            lambda %0:ragged<f32[2]; 0:rows over []> .
-            let %1:ragged<f32[2]; 0:rows over []> = guard [boundary="raw", declared_types=[ragged<f32[2]; 0:rows over []>]] %0
-            in (%1)"#}
-        );
-        let value = raw_guard_value(r#type.clone(), vec![Array::scalar(1i64).unwrap()]);
-        assert_eq!(program.interpret(value.clone()), Ok(vec![value.clone()]));
-        let replacement = DimensionVariable::new("renamed_rows", r#type.ragged_dimensions()[0].dimension().bounds());
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(r#type.ragged_dimensions()[0].dimension().clone(), replacement).unwrap();
-        let renamed = program.rename_type_identities(&renaming).unwrap();
-        let renamed_value = value.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed.interpret(renamed_value.clone()), Ok(vec![renamed_value]));
-        let invalid = raw_guard_value(r#type.clone(), vec![Array::scalar(999i64).unwrap()]);
-        let error = operation.interpret_ragged(&[invalid]).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::FailedElements {
-                message: "ragged extent on storage axis 0 is outside its declared bounds".into(),
-                failures: vec![AssertionFailure {
-                    index: Vec::new(),
-                    observations: vec![("extent".into(), "999".into())]
-                }],
-                omitted: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn test_array_ir_guard_ragged_declared_actual_name_collision() {
-        type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let n = DimensionVariable::new("n", DimensionBounds::non_negative(Some(8)).unwrap());
-        let m = DimensionVariable::new("m", n.bounds());
-        let declared_raw = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 7]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, n.clone(), vec![0])],
-        )
-        .unwrap();
-        let actual_raw = RaggedType::new(
-            declared_raw.storage_type().clone(),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, m.clone(), vec![0])],
-        )
-        .unwrap();
-        let dense_declaration = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![m.clone().into()])));
-        let declared = vec![declared_raw.clone().into(), declared_raw.into(), dense_declaration.clone()];
-        let operation = GuardOperation::new("separate scopes", declared).with_retained_identities(vec![m.clone()]);
-        let raw = raw_guard_value(actual_raw.clone(), vec![Array::vector(vec![1i64, 2]).unwrap()]);
-        let dense = ArrayIrValue::Array(Array::vector(vec![3f32; 5]).unwrap());
-        let inputs = vec![raw.clone(), raw.clone(), dense.clone()];
-        // The dense LOCAL `m` is independent of the ACTUAL indexed `m`: length 5 need not equal either row length.
-        assert_eq!(operation.interpret_ragged(&inputs), Ok(inputs.clone()));
-
-        let child_raw = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [7]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, n, Vec::new())],
-        )
-        .unwrap();
-        let child_guard =
-            GuardOperation::new("separate scopes", vec![child_raw.clone().into(), child_raw.into(), dense_declaration])
-                .with_retained_identities(vec![m]);
-        let axes = vec![BatchAxis::new(0), BatchAxis::new(0), BatchAxis::replicated()];
-        assert_eq!(
-            batch(
-                |input: Vec<BatchingTracer<Eager, ArrayIrBatchingPolicy>>| {
-                    input[0]
-                        .domain()
-                        .bind(child_guard.clone(), Vec::new(), &input)?
-                        .into_iter()
-                        .map(|value| {
-                            let ragged = matches!(value.r#type().as_ref(), ArrayIrType::Ragged(_));
-                            if ragged { value.ragged_storage() } else { Ok(value) }
-                        })
-                        .collect::<Result<Vec<_>, ProgramError>>()
-                },
-                inputs.clone(),
-                axes.clone(),
-                axes.clone(),
-                BatchAxisSpecification::default(),
-            ),
-            Ok(inputs
-                .iter()
-                .map(|value| match value {
-                    ArrayIrValue::Ragged(value) => ArrayIrValue::Array(value.storage().clone()),
-                    _ => value.clone(),
-                })
-                .collect::<Vec<_>>()),
-        );
-        let changed = raw_guard_value(actual_raw, vec![Array::vector(vec![2i64, 2]).unwrap()]);
-        let expected = AssertionError::FailedElements {
-            message: "guarded ragged occurrences of `m` must have equal live extents".into(),
-            failures: vec![AssertionFailure {
-                index: vec![0],
-                observations: vec![("extent".into(), "2".into()), ("other_extent".into(), "1".into())],
-            }],
-            omitted: 0,
-        };
-        assert_eq!(
-            operation
-                .interpret_ragged(&[raw.clone(), changed.clone(), dense.clone()])
-                .unwrap_err()
-                .downcast_custom(),
-            Some(&expected)
-        );
-        let error: ProgramError = batch(
-            |input: Vec<BatchingTracer<Eager, ArrayIrBatchingPolicy>>| {
-                input[0]
-                    .domain()
-                    .bind(child_guard.clone(), Vec::new(), &input)?
-                    .into_iter()
-                    .map(|value| {
-                        let ragged = matches!(value.r#type().as_ref(), ArrayIrType::Ragged(_));
-                        if ragged { value.ragged_storage() } else { Ok(value) }
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()
-            },
-            vec![raw, changed, dense],
-            axes.clone(),
-            axes,
-            BatchAxisSpecification::default(),
-        )
-        .unwrap_err()
-        .into();
-        assert_eq!(error.downcast_custom(), Some(&expected));
-    }
-
-    #[test]
-    fn test_array_ir_guard_ragged_cross_role_equality() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        let array_type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
-        )
-        .unwrap();
-        let dimension_type = RaggedType::new(
-            ArrayType::new_static(DataType::I64, [2]),
-            RaggedValueKind::Dimension(rows.into()),
-            Vec::new(),
-        )
-        .unwrap();
-        let array = raw_guard_value(array_type.clone(), vec![Array::vector(vec![1i64, 2]).unwrap()]);
-        let dimension = |values: Vec<i64>| {
-            ArrayIrValue::Ragged(
-                RaggedValue::new(dimension_type.clone(), Array::vector(values).unwrap(), Vec::new()).unwrap(),
-            )
-        };
-        let guard = GuardOperation::new("cross_role", vec![array_type.into(), dimension_type.clone().into()]);
-        let values = [array.clone(), dimension(vec![1, 2])];
-        assert_eq!(guard.interpret_ragged(&values), Ok(values.to_vec()));
-        let error = guard.interpret_ragged(&[array, dimension(vec![2, 2])]).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::FailedElements {
-                message: "guarded ragged occurrences of `rows` must have equal live extents".into(),
-                failures: vec![AssertionFailure {
-                    index: vec![0],
-                    observations: vec![("extent".into(), "2".into()), ("other_extent".into(), "1".into())]
-                }],
-                omitted: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn test_array_ir_guard_ragged_repeated_padding_and_empty_domain() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4)).unwrap());
-        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
-        let r#type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3, 3, 3]),
-            RaggedValueKind::Array,
-            vec![
-                RaggedDimension::new(1, rows, vec![0]),
-                RaggedDimension::new(2, columns.clone(), vec![0, 1]),
-                RaggedDimension::new(3, columns, vec![0, 1]),
-            ],
-        )
-        .unwrap();
-        let guard = GuardOperation::new("padding", vec![r#type.clone().into()]);
-        for rows in [[1i64, 0], [0, 0]] {
-            let extents = vec![
-                Array::vector(rows.to_vec()).unwrap(),
-                Array::matrix(2, 3, vec![1i64, 999, -7, 999, -7, 999]).unwrap(),
-                Array::matrix(2, 3, vec![1i64, -7, 999, -7, 999, -7]).unwrap(),
-            ];
-            let value = raw_guard_value(r#type.clone(), extents);
-            assert_eq!(guard.interpret_ragged(&[value.clone()]), Ok(vec![value]));
-        }
-        let value = raw_guard_value(
-            r#type,
-            vec![
-                Array::vector(vec![1i64, 0]).unwrap(),
-                Array::matrix(2, 3, vec![1i64, 999, -7, 999, -7, 999]).unwrap(),
-                Array::matrix(2, 3, vec![2i64, -7, 999, -7, 999, -7]).unwrap(),
-            ],
-        );
-        let error = guard.interpret_ragged(&[value]).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::FailedElements {
-                message: "ragged occurrences of `columns` must have equal live extents".into(),
-                failures: vec![AssertionFailure {
-                    index: vec![0, 0],
-                    observations: vec![("extent".into(), "2".into()), ("other_extent".into(), "1".into())]
-                }],
-                omitted: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn test_array_ir_guard_ragged_active_differentiation() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
-        let r#type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, rows, Vec::new())],
-        )
-        .unwrap();
-        let value = raw_guard_value(r#type.clone(), vec![Array::scalar(1i64).unwrap()]);
-        let tangent = ArrayIrValue::Ragged(
-            RaggedValue::new(
-                r#type.clone(),
-                Array::vector(vec![3f32, 5.]).unwrap(),
-                vec![Array::scalar(1i64).unwrap()],
-            )
-            .unwrap(),
-        );
-        let declaration = ArrayIrType::Ragged(r#type.clone());
-        let (primal, actual_tangent) = differentiate_at(value.clone())
-            .jvp(tangent.clone(), |input| {
-                input
-                    .domain()
-                    .bind(GuardOperation::new("active", vec![declaration.clone()]), Vec::new(), &[input.clone()])
-                    .map(|mut outputs| outputs.remove(0))
-            })
-            .unwrap();
-        assert_eq!(primal, value);
-        assert_eq!(actual_tangent, tangent);
-        let (_, pullback) = differentiate_at(value.clone())
-            .vjp(|input| {
-                let checked = input
-                    .domain()
-                    .bind(GuardOperation::new("active", vec![declaration.clone()]), Vec::new(), &[input.clone()])?
-                    .remove(0);
-                checked.ragged_storage()
-            })
-            .unwrap();
-        for residual in pullback.residuals() {
-            if let ArrayIrValue::Ragged(residual) = residual {
-                assert_eq!(residual.storage().r#type().data_type(), DataType::Zero);
-                assert!(residual.storage().storage_bytes().is_empty());
-            }
-        }
-        let cotangent = pullback.apply_materialized(Array::vector(vec![1f32, 1.]).unwrap().into()).unwrap();
-        assert_eq!(cotangent.ragged_storage(), Ok(Array::vector(vec![1f32, 1.]).unwrap().into()));
-        assert_eq!(cotangent.ragged_extents(0), value.ragged_extents(0));
-    }
-
-    #[test]
-    fn test_array_ir_guard_ragged_mixed_structural_rejection() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(3)).unwrap());
-        let r#type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, rows, Vec::new())],
-        )
-        .unwrap();
-        let value = raw_guard_value(r#type, vec![Array::scalar(1i64).unwrap()]);
-        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let types = vec![value.r#type().into_owned(), dimension.r#type().into_owned()];
-        let guard = GuardOperation::new("mixed", types);
-        assert_eq!(
-            guard.interpret_ragged(&[value, dimension]),
-            Err(ProgramError::UnsupportedOperation {
-                message: "ragged guards cannot yet mix structural dimension or reference members".into(),
-            })
-        );
-    }
-
     #[test]
     fn test_assertion_error() {
         let failure = AssertionError::Failed {
@@ -3693,7 +2964,6 @@ mod tests {
         impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for CustomExtent {
             type Batch = ArrayBatch<C::Value>;
             type Extent = HostExtent;
-            type Evidence = Vec<DimensionVariable>;
             type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
             fn batch(value: C::Value, axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
                 <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::batch(value, axis)
@@ -3838,7 +3108,7 @@ mod tests {
                 assert_eq!(
                     operation
                         .batch(&context, &EmptyRegionDriver, &[passing, observation.clone()])
-                        .map(|outputs| outputs.into_parts().0.len()),
+                        .map(|outputs| outputs.len()),
                     Ok(0),
                 );
                 let condition = ArrayBatch::new(
@@ -3848,7 +3118,7 @@ mod tests {
                 .unwrap();
                 let failure = operation.batch(&context, &EmptyRegionDriver, &[condition, observation.clone()]);
                 if extent == 0 {
-                    assert_eq!(failure.map(|outputs| outputs.into_parts().0.len()), Ok(0));
+                    assert_eq!(failure.map(|outputs| outputs.len()), Ok(0));
                 } else {
                     let BatchingError::Program(error) = failure.unwrap_err() else {
                         panic!("expected a program error")
@@ -3880,12 +3150,10 @@ mod tests {
                     .unwrap();
             let input = ArrayBatch::new(value.clone(), BatchAxis::new(0)).unwrap();
             let guard = GuardOperation::new("custom policy", vec![member_type.clone()]);
-            let guarded =
-                guard.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
+            let guarded = guard.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
             assert_eq!(guarded, vec![input.clone()]);
             let cast = CastOperation::unchecked(member_type.clone(), vec![member_type.clone(), member_type]).unwrap();
-            let casted =
-                cast.batch(&context, &EmptyRegionDriver, &[input.clone(), input.clone()]).unwrap().into_parts().0;
+            let casted = cast.batch(&context, &EmptyRegionDriver, &[input.clone(), input.clone()]).unwrap();
             assert_eq!(casted, vec![input.clone()]);
 
             let context = BatchingContext::<_, ArrayBatchingPolicy<CustomExtent>>::with_policy(
@@ -3894,21 +3162,15 @@ mod tests {
             );
             let guarded = MinimalOperation::<Array>::from(guard)
                 .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-                .unwrap()
-                .into_parts()
-                .0;
+                .unwrap();
             assert_eq!(guarded, vec![input.clone()]);
             let casted = MinimalOperation::<Array>::from(cast)
                 .batch(&context, &EmptyRegionDriver, &[input.clone(), input.clone()])
-                .unwrap()
-                .into_parts()
-                .0;
+                .unwrap();
             assert_eq!(casted, vec![input.clone()]);
             let transposed = MinimalOperation::<Array>::from(TransposeOperation::new(vec![0]))
                 .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-                .unwrap()
-                .into_parts()
-                .0;
+                .unwrap();
             assert_eq!(transposed, vec![input]);
         }
     }
@@ -4412,58 +3674,6 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_batching_dynamic_mapped_dimension_observation() {
-        // A mapped dimension holds one extent per batch item; the assertion reports the failing items' extents.
-        let dimension_type = DimensionType::new("n", DimensionBounds::new(0, Some(8)).unwrap());
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            DimensionValue::constant(3).unwrap().into(),
-        );
-        let inputs = [
-            ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![true, false, false]).unwrap()), BatchAxis::new(0))
-                .unwrap(),
-            ArrayIrBatch::mapped_dimension(
-                ArrayIrValue::Array(Array::vector(vec![2i32, 5, 3]).unwrap()),
-                BatchAxis::new(0),
-                dimension_type,
-            )
-            .unwrap(),
-        ];
-        let operation = AssertOperation::<ArrayIrType>::new("mapped").with_labels(vec!["size".to_owned()]);
-        let BatchingError::Program(error) =
-            operation.batch(&context, &EmptyRegionDriver, &inputs).map(|_| ()).unwrap_err()
-        else {
-            panic!("expected an assertion failure")
-        };
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::Failed {
-                message: "mapped".to_owned(),
-                observations: vec![("size".to_owned(), "5".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
-            }),
-        );
-        let BatchingError::Program(error) = operation
-            .with_failure_limit(NonZeroUsize::new(2).unwrap())
-            .batch(&context, &EmptyRegionDriver, &inputs)
-            .map(|_| ())
-            .unwrap_err()
-        else {
-            panic!("expected an assertion failure")
-        };
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::FailedElements {
-                message: "mapped".to_owned(),
-                failures: vec![
-                    AssertionFailure { index: vec![1], observations: vec![("size".to_owned(), "5".to_owned())] },
-                    AssertionFailure { index: vec![2], observations: vec![("size".to_owned(), "3".to_owned())] },
-                ],
-                omitted: 0,
-            }),
-        );
-    }
-
-    #[test]
     fn test_assert_batching_dynamic_index_limit() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(i32::MAX as usize + 2)).unwrap());
@@ -4612,53 +3822,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn test_assert_batching_with_limit_rejects_ragged() {
-        // Both carriers must reject the logical ragged signature before physical padding can become a failed element,
-        // irrespective of whether the padding happens to contain true or false.
-        let dimension = DimensionVariable::new("item", DimensionBounds::non_negative(Some(4)).unwrap());
-        let extents = Array::vector(vec![1i32, 2]).unwrap();
-        let expected = Err(BatchingError::UnsupportedOperation {
-            message: "`assert` does not support bounded ragged dimension `item` on input 0".to_owned(),
-        });
-        for padding in [false, true] {
-            let condition = Array::matrix(2, 3, vec![true, padding, padding, true, true, padding]).unwrap();
-            let input = ragged_array_batch(condition.clone(), extents.clone(), &dimension, 1).unwrap();
-            let context =
-                BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-            assert_eq!(
-                AssertOperation::<ArrayType>::new("logical items")
-                    .with_failure_limit(NonZeroUsize::new(3).unwrap())
-                    .batch(&context, &EmptyRegionDriver, &[input.clone()])
-                    .map(|_| ()),
-                expected,
-            );
-            let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-                ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
-                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-            );
-            assert_eq!(
-                AssertOperation::<ArrayType>::new("logical items")
-                    .with_failure_limit(NonZeroUsize::new(3).unwrap())
-                    .batch(&context, &EmptyRegionDriver, &[input])
-                    .map(|_| ()),
-                expected,
-            );
-            let input = ragged_batch(condition.into(), extents.clone().into(), &dimension, 1).unwrap();
-            let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                DimensionValue::constant(2).unwrap().into(),
-            );
-            assert_eq!(
-                AssertOperation::<ArrayIrType>::new("logical items")
-                    .with_failure_limit(NonZeroUsize::new(3).unwrap())
-                    .batch(&context, &EmptyRegionDriver, &[input])
-                    .map(|_| ()),
-                expected,
-            );
         }
     }
 
@@ -6023,9 +5186,7 @@ mod tests {
                             &batching,
                             &EmptyRegionDriver,
                             &[ArrayIrBatch::new(mapped, BatchAxis::new(0))?, ArrayIrBatch::replicated(replicated)],
-                        )?
-                        .into_parts()
-                        .0;
+                        )?;
                     assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
                     assert_eq!(outputs[1].batch_axis(), BatchAxis::replicated());
                     Ok(outputs.into_iter().map(|output| output.value().clone()).collect::<Vec<_>>())
@@ -6094,10 +5255,11 @@ mod tests {
                 |mapped| {
                     let batching = BatchingContext::<_, ArrayBatchingPolicy>::new(mapped.domain(), 2)
                         .with_axis_sharding(ShardingDimension::sharded(["x"]));
-                    let outputs = GuardOperation::new("region", vec![per_item.clone()])
-                        .batch(&batching, &EmptyRegionDriver, &[ArrayBatch::new(mapped, BatchAxis::new(-1))?])?
-                        .into_parts()
-                        .0;
+                    let outputs = GuardOperation::new("region", vec![per_item.clone()]).batch(
+                        &batching,
+                        &EmptyRegionDriver,
+                        &[ArrayBatch::new(mapped, BatchAxis::new(-1))?],
+                    )?;
                     assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
                     Ok(outputs[0].value().clone())
                 },
@@ -6120,10 +5282,11 @@ mod tests {
                     |(extent, mapped)| {
                         let batching = BatchingContext::new(extent.domain(), extent)
                             .with_axis_sharding(ShardingDimension::sharded(["x"]));
-                        let outputs = GuardOperation::new("region", vec![declared.clone()])
-                            .batch(&batching, &EmptyRegionDriver, &[ArrayIrBatch::new(mapped, BatchAxis::new(-1))?])?
-                            .into_parts()
-                            .0;
+                        let outputs = GuardOperation::new("region", vec![declared.clone()]).batch(
+                            &batching,
+                            &EmptyRegionDriver,
+                            &[ArrayIrBatch::new(mapped, BatchAxis::new(-1))?],
+                        )?;
                         assert_eq!(outputs.len(), usize::from(!reference));
                         Ok(outputs.into_iter().map(|output| output.value().clone()).collect::<Vec<_>>())
                     },
@@ -6173,9 +5336,7 @@ mod tests {
                     ArrayIrBatch::new(packed(2), BatchAxis::new(0)).unwrap(),
                 ],
             )
-            .unwrap()
-            .into_parts()
-            .0;
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].value(), &dimension);
         assert!(
@@ -6187,235 +5348,6 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn test_guard_batching_rejects_ragged_carriers() {
-        // Bounded ragged carriers hold their per-item extents outside their packed types, which a lifted guard cannot
-        // relate, so both carrier families reject them before lifting the declarations.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let declared = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let message = "`guard` does not support bounded ragged dimension `length` on input 0".to_owned();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let input = ragged_array_batch(
-            Array::matrix(2, 3, vec![1f32; 6]).unwrap(),
-            Array::vector(vec![1i32, 3]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            GuardOperation::new("region", vec![declared.clone()])
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|_| ()),
-            Err(BatchingError::UnsupportedOperation { message: message.clone() }),
-        );
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let input = ragged_batch(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
-            &length,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            GuardOperation::new("region", vec![declared.into()])
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|_| ()),
-            Err(BatchingError::UnsupportedOperation { message }),
-        );
-    }
-
-    #[test]
-    fn test_guard_batching_rejects_replicated_ragged_carriers() {
-        // A replicated carrier keeps the per-item extents of its bounded ragged axes outside its packed type too, so
-        // guarding its padded storage (`[1, 2, 99]` with live extent 2) would read the padding as data.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let declared = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0, 99.0]).unwrap()))
-            .with_ragged_axes(vec![RaggedAxis::new(
-                0,
-                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
-                length.clone(),
-                vec![],
-            )])
-            .unwrap();
-        assert_eq!(
-            GuardOperation::new("region", vec![declared.into()])
-                .batch(&context, &EmptyRegionDriver, &[input])
-                .map(|_| ()),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`guard` does not support bounded ragged dimension `length` on input 0".to_owned(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_guard_batching_rejects_ragged_carriers_in_eager_replay() {
-        // Replaying `[f32[length], f32[length]]` through a batching context over an eager parent, at a bounded ragged
-        // `f32[length]` and a replicated `f32[3]`, leaves their relationship unproven by the carrier types. Although
-        // the context is eager, replay must bind the entry guard through the batching context, whose guard rule
-        // rejects the ragged carrier, rather than check the packed values directly in the eager parent.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let first = builder.add_input(vector_type.clone());
-        builder.add_input(vector_type);
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let ragged = ragged_array_batch(
-            Array::matrix(2, 3, vec![1f32; 6]).unwrap(),
-            Array::vector(vec![1i32, 3]).unwrap(),
-            &length,
-            1,
-        )
-        .unwrap();
-        let replicated = ArrayBatch::replicated(Array::vector(vec![1f32; 3]).unwrap());
-        let inputs =
-            vec![BatchingTracer::new(context.clone(), ragged), BatchingTracer::new(context.clone(), replicated)];
-        assert!(context.is_eager());
-        assert_eq!(
-            program.interpret_in_context(&context, inputs).map(|_| ()),
-            Err(ProgramError::custom(BatchingError::UnsupportedOperation {
-                message: "`guard` does not support bounded ragged dimension `length` on input 0".to_owned(),
-            })),
-        );
-    }
-
-    #[test]
-    fn test_guard_batching_aligns_replicated_ragged_inputs() -> Result<(), ProgramError> {
-        type Eager = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type Trace = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4))?);
-        let item_type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(0, rows.clone(), Vec::new())],
-        )?;
-        let mapped_type = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, rows, vec![0])],
-        )?;
-        let guard = GuardOperation::new("region", vec![ArrayIrType::Ragged(item_type.clone()); 2]);
-        let driver = RecursiveBatchingDriver::new(&EmptyRegionDriver);
-
-        // A replicated input whose identity indexes the per-item extents of a mapped carrier is broadcast onto that
-        // carrier's representation by the policy before the lifted guard relates both occurrences item by item. One
-        // region cannot index `rows` both with and without the batch coordinate, so the staged parent is inspected
-        // through its recorded instructions rather than through a built program.
-        let parent = Trace::new();
-        let extent = parent.input(DimensionType::from(Dimension::Static(2)).into());
-        let mapped = parent.input(ArrayIrType::Ragged(mapped_type.clone()));
-        let replicated = parent.input(ArrayIrType::Ragged(item_type.clone()));
-        let outputs = guard
-            .batch(
-                &BatchingContext::new(parent.clone(), extent),
-                &driver,
-                &[ArrayIrBatch::new(mapped, BatchAxis::new(0))?, ArrayIrBatch::replicated(replicated)],
-            )?
-            .into_parts()
-            .0;
-        assert_eq!(outputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>(), vec![BatchAxis::new(0); 2]);
-        assert_eq!(
-            outputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>(),
-            vec![ArrayIrType::Ragged(item_type.clone()); 2],
-        );
-        assert_eq!(
-            parent
-                .builder()
-                .borrow()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            indoc! {r#"
-                ragged_storage
-                constant [value=3]
-                broadcast [output_axes=[1]]
-                ragged_extents [axis=0]
-                broadcast [output_axes=[]]
-                ragged_new [output_type=ragged<f32[2, 3]; 1:rows over [0]>]
-                guard [
-                    boundary="region",
-                    declared_types=[ragged<f32[2, 3]; 1:rows over [0]>, ragged<f32[2, 3]; 1:rows over [0]>],
-                    retained_identities=[rows],
-                ]"#},
-        );
-
-        // A guard whose ragged inputs are all replicated keeps them replicated and stages only the guard itself.
-        let parent = Trace::new();
-        let extent = parent.input(DimensionType::from(Dimension::Static(2)).into());
-        let inputs = [
-            parent.input(ArrayIrType::Ragged(item_type.clone())),
-            parent.input(ArrayIrType::Ragged(item_type.clone())),
-        ];
-        let outputs = guard
-            .batch(&BatchingContext::new(parent.clone(), extent), &driver, &inputs.map(ArrayIrBatch::replicated))?
-            .into_parts()
-            .0;
-        assert_eq!(outputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>(), vec![BatchAxis::replicated(); 2]);
-        assert_eq!(parent.builder().borrow().instructions().len(), 1);
-
-        // Executing the aligned guard checks each batch item's live extents against the shared replicated extent.
-        let mapped = |extents: Vec<i64>| -> Result<ArrayIrValue<Array>, ProgramError> {
-            Ok(ArrayIrValue::Ragged(RaggedValue::new(
-                mapped_type.clone(),
-                Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.])?,
-                vec![Array::vector(extents)?],
-            )?))
-        };
-        let replicated = ArrayIrValue::Ragged(RaggedValue::new(
-            item_type.clone(),
-            Array::vector(vec![7f32, 8., 9.])?,
-            vec![Array::scalar(2i64)?],
-        )?);
-        let guarded = |mapped: ArrayIrValue<Array>| {
-            batch(
-                |inputs: Vec<BatchingTracer<Eager, ArrayIrBatchingPolicy>>| {
-                    inputs[0]
-                        .domain()
-                        .bind(guard.clone(), Vec::new(), &inputs)?
-                        .iter()
-                        .map(RaggedStorage::ragged_storage)
-                        .collect::<Result<Vec<_>, ProgramError>>()
-                },
-                vec![mapped, replicated.clone()],
-                vec![BatchAxis::new(0), BatchAxis::replicated()],
-                vec![BatchAxis::new(0); 2],
-                BatchAxisSpecification::default(),
-            )
-        };
-        assert_eq!(
-            guarded(mapped(vec![2, 2])?),
-            Ok(vec![
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.])?),
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![7f32, 8., 9., 7., 8., 9.])?),
-            ]),
-        );
-        let error: ProgramError = guarded(mapped(vec![2, 1])?).unwrap_err().into();
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::FailedElements {
-                message: "guarded ragged occurrences of `rows` must have equal live extents".into(),
-                failures: vec![AssertionFailure {
-                    index: vec![1],
-                    observations: vec![("extent".into(), "2".into()), ("other_extent".into(), "1".into())],
-                }],
-                omitted: 0,
-            }),
-        );
-        Ok(())
     }
 
     #[test]
@@ -6442,19 +5374,16 @@ mod tests {
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, first, second, dimension)| {
                 let batching = BatchingContext::new(extent.domain(), extent);
-                let outputs = discharged
-                    .batch(
-                        &batching,
-                        &EmptyRegionDriver,
-                        &[
-                            ArrayIrBatch::replicated(first),
-                            ArrayIrBatch::replicated(second),
-                            ArrayIrBatch::replicated(dimension.clone()),
-                            ArrayIrBatch::replicated(dimension),
-                        ],
-                    )?
-                    .into_parts()
-                    .0;
+                let outputs = discharged.batch(
+                    &batching,
+                    &EmptyRegionDriver,
+                    &[
+                        ArrayIrBatch::replicated(first),
+                        ArrayIrBatch::replicated(second),
+                        ArrayIrBatch::replicated(dimension.clone()),
+                        ArrayIrBatch::replicated(dimension),
+                    ],
+                )?;
                 Ok(outputs.into_iter().map(|output| output.value().clone()).collect::<Vec<_>>())
             },
             (
@@ -6644,49 +5573,6 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_differentiation_linearize_retains_shape_carrier() -> Result<(), ProgramError> {
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(4))?);
-        let representation = RaggedType::new(
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            RaggedValueKind::Array,
-            vec![RaggedDimension::new(1, rows.clone(), vec![0])],
-        )?;
-        let storage = Array::matrix(2, 3, vec![1f32; 6])?;
-        let extents = Array::vector(vec![1i64, 2])?;
-        let primal =
-            ArrayIrValue::Ragged(RaggedValue::new(representation.clone(), storage.clone(), vec![extents.clone()])?);
-        let (_, pushforward) = differentiate_at(primal.clone())
-            .linearize(|value| {
-                let operation = GuardOperation::new("entry", vec![representation.clone().into()])
-                    .with_retained_identities(vec![rows.clone()]);
-                let mut outputs = value.context().bind(operation, vec![], &[value.clone()])?;
-                outputs.remove(0).ragged_storage()
-            })
-            .map_err(ProgramError::from)?;
-        assert_eq!(pushforward.apply(primal).map_err(ProgramError::from)?, ArrayIrValue::Array(storage));
-        let (_, linear, residuals, ..) = pushforward.into_parts();
-        assert_eq!(residuals.len(), 1);
-        assert_eq!(
-            linear.to_string(),
-            indoc! {"
-            lambda %0:ragged<f32[2, 3]; 1:rows over [0]>, %1:ragged<zero[2, 3]; 1:rows over [0]> .
-            let %2:f32[2, 3] = ragged_storage %0
-                %3:i64[2] = ragged_extents [axis=1] %0
-                %4:ragged<f32[2, 3]; 1:rows over [0]> = ragged_new \
-                    [output_type=ragged<f32[2, 3]; 1:rows over [0]>, identity_source=true] %2 %3 %1
-                %5:f32[2, 3] = ragged_storage %4
-            in (%5)"}
-        );
-        for residual in residuals {
-            let ArrayIrValue::Ragged(carrier) = residual else { panic!("expected shape-only residual") };
-            assert_eq!(carrier.storage().r#type().data_type(), DataType::Zero);
-            assert!(carrier.storage().storage_bytes().is_empty());
-            assert_eq!(carrier.extents(), &[extents.clone()]);
-        }
-        Ok(())
-    }
-
-    #[test]
     fn test_guard_operation_provider() {
         let r#type = ArrayType::scalar(DataType::F32);
         let guard = GuardOperation::new("region", vec![r#type.clone()]);
@@ -6731,5 +5617,35 @@ mod tests {
             Family::provide(guard.clone(), &[&r#type]),
             Ok(Family::Checked(actual)) if actual == guard,
         ));
+    }
+
+    #[test]
+    fn test_guard_transposition() {
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first = builder.add_input(r#type.clone());
+        let second = builder.add_input(r#type.clone());
+        let outputs = builder
+            .add_instruction(
+                GuardOperation::new("linear", vec![r#type.clone(), r#type]),
+                Vec::new(),
+                vec![first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {r#"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2], %3:f32[2] = guard [boundary="linear", declared_types=[f32[2], f32[2]]] %0 %1
+                in (%2, %3)"#},
+        );
+        let seeds = vec![Array::vector(vec![2f32, 3.]).unwrap(), Array::vector(vec![5f32, 7.]).unwrap()];
+        assert_eq!(transposed.interpret(seeds.clone()), Ok(seeds));
     }
 }

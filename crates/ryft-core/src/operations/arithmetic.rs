@@ -208,7 +208,17 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, AddOperation<Arr
 
     #[inline]
     fn provide(_request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        // The composite family adds arrays only, so the provider rejects every other member kind before constructing
+        // the array member rather than leaving the mismatch to that member's input projection.
         check_count!("input", input_types, 2, ProgramError);
+        for (index, input_type) in input_types.iter().enumerate() {
+            if !matches!(input_type, ArrayIrType::Array(_)) {
+                return Err(TypeError::invalid(format!(
+                    "`{ADD_OPERATION_NAME}` input {index} must be an array but got type `{input_type}`",
+                ))
+                .into());
+            }
+        }
         Ok(Self::Array(ArrayOperation::Add(AddOperation::new())))
     }
 }
@@ -1947,6 +1957,12 @@ mod tests {
             ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&composite_type, &composite_type])
                 .unwrap();
         assert_eq!(provided.to_string(), "add");
+        let dimension_type = ArrayIrType::Dimension(DimensionValue::constant(2).unwrap().r#type().into_owned());
+        assert_eq!(
+            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&composite_type, &dimension_type])
+                .unwrap_err(),
+            ProgramError::Type(TypeError::invalid("`add` input 1 must be an array but got type `dimension<2>`")),
+        );
         assert_eq!(
             provided.infer_output_types(&[composite_type.clone(), composite_type.clone()], &[]),
             Ok(vec![composite_type]),
