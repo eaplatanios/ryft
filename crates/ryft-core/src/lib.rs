@@ -117,20 +117,20 @@ pub use operations::{
     CustomRuleSpecializer, CustomRuleTracer, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE,
     DIMENSION_DIV_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME,
     DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME,
-    DIMENSION_REM_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME,
-    DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME, DIV_OPERATION_NAME, DOT_OPERATION_NAME,
-    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DefaultBatching, DefaultJvp, DefaultVjp,
-    DimensionAddOperation, DimensionConstant, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation,
-    DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
-    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
-    DivOperation, Dot, DotDimensionNumbers, DotOperation, DotOperations, DynamicBroadcast, DynamicBroadcastOperation,
-    DynamicConcatenate, DynamicFill, DynamicGather, DynamicIota, DynamicManipulationOperations, DynamicOne, DynamicPad,
-    DynamicReshape, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds,
-    DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, DynamicZero,
-    ERF_OPERATION_NAME, EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp, ExpOperation,
-    ExponentialOperations, ExtremaOperations, FLOOR_OPERATION_NAME, Fill, Floor, FloorOperation, GATHER_OPERATION_NAME,
-    GUARD_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, GuardOperation,
+    DIMENSION_REM_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME,
+    DIMENSION_TO_SCALAR_OPERATION_NAME, DIV_OPERATION_NAME, DOT_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME,
+    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DefaultBatching, DefaultJvp, DefaultVjp, DimensionAddOperation,
+    DimensionConstant, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation,
+    DotOperations, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicFill, DynamicGather,
+    DynamicIota, DynamicManipulationOperations, DynamicOne, DynamicPad, DynamicReshape, DynamicReshapeOperation,
+    DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,
+    DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, DynamicZero, ERF_OPERATION_NAME,
+    EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp, ExpOperation, ExponentialOperations,
+    ExtremaOperations, FLOOR_OPERATION_NAME, Fill, Floor, FloorOperation, GATHER_OPERATION_NAME, GUARD_OPERATION_NAME,
+    Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, GuardOperation,
     IMAGINARY_OPERATION_NAME, IOTA_OPERATION_NAME, Imaginary, ImaginaryOperation, IndexInteger, IndexMask,
     IndexSelector, IndexSlice, Indexed, Indexing, Iota, IotaOperation, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME,
     LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LiftedCustomRules,
@@ -159,23 +159,24 @@ pub use operations::{
     ReferenceWriteOperation, Rem, RemOperation, RematerializationOptimizationBarrier, RematerializeOperation, Reshape,
     ReshapeOperation, Reshard, ReshardDispatch, ReshardOperation, Reverse, ReverseOperation, RngBitGenerator,
     RngBitGeneratorOperation, Round, RoundOperation, RoundingOperations, Rsqrt, RsqrtOperation,
-    SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME,
-    SHARD_MAP_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SORT_OPERATION_NAME,
-    SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation,
-    ScanOperation, ScanType, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-    ScatterReductionKind, Select, SelectOperation, ShapeChangingCollectiveValue, ShardMap, ShardMapContext,
-    ShardMapError, ShardMapOperation, ShardMapTracer, ShardingOperations, Sign, SignOperation, Sin, SinOperation,
-    Slice, SliceOperation, Sort, SortDirection, SortOperation, SortOrdering, Sqrt, SqrtOperation, StopGradient,
-    StopGradientOperation, StopGradients, Sub, SubOperation, TAG_OPERATION_NAME, TAN_OPERATION_NAME,
-    TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan,
-    TanOperation, Tanh, TanhOperation, Tolerance, TopK, TracedShardMap, TransferToMemory, TransferToMemoryOperation,
-    Transpose, TransposeOperation, TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
-    UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation,
-    WhilePredicate, WhileType, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
-    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
-    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    check_batching_rule_consistency, custom_function, shard_map, shard_map_in_context, shard_map_with_options,
-    trace_shard_map, trace_shard_map_with_named_axes, trace_shard_map_with_options, transpose_primal_condition,
+    SATURATING_SUB_OPERATION_NAME, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
+    SELECT_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
+    SORT_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, SaturatingSub,
+    SaturatingSubOperation, ScaledDot, ScaledDotOperation, ScanOperation, ScanType, Scatter, ScatterDimensionNumbers,
+    ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Select, SelectOperation,
+    ShapeChangingCollectiveValue, ShardMap, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer,
+    ShardingOperations, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sort, SortDirection,
+    SortOperation, SortOrdering, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub,
+    SubOperation, TAG_OPERATION_NAME, TAN_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME,
+    TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tan, TanOperation, Tanh, TanhOperation, Tolerance, TopK,
+    TracedShardMap, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
+    TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules, UpdateSlice, UpdateSliceOperation,
+    WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation, WhilePredicate, WhileType, WithAccumulatingVjp,
+    WithAxisDependentBatching, WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp,
+    XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation, associative_scan, check_batching_rule_consistency, custom_function, shard_map,
+    shard_map_in_context, shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes,
+    trace_shard_map_with_options, transpose_primal_condition,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -243,11 +244,19 @@ pub(crate) mod tests {
     use std::convert::Infallible;
     use std::fmt::{Debug, Display};
     use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
 
     use ryft_macros::Operation;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue,
+        ArrayReferenceTransform, ArrayType, Dimension, DimensionSource, StaticArrayExtentBatchingPolicy,
+    };
+    use crate::axes::Axis;
+    use crate::batching::{
+        BatchAxis, BatchingContext, BatchingError, BatchingPolicy, BoundaryPreservingBatchedProgram,
+    };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::forward::tests::{
         CustomCubeOperation, CustomWeightedCubeOperation, NestedRuleOperation, RuleMarkerOperation,
@@ -260,12 +269,12 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
+        AddOperation, Broadcast, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
         ConstantOperation, ConvertElementTypeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation,
         DivOperation, ExpOperation, GuardOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation,
         OneOperation, PadOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation,
         ReferenceWriteOperation, ReshapeOperation, ReshardOperation, SelectOperation, SliceOperation,
-        StopGradientOperation, SubOperation, TransposeOperation, UpdateSliceOperation, ZeroLikeOperation,
+        StopGradientOperation, SubOperation, Transpose, TransposeOperation, UpdateSliceOperation, ZeroLikeOperation,
         ZeroOperation,
     };
     use crate::parameters::Parameter;
@@ -279,6 +288,116 @@ pub(crate) mod tests {
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{Tracer, TracingContext};
+
+    /// Non-Copy host extent with independent metadata, shared by tests of extensible array batching policies.
+    #[derive(Clone, Debug)]
+    pub(crate) struct CustomArrayExtent {
+        /// Concrete size used by this policy's own alignment and broadcasting implementations.
+        pub(crate) size: usize,
+
+        /// Extra state proving that consumers preserve the extent representation instead of replacing it with usize.
+        pub(crate) metadata: String,
+
+        /// Queries of the optional host-size projection, so tests can observe which policy contract a rule uses.
+        pub(crate) axis_size_queries: Arc<AtomicUsize>,
+    }
+
+    /// Independent array batching policy with host extent metadata and observable host-size queries. Rules that only
+    /// broadcast or move arrays use [`ArrayExtentBatchingPolicy::match_axis`] instead of requiring a host-size query.
+    #[derive(Copy, Clone, Debug)]
+    pub(crate) struct CustomArrayExtentBatchingPolicy;
+
+    impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for CustomArrayExtentBatchingPolicy {
+        type Batch = ArrayBatch<C::Value>;
+        type Extent = CustomArrayExtent;
+        type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
+
+        fn batch(value: C::Value, axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::batch(value, axis)
+        }
+
+        fn replicated(value: C::Value) -> Self::Batch {
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::replicated(value)
+        }
+
+        fn value(batch: &Self::Batch) -> &C::Value {
+            batch.value()
+        }
+
+        fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+            batch.batch_axis()
+        }
+
+        fn batched_type(
+            context: &BatchingContext<C, Self>,
+            input: &Self::Batch,
+            declared: &ArrayType,
+        ) -> Result<ArrayType, BatchingError> {
+            let context = BatchingContext::<C, StaticArrayExtentBatchingPolicy>::with_policy(
+                context.parent().clone(),
+                context.axis_extent().size,
+            )
+            .with_axis_sharding(context.axis_sharding().clone());
+            StaticArrayExtentBatchingPolicy::batched_type(&context, input, declared)
+        }
+
+        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, ArrayType> {
+            Cow::Owned(batch.unbatched_type())
+        }
+
+        fn adapt_batched_program<
+            CollapseFn: Fn(
+                &TracingContext<C::Constant, C::Operation>,
+                Tracer<TracingContext<C::Constant, C::Operation>>,
+                Axis,
+            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+        >(
+            program: Self::BatchedProgram,
+            required_output_axes: Option<&[BatchAxis]>,
+            collapse_fn: CollapseFn,
+        ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
+                program,
+                required_output_axes,
+                collapse_fn,
+            )
+        }
+    }
+
+    impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayExtentBatchingPolicy<C>
+        for CustomArrayExtentBatchingPolicy
+    {
+        fn axis_dimension(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<Dimension, BatchingError> {
+            Ok(Dimension::Static(context.axis_extent().size))
+        }
+
+        fn axis_size(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<usize, BatchingError> {
+            context.axis_extent().axis_size_queries.fetch_add(1, Ordering::Relaxed);
+            Ok(context.axis_extent().size)
+        }
+
+        fn match_axis(
+            context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+            batch: &ArrayBatch<C::Value>,
+            axis: Axis,
+        ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+            batch.match_axis(axis, context.axis_extent().size, context.axis_sharding().clone())
+        }
+
+        fn broadcast_input(
+            context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+            input: &ArrayBatch<C::Value>,
+            target: ArrayType,
+            axes: Vec<usize>,
+            batch_axis: Axis,
+            sources: Vec<DimensionSource<C::Value>>,
+        ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+            let context =
+                BatchingContext::<C, ArrayBatchingPolicy>::new(context.parent().clone(), context.axis_extent().size)
+                    .with_axis_sharding(context.axis_sharding().clone());
+            StaticArrayExtentBatchingPolicy::broadcast_input(&context, input, target, axes, batch_axis, sources)
+        }
+    }
 
     /// Returns the hash of `value` under the standard library's default hasher, so that tests can check that equal
     /// values hash equally (e.g., for operation payloads whose [`Hash`] implementations normalize floating-point

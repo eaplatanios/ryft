@@ -52,6 +52,7 @@ macro_rules! check_count {
 ///   - `@numeric`: Accepts integer, floating-point, and complex [`DataType`](crate::DataType)s.
 ///   - `@boolean_or_numeric`: Accepts [`DataType::Boolean`](crate::DataType::Boolean) together with every type that
 ///     `@numeric` accepts.
+///   - `@integer`: Accepts signed and unsigned sub-byte and primitive integer [`DataType`](crate::DataType)s.
 ///   - `@float`: Accepts floating-point and complex [`DataType`](crate::DataType)s.
 ///   - `@real`: Excludes complex [`DataType`](crate::DataType)s and is intended to refine `@numeric` or `@float`.
 ///   - `@no_unreduced`: Rejects [`ArrayType`](crate::ArrayType)s carrying any unreduced mesh axes.
@@ -158,6 +159,11 @@ macro_rules! check_types {
     (@matches_data_type $input_type:ident; @boolean_or_numeric $($selectors:tt)*) => {
         ($input_type.is_boolean() || $input_type.is_numeric())
             && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+    };
+
+    // This internal helper selects the integer subset independently, so it composes with every other predicate.
+    (@matches_data_type $input_type:ident; @integer $($selectors:tt)*) => {
+        $input_type.is_integer() && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
     };
 
     // This internal helper accepts real floating-point and complex types as one float-capable universe. Keeping this
@@ -6315,6 +6321,69 @@ mod tests {
         assert_eq!(
             check_float_then_real(&[DataType::I64]),
             Err(TypeError::invalid("`test` does not support input data type `i64`".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_check_types_data_types_integer() {
+        let check_integer = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@integer, "test", types);
+            Ok(())
+        };
+
+        let check_integer_then_numeric = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@integer @numeric @real @integer, "test", types);
+            Ok(())
+        };
+
+        let check_numeric_then_integer = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@real @numeric @integer, "test", types);
+            Ok(())
+        };
+
+        let check_integer_then_float = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@integer @float, "test", types);
+            Ok(())
+        };
+
+        let check_float_then_integer = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@float @integer, "test", types);
+            Ok(())
+        };
+
+        let integers = [
+            DataType::I1,
+            DataType::I2,
+            DataType::I4,
+            DataType::I8,
+            DataType::I16,
+            DataType::I32,
+            DataType::I64,
+            DataType::U1,
+            DataType::U2,
+            DataType::U4,
+            DataType::U8,
+            DataType::U16,
+            DataType::U32,
+            DataType::U64,
+        ];
+        assert_eq!(check_integer(&integers), Ok(()));
+        assert_eq!(check_integer_then_numeric(&integers), Ok(()));
+        assert_eq!(check_numeric_then_integer(&integers), Ok(()));
+
+        for data_type in [DataType::Boolean, DataType::F32, DataType::C64, DataType::Token, DataType::Zero] {
+            assert_eq!(
+                check_integer(&[data_type]),
+                Err(TypeError::invalid(format!("`test` does not support input data type `{data_type}`"))),
+            );
+        }
+        assert_eq!(
+            check_integer_then_float(&[DataType::I32]),
+            Err(TypeError::invalid("`test` does not support input data type `i32`")),
+        );
+        assert_eq!(
+            check_float_then_integer(&[DataType::F32]),
+            Err(TypeError::invalid("`test` does not support input data type `f32`")),
         );
     }
 

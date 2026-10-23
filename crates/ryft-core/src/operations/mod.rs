@@ -43,8 +43,8 @@ pub use arithmetic::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, ArithmeticOperations,
     DIV_OPERATION_NAME, Div, DivOperation, MUL_OPERATION_NAME, Mul, MulOperation, NEG_OPERATION_NAME, Neg,
     NegOperation, POW_OPERATION_NAME, Pow, PowOperation, REM_OPERATION_NAME, RSQRT_OPERATION_NAME, Rem, RemOperation,
-    Rsqrt, RsqrtOperation, SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME, Sign, SignOperation, Sqrt,
-    SqrtOperation, Sub, SubOperation,
+    Rsqrt, RsqrtOperation, SATURATING_SUB_OPERATION_NAME, SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME,
+    SaturatingSub, SaturatingSubOperation, Sign, SignOperation, Sqrt, SqrtOperation, Sub, SubOperation,
 };
 pub use assertions::{
     ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
@@ -101,12 +101,11 @@ pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
     DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME,
-    DIMENSION_SATURATING_SUB_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME,
-    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
-    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
-    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation,
+    DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalar, DimensionToScalarOperation,
 };
 pub use dot::{
     DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOperations, RAGGED_DOT_OPERATION_NAME, RaggedDot,

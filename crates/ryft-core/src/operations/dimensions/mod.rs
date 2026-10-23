@@ -7,11 +7,11 @@
 //! The operations fall into three groups:
 //!
 //!   - **Arithmetic:** Addition, subtraction, multiplication, division, and remainder use the ordinary
-//!     [`Add`](crate::Add), [`Sub`](crate::Sub), [`Mul`](crate::Mul), [`Div`](crate::Div), and [`Rem`](crate::Rem)
-//!     capabilities, while [`DimensionPow`], [`DimensionMax`], [`DimensionMin`], and [`DimensionSaturatingSub`] have
-//!     their own. Every operation infers the bounds of its result from the bounds of its inputs, folds identities such
-//!     as adding zero, and reports a checked runtime assertion effect only when the input bounds leave an overflow or
-//!     a division by zero possible.
+//!     [`Add`](crate::Add), [`Sub`](crate::Sub), [`SaturatingSub`](crate::SaturatingSub), [`Mul`](crate::Mul),
+//!     [`Div`](crate::Div), and [`Rem`](crate::Rem) capabilities, and [`DimensionPow`], [`DimensionMax`], and
+//!     [`DimensionMin`] have their own capabilities. Every operation infers its result bounds from its input bounds,
+//!     folds identities such as adding zero, and reports a checked runtime assertion effect only when the input bounds
+//!     leave an overflow or a division by zero possible.
 //!   - **Bridges Between Arrays and Dimensions:** [`DimensionSize`] reads an axis extent of an array as a dimension,
 //!     [`DimensionToScalar`] turns a dimension into a scalar integer array, and [`DimensionFromScalar`] turns a scalar
 //!     integer array back into a dimension with declared bounds, which is checked at run time.
@@ -93,10 +93,10 @@ pub mod dimension_min;
 pub mod dimension_mul;
 pub mod dimension_pow;
 pub mod dimension_rem;
-pub mod dimension_saturating_sub;
 pub mod dimension_size;
 pub mod dimension_sub;
 pub mod dimension_to_scalar;
+mod saturating_sub;
 
 pub use dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
 pub use dimension_div::{DIMENSION_DIV_OPERATION_NAME, DimensionDivOperation};
@@ -108,9 +108,6 @@ pub use dimension_min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMin
 pub use dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
 pub use dimension_pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
 pub use dimension_rem::{DIMENSION_REM_OPERATION_NAME, DimensionRemOperation};
-pub use dimension_saturating_sub::{
-    DIMENSION_SATURATING_SUB_OPERATION_NAME, DimensionSaturatingSub, DimensionSaturatingSubOperation,
-};
 pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
 pub use dimension_sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSubOperation};
 pub use dimension_to_scalar::{
@@ -200,7 +197,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     }
 }
 
-/// Shared type-identity inference and effect metadata stored by every binary dimension arithmetic operation.
+/// Shared type-identity inference and effect metadata for stateful binary dimension arithmetic operations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub(crate) struct ArithmeticDimensionOperationMetadata {
     /// Expected left input [`DimensionType`].

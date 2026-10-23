@@ -6,9 +6,9 @@
 //!   - **Sign and Magnitude:** [`Neg`] negates a value, [`Abs`] computes its absolute value (i.e., the real magnitude
 //!     `|z|` for a complex value), and [`Sign`] maps it to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
 //!     value).
-//!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`Mul`], and [`Div`] compute sums, differences, products, and
-//!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division,
-//!     like [`std::ops::Rem`]).
+//!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`SaturatingSub`], [`Mul`], and [`Div`] compute sums, differences,
+//!     products, and quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated
+//!     division, like [`std::ops::Rem`]).
 //!   - **Powers and Roots:** [`Pow`] raises one value to the power of another (i.e., the principal value
 //!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal
 //!     square roots.
@@ -21,13 +21,15 @@
 //! other is reduced over those same axes, and division permits an unreduced numerator with a denominator reduced over
 //! those axes. Every other operation rejects such inputs. Refer to the documentation of each operation for the element
 //! types it supports. [`Neg`], [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the fallible counterparts of the
-//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer arrays
-//! wrap at their element width, whereas the host integer primitives report overflow as an error.
+//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Ordinary integer
+//! arithmetic wraps at the element width for eager arrays and reports overflow for host primitives. Saturating
+//! subtraction instead clamps integer arrays and host integers to their numeric bounds.
 //!
 //! Negation, addition, and subtraction are linear. Multiplication is linear in either input when the other one is
 //! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
-//! [`Sign`] is piecewise constant and has zero derivatives, and the remaining operations are nonlinear, so reverse-mode
-//! differentiation transposes their linearizations instead.
+//! [`Sign`] is piecewise constant and has zero derivatives. Saturating subtraction has discrete integer outputs with
+//! structural-zero tangents. The remaining operations are nonlinear, so reverse-mode differentiation transposes their
+//! linearizations instead.
 //!
 //! # Example
 //!
@@ -45,8 +47,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType,
-    FloatingPointArrayElement, NumericArrayElement, RealArrayElement,
+    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, Broadcastable,
+    DataType, FloatingPointArrayElement, NumericArrayElement, RealArrayElement, i1, i2, i4, u1, u2, u4,
 };
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -399,6 +401,121 @@ impl_sub_for_primitive!(@integer u128);
 impl_sub_for_primitive!(@integer usize);
 impl_sub_for_primitive!(@float f32);
 impl_sub_for_primitive!(@float f64);
+
+/// Canonical operation name for [`SaturatingSubOperation`].
+pub const SATURATING_SUB_OPERATION_NAME: &str = "saturating_sub";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that subtracts integer values elementwise, saturating at the result element type's numeric bounds.
+    /// Array inputs promote to a common integer element type and broadcast their shapes before subtraction. Signed
+    /// results clamp to their minimum or maximum representable value, and unsigned results clamp at zero. Input types
+    /// whose promotion produces a floating-point type are rejected, as are unreduced partial sums and mismatched
+    /// reduced-axis markers. First-class dimensions use the same operation in their own universe and clamp at zero.
+    SaturatingSubOperation,
+    SATURATING_SUB_OPERATION_NAME,
+    SaturatingSub,
+    saturating_sub,
+    infer_data_types = |input_types: &[DataType]| {
+        let output_type = input_types[0].broadcast(&input_types[1]).map_err(|_| {
+            TypeError::invalid(format!("`{SATURATING_SUB_OPERATION_NAME}` input types are not broadcast-compatible"))
+        })?;
+        if !output_type.is_integer() {
+            return Err(TypeError::invalid(format!(
+                "`{SATURATING_SUB_OPERATION_NAME}` requires an integer result data type",
+            )));
+        }
+        Ok(vec![output_type])
+    },
+    check_data_types = [@integer],
+    check_array_types = [@no_unreduced, @same_reduced_axes],
+);
+
+// Integer arrays and first-class dimensions have trivial differential spaces. Reuse the shared discrete-operation
+// rule so primal evaluation is preserved and tangents stay structural zeros without staging tangent arithmetic.
+impl_differentiable_elementwise_operation!(@non_differentiable SaturatingSubOperation);
+
+define_elementwise_capability!(
+    @binary
+    /// Value capability for integer subtraction that saturates at the numeric bounds instead of overflowing. Array
+    /// values broadcast and promote their inputs to an integer result type before applying saturation. First-class
+    /// [`DimensionValue`](crate::DimensionValue)s clamp at zero while retaining inferred extent bounds, and host
+    /// integer primitives use their own numeric bounds. Floating-point, complex, and Boolean values are unsupported.
+    /// Integer values have structural-zero tangents and cotangents. Differentiation replays the primal subtraction
+    /// without staging tangent arithmetic; direct primitive transposition is unsupported.
+    ///
+    /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array values
+    /// implement this capability for [`ArrayType`] and [`ArrayIrType`], first-class dimensions implement it for
+    /// [`DimensionType`](crate::DimensionType), and host integers use their own universes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DimensionValue, ProgramError, SaturatingSub};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// assert_eq!(Array::scalar(-120i8)?.saturating_sub(&Array::scalar(20i8)?)?, Array::scalar(i8::MIN)?);
+    /// assert_eq!(DimensionValue::constant(3)?.saturating_sub(&DimensionValue::constant(7)?)?.extent(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    SaturatingSub,
+    /// Subtracts `right` from this value, saturating at its numeric bounds.
+    saturating_sub(right),
+    SaturatingSubOperation,
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    SaturatingSub,
+    saturating_sub,
+    operation = SATURATING_SUB_OPERATION_NAME,
+    inputs = @integer,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |left, right| SaturatingSub::saturating_sub(&left, &right),
+);
+
+/// Implements [`SaturatingSub`] for one host integer primitive or checked sub-byte integer element.
+macro_rules! impl_saturating_sub_for_primitive {
+    // Sub-byte integers saturate in their host carrier, then clamp to their logical element width before encoding.
+    (@sub_byte $type:ty) => {
+        impl SaturatingSub for $type {
+            #[inline]
+            fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(Self::new(self.value().saturating_sub(right.value()).clamp(Self::MIN.value(), Self::MAX.value()))
+                    .unwrap())
+            }
+        }
+    };
+
+    // Host integers saturate at their own numeric bounds and cannot fail.
+    ($type:ty) => {
+        impl SaturatingSub for $type {
+            #[inline]
+            fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(<$type>::saturating_sub(*self, *right))
+            }
+        }
+    };
+}
+
+impl_saturating_sub_for_primitive!(i8);
+impl_saturating_sub_for_primitive!(i16);
+impl_saturating_sub_for_primitive!(i32);
+impl_saturating_sub_for_primitive!(i64);
+impl_saturating_sub_for_primitive!(i128);
+impl_saturating_sub_for_primitive!(isize);
+impl_saturating_sub_for_primitive!(u8);
+impl_saturating_sub_for_primitive!(u16);
+impl_saturating_sub_for_primitive!(u32);
+impl_saturating_sub_for_primitive!(u64);
+impl_saturating_sub_for_primitive!(u128);
+impl_saturating_sub_for_primitive!(usize);
+impl_saturating_sub_for_primitive!(@sub_byte i1);
+impl_saturating_sub_for_primitive!(@sub_byte i2);
+impl_saturating_sub_for_primitive!(@sub_byte i4);
+impl_saturating_sub_for_primitive!(@sub_byte u1);
+impl_saturating_sub_for_primitive!(@sub_byte u2);
+impl_saturating_sub_for_primitive!(@sub_byte u4);
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
@@ -1454,7 +1571,9 @@ impl_rsqrt_for_primitive!(f64);
 
 /// Group of the elementwise arithmetic capabilities, including both the fallible capabilities (e.g., [`Add`]) and the
 /// panicking [`std::ops`] operator sugar for negation, addition, subtraction, multiplication, and division. It is
-/// implemented automatically for every type that implements all of its members.
+/// implemented automatically for every type that implements all of its members. Integer-only [`SaturatingSub`] is
+/// required separately by [`ArrayOperations`](crate::ArrayOperations), so this bundle remains available to
+/// floating-point host scalars.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
@@ -1521,7 +1640,8 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError, differentiate_at,
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        TransposableOperation, TranspositionContext, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
@@ -1532,7 +1652,9 @@ mod tests {
     use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::{Parameter, Parameterwise, Placeholder};
+    use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, TypeError, Typed};
+    use crate::tracing::Trace;
 
     use super::*;
 
@@ -2543,6 +2665,358 @@ mod tests {
     #[should_panic(expected = "binary parameterwise operation inputs must have the same parameter structure")]
     fn test_sub_parameterwise_mismatched_structures() {
         let _ = Parameterwise::<i32, _>::from((vec![1i32], 2i32)) - Parameterwise::from((vec![1i32, 2], 3i32));
+    }
+
+    #[test]
+    fn test_saturating_sub_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = SaturatingSubOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I8, DataType::I16],
+                    output_data_types = [DataType::I16],
+                },
+                {
+                    input_data_types = [DataType::U8, DataType::I16],
+                    output_data_types = [DataType::I16],
+                },
+                {
+                    input_data_types = [DataType::U64, DataType::U64],
+                    output_data_types = [DataType::U64],
+                },
+                {
+                    input_data_types = [DataType::I64, DataType::U64],
+                    error = "`saturating_sub` requires an integer result data type",
+                },
+                {
+                    input_data_types = [DataType::F32, DataType::I32],
+                    error = "`saturating_sub` does not support input data type `f32`",
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::Boolean],
+                    error = "`saturating_sub` does not support input data type `bool`",
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    error = "`saturating_sub` does not support input data type `c64`",
+                },
+                {
+                    input_data_types = [DataType::Token, DataType::I32],
+                    error = "`saturating_sub` does not support input data type `token`",
+                },
+                {
+                    input_data_types = [DataType::Zero, DataType::I32],
+                    error = "`saturating_sub` does not support input data type `zero`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SaturatingSubOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::I32), ArrayType::scalar(DataType::I32)],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = SaturatingSubOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::I32), ArrayType::scalar(DataType::I32)],
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_interpretation() {
+        assert_eq!(
+            SaturatingSubOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![i8::MIN, i8::MAX, 3, -3]).unwrap(), Array::vector(vec![1i8, -1, 7, 7]).unwrap(),],
+            ),
+            Ok(vec![Array::vector(vec![i8::MIN, i8::MAX, -4, -10]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SaturatingSubOperation::new(),
+            inputs = [Array::scalar(i8::MIN).unwrap(), Array::scalar(1i8).unwrap()],
+            expected = Array::scalar(i8::MIN).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = SaturatingSubOperation::new(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![i8::MIN, i8::MAX]).unwrap()),
+                        (@replicated, Array::scalar(1i8).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![i8::MIN, 126]).unwrap())],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(0i8).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![i8::MIN, i8::MAX]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![i8::MAX, -127]).unwrap())],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation() {
+        // Integer primals have no ordinary tangent values, including where the primal arithmetic saturates.
+        let outputs = SaturatingSubOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(i8::MAX).unwrap()).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(-1i8).unwrap()).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(i8::MAX).unwrap());
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero),
+        ));
+
+        // The public JVP boundary accepts only zero-space tangent values and preserves their shape.
+        let left = Array::vector(vec![i8::MIN, i8::MAX, 3]).unwrap();
+        let right = Array::vector(vec![1i8, -1, 7]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::new_static(DataType::Zero, [3]), &[]).unwrap();
+        assert_eq!(
+            differentiate_at((left, right))
+                .jvp((zero.clone(), zero.clone()), |(left, right)| left.saturating_sub(&right)),
+            Ok((Array::vector(vec![i8::MIN, i8::MAX, -4]).unwrap(), zero)),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation_staged() {
+        // Integer tangent slots are omitted from the program, leaving exactly the primal subtraction.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| Ok(vec![inputs[0].saturating_sub(&inputs[1])?]),
+            vec![ArrayType::new_static(DataType::I8, [3]), ArrayType::scalar(DataType::I8)],
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:i8[3], %1:i8[] .
+                let %2:i8[3] = saturating_sub %0 %1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_differentiation_reverse() {
+        // Reverse mode transposes the empty tangent program and returns structural-zero integer cotangents.
+        let left = Array::vector(vec![i8::MIN, i8::MAX, 3]).unwrap();
+        let right = Array::scalar(1i8).unwrap();
+        let (primal, pullback) =
+            differentiate_at((left, right)).vjp(|(left, right)| left.saturating_sub(&right)).unwrap();
+        assert_eq!(primal, Array::vector(vec![i8::MIN, 126, 2]).unwrap());
+        assert!(pullback.residuals().is_empty());
+        let zero_type = ArrayType::new_static(DataType::Zero, [3]);
+        assert_eq!(
+            pullback.apply(Array::from_logical_bytes(zero_type.clone(), &[]).unwrap()),
+            Ok((MaybeZero::Zero(zero_type), MaybeZero::Zero(ArrayType::scalar(DataType::Zero)))),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_transposition() {
+        // Program transposition elides integer cotangents, so exercise the primitive's rejection directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            SaturatingSubOperation::<ArrayType>::new().transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::I8)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::I8)),
+                ],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `saturating_sub` is not transposable",
+        ));
+    }
+
+    #[test]
+    fn test_array_saturating_sub() {
+        // Signed saturation preserves negative differences and clamps at both numeric bounds.
+        assert_eq!(
+            Array::vector(vec![i8::MIN, i8::MAX, 3, -3])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![1i8, -1, 7, 7]).unwrap()),
+            Ok(Array::vector(vec![i8::MIN, i8::MAX, -4, -10]).unwrap()),
+        );
+        assert_eq!(
+            Array::vector(vec![0u8, u8::MAX, 3])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![1u8, 1, 7]).unwrap()),
+            Ok(Array::vector(vec![0u8, 254, 0]).unwrap()),
+        );
+
+        // Extreme differences cannot be represented in the same 64-bit carrier before saturation.
+        assert_eq!(
+            Array::vector(vec![i64::MIN, i64::MAX, i64::MIN, i64::MAX])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![i64::MAX, i64::MIN, i64::MIN, i64::MAX]).unwrap()),
+            Ok(Array::vector(vec![i64::MIN, i64::MAX, 0, 0]).unwrap()),
+        );
+        assert_eq!(
+            Array::vector(vec![0u64, u64::MAX, 5])
+                .unwrap()
+                .saturating_sub(&Array::vector(vec![u64::MAX, 1, 2]).unwrap()),
+            Ok(Array::vector(vec![0u64, u64::MAX - 1, 3]).unwrap()),
+        );
+
+        let left = Array::from_elements(ArrayType::new_static(DataType::I16, [2, 1]), &[i16::MIN, 100]).unwrap();
+        let right = Array::from_elements(ArrayType::new_static(DataType::U8, [1, 3]), &[1u8, 3, 255]).unwrap();
+        assert_eq!(
+            left.saturating_sub(&right),
+            Ok(Array::from_elements(
+                ArrayType::new_static(DataType::I16, [2, 3]),
+                &[i16::MIN, i16::MIN, i16::MIN, 99, 97, -155],
+            )
+            .unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_array_saturating_sub_sub_byte() {
+        macro_rules! check_sub_byte {
+            // Exhaust every pair against a wider signed arithmetic oracle, then clamp to the logical element width.
+            ($element:ty) => {{
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                let mut expected = Vec::new();
+                let minimum = <$element>::MIN.value() as i16;
+                let maximum = <$element>::MAX.value() as i16;
+                for left_value in minimum..=maximum {
+                    for right_value in minimum..=maximum {
+                        left.push(<$element>::new(left_value as _).unwrap());
+                        right.push(<$element>::new(right_value as _).unwrap());
+                        expected
+                            .push(<$element>::new((left_value - right_value).clamp(minimum, maximum) as _).unwrap());
+                    }
+                }
+                assert_eq!(
+                    Array::vector(left).unwrap().saturating_sub(&Array::vector(right).unwrap()),
+                    Ok(Array::vector(expected).unwrap()),
+                );
+            }};
+        }
+
+        check_sub_byte!(i1);
+        check_sub_byte!(i2);
+        check_sub_byte!(i4);
+        check_sub_byte!(u1);
+        check_sub_byte!(u2);
+        check_sub_byte!(u4);
+    }
+
+    #[test]
+    fn test_array_saturating_sub_empty() {
+        let left = Array::from_elements(ArrayType::new_static(DataType::I16, [0, 1]), &[] as &[i16]).unwrap();
+        let right = Array::from_elements(ArrayType::new_static(DataType::U8, [1, 3]), &[1u8, 3, 255]).unwrap();
+        assert_eq!(
+            left.saturating_sub(&right),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::I16, [0, 3]), &[] as &[i16]).unwrap()),
+        );
+
+        let invalid = Array::from_elements(ArrayType::new_static(DataType::Boolean, [0]), &[] as &[bool]).unwrap();
+        assert_eq!(
+            invalid.saturating_sub(&Array::scalar(1i32).unwrap()),
+            Err(TypeError::invalid("`saturating_sub` does not support input data type `bool`").into()),
+        );
+        let invalid = Array::from_elements(ArrayType::new_static(DataType::F32, [0]), &[] as &[f32]).unwrap();
+        assert_eq!(
+            invalid.saturating_sub(&Array::scalar(1i32).unwrap()),
+            Err(TypeError::invalid("`saturating_sub` does not support input data type `f32`").into()),
+        );
+        let left = Array::from_elements(ArrayType::new_static(DataType::I64, [0]), &[] as &[i64]).unwrap();
+        assert_eq!(
+            left.saturating_sub(&Array::scalar(1u64).unwrap()),
+            Err(TypeError::invalid("`saturating_sub` requires an integer result data type").into()),
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_primitives() {
+        assert_eq!(SaturatingSub::saturating_sub(&3i32, &7), Ok(-4));
+        assert_eq!(SaturatingSub::saturating_sub(&i8::MIN, &1), Ok(i8::MIN));
+        assert_eq!(SaturatingSub::saturating_sub(&i8::MAX, &-1), Ok(i8::MAX));
+        assert_eq!(SaturatingSub::saturating_sub(&i128::MIN, &i128::MAX), Ok(i128::MIN));
+        assert_eq!(SaturatingSub::saturating_sub(&i128::MAX, &i128::MIN), Ok(i128::MAX));
+        assert_eq!(SaturatingSub::saturating_sub(&isize::MIN, &1), Ok(isize::MIN));
+        assert_eq!(SaturatingSub::saturating_sub(&0u128, &u128::MAX), Ok(0));
+        assert_eq!(SaturatingSub::saturating_sub(&u128::MAX, &1), Ok(u128::MAX - 1));
+        assert_eq!(SaturatingSub::saturating_sub(&0usize, &1), Ok(0));
+    }
+
+    #[test]
+    fn test_saturating_sub_parameterwise() {
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![i8::MIN, 3]).unwrap()]);
+        let right = Parameterwise::from(vec![Array::vector(vec![1i8, 7]).unwrap()]);
+        assert_eq!(
+            left.saturating_sub(&right).map(Parameterwise::into_inner),
+            Ok(vec![Array::vector(vec![i8::MIN, -4]).unwrap()]),
+        );
+        assert_eq!(
+            left.saturating_sub(&Parameterwise::from(Vec::new())),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+
+        let left = Parameterwise::<i8, _>::from((vec![i8::MIN, 3], i8::MAX));
+        let right = Parameterwise::from((vec![1i8, 7], -1i8));
+        assert_eq!(left.saturating_sub(&right).map(Parameterwise::into_inner), Ok((vec![i8::MIN, -4], i8::MAX)));
+
+        let left = ArrayIrValue::Array(Array::scalar(0u64).unwrap());
+        let right = ArrayIrValue::Array(Array::scalar(u64::MAX).unwrap());
+        assert_eq!(left.saturating_sub(&right), Ok(ArrayIrValue::Array(Array::scalar(0u64).unwrap())));
+    }
+
+    #[test]
+    fn test_saturating_sub_composite_projection() {
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(left, right)| left.saturating_sub(&right),
+            (ArrayIrType::Array(ArrayType::scalar(DataType::I8)), ArrayIrType::Array(ArrayType::scalar(DataType::I8))),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:i8[], %1:i8[] .
+            let %2:i8[] = saturating_sub %0 %1
+            in (%2)"}
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::scalar(i8::MAX).unwrap()),
+                ArrayIrValue::Array(Array::scalar(-1i8).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::scalar(i8::MAX).unwrap())),
+        );
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(
+            dimension.saturating_sub(&dimension),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
     }
 
     #[test]
