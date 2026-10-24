@@ -1013,22 +1013,15 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Forward-mode (JVP) rule for [`ConditionOperation`]. The predicate is the first input and carries no tangent (Boolean
-// predicates have no tangent space). The rule analyzes which branch inputs and outputs carry live tangents and
-// differentiates each branch through its instruction-scoped differentiation driver. A shared primal/tangent context
-// stages one fused condition. Separate contexts stage a primal condition that records the selected branch's residuals
-// and a tangent condition that consumes them, joining the two branch linearizations over one shared residual boundary
-// as the known/residual split of partial evaluation does. Placeholders for the peer branch's residual slots use live
-// input extents or forward a known input of the identical type, and a residual that admits no placeholder makes
-// separate-context linearization fail.
-impl<C> DifferentiableOperation<C> for ConditionOperation<C::Type>
+impl<
+    C: Context<
+            Type: ConditionType + DifferentiableType,
+            Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<ConditionOperation<C::Type>>,
+        >,
+> DifferentiableOperation<C> for ConditionOperation<C::Type>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    C: Context<Type: ConditionType + DifferentiableType>,
-    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<ConditionOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1036,12 +1029,22 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Direct differentiated binds can reach this rule before the original operation's output inference. Validate
-        // the complete primal application before analyzing tangent slots or deriving either branch program;
+        // The predicate is the first input and carries no tangent as Boolean predicates have no tangent space. The rule
+        // analyzes which branch inputs and outputs carry live tangents and differentiates each branch through its
+        // instruction-scoped differentiation driver. A shared primal/tangent context stages one fused condition.
+        // Separate contexts stage a primal condition that records the selected branch's residuals and a tangent
+        // condition that consumes them, joining the two branch linearizations over one shared residual boundary as the
+        // known/residual split of partial evaluation does. Placeholders for the peer branch's residual slots use live
+        // input extents or forward a known input of the identical type, and a residual that admits no placeholder makes
+        // separate-context linearization fail.
+
+        // Direct differentiated binds can reach this rule before the original operation's output inference.
+        // Validate the complete primal application before analyzing tangent slots or deriving either branch program;
         // specializing the attached regions alone validates only their input interfaces.
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
         let output_count = self.validate_application(&input_types, branches)?.len();
+
         // Both branches receive the same live input tangents. Equal primal signatures and reference roots give them the
         // same tangent slots, including reference tangents, which cannot be padded with invented allocation state.
         let input_tangent_liveness = inputs[1..].iter().map(|input| !input.tangent().is_zero()).collect::<Vec<_>>();
@@ -1049,8 +1052,9 @@ where
             TangentActivity::new(driver, branches[0], &input_tangent_liveness)?,
             TangentActivity::new(driver, branches[1], &input_tangent_liveness)?,
         ];
-        // An output tangent is live when it depends on an active input in either branch. Both derivative paths use this
-        // shared layout, leaving inactive outputs as structural zeros.
+
+        // An output tangent is live when it depends on an active input in either branch.
+        // Both derivative paths use this shared layout, leaving inactive outputs as structural zeros.
         let output_activity = branch_activities[0]
             .output_tangent_liveness()
             .iter()
@@ -1105,6 +1109,7 @@ where
                         .collect(),
                 )?);
             }
+
             // The boundary of the joined branches is the branch primals followed by the live branch tangents, whose
             // types the tangent program of either linearization declares first.
             let mut branch_input_types = branches[0].input_types();
@@ -1116,8 +1121,8 @@ where
             let false_partition = partitions.pop().unwrap();
             let true_partition = partitions.pop().unwrap();
             let bind_residual = |operation, programs, inputs: &[C::Value]| {
-                // The residual condition receives the predicate, the live tangents, and the residuals. The predicate
-                // and the residuals are primal values, which enter the tangent context explicitly.
+                // The residual condition receives the predicate, the live tangents, and the residuals. The
+                // predicate and the residuals are primal values, which enter the tangent context explicitly.
                 let tangent_inputs = inputs
                     .iter()
                     .enumerate()
@@ -1131,9 +1136,10 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 context.tangent().bind(operation, programs, &tangent_inputs)
             };
-            // Join both branch linearizations over one residual signature. Each known branch supplies placeholders for
-            // the peer's unused edges; a reference residual, invalid variation, or missing placeholder rejects the
-            // join.
+
+            // Join both branch linearizations over one residual signature. Each known branch supplies placeholders
+            // for the peer's unused edges; a reference residual, invalid variation, or missing placeholder rejects
+            // the join.
             let outputs = reconstruct_partitioned_condition(
                 &input_types[0],
                 &branch_input_types,
@@ -1155,6 +1161,7 @@ where
                                 placeholder_context.input(builder.atoms()[input.index()].r#type().into_owned())
                             })
                             .collect::<Vec<_>>();
+
                         // Non-zeroable types have no typed zero. Type-only zeros also cannot supply reference-position
                         // identities such as the runtime extent of an array; the residual-zero protocol must capture
                         // those from known inputs.
@@ -1177,24 +1184,29 @@ where
                             // an extent.
                             let mut captured = None;
                             for source in &sources {
-                                captured =
-                                    C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?;
-                                if captured.is_some() {
+                                if C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?
+                                    .is_some()
+                                {
                                     break;
                                 }
                             }
+
                             let Some(captured) = captured else {
                                 return Ok(None);
                             };
+
                             if captured.r#type().as_ref() != edge_type {
                                 return Err(ProgramError::MalformedProgram(format!(
-                                    "`{CONDITION_OPERATION_NAME}` residual placeholder has type `{}` but expected \
-                                     `{edge_type}`",
+                                    "`{}` residual placeholder has type `{}` but expected `{}`",
+                                    CONDITION_OPERATION_NAME,
                                     captured.r#type().as_ref(),
+                                    edge_type,
                                 )));
                             }
+
                             captured
                         };
+
                         // Build in a detached trace and splice into this known branch with its original inputs,
                         // preserving identities.
                         let placeholder_program = placeholder_context
@@ -1216,16 +1228,18 @@ where
                     bind_residual,
                 },
             )?;
+
             outputs.map_err(|rejection| -> DifferentiationError {
                 ProgramError::UnsupportedOperation {
                     message: format!(
-                        "`{CONDITION_OPERATION_NAME}` linearization cannot join the residuals of its branches, because \
-                         {rejection}",
+                        "`{CONDITION_OPERATION_NAME}` linearization cannot join the residuals of its branches, \
+                         because {rejection}",
                     ),
                 }
                 .into()
             })?
         };
+
         // Reconstruct structural zeros from the actual primal outputs so runtime type identities remain intact.
         check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
         let mut primal_outputs = outputs;
@@ -1233,6 +1247,8 @@ where
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &output_activity)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Partition-aware transpose rule for a primal [`ConditionOperation`]. The predicate and the per-branch residuals ride
 // as ordinary known inputs, and the branch recursion happens through the instruction-scoped driver's transposition
@@ -2162,7 +2178,14 @@ struct ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind> {
 ///   - `input_known`: Knownness mask over the branch inputs, which both partitions were split with.
 ///   - `partitions`: Partitions of the `true` and `false` branches into their known and residual programs.
 ///   - `join`: Placeholder construction and binding strategy of the split.
-fn reconstruct_partitioned_condition<V: Value, O, Input, PlaceholderBuild, KnownBind, ResidualBind>(
+fn reconstruct_partitioned_condition<
+    V: Value<Type: ConditionType>,
+    O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
+    Input: Clone,
+    PlaceholderBuild: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
+    KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+>(
     predicate_type: &V::Type,
     branch_input_types: &[V::Type],
     output_count: usize,
@@ -2170,15 +2193,7 @@ fn reconstruct_partitioned_condition<V: Value, O, Input, PlaceholderBuild, Known
     input_known: &[bool],
     partitions: [PartitionedProgram<V, O>; 2],
     join: ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind>,
-) -> Result<Result<Vec<Input>, ConditionSplitRejection<V::Type>>, ProgramError>
-where
-    V::Type: ConditionType,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
-    Input: Clone,
-    PlaceholderBuild: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
-    KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
-    ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
-{
+) -> Result<Result<Vec<Input>, ConditionSplitRejection<V::Type>>, ProgramError> {
     let ConditionSplitJoin { mut build_placeholder, mut bind_known, mut bind_residual } = join;
     let [true_partition, false_partition] = partitions;
     let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
