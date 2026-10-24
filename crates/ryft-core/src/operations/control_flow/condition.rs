@@ -1486,25 +1486,26 @@ where
 /// so, as in JAX's `cond`, it is pruned from the branches and returned as the input itself instead of through the
 /// condition.
 ///
-/// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. This
-/// function then aligns the condition boundary with the predicate. It varies every input over each manual axis of the
-/// predicate that the input does not already vary over before tracing the branches, and varies every branch output in
-/// the same way at the end of its branch (refer to [`ManualVariationAlignment::align_manual_variation_to`]). The
-/// branches therefore compute on varying values, so their outputs and partial-evaluation residuals are typed as the
-/// per-device values that they are, and the gradient of an input that was invariant is summed across devices by the
-/// transpose of its boundary `parallel_vary`, outside of the branches. JAX instead types such values as invariant, and
-/// a branch that varies an invariant input sums that input's gradient inside the branch, with a collective that
-/// devices taking different branches reach differently. An output that both branches forward from the same invariant
-/// input keeps its invariance because it is returned as that input, while an output that only one branch forwards
-/// varies, because the other branch can produce a different value. With an invariant predicate, or outside of manual
-/// regions, no alignment is staged. The functions cannot use values of the enclosing trace other than through `inputs`
-/// (only constants can be closed over), so every differentiable value crosses the aligned boundary, while constants
+/// Conditions that appear within _manual regions_ (i.e., inside the body of a
+/// [`ShardMapOperation`](crate::ShardMapOperation)) receive special treatment. Each device runs that body on its local
+/// shards, with explicit collectives for communication along the operation's selected mesh axes (i.e., its active
+/// manual mesh axes). A predicate that varies over those axes lets devices take different branches. This function
+/// aligns the condition boundary with the predicate. It varies every input over each manual axis of the predicate that
+/// the input does not already vary over before tracing the branches, and varies every branch output in the same way at
+/// the end of its branch (refer to [`ManualVariationAlignment::align_manual_variation_to`]). The branches therefore
+/// compute on varying values, so their outputs and partial-evaluation residuals are typed as the per-device values that
+/// they are, and the gradient of an input that was invariant is summed across devices by the transpose of its boundary
+/// `parallel_vary`, outside of the branches. An output that both branches forward from the same invariant input keeps
+/// its invariance because it is returned as that input, while an output that only one branch forwards varies, because
+/// the other branch can produce a different value. With an invariant predicate, or outside of manual regions, no
+/// alignment is staged. The functions cannot use values of the enclosing trace other than through `inputs` (only
+/// constants can be closed over), so every differentiable value crosses the aligned boundary, while constants
 /// carry no tangent and so their alignment inside a branch never transposes into a collective.
 ///
-/// Inputs and outputs may be leaves, tuples, vectors, maps, or custom [`Parameterized`] structures. Both branch
-/// outputs must have equal parameter structures, including static metadata: a runtime predicate selects value leaves,
-/// while the Rust structure is determined during tracing. The input and output structures may differ, and neither
-/// needs to implement `Clone`. Nested branch programs retain flat boundaries for positional replay.
+/// Inputs and outputs may be leaves, tuples, vectors, maps, or custom [`Parameterized`] structures. Both branch outputs
+/// must have equal parameter structures, including static metadata: a runtime predicate selects value leaves, while the
+/// Rust structure is determined during tracing. The input and output structures may differ, and neither needs to
+/// implement `Clone`. Nested branch programs retain flat boundaries for positional replay.
 ///
 /// The universe parameter `T` defaults to the `Capability` universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
