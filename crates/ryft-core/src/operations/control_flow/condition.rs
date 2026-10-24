@@ -777,8 +777,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
@@ -799,12 +797,10 @@ impl<
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        // Batching binds one condition into the parent context for a replicated predicate, whose items all take the
-        // same branch (refer to `batch_condition_with_replicated_predicate`), and selects both branches' outputs per
-        // item for a batch-varying predicate (refer to `batch_condition_with_mapped_predicate`), in which case both
-        // branches must be pure (refer to `validate_mapped_predicate_branch_effects`), every input is gated, and every
-        // output is selected. Every per-item primitive re-enters this operation family's batching rules against the
-        // same active context, so the rewrite composes for eager and staging parents alike.
+        // A replicated predicate binds one condition whose items all take the same branch. A mapped predicate evaluates
+        // both pure branches, gates every input, and selects every output. Every per-item primitive re-enters this
+        // operation family's batching rules in the active context, so the rewrite composes for eager and staging
+        // parents alike.
 
         // Validate the original logical application after input refinement, before either lowering rewrites the
         // branches, so that a staging parent cannot skip it. Per-item types remove the mapped axis while retaining
@@ -812,19 +808,30 @@ impl<
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
         self.validate_application(&input_types, branches)?;
+
         let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
         if predicate.batch_axis().is_replicated() {
-            return batch_condition_with_replicated_predicate(
-                context,
+            return context.batch_condition_with_replicated_predicate(
                 driver,
                 branches,
                 predicate.value(),
                 branch_inputs,
             );
         }
-        validate_mapped_predicate_branch_effects(branches)?;
-        batch_condition_with_mapped_predicate(
-            context,
+
+        // Both branches run for a mapped predicate, including work that an item does not select. Effects and
+        // deferred transformation obligations cannot be selected per item, so both branches must be pure.
+        if branches.iter().any(|branch| !is_pure(branch.effects())) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that have \
+                     effects or deferred work because neither observable effects nor transformation obligations can be \
+                     selected per batch item",
+                ),
+            });
+        }
+
+        context.batch_condition_with_mapped_predicate(
             driver,
             predicate,
             branch_inputs,
@@ -839,14 +846,16 @@ impl<
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 // A replicated predicate binds one condition whose batched branches explicitly thread the mapped extent (refer to
-// `batch_condition_with_replicated_predicate`). A batch-varying predicate evaluates both branches and selects their
-// outputs per item, as for homogeneous arrays (refer to `batch_condition_with_mapped_predicate`), except that only
-// array inputs are gated and only array outputs are selected. Dimension and reference inputs pass through unchanged, a
-// dimension output is replicated and equal in both branches, and a reference output must forward the same branch input
-// in both branches (refer to `merge_mapped_predicate_composite_output`). The branches must not access or allocate
-// references, and a staging parent rejects branch-local type identities (refer to
-// `validate_mapped_predicate_composite_branches`).
+// `BatchingContext::batch_condition_with_replicated_predicate`). A batch-varying predicate evaluates both branches and
+// selects their outputs per item, as for homogeneous arrays (refer to
+// `BatchingContext::batch_condition_with_mapped_predicate`), except that only array inputs are gated and only array
+// outputs are selected. Dimension and reference inputs pass through unchanged, a dimension output is replicated and
+// equal in both branches, and a reference output must forward the same branch input in both branches (refer to
+// `merge_mapped_predicate_composite_output`). The branches must not access or allocate references, and a staging parent
+// rejects branch-local type identities before either branch is replayed.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
 where
     C: ContextProjection<
@@ -886,18 +895,59 @@ where
         self.validate_application(&input_types, branches)?;
         let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
         if predicate.batch_axis().is_replicated() {
-            return batch_condition_with_replicated_predicate(
-                context,
+            return context.batch_condition_with_replicated_predicate(
                 driver,
                 branches,
                 predicate.value(),
                 branch_inputs,
             );
         }
-        let analyses = validate_mapped_predicate_composite_branches(branches, context.parent().is_eager())?;
+        // Both branches run, so even a read in the inactive branch would be ordered against writes in the selected
+        // branch, and allocating a reference is itself an effect. Reject accesses and allocations before generic
+        // purity; forwarding an untouched reference remains valid and its output roots are checked when merging.
+        let [true_analysis, false_analysis] = branches.map(|branch| branch.reference_analysis(0));
+        let analyses = [true_analysis.map_err(ProgramError::from)?, false_analysis.map_err(ProgramError::from)?];
+        for analysis in &analyses {
+            let allocates = analysis.roots().any(|root| matches!(root, ReferenceRoot::Allocation { .. }));
+            if !analysis.access_modes().is_empty() || allocates {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose branches \
+                         access references because select lowering runs both branches and reference effects cannot \
+                         be selected per batch item",
+                    ),
+                });
+            }
+        }
+        // Check other effects and deferred work only after reference accesses, so the reference diagnostic names the
+        // cause when both restrictions apply. Selecting outputs cannot suppress work in an inactive branch.
+        if branches.iter().any(|branch| !is_pure(branch.effects())) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that have \
+                     effects or deferred work because neither observable effects nor transformation obligations can be \
+                     selected per batch item",
+                ),
+            });
+        }
+        // Staging both branches into one trace would collide their local identities across branches or invocations.
+        // Freshening those identities would instead give dependent arrays unrelated shapes at selection. Identities
+        // established by the inputs keep their existing authority; eager execution has concrete output dimensions.
+        if !context.parent().is_eager() {
+            for (slot, branch) in ["true", "false"].into_iter().zip(branches) {
+                if let Some(identity) = branch.type_identity_signature().internal_identities().first() {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "cannot stage a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose `{slot}` \
+                             branch defines branch-local type identity `{identity}` because select lowering cannot \
+                             preserve branch-local type identity scopes",
+                        ),
+                    });
+                }
+            }
+        }
         let branch_ids = branches.map(|branch| branch.id());
-        batch_condition_with_mapped_predicate(
-            context,
+        context.batch_condition_with_mapped_predicate(
             driver,
             predicate,
             branch_inputs,
@@ -1230,6 +1280,152 @@ trait ConditionRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDrive
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, D: ?Sized + RegionDriver<V, O>> ConditionRegionDriver<V, O> for D {}
+
+impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
+    /// Batches an application of a condition whose `predicate` is replicated, so that every batch item takes the same
+    /// branch, for any [`BatchingPolicy`]. Both `branches` are batched at the batch axes of `branch_inputs` with
+    /// natural output axes to discover which outputs each branch maps, and the two answers are joined into one output
+    /// layout, which takes the `true` branch's axis when both branches map an output. Each branch is then instantiated
+    /// at the joined axes and adapted to an ordinary region boundary (refer to
+    /// [`BatchingContext::align_and_adapt_batched_program_outputs`]), which keeps a discovery program whose axes
+    /// already equal the joined ones. Finally, one condition over the batched branches is bound into the parent context
+    /// over the unbatched predicate, the policy's boundary inputs (refer to [`BatchingPolicy::boundary_inputs`]), and
+    /// the batched branch inputs. A staging parent therefore keeps one `condition` whose selected branch runs the whole
+    /// batch, while an eager parent concretizes the predicate and interprets the selected batched branch.
+    fn batch_condition_with_replicated_predicate<D: BatchingDriver<C, P>>(
+        &self,
+        driver: &D,
+        branches: [RegionRef<'_, C::Constant, C::Operation>; 2],
+        predicate: &C::Value,
+        branch_inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError>
+    where
+        C::Operation: From<ConditionOperation<C::Type>>,
+    {
+        let branch_input_axes = branch_inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
+        let [true_program, false_program] = branches.map(|branch| {
+            driver.batch_program(self, branch, &branch_input_axes, ProgramBatchingOutputAxesPolicy::Natural)
+        });
+        let (true_program, false_program) = (true_program?, false_program?);
+        check_count!("output", false_program.output_axes(), true_program.output_axes().len(), ProgramError);
+        let output_axes = true_program
+            .output_axes()
+            .iter()
+            .zip(false_program.output_axes())
+            .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
+            .collect::<Vec<_>>();
+        let mut batched_branches = Vec::with_capacity(2);
+        for (branch, program) in branches.into_iter().zip([true_program, false_program]) {
+            batched_branches.push(self.align_and_adapt_batched_program_outputs(
+                driver,
+                branch,
+                &branch_input_axes,
+                program,
+                &output_axes,
+            )?);
+        }
+        let mut condition_inputs = vec![predicate.clone()];
+        condition_inputs.extend(P::boundary_inputs(self.axis_extent()));
+        condition_inputs.extend(branch_inputs.iter().map(|input| P::value(input).clone()));
+        let outputs = self.parent().bind(ConditionOperation::new(), batched_branches, &condition_inputs)?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
+    }
+
+    /// Batches an application of a condition whose `predicate` is batch-varying, for any [`BatchingPolicy`], by
+    /// evaluating both branches and selecting their outputs per item. The caller must have validated that the branches
+    /// can be evaluated together: both must be pure, have no deferred work, and satisfy the type family's reference and
+    /// identity constraints.
+    ///
+    /// Each branch is batched through `driver.batch_region` over gated inputs (refer to
+    /// [`gate_mapped_predicate_branch_inputs`]): an input for which `stop_gradient` returns its gradient-stopped copy
+    /// enters each branch as a per-item selection between itself and that copy, so primal values are unchanged but an
+    /// inactive branch contributes no derivatives, and in particular no non-finite ones, while an input for which it
+    /// returns `None` passes through unchanged. `merge` then combines output `index` of the two branches, given the
+    /// per-item selection.
+    ///
+    /// Each selection binds the predicate and its two candidates through `bind_select`, after aligning their manual
+    /// variation, because [`Context::bind`] does not align it. The candidates are aligned with each other and with the
+    /// predicate, and the predicate is aligned with them, staging `parallel_vary` on the Boolean predicate, which
+    /// carries no tangent, or on a candidate that varies less, whose transition then owns the adjoint. The predicate is
+    /// varied once for each distinct variation that the selections require, and later selections reuse it. Values
+    /// without manual variation pass through unchanged.
+    fn batch_condition_with_mapped_predicate<D, StopGradientFn, SelectBind, Merge>(
+        &self,
+        driver: &D,
+        predicate: &P::Batch,
+        branch_inputs: &[P::Batch],
+        stop_gradient: StopGradientFn,
+        bind_select: SelectBind,
+        merge: Merge,
+    ) -> Result<Vec<P::Batch>, BatchingError>
+    where
+        C::Value: ManualVariationAlignment<C::Type>,
+        D: BatchingDriver<C, P>,
+        StopGradientFn: Fn(&P::Batch) -> Result<Option<P::Batch>, BatchingError>,
+        SelectBind: Fn(&[P::Batch]) -> Result<P::Batch, BatchingError>,
+        Merge: Fn(
+            usize,
+            P::Batch,
+            P::Batch,
+            &dyn Fn(&P::Batch, &P::Batch) -> Result<P::Batch, BatchingError>,
+        ) -> Result<P::Batch, BatchingError>,
+    {
+        let stopped_inputs = branch_inputs.iter().map(stop_gradient).collect::<Result<Vec<_>, _>>()?;
+        let predicate_type = P::value(predicate).r#type().into_owned();
+        let predicate_sharding = predicate_type.sharding();
+        let varies_beyond_predicate = |sharding: &Sharding| {
+            let predicate_axes = predicate_sharding.map(Sharding::varying_manual_axes);
+            sharding
+                .varying_manual_axes()
+                .iter()
+                .any(|axis| !predicate_axes.is_some_and(|axes| axes.contains(axis)))
+        };
+        let varied_predicates = RefCell::new(Vec::<(BTreeSet<String>, C::Value)>::new());
+        let select = |on_true: &P::Batch, on_false: &P::Batch| -> Result<P::Batch, BatchingError> {
+            let candidates = [P::value(on_true).clone(), P::value(on_false).clone()];
+            let mut candidates = C::Value::align_manual_variation(&candidates)?;
+            if let Some(sharding) = predicate_sharding {
+                candidates = C::Value::align_manual_variation_to(&candidates, sharding)?;
+            }
+            // The aligned candidates vary over every axis that the predicate or either candidate varies over, and
+            // so must the predicate. Both aligned candidates vary over the same axes, so the first determines them.
+            let candidate_type = candidates[0].r#type().into_owned();
+            let predicate_value = match candidate_type.sharding() {
+                Some(target) if varies_beyond_predicate(target) => {
+                    let mut varied_predicates = varied_predicates.borrow_mut();
+                    match varied_predicates.iter().find(|(axes, _)| axes == target.varying_manual_axes()) {
+                        Some((_, varied)) => varied.clone(),
+                        None => {
+                            let varied =
+                                C::Value::align_manual_variation_to(&[P::value(predicate).clone()], target)?.remove(0);
+                            varied_predicates.push((target.varying_manual_axes().clone(), varied.clone()));
+                            varied
+                        }
+                    }
+                }
+                _ => P::value(predicate).clone(),
+            };
+            let mut candidates = candidates.into_iter();
+            bind_select(&[
+                P::batch(predicate_value, P::batch_axis(predicate))?,
+                P::batch(candidates.next().unwrap(), P::batch_axis(on_true))?,
+                P::batch(candidates.next().unwrap(), P::batch_axis(on_false))?,
+            ])
+        };
+        let true_inputs = gate_mapped_predicate_branch_inputs(0, branch_inputs, &stopped_inputs, select)?;
+        let true_outputs = driver.batch_region(self, 0, true_inputs)?;
+        let false_inputs = gate_mapped_predicate_branch_inputs(1, branch_inputs, &stopped_inputs, select)?;
+        let false_outputs = driver.batch_region(self, 1, false_inputs)?;
+        check_count!("output", false_outputs, true_outputs.len(), ProgramError);
+        true_outputs
+            .into_iter()
+            .zip(false_outputs)
+            .enumerate()
+            .map(|(index, (true_output, false_output))| merge(index, true_output, false_output, &select))
+            .collect()
+    }
+}
 
 /// Reference that the root of a `condition` branch's reference analysis denotes at the condition boundary. It is
 /// compared across the two branches by [`ConditionOperation::validate_reference_output_roots`] and named by the
@@ -1754,220 +1950,10 @@ where
         .collect()))
 }
 
-/// Batches an application of a condition whose `predicate` is replicated, so that every batch item takes the same
-/// branch, for any [`BatchingPolicy`]. Both `branches` are batched at the batch axes of `branch_inputs` with natural
-/// output axes to discover which outputs each branch maps, and the two answers are joined into one output layout,
-/// which takes the `true` branch's axis when both branches map an output. Each branch is then instantiated at the
-/// joined axes and adapted to an ordinary region boundary (refer to
-/// [`BatchingContext::align_and_adapt_batched_program_outputs`]), which keeps a discovery program whose axes already
-/// equal the joined ones. Finally, one condition over the batched branches is bound into the parent context over the
-/// unbatched predicate, the policy's boundary inputs (refer to [`BatchingPolicy::boundary_inputs`]), and the batched
-/// branch inputs. A staging parent therefore keeps one `condition` whose selected branch runs the whole batch, while an
-/// eager parent concretizes the predicate and interprets the selected batched branch.
-fn batch_condition_with_replicated_predicate<C, P, D>(
-    context: &BatchingContext<C, P>,
-    driver: &D,
-    branches: [RegionRef<'_, C::Constant, C::Operation>; 2],
-    predicate: &C::Value,
-    branch_inputs: &[P::Batch],
-) -> Result<Vec<P::Batch>, BatchingError>
-where
-    C: Context<Type: ConditionType, Operation: From<ConditionOperation<C::Type>>>,
-    P: BatchingPolicy<C>,
-    D: BatchingDriver<C, P>,
-{
-    let branch_input_axes = branch_inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
-    let [true_program, false_program] = branches.map(|branch| {
-        driver.batch_program(context, branch, &branch_input_axes, ProgramBatchingOutputAxesPolicy::Natural)
-    });
-    let (true_program, false_program) = (true_program?, false_program?);
-    check_count!("output", false_program.output_axes(), true_program.output_axes().len(), ProgramError);
-    let output_axes = true_program
-        .output_axes()
-        .iter()
-        .zip(false_program.output_axes())
-        .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
-        .collect::<Vec<_>>();
-    let mut batched_branches = Vec::with_capacity(2);
-    for (branch, program) in branches.into_iter().zip([true_program, false_program]) {
-        batched_branches.push(context.align_and_adapt_batched_program_outputs(
-            driver,
-            branch,
-            &branch_input_axes,
-            program,
-            &output_axes,
-        )?);
-    }
-    let mut condition_inputs = vec![predicate.clone()];
-    condition_inputs.extend(P::boundary_inputs(context.axis_extent()));
-    condition_inputs.extend(branch_inputs.iter().map(|input| P::value(input).clone()));
-    let outputs = context.parent().bind(ConditionOperation::new(), batched_branches, &condition_inputs)?;
-    check_count!("output", outputs, output_axes.len(), ProgramError);
-    outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
-}
-
-/// Batches an application of a condition whose `predicate` is batch-varying, for any [`BatchingPolicy`], by evaluating
-/// both branches and selecting their outputs per item. The caller must have validated that the branches can be
-/// evaluated together (refer to [`validate_mapped_predicate_branch_effects`]).
-///
-/// Each branch is batched through `driver.batch_region` over gated inputs (refer to
-/// [`gate_mapped_predicate_branch_inputs`]): an input for which `stop_gradient` returns its gradient-stopped copy
-/// enters each branch as a per-item selection between itself and that copy, so primal values are unchanged but an
-/// inactive branch contributes no derivatives, and in particular no non-finite ones, while an input for which it
-/// returns `None` passes through unchanged. `merge` then combines output `index` of the two branches, given the
-/// per-item selection.
-///
-/// Each selection binds the predicate and its two candidates through `bind_select`, after aligning their manual
-/// variation, because [`Context::bind`] does not align it. The candidates are aligned with each other and with the
-/// predicate, and the predicate is aligned with them, staging `parallel_vary` on the Boolean predicate, which carries
-/// no tangent, or on a candidate that varies less, whose transition then owns the adjoint. The predicate is varied once
-/// for each distinct variation that the selections require, and later selections reuse it. Values without manual
-/// variation pass through unchanged.
-fn batch_condition_with_mapped_predicate<C, P, D, StopGradientFn, SelectBind, Merge>(
-    context: &BatchingContext<C, P>,
-    driver: &D,
-    predicate: &P::Batch,
-    branch_inputs: &[P::Batch],
-    stop_gradient: StopGradientFn,
-    bind_select: SelectBind,
-    merge: Merge,
-) -> Result<Vec<P::Batch>, BatchingError>
-where
-    C: Context<Type: ConditionType>,
-    C::Value: ManualVariationAlignment<C::Type>,
-    P: BatchingPolicy<C>,
-    D: BatchingDriver<C, P>,
-    StopGradientFn: Fn(&P::Batch) -> Result<Option<P::Batch>, BatchingError>,
-    SelectBind: Fn(&[P::Batch]) -> Result<P::Batch, BatchingError>,
-    Merge: Fn(
-        usize,
-        P::Batch,
-        P::Batch,
-        &dyn Fn(&P::Batch, &P::Batch) -> Result<P::Batch, BatchingError>,
-    ) -> Result<P::Batch, BatchingError>,
-{
-    let stopped_inputs = branch_inputs.iter().map(stop_gradient).collect::<Result<Vec<_>, _>>()?;
-    let predicate_type = P::value(predicate).r#type().into_owned();
-    let predicate_sharding = predicate_type.sharding();
-    let varies_beyond_predicate = |sharding: &Sharding| {
-        let predicate_axes = predicate_sharding.map(Sharding::varying_manual_axes);
-        sharding
-            .varying_manual_axes()
-            .iter()
-            .any(|axis| !predicate_axes.is_some_and(|axes| axes.contains(axis)))
-    };
-    let varied_predicates = RefCell::new(Vec::<(BTreeSet<String>, C::Value)>::new());
-    let select = |on_true: &P::Batch, on_false: &P::Batch| -> Result<P::Batch, BatchingError> {
-        let candidates = [P::value(on_true).clone(), P::value(on_false).clone()];
-        let mut candidates = C::Value::align_manual_variation(&candidates)?;
-        if let Some(sharding) = predicate_sharding {
-            candidates = C::Value::align_manual_variation_to(&candidates, sharding)?;
-        }
-        // The aligned candidates vary over every axis that the predicate or either candidate varies over, and so must
-        // the predicate. Both aligned candidates vary over the same axes, so the first one determines them.
-        let candidate_type = candidates[0].r#type().into_owned();
-        let predicate_value = match candidate_type.sharding() {
-            Some(target) if varies_beyond_predicate(target) => {
-                let mut varied_predicates = varied_predicates.borrow_mut();
-                match varied_predicates.iter().find(|(axes, _)| axes == target.varying_manual_axes()) {
-                    Some((_, varied)) => varied.clone(),
-                    None => {
-                        let varied =
-                            C::Value::align_manual_variation_to(&[P::value(predicate).clone()], target)?.remove(0);
-                        varied_predicates.push((target.varying_manual_axes().clone(), varied.clone()));
-                        varied
-                    }
-                }
-            }
-            _ => P::value(predicate).clone(),
-        };
-        let mut candidates = candidates.into_iter();
-        bind_select(&[
-            P::batch(predicate_value, P::batch_axis(predicate))?,
-            P::batch(candidates.next().unwrap(), P::batch_axis(on_true))?,
-            P::batch(candidates.next().unwrap(), P::batch_axis(on_false))?,
-        ])
-    };
-    let true_inputs = gate_mapped_predicate_branch_inputs(0, branch_inputs, &stopped_inputs, select)?;
-    let true_outputs = driver.batch_region(context, 0, true_inputs)?;
-    let false_inputs = gate_mapped_predicate_branch_inputs(1, branch_inputs, &stopped_inputs, select)?;
-    let false_outputs = driver.batch_region(context, 1, false_inputs)?;
-    check_count!("output", false_outputs, true_outputs.len(), ProgramError);
-    true_outputs
-        .into_iter()
-        .zip(false_outputs)
-        .enumerate()
-        .map(|(index, (true_output, false_output))| merge(index, true_output, false_output, &select))
-        .collect()
-}
-
 /// Returns whether a computation whose effects are summarized by `effects` is pure, i.e., has no effects and carries
 /// no deferred work.
 fn is_pure(effects: EffectsSummary) -> bool {
     effects.classes().is_empty() && !effects.has_deferred_work()
-}
-
-/// Validates that the `true` and `false` `branches` of a condition whose predicate is batch-varying are pure (refer to
-/// [`is_pure`]). Batching such a condition evaluates both branches and selects their outputs per item, which would
-/// perform the effects of the branch that an item does not take and cannot select transformation obligations per item.
-fn validate_mapped_predicate_branch_effects<V: Value, O: Operation<Type = V::Type>>(
-    branches: [RegionRef<'_, V, O>; 2],
-) -> Result<(), BatchingError> {
-    if branches.iter().all(|branch| is_pure(branch.effects())) {
-        return Ok(());
-    }
-    Err(BatchingError::UnsupportedOperation {
-        message: format!(
-            "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that have \
-             effects or deferred work because neither observable effects nor transformation obligations can be \
-             selected per batch item",
-        ),
-    })
-}
-
-/// Validates that the `true` and `false` `branches` of a composite condition whose predicate is batch-varying can be
-/// evaluated together and selected per item, and returns their reference analyses. No branch may access or allocate a
-/// reference in any mode: a read in the branch that an item does not take would still be ordered against the writes
-/// of the branch that it takes, and a local allocation is a state effect of its own. A branch that merely forwards a
-/// reference that it never accesses is accepted. This check runs ahead of the effect check (refer to
-/// [`validate_mapped_predicate_branch_effects`]), so that its diagnostic names the actual cause. A staging parent
-/// (i.e., when `is_eager` is `false`) also rejects branch-local type identities: replaying both branches into one trace
-/// does not relocate their internal identities, so their definitions would collide across the two branches or a
-/// repeated invocation, and merely freshening them would leave dependent arrays with unrelated shapes at selection.
-/// Input-established identities retain their existing authority.
-fn validate_mapped_predicate_composite_branches<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
-    branches: [RegionRef<'_, V, O>; 2],
-    is_eager: bool,
-) -> Result<[Arc<ReferenceAnalysis>; 2], BatchingError> {
-    let [true_analysis, false_analysis] = branches.map(|branch| branch.reference_analysis(0));
-    let analyses = [true_analysis.map_err(ProgramError::from)?, false_analysis.map_err(ProgramError::from)?];
-    for analysis in &analyses {
-        let allocates = analysis.roots().any(|root| matches!(root, ReferenceRoot::Allocation { .. }));
-        if !analysis.access_modes().is_empty() || allocates {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose branches access \
-                     references because select lowering runs both branches and reference effects cannot be selected \
-                     per batch item",
-                ),
-            });
-        }
-    }
-    validate_mapped_predicate_branch_effects(branches)?;
-    if !is_eager {
-        for (slot, branch) in ["true", "false"].into_iter().zip(branches) {
-            if let Some(identity) = branch.type_identity_signature().internal_identities().first() {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "cannot stage a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose `{slot}` \
-                         branch defines branch-local type identity `{identity}` because select lowering cannot \
-                         preserve branch-local type identity scopes",
-                    ),
-                });
-            }
-        }
-    }
-    Ok(analyses)
 }
 
 /// Returns the inputs of the branch at `branch_index` (i.e., `0` for the `true` branch and `1` for the `false` branch)
@@ -1997,9 +1983,9 @@ fn gate_mapped_predicate_branch_inputs<B: Clone>(
 /// Merges output `index` of the two branches of a composite condition whose predicate is batch-varying, given the
 /// branches' outputs `true_output` and `false_output`. An array output is selected per item through `select`. A
 /// dimension output is replicated, and both branches produce the same dimension value without a runtime comparison:
-/// type inference proved the two refined output types equal, a staging parent rejected every branch-local identity
-/// (refer to [`validate_mapped_predicate_composite_branches`]), so an equal type names only input-established
-/// identities, and an eager parent produces exact dimension types, which determine their values. A reference output
+/// type inference proved the two refined output types equal, and batching rejected every branch-local identity for a
+/// staging parent, so an equal type names only input-established identities. An eager parent produces exact dimension
+/// types, which determine their values. A reference output
 /// is never selected: both branches must forward the same branch input, according to their reference `analyses`, and
 /// the batch of the corresponding entry of `branch_inputs` then passes through unchanged, with the axis that its
 /// referent fixes. A root must be an input of its own branch (whose identifier `branch_ids` lists), so that a root of
