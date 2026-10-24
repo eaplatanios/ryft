@@ -5865,7 +5865,8 @@ pub(crate) mod tests {
             context.bind(ConditionOperation::new(), vec![branch(), branch()], &[predicate, value]).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "`condition` reference output 0 must denote the same reference in both branches, but the `true` branch \
-                 returns a reference that it allocates and the `false` branch returns a reference that it allocates",
+                 returns a reference allocated in the region and the `false` branch returns a reference allocated in \
+                 the region",
             ))),
         );
     }

@@ -2341,32 +2341,61 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_semantic_key_preserves_custom_attribute_kinds_and_bits() {
+        let definition = |attribute| {
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            body.add_instruction(
+                ArrayIrOperation::CustomCall(
+                    CustomCallOperation::new("test.foreign", vec![]).with_attribute("value", attribute),
+                ),
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
+            KernelDefinition::new(
+                KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),
+                body.build(vec![], vec![], vec![]).unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Attributes of different kinds render differently (strings are quoted and narrow integers carry their
+        // width), and their keys differ as well.
+        for (attributes, renderings) in [
+            (
+                [CustomCallAttribute::String("true".to_owned()), CustomCallAttribute::Boolean(true)],
+                ["value=\"true\"", "value=true"],
+            ),
+            ([CustomCallAttribute::String("1".to_owned()), CustomCallAttribute::I64(1)], ["value=\"1\"", "value=1"]),
+            ([CustomCallAttribute::I32(1), CustomCallAttribute::I64(1)], ["value=1i32", "value=1"]),
+            (
+                [CustomCallAttribute::Bytes(vec![0, 255]), CustomCallAttribute::String("bytes [00, ff]".to_owned())],
+                ["value=bytes [00, ff]", "value=\"bytes [00, ff]\""],
+            ),
+        ] {
+            let definitions = attributes.map(definition);
+            for (definition, rendering) in definitions.iter().zip(renderings) {
+                assert_eq!(
+                    definition.body().to_string(),
+                    format!("lambda  .\nlet () = custom_call [target=test.foreign, {rendering}]\nin ()"),
+                );
+            }
+            assert_ne!(definitions[0].semantic_key().unwrap(), definitions[1].semantic_key().unwrap());
+        }
+
+        // Floating-point attributes that differ only in their NaN payload render identically, but the key preserves
+        // their bits.
         for attributes in [
-            [CustomCallAttribute::String("true".to_owned()), CustomCallAttribute::Boolean(true)],
-            [CustomCallAttribute::String("1".to_owned()), CustomCallAttribute::I64(1)],
-            [CustomCallAttribute::Bytes(vec![0, 255]), CustomCallAttribute::String("bytes [00, ff]".to_owned())],
             [
                 CustomCallAttribute::F64(f64::from_bits(0x7ff8_0000_0000_0001)),
                 CustomCallAttribute::F64(f64::from_bits(0x7ff8_0000_0000_0002)),
             ],
+            [
+                CustomCallAttribute::F32(f32::from_bits(0x7fc0_0001)),
+                CustomCallAttribute::F32(f32::from_bits(0x7fc0_0002)),
+            ],
         ] {
-            let definitions = attributes.map(|attribute| {
-                let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-                body.add_instruction(
-                    ArrayIrOperation::CustomCall(
-                        CustomCallOperation::new("test.foreign", vec![]).with_attribute("value", attribute),
-                    ),
-                    vec![],
-                    vec![],
-                    None,
-                )
-                .unwrap();
-                KernelDefinition::new(
-                    KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),
-                    body.build(vec![], vec![], vec![]).unwrap(),
-                )
-                .unwrap()
-            });
+            let definitions = attributes.map(definition);
             assert_eq!(definitions[0].body().to_string(), definitions[1].body().to_string());
             assert_ne!(definitions[0].semantic_key().unwrap(), definitions[1].semantic_key().unwrap());
         }

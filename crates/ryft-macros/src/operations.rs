@@ -1067,21 +1067,37 @@ impl OperationEnum {
             self.operation_forwarding_arms(quote!(output_region_provenance), quote!(, output_index));
         let region_data_flow_arms = self.operation_forwarding_arms(quote!(region_data_flow), quote!());
         let prune_boundary_arms = self.variants.iter().map(|variant| {
-            // Boundary pruning exchanges only liveness flags, so every variant class delegates to the payload's own
-            // hook and wraps the pruned payload back into its variant.
+            // Boundary pruning sees the instruction input types, so each variant class prunes in the universe whose
+            // contract its payload defines, like region input type inference, and wraps the pruned payload back into
+            // its variant.
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             let wrapped = if variant.is_boxed { quote!(::std::boxed::Box::new(operation)) } else { quote!(operation) };
-            quote! {
-                Self::#variant_ident(operation) => ::std::result::Result::Ok(
-                    <#payload_type as #ryft::Operation>::prune_boundary(
+            let pruning = match &variant.class {
+                OperationVariantClass::MixedMember { .. } => quote! {
+                    <#payload_type as #ryft::MemberOperation<#primary_type>>::prune_parent_boundary(
                         #receiver,
-                        input_count,
+                        input_types,
                         used_outputs,
                         regions,
-                    )?
-                    .map(|pruning| pruning.map_operation(|operation| Self::#variant_ident(#wrapped))),
+                    )
+                },
+                OperationVariantClass::ProjectedMember { .. } => quote! {
+                    #ryft::prune_projected_operation_boundary(#receiver, input_types, used_outputs, regions)
+                },
+                OperationVariantClass::CompositeNative => quote! {
+                    <#payload_type as #ryft::Operation>::prune_boundary(
+                        #receiver,
+                        input_types,
+                        used_outputs,
+                        regions,
+                    )
+                },
+            };
+            quote! {
+                Self::#variant_ident(operation) => ::std::result::Result::Ok(
+                    #pruning?.map(|pruning| pruning.map_operation(|operation| Self::#variant_ident(#wrapped))),
                 ),
             }
         });
@@ -1174,7 +1190,7 @@ impl OperationEnum {
 
                 fn prune_boundary(
                     &self,
-                    input_count: usize,
+                    input_types: &[#primary_type],
                     used_outputs: &[bool],
                     regions: &mut dyn #ryft::RegionLiveness,
                 ) -> ::std::result::Result<

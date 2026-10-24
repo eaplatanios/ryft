@@ -1877,10 +1877,11 @@ impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O>
                     .inputs()
                     .iter()
                     .map(|input| source.atoms()[input.index()].r#type().into_owned())
-                    .collect();
+                    .collect::<Vec<_>>();
                 let operation = instruction.operation();
-                let mut liveness = AttachedRegionLiveness::new(self, operation, input_types, instruction.regions());
-                operation.prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
+                let mut liveness =
+                    AttachedRegionLiveness::new(self, operation, input_types.clone(), instruction.regions());
+                operation.prune_boundary(&input_types, &used_outputs, &mut liveness)?
             };
 
             let instruction_pruning = match pruning {
@@ -4761,14 +4762,14 @@ mod tests {
 
             fn prune_boundary(
                 &self,
-                input_count: usize,
+                input_types: &[Self::Type],
                 used_outputs: &[bool],
                 _regions: &mut dyn RegionLiveness,
             ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
                 let (kept_inputs, kept_outputs) = match self {
                     Self::Neg => return Ok(None),
-                    Self::DropsUsedOutput => (vec![true; input_count], vec![false; used_outputs.len()]),
-                    Self::DropsLiveInput => (vec![false; input_count], used_outputs.to_vec()),
+                    Self::DropsUsedOutput => (vec![true; input_types.len()], vec![false; used_outputs.len()]),
+                    Self::DropsLiveInput => (vec![false; input_types.len()], used_outputs.to_vec()),
                 };
                 Ok(Some(OperationBoundaryPruning { operation: self.clone(), kept_inputs, kept_outputs }))
             }

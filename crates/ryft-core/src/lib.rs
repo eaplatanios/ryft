@@ -225,7 +225,7 @@ pub use programs::{
     ValueProjection, batch_reference_transforms, discharge_local_reference_operation,
     discharge_positional_region_operation, discharge_reference_free_operation, fold_projected_operation,
     infer_projected_operation_output_types, infer_projected_operation_region_input_types, infer_reference_view_type,
-    rewrite_reference_access_transforms, type_identities_needing_runtime_checks,
+    prune_projected_operation_boundary, rewrite_reference_access_transforms, type_identities_needing_runtime_checks,
     validate_projected_operation_region_interfaces, validate_reference_boundary,
     validated_reference_access_descriptors,
 };

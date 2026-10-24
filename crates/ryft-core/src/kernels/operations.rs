@@ -381,40 +381,40 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
 
     fn prune_boundary(
         &self,
-        input_count: usize,
+        input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         match self {
             Self::Portable(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::Portable))),
             Self::Call(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::Call))),
             Self::Scratch(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::Scratch))),
             Self::TileLoad(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::TileLoad))),
             Self::AsyncCopy(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::AsyncCopy))),
             Self::Wait(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::Wait))),
             Self::MaskedLoad(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::MaskedLoad))),
             Self::MaskedStore(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::MaskedStore))),
             Self::MaskedSwap(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::MaskedSwap))),
             Self::Extension(operation) => Ok(operation
-                .prune_boundary(input_count, used_outputs, regions)?
+                .prune_boundary(input_types, used_outputs, regions)?
                 .map(|pruning| pruning.map_operation(Self::Extension))),
         }
     }

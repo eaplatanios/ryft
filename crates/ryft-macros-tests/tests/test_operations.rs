@@ -372,7 +372,7 @@ trait Operation: Clone {
 
     fn prune_boundary(
         &self,
-        _input_count: usize,
+        _input_types: &[Self::Type],
         _used_outputs: &[bool],
         _regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
@@ -546,6 +546,20 @@ where
 {
     let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
     operation.fold(&input_types, &region_interfaces)
+}
+
+/// Prunes a member operation's boundary through the same projected input types as output inference.
+fn prune_projected_operation_boundary<T: Type, U: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[U],
+    used_outputs: &[bool],
+    regions: &mut dyn RegionLiveness,
+) -> Result<Option<OperationBoundaryPruning<O>>, ProgramError>
+where
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    let (input_types, _) = project_operation_boundary::<T, U>(input_types, &[])?;
+    operation.prune_boundary(&input_types, used_outputs, regions)
 }
 
 /// Projects a stand-in composite inference boundary to one member type.
@@ -1293,7 +1307,7 @@ impl Operation for PrintOperation {
 
     fn prune_boundary(
         &self,
-        _input_count: usize,
+        _input_types: &[Self::Type],
         _used_outputs: &[bool],
         _regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
@@ -1779,9 +1793,9 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
     struct NoRegionLiveness;
     impl RegionLiveness for NoRegionLiveness {}
-    assert!(matches!(add.prune_boundary(2, &[true], &mut NoRegionLiveness), Ok(None)));
+    assert!(matches!(add.prune_boundary(&[DataType, DataType], &[true], &mut NoRegionLiveness), Ok(None)));
     assert!(matches!(
-        print.prune_boundary(1, &[false], &mut NoRegionLiveness),
+        print.prune_boundary(&[DataType], &[false], &mut NoRegionLiveness),
         Ok(Some(OperationBoundaryPruning { operation: DataOperation::Print(PrintOperation) })),
     ));
     assert_eq!(add.region_capture_input_count(0), None);
