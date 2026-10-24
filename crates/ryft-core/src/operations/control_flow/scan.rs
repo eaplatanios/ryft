@@ -51,7 +51,7 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     ResidualZeroProvider, TangentActivity, TransposableOperation, TransposedProgramCotangent, TranspositionContext,
     TranspositionDriver,
@@ -263,7 +263,7 @@ impl<T: Type> ScanOperation<T> {
 
     /// Validates the instruction and body positions used by the producer-source and execution-demand contracts.
     fn validate_data_flow_boundary(&self, boundary: RegionDataFlowBoundary<'_>) -> Result<(), ProgramError> {
-        let runtime_length_count = runtime_length_count(&self.length);
+        let runtime_length_count = usize::from(self.length.variable().is_some());
         if boundary.regions.len() != 1
             || boundary.output_count < self.carry_count
             || boundary.regions[0].output_count != boundary.output_count
@@ -385,7 +385,7 @@ impl<T: ScanType> ScanOperation<T> {
         check_count!(
             "input",
             input_types,
-            body_input_types.len() - 1 + runtime_length_count(&self.length),
+            body_input_types.len() - 1 + usize::from(self.length.variable().is_some()),
             ProgramError
         );
         T::validate_scan_input_type_signature(&body_input_types, self.carry_count, &self.length, input_types)?;
@@ -475,7 +475,16 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("region", region_interfaces, 1, TypeError);
-        validate_scan_length(&self.length)?;
+        // Static trip counts must fit the intrinsic scalar `i64` index. Runtime dimensions enforce this bound when
+        // their values are created.
+        let length = &self.length;
+        if let Some(length) = length.value()
+            && length > MAX_DIMENSION_EXTENT
+        {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` length {length} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
+            )));
+        }
         let output_types = T::infer_scan_output_types(
             region_interfaces[0].input_types(),
             region_interfaces[0].output_types(),
@@ -541,7 +550,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
                  {stacked_count} stacked inputs",
             ))
         })?;
-        let runtime_length_count = runtime_length_count(&self.length);
+        let runtime_length_count = usize::from(self.length.variable().is_some());
         if trailing_count != runtime_length_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{SCAN_OPERATION_NAME}` expects {runtime_length_count} trailing runtime length inputs but has \
@@ -1019,7 +1028,7 @@ pub(crate) trait ScanIterationType<C: Domain<Type = Self>>: ScanType {
     /// and the variation of a slice can then differ from that of the earlier slices (e.g., when the body stacks a carry
     /// whose variation an earlier iteration changed). A family whose values can relabel their manual variation widens
     /// the stack and the slice to the join of their variation, as `parallel_vary` does, while a family that cannot
-    /// rejects the slice (refer to `validate_scan_slice_variation`). Only stacks are widened: a carry keeps the type
+    /// rejects the slice. Only stacks are widened: a carry keeps the type
     /// that the last iteration returns for it (or its entry type when the scan runs no iteration), which can vary over
     /// fewer manual axes than the join of its entry and body types.
     fn write_iteration(
@@ -1072,10 +1081,36 @@ where
         // variation differs from that of the stack is rejected.
         let accumulator = match accumulator {
             Some(accumulator) => {
-                validate_scan_slice_variation(output, &accumulator, &value)?;
+                let stacked = accumulator
+                    .r#type()
+                    .sharding()
+                    .map(|sharding| sharding.varying_manual_axes().clone())
+                    .unwrap_or_default();
+                let returned = value
+                    .r#type()
+                    .sharding()
+                    .map(|sharding| sharding.varying_manual_axes().clone())
+                    .unwrap_or_default();
+                if stacked != returned {
+                    let render = |axes: &BTreeSet<String>| {
+                        if axes.is_empty() {
+                            "no manual axes".to_owned()
+                        } else {
+                            format!("`{}`", axes.iter().cloned().collect::<Vec<_>>().join("`, `"))
+                        }
+                    };
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` body returns a slice of output {output} that varies over {} after \
+                         earlier slices that vary over {}; every slice of a stacked output must have the same manual \
+                         variation",
+                        render(&returned),
+                        render(&stacked),
+                    ))
+                    .into());
+                }
                 accumulator
             }
-            None => context.zero(&stacked_scan_type(&value.r#type(), length))?,
+            None => context.zero(&value.r#type().with_inserted_dimension(0, length.into()).unwrap())?,
         };
         write_scan_iteration(accumulator, iteration, value)
     }
@@ -1092,9 +1127,9 @@ where
 
 // Composite scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
 // count from the trailing first-class dimension input. A concrete [`Array`] relabels its type without changing its
-// elements, so a slice whose manual variation differs from that of its stack widens both to the join of their variation
-// (refer to `join_scan_slice_variation`). The `shard_map` emulator delegates to these functions on every device, so a
-// scan widens its stacks the same way whether or not its body uses collectives over the emulated manual axes.
+// elements, so a slice whose manual variation differs from that of its stack widens both to the join of their
+// variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its stacks the
+// same way whether or not its body uses collectives over the emulated manual axes.
 impl<O: Operation<Type = ArrayIrType>> ScanIterationType<EagerContext<ArrayIrValue<Array>, O>> for ArrayIrType {
     fn runtime_length(runtime_length: &ArrayIrValue<Array>) -> Result<usize, ProgramError> {
         Ok(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(runtime_length)?.extent())
@@ -1128,12 +1163,31 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<EagerContext<ArrayIrVal
     ) -> Result<ArrayIrValue<Array>, ProgramError> {
         let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
         let (accumulator, value) = match accumulator {
-            Some(accumulator) => join_scan_slice_variation(
-                <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(accumulator)?,
-                value,
-            )?,
+            Some(accumulator) => {
+                // Join manual variation across iterations by relabeling both concrete arrays. An unsharded value first
+                // receives replicated placement on the missing axis's mesh; its elements stay unchanged.
+                let accumulator = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(accumulator)?;
+                let types = [accumulator.r#type().into_owned(), value.r#type().into_owned()];
+                let axes = manual_variation_axes(&types);
+                let mut joined =
+                    vary_over_missing_manual_axes(vec![accumulator, value], &types, &axes, |value, axis, mesh| {
+                        let mut input_type = value.r#type().into_owned();
+                        if input_type.sharding().is_none() {
+                            let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
+                            input_type = input_type
+                                .with_sharding(sharding)
+                                .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        }
+                        let output_type = ParallelVaryOperation::new(axis.to_string())
+                            .infer_output_types(&[input_type], &[])?
+                            .remove(0);
+                        Array::from_logical_bytes(output_type, &value.logical_bytes())
+                    })?;
+                let value = joined.pop().unwrap();
+                (joined.pop().unwrap(), value)
+            }
             None => {
-                let stack_type = stacked_scan_type(&value.r#type(), length);
+                let stack_type = value.r#type().with_inserted_dimension(0, length.into()).unwrap();
                 (EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?, value)
             }
         };
@@ -1183,19 +1237,18 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<EagerContext<ArrayIrVal
     }
 }
 
-// Partial evaluation splits off the known work of a scan through `split_scan_by_knownness`: a carry stays known while
-// the body computes its next value from known values alone, a *known scan* bound in the known-side context performs the
-// known work, and an *unknown scan* left in the residual program consumes its residuals (refer to that function and to
-// `reconstruct_partitioned_scan` for the full recipe). Loop-invariant residuals, such as the initial values of known
-// carries that the body passes through unchanged and pure work over them, are computed once before the scan. Those that
-// resolve to constants of the known-side context are embedded into the unknown body as constants, so that partial
-// evaluation against known values specializes the residual body. Computed loop-invariant work is hoisted only when the
-// declared length guarantees an iteration, so a split never runs body work that no iteration performs. Before splitting
-// or residualizing the scan, the rule guards its complete boundary (refer to `PartialEvaluationContext::guard_inputs`),
-// whose declared types also relate the runtime length to the leading axes of the stacked inputs, so that neither the
-// rebuilt scans nor forwarded outputs rely on a relationship that the input types leave unproven. Non-reference carries
-// that the body passes through unchanged are then forwarded from their guarded inputs, and a scan where nothing folds
-// residualizes unchanged.
+// Partial evaluation splits off the known work of a scan: a carry stays known while the body computes its next value
+// from known values alone, a *known scan* bound in the known-side context performs the known work, and an *unknown
+// scan* left in the residual program consumes its residuals (refer to `reconstruct_partitioned_scan` for the full
+// recipe). Loop-invariant residuals, such as the initial values of known carries that the body passes through unchanged
+// and pure work over them, are computed once before the scan. Those that resolve to constants of the known-side context
+// are embedded into the unknown body as constants, so that partial evaluation against known values specializes the
+// residual body. Computed loop-invariant work is hoisted only when the declared length guarantees an iteration, so a
+// split never runs body work that no iteration performs. Before splitting or residualizing the scan, the rule guards
+// its complete boundary (refer to `PartialEvaluationContext::guard_inputs`), whose declared types also relate the
+// runtime length to the leading axes of the stacked inputs, so that neither the rebuilt scans nor forwarded outputs
+// rely on a relationship that the input types leave unproven. Non-reference carries that the body passes through
+// unchanged are then forwarded from their guarded inputs, and a scan where nothing folds residualizes unchanged.
 impl<T, V, O, C> PartiallyEvaluatableOperation<C> for ScanOperation<T>
 where
     T: ScanType + TemporalResidualType,
@@ -1230,10 +1283,47 @@ where
         // The trailing runtime length input of a dynamic-length scan is neither a carry nor a stacked input, so it does
         // not make any per-iteration work known. A split forwards the carries that the body passes through itself.
         let scanned_inputs = &inputs[..body_input_types.len() - 1];
-        if scanned_inputs.iter().any(PartialEvaluationValue::is_known)
-            && let Some(outputs) = split_scan_by_knownness(context, driver, self, body, &inputs)?
-        {
-            return Ok(outputs);
+        if scanned_inputs.iter().any(PartialEvaluationValue::is_known) {
+            let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len() - 1);
+            let mut body_known = std::iter::once(true)
+                .chain(body_inputs.iter().map(PartialEvaluationValue::is_known))
+                .collect::<Vec<bool>>();
+
+            // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging
+            // context. Unlike the body's derived forward-mode and transposed programs, a partition is not retained by
+            // the body region's transform cache: it depends on the configuration of the partial-evaluation context
+            // (e.g., effect folding and residual placement), so the body and the known-ness mask alone do not determine
+            // it.
+            let partition = loop {
+                let partition = driver.partition_program(context, body, &body_known)?;
+                let mut changed = false;
+                for (index, known) in body_known[1..1 + carry_count].iter_mut().enumerate() {
+                    let stays_known = matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_)));
+                    changed |= *known && !stays_known;
+                    *known &= stays_known;
+                }
+                if !changed {
+                    break partition;
+                }
+            };
+
+            // Ordinary specialization preserves global effect ordering; a conflicting split must stay whole.
+            if !partition.has_effect_ordering_conflicts()
+                && let Some(outputs) = reconstruct_partitioned_scan(
+                    self,
+                    &body_input_types,
+                    &inputs,
+                    &body_known,
+                    runtime_length_inputs.iter().all(PartialEvaluationValue::is_known),
+                    partition,
+                    |constant| Ok(context.known_value(context.parent().lift(constant)?)),
+                    |value| value.as_known().and_then(|value| context.parent().resolve(value).into_constant()),
+                    |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs),
+                    |operation, programs, inputs| context.residualize(operation, programs, inputs),
+                )?
+            {
+                return Ok(outputs);
+            }
         }
         let mut outputs = context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], &inputs)?;
 
@@ -1338,13 +1428,13 @@ where
     }
 }
 
-// Partition-aware transpose rule for a *primal* [`ScanOperation`], forwarding to `transpose_primal_scan`. Reference
-// carries and stacks accumulate through the enclosing context's cotangent references, which are resolved (and allocated
-// on first use when their state cotangent is live) before the primal rule threads them positionally through the
-// reversed scan. Ordinary carry cotangents drive earlier iterations and scanned cotangents have element shapes inside
-// the body, so the destinations are resolved without the accumulators, every non-reference cotangent is returned as a
-// value, and the accumulators then apply demand or gradient buffers. A universe without reference types (e.g.,
-// [`ArrayType`], whose referent family is [`NoReferent`](crate::programs::NoReferent)) has no cotangent references.
+// Partition-aware transpose rule for a primal [`ScanOperation`]. Reference carries and stacks accumulate through the
+// enclosing context's cotangent references, which are resolved (and allocated on first use when their state cotangent
+// is live) before the primal rule threads them positionally through the reversed scan. Ordinary carry cotangents drive
+// earlier iterations and scanned cotangents have element shapes inside the body, so the destinations are resolved
+// without the accumulators, every non-reference cotangent is returned as a value, and the accumulators then apply
+// demand or gradient buffers. A universe without reference types (e.g., [`ArrayType`], whose referent family is
+// [`NoReferent`](crate::programs::NoReferent)) has no cotangent references.
 impl<T, V: Value<Type = T>, O> TransposableOperation<V, O> for ScanOperation<T>
 where
     TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
@@ -1365,7 +1455,347 @@ where
     ) -> Result<(), DifferentiationError> {
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let cotangents = context.cotangent_destinations(driver, inputs, &[])?;
-        let contributions = transpose_primal_scan(self, context, driver, inputs, outputs, &cotangents)?;
+
+        // Validate the original boundary before eliminating zero cotangents or requesting a transformed body.
+        let body = driver.region(0)?;
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.validate_application(&input_types, body)?;
+        check_count!("output", outputs, body.output_ids().len(), ProgramError);
+        check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
+
+        // Live reference state, observable effects, or deferred backward work keep the rule live even when every
+        // ordinary output cotangent is zero. Still submit structural zeros to the accumulators when the rule is
+        // skipped.
+        let contributions = if cotangents.can_skip_transposition(outputs, [body]) {
+            inputs
+                .iter()
+                .map(|input| input.r#type().cotangent().map(MaybeZero::Zero))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let carry_count = self.carry_count;
+            let scan_input_count = body.input_ids().len() - 1;
+
+            // Known loop-invariant residuals may be interleaved with the linear carries of a partitioned scan.
+            // Unknown inputs are linear. Promote a changing known, non-reference carry with a nonzero cotangent space
+            // to internal linear state; its known initializer must still receive no cotangent. Changing known reference
+            // or zero-space carries cannot be promoted: their per-iteration values must arrive as stacked residuals.
+            let passes_through = passed_through_carries(body, 1..1 + carry_count);
+            let input_linear = inputs[..scan_input_count]
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let r#type = input.r#type();
+                    Ok(input.is_unknown()
+                        || (index < carry_count
+                            && !passes_through[index]
+                            && !r#type.is_reference()
+                            && !r#type.cotangent()?.is_zero_space()))
+                })
+                .collect::<Result<Vec<_>, TypeError>>()?;
+            if let Some(index) = (0..carry_count).find(|&index| !input_linear[index] && !passes_through[index]) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{SCAN_OPERATION_NAME}` transposition requires known carry {index} to pass through the body \
+                         unchanged; time-varying known values must be supplied as stacked inputs",
+                    ),
+                }
+                .into());
+            }
+            let zero_output_cotangents = outputs
+                .iter()
+                .enumerate()
+                .map(|(index, cotangent)| index >= carry_count && cotangent.is_zero())
+                .collect::<Vec<_>>();
+
+            // The body's index is known, so linear input positions are offset by one. Keep each selected input's
+            // destination kind: live references accumulate in place, while ignored references have no boundary slot.
+            let destination_kinds = cotangents.kinds();
+            let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = input_linear
+                .iter()
+                .zip(destination_kinds)
+                .enumerate()
+                .filter_map(|(index, (&linear, &kind))| linear.then_some((index + 1, kind)))
+                .unzip();
+
+            // Carry cotangents recur between iterations and need concrete values. Disconnected scanned-input cotangents
+            // remain structural zeros, so the reversed scan need not allocate or return their stacks.
+            let materialize_zeros = input_indices.iter().map(|&index| index <= carry_count).collect::<Vec<_>>();
+
+            // Request the retained body transposition through the instruction-scoped driver, preserving its cache and
+            // avoiding a recursive TransposableOperation bound on the operation family.
+            let transposed = driver.transpose_program_with_zero_seeds(
+                body,
+                &input_indices,
+                &materialize_zeros,
+                &zero_output_cotangents,
+                &selected_destination_kinds,
+            )?;
+
+            // Restore one slot per original scan input, then adapt the transposed body to scan order. The intrinsic
+            // index is regenerated by the reversed scan; reference carries retain one shared cotangent reference across
+            // iterations.
+            let mut input_cotangent_slots = vec![TransposedProgramCotangent::Absent; input_linear.len()];
+            for (&index, &slot) in input_indices.iter().zip(transposed.cotangents()) {
+                input_cotangent_slots[index - 1] = slot;
+            }
+            // Threading belongs to this scan attachment, not the retained transposition cache. Known carries pass
+            // through their value slots, live reference carries keep shared roots, and reference-stack identity outputs
+            // are omitted because their accumulated state is already visible through those roots.
+            let reversed_body = {
+                let program = Arc::unwrap_or_clone(transposed.into_program());
+                let body_output_types = body.output_types();
+                let destination_kinds = &destination_kinds[..input_linear.len()];
+                let retained_carries = (0..carry_count)
+                    .filter(|&index| destination_kinds[index] != CotangentDestinationKind::Ignore)
+                    .collect::<Vec<_>>();
+                for &index in &retained_carries {
+                    if input_linear[index] && input_cotangent_slots[index] != TransposedProgramCotangent::Output {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "`{SCAN_OPERATION_NAME}` transposition carry {index} has no materialized cotangent output",
+                        ))
+                        .into());
+                    }
+                }
+
+                // The retained transpose accepts output seeds, live cotangent references, then known values with the
+                // original index first. Zero-space seeds occupy positions but carry no information, so they are
+                // projected out.
+                let mut cotangent_input_count = 0;
+                let mut output_cotangent_positions = Vec::with_capacity(body_output_types.len());
+                for (output_type, &zero) in body_output_types.iter().zip(&zero_output_cotangents) {
+                    if output_type.is_reference() || zero {
+                        output_cotangent_positions.push(None);
+                        continue;
+                    }
+                    output_cotangent_positions
+                        .push((!output_type.cotangent()?.is_zero_space()).then_some(cotangent_input_count));
+                    cotangent_input_count += 1;
+                }
+
+                // Count live reference slots before locating the known index and the remaining known input values.
+                let reference_input_positions = destination_kinds
+                    .iter()
+                    .scan(cotangent_input_count, |position, &kind| {
+                        let live_reference = kind == CotangentDestinationKind::Reference;
+                        let result = live_reference.then_some(*position);
+                        *position += usize::from(live_reference);
+                        Some(result)
+                    })
+                    .collect::<Vec<_>>();
+                let index_position = cotangent_input_count + reference_input_positions.iter().flatten().count();
+                let known_input_positions = input_linear
+                    .iter()
+                    .scan(index_position + 1, |position, &linear| {
+                        let result = (!linear).then_some(*position);
+                        *position += usize::from(!linear);
+                        Some(result)
+                    })
+                    .collect::<Vec<_>>();
+
+                // Select the intrinsic index first, restore each retained carry at its original position, then append
+                // live output slices and the reference roots or known residual slices consumed by each reversed
+                // iteration.
+                let mut input_order = vec![index_position];
+                for &index in &retained_carries {
+                    let position = if !input_linear[index] {
+                        known_input_positions[index]
+                    } else if destination_kinds[index] == CotangentDestinationKind::Reference {
+                        reference_input_positions[index]
+                    } else {
+                        output_cotangent_positions[index]
+                    };
+                    let Some(position) = position else {
+                        // A linear carry whose cotangent is a zero space (e.g., an integer carry) has no cotangent
+                        // input to carry through the reversed scan. Any other carry without a slot is a malformed
+                        // transposed body.
+                        let carry_type = &body_output_types[index];
+                        if input_linear[index] && !carry_type.is_reference() && carry_type.cotangent()?.is_zero_space()
+                        {
+                            return Err(ProgramError::UnsupportedOperation {
+                                message: format!(
+                                    "`{SCAN_OPERATION_NAME}` transposition does not support linear carry {index} of \
+                                     type `{carry_type}`, whose cotangent is a zero space",
+                                ),
+                            }
+                            .into());
+                        }
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "`{SCAN_OPERATION_NAME}` transposition carry {index} has no boundary slot in the \
+                             transposed body",
+                        ))
+                        .into());
+                    };
+                    input_order.push(position);
+                }
+                input_order.extend(output_cotangent_positions[carry_count..].iter().flatten().copied());
+
+                // A scanned input is either linear (with a cotangent reference slot exactly when it is a live
+                // reference) or known, so at most one of the two positions is present for it.
+                for index in carry_count..input_linear.len() {
+                    input_order.extend(reference_input_positions[index].or(known_input_positions[index]));
+                }
+                let selected_inputs = input_order
+                    .iter()
+                    .map(|&index| {
+                        program.input_ids().get(index).copied().ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "`{SCAN_OPERATION_NAME}` transposition boundary references missing input position \
+                                 {index}",
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // The transposed body returns its cotangents in body order: the linear carries lead the live scanned
+                // inputs, and a dead reference carry returns none. A known carry passes its threaded input through
+                // instead. Output metadata identifies the live scanned-input cotangents, of which only the
+                // `Return`-kind ones are stacked: a live reference stack returns its per-iteration cotangent view by
+                // identity, which the reversed scan cannot stack.
+                let mut outputs = program.output_ids().iter().copied();
+                let mut restored_outputs = Vec::with_capacity(program.output_count() + retained_carries.len());
+                for (position, &index) in retained_carries.iter().enumerate() {
+                    restored_outputs.push(if input_linear[index] {
+                        outputs.next().unwrap()
+                    } else {
+                        selected_inputs[position + 1]
+                    });
+                }
+                for index in carry_count..input_linear.len() {
+                    if input_cotangent_slots[index] == TransposedProgramCotangent::Output {
+                        let output = outputs.next().unwrap();
+                        if destination_kinds[index] == CotangentDestinationKind::Return {
+                            restored_outputs.push(output);
+                        }
+                    }
+                }
+                program
+                    .into_filtered(&selected_inputs, &restored_outputs, &selected_inputs)
+                    .map(|(program, _)| program)?
+            };
+            let reversed_body = Arc::new(reversed_body);
+            let (scan_inputs, runtime_length_inputs) = inputs.split_at(input_linear.len());
+
+            // A dead carry still needs an initial cotangent value for the recurrence. Gather live output cotangents,
+            // known inputs, and cotangent references as sources of the runtime identities needed to materialize that
+            // zero.
+            let dimension_sources = || {
+                outputs
+                    .iter()
+                    .filter_map(MaybeZero::as_value)
+                    .chain(inputs.iter().filter_map(PartialValue::as_known))
+                    .chain(cotangents.references())
+            };
+
+            // Every non-linear input is known by the classification above. Consume cotangent references in input order,
+            // carrying live reference state unchanged through the reversed iterations and omitting ignored references.
+            let mut cotangent_references = cotangents.references().iter();
+            let mut reversed_inputs = Vec::with_capacity(outputs.len() + inputs.len());
+            for (index, input) in scan_inputs[..carry_count].iter().enumerate() {
+                match cotangents.kind(index) {
+                    CotangentDestinationKind::Reference => {
+                        reversed_inputs.push(cotangent_references.next().unwrap().clone())
+                    }
+                    CotangentDestinationKind::Ignore => {}
+                    CotangentDestinationKind::Return if input_linear[index] => {
+                        reversed_inputs.push(O::materialize_zero_from_residual_sources(
+                            &**context,
+                            outputs[index].clone(),
+                            dimension_sources(),
+                        )?);
+                    }
+                    CotangentDestinationKind::Return => reversed_inputs.push(input.as_known().unwrap().clone()),
+                }
+            }
+
+            // Live stacked output cotangents enter as slices. Their types are those of the scan's output stacks; zero
+            // seeds and zero-space cotangents have no reversed-scan input.
+            for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
+                if let MaybeZero::Value(cotangent) = cotangent
+                    && !output_type.is_reference()
+                    && !output_type.cotangent()?.is_zero_space()
+                {
+                    reversed_inputs.push(cotangent.clone());
+                }
+            }
+
+            // Known residual stacks and live reference cotangent roots follow the output seeds. The reversed body uses
+            // its own index to select reference views. Known reference roots may support deferred backward writes, but
+            // body transposition rejects primal reads that would observe backward-time state instead of the forward
+            // value.
+            for (index, input) in scan_inputs.iter().enumerate().skip(carry_count) {
+                match cotangents.kind(index) {
+                    CotangentDestinationKind::Reference => {
+                        reversed_inputs.push(cotangent_references.next().unwrap().clone())
+                    }
+                    CotangentDestinationKind::Return if !input_linear[index] => {
+                        reversed_inputs.push(input.as_known().unwrap().clone())
+                    }
+                    CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {}
+                }
+            }
+
+            // The trailing runtime length is structural, never linear, and stays last in the instruction boundary.
+            for (index, input) in runtime_length_inputs.iter().enumerate() {
+                reversed_inputs.push(input.as_known().cloned().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "`{SCAN_OPERATION_NAME}` transposition runtime length input {index} is not known"
+                    ))
+                })?);
+            }
+            let retained_carry_count =
+                (0..carry_count).filter(|&index| cotangents.kind(index) != CotangentDestinationKind::Ignore).count();
+
+            // Reverse visit order while preserving length and the lowering-only unroll factor. Residual stack slice i
+            // then meets the cotangent for the same forward iteration without reversing any arrays.
+            let reversed = ScanOperation { carry_count: retained_carry_count, reverse: !self.reverse, ..self.clone() };
+            let scan_cotangents = context.stage_operation(
+                O::from(reversed),
+                CalleeRegionDriver::new(std::slice::from_ref(&reversed_body)),
+                reversed_inputs.as_slice(),
+            )?;
+
+            // The reversed scan outputs one carry cotangent per retained carry and one stacked cotangent per live
+            // non-reference scanned input (a reference stack's cotangent lives in its cotangent reference). Structural
+            // zeros have no per-iteration output, so the scan neither allocates nor returns their stacks.
+            let stacked_count = (carry_count..scan_input_count)
+                .filter(|&index| {
+                    input_cotangent_slots[index] == TransposedProgramCotangent::Output
+                        && cotangents.kind(index) == CotangentDestinationKind::Return
+                })
+                .count();
+            check_count!("output", scan_cotangents, retained_carry_count + stacked_count, ProgramError);
+
+            // Drain reversed outputs in the original input order. Promoted known initializers discard their carry
+            // cotangents, and live reference carries discard their identity outputs because their buffers accumulated
+            // in place. Disconnected stacks, known inputs, ignored references, and the runtime length receive
+            // structural zeros.
+            let mut scan_cotangents = scan_cotangents.into_iter();
+            inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let returned = if index < carry_count {
+                        match cotangents.kind(index) {
+                            CotangentDestinationKind::Return => scan_cotangents.next().filter(|_| input.is_unknown()),
+                            CotangentDestinationKind::Reference => scan_cotangents.next().and(None),
+                            CotangentDestinationKind::Ignore => None,
+                        }
+                    } else if index < input_linear.len()
+                        && input_linear[index]
+                        && cotangents.kind(index) == CotangentDestinationKind::Return
+                        && input_cotangent_slots[index] == TransposedProgramCotangent::Output
+                    {
+                        scan_cotangents.next()
+                    } else {
+                        None
+                    };
+                    Ok(match returned {
+                        Some(cotangent) => MaybeZero::Value(cotangent),
+                        None => MaybeZero::Zero(input.r#type().cotangent()?),
+                    })
+                })
+                .collect::<Result<Vec<_>, DifferentiationError>>()?
+        };
         for (accumulator, contribution) in accumulators.iter().zip(contributions) {
             accumulator.accumulate(context, contribution)?;
         }
@@ -1432,7 +1862,14 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
         carry_count: usize,
         length: &Dimension,
     ) -> Result<(), TypeError> {
-        validate_scan_length(length)?;
+        // Validate the declared trip count before inspecting or specializing the body signature.
+        if let Some(length) = length.value()
+            && length > MAX_DIMENSION_EXTENT
+        {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` length {length} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
+            )));
+        }
         if length.variable().is_some() {
             Self::runtime_length_type(length)?;
         }
@@ -1483,11 +1920,36 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
             length,
             &ShardingDimension::Replicated,
         )?;
-        check_count!("input", input_types, expected_input_types.len() + runtime_length_count(length), TypeError);
+        check_count!(
+            "input",
+            input_types,
+            expected_input_types.len() + usize::from(length.variable().is_some()),
+            TypeError
+        );
         for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
             match (body_input_types[index].scan_member(), actual.scan_member()) {
                 (ScanMember::Array(declared), ScanMember::Array(actual)) if index >= carry_count => {
-                    validate_stacked_scan_input(index, declared, actual, length)?;
+                    // Validate the slice the body receives, including its placement and manual variation, rather than
+                    // comparing whole-stack metadata with the declared boundary type.
+                    if actual.rank() == 0 {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have rank at least 1 but has type \
+                             `{actual}`",
+                        )));
+                    }
+                    let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
+                    if !length.is_refined_by(&leading_dimension) {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` \
+                             but has type `{actual}`",
+                        )));
+                    }
+                    if !declared.is_refined_by(&slice_type) {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` stacked input {index} has type `{actual}`, whose slice type \
+                             `{slice_type}` does not refine its body input type `{declared}`",
+                        )));
+                    }
                 }
                 _ => validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?,
             }
@@ -1515,7 +1977,7 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
         let stacked_input_end = body_input_count
             .checked_sub(1)
             .ok_or_else(|| TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body must have a slice index input")))?;
-        check_count!("input", input_types, stacked_input_end + runtime_length_count(length), TypeError);
+        check_count!("input", input_types, stacked_input_end + usize::from(length.variable().is_some()), TypeError);
         if carry_count > stacked_input_end {
             return Err(TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body input count {stacked_input_end}",
@@ -1676,11 +2138,22 @@ impl ScanType for ArrayType {
     }
 
     fn validate_scan_body_members(body_input_types: &[Self], body_output_types: &[Self]) -> Result<(), TypeError> {
-        for (index, input_type) in body_input_types.iter().enumerate() {
-            validate_static_scan_type("input", index + 1, input_type)?;
-        }
-        for (index, output_type) in body_output_types.iter().enumerate() {
-            validate_static_scan_type("output", index, output_type)?;
+        // Homogeneous bodies cannot carry dynamic array shapes. Report body positions, including the index input.
+        for (role, index, r#type) in body_input_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| ("input", index + 1, r#type))
+            .chain(body_output_types.iter().enumerate().map(|(index, r#type)| ("output", index, r#type)))
+        {
+            for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
+                if dimension.value().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` body {role} {index} must have a fully static type but axis {axis} of \
+                         `{type}` has size `{dimension}`",
+                        r#type = r#type,
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1739,117 +2212,6 @@ fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, 
     })
 }
 
-/// Validates that every dimension of `r#type` is static, reporting a precise error that names the scan `role` (for
-/// example, `input 1` or `output 0`) when one is not. Homogeneous scans require static body array types, and composite
-/// scans require static reference stacks so their per-iteration access paths have statically known root shapes.
-/// Composite array slices may instead retain dynamic dimensions.
-fn validate_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Result<(), TypeError> {
-    for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
-        if dimension.value().is_none() {
-            return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` body {role} {index} must have a fully static type but axis {axis} of `{type}` \
-                 has size `{dimension}`",
-                r#type = r#type,
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Returns the number of trailing runtime length inputs of a scan whose trip count is `length`: one first-class
-/// dimension input that supplies the trip count when `length` is dynamic, and none otherwise.
-#[inline]
-fn runtime_length_count(length: &Dimension) -> usize {
-    usize::from(length.variable().is_some())
-}
-
-/// Checks that a static scan length fits the scalar `i64` loop counter. Dynamic lengths receive the same bound when
-/// their runtime [`DimensionValue`](crate::arrays::DimensionValue) is created, so symbolic bounds need no additional
-/// restriction here.
-fn validate_scan_length(length: &Dimension) -> Result<(), TypeError> {
-    if let Some(length) = length.value()
-        && length > MAX_DIMENSION_EXTENT
-    {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` length {length} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
-        )));
-    }
-    Ok(())
-}
-
-/// Returns the stacked variant of a scan body slice type, prepending `length` to its shape. The stacked type preserves
-/// the slice's memory placement and sharding, with the stacked dimension replicated (i.e., it is the inverse of slicing
-/// a stacked input with [`ArrayType::without_dimension`]), but carries no layout. This is the type of the stacks that
-/// scans produce (e.g., their stacked outputs and the residual stacks of their derivatives).
-pub(crate) fn stacked_scan_type<L: Into<Dimension>>(slice_type: &ArrayType, length: L) -> ArrayType {
-    // Inserting a replicated dimension into a valid sharding cannot fail.
-    slice_type.with_inserted_dimension(0, length.into()).unwrap()
-}
-
-/// Returns the type of a stacked scan output whose slices have type `slice_type` and whose leading scan axis is placed
-/// as `stacked_axis_sharding` declares (refer to [`ScanOperation::with_stacked_axis_sharding`]). A replicated placement
-/// yields the [`stacked_scan_type`]; any other placement is applied through [`ArrayType::batched`], which records the
-/// variation that a placement over manual mesh axes introduces and rejects mesh axes that the slice's sharding does not
-/// know. A slice without a sharding stacks without placement.
-fn stacked_scan_output_type(
-    slice_type: &ArrayType,
-    length: &Dimension,
-    stacked_axis_sharding: &ShardingDimension,
-) -> Result<ArrayType, TypeError> {
-    if *stacked_axis_sharding == ShardingDimension::Replicated {
-        return Ok(stacked_scan_type(slice_type, length.clone()));
-    }
-    slice_type.batched(0, length.clone(), stacked_axis_sharding.clone()).map_err(|error| {
-        TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type `{slice_type}` on \
-             `{stacked_axis_sharding}` ({error})",
-        ))
-    })
-}
-
-/// Returns the declared type of a stacked scan input whose slices have type `slice_type`, which is the
-/// [`stacked_scan_type`] of `slice_type` without its optional sharding metadata. Scan input validation compares the
-/// slices of the actual stacks with `slice_type` instead (refer to [`validate_stacked_scan_input`]), because the
-/// sharding of a stack admits slices whose sharding differs from that of the stack (e.g., a scan axis sharded over an
-/// `Auto` mesh axis), so this type relates the identities of a stack (e.g., in an entry guard) but not its metadata.
-fn declared_stacked_scan_input_type(slice_type: &ArrayType, length: &Dimension) -> ArrayType {
-    let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-    dimensions.push(length.clone());
-    dimensions.extend(slice_type.shape().dimensions().iter().cloned());
-    ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory())
-}
-
-/// Validates the stacked array input at operation input position `index`, of type `actual`, against the slice type
-/// `declared` that the body declares for it: the stack must have a leading scan axis of extent `length`, and its slice
-/// (refer to [`scan_slice_type`]), which is what each iteration of the body receives, must refine `declared`, including
-/// its sharding and manual variation.
-fn validate_stacked_scan_input(
-    index: usize,
-    declared: &ArrayType,
-    actual: &ArrayType,
-    length: &Dimension,
-) -> Result<(), TypeError> {
-    if actual.rank() == 0 {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` stacked input {index} must have rank at least 1 but has type `{actual}`",
-        )));
-    }
-    let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
-    if !length.is_refined_by(&leading_dimension) {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` but has type \
-             `{actual}`",
-        )));
-    }
-    if !declared.is_refined_by(&slice_type) {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` stacked input {index} has type `{actual}`, whose slice type `{slice_type}` does \
-             not refine its body input type `{declared}`",
-        )));
-    }
-    Ok(())
-}
-
 /// Side of a scan's body signature used to derive its operation boundary. Reference stacks are admitted only
 /// as inputs; a body cannot return a reference to be stacked.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -1869,7 +2231,7 @@ impl Display for ScanBoundarySide {
 
 /// Derives operation types from a body's carry and trailing types, excluding its intrinsic index input. Carries are
 /// unchanged and trailing arrays gain a leading scan axis, which `stacked_axis_sharding` places on the output side
-/// (refer to [`stacked_scan_output_type`]); the input side ignores it, because stacked inputs carry their own
+/// through [`ArrayType::batched`]; the input side ignores it, because stacked inputs carry their own
 /// placement. A trailing input reference already names the whole stack and keeps its type; a trailing reference output
 /// and a trailing first-class dimension are rejected.
 fn scan_boundary_types<T: ScanType>(
@@ -1890,13 +2252,40 @@ fn scan_boundary_types<T: ScanType>(
         let index = carry_count + index;
         boundary_types.push(match (r#type.scan_member(), side) {
             (ScanMember::Array(slice_type), ScanBoundarySide::Input) => {
-                T::from(declared_stacked_scan_input_type(slice_type, length))
+                // Entry guards relate stack identities, but its own slice determines the admitted sharding.
+                let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
+                dimensions.push(length.clone());
+                dimensions.extend(slice_type.shape().dimensions().iter().cloned());
+                T::from(ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory()))
             }
             (ScanMember::Array(slice_type), ScanBoundarySide::Output) => {
-                T::from(stacked_scan_output_type(slice_type, length, stacked_axis_sharding)?)
+                // Replicated insertion preserves the slice's placement without adding variation. Other placements use
+                // `batched`, which records manual-axis variation and rejects axes absent from the slice's mesh.
+                let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
+                    // Inserting a replicated dimension into a valid sharding cannot fail.
+                    slice_type.with_inserted_dimension(0, length.clone()).unwrap()
+                } else {
+                    slice_type.batched(0, length.clone(), stacked_axis_sharding.clone()).map_err(|error| {
+                        TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
+                             `{slice_type}` on `{stacked_axis_sharding}` ({error})",
+                        ))
+                    })?
+                };
+                T::from(stacked_type)
             }
             (ScanMember::Reference(referent), ScanBoundarySide::Input) => {
-                validate_static_scan_type("input", index + 1, referent)?;
+                // Reference access paths require a static root shape even in the composite family.
+                for (axis, dimension) in referent.shape().dimensions().iter().enumerate() {
+                    if dimension.value().is_none() {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` body input {} must have a fully static type but axis {axis} of \
+                             `{type}` has size `{dimension}`",
+                            index + 1,
+                            r#type = referent,
+                        )));
+                    }
+                }
                 if referent.rank() == 0 || !length.is_refined_by(&referent.dimension(0)) {
                     return Err(TypeError::invalid(format!(
                         "`{SCAN_OPERATION_NAME}` reference input {index} must have leading dimension `{length}`",
@@ -2052,71 +2441,6 @@ fn scan_entry_guard<T: ScanType>(
     Ok(Some((guard.retaining(&member_types, &[])?, members)))
 }
 
-/// Validates that the `slice` that an iteration of a scan returns for its output `index` has the manual variation of
-/// the output `stack`, which is allocated from the first slice. Type families whose values cannot relabel their manual
-/// variation use it to reject a slice that they cannot write into the stack (refer to
-/// [`ScanIterationType::write_iteration`]).
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] when the manual variation of `slice` differs from that of `stack`.
-fn validate_scan_slice_variation<V: Value<Type: ScanType>>(
-    index: usize,
-    stack: &V,
-    slice: &V,
-) -> Result<(), TypeError> {
-    let variation = |value: &V| match value.r#type().scan_member() {
-        ScanMember::Array(r#type) => {
-            r#type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default()
-        }
-        _ => BTreeSet::new(),
-    };
-    let (stacked, returned) = (variation(stack), variation(slice));
-    if stacked != returned {
-        let render = |axes: &BTreeSet<String>| {
-            if axes.is_empty() {
-                "no manual axes".to_owned()
-            } else {
-                format!("`{}`", axes.iter().cloned().collect::<Vec<_>>().join("`, `"))
-            }
-        };
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` body returns a slice of output {index} that varies over {} after earlier slices \
-             that vary over {}; every slice of a stacked output must have the same manual variation",
-            render(&returned),
-            render(&stacked),
-        )));
-    }
-    Ok(())
-}
-
-/// Returns the `stack` of a scan output and the `slice` that an iteration writes into it, widened to the join of their
-/// manual variation: each is varied over every manual axis that only the other one varies over, after attaching a
-/// replicated placement on the mesh of that axis when it carries no sharding. As for `parallel_vary` on a device that
-/// already holds its value, only the types change, so the elements are unchanged (refer to
-/// [`ScanIterationType::write_iteration`]).
-///
-/// # Errors
-///
-/// Returns an error when varying `stack` or `slice` over a missing axis is invalid for its type (e.g., when it carries
-/// a sharding on another mesh or reduction state along that axis).
-fn join_scan_slice_variation(stack: Array, slice: Array) -> Result<(Array, Array), ProgramError> {
-    let types = [stack.r#type().into_owned(), slice.r#type().into_owned()];
-    let axes = manual_variation_axes(&types);
-    let mut joined = vary_over_missing_manual_axes(vec![stack, slice], &types, &axes, |value, axis, mesh| {
-        let mut input_type = value.r#type().into_owned();
-        if input_type.sharding().is_none() {
-            let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
-            input_type = input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-        }
-        let output_type =
-            ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
-        Array::from_logical_bytes(output_type, &value.logical_bytes())
-    })?;
-    let slice = joined.pop().unwrap();
-    Ok((joined.pop().unwrap(), slice))
-}
-
 /// Replaces the output of every non-reference carry that `body` passes through unchanged with that carry's input. Such
 /// a carry ends with its initial value regardless of the trip count, so forwarding the input lets later work depend on
 /// it instead of on the scan, keeps a known initial value known under partial evaluation, and preserves a symbolic-zero
@@ -2184,91 +2508,6 @@ where
     accumulator.update_slice(&expanded, start_indices.as_slice())
 }
 
-/// Splits `scan` into a *known scan* bound in the enclosing known-side context and an *unknown scan* emitted into the
-/// residual program, using a fixed point over carry knownness that preserves time-varying known computations. Returns
-/// `None` when the scan must stay whole instead.
-///
-/// A carry stays known iff the body computes its next value from known values alone (its init must be known); known
-/// stacked inputs are known throughout. Knownness needs no constant resolution, so symbolic known inits (tracers into a
-/// live outer trace) participate fully. Each fixed-point round splits the body through a **fresh** staging context
-/// whose inputs stand in for the known body inputs, so no split work can leak into the caller's context.
-///
-/// From the converged split, the *known scan*'s body maps the known carries and known stacked slices to the known
-/// next-carries, the known per-iteration outputs, and the **residual edges** — every known per-iteration value the
-/// unknown side consumes — which the known scan *stacks* over the scan length as extra scanned outputs. The known scan
-/// is bound whole into the enclosing known-side context over the original known inputs (interpreting it under an eager
-/// context and staging it into the outer program under a staging one). The *unknown scan*'s body consumes the unknown
-/// carries, the unknown stacked slices, and one slice of each stacked edge per iteration; a known body next-carry
-/// belonging to an *unknown* carry (one whose value the unknown side threads) is instantiated as one more residual edge
-/// that the unknown body passes through. A known scan with no carries or instructions that only returns its input
-/// slices at a static length is replaced by the corresponding stacked inputs. An effectful unknown body still produces
-/// a zero-output residual scan when every boundary result belongs to the known side. The scan stays whole when the
-/// known and the residual work must stay ordered or when the known side has no outputs, residual edges, or effects
-/// (refer to `reconstruct_partitioned_scan`).
-///
-/// # Parameters
-///
-///   - `context`: Partial-evaluation context that binds known work and records the residual scan.
-///   - `driver`: Partitions the body under each carry-knownness mask.
-///   - `scan`: Source scan, whose length, traversal order, and lowering attributes are preserved.
-///   - `body`: Validated iteration body, including its intrinsic index input.
-///   - `inputs`: Source operation inputs, followed by its runtime length when the length is dynamic, guarded so that
-///     their types prove every relationship of the scan boundary (refer to
-///     [`PartialEvaluationContext::guard_inputs`]).
-fn split_scan_by_knownness<C: Context, D: PartialEvaluationDriver<C>>(
-    context: &PartialEvaluationContext<C>,
-    driver: &D,
-    scan: &ScanOperation<C::Type>,
-    body: RegionRef<'_, C::Constant, C::Operation>,
-    inputs: &[PartialEvaluationValue<C::Value>],
-) -> Result<Option<Vec<PartialEvaluationValue<C::Value>>>, ProgramError>
-where
-    C::Type: ScanType + TemporalResidualType,
-    C::Operation: From<ScanOperation<C::Type>> + TemporalResidualOperation<C::Type>,
-{
-    let carry_count = scan.carry_count;
-    let body_input_types = body.input_types();
-    let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len() - 1);
-    let mut body_known = std::iter::once(true)
-        .chain(body_inputs.iter().map(PartialEvaluationValue::is_known))
-        .collect::<Vec<bool>>();
-
-    // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging context.
-    // Unlike the body's derived forward-mode and transposed programs, a partition is not retained by the body region's
-    // transform cache: it depends on the configuration of the partial-evaluation context (e.g., effect folding and
-    // residual placement), so the body and the known-ness mask alone do not determine it.
-    let partition = loop {
-        let partition = driver.partition_program(context, body, &body_known)?;
-        let mut changed = false;
-        for (index, known) in body_known[1..1 + carry_count].iter_mut().enumerate() {
-            let stays_known = matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_)));
-            changed |= *known && !stays_known;
-            *known &= stays_known;
-        }
-        if !changed {
-            break partition;
-        }
-    };
-
-    // The partition records the effect constraints of its construction contract. Ordinary specialization keeps
-    // global ordering; separately invoked residual work can exchange only independent reference resources.
-    if partition.has_effect_ordering_conflicts() {
-        return Ok(None);
-    }
-    reconstruct_partitioned_scan(
-        scan,
-        &body_input_types,
-        inputs,
-        &body_known,
-        runtime_length_inputs.iter().all(PartialEvaluationValue::is_known),
-        partition,
-        |constant| Ok(context.known_value(context.parent().lift(constant)?)),
-        |value| value.as_known().and_then(|value| context.parent().resolve(value).into_constant()),
-        |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs),
-        |operation, programs, inputs| context.residualize(operation, programs, inputs),
-    )
-}
-
 /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body passes
 /// through unchanged.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -2276,7 +2515,7 @@ enum ScanInvariantSource {
     /// Initial value of the known carry at this index, which the body passes through unchanged.
     Carry(usize),
 
-    /// Value of this feeder atom of the known program, which [`hoist_scan_invariants`] computes once before the scan.
+    /// Value of this feeder atom of the known program, computed once before the scan.
     /// Feeders are keyed by atom rather than by residual edge, because a partition can expose the same value through
     /// several edges, and the unknown scan must thread it once.
     Hoisted(AtomId),
@@ -2303,82 +2542,6 @@ enum ScanResidual<T: Type> {
     /// A logical value, optionally supplied by a stack. An omitted stack means an original unknown input already
     /// carries the value. Even a stacked value may later be recovered from an invariant input instead.
     Value { r#type: T, stack: Option<ScanStackSource> },
-}
-
-/// Computes the loop-invariant `feeders` of a partitioned scan once, before the scan, by replaying their dependencies
-/// in the known-side context, and returns the computed values keyed by atom. The caller has established that every
-/// feeder depends only on constants, passed-through carries, and pure region-free instructions.
-///
-/// # Parameters
-///
-///   - `known_program`: Known side of the partitioned body.
-///   - `passed_through_carries`: Body input atoms of passed-through known carries, in carry order; their initial
-///     values come from the corresponding entries of `body_inputs`.
-///   - `body_inputs`: Scan inputs, `[carry..., stacked_x...]`, in the known-side representation for known inputs.
-///   - `feeders`: Atoms of `known_program` to compute.
-///   - `lift_known`: Lifts a constant of `known_program` into the known-side representation.
-///   - `bind_known`: Binds one operation in the known-side context.
-fn hoist_scan_invariants<V, O, Input, LiftKnown, KnownBind>(
-    known_program: &Program<V, O, Vec<V>, Vec<V>>,
-    passed_through_carries: &[Option<AtomId>],
-    body_inputs: &[Input],
-    feeders: impl Iterator<Item = AtomId>,
-    lift_known: &mut LiftKnown,
-    bind_known: &mut KnownBind,
-) -> Result<HashMap<AtomId, Input>, ProgramError>
-where
-    V: Value,
-    O: Operation<Type = V::Type>,
-    Input: Clone,
-    LiftKnown: FnMut(V) -> Result<Input, ProgramError>,
-    KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
-{
-    let region = known_program.entry_region_ref();
-    let mut values = passed_through_carries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, atom)| atom.map(|atom| (atom, body_inputs[index].clone())))
-        .collect::<HashMap<_, _>>();
-
-    // Unlike filtering a program, this dependency query does not retain unrelated effects from the iteration body.
-    let live = known_program.live_sets_for_atoms(&feeders.collect::<Vec<_>>())?;
-    for (atom, needed) in live.atoms().iter().enumerate() {
-        if let (true, Some(constant)) = (*needed, region.atoms()[atom].as_constant()) {
-            values.insert(AtomId::new(atom), lift_known(constant.clone())?);
-        }
-    }
-    for (instruction, _) in region.instructions().iter().zip(live.instructions()).filter(|(_, replayed)| **replayed) {
-        let inputs = instruction.inputs().iter().map(|input| values[input].clone()).collect::<Vec<_>>();
-        let outputs = bind_known(instruction.operation().clone(), Vec::new(), &inputs)?;
-        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-        values.extend(instruction.outputs().iter().copied().zip(outputs));
-    }
-    Ok(values)
-}
-
-/// How the rebuilt scans of a partitioned scan supply its original outputs and the residuals of its body partition
-/// (refer to `classify_scan_residuals`).
-struct ScanResidualPlan<T: Type> {
-    /// How the unknown iteration body obtains each residual edge, in edge order, followed by one residual per
-    /// instantiated known next value of an unknown carry.
-    residuals: Vec<ScanResidual<T>>,
-
-    /// Sources of the invariant carries of the unknown scan, without repetitions.
-    invariant_sources: Vec<ScanInvariantSource>,
-
-    /// Output of the known program behind each output of the known scan: its known results (the known next carries,
-    /// then the known per-iteration outputs), followed by the residuals that it stacks.
-    known_program_output_indices: Vec<usize>,
-
-    /// Number of known results among the `known_program_output_indices`.
-    known_result_count: usize,
-
-    /// Position of each original output among the outputs of the known scan or, for the outputs that the unknown side
-    /// owns, still the partition's own output descriptor (refer to `unknown_scan_body`).
-    scan_outputs: Vec<PartialEvaluationOutput<usize>>,
-
-    /// Position among the `residuals` of the instantiated known next value of each unknown carry.
-    instantiated_edge_positions: Vec<Option<usize>>,
 }
 
 /// Rebuilds two scans from a partitioned iteration body, storing each varying residual once per iteration. Returns
@@ -2467,188 +2630,8 @@ where
         })
         .collect::<BTreeSet<_>>();
 
-    let (invariant_atoms, passed_through_carries) =
-        scan_invariant_atoms(&known_program, &known_input_indices, &partition_outputs, carry_known);
-    let plan = classify_scan_residuals(
-        scan,
-        body_input_types,
-        body_known,
-        &known_program,
-        &known_input_indices,
-        &partition_outputs,
-        &residual_edges,
-        &passed_through_carries,
-        &invariant_atoms,
-        &mut live_edges,
-    )?;
-
-    // An empty known side means the split folds nothing, and the scan stays whole. A known side that only forwards
-    // stacked inputs or known carries that the body passes through, or that only hoists invariant feeders, still
-    // splits, but it needs no known scan. A known carry that the body passes through unchanged ends with its initial
-    // value, so the known scan is needed only for its other outputs or for its effects.
-    let passed_through_carry_count = passed_through_carries.iter().flatten().count();
-    let needs_known_scan = plan.known_program_output_indices.len() > passed_through_carry_count
-        || !known_program.effects().classes().is_empty()
-        || known_program.effects().has_deferred_work();
-    if needs_known_scan && !runtime_length_known {
-        return Ok(None);
-    }
-    let hoists_edges = plan.invariant_sources.iter().any(|source| matches!(source, ScanInvariantSource::Hoisted(_)));
-    let forwards_stacked_inputs = plan
-        .residuals
-        .iter()
-        .any(|residual| matches!(residual, ScanResidual::Value { stack: Some(ScanStackSource::Input(_)), .. }));
-    if !needs_known_scan && !hoists_edges && passed_through_carry_count == 0 && !forwards_stacked_inputs {
-        return Ok(None);
-    }
-
-    // Bind the known scan into the enclosing known-side context over the original known inputs.
-    let known_carry_count = carry_known.iter().filter(|&&known| known).count();
-    let mut known_scan_inputs = known_input_indices
-        .iter()
-        .filter(|&&index| index != 0)
-        .map(|&index| body_inputs[index - 1].clone())
-        .collect::<Vec<_>>();
-    known_scan_inputs.extend_from_slice(runtime_length_inputs);
-    let known_body = known_scan_body(&known_program, &plan)?;
-    let known_scan = ScanOperation { carry_count: known_carry_count, ..scan.clone() };
-    // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original stacked
-    // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep
-    // runtime-length scans explicit because their outputs may refine the stacked inputs' symbolic extent types.
-    let forwarded_outputs = (matches!(scan.length(), Dimension::Static(_))
-        && known_carry_count == 0
-        && known_body.instructions().is_empty())
-    .then(|| {
-        known_body
-            .output_ids()
-            .iter()
-            .map(|output| {
-                known_body
-                    .input_ids()
-                    .iter()
-                    .position(|input| input == output)
-                    .and_then(|index| index.checked_sub(1))
-                    .map(|index| known_scan_inputs[index].clone())
-            })
-            .collect::<Option<Vec<_>>>()
-    })
-    .flatten();
-    let known_outputs = match forwarded_outputs {
-        Some(outputs) => outputs,
-        None if !needs_known_scan => Vec::new(),
-        None => bind_known(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
-    };
-
-    // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge per
-    // residual edge, each fed by the known scan's matching stacked output or by a forwarded known stacked input.
-    let mut scan_outputs = plan.scan_outputs.clone();
-    let mut residual_outputs = Vec::new();
-    let needs_unknown_scan =
-        partition_outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
-            || carry_known.iter().any(|&known| !known)
-            || !residual_program.effects().classes().is_empty()
-            || residual_program.effects().has_deferred_work();
-    if needs_unknown_scan {
-        // Loop-invariant values are computed once before the scan. A value that resolves to an identity-free constant
-        // of the known-side context is embedded into the unknown body, so that partial evaluation against known values
-        // specializes that body. Every other value is threaded through the unknown scan as a carry that its body passes
-        // through unchanged.
-        let mut hoisted_values = hoist_scan_invariants(
-            &known_program,
-            &passed_through_carries,
-            body_inputs,
-            plan.invariant_sources.iter().filter_map(|source| match source {
-                ScanInvariantSource::Carry(_) => None,
-                ScanInvariantSource::Hoisted(feeder) => Some(*feeder),
-            }),
-            &mut lift_known,
-            &mut bind_known,
-        )?;
-        let invariant_values = plan
-            .invariant_sources
-            .iter()
-            .map(|source| match source {
-                ScanInvariantSource::Carry(index) => body_inputs[*index].clone(),
-                ScanInvariantSource::Hoisted(feeder) => hoisted_values.remove(feeder).unwrap(),
-            })
-            .collect::<Vec<_>>();
-        let invariant_constants = plan
-            .invariant_sources
-            .iter()
-            .zip(&invariant_values)
-            .map(|(_, value)| {
-                resolve_constant(value).filter(|constant| {
-                    let constant_type = constant.r#type();
-                    !constant_type.is_reference() && constant_type.identities().next().is_none()
-                })
-            })
-            .collect::<Vec<_>>();
-        let (unknown_body, unknown_carry_count) = unknown_scan_body(
-            body_input_types,
-            body_known,
-            &known_program,
-            &residual_program,
-            &residual_inputs,
-            &live_residual_inputs,
-            &live_edges,
-            &partition_outputs,
-            &plan,
-            &invariant_constants,
-            &mut scan_outputs,
-        )?;
-        let unknown_scan = ScanOperation { carry_count: unknown_carry_count, ..scan.clone() };
-        let mut unknown_scan_inputs = invariant_values
-            .into_iter()
-            .zip(&invariant_constants)
-            .filter_map(|(value, constant)| constant.is_none().then_some(value))
-            .collect::<Vec<_>>();
-        unknown_scan_inputs.extend(
-            body_inputs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !body_known[index + 1])
-                .map(|(_, input)| input.clone()),
-        );
-        for residual in &plan.residuals {
-            match residual {
-                ScanResidual::Value { stack: Some(ScanStackSource::Input(input)), .. } => {
-                    unknown_scan_inputs.push(body_inputs[*input].clone());
-                }
-                ScanResidual::Value { stack: Some(ScanStackSource::KnownOutput(position)), .. } => {
-                    unknown_scan_inputs.push(known_outputs[*position].clone());
-                }
-                _ => {}
-            }
-        }
-        unknown_scan_inputs.extend_from_slice(runtime_length_inputs);
-        residual_outputs = bind_residual(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
-    }
-
-    // Reassemble the original scan's outputs from the two sides.
-    Ok(Some(
-        scan_outputs
-            .iter()
-            .enumerate()
-            .map(|(index, output)| match output {
-                _ if index < carry_count && passed_through_carries[index].is_some() => body_inputs[index].clone(),
-                PartialEvaluationOutput::Known(position) => known_outputs[*position].clone(),
-                PartialEvaluationOutput::Unknown(position) => residual_outputs[*position].clone(),
-            })
-            .collect(),
-    ))
-}
-
-/// Returns which atoms of the `known_program` of a partitioned scan body hold the same value on every iteration
-/// (constants, the inputs of the known carries that the body passes through unchanged, and the outputs of pure,
-/// region-free instructions over such atoms), and the body input atom of each known carry that the body passes through
-/// unchanged, in carry order. A feeder among those atoms is computed once before the scan and threaded through the
-/// unknown scan as an invariant carry instead of being stacked per iteration.
-fn scan_invariant_atoms<V: Value, O: Operation<Type = V::Type>>(
-    known_program: &Program<V, O, Vec<V>, Vec<V>>,
-    known_input_indices: &[usize],
-    partition_outputs: &[PartialEvaluationOutput<usize>],
-    carry_known: &[bool],
-) -> (Vec<bool>, Vec<Option<AtomId>>) {
+    // Constants, passed-through known carries, and pure region-free work over them are invariant across iterations.
+    // Identify those atoms before assigning storage so they need not become per-iteration residual stacks.
     let known_region = known_program.entry_region_ref();
     let mut invariant_atoms = known_region.atoms().iter().map(|atom| atom.as_constant().is_some()).collect::<Vec<_>>();
     let mut passed_through_carries = vec![None; carry_known.len()];
@@ -2679,39 +2662,13 @@ fn scan_invariant_atoms<V: Value, O: Operation<Type = V::Type>>(
             }
         }
     }
-    (invariant_atoms, passed_through_carries)
-}
 
-/// Classifies the residual edges of a partitioned scan body by how the rebuilt scans supply them (refer to
-/// [`ScanResidualPlan`]): the intrinsic index is regenerated by each scan, a feeder that is the input of a known carry
-/// that the body passes through (refer to `scan_invariant_atoms`) is threaded as that carry's initial value, any other
-/// loop-invariant feeder is hoisted when the declared length guarantees an iteration (a computed feeder may fail even
-/// when its inputs are invariant), a known stacked input is forwarded, a value whose identity an unknown body input
-/// already carries is recovered from that input, and every remaining value is stacked by the known scan. The known next
-/// value of each unknown carry becomes one more stacked residual that the unknown body returns as that carry's output.
-#[allow(clippy::too_many_arguments)]
-fn classify_scan_residuals<V, O>(
-    scan: &ScanOperation<V::Type>,
-    body_input_types: &[V::Type],
-    body_known: &[bool],
-    known_program: &Program<V, O, Vec<V>, Vec<V>>,
-    known_input_indices: &[usize],
-    partition_outputs: &[PartialEvaluationOutput<usize>],
-    residual_edges: &[(V::Type, usize)],
-    passed_through_carries: &[Option<AtomId>],
-    invariant_atoms: &[bool],
-    live_edges: &mut BTreeSet<usize>,
-) -> Result<ScanResidualPlan<V::Type>, ProgramError>
-where
-    V: Value<Type: TemporalResidualType>,
-    O: Operation<Type = V::Type> + TemporalResidualOperation<V::Type>,
-{
-    let carry_count = scan.carry_count;
-    let carry_known = &body_known[1..1 + carry_count];
-
-    // The known body's outputs are the known next-carries, then the known per-iteration outputs, then the residuals
-    // that it stacks. Absolute positions into this list equal positions into the known scan's outputs, because the
-    // known scan's outputs are its final carries followed by its stacked per-iteration outputs in the same order.
+    // Classify each edge as an index, invariant, forwarded stack, recovered identity, or value to stack. Computed
+    // invariant work is hoisted only when an iteration is guaranteed, since even pure work may fail on a zero-trip
+    // scan. The known body's outputs are the known next-carries, then the known per-iteration outputs, then the
+    // residuals that it stacks. Absolute positions into this list equal positions into the known scan's outputs,
+    // because the known scan's outputs are its final carries followed by its stacked per-iteration outputs in the same
+    // order.
     let mut known_program_output_indices = Vec::with_capacity(known_program.output_ids().len());
     let mut scan_outputs = partition_outputs.to_vec();
     for (index, output) in partition_outputs.iter().enumerate() {
@@ -2798,242 +2755,339 @@ where
             known_program_output_indices.push(*output);
         }
     }
-    Ok(ScanResidualPlan {
-        residuals,
-        invariant_sources,
-        known_program_output_indices,
-        known_result_count,
-        scan_outputs,
-        instantiated_edge_positions,
-    })
-}
 
-/// Returns the body of the known scan of a partitioned scan: the `known_program` restricted to the outputs and effects
-/// that the known scan retains, so that hoisted feeders are not rebuilt in the iteration body, with each stacked
-/// residual converted to its temporal storage (refer to [`TemporalResidualOperation`]).
-fn known_scan_body<V, O>(
-    known_program: &Program<V, O, Vec<V>, Vec<V>>,
-    plan: &ScanResidualPlan<V::Type>,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
-where
-    V: Value<Type: TemporalResidualType>,
-    O: Operation<Type = V::Type> + TemporalResidualOperation<V::Type>,
-{
-    let known_output_atoms = plan
-        .known_program_output_indices
+    // An empty known side means the split folds nothing, and the scan stays whole. A known side that only forwards
+    // stacked inputs or known carries that the body passes through, or that only hoists invariant feeders, still
+    // splits, but it needs no known scan. A known carry that the body passes through unchanged ends with its initial
+    // value, so the known scan is needed only for its other outputs or for its effects.
+    let passed_through_carry_count = passed_through_carries.iter().flatten().count();
+    let needs_known_scan = known_program_output_indices.len() > passed_through_carry_count
+        || !known_program.effects().classes().is_empty()
+        || known_program.effects().has_deferred_work();
+    if needs_known_scan && !runtime_length_known {
+        return Ok(None);
+    }
+    let hoists_edges = invariant_sources.iter().any(|source| matches!(source, ScanInvariantSource::Hoisted(_)));
+    let forwards_stacked_inputs = residuals
         .iter()
-        .map(|&index| known_program.output_ids()[index])
+        .any(|residual| matches!(residual, ScanResidual::Value { stack: Some(ScanStackSource::Input(_)), .. }));
+    if !needs_known_scan && !hoists_edges && passed_through_carry_count == 0 && !forwards_stacked_inputs {
+        return Ok(None);
+    }
+
+    // Bind the known scan into the enclosing known-side context over the original known inputs.
+    let known_carry_count = carry_known.iter().filter(|&&known| known).count();
+    let mut known_scan_inputs = known_input_indices
+        .iter()
+        .filter(|&&index| index != 0)
+        .map(|&index| body_inputs[index - 1].clone())
         .collect::<Vec<_>>();
-    let (known_body, _) =
-        known_program.filtered(known_program.input_ids(), &known_output_atoms, known_program.input_ids())?;
-    let known_program_output_types = known_program.output_types();
-    let mut conversions = Vec::new();
-    for (position, &output) in plan.known_program_output_indices.iter().enumerate().skip(plan.known_result_count) {
-        if let Some(operation) = O::residual_to_storage(&known_program_output_types[output])? {
-            conversions.push((position, operation));
+    known_scan_inputs.extend_from_slice(runtime_length_inputs);
+    // Project the known iteration body to its retained results and effects, then convert metadata residuals to temporal
+    // storage. Ordinary arrays already have that representation and need no second replay.
+    let known_body = {
+        let known_output_atoms = known_program_output_indices
+            .iter()
+            .map(|&index| known_program.output_ids()[index])
+            .collect::<Vec<_>>();
+        let (known_body, _) =
+            known_program.filtered(known_program.input_ids(), &known_output_atoms, known_program.input_ids())?;
+        let mut conversions = Vec::new();
+        for (position, &output) in known_program_output_indices.iter().enumerate().skip(known_result_count) {
+            if let Some(operation) = O::residual_to_storage(&known_program_output_types[output])? {
+                conversions.push((position, operation));
+            }
         }
-    }
-    // Arrays already are their temporal representation. Keep the projected body directly unless a metadata value
-    // actually needs a storage gateway, avoiding a second replay for ordinary array scans.
-    if conversions.is_empty() {
-        return Ok(known_body);
-    }
-    let mut builder = ProgramBuilder::<V, O>::new();
-    let inputs = known_body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-    let mut outputs = builder.splice_program(&known_body, &inputs)?;
-    for (position, operation) in conversions {
-        outputs[position] = builder.add_instruction(operation, Vec::new(), vec![outputs[position]], None)?[0];
-    }
-    builder.build::<Vec<V>, Vec<V>>(
-        outputs,
-        vec![Placeholder; inputs.len()],
-        vec![Placeholder; plan.known_program_output_indices.len()],
-    )
-}
+        // Arrays already are their temporal representation. Keep the projected body directly unless a metadata value
+        // actually needs a storage gateway, avoiding a second replay for ordinary array scans.
+        if conversions.is_empty() {
+            known_body
+        } else {
+            let mut builder = ProgramBuilder::<V, O>::new();
+            let inputs =
+                known_body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let mut outputs = builder.splice_program(&known_body, &inputs)?;
+            for (position, operation) in conversions {
+                outputs[position] = builder.add_instruction(operation, Vec::new(), vec![outputs[position]], None)?[0];
+            }
+            builder.build::<Vec<V>, Vec<V>>(
+                outputs,
+                vec![Placeholder; inputs.len()],
+                vec![Placeholder; known_program_output_indices.len()],
+            )?
+        }
+    };
+    let known_scan = ScanOperation { carry_count: known_carry_count, ..scan.clone() };
+    // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original stacked
+    // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep
+    // runtime-length scans explicit because their outputs may refine the stacked inputs' symbolic extent types.
+    let forwarded_outputs = (matches!(scan.length(), Dimension::Static(_))
+        && known_carry_count == 0
+        && known_body.instructions().is_empty())
+    .then(|| {
+        known_body
+            .output_ids()
+            .iter()
+            .map(|output| {
+                known_body
+                    .input_ids()
+                    .iter()
+                    .position(|input| input == output)
+                    .and_then(|index| index.checked_sub(1))
+                    .map(|index| known_scan_inputs[index].clone())
+            })
+            .collect::<Option<Vec<_>>>()
+    })
+    .flatten();
+    let known_outputs = match forwarded_outputs {
+        Some(outputs) => outputs,
+        None if !needs_known_scan => Vec::new(),
+        None => bind_known(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
+    };
 
-/// Returns the body of the unknown scan of a partitioned scan and its carry count. The body consumes `[index,
-/// invariant_carries..., unknown_carries_and_stacked_slices..., edge_slices...]` (an invariant that
-/// `invariant_constants` resolves is embedded as a constant instead of being an input), splices the `residual_program`
-/// over the unknown inputs and the restored residuals (refer to `restore_scan_residuals`), and returns
-/// `[invariant_carries..., unknown_carries..., unknown_stacked_outputs...]`, where the known next value of an unknown
-/// carry passes through from its instantiated edge. Each original output that the unknown side owns is assigned its
-/// position among those outputs in `scan_outputs`.
-#[allow(clippy::too_many_arguments)]
-fn unknown_scan_body<V, O>(
-    body_input_types: &[V::Type],
-    body_known: &[bool],
-    known_program: &Program<V, O, Vec<V>, Vec<V>>,
-    residual_program: &Program<V, O, Vec<V>, Vec<V>>,
-    residual_inputs: &[ResidualInputSource],
-    live_residual_inputs: &[usize],
-    live_edges: &BTreeSet<usize>,
-    partition_outputs: &[PartialEvaluationOutput<usize>],
-    plan: &ScanResidualPlan<V::Type>,
-    invariant_constants: &[Option<V>],
-    scan_outputs: &mut [PartialEvaluationOutput<usize>],
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, usize), ProgramError>
-where
-    V: Value<Type: TemporalResidualType>,
-    O: Operation<Type = V::Type> + TemporalResidualOperation<V::Type>,
-{
-    let carry_count = plan.instantiated_edge_positions.len();
-    let mut builder = ProgramBuilder::<V, O>::new();
-    let index_atom = builder.add_input(body_input_types[0].clone());
-    let mut invariant_atoms = plan
-        .invariant_sources
-        .iter()
-        .zip(invariant_constants)
-        .map(|(source, constant)| {
-            constant.is_none().then(|| {
-                builder.add_input(match source {
-                    ScanInvariantSource::Carry(index) => body_input_types[index + 1].clone(),
-                    ScanInvariantSource::Hoisted(feeder) => {
-                        known_program.entry_region_ref().atoms()[feeder.index()].r#type().into_owned()
-                    }
+    // The unknown scan consumes its invariant carries and the unknown original inputs, followed by one stacked edge per
+    // residual edge, each fed by the known scan's matching stacked output or by a forwarded known stacked input.
+    let mut residual_outputs = Vec::new();
+    let needs_unknown_scan =
+        partition_outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
+            || carry_known.iter().any(|&known| !known)
+            || !residual_program.effects().classes().is_empty()
+            || residual_program.effects().has_deferred_work();
+    if needs_unknown_scan {
+        // Loop-invariant values are computed once before the scan. A value that resolves to an identity-free constant
+        // of the known-side context is embedded into the unknown body, so that partial evaluation against known values
+        // specializes that body. Every other value is threaded through the unknown scan as a carry that its body passes
+        // through unchanged.
+        let mut hoisted_values = {
+            let region = known_program.entry_region_ref();
+            let mut values = passed_through_carries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, atom)| atom.map(|atom| (atom, body_inputs[index].clone())))
+                .collect::<HashMap<_, _>>();
+
+            // Unlike filtering a program, this dependency query does not retain unrelated effects from the iteration
+            // body.
+            let feeders = invariant_sources
+                .iter()
+                .filter_map(|source| match source {
+                    ScanInvariantSource::Carry(_) => None,
+                    ScanInvariantSource::Hoisted(feeder) => Some(*feeder),
+                })
+                .collect::<Vec<_>>();
+            let live = known_program.live_sets_for_atoms(&feeders)?;
+            for (atom, needed) in live.atoms().iter().enumerate() {
+                if let (true, Some(constant)) = (*needed, region.atoms()[atom].as_constant()) {
+                    values.insert(AtomId::new(atom), lift_known(constant.clone())?);
+                }
+            }
+            for (instruction, _) in
+                region.instructions().iter().zip(live.instructions()).filter(|(_, replayed)| **replayed)
+            {
+                let inputs = instruction.inputs().iter().map(|input| values[input].clone()).collect::<Vec<_>>();
+                let outputs = bind_known(instruction.operation().clone(), Vec::new(), &inputs)?;
+                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                values.extend(instruction.outputs().iter().copied().zip(outputs));
+            }
+            values
+        };
+        let invariant_values = invariant_sources
+            .iter()
+            .map(|source| match source {
+                ScanInvariantSource::Carry(index) => body_inputs[*index].clone(),
+                ScanInvariantSource::Hoisted(feeder) => hoisted_values.remove(feeder).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let invariant_constants = invariant_values
+            .iter()
+            .map(|value| {
+                resolve_constant(value).filter(|constant| {
+                    let constant_type = constant.r#type();
+                    !constant_type.is_reference() && constant_type.identities().next().is_none()
                 })
             })
-        })
-        .collect::<Vec<_>>();
-    let invariant_carry_atoms = invariant_atoms.iter().flatten().copied().collect::<Vec<_>>();
-    let unknown_body_input_atoms = body_input_types
-        .iter()
-        .enumerate()
-        .map(|(index, input_type)| match index {
-            0 => Some(index_atom),
-            _ if body_known[index] => None,
-            _ => Some(builder.add_input(input_type.clone())),
-        })
-        .collect::<Vec<_>>();
-    // Every input precedes the restored residuals, so that the identities that the inputs establish are known before
-    // any residual is restored.
-    let mut edge_atoms = plan
-        .residuals
-        .iter()
-        .map(|residual| {
-            Ok(match residual {
-                ScanResidual::Index => Some(index_atom),
-                ScanResidual::Value { r#type, stack: Some(_) } => {
-                    Some(builder.add_input(r#type.temporal_storage_type()?))
+            .collect::<Vec<_>>();
+        // Build the unknown body in boundary order: index, nonconstant invariants, unknown original inputs, then
+        // residual slices. Constant invariants are embedded; other invariants pass through as additional carries.
+        let (unknown_body, unknown_carry_count) = {
+            let mut builder = ProgramBuilder::<V, O>::new();
+            let index_atom = builder.add_input(body_input_types[0].clone());
+            let mut invariant_atoms = invariant_sources
+                .iter()
+                .zip(&invariant_constants)
+                .map(|(source, constant)| {
+                    constant.is_none().then(|| {
+                        builder.add_input(match source {
+                            ScanInvariantSource::Carry(index) => body_input_types[index + 1].clone(),
+                            ScanInvariantSource::Hoisted(feeder) => {
+                                known_program.entry_region_ref().atoms()[feeder.index()].r#type().into_owned()
+                            }
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let invariant_carry_atoms = invariant_atoms.iter().flatten().copied().collect::<Vec<_>>();
+            let unknown_body_input_atoms = body_input_types
+                .iter()
+                .enumerate()
+                .map(|(index, input_type)| match index {
+                    0 => Some(index_atom),
+                    _ if body_known[index] => None,
+                    _ => Some(builder.add_input(input_type.clone())),
+                })
+                .collect::<Vec<_>>();
+            // Every input precedes the restored residuals, so that the identities that the inputs establish are known
+            // before any residual is restored.
+            let mut edge_atoms = residuals
+                .iter()
+                .map(|residual| {
+                    Ok(match residual {
+                        ScanResidual::Index => Some(index_atom),
+                        ScanResidual::Value { r#type, stack: Some(_) } => {
+                            Some(builder.add_input(r#type.temporal_storage_type()?))
+                        }
+                        _ => None,
+                    })
+                })
+                .collect::<Result<Vec<_>, TypeError>>()?;
+            for (atom, constant) in invariant_atoms.iter_mut().zip(&invariant_constants) {
+                if let Some(constant) = constant {
+                    *atom = Some(builder.add_constant(constant.clone()));
                 }
-                _ => None,
+            }
+            let invariant_atoms = invariant_atoms.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+            // Restore live metadata after all inputs establish their identities. Reuse an input carrier or an earlier
+            // restoration before reading temporal storage, so each nominal identity has one SSA definition.
+            let carriers = builder
+                .input_ids()
+                .iter()
+                .map(|&input| (input, builder.atoms()[input.index()].r#type().into_owned()))
+                .collect::<Vec<_>>();
+            let mut restored_identity_edges = Vec::<(V::Type, AtomId)>::new();
+            for (edge, (residual, atom)) in residuals.iter().zip(edge_atoms.iter_mut()).enumerate() {
+                let edge_type = match residual {
+                    ScanResidual::Index => continue,
+                    ScanResidual::Invariant(position) => {
+                        *atom = Some(invariant_atoms[*position]);
+                        continue;
+                    }
+                    ScanResidual::Value { r#type, .. } => r#type,
+                };
+                let Some(operation) = O::residual_from_storage(edge_type)? else {
+                    continue;
+                };
+                if !live_edges.contains(&edge) {
+                    continue;
+                }
+                let defines_identity =
+                    edge_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
+                if defines_identity
+                    && let Some((_, restored)) =
+                        restored_identity_edges.iter().find(|(restored_type, _)| restored_type == edge_type)
+                {
+                    *atom = Some(*restored);
+                    continue;
+                }
+                let mut restored = None;
+                for (carrier, carrier_type) in &carriers {
+                    if carrier_type == edge_type {
+                        restored = Some(*carrier);
+                    } else if let Some(operation) = O::residual_from_carrier(edge_type, carrier_type)? {
+                        restored = Some(builder.add_instruction(operation, Vec::new(), vec![*carrier], None)?[0]);
+                    } else {
+                        continue;
+                    }
+                    break;
+                }
+                let restored = match restored {
+                    Some(restored) => restored,
+                    None => builder.add_instruction(operation, Vec::new(), vec![atom.unwrap()], None)?[0],
+                };
+                *atom = Some(restored);
+                if defines_identity {
+                    restored_identity_edges.push((edge_type.clone(), restored));
+                }
+            }
+
+            // Partitions feed only unknown body inputs and residual edges to the residual program, because forwarded
+            // body partitions are rejected before the split.
+            let spliced_inputs = live_residual_inputs
+                .iter()
+                .map(|&input| match residual_inputs[input] {
+                    ResidualInputSource::UnknownInput(index) => Ok(unknown_body_input_atoms[index].unwrap()),
+                    ResidualInputSource::ResidualEdge(edge) => Ok(edge_atoms[edge].unwrap()),
+                    ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
+                        Err(ProgramError::MalformedProgram(format!(
+                            "`{SCAN_OPERATION_NAME}` residual body consumes a forwarded known body partition input, \
+                             which partial evaluation rejects before splitting",
+                        )))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let spliced_outputs = builder.splice_program(&residual_program, &spliced_inputs)?;
+            let mut unknown_output_atoms = invariant_carry_atoms.clone();
+            for (index, output) in partition_outputs.iter().enumerate() {
+                let atom = match output {
+                    PartialEvaluationOutput::Unknown(spliced) => spliced_outputs[*spliced],
+                    PartialEvaluationOutput::Known(_) if index < carry_count && !body_known[index + 1] => {
+                        edge_atoms[instantiated_edge_positions[index].unwrap()].unwrap()
+                    }
+                    PartialEvaluationOutput::Known(_) => continue,
+                };
+                scan_outputs[index] = PartialEvaluationOutput::Unknown(unknown_output_atoms.len());
+                unknown_output_atoms.push(atom);
+            }
+            let unknown_carry_count =
+                invariant_carry_atoms.len() + body_known[1..1 + carry_count].iter().filter(|&&known| !known).count();
+            let input_count = builder.input_ids().len();
+            let output_count = unknown_output_atoms.len();
+            let unknown_body = builder.build::<Vec<V>, Vec<V>>(
+                unknown_output_atoms,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )?;
+            (unknown_body, unknown_carry_count)
+        };
+        let unknown_scan = ScanOperation { carry_count: unknown_carry_count, ..scan.clone() };
+        let mut unknown_scan_inputs = invariant_values
+            .into_iter()
+            .zip(&invariant_constants)
+            .filter_map(|(value, constant)| constant.is_none().then_some(value))
+            .collect::<Vec<_>>();
+        unknown_scan_inputs.extend(
+            body_inputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !body_known[index + 1])
+                .map(|(_, input)| input.clone()),
+        );
+        for residual in &residuals {
+            match residual {
+                ScanResidual::Value { stack: Some(ScanStackSource::Input(input)), .. } => {
+                    unknown_scan_inputs.push(body_inputs[*input].clone());
+                }
+                ScanResidual::Value { stack: Some(ScanStackSource::KnownOutput(position)), .. } => {
+                    unknown_scan_inputs.push(known_outputs[*position].clone());
+                }
+                _ => {}
+            }
+        }
+        unknown_scan_inputs.extend_from_slice(runtime_length_inputs);
+        residual_outputs = bind_residual(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
+    }
+
+    // Reassemble the original scan's outputs from the two sides.
+    Ok(Some(
+        scan_outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| match output {
+                _ if index < carry_count && passed_through_carries[index].is_some() => body_inputs[index].clone(),
+                PartialEvaluationOutput::Known(position) => known_outputs[*position].clone(),
+                PartialEvaluationOutput::Unknown(position) => residual_outputs[*position].clone(),
             })
-        })
-        .collect::<Result<Vec<_>, TypeError>>()?;
-    for (atom, constant) in invariant_atoms.iter_mut().zip(invariant_constants) {
-        if let Some(constant) = constant {
-            *atom = Some(builder.add_constant(constant.clone()));
-        }
-    }
-    let invariant_atoms = invariant_atoms.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-    restore_scan_residuals(&mut builder, &plan.residuals, &invariant_atoms, live_edges, &mut edge_atoms)?;
-
-    // Partitions feed only unknown body inputs and residual edges to the residual program, because forwarded body
-    // partitions are rejected before the split.
-    let spliced_inputs = live_residual_inputs
-        .iter()
-        .map(|&input| match residual_inputs[input] {
-            ResidualInputSource::UnknownInput(index) => Ok(unknown_body_input_atoms[index].unwrap()),
-            ResidualInputSource::ResidualEdge(edge) => Ok(edge_atoms[edge].unwrap()),
-            ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
-                Err(ProgramError::MalformedProgram(format!(
-                    "`{SCAN_OPERATION_NAME}` residual body consumes a forwarded known body partition input, which \
-                     partial evaluation rejects before splitting",
-                )))
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let spliced_outputs = builder.splice_program(residual_program, &spliced_inputs)?;
-    let mut unknown_output_atoms = invariant_carry_atoms.clone();
-    for (index, output) in partition_outputs.iter().enumerate() {
-        let atom = match output {
-            PartialEvaluationOutput::Unknown(spliced) => spliced_outputs[*spliced],
-            PartialEvaluationOutput::Known(_) if index < carry_count && !body_known[index + 1] => {
-                edge_atoms[plan.instantiated_edge_positions[index].unwrap()].unwrap()
-            }
-            PartialEvaluationOutput::Known(_) => continue,
-        };
-        scan_outputs[index] = PartialEvaluationOutput::Unknown(unknown_output_atoms.len());
-        unknown_output_atoms.push(atom);
-    }
-    let unknown_carry_count =
-        invariant_carry_atoms.len() + body_known[1..1 + carry_count].iter().filter(|&&known| !known).count();
-    let input_count = builder.input_ids().len();
-    let output_count = unknown_output_atoms.len();
-    let unknown_body = builder.build::<Vec<V>, Vec<V>>(
-        unknown_output_atoms,
-        vec![Placeholder; input_count],
-        vec![Placeholder; output_count],
-    )?;
-    Ok((unknown_body, unknown_carry_count))
-}
-
-/// Restores the residuals of the unknown body of a partitioned scan in `builder`, recording the atom of each one in
-/// `edge_atoms`: an invariant takes its invariant atom, and a live residual whose temporal storage differs from its own
-/// type is restored from that storage. A residual that defines an identity (e.g., a first-class dimension) is restored
-/// at most once, and not from storage at all when an input of the body (including its invariant inputs) already
-/// establishes its identity. A residual partition may also expose the same value through multiple feeder edges, which
-/// then share one SSA definition.
-fn restore_scan_residuals<V, O>(
-    builder: &mut ProgramBuilder<V, O>,
-    residuals: &[ScanResidual<V::Type>],
-    invariant_atoms: &[AtomId],
-    live_edges: &BTreeSet<usize>,
-    edge_atoms: &mut [Option<AtomId>],
-) -> Result<(), ProgramError>
-where
-    V: Value<Type: TemporalResidualType>,
-    O: Operation<Type = V::Type> + TemporalResidualOperation<V::Type>,
-{
-    let carriers = builder
-        .input_ids()
-        .iter()
-        .map(|&input| (input, builder.atoms()[input.index()].r#type().into_owned()))
-        .collect::<Vec<_>>();
-    let mut restored_identity_edges = Vec::<(V::Type, AtomId)>::new();
-    for (edge, (residual, atom)) in residuals.iter().zip(edge_atoms).enumerate() {
-        let edge_type = match residual {
-            ScanResidual::Index => continue,
-            ScanResidual::Invariant(position) => {
-                *atom = Some(invariant_atoms[*position]);
-                continue;
-            }
-            ScanResidual::Value { r#type, .. } => r#type,
-        };
-        let Some(operation) = O::residual_from_storage(edge_type)? else {
-            continue;
-        };
-        if !live_edges.contains(&edge) {
-            continue;
-        }
-        let defines_identity = edge_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
-        if defines_identity
-            && let Some((_, restored)) =
-                restored_identity_edges.iter().find(|(restored_type, _)| restored_type == edge_type)
-        {
-            *atom = Some(*restored);
-            continue;
-        }
-        let mut restored = None;
-        for (carrier, carrier_type) in &carriers {
-            if carrier_type == edge_type {
-                restored = Some(*carrier);
-            } else if let Some(operation) = O::residual_from_carrier(edge_type, carrier_type)? {
-                restored = Some(builder.add_instruction(operation, Vec::new(), vec![*carrier], None)?[0]);
-            } else {
-                continue;
-            }
-            break;
-        }
-        let restored = match restored {
-            Some(restored) => restored,
-            None => builder.add_instruction(operation, Vec::new(), vec![atom.unwrap()], None)?[0],
-        };
-        *atom = Some(restored);
-        if defines_identity {
-            restored_identity_edges.push((edge_type.clone(), restored));
-        }
-    }
-    Ok(())
+            .collect(),
+    ))
 }
 
 /// Batches an application of `operation` to the batched `inputs` structurally, binding one batched scan into the parent
@@ -3105,9 +3159,16 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let mut iteration_axes = std::iter::once(BatchAxis::replicated())
         .chain(carries.iter().map(P::batch_axis))
-        .chain(stacks.iter().map(|stack| match P::unbatched_type(stack).is_reference() {
-            true => P::batch_axis(stack),
-            false => scan_iteration_batch_axis(P::batch_axis(stack)),
+        .chain(stacks.iter().map(|stack| {
+            match P::unbatched_type(stack).is_reference() {
+                true => P::batch_axis(stack),
+                // Removing the leading scan dimension shifts a slice's mapped axis left. A replicated input stays
+                // replicated; a batch axis in front of the scan axis was already realigned above.
+                false => P::batch_axis(stack)
+                    .axis()
+                    .map(|axis| BatchAxis::new(axis.value().saturating_sub(1)))
+                    .unwrap_or_default(),
+            }
         }))
         .collect::<Vec<_>>();
     let carry_inputs = 1..1 + carry_count;
@@ -3159,16 +3220,6 @@ where
         forward_scan_carries(body, carry_count, inputs, &mut outputs);
     }
     Ok(outputs)
-}
-
-/// Maps a stacked scan input's packed batch axis to the corresponding per-iteration batch axis after removing the
-/// per-item leading scan dimension.
-fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
-    match batch_axis.axis() {
-        Some(axis) if axis.value() == 0 => BatchAxis::new(0),
-        Some(axis) => BatchAxis::new(axis.value() - 1),
-        None => BatchAxis::replicated(),
-    }
 }
 
 /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
@@ -3491,537 +3542,6 @@ impl<V: Value<Type: ScanType + DifferentiableType>, O: Operation<Type = V::Type>
         let tangent_outputs = primal_outputs.split_off(self.output_live.len());
         DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &self.output_live)
     }
-}
-
-/// Partition-aware transposition rule for a [`ScanOperation`] in a tangent program. The per-iteration residuals of a
-/// linearized scan are ordinary *scanned inputs* (known residual stacks) and its loop-invariant residuals are known
-/// carries that the body passes through unchanged, so the rule reads them from the pullback and threads them back
-/// through a transposed scan with the same length.
-///
-/// The scan's instruction inputs correspond to the body's inputs after its intrinsic index as `[carries...,
-/// scanned_inputs...]`, followed by the runtime length of a dynamic-length scan. Each instruction input is
-/// independently linear (a tangent the reverse accumulates) or known (a residual the pullback reads), so a known
-/// loop-invariant residual can sit among the linear carries (e.g., the hoisted residuals of a partitioned scan or the
-/// invariant residuals of a bounded `while`). Known carries that the body changes are promoted to internal linear state
-/// (refer to `linear_scan_inputs`). This rule then:
-///
-///   1. Transposes the body under each input's linearity and threads the result into the reversed body (refer to
-///      `transpose_scan_body`), which regenerates the index, keeps one carry slot per retained forward carry, and
-///      consumes the live stacked output cotangents and the known stacked inputs as per-iteration slices.
-///   2. Re-stages a primal [`ScanOperation`] over the reversed body with flipped [`reverse`](ScanOperation::reverse)
-///      and the same length and (lowering-only) unroll factor (refer to `reversed_scan_inputs` for its inputs).
-///      Flipping `reverse` pairs cotangent iteration `i` with residual stack iteration `i` exactly when the forward
-///      scan consumed them, making reverse mode through the scan total with no array-reversal operation.
-///   3. Assembles one cotangent per instruction input (refer to `scan_input_cotangents`).
-///
-/// A structural-zero stacked output cotangent stays symbolic: the body is transposed without a seed for it, so the
-/// reversed scan receives no zero stack, and a scanned input that only such outputs reach keeps a structural-zero
-/// cotangent. The body recursion happens through the instruction-scoped driver's transposition requests in the same
-/// operation family, so it introduces no recursive [`TransposableOperation`] obligation on `O`.
-///
-/// # Parameters
-///
-///   - `operation`: Primal scan staged into the tangent program.
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `driver`: Instruction-scoped driver whose region 0 is the body.
-///   - `inputs`: Per-input [`PartialValue`] knowledge. A linear input is [`Unknown`](PartialValue::Unknown); a known
-///     input is [`Known`](PartialValue::Known) of the residual tracer the pullback reads.
-///   - `outputs`: Symbolic cotangents for the scan's outputs.
-///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). A live (`Reference`-kind) reference carry is threaded through
-///     the reversed scan as a carry at its own position: the reversed body receives its cotangent reference as that
-///     carry's input and passes it back out by identity as that carry's output, so every reversed iteration accumulates
-///     into and reads from one shared cotangent reference. A live reference *stack* (a linear reference-typed scanned
-///     input whose body input is the whole root) is threaded as a scanned input of the reversed scan at its own
-///     position: its cotangent reference is the enclosing context's whole stacked cotangent reference. The reversed
-///     body selects the per-iteration cotangent view using its own index and accumulates into it in place, while the
-///     reversed scan has no output for it. A dead (`Ignore`-kind) reference input has no slot in the transposed body
-///     and is dropped from the reversed scan's inputs. A *known* reference stack is threaded as a scanned input of the
-///     reversed scan at its own position, as its whole root, like a known reference carry. Deferred backward work in
-///     the body (e.g., a dormant custom backward rule) may update it in the reversed body. Reading it there, however,
-///     would observe its state at backward time rather than the state that the forward scan read, so body
-///     transposition rejects such primal reads; the partial-evaluation split residualizes them into stacked inputs
-///     instead.
-fn transpose_primal_scan<T, V, O, D: TranspositionDriver<V, O>>(
-    operation: &ScanOperation<T>,
-    context: &mut TracingContext<V, O>,
-    driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
-where
-    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
-    T: DifferentiableType + ScanType,
-    V: Value<Type = T>,
-    O: Operation<Type = T> + ResidualZeroProvider<T, Operation = O> + From<ScanOperation<T>>,
-{
-    let body = driver.region(0)?;
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    operation.validate_application(&input_types, body)?;
-    check_count!("output", outputs, body.output_ids().len(), ProgramError);
-    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
-
-    // A live reference carry keeps the rule live even without live output cotangents, because its accumulated state
-    // cotangent flows through the reversed body, and so does a body with deferred work or observable rule effects.
-    if cotangents.can_skip_transposition(outputs, [body]) {
-        return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
-    }
-
-    let carry_count = operation.carry_count;
-    let scan_input_count = body.input_ids().len() - 1;
-    let input_linear = linear_scan_inputs(body, carry_count, &inputs[..scan_input_count])?;
-    let zero_output_cotangents = outputs
-        .iter()
-        .enumerate()
-        .map(|(index, cotangent)| index >= carry_count && cotangent.is_zero())
-        .collect();
-    let (reversed_body, input_cotangent_slots) =
-        transpose_scan_body(driver, body, carry_count, &input_linear, zero_output_cotangents, cotangents.kinds())?;
-    let reversed_inputs = reversed_scan_inputs(context, body, carry_count, inputs, outputs, &input_linear, cotangents)?;
-    let retained_carry_count =
-        (0..carry_count).filter(|&index| cotangents.kind(index) != CotangentDestinationKind::Ignore).count();
-    let reversed =
-        ScanOperation { carry_count: retained_carry_count, reverse: !operation.reverse, ..operation.clone() };
-    let scan_cotangents = context.stage_operation(
-        O::from(reversed),
-        CalleeRegionDriver::new(std::slice::from_ref(&reversed_body)),
-        reversed_inputs.as_slice(),
-    )?;
-
-    // The reversed scan outputs one carry cotangent per retained carry and one stacked cotangent per live
-    // non-reference scanned input (a reference stack's cotangent lives in its cotangent reference). Structural zeros
-    // have no per-iteration output, so the scan neither allocates nor returns their stacks.
-    let stacked_count = (carry_count..scan_input_count)
-        .filter(|&index| {
-            input_cotangent_slots[index] == TransposedProgramCotangent::Output
-                && cotangents.kind(index) == CotangentDestinationKind::Return
-        })
-        .count();
-    check_count!("output", scan_cotangents, retained_carry_count + stacked_count, ProgramError);
-    scan_input_cotangents(inputs, carry_count, &input_linear, &input_cotangent_slots, cotangents, scan_cotangents)
-}
-
-/// Returns whether each of the `scan_inputs` (i.e., the carries followed by the stacked inputs) of a scan with the
-/// iteration `body` and `carry_count` carries is linear under transposition. Every unknown input is linear. A known
-/// carry that the body does not pass through unchanged is promoted to internal linear state (e.g., the materialized
-/// zero initial tangent of a carry that only later iterations make live), whose initializer receives no cotangent, and
-/// every other known input is a residual. Body transposition rejects a promoted carry whose recurrence is not linear,
-/// including a changing known coefficient of a linear computation, which the reverse cannot reconstruct from its
-/// initializer, while a promoted carry that reaches no linear computation contributes nothing to the linear map. A
-/// known reference carry keeps its resolved state destination and a known zero-space carry has no cotangent, so neither
-/// can be promoted, and each must pass through the body unchanged: linearization supplies the per-iteration values of a
-/// changing coefficient as stacked residuals instead.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::UnsupportedOperation`] for a known reference or zero-space carry that the body changes.
-fn linear_scan_inputs<
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>,
-    Input: Value<Type = V::Type>,
->(
-    body: RegionRef<'_, V, O>,
-    carry_count: usize,
-    scan_inputs: &[PartialValue<Input>],
-) -> Result<Vec<bool>, DifferentiationError> {
-    let passes_through = passed_through_carries(body, 1..1 + carry_count);
-    let input_linear = scan_inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            let r#type = input.r#type();
-            Ok(input.is_unknown()
-                || (index < carry_count
-                    && !passes_through[index]
-                    && !r#type.is_reference()
-                    && !r#type.cotangent()?.is_zero_space()))
-        })
-        .collect::<Result<Vec<_>, TypeError>>()?;
-    if let Some(index) = (0..carry_count).find(|&index| !input_linear[index] && !passes_through[index]) {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{SCAN_OPERATION_NAME}` transposition requires known carry {index} to pass through the body \
-                 unchanged; time-varying known values must be supplied as stacked inputs",
-            ),
-        }
-        .into());
-    }
-    Ok(input_linear)
-}
-
-/// Transposes the iteration `body` of a scan with `carry_count` carries and threads the result into the body of the
-/// reversed scan (refer to `thread_scan_carries`), returning that body and the cotangent slot of each body input after
-/// the index (absent for the known inputs). The body is transposed with respect to the inputs that `input_linear`
-/// marks, each with its own destination kind from `destination_kinds`: a live reference input is threaded as a
-/// `Reference` destination and a dead one as an `Ignore` destination. The cotangent of every output that
-/// `zero_output_cotangents` flags is a structural zero without a transposed-body input. The transposed body then maps
-/// `[unflagged_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to the cotangents
-/// of the linear inputs other than the dead references, in body order on each side, where a live reference input's
-/// cotangent is its cotangent reference itself. Carry cotangents are materialized because they recur across
-/// iterations, while disconnected scanned-input cotangents remain structural and have no output. The body is transposed
-/// through its region's retained transform cache, so a body shared by several programs is transposed once per
-/// selection and repeated attachments of the result intern by `Arc` identity.
-///
-/// # Errors
-///
-/// Returns the errors of transposing the body and of threading the result.
-fn transpose_scan_body<V, O, D: TranspositionDriver<V, O>>(
-    driver: &D,
-    body: RegionRef<'_, V, O>,
-    carry_count: usize,
-    input_linear: &[bool],
-    zero_output_cotangents: Vec<bool>,
-    destination_kinds: &[CotangentDestinationKind],
-) -> Result<(Arc<Program<V, O, Vec<V>, Vec<V>>>, Vec<TransposedProgramCotangent>), DifferentiationError>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>,
-{
-    let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = input_linear
-        .iter()
-        .zip(destination_kinds)
-        .enumerate()
-        .filter_map(|(index, (&linear, &kind))| linear.then_some((index + 1, kind)))
-        .unzip();
-    let materialize_zeros = input_indices.iter().map(|&index| index <= carry_count).collect::<Vec<_>>();
-    let transposed = driver.transpose_program_with_zero_seeds(
-        body,
-        &input_indices,
-        &materialize_zeros,
-        &zero_output_cotangents,
-        &selected_destination_kinds,
-    )?;
-    let mut input_cotangent_slots = vec![TransposedProgramCotangent::Absent; input_linear.len()];
-    for (&index, &slot) in input_indices.iter().zip(transposed.cotangents()) {
-        input_cotangent_slots[index - 1] = slot;
-    }
-    let reversed_body = thread_scan_carries(
-        Arc::unwrap_or_clone(transposed.into_program()),
-        &body.output_types(),
-        &zero_output_cotangents,
-        input_linear,
-        &destination_kinds[..input_linear.len()],
-        &input_cotangent_slots,
-        carry_count,
-    )?;
-    Ok((Arc::new(reversed_body), input_cotangent_slots))
-}
-
-/// Rebuilds a transposed scan body (refer to `transpose_scan_body`) into the body of the reversed scan, which consumes
-/// `[index, retained_carries..., stacked_slices_or_roots...]` and produces `[retained_carries..., stacked_slices...]`
-/// in body order. A known carry is loop state rather than a stacked input: its known-value input moves into its carry
-/// slot and passes through as its carry output, which preserves one carry slot per forward carry without fabricating a
-/// zero stack and lets first-class dimension carries define the identities that dynamic tangent carries reference. A
-/// live reference carry's cotangent reference likewise moves into its carry slot, while a dead (`Ignore`-kind)
-/// reference input, which has no slot in the transposed body, is dropped. The live stacked output cotangents, the
-/// cotangent references of the live reference stacks (whole roots), and the known stacked values (per-iteration slices
-/// or known reference roots) follow in body order, and the reversed body creates views using its own index, just as the
-/// primal body does. Every transposed body exposes the original index as a known input, which moves first so that the
-/// reversed scan regenerates it instead of consuming an index stack. The identity outputs of the live reference stacks,
-/// which cannot be stacked and whose accumulation is visible through the shared stacked cotangent reference, are
-/// projected out.
-///
-/// Threading is a per-attachment rewrite of the retained transposition rather than a property of the body, so the
-/// shared artifact is rebuilt here instead of being retained in its threaded form.
-///
-/// # Parameters
-///
-///   - `program`: Transposed body.
-///   - `body_output_types`: Output types of the forward body.
-///   - `zero_output_cotangents`: Whether each forward body output's cotangent is a structural zero without an input.
-///   - `input_linear`: Whether each forward body input after the index is linear.
-///   - `destination_kinds`: Destination kind of each forward body input after the index.
-///   - `input_cotangent_slots`: Cotangent slot of each forward body input after the index, with known inputs absent.
-///   - `carry_count`: Number of forward carries.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] when a retained linear carry has no cotangent output or no boundary slot.
-fn thread_scan_carries<V, O>(
-    program: Program<V, O, Vec<V>, Vec<V>>,
-    body_output_types: &[V::Type],
-    zero_output_cotangents: &[bool],
-    input_linear: &[bool],
-    destination_kinds: &[CotangentDestinationKind],
-    input_cotangent_slots: &[TransposedProgramCotangent],
-    carry_count: usize,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>,
-{
-    let retained_carries = (0..carry_count)
-        .filter(|&index| destination_kinds[index] != CotangentDestinationKind::Ignore)
-        .collect::<Vec<_>>();
-    for &index in &retained_carries {
-        if input_linear[index] && input_cotangent_slots[index] != TransposedProgramCotangent::Output {
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` transposition carry {index} has no materialized cotangent output",
-            )));
-        }
-    }
-    let input_order = reversed_scan_body_input_positions(
-        body_output_types,
-        zero_output_cotangents,
-        input_linear,
-        destination_kinds,
-        &retained_carries,
-        carry_count,
-    )?;
-    let selected_inputs = input_order
-        .iter()
-        .map(|&index| {
-            program.input_ids().get(index).copied().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "`{SCAN_OPERATION_NAME}` transposition boundary references missing input position {index}",
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // The transposed body returns its cotangents in body order: the linear carries lead the live scanned inputs, and a
-    // dead reference carry returns none. A known carry passes its threaded input through instead. Output metadata
-    // identifies the live scanned-input cotangents, of which only the `Return`-kind ones are stacked: a live reference
-    // stack returns its per-iteration cotangent view by identity, which the reversed scan cannot stack.
-    let mut outputs = program.output_ids().iter().copied();
-    let mut restored_outputs = Vec::with_capacity(program.output_count() + retained_carries.len());
-    for (position, &index) in retained_carries.iter().enumerate() {
-        restored_outputs.push(if input_linear[index] {
-            outputs.next().unwrap()
-        } else {
-            selected_inputs[position + 1]
-        });
-    }
-    for index in carry_count..input_linear.len() {
-        if input_cotangent_slots[index] == TransposedProgramCotangent::Output {
-            let output = outputs.next().unwrap();
-            if destination_kinds[index] == CotangentDestinationKind::Return {
-                restored_outputs.push(output);
-            }
-        }
-    }
-    program
-        .into_filtered(&selected_inputs, &restored_outputs, &selected_inputs)
-        .map(|(program, _)| program)
-}
-
-/// Returns the positions among the inputs of a transposed scan body (refer to `transpose_scan_body`) of the inputs of
-/// the reversed scan body (refer to `thread_scan_carries`), in its order: the intrinsic index, the `retained_carries`,
-/// the stacked output cotangents, and the cotangent references or known values of the stacked inputs. Every
-/// non-reference output whose cotangent `zero_output_cotangents` does not flag owns one cotangent input, of which only
-/// the nonzero-space ones are selected: a zero-space cotangent input carries no information and cannot affect a
-/// well-formed transposed body, so it is projected out instead of fabricating a typed value for it. The cotangent
-/// references of the `Reference`-kind inputs and the known inputs (the index first) follow the cotangent inputs.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::UnsupportedOperation`] for a linear carry whose cotangent is a zero space (e.g., an integer
-/// carry), [`ProgramError::MalformedProgram`] when any other retained carry has no boundary slot, and the errors of
-/// computing cotangent types.
-fn reversed_scan_body_input_positions<T: DifferentiableType>(
-    body_output_types: &[T],
-    zero_output_cotangents: &[bool],
-    input_linear: &[bool],
-    destination_kinds: &[CotangentDestinationKind],
-    retained_carries: &[usize],
-    carry_count: usize,
-) -> Result<Vec<usize>, ProgramError> {
-    let mut cotangent_input_count = 0;
-    let mut output_cotangent_positions = Vec::with_capacity(body_output_types.len());
-    for (output_type, &zero) in body_output_types.iter().zip(zero_output_cotangents) {
-        if output_type.is_reference() || zero {
-            output_cotangent_positions.push(None);
-            continue;
-        }
-        output_cotangent_positions.push((!output_type.cotangent()?.is_zero_space()).then_some(cotangent_input_count));
-        cotangent_input_count += 1;
-    }
-    let reference_input_positions = destination_kinds
-        .iter()
-        .scan(cotangent_input_count, |position, &kind| {
-            let live_reference = kind == CotangentDestinationKind::Reference;
-            let result = live_reference.then_some(*position);
-            *position += usize::from(live_reference);
-            Some(result)
-        })
-        .collect::<Vec<_>>();
-    let index_position = cotangent_input_count + reference_input_positions.iter().flatten().count();
-    let known_input_positions = input_linear
-        .iter()
-        .scan(index_position + 1, |position, &linear| {
-            let result = (!linear).then_some(*position);
-            *position += usize::from(!linear);
-            Some(result)
-        })
-        .collect::<Vec<_>>();
-    let mut input_positions = vec![index_position];
-    for &index in retained_carries {
-        let position = if !input_linear[index] {
-            known_input_positions[index]
-        } else if destination_kinds[index] == CotangentDestinationKind::Reference {
-            reference_input_positions[index]
-        } else {
-            output_cotangent_positions[index]
-        };
-        let Some(position) = position else {
-            // A linear carry whose cotangent is a zero space (e.g., an integer carry) has no cotangent input to carry
-            // through the reversed scan. Any other carry without a slot is a malformed transposed body.
-            let carry_type = &body_output_types[index];
-            if input_linear[index] && !carry_type.is_reference() && carry_type.cotangent()?.is_zero_space() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "`{SCAN_OPERATION_NAME}` transposition does not support linear carry {index} of type \
-                         `{carry_type}`, whose cotangent is a zero space",
-                    ),
-                });
-            }
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` transposition carry {index} has no boundary slot in the transposed body",
-            )));
-        };
-        input_positions.push(position);
-    }
-    input_positions.extend(output_cotangent_positions[carry_count..].iter().flatten().copied());
-    // A scanned input is either linear (with a cotangent reference slot exactly when it is a live reference) or known,
-    // so at most one of the two positions is present for it.
-    for index in carry_count..input_linear.len() {
-        input_positions.extend(reference_input_positions[index].or(known_input_positions[index]));
-    }
-    Ok(input_positions)
-}
-
-/// Returns the inputs of the reversed scan of a transposed scan, matching the body that `transpose_scan_body` builds:
-/// one per retained carry, the live stacked output cotangents, one per known or live reference stacked input, and the
-/// runtime length of a dynamic-length scan. A retained carry receives the cotangent reference of a live reference
-/// carry, the known value of a known carry, or the output cotangent of a linear carry. The cotangents of the stacked
-/// outputs are typed by the scan's outputs rather than by the body's per-iteration outputs, and a structural-zero one
-/// has no input. A known stacked input supplies its residual stack (a known reference stack its whole root) and a live
-/// reference stack its whole stacked cotangent reference, while a dead reference input has no slot.
-///
-/// A dead carry's structural-zero cotangent is still the initial value of its reversed carry. Its type alone cannot
-/// construct it when it references runtime identities, but the boundary collectively names every such quantity, so the
-/// zero is assembled from the peers one identity at a time: the carry cotangents keep the per-iteration shapes that the
-/// live peer cotangents and known carries also carry, while live cotangent references also supply their referents'
-/// extents when every ordinary output cotangent is zero and only reference state keeps the reverse live.
-///
-/// # Errors
-///
-/// Returns the errors of materializing a dead carry's cotangent, and [`ProgramError::MalformedProgram`] when the
-/// runtime length is selected as a linear input.
-fn reversed_scan_inputs<V, O>(
-    context: &TracingContext<V, O>,
-    body: RegionRef<'_, V, O>,
-    carry_count: usize,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    input_linear: &[bool],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<Tracer<TracingContext<V, O>>>, DifferentiationError>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>,
-{
-    let (scan_inputs, runtime_length_inputs) = inputs.split_at(input_linear.len());
-    let dimension_sources = || {
-        outputs
-            .iter()
-            .filter_map(MaybeZero::as_value)
-            .chain(inputs.iter().filter_map(PartialValue::as_known))
-            .chain(cotangents.references())
-    };
-    // A non-linear input is known by construction (refer to `linear_scan_inputs`), and the cotangent references are
-    // consumed in input order: the carries first and the stacks after them.
-    let mut cotangent_references = cotangents.references().iter();
-    let mut reversed_inputs = Vec::with_capacity(outputs.len() + inputs.len());
-    for (index, input) in scan_inputs[..carry_count].iter().enumerate() {
-        match cotangents.kind(index) {
-            CotangentDestinationKind::Reference => reversed_inputs.push(cotangent_references.next().unwrap().clone()),
-            CotangentDestinationKind::Ignore => {}
-            CotangentDestinationKind::Return if input_linear[index] => {
-                reversed_inputs.push(O::materialize_zero_from_residual_sources(
-                    context,
-                    outputs[index].clone(),
-                    dimension_sources(),
-                )?);
-            }
-            CotangentDestinationKind::Return => reversed_inputs.push(input.as_known().unwrap().clone()),
-        }
-    }
-    for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
-        if let MaybeZero::Value(cotangent) = cotangent
-            && !output_type.is_reference()
-            && !output_type.cotangent()?.is_zero_space()
-        {
-            reversed_inputs.push(cotangent.clone());
-        }
-    }
-    for (index, input) in scan_inputs.iter().enumerate().skip(carry_count) {
-        match cotangents.kind(index) {
-            CotangentDestinationKind::Reference => reversed_inputs.push(cotangent_references.next().unwrap().clone()),
-            CotangentDestinationKind::Return if !input_linear[index] => {
-                reversed_inputs.push(input.as_known().unwrap().clone())
-            }
-            CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {}
-        }
-    }
-    for (index, input) in runtime_length_inputs.iter().enumerate() {
-        reversed_inputs.push(input.as_known().cloned().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` transposition runtime length input {index} is not known"
-            ))
-        })?);
-    }
-    Ok(reversed_inputs)
-}
-
-/// Assembles one cotangent per instruction input of a transposed scan from the reversed scan's outputs
-/// `scan_cotangents`, which are one carry cotangent per retained carry followed by one stacked cotangent per live
-/// non-reference scanned input. Every carry precedes every scanned input, so a single sequential drain hands each
-/// retained carry the next carry cotangent and each live non-reference scanned input the next stacked cotangent. A
-/// linear carry receives its cotangent, while a promoted known initializer discards it, as does a live reference carry,
-/// whose cotangent reference accumulated in place. Disconnected and known scanned inputs consume no output, a live
-/// reference stack accumulated into the enclosing context's stacked cotangent reference, and a dead reference input has
-/// no output either, so all of them and the runtime length receive structural zeros.
-///
-/// # Errors
-///
-/// Returns the errors of computing the cotangent types of the inputs.
-fn scan_input_cotangents<Output: Value<Type: DifferentiableType>>(
-    inputs: &[PartialValue<Output>],
-    carry_count: usize,
-    input_linear: &[bool],
-    input_cotangent_slots: &[TransposedProgramCotangent],
-    cotangents: &CotangentDestinations<Output>,
-    scan_cotangents: Vec<Output>,
-) -> Result<Vec<MaybeZero<Output>>, DifferentiationError> {
-    let mut scan_cotangents = scan_cotangents.into_iter();
-    inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            let returned = if index < carry_count {
-                match cotangents.kind(index) {
-                    CotangentDestinationKind::Return => scan_cotangents.next().filter(|_| input.is_unknown()),
-                    CotangentDestinationKind::Reference => scan_cotangents.next().and(None),
-                    CotangentDestinationKind::Ignore => None,
-                }
-            } else if index < input_linear.len()
-                && input_linear[index]
-                && cotangents.kind(index) == CotangentDestinationKind::Return
-                && input_cotangent_slots[index] == TransposedProgramCotangent::Output
-            {
-                scan_cotangents.next()
-            } else {
-                None
-            };
-            Ok(match returned {
-                Some(cotangent) => MaybeZero::Value(cotangent),
-                None => MaybeZero::Zero(input.r#type().cotangent()?),
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -4540,7 +4060,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(position, r#type)| match r#type {
-                ArrayIrType::Array(r#type) if position >= carry_count => stacked_scan_type(r#type, length).into(),
+                ArrayIrType::Array(r#type) if position >= carry_count => {
+                    r#type.with_inserted_dimension(0, length.into()).unwrap().into()
+                }
                 r#type => r#type.clone(),
             })
             .collect::<Vec<_>>();
@@ -5225,7 +4747,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&sharded_stack_type), std::slice::from_ref(&interface)),
-            Ok(vec![stacked_scan_type(&slice_type, 3)]),
+            Ok(vec![slice_type.with_inserted_dimension(0, 3.into()).unwrap()]),
         );
         let interface = RegionInterface::new(
             vec![ArrayType::scalar(DataType::I64).into(), slice_type.clone().into()],
@@ -5239,7 +4761,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[sharded_stack_type.into()], std::slice::from_ref(&interface)),
-            Ok(vec![stacked_scan_type(&slice_type, 3).into()]),
+            Ok(vec![slice_type.with_inserted_dimension(0, 3.into()).unwrap().into()]),
         );
     }
 
@@ -11104,7 +10626,7 @@ mod tests {
         let body = builder.build(vec![carry, square], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
         let program = single_scan_program(&body, 1, 2);
         let outer = TestIrTracingContext::new();
-        let stacked_type: ArrayIrType = stacked_scan_type(&vector_type, 2).into();
+        let stacked_type: ArrayIrType = vector_type.with_inserted_dimension(0, 2.into()).unwrap().into();
         let evaluation = program
             .partially_evaluate_in_context(
                 &outer,
@@ -11165,7 +10687,7 @@ mod tests {
         let body = builder.build(vec![square], vec![Placeholder; 3], vec![Placeholder]).unwrap();
         let program = single_scan_program(&body, 0, 2);
         let outer = TestIrTracingContext::new();
-        let stacked_type: ArrayIrType = stacked_scan_type(&vector_type, 2).into();
+        let stacked_type: ArrayIrType = vector_type.with_inserted_dimension(0, 2.into()).unwrap().into();
         let evaluation = program
             .partially_evaluate_in_context(
                 &outer,
@@ -18353,43 +17875,40 @@ mod tests {
             let carry = builder.add_input(scalar_type.clone());
             builder.build(vec![carry], vec![Placeholder; 2], vec![Placeholder]).unwrap()
         };
-        let cotangents = CotangentDestinations::without_references([true]);
-        let mut context = TracingContext::<Array, TestOperation>::new();
+        let mut context = TranspositionContext::new(TracingContext::<Array, TestOperation>::new());
+        let inputs = [PartialValue::Unknown(scalar_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert_eq!(
-            transpose_primal_scan(
-                &TestScanOperation::new(1, 1),
-                &mut context,
-                &Driver(body(DataType::Boolean)),
-                &[PartialValue::Unknown(scalar_type.clone())],
-                &[MaybeZero::Zero(scalar_type.clone())],
-                &cotangents,
-            )
-            .unwrap_err(),
+            TestScanOperation::new(1, 1)
+                .transpose(
+                    &mut context,
+                    &Driver(body(DataType::Boolean)),
+                    &inputs,
+                    &[MaybeZero::Zero(scalar_type.clone())],
+                    &accumulators,
+                )
+                .unwrap_err(),
             DifferentiationError::from(TypeError::invalid("`scan` body input 0 must be a scalar `i64` slice index")),
         );
         assert_eq!(
-            transpose_primal_scan(
-                &TestScanOperation::new(1, 1),
-                &mut context,
-                &Driver(body(DataType::I64)),
-                &[PartialValue::Unknown(scalar_type.clone())],
-                &[],
-                &cotangents,
-            )
-            .unwrap_err(),
+            TestScanOperation::new(1, 1)
+                .transpose(&mut context, &Driver(body(DataType::I64)), &inputs, &[], &accumulators)
+                .unwrap_err(),
             DifferentiationError::from(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         );
         let boolean = context.constant(Array::scalar(true).unwrap());
+        let inputs = [PartialValue::Known(boolean)];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert_eq!(
-            transpose_primal_scan(
-                &TestScanOperation::new(1, 1),
-                &mut context,
-                &Driver(body(DataType::I64)),
-                &[PartialValue::Known(boolean)],
-                &[MaybeZero::Zero(scalar_type)],
-                &cotangents,
-            )
-            .unwrap_err(),
+            TestScanOperation::new(1, 1)
+                .transpose(
+                    &mut context,
+                    &Driver(body(DataType::I64)),
+                    &inputs,
+                    &[MaybeZero::Zero(scalar_type)],
+                    &accumulators,
+                )
+                .unwrap_err(),
             DifferentiationError::from(TypeError::invalid(
                 "`scan` input 0 has type `bool[]`, which does not refine its expected type `f64[]`",
             )),
@@ -19019,6 +18538,41 @@ mod tests {
                 ]
                 in (%4, %5)"}
             .to_owned()),
+        );
+    }
+
+    #[test]
+    fn test_scan_transposition_threads_symbolic_zero_space_known_carries() {
+        // A known integer carry keeps its symbolic shape and passes through the reversed body. Its zero-space output
+        // seed has no information and is omitted from that body, so threading never needs to allocate a dynamic zero.
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayIrType::Array(ArrayType::new(DataType::U64, Shape::new(vec![extent.into()])));
+        let accumulator_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let key = body.add_input(key_type.clone());
+        let accumulator = body.add_input(accumulator_type.clone());
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![key, accumulator],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let program = scan_program(ScanOperation::new(2, 3), body, vec![key_type, accumulator_type]);
+        assert_eq!(
+            program.transpose_with_respect_to(&[1], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:zero[extent], %1:f64[], %2:u64[extent] .
+                let %3:u64[extent], %4:f64[] = scan [carry_count=2, length=3, reverse=true] %2 %1 [
+                    body={
+                        lambda %0:i64[], %1:u64[extent], %2:f64[] .
+                        in (%1, %2)
+                    },
+                ]
+                in (%4)
+            "}
+            .trim_end(),
         );
     }
 
@@ -19874,16 +19428,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stacked_scan_type() {
-        // Stacking prepends the scan length to the slice type and keeps the slice's memory placement.
-        let slice_type = ArrayType::new_static(DataType::F64, [3]).with_memory(Memory::Host { pinned: true });
-        assert_eq!(
-            stacked_scan_type(&slice_type, 2),
-            ArrayType::new_static(DataType::F64, [2, 3]).with_memory(Memory::Host { pinned: true }),
-        );
-    }
-
-    #[test]
     fn test_forward_scan_carries() {
         // The body maps `[scale, accumulator, reference]` to `[scale, accumulator + scale, reference]`. Only the
         // non-reference carry that the body passes through unchanged is forwarded from its input: an updated carry
@@ -19955,16 +19499,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_iteration_batch_axis() {
-        // Removing the per-item leading scan dimension shifts every packed batch axis behind it left by one, while a
-        // batch axis in front of it stays in place.
-        assert_eq!(scan_iteration_batch_axis(BatchAxis::replicated()), BatchAxis::replicated());
-        assert_eq!(scan_iteration_batch_axis(BatchAxis::new(0)), BatchAxis::new(0));
-        assert_eq!(scan_iteration_batch_axis(BatchAxis::new(1)), BatchAxis::new(0));
-        assert_eq!(scan_iteration_batch_axis(BatchAxis::new(2)), BatchAxis::new(1));
-    }
-
-    #[test]
     fn test_live_scan_signature_permutation() {
         // The live tangent entries follow all primal entries in JVP order. Scan order interleaves them so that the
         // carries, followed by the live carry tangents, lead the scanned entries and their live tangents.
@@ -20000,46 +19534,6 @@ mod tests {
         assert_eq!(
             reorder_program_boundary(&nullary, &[], &[1, 0]).unwrap().interpret(vec![]),
             Ok(vec![Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap(),])
-        );
-    }
-
-    #[test]
-    fn test_thread_scan_carries() {
-        // The transposed body exposes `[key_cotangent, accumulator_cotangent, index, known_key]`. The zero-space key
-        // cotangent is an unused boundary input, so threading erases its slot and passes the known key value through
-        // its carry slot instead of constructing a dynamically shaped zero, while the index moves to the front.
-        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let key_type = ArrayIrType::Array(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)])));
-        let accumulator_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let _key_cotangent = builder.add_input(key_type.cotangent().unwrap());
-        let accumulator_cotangent = builder.add_input(accumulator_type.cotangent().unwrap());
-        let _index = builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let _known_key = builder.add_input(key_type.clone());
-        let transposed = builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![accumulator_cotangent],
-                vec![Placeholder; 4],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let threaded = thread_scan_carries(
-            transposed,
-            &[key_type, accumulator_type],
-            &[false, false],
-            &[false, true],
-            &[CotangentDestinationKind::Return; 2],
-            &[TransposedProgramCotangent::Absent, TransposedProgramCotangent::Output],
-            2,
-        )
-        .unwrap();
-        assert_eq!(
-            threaded.to_string(),
-            indoc! {"
-                lambda %0:i64[], %1:u64[extent], %2:f64[] .
-                in (%1, %2)
-            "}
-            .trim_end(),
         );
     }
 }
