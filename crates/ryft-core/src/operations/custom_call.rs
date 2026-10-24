@@ -514,8 +514,6 @@ impl Display for CustomCallBatching {
 /// Canonical operation name for [`CustomCallOperation`].
 pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields,
 /// where a configuration attribute of the same name would be indistinguishable from the field.
 const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
@@ -537,9 +535,13 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// to the returned buffers. Both contracts share one payload with the same target, output declarations, attributes,
 /// layouts, aliases, effects, rendering, and backend-kernel semantics.
 ///
-/// Input/output aliases allow a backend to reuse an input array's buffer for an output without changing Ryft's
-/// functional Single Static Assignment (SSA) semantics. Alias indices address only array inputs and outputs; trailing
-/// dimension inputs and backend-internal effect tokens are excluded.
+/// Backends that support bounded dynamic arrays pass each array to the kernel as a dense buffer at its inclusive bounds
+/// and allocate dynamic outputs the same way. Elements beyond the runtime extent are unspecified. A kernel that needs
+/// the live extent must receive it as an ordinary array input. Dynamic inputs without a finite bound are rejected.
+///
+/// Input/output aliases, declared with [`CustomCallInputOutputAlias`], allow a backend to reuse an input array's buffer
+/// for an output without changing Ryft's functional Single Static Assignment (SSA) semantics. Alias indices address
+/// only array inputs and outputs; trailing dimension inputs and backend-internal effect tokens are excluded.
 ///
 /// Type inference also validates the configuration: attribute names must be unique (including within nested
 /// dictionaries) and must not reuse the names of the operation's own rendered fields (i.e., `target`, `input_layouts`,
@@ -606,18 +608,8 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// side-effecting calls. Backends that cannot execute foreign kernels (like the reference array backend) reject
 /// interpretation with a clear error instead of guessing.
 ///
-/// Array layouts come from the canonical [`ArrayType`] descriptors of the results and from the declared input layouts.
-/// An input without a declared layout, including a [`None`] entry, uses dense row-major storage regardless of its
-/// original type's layout; an output without a layout also uses dense row-major storage. Portable flat-array buffer
-/// aliases are declared with [`CustomCallInputOutputAlias`]. A backend that accepts array inputs with bounded dynamic
-/// dimensions hands the kernel each such input as a dense buffer at its inclusive bounds, exactly like the results of
-/// the mixed form are allocated, and never passes the runtime extent: the kernel sees the whole bound-sized buffer,
-/// whose elements beyond the runtime extent are unspecified, so a kernel that needs the live extent takes it as an
-/// ordinary array input. Dynamic inputs without a finite bound have no such buffer and are rejected. Backend-specific
-/// vocabulary must never grow on this payload: encodings such as XLA's FFI API version, `backend_config`
-/// representation, tuple alias paths, result tiling attributes, or called-computation references belong in the owning
-/// backend's lowering (or in a backend-owned operation). If a configuration knob only makes sense for one backend,
-/// it does not belong on this operation.
+/// Inputs without a declared layout (including [`None`] entries) and outputs without a layout use dense row-major
+/// storage. Backend-specific configuration belongs in the backend's lowering or a backend-owned operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallOperation {
     /// Name under which the foreign kernel is registered with the executing backend.
@@ -641,6 +633,8 @@ pub struct CustomCallOperation {
     /// Behavior requested when the batching transform maps one of this call's inputs.
     batching: CustomCallBatching,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl CustomCallOperation {
     /// Creates a new [`CustomCallOperation`] with the provided target name and declared output types.
@@ -1397,7 +1391,7 @@ where
 
                 // The stacked results take the batch axis's own placement, like every other batched value.
                 let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), P::axis_size(context)?)
-                    .with_stacked_axis_sharding(context.axis_sharding().clone());
+                    .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
                 if let Some(unroll) = self.sequential_unroll(&P::axis_dimension(context)?)? {
                     scan = scan.with_unroll(unroll)?;
                 }
@@ -1689,7 +1683,7 @@ where
                 )?;
 
                 let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
-                    .with_stacked_axis_sharding(context.axis_sharding().clone());
+                    .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
                 if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
                     scan = scan.with_unroll(unroll)?;
                 }
@@ -3853,7 +3847,7 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:{packed} .
-                let %1:{packed} = scan [carry_count=0, length=2, reverse=false, stacked_axis_sharding={{'m'}}] %0 [
+                let %1:{packed} = scan [carry_count=0, length=2, reverse=false, stacked_axis_shardings=[{{'m'}}]] %0 [
                     body={{
                         lambda %0:i64[], %1:{varying} .
                         let %2:{varying} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
