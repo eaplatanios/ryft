@@ -1914,34 +1914,37 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// One branch's half of a known/residual condition split: the known and residual programs of the branch's partition,
-/// with the residual edges that the branch contributes to the shared residual boundary of the two rebuilt conditions.
-/// [`reconstruct_partitioned_condition`] builds one per branch, from a partition that partial evaluation or
-/// linearization produced.
-struct ConditionBranchSplit<V: Value, O: Operation<Type = V::Type>> {
+/// Contains the known and residual programs of one condition branch, together with the values passed between them.
+/// Specifically, this struct stores the [`PartitionedProgram`] produced by partial evaluation or linearization
+/// alongside a list of residual edges. The list contains the partition's own edges, followed by outputs known in this
+/// branch but residual in the other branch. Those outputs must still be returned by the residual condition, so their
+/// known values become extra inputs to the residual branch. [`reconstruct_partitioned_condition`] creates one instance
+/// per branch and combines their edges into a shared boundary. The known condition produces those edges; each residual
+/// branch reads only its own branch's edges. Known branches fill unused slots for the other branch's edges with
+/// placeholders.
+struct PartitionedConditionBranch<V: Value, O: Operation<Type = V::Type>> {
     /// Original branch partition, including its known and residual programs and their boundary wiring.
     partition: PartitionedProgram<V, O>,
 
-    /// Type and known-program output index of each residual edge, in edge order: the partition's edges, followed by
-    /// the folded values of outputs that this branch folded but that are residual for the condition.
+    /// Type and known-program output index of each value carried into the residual condition. Entries follow the
+    /// partition's residual-edge order, then output order for values known only in this branch.
     edges: Vec<(V::Type, usize)>,
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
-    /// Creates the [`ConditionBranchSplit`] of one branch from `partition`, the partition of that branch over the
-    /// knownness mask `input_known` of the branch inputs, for a condition whose output `index` is known exactly when
-    /// `output_known[index]` holds. Each residual edge of the partition becomes an edge of the branch, and each output
-    /// that the branch folded but that is residual for the condition (i.e., that the peer branch did not fold) becomes
-    /// one more edge, which the residual branch then returns.
+// TODO(eaplatanios): Review from here onwards.
+
+impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
+    /// Creates a new [`PartitionedConditionBranch`] by validating `partition` against its input knownness mask
+    /// `input_known` and preparing the residual edges for the condition's output knownness mask `output_known`.
+    /// An output is known to the condition only when it is known in both branches. A result known only in this branch
+    /// must be carried through an extra residual edge so the residual branch can return it.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the partition forwards residual inputs, selects other known
-    /// inputs than `input_known`, or violates the edge layout that
-    /// [`PartitionedProgram::validate_canonical_residual_edges`] validates,
-    /// and [`ProgramError::InvalidOutputCount`] when it reports a different number of outputs than `output_known`.
+    /// Returns [`ProgramError::MalformedProgram`] when the partition forwards residual inputs,
+    /// selects other known inputs than `input_known`, or violates the edge layout that
+    /// [`PartitionedProgram::validate_canonical_residual_edges`] validates, and [`ProgramError::InvalidOutputCount`]
+    /// when it reports a different number of outputs than `output_known`.
     fn from_partition(
         partition: PartitionedProgram<V, O>,
         input_known: &[bool],
@@ -2180,8 +2183,8 @@ fn reconstruct_partitioned_condition<
                 .all(|partition| matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_))))
         })
         .collect::<Vec<bool>>();
-    let true_split = ConditionBranchSplit::from_partition(true_partition, input_known, &output_known)?;
-    let false_split = ConditionBranchSplit::from_partition(false_partition, input_known, &output_known)?;
+    let true_split = PartitionedConditionBranch::from_partition(true_partition, input_known, &output_known)?;
+    let false_split = PartitionedConditionBranch::from_partition(false_partition, input_known, &output_known)?;
     let splits = [&true_split, &false_split];
 
     // Every residual edge is an output of the known condition. Devices whose predicates differ take different branches
@@ -2978,7 +2981,7 @@ mod tests {
         assert!(!ArrayType::new_static(DataType::Boolean, [2]).is_condition_predicate());
         assert!(
             !ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()))
-                .is_condition_predicate()
+                .is_condition_predicate(),
         );
         assert!(!ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::Boolean))).is_condition_predicate());
     }
@@ -3134,7 +3137,7 @@ mod tests {
                 interfaces.as_slice(),
             ),
             Err(TypeError::invalid(
-                "`condition` input 1 has type `f64[2]`, which does not refine its branch input type `f64[]`"
+                "`condition` input 1 has type `f64[2]`, which does not refine its branch input type `f64[]`",
             )),
         );
 
@@ -3175,7 +3178,7 @@ mod tests {
                 &[true_branch.interface(), boolean_branch.interface()],
             ),
             Err(TypeError::invalid(
-                "`condition` branch output type signature mismatch: expected [f64[]] but got [bool[]]"
+                "`condition` branch output type signature mismatch: expected [f64[]] but got [bool[]]",
             )),
         );
 
@@ -3281,14 +3284,14 @@ mod tests {
             branches[0].to_string(),
             indoc! {"
             lambda %0:f64[extent] .
-            in (%0)"}
+            in (%0)"},
         );
         assert_eq!(
             branches[1].to_string(),
             indoc! {"
             lambda %0:f64[extent] .
             let %1:f64[3] = const [2.0, 2.0, 2.0]
-            in (%1)"}
+            in (%1)"},
         );
         let interfaces = branches.each_ref().map(Program::interface);
 
@@ -3460,7 +3463,7 @@ mod tests {
                 &[
                     predicate_type.clone(),
                     ArrayIrType::Array(ArrayType::new_static(DataType::F32, [9])),
-                    static_type.clone()
+                    static_type.clone(),
                 ],
                 interfaces.as_slice(),
             ),
@@ -3567,7 +3570,7 @@ mod tests {
                     in (%0)
                 },
             ]
-            in (%3)"}
+            in (%3)"},
         );
 
         let context = TracingContext::<TestIrValue, TestIrOperation>::new();
@@ -3597,7 +3600,7 @@ mod tests {
                     in (%0)
                 },
             ]
-            in (%3)"}
+            in (%3)"},
         );
 
         for predicate in [false, true] {
@@ -3700,7 +3703,7 @@ mod tests {
         let input = context.input(varying_type.clone());
         assert_eq!(
             context.bind(operation, branches.clone(), &[predicate, input]).map(|_| ()),
-            Err(ProgramError::Type(expected.clone()))
+            Err(ProgramError::Type(expected.clone())),
         );
         assert!(context.builder().borrow().instructions().is_empty());
         for predicate in [false, true] {
@@ -3708,7 +3711,7 @@ mod tests {
             let input = Array::from_elements::<f64>(varying_type.clone(), &[1.0]).unwrap();
             assert_eq!(
                 context.bind(operation, branches.clone(), &[Array::scalar(predicate).unwrap(), input]),
-                Err(ProgramError::Type(expected.clone()))
+                Err(ProgramError::Type(expected.clone())),
             );
         }
     }
@@ -4208,14 +4211,14 @@ mod tests {
         assert_eq!(
             discharged.program().interpret(vec![
                 TestIrValue::Array(Array::scalar(true).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(4.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(4.0).unwrap()),
             ]),
             Ok(vec![TestIrValue::Array(Array::scalar::<f32>(4.0).unwrap())]),
         );
         assert_eq!(
             discharged.program().interpret(vec![
                 TestIrValue::Array(Array::scalar(false).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(4.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(4.0).unwrap()),
             ]),
             Ok(vec![TestIrValue::Array(Array::scalar::<f32>(4.0).unwrap())]),
         );
@@ -4353,11 +4356,11 @@ mod tests {
             discharged.program().interpret(vec![
                 TestIrValue::Array(Array::scalar(true).unwrap()),
                 TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap()),
             ]),
             Ok(vec![
                 TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap()),
             ]),
         );
 
@@ -4366,11 +4369,11 @@ mod tests {
             discharged.program().interpret(vec![
                 TestIrValue::Array(Array::scalar(false).unwrap()),
                 TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(7.0).unwrap()),
             ]),
             Ok(vec![
                 TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
             ]),
         );
 
@@ -4440,7 +4443,7 @@ mod tests {
             discharged.external_reference_bindings(),
             &[
                 ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, None),
-                ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, Some(1))
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, Some(1)),
             ],
         );
 
@@ -4455,7 +4458,7 @@ mod tests {
             discharged.program().interpret(inputs),
             Ok(vec![
                 TestIrValue::Array(Array::scalar(10.0f32).unwrap()),
-                TestIrValue::Array(Array::scalar(21.0f32).unwrap())
+                TestIrValue::Array(Array::scalar(21.0f32).unwrap()),
             ]),
         );
         let inputs = vec![
@@ -4467,7 +4470,7 @@ mod tests {
             discharged.program().interpret(inputs),
             Ok(vec![
                 TestIrValue::Array(Array::scalar(20.0f32).unwrap()),
-                TestIrValue::Array(Array::scalar(20.0f32).unwrap())
+                TestIrValue::Array(Array::scalar(20.0f32).unwrap()),
             ]),
         );
     }
@@ -4884,7 +4887,7 @@ mod tests {
             discharged.external_reference_bindings(),
             &[
                 ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, Some(2)),
-                ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, Some(3))
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, Some(3)),
             ],
         );
 
@@ -4903,7 +4906,7 @@ mod tests {
                 TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
                 TestIrValue::Array(Array::scalar::<f32>(20.0).unwrap()),
                 TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(22.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(22.0).unwrap()),
             ]),
         );
 
@@ -4921,7 +4924,7 @@ mod tests {
                 TestIrValue::Array(Array::scalar::<f32>(10.0).unwrap()),
                 TestIrValue::Array(Array::scalar::<f32>(20.0).unwrap()),
                 TestIrValue::Array(Array::scalar::<f32>(11.0).unwrap()),
-                TestIrValue::Array(Array::scalar::<f32>(20.0).unwrap())
+                TestIrValue::Array(Array::scalar::<f32>(20.0).unwrap()),
             ]),
         );
     }
@@ -6369,7 +6372,7 @@ mod tests {
             assert_eq!(program.interpret(inputs), Ok(expected.clone()));
         }
         let inputs = vec![array(Array::scalar(true).unwrap()), dimension(&renamed_extent_type, 4), input];
-        assert!(is_extent_mismatch(&eager.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs,)));
+        assert!(is_extent_mismatch(&eager.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs)));
         assert!(is_extent_mismatch(&program.interpret(inputs)));
     }
 
@@ -6665,7 +6668,7 @@ mod tests {
                     in (%1)
                 },
             ]
-            in (%2)"}
+            in (%2)"},
         );
     }
 
@@ -6986,7 +6989,7 @@ mod tests {
                     in (%0)
                 },
             ]
-            in (%3)"}
+            in (%3)"},
         );
     }
 
@@ -8867,7 +8870,7 @@ mod tests {
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0)]);
         assert!(matches!(
             evaluation.inputs.as_slice(),
-            [PartialEvaluationInput::Unknown(2), PartialEvaluationInput::Known(_), PartialEvaluationInput::Known(_),],
+            [PartialEvaluationInput::Unknown(2), PartialEvaluationInput::Known(_), PartialEvaluationInput::Known(_)],
         ));
         let known_program = known_side_program(&outer, &evaluation, 2);
         let invariant = "f32[][sharding={mesh<['devices'=2:manual]>, []}]";
@@ -9248,7 +9251,7 @@ mod tests {
                 [array(Array::scalar(predicate).unwrap()), dimension(&extent_type, 3), left.clone(), right.clone()];
             assert_eq!(
                 program.interpret(arguments.to_vec()),
-                Ok(vec![array(Array::vector(expected.clone()).unwrap())])
+                Ok(vec![array(Array::vector(expected.clone()).unwrap())]),
             );
             assert_eq!(
                 evaluation.interpret(&TestEagerContext::new(), &[arguments[0].clone(), arguments[3].clone()]),
@@ -10628,16 +10631,55 @@ mod tests {
         let input = matrix(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let other_input = matrix(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
         let extent = DimensionValue::constant(2).unwrap();
-        for (predicate_axis, predicate, expected) in [
+        for (predicate_axis, predicate, expected, expected_program) in [
             (
                 BatchAxis::replicated(),
                 array(Array::scalar(true).unwrap()),
                 matrix(&[11.0, 24.0, 39.0, 56.0, 75.0, 96.0]),
+                indoc! {"
+                    lambda %0:dimension<2>, %1:bool[], %2:f64[2, 3], %3:f64[2, 3] .
+                    let %4:f64[2, 3] = condition %1 %0 %2 %3 [
+                        true={
+                            lambda %0:dimension<2>, %1:f64[2, 3], %2:f64[2, 3] .
+                            let %3:f64[2, 3] = mul %1 %1
+                                %4:f64[2, 3] = add %3 %2
+                            in (%4)
+                        },
+                        false={
+                            lambda %0:dimension<2>, %1:f64[2, 3], %2:f64[2, 3] .
+                            let %3:f64[2, 3] = add %1 %2
+                            in (%3)
+                        },
+                    ]
+                    in (%0, %4)"},
             ),
             (
                 BatchAxis::new(0),
                 array(Array::vector(vec![true, false]).unwrap()),
                 matrix(&[11.0, 24.0, 39.0, 44.0, 55.0, 66.0]),
+                indoc! {"
+                    lambda %0:dimension<2>, %1:bool[2], %2:f64[2, 3], %3:f64[2, 3] .
+                    let %4:dimension<3> = constant [value=3]
+                        %5:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %4
+                        %6:dimension<3> = constant [value=3]
+                        %7:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %6
+                        %8:f64[2, 3] = stop_gradient %2
+                        %9:f64[2, 3] = select %7 %2 %8
+                        %10:f64[2, 3] = mul %9 %9
+                        %11:dimension<3> = constant [value=3]
+                        %12:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %11
+                        %13:f64[2, 3] = stop_gradient %3
+                        %14:f64[2, 3] = select %12 %3 %13
+                        %15:f64[2, 3] = add %10 %14
+                        %16:dimension<3> = constant [value=3]
+                        %17:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %16
+                        %18:f64[2, 3] = select %17 %8 %2
+                        %19:dimension<3> = constant [value=3]
+                        %20:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %19
+                        %21:f64[2, 3] = select %20 %13 %3
+                        %22:f64[2, 3] = add %18 %21
+                        %23:f64[2, 3] = select %5 %15 %22
+                    in (%0, %23)"},
             ),
         ] {
             let batched = refined_vector_condition_program()
@@ -10650,58 +10692,14 @@ mod tests {
                 .unwrap()
                 .into_parts()
                 .0;
-            assert_eq!(
-                batched.to_string(),
-                if predicate_axis.is_replicated() {
-                    indoc! {"
-                        lambda %0:dimension<2>, %1:bool[], %2:f64[2, 3], %3:f64[2, 3] .
-                        let %4:f64[2, 3] = condition %1 %0 %2 %3 [
-                            true={
-                                lambda %0:dimension<2>, %1:f64[2, 3], %2:f64[2, 3] .
-                                let %3:f64[2, 3] = mul %1 %1
-                                    %4:f64[2, 3] = add %3 %2
-                                in (%4)
-                            },
-                            false={
-                                lambda %0:dimension<2>, %1:f64[2, 3], %2:f64[2, 3] .
-                                let %3:f64[2, 3] = add %1 %2
-                                in (%3)
-                            },
-                        ]
-                        in (%0, %4)"}
-                } else {
-                    indoc! {"
-                        lambda %0:dimension<2>, %1:bool[2], %2:f64[2, 3], %3:f64[2, 3] .
-                        let %4:dimension<3> = constant [value=3]
-                            %5:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %4
-                            %6:dimension<3> = constant [value=3]
-                            %7:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %6
-                            %8:f64[2, 3] = stop_gradient %2
-                            %9:f64[2, 3] = select %7 %2 %8
-                            %10:f64[2, 3] = mul %9 %9
-                            %11:dimension<3> = constant [value=3]
-                            %12:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %11
-                            %13:f64[2, 3] = stop_gradient %3
-                            %14:f64[2, 3] = select %12 %3 %13
-                            %15:f64[2, 3] = add %10 %14
-                            %16:dimension<3> = constant [value=3]
-                            %17:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %16
-                            %18:f64[2, 3] = select %17 %8 %2
-                            %19:dimension<3> = constant [value=3]
-                            %20:bool[2, 3] = broadcast [output_axes=[0]] %1 %0 %19
-                            %21:f64[2, 3] = select %20 %13 %3
-                            %22:f64[2, 3] = add %18 %21
-                            %23:f64[2, 3] = select %5 %15 %22
-                        in (%0, %23)"}
-                },
-            );
+            assert_eq!(batched.to_string(), expected_program);
             assert_eq!(batched.output_types()[1], ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])));
             assert_eq!(
                 batched.interpret(vec![
                     TestIrValue::Dimension(extent.clone()),
                     predicate,
                     input.clone(),
-                    other_input.clone()
+                    other_input.clone(),
                 ]),
                 Ok(vec![TestIrValue::Dimension(extent.clone()), expected]),
             );
@@ -10828,8 +10826,7 @@ mod tests {
                 in (%0, %4, %5)"},
         );
 
-        // Generic program interpretation cannot bind a reference entering a branch region (stateful compilation
-        // domains own that boundary), so the runtime agreement is checked through the discharged program.
+        // Interpreting both batched programs yields the same snapshot and final state for either predicate.
         for (predicate, expected) in [(true, vec![2.0f32, 4.0]), (false, vec![1.0f32, 2.0])] {
             let inputs = vec![
                 TestIrValue::Dimension(axis_extent.clone()),
@@ -11437,7 +11434,7 @@ mod tests {
         let reference = TestIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()));
         let inputs = vec![array(Array::scalar(true).unwrap()), dimension(&n_type, 3), reference.clone()];
         assert_eq!(
-            TestEagerContext::new().bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs,),
+            TestEagerContext::new().bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
             Ok(vec![reference.clone()]),
         );
         let (outputs, _) = differentiate_at(inputs)
@@ -11880,7 +11877,7 @@ mod tests {
         // With the reference inactive it reaches the branches as plumbing at a non-prefix position: the branches
         // receive no tangent input for it (`[x, r, ẋ]`), the read's tangent is zero, and the program still
         // differentiates with `ẏ = ẋ`. The fused program is spliced behind local allocations of the reference inputs so
-        // that the interpreted program owns the state it mutates.
+        // that the interpreted program owns the state that its branches read.
         let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -11922,7 +11919,7 @@ mod tests {
             ]),
             Ok(vec![
                 TestIrValue::Array(Array::scalar(7.0f32).unwrap()),
-                TestIrValue::Array(Array::scalar(3.0f32).unwrap())
+                TestIrValue::Array(Array::scalar(3.0f32).unwrap()),
             ]),
         );
 
@@ -11978,7 +11975,7 @@ mod tests {
             ]),
             Ok(vec![
                 TestIrValue::Array(Array::scalar(7.0f32).unwrap()),
-                TestIrValue::Array(Array::scalar(3.5f32).unwrap())
+                TestIrValue::Array(Array::scalar(3.5f32).unwrap()),
             ]),
         );
     }
@@ -12043,13 +12040,13 @@ mod tests {
             ]),
             Ok(vec![
                 TestIrValue::Array(Array::scalar(5.0f32).unwrap()),
-                TestIrValue::Array(Array::scalar(0.0f32).unwrap())
+                TestIrValue::Array(Array::scalar(0.0f32).unwrap()),
             ]),
         );
 
         // An active reference is forwarded together with its tangent reference, and the read pairs them back up. The
         // fused program is spliced behind local allocations of the reference inputs so that the interpreted program
-        // owns the state it mutates.
+        // owns the state that it reads.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -12110,7 +12107,7 @@ mod tests {
             ]),
             Ok(vec![
                 TestIrValue::Array(Array::scalar(5.0f32).unwrap()),
-                TestIrValue::Array(Array::scalar(0.5f32).unwrap())
+                TestIrValue::Array(Array::scalar(0.5f32).unwrap()),
             ]),
         );
     }
@@ -12538,10 +12535,10 @@ mod tests {
 
     #[test]
     fn test_condition_differentiation_reuses_shared_branch_transforms() {
-        // The `condition` differentiation rules reach their branches through the per-`Region` transform
-        // cache, so several programs attaching one shared pair of branches derive each branch's fused forward-mode
-        // program once and each branch's transposition once per linearity mask, while staging exactly the programs the
-        // uncached path stages from independently built copies of the same branches.
+        // The `condition` differentiation rules reach their branches through the per-`Region` transform cache, so
+        // several programs attaching one shared pair of branches derive each branch's transposition once per linearity
+        // mask, while staging exactly the programs the uncached path stages from independently built copies of the
+        // same branches.
         /// Builds a program that applies a condition over the provided branches followed by `epilogue` sines, so that
         /// programs sharing one pair of branches still have distinct derived programs.
         fn conditional_program(
@@ -12901,7 +12898,7 @@ mod tests {
             Ok(vec![
                 dimension(&extent_type, 4),
                 array(Array::scalar(10.0).unwrap()),
-                array(Array::scalar(14.0).unwrap())
+                array(Array::scalar(14.0).unwrap()),
             ]),
         );
 
@@ -13020,7 +13017,7 @@ mod tests {
                 array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 3),
             ]),
-            Ok(vec![array(Array::vector(vec![0.0f64; 3]).unwrap()), array(Array::vector(vec![0.0f64; 3]).unwrap()),]),
+            Ok(vec![array(Array::vector(vec![0.0f64; 3]).unwrap()), array(Array::vector(vec![0.0f64; 3]).unwrap())]),
         );
 
         // Eager direct JVP derives the concrete output tangent extent from the selected primal result at the public
@@ -13154,6 +13151,7 @@ mod tests {
 
     #[test]
     fn test_condition_differentiation_jvp_receives_projection_materialized_zero_tangents() {
+        // The `stop_gradient` projection owns the shaped-zero materialization; no test in this module owns it.
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let branch = || {
@@ -13252,7 +13250,7 @@ mod tests {
             ]),
             Ok(vec![
                 array(Array::vector(vec![11.0, 22.0, 33.0]).unwrap()),
-                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
             ]),
         );
     }
@@ -14396,7 +14394,7 @@ mod tests {
                 transposed
                     .program()
                     .interpret(vec![Array::scalar(2.0f64).unwrap(), Array::scalar(predicate).unwrap()]),
-                Ok(vec![Array::scalar(16.0f64).unwrap()])
+                Ok(vec![Array::scalar(16.0f64).unwrap()]),
             );
         }
     }
@@ -14485,7 +14483,7 @@ mod tests {
             for predicate in [true, false] {
                 assert_eq!(
                     program.interpret(vec![Array::scalar(3.0f64).unwrap(), Array::scalar(predicate).unwrap()]),
-                    Ok(Vec::new())
+                    Ok(Vec::new()),
                 );
             }
         }
@@ -14805,7 +14803,7 @@ mod tests {
             vec![
                 scalar_type.clone(),
                 ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
-                predicate_type
+                predicate_type,
             ],
         );
         assert_eq!(
