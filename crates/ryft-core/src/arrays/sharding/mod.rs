@@ -1,6 +1,10 @@
 use thiserror::Error;
 
-use crate::programs::TypeError;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::DimensionType;
+use crate::arrays::types::ir::ArrayIrType;
+use crate::programs::{ReferenceType, Type, TypeError};
 
 pub mod meshes;
 pub mod shardings;
@@ -75,8 +79,68 @@ impl From<ShardingError> for TypeError {
     }
 }
 
+/// Read-only access to the optional [`Sharding`] of a type family. Arrays expose their placement, references expose
+/// their referent's placement, and scalar data types and first-class dimensions carry no sharding. Composite types
+/// follow the corresponding member's contract. Operations separately validate which members they accept and which
+/// placement or variation transitions they permit.
+pub trait ShardableType: Type {
+    /// Returns the sharding metadata of this type, or of its referent for a reference, when present.
+    fn sharding(&self) -> Option<&Sharding>;
+
+    /// Returns whether this type records variation across at least one manual mesh axis through
+    /// [`Sharding::varying_manual_axes`]. This describes permitted differences between devices;
+    /// actual values may still be equal. Types without sharding metadata return `false`.
+    #[inline]
+    fn is_varying(&self) -> bool {
+        self.sharding().is_some_and(|sharding| !sharding.varying_manual_axes().is_empty())
+    }
+}
+
+impl<T: ShardableType> ShardableType for ReferenceType<T> {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        self.referent().sharding()
+    }
+}
+
+impl ShardableType for DataType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        None
+    }
+}
+
+impl ShardableType for ArrayType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        self.sharding()
+    }
+}
+
+impl ShardableType for DimensionType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        None
+    }
+}
+
+impl ShardableType for ArrayIrType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        match self {
+            Self::Array(r#type) => r#type.sharding(),
+            Self::Dimension(r#type) => r#type.sharding(),
+            Self::Reference(r#type) => r#type.sharding(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::types::dimensions::Dimension;
+
     use super::*;
 
     #[test]
@@ -86,5 +150,50 @@ mod tests {
         assert_eq!(type_error.downcast_custom::<ShardingError>(), Some(&error));
         assert_eq!(type_error.clone().downcast_custom::<ShardingError>(), Some(&error));
         assert_eq!(type_error.to_string(), error.to_string());
+    }
+
+    #[test]
+    fn test_shardable_type_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["devices"]).unwrap();
+        let array = ArrayType::new_static(DataType::F32, [3]).with_sharding(sharding.clone()).unwrap();
+        let reference = ReferenceType::new(array.clone());
+        let dimension = DimensionType::from(Dimension::Static(3));
+
+        // Disambiguate the trait query from the existing concrete array accessor.
+        assert_eq!(ShardableType::sharding(&array), Some(&sharding));
+        assert_eq!(reference.sharding(), Some(&sharding));
+        assert_eq!(ArrayIrType::Array(array).sharding(), Some(&sharding));
+        assert_eq!(ArrayIrType::Reference(reference).sharding(), Some(&sharding));
+        assert_eq!(ArrayType::scalar(DataType::Boolean).sharding(), None);
+        assert_eq!(DataType::F32.sharding(), None);
+        assert_eq!(dimension.sharding(), None);
+        assert_eq!(ArrayIrType::Dimension(dimension).sharding(), None);
+    }
+
+    #[test]
+    fn test_shardable_type_is_varying() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = invariant
+            .clone()
+            .with_sharding(invariant.sharding().unwrap().clone().with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        let tiled = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap())
+            .unwrap();
+        assert!(!ArrayType::scalar(DataType::Boolean).is_varying());
+        assert!(!invariant.is_varying());
+        assert!(!tiled.is_varying());
+        assert!(varying.is_varying());
+        assert!(!ReferenceType::new(invariant.clone()).is_varying());
+        assert!(ReferenceType::new(varying.clone()).is_varying());
+        assert!(!ArrayIrType::Array(invariant).is_varying());
+        assert!(ArrayIrType::Array(varying.clone()).is_varying());
+        assert!(ArrayIrType::Reference(ReferenceType::new(varying)).is_varying());
+        assert!(!DataType::F32.is_varying());
+        let dimension = DimensionType::from(Dimension::Static(3));
+        assert!(!dimension.is_varying());
+        assert!(!ArrayIrType::Dimension(dimension).is_varying());
     }
 }

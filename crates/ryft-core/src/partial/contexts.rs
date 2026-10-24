@@ -1284,18 +1284,18 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     /// # Parameters
     ///
-    ///   - `declared`: Declared input types of the entry.
+    ///   - `declared_types`: Declared input types of the entry.
     ///   - `inputs`: Entry values in input order, with [`None`] marking root unknowns that are not allocated yet.
     ///   - `input_types`: Actual types of `inputs`, in input order.
     ///   - `guard_shared_identities`: Refer to [`Self::plan_entry_guard`] for information on this argument.
     fn prepare_entry_inputs(
         &self,
-        declared: &[C::Type],
+        declared_types: &[C::Type],
         mut inputs: Vec<Option<PartialEvaluationValue<C::Value>>>,
         mut input_types: Vec<C::Type>,
         guard_shared_identities: bool,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        check_count!("input", inputs, declared.len(), ProgramError);
+        check_count!("input", inputs, declared_types.len(), ProgramError);
         check_count!("input", input_types, inputs.len(), ProgramError);
 
         // Plan the narrowing of the known members of the entry by the relationships among the known inputs alone.
@@ -1315,7 +1315,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             .map(|input| input.as_ref().is_some_and(PartialEvaluationValue::is_known))
             .collect::<Vec<_>>();
         let indices = (0..known.len()).filter(|&index| known[index]).collect::<Vec<_>>();
-        let known_declared = indices.iter().map(|&index| declared[index].clone()).collect::<Vec<_>>();
+        let known_declared = indices.iter().map(|&index| declared_types[index].clone()).collect::<Vec<_>>();
         let known_types = indices.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
         if let Some((guard, members)) = GuardOperation::for_entry("partial evaluation", &known_declared, &known_types)?
         {
@@ -1342,7 +1342,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             for (index, r#type) in &outputs {
                 narrowed_types[*index] = r#type.clone();
             }
-            Self::plan_entry_guard(declared, &inputs, &mut narrowed_types, guard_shared_identities)?;
+            Self::plan_entry_guard(declared_types, &inputs, &mut narrowed_types, guard_shared_identities)?;
 
             // Apply the known guard, replacing only the known members whose types it changes.
             let guarded = members.iter().map(|&index| inputs[index].clone().unwrap()).collect::<Vec<_>>();
@@ -1357,7 +1357,8 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
 
         // Plan and apply the guard over the complete entry, whose known members are now narrowed.
-        let (members, guard) = Self::plan_entry_guard(declared, &inputs, &mut input_types, guard_shared_identities)?;
+        let (members, guard) =
+            Self::plan_entry_guard(declared_types, &inputs, &mut input_types, guard_shared_identities)?;
         let mut inputs = inputs
             .into_iter()
             .zip(input_types)
@@ -1369,7 +1370,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         };
         let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
         let output_members =
-            members.iter().copied().filter(|&index| !declared[index].is_reference()).collect::<Vec<_>>();
+            members.iter().copied().filter(|&index| !declared_types[index].is_reference()).collect::<Vec<_>>();
         let outputs = self.fold_or_residualize(guard, Vec::new(), &guarded)?;
         check_count!("output", outputs, output_members.len(), ProgramError);
         for (index, output) in output_members.into_iter().zip(outputs) {
@@ -1395,7 +1396,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     /// # Parameters
     ///
-    ///   - `declared`: Declared input types of the entry.
+    ///   - `declared_types`: Declared input types of the entry.
     ///   - `inputs`: Current entry values in input order, with known members already narrowed among themselves and
     ///     [`None`] marking root unknowns that are not allocated yet.
     ///   - `input_types`: Actual types of `inputs`, in input order. Unallocated root unknowns outside the guard are
@@ -1405,12 +1406,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     the unknown inputs are supplied by a separate invocation and the entry's body has effects (refer to
     ///     [`Self::guard_inputs`]).
     fn plan_entry_guard(
-        declared: &[C::Type],
+        declared_types: &[C::Type],
         inputs: &[Option<PartialEvaluationValue<C::Value>>],
         input_types: &mut [C::Type],
         guard_shared_identities: bool,
     ) -> Result<(Vec<usize>, Option<C::Operation>), ProgramError> {
-        let mut members = GuardOperation::for_entry("partial evaluation", declared, input_types)?
+        let mut members = GuardOperation::for_entry("partial evaluation", declared_types, input_types)?
             .map(|(_, members)| members)
             .unwrap_or_default();
         let pinned = Self::pinned_identities(
@@ -1423,7 +1424,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         if inputs.iter().any(Option::is_none) {
             // Outside guarded members, only an actual identity's own singleton bounds can narrow an unknown.
             // Guarded representations always stay inside the body, so checked unknown headers remain unchanged.
-            let refinements = <C::Type as Type>::Refinements::new(declared.iter(), input_types.iter())?;
+            let refinements = <C::Type as Type>::Refinements::new(declared_types.iter(), input_types.iter())?;
             for (index, (input_type, input)) in input_types.iter_mut().zip(inputs).enumerate() {
                 if input.is_none() && !input_type.is_reference() && !members.contains(&index) {
                     *input_type = refinements.refine_actual(input_type, &pinned)?;
@@ -1460,8 +1461,9 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
 
         let member_types = members.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
-        let declared_types = members.iter().map(|&index| declared[index].clone()).collect();
-        let guard = GuardOperation::new("partial evaluation", declared_types).retaining(&member_types, &pinned)?;
+        let member_declared_types = members.iter().map(|&index| declared_types[index].clone()).collect();
+        let guard =
+            GuardOperation::new("partial evaluation", member_declared_types).retaining(&member_types, &pinned)?;
         let guard = C::Operation::provide(guard, &member_types.iter().collect::<Vec<_>>())?;
         Ok((members, Some(guard)))
     }

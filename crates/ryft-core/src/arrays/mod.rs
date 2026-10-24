@@ -40,8 +40,8 @@ pub use references::{
     ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayReferenceViewError,
 };
 pub use sharding::{
-    Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,
-    ShardingError, ShardingVisualization,
+    Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, ShardableType, Sharding,
+    ShardingDimension, ShardingError, ShardingVisualization,
 };
 pub use types::{
     ArrayIrType, ArrayIrTypeRefinements, ArrayType, ArrayTypeRefinements, AsArrayType, AsDimensionType, DataType,

@@ -30,26 +30,27 @@
 //!     binds per device like an ordinary operation.
 //!   - **Region Operations:** An operation whose attached region closure contains no collective over an emulated axis
 //!     binds per device, so its regions run through the ordinary eager rules. Otherwise, its regions run in lockstep:
-//!     a `while` loop iterates until every device's predicate is false, a `condition` runs the branch that every
-//!     device selects, a `scan` iterates over its static length (passing reference carries and stacks through, as its
-//!     eager rule does), `custom_function`, `linear_call`, and `rematerialize` replay their primal region, and a nested
-//!     `shard_map` extends the device set by its own active manual axes. A `while` or `scan` first validates on every
-//!     device what its eager rule validates before the first iteration (e.g., that its body returns each reference
-//!     carry as the reference that it entered with). Devices whose `while` or `condition` predicates diverge cannot run
-//!     such regions in lockstep, and every other region operation that needs lockstep execution (including a `scan`
-//!     with a dynamic length) is rejected with [`ProgramError::UnsupportedOperation`].
+//!     `while`, `condition`, and `scan` run their eager rules over values that hold the value of every device, whose
+//!     regions the emulator replays in lockstep, so that they validate, iterate, and select exactly as eager
+//!     interpretation does on every device. Their inputs must have the same type on every device, the devices must
+//!     agree on every `while` and `condition` predicate, and a `scan` slice whose manual variation differs from that
+//!     of its stack widens both to the join of their variation, as `parallel_vary` would. `custom_function`,
+//!     `linear_call`, and `rematerialize` replay their primal region, and a nested `shard_map` extends the device set
+//!     by its own active manual axes. Devices that disagree cannot run such regions in lockstep, and every other region
+//!     operation that needs lockstep execution is rejected, both with [`ProgramError::UnsupportedOperation`].
 //!
 //! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region
 //! operation in lockstep requires knowing how its regions are sequenced (e.g., how many times and with which inputs),
 //! which the emulator knows only for the operations above: the eager rule of any other region operation runs its
-//! regions on one device's values at a time, which cannot compute a collective across devices. The trip count of a
-//! dynamic-length `scan` is a per-device value that the devices could disagree on, like a divergent predicate, and
-//! supporting it would add a consensus check for a case that static-length scans already cover. Backends with a device
+//! regions on one device's values at a time, which cannot compute a collective across devices. Backends with a device
 //! runtime execute all of these bodies.
 
+use std::borrow::Cow;
+use std::fmt::Display;
+
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, Dimension, Sharding,
-    ShardingDimension,
+    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType,
+    Sharding, ShardingDimension,
 };
 use crate::contexts::{Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -62,18 +63,21 @@ use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
 use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAllOperation;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
-use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
+use crate::operations::collectives::parallel_vary::{
+    ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
+};
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
 use crate::operations::control_flow::scan::{ScanIterationType, ScanOperation};
-use crate::operations::control_flow::r#while::{WhileOperation, WhilePredicate};
+use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate};
 use crate::operations::custom_functions::operations::CUSTOM_FUNCTION_OPERATION_NAME;
 use crate::operations::differentiation::linear_call::LINEAR_CALL_OPERATION_NAME;
 use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_NAME;
 use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::parameters::Parameter;
 use crate::programs::{
     Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection, ProgramError, RegionRef,
-    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed, Value,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed, Value, ValueDirectDispatch,
 };
 
 use super::{SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, boundary_array_type};
@@ -403,8 +407,8 @@ where
         if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
             return self.run_while(operation, regions[0], regions[1], inputs);
         }
-        if operation.projected_payload::<ConditionOperation<ArrayIrType>>().is_some() {
-            return self.run_condition(&regions, inputs);
+        if let Some(operation) = operation.projected_payload::<ConditionOperation<ArrayIrType>>() {
+            return self.run_condition(operation, [regions[0], regions[1]], inputs);
         }
         if let Some(operation) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
             return self.run_scan(operation, regions[0], inputs);
@@ -697,9 +701,9 @@ where
         Ok(Some(vec![outputs]))
     }
 
-    /// Runs a `while` loop whose condition or body uses collectives over the emulated axes in lockstep, applying the
-    /// same masked state update as the eager rule on every device. Like the eager rule, it first validates on every
-    /// device that the body returns each reference carry as the reference that it entered with.
+    /// Runs a `while` loop whose condition or body uses collectives over the emulated axes in lockstep, through its
+    /// eager rule over [`LockstepValue`]s (refer to [`WhileOperation::interpret_with`]): the devices must agree on
+    /// whether the loop continues, and each device masks its own state with its own predicate.
     fn run_while(
         &self,
         operation: &WhileOperation<ArrayIrType>,
@@ -707,142 +711,267 @@ where
         body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
-        for device in 0..self.grid.device_count() {
-            let input_references = inputs.iter().map(|values| values[device].reference_id()).collect::<Vec<_>>();
-            operation.validate_live_reference_carries(body, &input_references)?;
-        }
-        let mut state = inputs.to_vec();
-        let mut completed_iterations = 0;
-        loop {
-            if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                return Ok(state);
-            }
-            let mut predicates = self.run_region(condition, state.clone())?;
-            check_count!("output", predicates, 1, ProgramError);
-            let predicates = predicates.remove(0);
-            let continuing = predicates.iter().map(WhilePredicate::any_true).collect::<Result<Vec<_>, _>>()?;
-            if continuing.iter().all(|continuing| !continuing) {
-                return Ok(state);
-            }
-            if !continuing.iter().all(|continuing| *continuing) {
-                return Err(divergent_predicates_error(operation.name()));
-            }
-            let candidates = self.run_region(body, state.clone())?;
-            check_count!("output", candidates, state.len(), ProgramError);
-            state = candidates
-                .iter()
-                .zip(&state)
-                .map(|(candidates, carried)| {
-                    predicates
-                        .iter()
-                        .zip(candidates.iter().zip(carried))
-                        .map(|(predicate, (candidate, carried))| predicate.mask_select(candidate, carried))
-                        .collect()
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            completed_iterations += 1;
-        }
+        let inputs = lockstep_values(operation.name(), inputs)?;
+        let outputs = operation.interpret_with(
+            body,
+            &inputs,
+            |state| self.run_lockstep_region(condition, state),
+            |state| self.run_lockstep_region(body, state),
+        )?;
+        Ok(outputs.into_iter().map(|output| output.0).collect())
     }
 
-    /// Runs the branch of a `condition` whose branches use collectives over the emulated axes in lockstep, which
-    /// requires every device to select the same branch.
+    /// Runs the branch of a `condition` whose branches use collectives over the emulated axes in lockstep, through its
+    /// eager rule over [`LockstepValue`]s (refer to [`ConditionOperation::interpret_with`]), which requires every
+    /// device to select the same branch.
     fn run_condition(
         &self,
-        branches: &[RegionRef<'_, ArrayIrValue<Array>, C::Operation>],
+        operation: &ConditionOperation<ArrayIrType>,
+        branches: [RegionRef<'_, ArrayIrValue<Array>, C::Operation>; 2],
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let (predicates, inputs) =
-            inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        let predicates = predicates.iter().map(Concretizable::<bool>::concretize).collect::<Result<Vec<_>, _>>()?;
-        if predicates.iter().any(|predicate| *predicate != predicates[0]) {
-            return Err(divergent_predicates_error(CONDITION_OPERATION_NAME));
-        }
-        self.run_region(branches[if predicates[0] { 0 } else { 1 }], inputs.to_vec())
+        let inputs = lockstep_values(operation.name(), inputs)?;
+        let outputs = operation
+            .interpret_with(branches, &inputs, |branch, inputs| self.run_lockstep_region(branches[branch], inputs))?;
+        Ok(outputs.into_iter().map(|output| output.0).collect())
     }
 
-    /// Runs a `scan` whose body uses collectives over the emulated axes in lockstep, following the eager rule for
-    /// static trip counts: the complete application is validated on every device at its actual input types before any
-    /// iteration runs (including that the body returns each reference carry as the reference that it entered with),
-    /// every iteration receives the slice of each array stack, while reference carries and stacks pass through as the
-    /// roots that the body indexes itself, and each output stack is allocated from the actual type of its first slice.
+    /// Runs a `scan` whose body uses collectives over the emulated axes in lockstep, through its eager rule over
+    /// [`LockstepValue`]s (refer to [`ScanOperation::interpret_with`] and to the [`ScanIterationType`] implementation
+    /// for [`LockstepDomain`]).
     fn run_scan(
         &self,
         operation: &ScanOperation<ArrayIrType>,
         body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let device_count = self.grid.device_count();
-        let device_inputs = (0..device_count)
-            .map(|device| inputs.iter().map(|values| values[device].clone()).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let mut output_types = Vec::with_capacity(device_count);
-        for values in &device_inputs {
-            let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-            let input_references = values.iter().map(Value::reference_id).collect::<Vec<_>>();
-            output_types.push(operation.validate_application(&input_types, body, Some(&input_references))?);
-        }
-        let &Dimension::Static(length) = operation.length() else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{SHARD_MAP_OPERATION_NAME}` interpretation cannot run `{}` with a dynamic length in lockstep \
-                     across devices",
-                    operation.name(),
-                ),
-            });
-        };
-        // The emulated devices share one eager scan rule, whose iteration functions use no state of this context.
-        let context = EagerContext::<ArrayIrValue<Array>, C::Operation>::new();
-        let carry_count = operation.carry_count();
-        let (carries, stacks) = inputs.split_at(carry_count);
-        let mut carries = carries.to_vec();
-        let mut accumulators = vec![vec![None; device_count]; output_types[0].len() - carry_count];
-        for visit in 0..length {
-            let iteration = if operation.reverse() { length - 1 - visit } else { visit };
-            let mut iteration_inputs = vec![vec![ArrayIrValue::Array(Array::scalar(iteration as i64)?); device_count]];
-            iteration_inputs.extend(carries.iter().cloned());
-            for stack in stacks {
-                iteration_inputs.push(
-                    stack
-                        .iter()
-                        .map(|value| {
-                            <ArrayIrType as ScanIterationType<EagerContext<_, C::Operation>>>::read_iteration(
-                                value, iteration,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-            }
-            let mut outputs = self.run_region(body, iteration_inputs)?;
-            check_count!("output", outputs, carry_count + accumulators.len(), ProgramError);
-            let stacked_outputs = outputs.split_off(carry_count);
-            carries = outputs;
-            for (accumulators, outputs) in accumulators.iter_mut().zip(stacked_outputs) {
-                for (accumulator, output) in accumulators.iter_mut().zip(outputs) {
-                    *accumulator =
-                        Some(ArrayIrType::write_iteration(&context, accumulator.take(), length, iteration, output)?);
-                }
-            }
-        }
-        let body_input_types = body.input_types();
-        for (position, accumulators) in accumulators.into_iter().enumerate() {
-            carries.push(
-                accumulators
-                    .into_iter()
-                    .zip(device_inputs.iter().zip(&output_types))
-                    .map(|(accumulator, (values, output_types))| match accumulator {
-                        Some(stack) => Ok(stack),
-                        None => ArrayIrType::empty_stack(
-                            &context,
-                            &output_types[carry_count + position],
-                            &body_input_types,
-                            values,
-                        ),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-        Ok(carries)
+        let inputs = lockstep_values(operation.name(), inputs)?;
+        let context = LockstepDomain { device_count: self.grid.device_count() };
+        let outputs =
+            operation.interpret_with(&context, body, &inputs, |inputs| self.run_lockstep_region(body, inputs))?;
+        Ok(outputs.into_iter().map(|output| output.0).collect())
     }
+
+    /// Replays `region` over the [`LockstepValue`] `inputs` in lockstep and returns its outputs.
+    fn run_lockstep_region(
+        &self,
+        region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
+        inputs: Vec<LockstepValue>,
+    ) -> Result<Vec<LockstepValue>, ProgramError> {
+        let outputs = self.run_region(region, inputs.into_iter().map(|input| input.0).collect())?;
+        Ok(outputs.into_iter().map(LockstepValue).collect())
+    }
+}
+
+/// Values of one program atom on every emulated device, in device order, as one value of the [`LockstepDomain`]. The
+/// emulator runs the eager rules of the region operations that must run in lockstep (i.e., `while`, `condition`, and
+/// `scan`) over these values, so that every device follows the rule that eager interpretation follows. The type of a
+/// [`LockstepValue`] is that of the value of device zero, which is the type of the value of every device when the
+/// value enters such an operation (refer to [`lockstep_values`]), so that the rules validate each application once for
+/// all devices.
+#[derive(Clone, Debug)]
+struct LockstepValue(DeviceValues);
+
+impl Display for LockstepValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let values = self.0.iter().map(ToString::to_string).collect::<Vec<_>>();
+        write!(formatter, "[{}]", values.join(", "))
+    }
+}
+
+impl Parameter for LockstepValue {}
+
+impl Typed for LockstepValue {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+        self.0[0].r#type()
+    }
+}
+
+impl Value for LockstepValue {
+    type Dispatch = ValueDirectDispatch;
+    type Domain = LockstepDomain;
+
+    #[inline]
+    fn domain(&self) -> LockstepDomain {
+        LockstepDomain { device_count: self.0.len() }
+    }
+}
+
+// The devices must agree on a predicate, because the regions that it selects or repeats communicate across them, while
+// each device masks its own state with its own predicate (refer to `WhilePredicate`).
+impl Concretizable<bool> for LockstepValue {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        agreed_predicate(self.0.iter().map(Concretizable::concretize), CONDITION_OPERATION_NAME)
+    }
+}
+
+impl WhilePredicate for LockstepValue {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        agreed_predicate(self.0.iter().map(WhilePredicate::any_true), WHILE_OPERATION_NAME)
+    }
+
+    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        self.0
+            .iter()
+            .zip(on_true.0.iter().zip(&on_false.0))
+            .map(|(predicate, (on_true, on_false))| predicate.mask_select(on_true, on_false))
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+}
+
+/// Passive [`Domain`] of the [`LockstepValue`]s of a fixed number of emulated devices.
+struct LockstepDomain {
+    /// Number of emulated devices.
+    device_count: usize,
+}
+
+impl Domain for LockstepDomain {
+    type Type = ArrayIrType;
+    type Value = LockstepValue;
+    type Constant = LockstepValue;
+    type Operation = ArrayIrOperation<Array>;
+}
+
+/// Eager composite array context whose scan iteration functions every emulated device applies to its own values.
+type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+// Every device applies the eager composite iteration functions to its own values, except that a slice whose manual
+// variation differs from that of its stack widens both to the join of their variation first, as `parallel_vary` does on
+// every device, which the eager functions cannot do because a concrete array outside a manual region cannot vary (refer
+// to `vary_to_join`). The devices agree on a dynamic trip count, because they agree on the type of the runtime length
+// (refer to `lockstep_values`), which is its extent.
+impl ScanIterationType<LockstepDomain> for ArrayIrType {
+    fn runtime_length(runtime_length: &LockstepValue) -> Result<usize, ProgramError> {
+        <Self as ScanIterationType<DeviceContext>>::runtime_length(&runtime_length.0[0])
+    }
+
+    fn iteration_index(context: &LockstepDomain, iteration: usize) -> Result<LockstepValue, ProgramError> {
+        let index = <Self as ScanIterationType<DeviceContext>>::iteration_index(&DeviceContext::new(), iteration)?;
+        Ok(LockstepValue(vec![index; context.device_count]))
+    }
+
+    fn read_iteration(stack: &LockstepValue, iteration: usize) -> Result<LockstepValue, ProgramError> {
+        stack
+            .0
+            .iter()
+            .map(|stack| <Self as ScanIterationType<DeviceContext>>::read_iteration(stack, iteration))
+            .collect::<Result<_, _>>()
+            .map(LockstepValue)
+    }
+
+    fn write_iteration(
+        context: &LockstepDomain,
+        output: usize,
+        accumulator: Option<LockstepValue>,
+        length: usize,
+        iteration: usize,
+        value: LockstepValue,
+    ) -> Result<LockstepValue, ProgramError> {
+        let accumulators = match accumulator {
+            Some(accumulator) => accumulator.0.into_iter().map(Some).collect(),
+            None => vec![None; context.device_count],
+        };
+        accumulators
+            .into_iter()
+            .zip(value.0)
+            .map(|(accumulator, value)| {
+                let (accumulator, value) = match accumulator {
+                    Some(accumulator) => {
+                        let [accumulator, value] = vary_to_join([accumulator, value])?;
+                        (Some(accumulator), value)
+                    }
+                    None => (None, value),
+                };
+                <Self as ScanIterationType<DeviceContext>>::write_iteration(
+                    &DeviceContext::new(),
+                    output,
+                    accumulator,
+                    length,
+                    iteration,
+                    value,
+                )
+            })
+            .collect::<Result<_, _>>()
+            .map(LockstepValue)
+    }
+
+    fn empty_stack(
+        context: &LockstepDomain,
+        output_type: &Self,
+        body_input_types: &[Self],
+        inputs: &[LockstepValue],
+    ) -> Result<LockstepValue, ProgramError> {
+        (0..context.device_count)
+            .map(|device| {
+                let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
+                <Self as ScanIterationType<DeviceContext>>::empty_stack(
+                    &DeviceContext::new(),
+                    output_type,
+                    body_input_types,
+                    &inputs,
+                )
+            })
+            .collect::<Result<_, _>>()
+            .map(LockstepValue)
+    }
+}
+
+/// Returns the per-device `inputs` of the region operation named `operation_name` that runs in lockstep as
+/// [`LockstepValue`]s, after validating that the input of every device has the type of the input of device zero.
+/// Devices whose inputs differ in type (e.g., in the extent of the runtime length of a `scan`, which is its trip count)
+/// would take different paths through the operation, whose regions communicate across them.
+fn lockstep_values(operation_name: &str, inputs: &[DeviceValues]) -> Result<Vec<LockstepValue>, ProgramError> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(index, values)| {
+            if values.iter().any(|value| value.r#type() != values[0].r#type()) {
+                return Err(divergent_devices_error(&format!("the type of input {index}"), operation_name));
+            }
+            Ok(LockstepValue(values.clone()))
+        })
+        .collect()
+}
+
+/// Returns the predicate on which every device agrees, given the predicate `values` of every device for the region
+/// operation named `operation_name`.
+fn agreed_predicate(
+    values: impl Iterator<Item = Result<bool, ProgramError>>,
+    operation_name: &str,
+) -> Result<bool, ProgramError> {
+    let values = values.collect::<Result<Vec<_>, _>>()?;
+    if values.iter().any(|value| *value != values[0]) {
+        return Err(divergent_devices_error("the predicate", operation_name));
+    }
+    Ok(values[0])
+}
+
+/// Returns the `stack` and the `slice` written into it widened to the join of their manual variation: each is varied
+/// over every manual axis that only the other one varies over, attaching a replicated placement on that axis's mesh
+/// first when it carries no sharding. As for `parallel_vary` (refer to [`ShardMapEmulator::run_collective`]), only
+/// the types change, because every device already holds its value. Dimension and reference values pass through.
+fn vary_to_join([stack, slice]: [ArrayIrValue<Array>; 2]) -> Result<[ArrayIrValue<Array>; 2], ProgramError> {
+    let (ArrayIrValue::Array(stack), ArrayIrValue::Array(slice)) = (&stack, &slice) else {
+        return Ok([stack, slice]);
+    };
+    let types = [stack.r#type().into_owned(), slice.r#type().into_owned()];
+    let axes = manual_variation_axes(&types);
+    let varied =
+        vary_over_missing_manual_axes(vec![stack.clone(), slice.clone()], &types, &axes, |value, axis, mesh| {
+            let mut input_type = value.r#type().into_owned();
+            if input_type.sharding().is_none() {
+                let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
+                input_type =
+                    input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+            }
+            retype(&value, &single_output_type(&ParallelVaryOperation::new(axis.to_string()), &[input_type])?)
+        })?;
+    let [stack, slice] = <[Array; 2]>::try_from(varied).unwrap();
+    Ok([ArrayIrValue::Array(stack), ArrayIrValue::Array(slice)])
 }
 
 /// Returns the name of the axis that `operation` communicates along when it is a collective (including `axis_index`,
@@ -874,11 +1003,12 @@ pub(super) fn collective_axis_name<O: OperationPayloadProjection>(operation: &O)
         })
 }
 
-/// Returns the error reported when devices take different paths through a region operation that runs in lockstep.
-fn divergent_predicates_error(operation_name: &str) -> ProgramError {
+/// Returns the error reported when devices disagree on the `subject` (e.g., the predicate) of the region operation named
+/// `operation_name` that runs in lockstep, so that they would take different paths through it.
+fn divergent_devices_error(subject: &str, operation_name: &str) -> ProgramError {
     ProgramError::UnsupportedOperation {
         message: format!(
-            "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a `{operation_name}` whose \
+            "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on {subject} of a `{operation_name}` whose \
              regions use collectives over the manual axes, so the collectives would not have matching participants",
         ),
     }
@@ -1220,8 +1350,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayReferenceTransform, DataType, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape,
+        ArrayIrOperation, ArrayReferenceTransform, DataType, Dimension, DimensionBounds, DimensionVariable,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape,
     };
     use crate::contexts::Context;
     use crate::differentiation::NothingSavable;
