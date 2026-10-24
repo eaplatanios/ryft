@@ -2134,10 +2134,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Rebuilds both halves of a conditional over one shared residual signature: a known condition bound through
-/// `bind_known_fn` and a residual condition bound through `bind_residual_fn`, and returns the outputs of the original
+/// Rebuilds both halves of a conditional over one shared residual signature (i.e., a known condition bound through
+/// `bind_known_fn` and a residual condition bound through `bind_residual_fn`) and returns the outputs of the original
 /// condition in order. Unit-returning splits retain residual effects and deferred work without binding an empty known
 /// condition.
 ///
@@ -2155,9 +2153,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
 ///   - `inputs`: Condition inputs, starting with the predicate, in the caller's value representation.
 ///   - `input_known`: Knownness mask over the branch inputs, which both partitions were split with.
 ///   - `partitions`: Partitions of the `true` and `false` branches into their known and residual programs.
-///   - `build_placeholder_fn`: Stages a placeholder of the given edge type for a residual edge of the peer branch into a
-///     detached known-branch builder, given that branch's known input atoms. Returning `None` rejects the split with a
-///     message identifying the missing placeholder's type.
+///   - `build_placeholder_fn`: Stages a placeholder of the given edge type for a residual edge of the peer branch into
+///     a detached known-branch builder, given that branch's known input atoms. Returning `None` rejects the split with
+///     a message identifying the missing placeholder's type.
 ///   - `bind_known_fn`: Binds the known condition over the predicate and the known inputs into the caller's known-side
 ///     context and returns its outputs: the known outputs followed by both branches' residual edges.
 ///   - `bind_residual_fn`: Binds the residual condition over the predicate, the unknown inputs, and both branches'
@@ -2183,9 +2181,10 @@ fn reconstruct_partitioned_condition<
 ) -> Result<Result<Vec<Input>, String>, ProgramError> {
     let [true_partition, false_partition] = partitions;
     let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
-    // Reject reference-typed known feeders and executable reference constants. A reference feeder has no typed zero for
-    // the other branch's edge slot, and splitting branches must not expose a reference through either an edge or a
-    // captured constant without accounting for its identity.
+
+    // Reject reference-typed known feeders and executable reference constants. A reference feeder has no typed zero
+    // for the other branch's edge slot, and splitting branches must not expose a reference through either an edge or
+    // a captured constant without accounting for its identity.
     if [&true_partition, &false_partition]
         .into_iter()
         .any(|partition| partition.has_known_reference_inputs_or_constants())
@@ -2220,13 +2219,13 @@ fn reconstruct_partitioned_condition<
         )));
     }
 
-    // An empty known side (no outputs, edges, effects, or deferred work on either branch) folds nothing, and neither
-    // does a known side whose branches only forward known inputs into their edges or compute values that depend on no
-    // input (e.g., a structural zero), because the residual condition could receive those inputs directly and compute
-    // those values itself instead of selecting them through a known condition. Retain a value-returning condition
-    // unchanged in both cases. In particular, the residual condition of separate-context linearization reaches this
-    // rule again when its tangent context is a partial-evaluation context, and must not be split a second time.
-    // Unit-returning branches still need their residual effects reconstructed, without binding an empty known
+    // An empty known side (i.e., no outputs, edges, effects, or deferred work on either branch) folds nothing,
+    // and neither does a known side whose branches only forward known inputs into their edges or compute values that
+    // depend on no input (e.g., a structural zero), because the residual condition could receive those inputs directly
+    // and compute those values itself instead of selecting them through a known condition. Retain a value-returning
+    // condition unchanged in both cases. In particular, the residual condition of separate-context linearization
+    // reaches this rule again when its tangent context is a partial-evaluation context, and must not be split a second
+    // time. Unit-returning branches still need their residual effects reconstructed, without binding an empty known
     // condition.
     let known_side_is_inert =
         !output_known.contains(&true) && splits.iter().all(|split| split.partition.known_program().effects().is_pure());
@@ -2245,8 +2244,8 @@ fn reconstruct_partitioned_condition<
         return Ok(Err("its known side would fold no work".to_string()));
     }
 
-    // Build both known branches before binding either condition, so that an unsupported placeholder can retain the
-    // original condition without staging any work in the caller's context. The caller decides how to construct
+    // Build both known branches before binding either condition, so that an unsupported placeholder can retain
+    // the original condition without staging any work in the caller's context. The caller decides how to construct
     // placeholders: partial evaluation accepts only identity-free typed zeros, while differentiation can obtain runtime
     // extents from the known branch inputs or forward a known input of the identical type. A unit-returning condition
     // with no known work still needs its residual branch effects, but binding an empty pure known condition serves no
@@ -2278,9 +2277,9 @@ fn reconstruct_partitioned_condition<
     };
 
     // A branch residual with effects or deferred work must survive even when the condition returns no residual values,
-    // because simplification retains that work and dropping the condition would discard it. The known condition
-    // returns the `true` branch's edges and then the `false` branch's edges after its known outputs, which is the order
-    // in which the residual condition receives them after the unknown inputs.
+    // because simplification retains that work and dropping the condition would discard it. The known condition returns
+    // the `true` branch's edges and then the `false` branch's edges after its known outputs, which is the order in
+    // which the residual condition receives them after the unknown inputs.
     let needs_residual_condition = output_known.contains(&false)
         || splits.iter().any(|split| !split.partition.residual_program().effects().is_pure());
     let residual_outputs = if needs_residual_condition {
