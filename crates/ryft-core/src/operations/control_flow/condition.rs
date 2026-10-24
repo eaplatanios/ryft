@@ -89,32 +89,36 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// Boolean array member. A first-class dimension describes an array extent rather than Boolean data, even though its
 /// runtime representation is scalar, and a reference is a mutable state handle rather than a predicate value.
 ///
-/// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches, so every
-/// condition output must vary over each manual axis that the predicate varies over (refer to
-/// [`validate_condition_output`](Self::validate_condition_output)). An invariant predicate keeps every device on the
-/// same branch. The [`Condition::condition`] function aligns the whole condition boundary with a varying predicate,
-/// varying the inputs before the branches and the branch outputs at their ends. A condition staged directly whose
-/// inputs do not vary over the predicate's axes still evaluates and partially evaluates, but its branches compute
-/// invariant-typed values from those inputs although devices take the branches differently. Splitting it around its
-/// known work (i.e., partial evaluation with a symbolic known predicate and separate-context linearization) would turn
-/// such values into invariant-typed outputs of a known condition that differ across devices, so partial evaluation
-/// keeps the condition whole and separate-context linearization fails. Transposing it with respect to such an input
-/// fails as well, because the input's cotangent differs across devices and its mesh sum would run inside the branches.
-/// As for a `while` loop with a varying predicate, keeping collectives out of branches that devices may take
-/// differently is the program's responsibility.
+/// A manual region is a [`ShardMapOperation`](crate::ShardMapOperation) body. It runs per device on local shards, with
+/// explicit collectives for communication along the operation's selected mesh axes (its active manual mesh axes). A
+/// scalar predicate may differ between devices along those axes and let them take different branches. Every condition
+/// output must therefore record variation over each axis that the predicate varies over (refer to
+/// [`Sharding::varying_manual_axes`] and [`validate_condition_output`](Self::validate_condition_output)). An invariant
+/// predicate keeps every device on the same branch. The [`Condition::condition`] function aligns the whole condition
+/// boundary with a varying predicate, varying the inputs before the branches and the branch outputs at their ends.
+/// A condition staged directly whose inputs do not vary over the predicate's axes still evaluates and partially
+/// evaluates, but its branches compute invariant-typed values from those inputs although devices take the branches
+/// differently. Splitting it around its known work (i.e., partial evaluation with a symbolic known predicate and
+/// separate-context linearization) would turn such values into invariant-typed outputs of a known condition that
+/// differ across devices, so partial evaluation keeps the condition whole and separate-context linearization fails.
+/// Transposing it with respect to such an input fails as well, because the input's cotangent differs across devices and
+/// its mesh sum would run inside the branches. As for a `while` loop with a varying predicate, keeping collectives out
+/// of branches that devices may take differently is the program's responsibility.
 pub trait ConditionType: Type {
-    /// Returns whether this type is a valid condition predicate.
+    /// Returns whether this type is a valid condition predicate (i.e., represents scalar Boolean value).
     fn is_condition_predicate(&self) -> bool;
 
-    /// Returns the [`Sharding`] of this type when it is used as a condition predicate, whose varying manual axes every
-    /// condition output must vary over, or `None` if it carries no sharding (e.g., outside of manual regions).
-    fn predicate_sharding(&self) -> Option<&Sharding>;
+    /// Returns the [`Sharding`] of this type when it is used as a condition predicate (i.e., when it represents scalar
+    /// Boolean value), whose varying manual axes every condition output must vary over, or `None` if it carries no
+    /// sharding (e.g., outside of manual regions).
+    fn condition_predicate_sharding(&self) -> Option<&Sharding>;
 
     /// Returns whether a condition predicate of this type varies over at least one manual mesh axis, so that devices
     /// may take different branches.
     #[inline]
-    fn is_varying_predicate(&self) -> bool {
-        self.predicate_sharding().is_some_and(|sharding| !sharding.varying_manual_axes().is_empty())
+    fn is_varying_condition_predicate(&self) -> bool {
+        self.condition_predicate_sharding()
+            .is_some_and(|sharding| !sharding.varying_manual_axes().is_empty())
     }
 
     /// Validates that a branch output of this type is well-typed under a predicate of type `predicate`: because
@@ -135,7 +139,7 @@ impl ConditionType for ArrayType {
     }
 
     #[inline]
-    fn predicate_sharding(&self) -> Option<&Sharding> {
+    fn condition_predicate_sharding(&self) -> Option<&Sharding> {
         self.sharding()
     }
 
@@ -162,9 +166,9 @@ impl ConditionType for ArrayIrType {
     }
 
     #[inline]
-    fn predicate_sharding(&self) -> Option<&Sharding> {
+    fn condition_predicate_sharding(&self) -> Option<&Sharding> {
         match self {
-            Self::Array(r#type) => r#type.predicate_sharding(),
+            Self::Array(r#type) => r#type.condition_predicate_sharding(),
             Self::Dimension(_) | Self::Reference(_) => None,
         }
     }
@@ -177,7 +181,7 @@ impl ConditionType for ArrayIrType {
             Self::Array(output) => output.validate_condition_output(predicate),
             Self::Reference(output) => output.referent().validate_condition_output(predicate),
             Self::Dimension(_) => {
-                if !predicate.is_varying_predicate() {
+                if !predicate.is_varying_condition_predicate() {
                     return Ok(());
                 }
                 Err(TypeError::invalid(format!(
@@ -435,7 +439,7 @@ impl<T: ConditionType> ConditionOperation<T> {
         branches: [RegionRef<'_, V, O>; 2],
         mut is_published: impl FnMut(ConditionReferenceSource) -> Result<bool, ProgramError>,
     ) -> Result<(), ProgramError> {
-        if !predicate_type.is_varying_predicate() {
+        if !predicate_type.is_varying_condition_predicate() {
             return Ok(());
         }
         for (index, (slot, branch)) in ["true", "false"].into_iter().zip(branches).enumerate() {
@@ -1091,7 +1095,7 @@ where
         let input_structure = inputs.parameter_structure();
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
         let context = self.domain();
-        let predicate_sharding = self.r#type().predicate_sharding().cloned();
+        let predicate_sharding = self.r#type().condition_predicate_sharding().cloned();
         let aligned_inputs = match &predicate_sharding {
             Some(sharding) => Self::align_manual_variation_to(&inputs, sharding)?,
             None => inputs.clone(),
@@ -1867,7 +1871,7 @@ where
 {
     let stopped_inputs = branch_inputs.iter().map(stop_gradient).collect::<Result<Vec<_>, _>>()?;
     let predicate_type = P::value(predicate).r#type().into_owned();
-    let predicate_sharding = predicate_type.predicate_sharding();
+    let predicate_sharding = predicate_type.condition_predicate_sharding();
     let varies_beyond_predicate = |sharding: &Sharding| {
         let predicate_axes = predicate_sharding.map(Sharding::varying_manual_axes);
         sharding
@@ -1885,7 +1889,7 @@ where
         // The aligned candidates vary over every axis that the predicate or either candidate varies over, and so must
         // the predicate. Both aligned candidates vary over the same axes, so the first one determines them.
         let candidate_type = candidates[0].r#type().into_owned();
-        let predicate_value = match candidate_type.predicate_sharding() {
+        let predicate_value = match candidate_type.condition_predicate_sharding() {
             Some(target) if varies_beyond_predicate(target) => {
                 let mut varied_predicates = varied_predicates.borrow_mut();
                 match varied_predicates.iter().find(|(axes, _)| axes == target.varying_manual_axes()) {
@@ -2577,7 +2581,7 @@ where
     O: Operation<Type = V::Type>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    if !predicate_type.is_varying_predicate() {
+    if !predicate_type.is_varying_condition_predicate() {
         return Ok(());
     }
     let mut cotangent_reference_input = output_cotangent_count;
@@ -15379,12 +15383,12 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap();
         let predicate = ArrayType::scalar(DataType::Boolean).with_sharding(sharding.clone()).unwrap();
-        assert_eq!(predicate.predicate_sharding(), Some(&sharding));
-        assert_eq!(ArrayType::scalar(DataType::Boolean).predicate_sharding(), None);
-        assert_eq!(ArrayIrType::Array(predicate).predicate_sharding(), Some(&sharding));
+        assert_eq!(predicate.condition_predicate_sharding(), Some(&sharding));
+        assert_eq!(ArrayType::scalar(DataType::Boolean).condition_predicate_sharding(), None);
+        assert_eq!(ArrayIrType::Array(predicate).condition_predicate_sharding(), Some(&sharding));
         assert_eq!(
             ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()))
-                .predicate_sharding(),
+                .condition_predicate_sharding(),
             None,
         );
     }
