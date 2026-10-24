@@ -209,24 +209,12 @@ pub struct ConditionOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T: Type> Copy for ConditionOperation<T> {}
-
 impl<T: ConditionType> ConditionOperation<T> {
     /// Creates a new [`ConditionOperation`]. The two branch [`Program`]s are supplied separately as the operation's
     /// attached regions via the region driver passed to [`Context::bind`]. [`Operation::infer_output_types`] validates
     /// that the branch interfaces agree and that the predicate input is a scalar Boolean.
     pub const fn new() -> Self {
         Self { marker: PhantomData }
-    }
-
-    /// Validates predicate admission before a rule or capability uses its sharding to align other values.
-    fn validate_predicate_type(predicate_type: &T) -> Result<(), TypeError> {
-        if predicate_type.is_condition_predicate() {
-            return Ok(());
-        }
-        Err(TypeError::invalid(format!(
-            "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{predicate_type}`",
-        )))
     }
 
     /// Validates that the two branches with interfaces `region_interfaces` declare the same input types. Both branches
@@ -239,6 +227,16 @@ impl<T: ConditionType> ConditionOperation<T> {
             region_interfaces[1].input_types(),
         ]);
         Ok(())
+    }
+
+    /// Validates predicate admission before a rule or capability uses its sharding to align other values.
+    fn validate_predicate_type(predicate_type: &T) -> Result<(), TypeError> {
+        if predicate_type.is_condition_predicate() {
+            return Ok(());
+        }
+        Err(TypeError::invalid(format!(
+            "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{predicate_type}`",
+        )))
     }
 
     /// Validates the application of this condition to inputs of the types `input_types` (i.e., the predicate followed
@@ -399,19 +397,19 @@ impl<T: ConditionType> ConditionOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<T: Type> Display for ConditionOperation<T> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(CONDITION_OPERATION_NAME)
-    }
-}
+impl<T: Type> Copy for ConditionOperation<T> {}
 
 impl<T: Type> Default for ConditionOperation<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: Type> Display for ConditionOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(CONDITION_OPERATION_NAME)
     }
 }
 
@@ -428,6 +426,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         const { &[RegionSlot::computation("true"), RegionSlot::computation("false")] }
     }
 
+    #[inline]
     fn validate_region_interfaces(&self, region_interfaces: &[RegionInterface<T>]) -> Result<(), ProgramError> {
         self.validate_region_count(region_interfaces.len())?;
         Ok(Self::validate_branch_input_types(region_interfaces)?)
@@ -441,9 +440,10 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         check_count!("region", region_interfaces, 2, TypeError);
         if input_types.is_empty() {
             return Err(TypeError::invalid(format!(
-                "`{CONDITION_OPERATION_NAME}` expects at least one input but got 0"
+                "`{CONDITION_OPERATION_NAME}` expects at least one input but got 0",
             )));
         }
+
         // Replay can refine shapes, but cannot repair mismatched metadata or supply a missing variation contract, so
         // specialize only when both refined branch signatures agree and their outputs satisfy the predicate's manual
         // variation requirements. Compare inputs after refinement because these interfaces may be partially reconciled
@@ -479,15 +479,18 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
                 Ok::<_, TypeError>((refine(&declared_inputs, &[])?, refine(&declared_outputs, &symbolic)?))
             })
             .collect::<Result<Vec<_>, _>>();
+
         if !refined_signatures.is_ok_and(|signatures| {
             signatures[0] == signatures[1]
                 && signatures[0].1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
         }) {
             return Ok(vec![None, None]);
         }
+
         if region_interfaces.iter().all(|interface| interface.input_types() == &input_types[1..]) {
             return Ok(vec![None, None]);
         }
+
         let branch_input_types = input_types[1..].to_vec();
         Ok(vec![Some(branch_input_types.clone()), Some(branch_input_types)])
     }
@@ -497,8 +500,8 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        // Both branches must declare the same input types, the predicate must be a scalar Boolean, and every input must
-        // refine its declared branch input type (a reference input refines it by its referent, refer to
+        // Both branches must declare the same input types, the predicate must be a scalar Boolean, and every
+        // input must refine its declared branch input type (a reference input refines it by its referent, refer to
         // `validate_region_input`). The declared branch outputs must agree after applying the facts that the inputs
         // establish (e.g., `f64[extent]` and `f64[3]` agree for an `f64[3]` input, and a `ref<f64[extent]>` output
         // becomes `ref<f64[3]>` for a `ref<f64[3]>` input), and every output must satisfy the predicate's manual
@@ -511,6 +514,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         for (index, (declared, actual)) in branch_input_types.iter().zip(&input_types[1..]).enumerate() {
             validate_region_input(CONDITION_OPERATION_NAME, index + 1, actual, declared, "branch input type")?;
         }
+
         // Which input a branch forwards to a reference output is only visible in its body, so reference outputs are
         // refined by the input facts like value outputs rather than taking the type of one input. Output-defined
         // identities stay symbolic, rather than inheriting facts about the entering values. Compare the two refined
@@ -539,6 +543,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         }
     }
 
+    #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![
             OutputRegionProvenance { region_index: 0, output_index },
@@ -574,6 +579,8 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         }))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // A condition's branches mirror its input list after the leading predicate, and its results are each branch's own
 // outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both branches
