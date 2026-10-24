@@ -295,8 +295,6 @@ pub enum CustomCallArrayAttribute {
     F64(Vec<f64>),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl CustomCallArrayAttribute {
     /// Returns the number of elements in this array.
     #[inline]
@@ -398,6 +396,8 @@ impl Hash for CustomCallArrayAttribute {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Declares that one flat array output of a [`CustomCallOperation`] aliases one flat array input.
 ///
