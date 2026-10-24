@@ -1931,8 +1931,6 @@ struct PartitionedConditionBranch<V: Value, O: Operation<Type = V::Type>> {
     edges: Vec<(V::Type, usize)>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
     /// Creates a new [`PartitionedConditionBranch`] by validating `partition` against its input knownness mask
     /// `input_known` and preparing the residual edges for the condition's output knownness mask `output_known`.
@@ -1972,36 +1970,25 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
         Ok(Self { partition, edges })
     }
 
-    /// Returns whether the known program of this branch only forwards its known inputs or computes values that depend
-    /// on no input (e.g., a structural zero), i.e., whether none of its instructions has inputs or regions.
-    fn known_program_only_forwards(&self) -> bool {
-        self.partition
-            .known_program()
-            .entry_region_ref()
-            .instructions()
-            .iter()
-            .all(|instruction| instruction.inputs().is_empty() && instruction.regions().is_empty())
-    }
-
-    /// Builds the branch of the known condition that corresponds to this branch. Its inputs are the known condition
-    /// inputs, and its outputs are the condition's known outputs (i.e., those that `output_known` selects) followed by
-    /// the residual edges of the `true` branch and then those of the `false` branch, where `is_true_branch` says which
-    /// of the two this branch is. The slots of the edges of `peer` hold placeholders that `build_placeholder` stages
-    /// into the detached builder of this branch given its known input atoms. They are dead outputs, because the
-    /// residual branch that the same predicate selects reads only this branch's edges.
-    ///
-    /// Returns a rejection message in the inner result when `build_placeholder` cannot construct a placeholder for one
-    /// of the edges of `peer`.
-    fn known_branch<PlaceholderBuild>(
+    /// Builds the branch [`Program`] of the known condition that corresponds to this branch. Its inputs are the known
+    /// condition inputs, and its outputs are the condition's known outputs (i.e., those that `output_known` selects)
+    /// followed by the residual edges of the `true` branch and then those of the `false` branch, where `is_true_branch`
+    /// says which of the two this branch is. The slots of the edges of `peer` hold placeholders staged by
+    /// `build_placeholder_fn` into this branch's detached builder using its known input atoms. They are dead outputs,
+    /// because the residual branch that the same predicate selects reads only this branch's edges. Returns a rejection
+    /// message in the inner result when `build_placeholder_fn` cannot construct a placeholder for one of the edges of
+    /// `peer`.
+    fn known_branch<
+        BuildPlaceholderFn: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
+    >(
         &self,
         peer: &Self,
         is_true_branch: bool,
         output_known: &[bool],
-        build_placeholder: &mut PlaceholderBuild,
-    ) -> Result<Result<Program<V, O, Vec<V>, Vec<V>>, String>, ProgramError>
-    where
-        PlaceholderBuild: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
-    {
+        build_placeholder_fn: &mut BuildPlaceholderFn,
+    ) -> Result<Result<Program<V, O, Vec<V>, Vec<V>>, String>, ProgramError> {
+        // Replay the known program in a detached builder over matching known inputs. Placeholder failure may reject
+        // the split, so this work must not reach the caller's context until both known branches are ready.
         let mut builder = ProgramBuilder::<V, O>::new();
         let known_program = self.partition.known_program();
         let known_inputs = known_program
@@ -2010,6 +1997,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             .map(|input_type| builder.add_input(input_type))
             .collect::<Vec<_>>();
         let known_outputs = builder.splice_program(known_program, known_inputs.as_slice())?;
+
+        // Publish only outputs known in both branches. Values known only in this branch must instead cross the split
+        // as residual edges so the residual condition can return them alongside the peer's unknown results.
         let mut output_atoms = Vec::new();
         for (index, output) in self.partition.outputs().iter().enumerate() {
             if output_known[index] {
@@ -2023,15 +2013,22 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
                 }
             }
         }
+
+        // Reserve slots for the peer's edges so both known branches have identical signatures. These slots are dead
+        // for this predicate choice: the residual condition selects this branch again and reads only its own edges.
+        // If a typed placeholder cannot be built, reject the split before binding any work in the caller's context.
         let mut placeholder_atoms = Vec::with_capacity(peer.edges.len());
         for (edge_type, _) in &peer.edges {
-            let Some(placeholder) = build_placeholder(&mut builder, edge_type, &known_inputs)? else {
+            let Some(placeholder) = build_placeholder_fn(&mut builder, edge_type, &known_inputs)? else {
                 return Ok(Err(format!(
                     "no known input determines a placeholder of type `{edge_type}` for a residual of the other branch",
                 )));
             };
             placeholder_atoms.push(placeholder);
         }
+
+        // Append real residual values and peer placeholders in a fixed `true`-then-`false` branch order.
+        // The edge list includes both original residual feeders and outputs that are known only in this branch.
         let edge_atoms = self.edges.iter().map(|(_, output)| known_outputs[*output]).collect::<Vec<_>>();
         if is_true_branch {
             output_atoms.extend(edge_atoms);
@@ -2040,6 +2037,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             output_atoms.extend(placeholder_atoms);
             output_atoms.extend(edge_atoms);
         }
+
+        // Seal and simplify the detached program, removing unused pure computations while preserving effects.
+        // The inner result accepts the split; builder and simplification errors propagate through the outer result.
         let output_count = output_atoms.len();
         builder
             .build::<Vec<V>, Vec<V>>(
@@ -2051,12 +2051,14 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             .map(Ok)
     }
 
-    /// Builds the branch of the residual condition that corresponds to this branch. Its inputs are the unknown branch
-    /// inputs (i.e., the `branch_input_types` that `input_known` does not select), followed by the residual edges of
-    /// the `true` branch and then those of the `false` branch, with the types from each branch's `edges` in that order,
-    /// where `is_true_branch` says which of the two this branch is. Its outputs are the condition outputs that
-    /// `output_known` leaves residual. The branch reads only its own edges, and returns an output that it folded from
-    /// that output's instantiated edge.
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Builds the branch [`Program`] of the residual condition that corresponds to this branch. Its inputs are the
+    /// unknown branch inputs (i.e., the `branch_input_types` that `input_known` does not select), followed by the
+    /// residual edges of the `true` branch and then those of the `false` branch, with the types from each branch's
+    /// `edges` in that order, where `is_true_branch` says which of the two this branch is. Its outputs are the
+    /// condition outputs that `output_known` leaves residual. The branch reads only its own edges, and returns
+    /// an output that it folded from that output's instantiated edge.
     fn residual_branch(
         &self,
         is_true_branch: bool,
@@ -2213,8 +2215,16 @@ fn reconstruct_partitioned_condition<
     let known_side_is_inert =
         !output_known.contains(&true) && splits.iter().all(|split| split.partition.known_program().effects().is_pure());
     let known_side_is_empty = known_side_is_inert && splits.iter().all(|split| split.edges.is_empty());
-    let known_side_only_forwards =
-        known_side_is_inert && splits.iter().all(|split| split.known_program_only_forwards());
+    let known_side_only_forwards = known_side_is_inert
+        && splits.iter().all(|split| {
+            split
+                .partition
+                .known_program()
+                .entry_region_ref()
+                .instructions()
+                .iter()
+                .all(|instruction| instruction.inputs().is_empty() && instruction.regions().is_empty())
+        });
     if (known_side_is_empty || known_side_only_forwards) && output_count != 0 {
         return Ok(Err("its known side would fold no work".to_string()));
     }
