@@ -1251,23 +1251,17 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-// Partition-aware transpose rule for a primal [`ConditionOperation`]. The predicate and the per-branch residuals ride
-// as ordinary known inputs, and the branch recursion happens through the instruction-scoped driver's transposition
-// requests, so instantiating this implementation for a closed operation enum introduces no recursive
-// [`TransposableOperation`] obligation on `O`. Reference inputs accumulate through the enclosing context's cotangent
-// references, which are resolved (and allocated on first use when their state cotangent is live) before the shared rule
-// passes them into both transposed branches. A universe without reference types (e.g., [`ArrayType`], whose referent
-// family is [`NoReferent`](crate::programs::NoReferent)) has no cotangent references, so every needed cotangent is
-// returned as a value.
-impl<T, V: Value<Type = T>, O> TransposableOperation<V, O> for ConditionOperation<T>
-where
-    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+impl<
     T: ConditionType + DifferentiableType + ReferenceMemberType,
+    V: Value<Type = T>,
     O: Operation<Type = T>
         + ResidualZeroProvider<T, Operation = O>
         + OperationProvider<T, AddOperation<T>, Operation = O>
         + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = O>
         + From<ConditionOperation<T>>,
+> TransposableOperation<V, O> for ConditionOperation<T>
+where
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1277,12 +1271,20 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // The predicate and the per-branch residuals ride as ordinary known inputs, and the branch recursion happens
+        // through the instruction-scoped driver's transposition requests, so instantiating this implementation for a
+        // closed operation enum introduces no recursive `TransposableOperation` obligation on `O`. Reference inputs
+        // accumulate through the enclosing context's cotangent references, which are resolved (and allocated on first
+        // use when their state cotangent is live) before the shared rule passes them into both transposed branches.
+        // A universe without reference types (e.g., `ArrayType`, whose referent family is `NoReferent`) has no
+        // cotangent references, so every needed cotangent is returned as a value.
         let branch = driver.region(0)?;
         check_count!("input", inputs, 1 + branch.input_types().len(), ProgramError);
         check_count!("output", outputs, branch.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        // Resolve shared cotangent references before transposing either branch: the selected branch accumulates into
-        // those references in place, while ignored destinations own no slot in the transposed boundary.
+
+        // Resolve shared cotangent references before transposing either branch (the selected branch accumulates into
+        // those references in place, while ignored destinations own no slot in the transposed boundary).
         let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
         check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
         let branches = [driver.region(0)?, driver.region(1)?];
