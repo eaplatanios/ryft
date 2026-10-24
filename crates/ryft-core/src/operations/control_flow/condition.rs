@@ -1869,10 +1869,6 @@ struct ConditionBranchSplit<V: Value, O: Operation<Type = V::Type>> {
     /// Type and known-program output index of each residual edge, in edge order: the partition's edges, followed by
     /// the folded values of outputs that this branch folded but that are residual for the condition.
     edges: Vec<(V::Type, usize)>,
-
-    /// For each branch output, the edge ordinal carrying its folded value when the output is residual for the condition
-    /// but this branch folded it.
-    instantiated_edge_ordinals: Vec<Option<usize>>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
@@ -1907,16 +1903,12 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
         let known_program_output_types = partition.known_program().output_types();
         check_count!("output", partition.outputs(), output_known.len(), ProgramError);
         partition.validate_known_input_indices(input_known)?;
-        let mut instantiated_edge_ordinals = vec![None; partition.outputs().len()];
-        for (index, output) in partition.outputs().iter().enumerate() {
-            if !output_known[index]
-                && let PartialEvaluationOutput::Known(output) = output
-            {
-                instantiated_edge_ordinals[index] = Some(edges.len());
+        for (output, &known) in partition.outputs().iter().zip(output_known) {
+            if !known && let PartialEvaluationOutput::Known(output) = output {
                 edges.push((known_program_output_types[*output].clone(), *output));
             }
         }
-        Ok(Self { partition, edges, instantiated_edge_ordinals })
+        Ok(Self { partition, edges })
     }
 
     /// Returns whether the known program of this branch only forwards its known inputs or computes values that depend
@@ -2021,6 +2013,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
         let [true_edge_atoms, false_edge_atoms] = edges
             .map(|edges| edges.iter().map(|(edge_type, _)| builder.add_input(edge_type.clone())).collect::<Vec<_>>());
         let own_edge_atoms = if is_true_branch { &true_edge_atoms } else { &false_edge_atoms };
+        // Canonical partition wiring consumes the original edges in order; appended known outputs follow them.
+        let mut edge_atoms = own_edge_atoms.iter().copied();
         let mut spliced_inputs = Vec::with_capacity(self.partition.residual_inputs().len());
         for input in self.partition.residual_inputs() {
             match input {
@@ -2031,7 +2025,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
                         ))
                     })?);
                 }
-                ResidualInputSource::ResidualEdge(edge) => spliced_inputs.push(own_edge_atoms[*edge]),
+                ResidualInputSource::ResidualEdge(_) => spliced_inputs.push(edge_atoms.next().unwrap()),
                 ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{CONDITION_OPERATION_NAME}` knownness split saw a forwarded residual input",
@@ -2041,19 +2035,19 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
         }
         let spliced_outputs = builder.splice_program(self.partition.residual_program(), &spliced_inputs)?;
         let mut output_atoms = Vec::new();
-        for (index, output) in self.partition.outputs().iter().enumerate() {
-            if output_known[index] {
+        for (output, &known) in self.partition.outputs().iter().zip(output_known) {
+            if known {
                 continue;
             }
             match output {
                 PartialEvaluationOutput::Unknown(spliced) => output_atoms.push(spliced_outputs[*spliced]),
                 PartialEvaluationOutput::Known(_) => {
-                    let edge = self.instantiated_edge_ordinals[index].ok_or_else(|| {
+                    let edge = edge_atoms.next().ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "`{CONDITION_OPERATION_NAME}` knownness split lost an instantiated output edge",
                         ))
                     })?;
-                    output_atoms.push(own_edge_atoms[edge]);
+                    output_atoms.push(edge);
                 }
             }
         }
@@ -7448,9 +7442,9 @@ mod tests {
 
     #[test]
     fn test_condition_partial_evaluation_instantiates_asymmetric_known_outputs() {
-        // The true branch returns `(sin(known), sin(unknown))` and the false branch returns
-        // `(unknown, known * unknown)`. Neither output is known across both branches: the first true output becomes
-        // an instantiated residual edge, while the false branch receives its known multiplier through a feeder edge.
+        // The true branch returns `(sin(known), sin(known) * unknown, known * known, sin(unknown))`, and the false
+        // branch returns `(unknown, known * unknown, unknown, unknown)`. The true branch's two instantiated outputs
+        // follow its original `sin(known)` feeder edge and are interleaved with unknown outputs in the result.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let mut true_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -7458,8 +7452,17 @@ mod tests {
         let unknown = true_builder.add_input(scalar_type.clone());
         let [known_sine, unknown_sine] = [known, unknown]
             .map(|input| true_builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0]);
+        let scaled = true_builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![known_sine, unknown], None)
+            .unwrap()[0];
+        let squared =
+            true_builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known], None).unwrap()[0];
         let true_branch = true_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![known_sine, unknown_sine], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![known_sine, scaled, squared, unknown_sine],
+                vec![Placeholder; 2],
+                vec![Placeholder; 4],
+            )
             .unwrap();
         let mut false_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let known = false_builder.add_input(scalar_type.clone());
@@ -7467,7 +7470,11 @@ mod tests {
         let product =
             false_builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, unknown], None).unwrap()[0];
         let false_branch = false_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![unknown, product], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![unknown, product, unknown, unknown],
+                vec![Placeholder; 2],
+                vec![Placeholder; 4],
+            )
             .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let predicate = builder.add_input(predicate_type.clone());
@@ -7485,7 +7492,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 4])
             .unwrap();
 
         let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -7501,7 +7508,15 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
+        assert_eq!(
+            evaluation.outputs,
+            vec![
+                PartialEvaluationOutput::Unknown(0),
+                PartialEvaluationOutput::Unknown(1),
+                PartialEvaluationOutput::Unknown(2),
+                PartialEvaluationOutput::Unknown(3),
+            ],
+        );
         let known_output_ids = evaluation
             .inputs
             .iter()
@@ -7514,49 +7529,55 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<Array>, Vec<Array>>(known_output_ids, vec![Placeholder; 2], vec![Placeholder; 3])
+            .build::<Vec<Array>, Vec<Array>>(known_output_ids, vec![Placeholder; 2], vec![Placeholder; 5])
             .unwrap();
         assert_eq!(
             known_program.to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[] = condition %0 %1 [
+                let %2:f64[], %3:f64[], %4:f64[], %5:f64[] = condition %0 %1 [
                     true={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
-                            %2:f64[] = zero [type=f64[]]
-                        in (%1, %2)
+                            %2:f64[] = mul %0 %0
+                            %3:f64[] = zero [type=f64[]]
+                        in (%1, %1, %2, %3)
                     },
                     false={
                         lambda %0:f64[] .
                         let %1:f64[] = zero [type=f64[]]
-                        in (%1, %0)
+                            %2:f64[] = zero [type=f64[]]
+                            %3:f64[] = zero [type=f64[]]
+                        in (%1, %2, %3, %0)
                     },
                 ]
-                in (%0, %2, %3)"},
+                in (%0, %2, %3, %4, %5)"},
         );
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:bool[], %2:f64[], %3:f64[] .
-                let %4:f64[], %5:f64[] = condition %1 %0 %2 %3 [
+                lambda %0:f64[], %1:bool[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
+                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = condition %1 %0 %2 %3 %4 %5 [
                     true={
-                        lambda %0:f64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = sin %0
-                        in (%1, %3)
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                        let %5:f64[] = mul %1 %0
+                            %6:f64[] = sin %0
+                        in (%2, %5, %3, %6)
                     },
                     false={
-                        lambda %0:f64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = mul %2 %0
-                        in (%0, %3)
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                        let %5:f64[] = mul %4 %0
+                        in (%0, %5, %0, %0)
                     },
                 ]
-                in (%4, %5)"},
+                in (%6, %7, %8, %9)"},
         );
 
         // Compose the two programs through the reported residual boundary for each runtime predicate. The inactive
         // branch's placeholder edge must never replace the selected branch's real known value.
-        for (predicate, expected) in [(true, [3.0f64.sin(), 4.0f64.sin()]), (false, [4.0, 12.0])] {
+        for (predicate, expected) in
+            [(true, [3.0f64.sin(), 3.0f64.sin() * 4.0, 9.0, 4.0f64.sin()]), (false, [4.0, 12.0, 4.0, 4.0])]
+        {
             let arguments =
                 vec![Array::scalar(predicate).unwrap(), Array::scalar(3.0f64).unwrap(), Array::scalar(4.0f64).unwrap()];
             let known_outputs = known_program.interpret(arguments[..2].to_vec()).unwrap();

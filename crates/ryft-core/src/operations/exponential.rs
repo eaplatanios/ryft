@@ -5,6 +5,7 @@
 //!
 //!   - [`Exp`] and [`Log`] compute the natural exponential and logarithm (i.e., `x ↦ eˣ` and `x ↦ ln(x)`, with the
 //!     principal branch of the logarithm for complex values).
+//!   - [`ExpM1`] computes `exp(x) - 1` accurately near zero.
 //!   - [`Ln1p`] computes `ln(1 + x)` accurately near zero.
 //!   - [`LogAddExp`] computes `log(exp(a) + exp(b))` without forming potentially overflowing exponentials.
 //!   - [`Logistic`] computes the logistic sigmoid (i.e., `x ↦ 1 / (1 + e^{-x})`).
@@ -34,7 +35,7 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
-use crate::operations::arithmetic::{Add, Div, Mul, Sub};
+use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Real};
 use crate::operations::constants::one_like::OneLike;
@@ -108,6 +109,75 @@ macro_rules! impl_exp_for_primitive {
 
 impl_exp_for_primitive!(f32);
 impl_exp_for_primitive!(f64);
+
+/// Canonical operation name for [`ExpM1Operation`].
+pub const EXP_M1_OPERATION_NAME: &str = "exp_m1";
+
+define_elementwise_operation!(
+    @unary @accuracy
+    /// [`Operation`](crate::Operation) that computes `exp(x) - 1` elementwise while retaining accuracy near zero
+    /// and preserving input metadata. Complex inputs use the analytic continuation `exp(z) - 1`, retaining small
+    /// real and imaginary components without subtracting one from a rounded complex exponential. Only floating-point
+    /// and complex inputs are supported; inputs that carry partial sums are rejected.
+    ExpM1Operation,
+    EXP_M1_OPERATION_NAME,
+    ExpM1,
+    exp_m1_with_accuracy,
+    check_data_types = [@float],
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_elementwise_operation! {
+    @unary
+    ExpM1Operation,
+    jvp<C> where C::Value: Exp + Mul {
+        // Recompute `exp(x)` from the aligned input: adding one to `exp_m1(x)` would lose the derivative
+        // when a sufficiently negative input makes the primal round to exactly minus one.
+        |operation, (input, input_tangent)| input.exp_with_accuracy(operation.accuracy())?.mul(&input_tangent)?
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @unary @accuracy
+    /// Represents the ability to compute elementwise `exp(input) - 1` accurately near zero. Concrete arrays compute
+    /// immediately while context-carrying values apply [`ExpM1Operation`] through their context.
+    ExpM1,
+    /// Computes `exp(input) - 1` elementwise, retaining accuracy near zero for real and complex inputs. Returns an
+    /// error if the input types or metadata are unsupported.
+    exp_m1,
+    /// Behaves like [`exp_m1`](Self::exp_m1), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata
+    /// are unsupported.
+    exp_m1_with_accuracy,
+    ExpM1Operation,
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    ExpM1,
+    exp_m1_with_accuracy(_accuracy),
+    operation = "exp_m1",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::exp_m1(input),
+);
+
+/// Implements [`ExpM1`] for one host primitive type, which provides one implementation
+/// for every requested [`Accuracy`].
+macro_rules! impl_exp_m1_for_primitive {
+    ($type:ty) => {
+        impl ExpM1 for $type {
+            #[inline]
+            fn exp_m1_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
+                Ok(<$type>::exp_m1(*self))
+            }
+        }
+    };
+}
+
+impl_exp_m1_for_primitive!(f32);
+impl_exp_m1_for_primitive!(f64);
 
 /// Canonical operation name for [`LogOperation`].
 pub const LOG_OPERATION_NAME: &str = "log";
@@ -475,11 +545,12 @@ impl_differentiable_elementwise_operation! {
     LogisticOperation,
     jvp<C>
     where
-        C::Value: OneLike + Sub + Mul,
+        C::Value: Neg + Mul + Logistic,
     {
-        // `d(logistic(x)) = logistic(x) · (1 - logistic(x)) · dx`, reusing the primal output
-        // evaluated at the tangent type.
-        |(_, input_tangent) -> output| output.mul(&output.one_like()?.sub(&output)?)?.mul(&input_tangent)?
+        // `logistic(-x)` retains the small complement even when `logistic(x)` rounds to one. Both factors
+        // use the tangent's element type, and remain differentiable for higher-order transforms.
+        |operation, (input, input_tangent) -> output|
+            output.mul(&input.neg()?.logistic_with_accuracy(operation.accuracy())?)?.mul(&input_tangent)?
     },
     transpose = @nonlinear,
 }
@@ -516,7 +587,12 @@ macro_rules! impl_logistic_for_primitive {
         impl Logistic for $type {
             #[inline]
             fn logistic_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
-                Ok(((-*self).exp() + 1.0).recip())
+                Ok(if *self >= 0.0 {
+                    ((-*self).exp() + 1.0).recip()
+                } else {
+                    let exponential = <$type>::exp(*self);
+                    exponential / (1.0 + exponential)
+                })
             }
         }
     };
@@ -525,19 +601,19 @@ macro_rules! impl_logistic_for_primitive {
 impl_logistic_for_primitive!(f32);
 impl_logistic_for_primitive!(f64);
 
-/// Group of the elementwise exponential and logarithmic capabilities [`Exp`], [`Log`], [`Ln1p`], [`LogAddExp`],
-/// and [`Logistic`]. It is implemented automatically for every type that implements all of its members.
+/// Group of the elementwise exponential and logarithmic capabilities [`Exp`], [`ExpM1`], [`Log`], [`Ln1p`],
+/// [`LogAddExp`], and [`Logistic`]. It is implemented automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and composite array IR
 /// values implement it for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their
 /// own universes.
 pub trait ExponentialOperations<T = <Self as Capability>::Universe>:
-    Capability + Exp<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>
+    Capability + Exp<T> + ExpM1<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>
 {
 }
 
-impl<T, V: Exp<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>> ExponentialOperations<T> for V {}
+impl<T, V: Exp<T> + ExpM1<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>> ExponentialOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {
@@ -547,7 +623,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, f4e2m1fn, f8e4m3fn, f8e8m0fnu};
+    use crate::arrays::{Array, ArrayIrValue, ArrayOperation, ArrayType, DataType, f4e2m1fn, f8e4m3fn, f8e8m0fnu};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
@@ -555,7 +631,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameterwise, Placeholder};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypeError};
 
     use super::*;
@@ -761,6 +837,231 @@ mod tests {
     fn test_exp_primitives() {
         assert_eq!(Exp::exp(&0.0f32), Ok(1.0));
         assert_eq!(Exp::exp(&0.0f64), Ok(1.0));
+    }
+
+    #[test]
+    fn test_exp_m1() {
+        let operation = ExpM1Operation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "exp_m1");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "exp_m1 [accuracy=highest]");
+    }
+
+    #[test]
+    fn test_exp_m1_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = ExpM1Operation,
+            cases = [{
+                input_data_types = [DataType::F32],
+                output_data_types = [DataType::F32],
+            }, {
+                input_data_types = [DataType::C128],
+                output_data_types = [DataType::C128],
+            }, {
+                input_data_types = [DataType::I32],
+                error = "`exp_m1` does not support input data type `i32`",
+            }],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = ExpM1Operation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_interpretation() {
+        assert_eq!(
+            ExpM1Operation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(1e-20f32).unwrap()],
+            ),
+            Ok(vec![Array::scalar(1e-20f32).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ExpM1Operation::new(),
+            inputs = [Array::scalar(0.7).unwrap()],
+            expected = Array::scalar(0.7f64.exp_m1()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = ExpM1Operation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.exp_m1(), (-1.0f64).exp_m1()]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = ExpM1Operation::new(),
+            cases = [{
+                primals = [Array::scalar(0.7).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.7f64.exp_m1()).unwrap()],
+                tangent_outputs = [Array::scalar(3.0 * 0.7f64.exp()).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = exp_m1 %0
+                        %3:f64[] = exp %0
+                        %4:f64[] = mul %3 %1
+                    in (%2, %4)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_differentiation_saturated_and_higher_order() {
+        // The rounded primal is exactly minus one, but its derivative remains representable.
+        let input = Array::scalar(-20.0f32).unwrap();
+        assert_eq!(input.exp_m1(), Ok(Array::scalar(-1.0f32).unwrap()));
+        let gradient = differentiate_at(input.clone()).gradient(|input| input.exp_m1()).unwrap();
+        assert_eq!(gradient.elements::<f32>(), Ok(vec![(-20.0f32).exp()]));
+        let hessian = differentiate_at(input).hessian(|input| input.exp_m1()).unwrap();
+        assert_eq!(hessian.values()[0].elements::<f32>(), Ok(vec![(-20.0f32).exp()]));
+    }
+
+    #[test]
+    fn test_exp_m1_differentiation_complex() {
+        let input = ComplexNumber::new(0.7f64, -0.3);
+        assert_eq!(
+            differentiate_at(Array::scalar(input).unwrap()).holomorphic().gradient(|input| input.exp_m1()),
+            Ok(Array::scalar(input.exp()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_differentiation_low_precision_uses_widened_tangents() {
+        let primal = Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap();
+        let (output, tangent) =
+            differentiate_at(primal).jvp(Array::scalar(3.0f32).unwrap(), |input| input.exp_m1()).unwrap();
+        assert_eq!(output.logical_bytes(), vec![0x82]);
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 * 2.0f32.exp(), epsilon = 1e-6);
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
+        let output = builder.add_instruction(ExpM1Operation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[], %1:f32[] .
+                let %2:f8e8m0fnu[] = exp_m1 %0
+                    %3:f32[] = convert_element_type [data_type=f32] %0
+                    %4:f32[] = exp %3
+                    %5:f32[] = mul %4 %1
+                in (%2, %5)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = ExpM1Operation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_exp_m1() {
+        assert_eq!(Array::scalar(1e-20f32).unwrap().exp_m1(), Ok(Array::scalar(1e-20f32).unwrap()));
+        assert_eq!(Array::scalar(1e-40f64).unwrap().exp_m1(), Ok(Array::scalar(1e-40f64).unwrap()));
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().exp_m1(),
+            Ok(Array::scalar(bf16::from_f32(0.5f32.exp_m1())).unwrap()),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().exp_m1(),
+            Ok(Array::scalar(f16::from_f32(0.5f32.exp_m1())).unwrap()),
+        );
+        assert_eq!(Array::scalar(f64::NEG_INFINITY).unwrap().exp_m1(), Ok(Array::scalar(-1.0f64).unwrap()));
+        assert_eq!(Array::scalar(f64::INFINITY).unwrap().exp_m1(), Ok(Array::scalar(f64::INFINITY).unwrap()));
+        assert!(Array::scalar(f64::NAN).unwrap().exp_m1().unwrap().elements::<f64>().unwrap()[0].is_nan());
+        assert_eq!(
+            Array::scalar(-0.0f64).unwrap().exp_m1().unwrap().elements::<f64>().unwrap()[0].to_bits(),
+            (-0.0f64).to_bits(),
+        );
+        assert_eq!(Array::vector(Vec::<f64>::new()).unwrap().exp_m1(), Ok(Array::vector(Vec::<f64>::new()).unwrap()));
+    }
+
+    #[test]
+    fn test_array_exp_m1_complex() {
+        let input = ComplexNumber::new(0.7f64, -0.3);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().exp_m1().unwrap(),
+            Array::scalar(input.exp() - 1.0).unwrap(),
+            epsilon = 1e-12,
+        );
+        assert_eq!(
+            Array::scalar(ComplexNumber::new(1e-20f64, 1e-20)).unwrap().exp_m1(),
+            Ok(Array::scalar(ComplexNumber::new(1e-20f64, 1e-20)).unwrap()),
+        );
+        assert_eq!(
+            Array::scalar(ComplexNumber::new(1e-20f32, 1e-20)).unwrap().exp_m1(),
+            Ok(Array::scalar(ComplexNumber::new(1e-20f32, 1e-20)).unwrap()),
+        );
+        let output = Array::scalar(ComplexNumber::new(0.0f64, 1e-10))
+            .unwrap()
+            .exp_m1()
+            .unwrap()
+            .elements::<ComplexNumber<f64>>()
+            .unwrap()[0];
+        assert_abs_diff_eq!(output.re, -5e-21, epsilon = 1e-35);
+        assert_eq!(output.im, 1e-10);
+    }
+
+    #[test]
+    fn test_array_exp_m1_low_precision() {
+        assert_eq!(
+            Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()])
+                .unwrap()
+                .exp_m1(),
+            Ok(Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0f64.exp_m1()).unwrap()])
+                .unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_exp_m1_primitives() {
+        assert_eq!(ExpM1::exp_m1(&1e-20f32), Ok(1e-20));
+        assert_eq!(ExpM1::exp_m1(&1e-40f64), Ok(1e-40));
+    }
+
+    #[test]
+    fn test_exp_m1_composite_and_parameterwise() {
+        assert_eq!(
+            ArrayIrValue::Array(Array::scalar(1e-20f32).unwrap()).exp_m1(),
+            Ok(ArrayIrValue::Array(Array::scalar(1e-20f32).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap()).exp_m1(),
+            Ok(ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())),
+        );
+        let inputs = Parameterwise::<Array, _>::from(vec![Array::scalar(1e-20f32).unwrap()]);
+        assert_eq!(inputs.exp_m1().map(Parameterwise::into_inner), Ok(vec![Array::scalar(1e-20f32).unwrap()]));
     }
 
     #[test]
@@ -1603,7 +1904,7 @@ mod tests {
     #[test]
     fn test_logistic_differentiation() {
         let logistic = 1.0 / (1.0 + (-0.7f64).exp());
-        let expected_tangent = 3.0 * logistic * (1.0 - logistic);
+        let expected_tangent = 3.0 * logistic / (1.0 + 0.7f64.exp());
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = LogisticOperation::new(),
@@ -1615,14 +1916,35 @@ mod tests {
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = logistic %0
-                        %3:f64[] = one_like %2
-                        %4:f64[] = sub %3 %2
+                        %3:f64[] = neg %0
+                        %4:f64[] = logistic %3
                         %5:f64[] = mul %2 %4
                         %6:f64[] = mul %5 %1
                     in (%2, %6)
                 "},
             }],
         );
+    }
+
+    #[test]
+    fn test_logistic_differentiation_saturated_and_higher_order() {
+        let expected = (-20.0f32).exp() / (1.0 + (-20.0f32).exp()).powi(2);
+        assert_eq!(Array::scalar(20.0f32).unwrap().logistic(), Ok(Array::scalar(1.0f32).unwrap()));
+        let gradient = differentiate_at(Array::scalar(20.0f32).unwrap()).gradient(|input| input.logistic()).unwrap();
+        assert_abs_diff_eq!(gradient.elements::<f32>().unwrap()[0], expected, epsilon = 1e-15);
+        let gradient = differentiate_at(Array::scalar(-20.0f32).unwrap()).gradient(|input| input.logistic()).unwrap();
+        assert_abs_diff_eq!(gradient.elements::<f32>().unwrap()[0], expected, epsilon = 1e-15);
+
+        let hessian = differentiate_at(Array::scalar(20.0f32).unwrap()).hessian(|input| input.logistic()).unwrap();
+        assert_abs_diff_eq!(hessian.values()[0].elements::<f32>().unwrap()[0], -expected, epsilon = 1e-15);
+        let hessian = differentiate_at(Array::scalar(-20.0f32).unwrap()).hessian(|input| input.logistic()).unwrap();
+        assert_abs_diff_eq!(hessian.values()[0].elements::<f32>().unwrap()[0], expected, epsilon = 1e-15);
+
+        // Overflow in `exp(-x)` must not erase a representable subnormal sigmoid or derivative.
+        let gradient = differentiate_at(Array::scalar(-100.0f32).unwrap()).gradient(|input| input.logistic()).unwrap();
+        assert_eq!(gradient.elements::<f32>(), Ok(vec![(-100.0f32).exp()]));
+        let gradient = differentiate_at(Array::scalar(100.0f32).unwrap()).gradient(|input| input.logistic()).unwrap();
+        assert_eq!(gradient.elements::<f32>(), Ok(vec![(-100.0f32).exp()]));
     }
 
     #[test]
@@ -1667,12 +1989,13 @@ mod tests {
                 lambda %0:f8e8m0fnu[], %1:f32[] .
                 let %2:f8e8m0fnu[] = logistic %0
                     %3:f32[] = convert_element_type [data_type=f32] %0
-                    %4:f32[] = logistic %3
-                    %5:f32[] = one_like %4
-                    %6:f32[] = sub %5 %4
-                    %7:f32[] = mul %4 %6
-                    %8:f32[] = mul %7 %1
-                in (%2, %8)
+                    %4:f32[] = convert_element_type [data_type=f32] %0
+                    %5:f32[] = logistic %4
+                    %6:f32[] = neg %3
+                    %7:f32[] = logistic %6
+                    %8:f32[] = mul %5 %7
+                    %9:f32[] = mul %8 %1
+                in (%2, %9)
             "}
             .trim_end(),
         );
@@ -1710,6 +2033,8 @@ mod tests {
         // Extreme inputs saturate to the asymptotes instead of producing NaNs, even when `exp(-x)` overflows.
         assert_eq!(Array::scalar(-1000.0f64).unwrap().logistic(), Ok(Array::scalar(0.0f64).unwrap()));
         assert_eq!(Array::scalar(1000.0f64).unwrap().logistic(), Ok(Array::scalar(1.0f64).unwrap()));
+        assert_eq!(Array::scalar(-100.0f32).unwrap().logistic(), Ok(Array::scalar((-100.0f32).exp()).unwrap()));
+        assert_eq!(Array::scalar(-710.0f64).unwrap().logistic(), Ok(Array::scalar((-710.0f64).exp()).unwrap()));
     }
 
     #[test]
@@ -1721,6 +2046,10 @@ mod tests {
             Array::scalar(input).unwrap().logistic().unwrap(),
             Array::scalar(expected).unwrap(),
             epsilon = 1e-12,
+        );
+        assert_eq!(
+            Array::scalar(ComplexNumber::new(-1000.0f64, 0.0)).unwrap().logistic(),
+            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0)).unwrap()),
         );
     }
 
