@@ -2051,8 +2051,6 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             .map(Ok)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Builds the branch [`Program`] of the residual condition that corresponds to this branch. Its inputs are the
     /// unknown branch inputs (i.e., the `branch_input_types` that `input_known` does not select), followed by the
     /// residual edges of the `true` branch and then those of the `false` branch, with the types from each branch's
@@ -2067,17 +2065,27 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
         output_known: &[bool],
         edges: [&[(V::Type, usize)]; 2],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        // Declare only unknown branch inputs, but retain an entry at every original input position. This keeps the
+        // partition's input indices valid while known inputs have no slot in the residual branch signature.
         let mut builder = ProgramBuilder::<V, O>::new();
         let unknown_input_atoms = branch_input_types
             .iter()
             .zip(input_known)
             .map(|(input_type, &known)| (!known).then(|| builder.add_input(input_type.clone())))
             .collect::<Vec<_>>();
+
+        // Both residual branches accept the shared edge boundary in `true`-then-`false` order. Keep the peer's slots
+        // in the signature even though this branch reads only its own edges; the peer's slots hold placeholders here.
         let [true_edge_atoms, false_edge_atoms] = edges
             .map(|edges| edges.iter().map(|(edge_type, _)| builder.add_input(edge_type.clone())).collect::<Vec<_>>());
         let own_edge_atoms = if is_true_branch { &true_edge_atoms } else { &false_edge_atoms };
+
         // Canonical partition wiring consumes the original edges in order; appended known outputs follow them.
+        // `from_partition` validated that layout, so one cursor can serve the original program and then extra outputs.
         let mut edge_atoms = own_edge_atoms.iter().copied();
+
+        // Rebuild the partition's residual input order from original unknown inputs and this branch's edges. Direct
+        // known feeders are invalid here: all known values must cross the condition split through its residual edges.
         let mut spliced_inputs = Vec::with_capacity(self.partition.residual_inputs().len());
         for input in self.partition.residual_inputs() {
             match input {
@@ -2097,6 +2105,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             }
         }
         let spliced_outputs = builder.splice_program(self.partition.residual_program(), &spliced_inputs)?;
+
+        // Restore only the condition's residual outputs, in their original order. Results computed by the residual
+        // program come from its replay; results known only in this branch come from the cursor's appended edge values.
         let mut output_atoms = Vec::new();
         for (output, &known) in self.partition.outputs().iter().zip(output_known) {
             if known {
@@ -2114,11 +2125,16 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
                 }
             }
         }
+
+        // Seal the region over the compact unknown inputs and both edge sets, including the unused peer slots.
+        // Retain residual effects and deferred work even when there are no residual output values.
         let input_count = unknown_input_atoms.iter().flatten().count() + true_edge_atoms.len() + false_edge_atoms.len();
         let output_count = output_atoms.len();
         builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Rebuilds both halves of a conditional over one shared residual signature: a known condition bound through
 /// `bind_known_fn` and a residual condition bound through `bind_residual_fn`, and returns the outputs of the original
