@@ -276,45 +276,26 @@ impl_custom_call_attribute_conversions!(u64, U64);
 impl_custom_call_attribute_conversions!(f32, F32);
 impl_custom_call_attribute_conversions!(f64, F64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// One-dimensional numeric array carried by [`CustomCallAttribute::Array`]. The element types are exactly the numeric
-/// array element types that a typed foreign-function interface can decode (e.g., as a `Span<const int32_t>` in XLA's
-/// FFI). Boolean arrays are deliberately absent because those interfaces cannot decode them. Equality and hashing
+/// array element types that a typed Foreign Function Interface (FFI) can decode (e.g., as a `Span<const int32_t>` in
+/// XLA's FFI). Boolean arrays are deliberately absent because those interfaces cannot decode them. Equality and hashing
 /// compare floating-point elements bitwise, like [`CustomCallAttribute`] does for scalars, and arrays render with
 /// their element type (e.g., `array<i32: 1, 2>`).
 #[derive(Clone, Debug)]
 pub enum CustomCallArrayAttribute {
-    /// Array of 8-bit signed integers.
     I8(Vec<i8>),
-
-    /// Array of 16-bit signed integers.
     I16(Vec<i16>),
-
-    /// Array of 32-bit signed integers.
     I32(Vec<i32>),
-
-    /// Array of 64-bit signed integers.
     I64(Vec<i64>),
-
-    /// Array of 8-bit unsigned integers.
     U8(Vec<u8>),
-
-    /// Array of 16-bit unsigned integers.
     U16(Vec<u16>),
-
-    /// Array of 32-bit unsigned integers.
     U32(Vec<u32>),
-
-    /// Array of 64-bit unsigned integers.
     U64(Vec<u64>),
-
-    /// Array of 32-bit floating-point numbers.
     F32(Vec<f32>),
-
-    /// Array of 64-bit floating-point numbers.
     F64(Vec<f64>),
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl CustomCallArrayAttribute {
     /// Returns the number of elements in this array.
