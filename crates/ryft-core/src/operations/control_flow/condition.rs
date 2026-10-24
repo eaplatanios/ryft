@@ -1249,8 +1249,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     T: ConditionType + DifferentiableType + ReferenceMemberType,
     V: Value<Type = T>,
@@ -1305,27 +1303,25 @@ where
                 .enumerate()
                 .filter_map(|(index, input)| input.is_unknown().then_some(index))
                 .collect::<Vec<_>>();
-            let read_known = |index: usize| -> Result<Tracer<TracingContext<V, O>>, ProgramError> {
-                inputs[index]
-                    .as_known()
-                    .ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!(
-                            "`{CONDITION_OPERATION_NAME}` transpose input {index} has no known value",
-                        ))
-                    })
-                    .cloned()
-            };
-            let predicate = read_known(0)?;
-            let residuals = (1..inputs.len())
-                .filter(|&index| !inputs[index].is_unknown())
-                .map(read_known)
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut known_inputs =
+                inputs.iter().enumerate().filter(|(index, input)| *index == 0 || !input.is_unknown()).map(
+                    |(index, input)| {
+                        input.as_known().cloned().ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "`{CONDITION_OPERATION_NAME}` transpose input {index} has no known value",
+                            ))
+                        })
+                    },
+                );
+            let predicate = known_inputs.next().unwrap()?;
+            let residuals = known_inputs.collect::<Result<Vec<_>, _>>()?;
 
-            // Structural-zero output cotangents stay symbolic in both transposed branches, which receive no input for
-            // them.
+            // Structural-zero output cotangents stay symbolic in both transposed branches,
+            // which receive no input for them.
             let branch_destination_kinds =
                 branch_input_indices.iter().map(|&index| cotangents.kind(index + 1)).collect::<Vec<_>>();
             let zero_outputs = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+
             // Use retained region transforms and initially omit every structural-zero input cotangent. Output seeds
             // that are structural zeros remain symbolic and own no input of either transposed branch.
             let mut transposed_branches = [
@@ -1344,6 +1340,7 @@ where
                     &branch_destination_kinds,
                 )?,
             ];
+
             // Inspect the derived cotangent metadata before inserting zeros. This keeps branch-transposition errors
             // ahead of variation errors, and variation errors ahead of zero-materialization failures.
             let predicate_type = predicate.r#type();
@@ -1359,9 +1356,9 @@ where
                     .count();
                 let mut cotangent_reference_input = output_cotangent_count;
                 for (position, index) in branch_input_indices.iter().map(|&index| index + 1).enumerate() {
-                    // Returned values cross when either branch needs them. Reference-state cotangents retain state
-                    // effects; an ordinary gradient buffer crosses only when a branch actually mutates its
-                    // corresponding input.
+                    // Returned values cross when either branch needs them. Reference-state cotangents retain
+                    // state effects; an ordinary gradient buffer crosses only when a branch actually mutates
+                    // its corresponding input.
                     let crosses_boundary = match cotangents.kind(index) {
                         CotangentDestinationKind::Return => transposed_branches
                             .iter()
@@ -1384,9 +1381,11 @@ where
                         }
                         CotangentDestinationKind::Ignore => false,
                     };
+
                     if cotangents.kind(index) == CotangentDestinationKind::Reference {
                         cotangent_reference_input += 1;
                     }
+
                     let input_type = inputs[index].r#type();
                     if crosses_boundary
                         && input_type.cotangent()?.validate_condition_output(predicate_type.as_ref()).is_err()
@@ -1402,6 +1401,7 @@ where
                     }
                 }
             }
+
             // Only after variation validation, materialize a zero inside its branch when the peer returns a value.
             // Compute both masks before changing either branch. Cotangents zero on both sides stay absent, and the
             // resulting metadata must agree before the branches can share a condition output signature.
@@ -1426,6 +1426,7 @@ where
                     )?;
                 }
             }
+
             if transposed_branches[0].cotangents() != transposed_branches[1].cotangents() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{CONDITION_OPERATION_NAME}` branch transposition returned inconsistent cotangent metadata after \
@@ -1433,8 +1434,9 @@ where
                 ))
                 .into());
             }
-            // The selected transpose receives [predicate, live non-reference output cotangents, cotangent references,
-            // residuals]. Reference outputs use the supplying input's cotangent reference; zero outputs own no input.
+
+            // The selected transpose receives `[predicate, live non-reference output cotangents, cotangent references,
+            // residuals]`. Reference outputs use the supplying input's cotangent reference; zero outputs own no input.
             let output_types = branches[0].output_types();
             let mut transposed_inputs = Vec::with_capacity(1 + output_types.len() + residuals.len());
             transposed_inputs.push(predicate);
@@ -1447,6 +1449,7 @@ where
             );
             transposed_inputs.extend(cotangents.references().iter().cloned());
             transposed_inputs.extend(residuals);
+
             // The shared transposed-branch handles are attached directly, so repeated binds of one transposed branch
             // intern by `Arc` identity instead of copying it again.
             let branch_cotangents = context.bind(
@@ -1464,8 +1467,8 @@ where
             let branch_cotangents =
                 transposed_branches[0].assemble_cotangents(&branch_cotangent_types, branch_cotangents)?;
 
-            // Predicate and residual inputs contribute nothing. Returned branch cotangents preserve both-zero slots as
-            // structural zeros; reference destinations have already accumulated in place and need no further
+            // Predicate and residual inputs contribute nothing. Returned branch cotangents preserve both-zero slots
+            // as structural zeros; reference destinations have already accumulated in place and need no further
             // contribution.
             let mut input_cotangents = inputs
                 .iter()
@@ -1476,15 +1479,20 @@ where
                     input_cotangents[index + 1] = cotangent.unwrap();
                 }
             }
+
             input_cotangents
         };
+
         check_count!("input", contributions, accumulators.len(), ProgramError);
         for (accumulator, contribution) in accumulators.iter().zip(contributions) {
             accumulator.accumulate(context, contribution)?;
         }
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to stage a [`ConditionOperation`] that applies one of two branch functions to structured
 /// inputs according to a scalar Boolean predicate, returning the outputs of the selected branch. This is the
