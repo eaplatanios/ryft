@@ -741,29 +741,23 @@ impl<
                 &guarded_inputs,
                 &input_known,
                 [true_partition, false_partition],
-                ConditionSplitJoin {
-                    build_placeholder: |builder: &mut ProgramBuilder<_, _>,
-                                        edge_type: &C::Type,
-                                        _known_inputs: &[AtomId]| {
-                        // Only identity-free types that admit zero can supply a placeholder. Inventing a reference or
-                        // a dimension identity here would change the residual program's contract, so reject the split.
-                        if edge_type.identities().next().is_some() || edge_type.validate_zero().is_err() {
-                            return Ok(None);
-                        }
-                        let zeros = builder.add_instruction(
-                            O::provide(ZeroOperation::new(edge_type.clone()), &[])?,
-                            Vec::new(),
-                            Vec::new(),
-                            None,
-                        )?;
-                        check_count!("output", zeros, 1, ProgramError);
-                        Ok(Some(zeros[0]))
-                    },
-                    bind_known: |operation, programs, inputs: &[_]| {
-                        context.fold_or_residualize(operation, programs, inputs)
-                    },
-                    bind_residual: |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
+                |builder: &mut ProgramBuilder<_, _>, edge_type: &C::Type, _known_inputs: &[AtomId]| {
+                    // Only identity-free types that admit zero can supply a placeholder. Inventing a reference or
+                    // a dimension identity here would change the residual program's contract, so reject the split.
+                    if edge_type.identities().next().is_some() || edge_type.validate_zero().is_err() {
+                        return Ok(None);
+                    }
+                    let zeros = builder.add_instruction(
+                        O::provide(ZeroOperation::new(edge_type.clone()), &[])?,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )?;
+                    check_count!("output", zeros, 1, ProgramError);
+                    Ok(Some(zeros[0]))
                 },
+                |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs),
+                |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
             )? {
                 return Ok(outputs);
             }
@@ -1147,87 +1141,75 @@ where
                 &condition_inputs,
                 &input_known,
                 [true_partition, false_partition],
-                ConditionSplitJoin {
-                    build_placeholder: |builder: &mut ProgramBuilder<C::Constant, C::Operation>,
-                                        edge_type: &C::Type,
-                                        known_inputs: &[AtomId]| {
-                        // This value fills an unused residual slot of the peer branch. Its type and runtime identities
-                        // must still match: construct a zero using live extents when possible, or forward/capture a
-                        // known value instead.
-                        let placeholder_context = TracingContext::<C::Constant, C::Operation>::new();
-                        let sources = known_inputs
-                            .iter()
-                            .map(|input| {
-                                placeholder_context.input(builder.atoms()[input.index()].r#type().into_owned())
-                            })
-                            .collect::<Vec<_>>();
+                |builder: &mut ProgramBuilder<C::Constant, C::Operation>,
+                 edge_type: &C::Type,
+                 known_inputs: &[AtomId]| {
+                    // This value fills an unused residual slot of the peer branch. Its type and runtime identities
+                    // must still match: construct a zero using live extents when possible, or forward/capture a
+                    // known value instead.
+                    let placeholder_context = TracingContext::<C::Constant, C::Operation>::new();
+                    let sources = known_inputs
+                        .iter()
+                        .map(|input| placeholder_context.input(builder.atoms()[input.index()].r#type().into_owned()))
+                        .collect::<Vec<_>>();
 
-                        // Non-zeroable types have no typed zero. Type-only zeros also cannot supply reference-position
-                        // identities such as the runtime extent of an array; the residual-zero protocol must capture
-                        // those from known inputs.
-                        let zero_is_constructible = edge_type.validate_zero().is_ok()
-                            && (!C::Operation::zero_residual_types(edge_type).is_empty()
-                                || edge_type
-                                    .identities()
-                                    .all(|(position, _)| position != TypeIdentityPosition::Reference));
-                        let placeholder = if zero_is_constructible {
-                            C::Operation::materialize_zero_from_residual_sources(
-                                &placeholder_context,
-                                MaybeZero::Zero(edge_type.clone()),
-                                &sources,
-                            )?
-                        } else if let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == edge_type)
-                        {
-                            source.clone()
-                        } else {
-                            // An input of another type may carry the required identity, for example an array carrying
-                            // an extent.
-                            let mut captured = None;
-                            for source in &sources {
-                                if let Some(value) =
-                                    C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?
-                                {
-                                    captured = Some(value);
-                                    break;
-                                }
+                    // Non-zeroable types have no typed zero. Type-only zeros also cannot supply reference-position
+                    // identities such as the runtime extent of an array; the residual-zero protocol must capture
+                    // those from known inputs.
+                    let zero_is_constructible = edge_type.validate_zero().is_ok()
+                        && (!C::Operation::zero_residual_types(edge_type).is_empty()
+                            || edge_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference));
+                    let placeholder = if zero_is_constructible {
+                        C::Operation::materialize_zero_from_residual_sources(
+                            &placeholder_context,
+                            MaybeZero::Zero(edge_type.clone()),
+                            &sources,
+                        )?
+                    } else if let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == edge_type) {
+                        source.clone()
+                    } else {
+                        // An input of another type may carry the required identity, for example an array carrying
+                        // an extent.
+                        let mut captured = None;
+                        for source in &sources {
+                            if let Some(value) =
+                                C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?
+                            {
+                                captured = Some(value);
+                                break;
                             }
+                        }
 
-                            let Some(captured) = captured else {
-                                return Ok(None);
-                            };
-
-                            if captured.r#type().as_ref() != edge_type {
-                                return Err(ProgramError::MalformedProgram(format!(
-                                    "`{}` residual placeholder has type `{}` but expected `{}`",
-                                    CONDITION_OPERATION_NAME,
-                                    captured.r#type().as_ref(),
-                                    edge_type,
-                                )));
-                            }
-
-                            captured
+                        let Some(captured) = captured else {
+                            return Ok(None);
                         };
 
-                        // Build in a detached trace and splice into this known branch with its original inputs,
-                        // preserving identities.
-                        let placeholder_program = placeholder_context
-                            .builder()
-                            .borrow()
-                            .clone()
-                            .build::<Vec<C::Constant>, Vec<C::Constant>>(
-                                vec![placeholder.atom_id()?],
-                                vec![Placeholder; known_inputs.len()],
-                                vec![Placeholder],
-                            )?;
-                        let placeholders = builder.splice_program(&placeholder_program, known_inputs)?;
-                        check_count!("output", placeholders, 1, ProgramError);
-                        Ok(Some(placeholders[0]))
-                    },
-                    bind_known: |operation, programs, inputs: &[C::Value]| {
-                        context.primal().bind(operation, programs, inputs)
-                    },
-                    bind_residual,
+                        if captured.r#type().as_ref() != edge_type {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "`{}` residual placeholder has type `{}` but expected `{}`",
+                                CONDITION_OPERATION_NAME,
+                                captured.r#type().as_ref(),
+                                edge_type,
+                            )));
+                        }
+
+                        captured
+                    };
+
+                    // Build in a detached trace and splice into this known branch with its original inputs,
+                    // preserving identities.
+                    let placeholder_program =
+                        placeholder_context.builder().borrow().clone().build::<Vec<C::Constant>, Vec<C::Constant>>(
+                            vec![placeholder.atom_id()?],
+                            vec![Placeholder; known_inputs.len()],
+                            vec![Placeholder],
+                        )?;
+                    let placeholders = builder.splice_program(&placeholder_program, known_inputs)?;
+                    check_count!("output", placeholders, 1, ProgramError);
+                    Ok(Some(placeholders[0]))
                 },
+                |operation, programs, inputs: &[C::Value]| context.primal().bind(operation, programs, inputs),
+                bind_residual,
             )?;
 
             outputs.map_err(|rejection| -> DifferentiationError {
@@ -1881,25 +1863,12 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
 /// [`reconstruct_partitioned_condition`] builds one per branch, from a partition that partial evaluation or
 /// linearization produced.
 struct ConditionBranchSplit<V: Value, O: Operation<Type = V::Type>> {
-    /// Known-side program of the branch partition, whose outputs are the branch's fully known outputs followed by its
-    /// partition's residual edges.
-    known_program: Program<V, O, Vec<V>, Vec<V>>,
+    /// Original branch partition, including its known and residual programs and their boundary wiring.
+    partition: PartitionedProgram<V, O>,
 
-    /// Residual-side program of the branch partition.
-    residual_program: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Source of each residual-program input, which is either an original unknown input or a residual edge.
-    residual_inputs: Vec<ResidualInputSource>,
-
-    /// Source of each original branch output.
-    outputs: Vec<PartialEvaluationOutput<usize>>,
-
-    /// Type of each residual edge of this branch, in edge order: the residual edges of the partition, followed by the
-    /// folded values of the outputs that this branch folded but that are residual for the condition.
-    edge_types: Vec<V::Type>,
-
-    /// Known-program output providing each edge, in edge order.
-    edge_program_outputs: Vec<usize>,
+    /// Type and known-program output index of each residual edge, in edge order: the partition's edges, followed by
+    /// the folded values of outputs that this branch folded but that are residual for the condition.
+    edges: Vec<(V::Type, usize)>,
 
     /// For each branch output, the edge ordinal carrying its folded value when the output is residual for the condition
     /// but this branch folded it.
@@ -1934,37 +1903,27 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
             )));
         }
         partition.validate_canonical_residual_edges()?;
-        let (mut edge_types, mut edge_program_outputs): (Vec<_>, Vec<_>) =
-            partition.residual_edges().into_iter().unzip();
+        let mut edges = partition.residual_edges();
         let known_program_output_types = partition.known_program().output_types();
         check_count!("output", partition.outputs(), output_known.len(), ProgramError);
         partition.validate_known_input_indices(input_known)?;
-        let (known_program, residual_program, _, residual_inputs, outputs) = partition.into_parts();
-        let mut instantiated_edge_ordinals = vec![None; outputs.len()];
-        for (index, output) in outputs.iter().enumerate() {
+        let mut instantiated_edge_ordinals = vec![None; partition.outputs().len()];
+        for (index, output) in partition.outputs().iter().enumerate() {
             if !output_known[index]
                 && let PartialEvaluationOutput::Known(output) = output
             {
-                instantiated_edge_ordinals[index] = Some(edge_types.len());
-                edge_types.push(known_program_output_types[*output].clone());
-                edge_program_outputs.push(*output);
+                instantiated_edge_ordinals[index] = Some(edges.len());
+                edges.push((known_program_output_types[*output].clone(), *output));
             }
         }
-        Ok(Self {
-            known_program,
-            residual_program,
-            residual_inputs,
-            outputs,
-            edge_types,
-            edge_program_outputs,
-            instantiated_edge_ordinals,
-        })
+        Ok(Self { partition, edges, instantiated_edge_ordinals })
     }
 
     /// Returns whether the known program of this branch only forwards its known inputs or computes values that depend
     /// on no input (e.g., a structural zero), i.e., whether none of its instructions has inputs or regions.
     fn known_program_only_forwards(&self) -> bool {
-        self.known_program
+        self.partition
+            .known_program()
             .entry_region_ref()
             .instructions()
             .iter()
@@ -1991,15 +1950,15 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
         PlaceholderBuild: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
     {
         let mut builder = ProgramBuilder::<V, O>::new();
-        let known_inputs = self
-            .known_program
+        let known_program = self.partition.known_program();
+        let known_inputs = known_program
             .input_types()
             .into_iter()
             .map(|input_type| builder.add_input(input_type))
             .collect::<Vec<_>>();
-        let known_outputs = builder.splice_program(&self.known_program, known_inputs.as_slice())?;
+        let known_outputs = builder.splice_program(known_program, known_inputs.as_slice())?;
         let mut output_atoms = Vec::new();
-        for (index, output) in self.outputs.iter().enumerate() {
+        for (index, output) in self.partition.outputs().iter().enumerate() {
             if output_known[index] {
                 match output {
                     PartialEvaluationOutput::Known(output) => output_atoms.push(known_outputs[*output]),
@@ -2011,8 +1970,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
                 }
             }
         }
-        let mut placeholder_atoms = Vec::with_capacity(peer.edge_types.len());
-        for edge_type in &peer.edge_types {
+        let mut placeholder_atoms = Vec::with_capacity(peer.edges.len());
+        for (edge_type, _) in &peer.edges {
             let Some(placeholder) = build_placeholder(&mut builder, edge_type, &known_inputs)? else {
                 return Ok(Err(format!(
                     "no known input determines a placeholder of type `{edge_type}` for a residual of the other branch",
@@ -2020,7 +1979,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
             };
             placeholder_atoms.push(placeholder);
         }
-        let edge_atoms = self.edge_program_outputs.iter().map(|&output| known_outputs[output]).collect::<Vec<_>>();
+        let edge_atoms = self.edges.iter().map(|(_, output)| known_outputs[*output]).collect::<Vec<_>>();
         if is_true_branch {
             output_atoms.extend(edge_atoms);
             output_atoms.extend(placeholder_atoms);
@@ -2041,17 +2000,17 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
 
     /// Builds the branch of the residual condition that corresponds to this branch. Its inputs are the unknown branch
     /// inputs (i.e., the `branch_input_types` that `input_known` does not select), followed by the residual edges of
-    /// the `true` branch and then those of the `false` branch, of the types `edge_types` lists in that order, where
-    /// `is_true_branch` says which of the two this branch is. Its outputs are the condition outputs that `output_known`
-    /// leaves residual. The branch reads only its own edges, and returns an output that it folded from that output's
-    /// instantiated edge.
+    /// the `true` branch and then those of the `false` branch, with the types from each branch's `edges` in that order,
+    /// where `is_true_branch` says which of the two this branch is. Its outputs are the condition outputs that
+    /// `output_known` leaves residual. The branch reads only its own edges, and returns an output that it folded from
+    /// that output's instantiated edge.
     fn residual_branch(
         &self,
         is_true_branch: bool,
         branch_input_types: &[V::Type],
         input_known: &[bool],
         output_known: &[bool],
-        edge_types: [&[V::Type]; 2],
+        edges: [&[(V::Type, usize)]; 2],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
         let mut builder = ProgramBuilder::<V, O>::new();
         let unknown_input_atoms = branch_input_types
@@ -2059,12 +2018,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
             .zip(input_known)
             .map(|(input_type, &known)| (!known).then(|| builder.add_input(input_type.clone())))
             .collect::<Vec<_>>();
-        let [true_edge_atoms, false_edge_atoms] = edge_types.map(|edge_types| {
-            edge_types.iter().map(|edge_type| builder.add_input(edge_type.clone())).collect::<Vec<_>>()
-        });
+        let [true_edge_atoms, false_edge_atoms] = edges
+            .map(|edges| edges.iter().map(|(edge_type, _)| builder.add_input(edge_type.clone())).collect::<Vec<_>>());
         let own_edge_atoms = if is_true_branch { &true_edge_atoms } else { &false_edge_atoms };
-        let mut spliced_inputs = Vec::with_capacity(self.residual_inputs.len());
-        for input in &self.residual_inputs {
+        let mut spliced_inputs = Vec::with_capacity(self.partition.residual_inputs().len());
+        for input in self.partition.residual_inputs() {
             match input {
                 ResidualInputSource::UnknownInput(index) => {
                     spliced_inputs.push(unknown_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
@@ -2081,9 +2039,9 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
                 }
             }
         }
-        let spliced_outputs = builder.splice_program(&self.residual_program, &spliced_inputs)?;
+        let spliced_outputs = builder.splice_program(self.partition.residual_program(), &spliced_inputs)?;
         let mut output_atoms = Vec::new();
-        for (index, output) in self.outputs.iter().enumerate() {
+        for (index, output) in self.partition.outputs().iter().enumerate() {
             if output_known[index] {
                 continue;
             }
@@ -2105,31 +2063,13 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
     }
 }
 
-/// Strategy with which [`reconstruct_partitioned_condition`] joins the partitions of the two branches of a split
-/// condition: how it constructs placeholders for the residual edges of the peer branch, and how it binds the known and
-/// the residual condition into the caller's contexts.
-struct ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind> {
-    /// Stages a placeholder of the given edge type for one of the peer branch's residual edges into the detached
-    /// builder of a known branch, given that branch's known input atoms. Returning `None` rejects the split with a
-    /// message identifying the missing placeholder's type.
-    build_placeholder: PlaceholderBuild,
-
-    /// Binds the known condition over the predicate and the known inputs into the caller's known-side context and
-    /// returns its outputs (i.e., the known outputs followed by both branches' residual edges).
-    bind_known: KnownBind,
-
-    /// Binds the residual condition over the predicate, the unknown inputs, and both branches' residual edges, and
-    /// returns the residual outputs.
-    bind_residual: ResidualBind,
-}
-
 /// Rebuilds both halves of a conditional over one shared residual signature: a known condition bound through
-/// `join.bind_known` and a residual condition bound through `join.bind_residual`, and returns the outputs of the
-/// original condition in order. Unit-returning splits retain residual effects and deferred work without binding an
-/// empty known condition.
+/// `bind_known` and a residual condition bound through `bind_residual`, and returns the outputs of the original
+/// condition in order. Unit-returning splits retain residual effects and deferred work without binding an empty known
+/// condition.
 ///
 /// Returns a rejection message in the inner result when the split would expose a reference, mistype a residual edge,
-/// fold nothing, or require a placeholder that `join.build_placeholder` cannot construct. Partial evaluation then keeps
+/// fold nothing, or require a placeholder that `build_placeholder` cannot construct. Partial evaluation then keeps
 /// the original condition intact, while separate-context linearization, which has no whole-condition fallback, reports
 /// the message. Program errors propagate through the outer result. Both known branches are constructed before either
 /// condition is bound, so a rejection never leaves partially staged work behind.
@@ -2142,7 +2082,15 @@ struct ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind> {
 ///   - `inputs`: Condition inputs, starting with the predicate, in the caller's value representation.
 ///   - `input_known`: Knownness mask over the branch inputs, which both partitions were split with.
 ///   - `partitions`: Partitions of the `true` and `false` branches into their known and residual programs.
-///   - `join`: Placeholder construction and binding strategy of the split.
+///   - `build_placeholder`: Stages a placeholder of the given edge type for a residual edge of the peer branch into a
+///     detached known-branch builder, given that branch's known input atoms. Returning `None` rejects the split with a
+///     message identifying the missing placeholder's type.
+///   - `bind_known`: Binds the known condition over the predicate and the known inputs into the caller's known-side
+///     context and returns its outputs: the known outputs followed by both branches' residual edges.
+///   - `bind_residual`: Binds the residual condition over the predicate, the unknown inputs, and both branches' residual
+///     edges, and returns the residual outputs.
+// Keep placeholder construction and the two binding destinations explicit.
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_partitioned_condition<
     V: Value<Type: ConditionType>,
     O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
@@ -2157,9 +2105,10 @@ fn reconstruct_partitioned_condition<
     inputs: &[Input],
     input_known: &[bool],
     partitions: [PartitionedProgram<V, O>; 2],
-    join: ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind>,
+    mut build_placeholder: PlaceholderBuild,
+    mut bind_known: KnownBind,
+    mut bind_residual: ResidualBind,
 ) -> Result<Result<Vec<Input>, String>, ProgramError> {
-    let ConditionSplitJoin { mut build_placeholder, mut bind_known, mut bind_residual } = join;
     let [true_partition, false_partition] = partitions;
     let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
     // Reject reference-typed known feeders and executable reference constants. A reference feeder has no typed zero for
@@ -2188,10 +2137,10 @@ fn reconstruct_partitioned_condition<
     // and produce different edge values, so each edge must vary over the predicate's manual axes. An edge that does not
     // (e.g., a residual computed only from invariant inputs) cannot be retyped without changing the residual program
     // that consumes it, so the original condition is kept instead of being mistyped.
-    if let Some(edge_type) = splits
+    if let Some((edge_type, _)) = splits
         .iter()
-        .flat_map(|split| &split.edge_types)
-        .find(|edge_type| edge_type.validate_condition_output(predicate_type).is_err())
+        .flat_map(|split| &split.edges)
+        .find(|(edge_type, _)| edge_type.validate_condition_output(predicate_type).is_err())
     {
         return Ok(Err(format!(
             "a residual of type `{edge_type}` does not vary over every manual axis that the predicate \
@@ -2208,8 +2157,8 @@ fn reconstruct_partitioned_condition<
     // Unit-returning branches still need their residual effects reconstructed, without binding an empty known
     // condition.
     let known_side_is_inert =
-        !output_known.contains(&true) && splits.iter().all(|split| split.known_program.effects().is_pure());
-    let known_side_is_empty = known_side_is_inert && splits.iter().all(|split| split.edge_program_outputs.is_empty());
+        !output_known.contains(&true) && splits.iter().all(|split| split.partition.known_program().effects().is_pure());
+    let known_side_is_empty = known_side_is_inert && splits.iter().all(|split| split.edges.is_empty());
     let known_side_only_forwards =
         known_side_is_inert && splits.iter().all(|split| split.known_program_only_forwards());
     if (known_side_is_empty || known_side_only_forwards) && output_count != 0 {
@@ -2223,7 +2172,7 @@ fn reconstruct_partitioned_condition<
     // with no known work still needs its residual branch effects, but binding an empty pure known condition serves no
     // purpose.
     let known_output_count = output_known.iter().filter(|&&known| known).count();
-    let edge_count = true_split.edge_types.len() + false_split.edge_types.len();
+    let edge_count = true_split.edges.len() + false_split.edges.len();
     let known_outputs = if known_side_is_empty {
         Vec::new()
     } else {
@@ -2251,14 +2200,14 @@ fn reconstruct_partitioned_condition<
     // because simplification retains that work and dropping the condition would discard it. The known condition
     // returns the `true` branch's edges and then the `false` branch's edges after its known outputs, which is the order
     // in which the residual condition receives them after the unknown inputs.
-    let needs_residual_condition =
-        output_known.contains(&false) || splits.iter().any(|split| !split.residual_program.effects().is_pure());
+    let needs_residual_condition = output_known.contains(&false)
+        || splits.iter().any(|split| !split.partition.residual_program().effects().is_pure());
     let residual_outputs = if needs_residual_condition {
-        let edge_types = [true_split.edge_types.as_slice(), false_split.edge_types.as_slice()];
+        let edges = [true_split.edges.as_slice(), false_split.edges.as_slice()];
         let residual_branches = [(&true_split, true), (&false_split, false)]
             .into_iter()
             .map(|(split, is_true_branch)| {
-                split.residual_branch(is_true_branch, branch_input_types, input_known, &output_known, edge_types)
+                split.residual_branch(is_true_branch, branch_input_types, input_known, &output_known, edges)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut residual_condition_inputs = vec![predicate.clone()];
@@ -7817,15 +7766,11 @@ mod tests {
                 &[Array::scalar(true).unwrap(), Array::scalar(3.0).unwrap(), Array::scalar(4.0).unwrap()],
                 &[true, false],
                 [partition(), partition()],
-                ConditionSplitJoin {
-                    build_placeholder: |_: &mut ProgramBuilder<Array, ArrayOperation<Array>>,
-                                        _: &ArrayType,
-                                        _: &[_]| {
-                        panic!("a rejected split builds no placeholders")
-                    },
-                    bind_known: |_, _, _: &[Array]| panic!("a rejected split binds no known condition"),
-                    bind_residual: |_, _, _: &[Array]| panic!("a rejected split binds no residual condition"),
+                |_: &mut ProgramBuilder<Array, ArrayOperation<Array>>, _: &ArrayType, _: &[_]| {
+                    panic!("a rejected split builds no placeholders")
                 },
+                |_, _, _: &[Array]| panic!("a rejected split binds no known condition"),
+                |_, _, _: &[Array]| panic!("a rejected split binds no residual condition"),
             ),
             Err(ProgramError::MalformedProgram(
                 "`condition` branch partition forwards residual inputs, but splitting branches requires residual edges"
