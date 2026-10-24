@@ -1184,9 +1184,10 @@ where
                             // an extent.
                             let mut captured = None;
                             for source in &sources {
-                                if C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?
-                                    .is_some()
+                                if let Some(value) =
+                                    C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?
                                 {
+                                    captured = Some(value);
                                     break;
                                 }
                             }

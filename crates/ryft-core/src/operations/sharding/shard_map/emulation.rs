@@ -32,9 +32,10 @@
 //!     binds per device, so its regions run through the ordinary eager rules. Otherwise, its regions run in lockstep:
 //!     `while`, `condition`, and `scan` run their eager rules over values that hold the value of every device, whose
 //!     regions the emulator replays in lockstep, so that they validate, iterate, and select exactly as eager
-//!     interpretation does on every device. Their inputs must have the same type on every device, the devices must
-//!     agree on every `while` and `condition` predicate, and a `scan` slice whose manual variation differs from that
-//!     of its stack widens both to the join of their variation, as `parallel_vary` would. `custom_function`,
+//!     interpretation does on every device. Their inputs must have the same type on every device (including the
+//!     runtime length of a `scan`, whose type is its extent), and the devices must agree on every `while` and
+//!     `condition` predicate. Either way, a `scan` slice whose manual variation differs from that of its stack widens
+//!     both to the join of their variation, as eager interpretation does. `custom_function`,
 //!     `linear_call`, and `rematerialize` replay their primal region, and a nested `shard_map` extends the device set
 //!     by its own active manual axes. Devices that disagree cannot run such regions in lockstep, and every other region
 //!     operation that needs lockstep execution is rejected, both with [`ProgramError::UnsupportedOperation`].
@@ -46,7 +47,7 @@
 //! runtime execute all of these bodies.
 
 use std::borrow::Cow;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::arrays::{
@@ -64,9 +65,7 @@ use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
 use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAllOperation;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
-use crate::operations::collectives::parallel_vary::{
-    ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
-};
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
 use crate::operations::control_flow::scan::{ScanIterationType, ScanOperation};
@@ -716,9 +715,10 @@ where
         let context = LockstepDomain::<C::Operation>::new(self.grid.device_count());
         let driver = LockstepInterpretationDriver {
             regions,
-            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>, inputs: Vec<LockstepValue>| {
+            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
+                               inputs: Vec<LockstepValue<C::Operation>>| {
                 let outputs = self.run_region(region, inputs.into_iter().map(|input| input.0).collect())?;
-                Ok(outputs.into_iter().map(LockstepValue).collect())
+                Ok(outputs.into_iter().map(LockstepValue::new).collect())
             },
         };
         let outputs = operation.interpret(&context, &driver, &inputs)?;
@@ -731,20 +731,39 @@ where
 /// `scan`) over these values, so that every device follows the rule that eager interpretation follows. The type of a
 /// [`LockstepValue`] is that of the value of device zero, which is the type of the value of every device when the
 /// value enters such an operation (refer to [`lockstep_values`]), so that the rules validate each application once for
-/// all devices.
-#[derive(Clone, Debug)]
-struct LockstepValue(DeviceValues);
+/// all devices. The operation family `O` of the regions that the emulator replays only ties these values to their
+/// [`LockstepDomain`].
+struct LockstepValue<O>(DeviceValues, PhantomData<fn() -> O>);
 
-impl Display for LockstepValue {
+impl<O> LockstepValue<O> {
+    /// Creates a [`LockstepValue`] that holds the `values` of every device, in device order.
+    fn new(values: DeviceValues) -> Self {
+        Self(values, PhantomData)
+    }
+}
+
+impl<O> Clone for LockstepValue<O> {
+    fn clone(&self) -> Self {
+        Self::new(self.0.clone())
+    }
+}
+
+impl<O> Debug for LockstepValue<O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("LockstepValue").field(&self.0).finish()
+    }
+}
+
+impl<O> Display for LockstepValue<O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let values = self.0.iter().map(ToString::to_string).collect::<Vec<_>>();
         write!(formatter, "[{}]", values.join(", "))
     }
 }
 
-impl Parameter for LockstepValue {}
+impl<O> Parameter for LockstepValue<O> {}
 
-impl Typed for LockstepValue {
+impl<O> Typed for LockstepValue<O> {
     type Type = ArrayIrType;
 
     #[inline]
@@ -753,25 +772,25 @@ impl Typed for LockstepValue {
     }
 }
 
-impl Value for LockstepValue {
+impl<O: Operation<Type = ArrayIrType>> Value for LockstepValue<O> {
     type Dispatch = ValueDirectDispatch;
-    type Domain = LockstepDomain;
+    type Domain = LockstepDomain<O>;
 
     #[inline]
-    fn domain(&self) -> LockstepDomain {
+    fn domain(&self) -> LockstepDomain<O> {
         LockstepDomain::new(self.0.len())
     }
 }
 
 // The devices must agree on a predicate, because the regions that it selects or repeats communicate across them, while
 // each device masks its own state with its own predicate (refer to `WhilePredicate`).
-impl Concretizable<bool> for LockstepValue {
+impl<O> Concretizable<bool> for LockstepValue<O> {
     fn concretize(&self) -> Result<bool, ProgramError> {
         agreed_predicate(self.0.iter().map(Concretizable::concretize), CONDITION_OPERATION_NAME)
     }
 }
 
-impl WhilePredicate for LockstepValue {
+impl<O: Operation<Type = ArrayIrType>> WhilePredicate for LockstepValue<O> {
     fn any_true(&self) -> Result<bool, ProgramError> {
         agreed_predicate(self.0.iter().map(WhilePredicate::any_true), WHILE_OPERATION_NAME)
     }
@@ -782,13 +801,13 @@ impl WhilePredicate for LockstepValue {
             .zip(on_true.0.iter().zip(&on_false.0))
             .map(|(predicate, (on_true, on_false))| predicate.mask_select(on_true, on_false))
             .collect::<Result<_, _>>()
-            .map(Self)
+            .map(Self::new)
     }
 }
 
 /// Passive [`Domain`] of the [`LockstepValue`]s of a fixed number of emulated devices. Regions retain their ordinary
 /// constants and operation family `O`; the emulator lifts each constant to one copy per device during replay.
-struct LockstepDomain<O: Operation<Type = ArrayIrType> = ArrayIrOperation<Array>> {
+struct LockstepDomain<O: Operation<Type = ArrayIrType>> {
     /// Number of emulated devices.
     device_count: usize,
 
@@ -805,7 +824,7 @@ impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
 
 impl<O: Operation<Type = ArrayIrType>> Domain for LockstepDomain<O> {
     type Type = ArrayIrType;
-    type Value = LockstepValue;
+    type Value = LockstepValue<O>;
     type Constant = ArrayIrValue<Array>;
     type Operation = O;
 }
@@ -834,14 +853,14 @@ impl<O: Operation<Type = ArrayIrType>, F> RegionDriver<ArrayIrValue<Array>, O>
 impl<O, F> InterpretationDriver<LockstepDomain<O>> for LockstepInterpretationDriver<'_, O, F>
 where
     O: Operation<Type = ArrayIrType>,
-    F: Fn(RegionRef<'_, ArrayIrValue<Array>, O>, Vec<LockstepValue>) -> Result<Vec<LockstepValue>, ProgramError>,
+    F: Fn(RegionRef<'_, ArrayIrValue<Array>, O>, Vec<LockstepValue<O>>) -> Result<Vec<LockstepValue<O>>, ProgramError>,
 {
     fn interpret_region(
         &self,
         _context: &LockstepDomain<O>,
         index: usize,
-        inputs: Vec<LockstepValue>,
-    ) -> Result<Vec<LockstepValue>, ProgramError> {
+        inputs: Vec<LockstepValue<O>>,
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
         (self.interpret_region)(self.region(index)?, inputs)
     }
 
@@ -850,8 +869,8 @@ where
         _context: &LockstepDomain<O>,
         operation: O,
         _regions: R,
-        _inputs: &[LockstepValue],
-    ) -> Result<Vec<LockstepValue>, ProgramError> {
+        _inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("lockstep interpretation cannot bind `{}` outside region replay", operation.name()),
         })
@@ -861,38 +880,37 @@ where
 /// Eager composite array context whose scan iteration functions every emulated device applies to its own values.
 type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-// Every device applies the eager composite iteration functions to its own values, except that a slice whose manual
-// variation differs from that of its stack widens both to the join of their variation first, as `parallel_vary` does on
-// every device, which the eager functions cannot do because a concrete array outside a manual region cannot vary (refer
-// to `vary_to_join`). The devices agree on a dynamic trip count, because they agree on the type of the runtime length
-// (refer to `lockstep_values`), which is its extent.
+// Every device applies the eager composite iteration functions to its own values, so a slice whose manual variation
+// differs from that of its stack widens both to the join of their variation exactly as when the scan binds per device.
+// The devices agree on a dynamic trip count, because they agree on the type of the runtime length (refer to
+// `lockstep_values`), which is its extent.
 impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for ArrayIrType {
-    fn runtime_length(runtime_length: &LockstepValue) -> Result<usize, ProgramError> {
+    fn runtime_length(runtime_length: &LockstepValue<O>) -> Result<usize, ProgramError> {
         <Self as ScanIterationType<DeviceContext>>::runtime_length(&runtime_length.0[0])
     }
 
-    fn iteration_index(context: &LockstepDomain<O>, iteration: usize) -> Result<LockstepValue, ProgramError> {
+    fn iteration_index(context: &LockstepDomain<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
         let index = <Self as ScanIterationType<DeviceContext>>::iteration_index(&DeviceContext::new(), iteration)?;
-        Ok(LockstepValue(vec![index; context.device_count]))
+        Ok(LockstepValue::new(vec![index; context.device_count]))
     }
 
-    fn read_iteration(stack: &LockstepValue, iteration: usize) -> Result<LockstepValue, ProgramError> {
+    fn read_iteration(stack: &LockstepValue<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
         stack
             .0
             .iter()
             .map(|stack| <Self as ScanIterationType<DeviceContext>>::read_iteration(stack, iteration))
             .collect::<Result<_, _>>()
-            .map(LockstepValue)
+            .map(LockstepValue::new)
     }
 
     fn write_iteration(
         context: &LockstepDomain<O>,
         output: usize,
-        accumulator: Option<LockstepValue>,
+        accumulator: Option<LockstepValue<O>>,
         length: usize,
         iteration: usize,
-        value: LockstepValue,
-    ) -> Result<LockstepValue, ProgramError> {
+        value: LockstepValue<O>,
+    ) -> Result<LockstepValue<O>, ProgramError> {
         let accumulators = match accumulator {
             Some(accumulator) => accumulator.0.into_iter().map(Some).collect(),
             None => vec![None; context.device_count],
@@ -901,13 +919,6 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
             .into_iter()
             .zip(value.0)
             .map(|(accumulator, value)| {
-                let (accumulator, value) = match accumulator {
-                    Some(accumulator) => {
-                        let [accumulator, value] = vary_to_join([accumulator, value])?;
-                        (Some(accumulator), value)
-                    }
-                    None => (None, value),
-                };
                 <Self as ScanIterationType<DeviceContext>>::write_iteration(
                     &DeviceContext::new(),
                     output,
@@ -918,15 +929,15 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
                 )
             })
             .collect::<Result<_, _>>()
-            .map(LockstepValue)
+            .map(LockstepValue::new)
     }
 
     fn empty_stack(
         context: &LockstepDomain<O>,
         output_type: &Self,
         body_input_types: &[Self],
-        inputs: &[LockstepValue],
-    ) -> Result<LockstepValue, ProgramError> {
+        inputs: &[LockstepValue<O>],
+    ) -> Result<LockstepValue<O>, ProgramError> {
         (0..context.device_count)
             .map(|device| {
                 let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
@@ -938,7 +949,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
                 )
             })
             .collect::<Result<_, _>>()
-            .map(LockstepValue)
+            .map(LockstepValue::new)
     }
 }
 
@@ -946,7 +957,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
 /// [`LockstepValue`]s, after validating that the input of every device has the type of the input of device zero.
 /// Devices whose inputs differ in type (e.g., in the extent of the runtime length of a `scan`, which is its trip count)
 /// would take different paths through the operation, whose regions communicate across them.
-fn lockstep_values(operation_name: &str, inputs: &[DeviceValues]) -> Result<Vec<LockstepValue>, ProgramError> {
+fn lockstep_values<O>(operation_name: &str, inputs: &[DeviceValues]) -> Result<Vec<LockstepValue<O>>, ProgramError> {
     inputs
         .iter()
         .enumerate()
@@ -954,7 +965,7 @@ fn lockstep_values(operation_name: &str, inputs: &[DeviceValues]) -> Result<Vec<
             if values.iter().any(|value| value.r#type() != values[0].r#type()) {
                 return Err(divergent_devices_error(&format!("the type of input {index}"), operation_name));
             }
-            Ok(LockstepValue(values.clone()))
+            Ok(LockstepValue::new(values.clone()))
         })
         .collect()
 }
@@ -970,30 +981,6 @@ fn agreed_predicate(
         return Err(divergent_devices_error("the predicate", operation_name));
     }
     Ok(values[0])
-}
-
-/// Returns the `stack` and the `slice` written into it widened to the join of their manual variation: each is varied
-/// over every manual axis that only the other one varies over, attaching a replicated placement on that axis's mesh
-/// first when it carries no sharding. As for `parallel_vary` (refer to [`ShardMapEmulator::run_collective`]), only
-/// the types change, because every device already holds its value. Dimension and reference values pass through.
-fn vary_to_join([stack, slice]: [ArrayIrValue<Array>; 2]) -> Result<[ArrayIrValue<Array>; 2], ProgramError> {
-    let (ArrayIrValue::Array(stack), ArrayIrValue::Array(slice)) = (&stack, &slice) else {
-        return Ok([stack, slice]);
-    };
-    let types = [stack.r#type().into_owned(), slice.r#type().into_owned()];
-    let axes = manual_variation_axes(&types);
-    let varied =
-        vary_over_missing_manual_axes(vec![stack.clone(), slice.clone()], &types, &axes, |value, axis, mesh| {
-            let mut input_type = value.r#type().into_owned();
-            if input_type.sharding().is_none() {
-                let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
-                input_type =
-                    input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-            }
-            retype(&value, &single_output_type(&ParallelVaryOperation::new(axis.to_string()), &[input_type])?)
-        })?;
-    let [stack, slice] = <[Array; 2]>::try_from(varied).unwrap();
-    Ok([ArrayIrValue::Array(stack), ArrayIrValue::Array(slice)])
 }
 
 /// Returns the name of the axis that `operation` communicates along when it is a collective (including `axis_index`,
@@ -1025,8 +1012,8 @@ pub(super) fn collective_axis_name<O: OperationPayloadProjection>(operation: &O)
         })
 }
 
-/// Returns the error reported when devices disagree on the `subject` (e.g., the predicate) of the region operation named
-/// `operation_name` that runs in lockstep, so that they would take different paths through it.
+/// Returns the error reported when devices disagree on the `subject` (e.g., the predicate) of the region operation
+/// named `operation_name` that runs in lockstep, so that they would take different paths through it.
 fn divergent_devices_error(subject: &str, operation_name: &str) -> ProgramError {
     ProgramError::UnsupportedOperation {
         message: format!(
@@ -1372,8 +1359,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayReferenceTransform, DataType, Dimension, DimensionBounds, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        ArrayIrOperation, ArrayReferenceTransform, DataType, Dimension, DimensionBounds, DimensionType,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
     };
     use crate::contexts::Context;
     use crate::differentiation::NothingSavable;
@@ -1915,6 +1902,45 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_rejects_inputs_whose_types_differ_across_devices() {
+        // The map body derives a first-class dimension from its local value, so its extent (and hence its type) differs
+        // across the devices, and passes it through a loop whose body reduces over the manual axis but whose predicate
+        // ignores it. Devices whose inputs differ in type could take different paths through the loop, so the emulator
+        // rejects it before the first iteration, even though no iteration would read the dimension.
+        let mesh = manual_mesh();
+        let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
+        let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
+        let local_type = ArrayIrType::Array(shard_map.local_input_type(0, &f32_type(&[2], Some(sharded))).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let state_types = vec![local_type.clone(), DimensionType::from(length.clone()).into()];
+        let condition = build_program(state_types.clone(), |builder, _| {
+            vec![builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()))]
+        });
+        let reduce =
+            build_program(state_types, |builder, inputs| vec![add_sum_over_x(builder, &mesh, inputs[0]), inputs[1]]);
+        let body = build_program(vec![local_type], |builder, inputs| {
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let value = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
+            let count = builder.add_instruction(convert, Vec::new(), vec![value], None).unwrap()[0];
+            let dimension = DimensionFromScalarOperation::new(length.clone().into());
+            let dimension = builder.add_instruction(dimension, Vec::new(), vec![count], None).unwrap()[0];
+            let regions = vec![builder.import_program(condition), builder.import_program(reduce)];
+            let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(1).unwrap();
+            vec![builder.add_instruction(operation, regions, vec![inputs[0], dimension], None).unwrap()[0]]
+        });
+        let program = shard_map_program(body, vec![ArrayIrType::Array(f32_type(&[2], None))], shard_map);
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "the devices of a `shard_map` disagree on the type of input 1 of a `while` whose regions use \
+                          collectives over the manual axes, so the collectives would not have matching participants"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_while_rejects_bodies_that_swap_reference_carries() {
         // The map body allocates two references and runs a loop over them whose body reduces over the manual axis, so
         // the loop runs in lockstep. Its body returns the two reference carries swapped, so the loop state has no fixed
@@ -2107,6 +2133,50 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_scan_rejects_divergent_dynamic_lengths() {
+        // The trip count of a scan whose body reduces over the manual axis is the first-class dimension `length` that
+        // the map body derives from its local count, which differs across the devices. Devices with different trip
+        // counts would reach the reduction a different number of times, so the emulator rejects the type of the runtime
+        // length (i.e., scan input 1, after the carry), which is its extent, before the first iteration.
+        let mesh = manual_mesh();
+        let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
+        let shard_map =
+            ShardMap::new(mesh.clone(), vec![sharded.clone(), sharded.clone()], vec![sharded.clone()], Vec::new());
+        let shard_map = shard_map.unwrap();
+        let local_type =
+            ArrayIrType::Array(shard_map.local_input_type(0, &f32_type(&[2], Some(sharded.clone()))).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let body = build_program(vec![local_type.clone(), local_type.clone()], |builder, inputs| {
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let count = builder.add_instruction(reshape, Vec::new(), vec![inputs[1]], None).unwrap()[0];
+            let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
+            let count = builder.add_instruction(convert, Vec::new(), vec![count], None).unwrap()[0];
+            let dimension = DimensionFromScalarOperation::new(length.clone().into());
+            let dimension = builder.add_instruction(dimension, Vec::new(), vec![count], None).unwrap()[0];
+            let scan_body = build_program(
+                vec![ArrayIrType::Array(ArrayType::scalar(DataType::I64)), local_type.clone()],
+                |builder, inputs| vec![add_sum_over_x(builder, &mesh, inputs[1])],
+            );
+            let scan_body = builder.import_program(scan_body);
+            let scan = ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length.clone()));
+            builder.add_instruction(scan, vec![scan_body], vec![inputs[0], dimension], None).unwrap().to_vec()
+        });
+        let input_types = vec![ArrayIrType::Array(f32_type(&[2], None)); 2];
+        let program = shard_map_program(body, input_types, shard_map);
+        assert_eq!(
+            program.interpret(vec![
+                f32_value(f32_type(&[2], None), &[1.0, 2.0]),
+                f32_value(f32_type(&[2], None), &[1.0, 2.0]),
+            ]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "the devices of a `shard_map` disagree on the type of input 1 of a `scan` whose regions use \
+                          collectives over the manual axes, so the collectives would not have matching participants"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_scan_widens_stacks_whose_manual_variation_changes_across_iterations() {
         // The body declares its carry and slice without manual variation, returns the slice as the next carry, and
         // stacks the carry that it receives, so with an invariant initial carry the first stacked slice is invariant
@@ -2121,8 +2191,8 @@ mod tests {
             build_program(vec![index_type, scalar_type.clone(), scalar_type], |_, inputs| vec![inputs[2], inputs[1]]);
         let initial = f32_value(f32_type(&[], Some(replicated(0))), &[10.0]);
         let inputs = vec![
-            LockstepValue(vec![initial.clone(), initial]),
-            LockstepValue(vec![
+            LockstepValue::new(vec![initial.clone(), initial]),
+            LockstepValue::new(vec![
                 f32_value(f32_type(&[2], Some(varying(1))), &[1.0, 2.0]),
                 f32_value(f32_type(&[2], Some(varying(1))), &[3.0, 4.0]),
             ]),
@@ -2130,7 +2200,8 @@ mod tests {
         let regions = [body.entry_region_ref()];
         let driver = LockstepInterpretationDriver {
             regions: &regions,
-            interpret_region: |region: RegionRef<'_, TestValue, TestOperation>, inputs: Vec<LockstepValue>| {
+            interpret_region: |region: RegionRef<'_, TestValue, TestOperation>,
+                               inputs: Vec<LockstepValue<TestOperation>>| {
                 let mut outputs = vec![Vec::new(); 2];
                 for device in 0..2 {
                     let device_inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
@@ -2140,7 +2211,7 @@ mod tests {
                         output.push(value);
                     }
                 }
-                Ok(outputs.into_iter().map(LockstepValue).collect())
+                Ok(outputs.into_iter().map(LockstepValue::new).collect())
             },
         };
         let outputs = ScanOperation::<ArrayIrType>::new(1, 2usize)
@@ -2159,6 +2230,61 @@ mod tests {
                 ],
             ],
         );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_scan_widening_does_not_depend_on_collectives() {
+        // The scan body declares its carry and slice without manual variation, returns the slice as the next carry, and
+        // stacks the carry that it receives, so with the invariant initial carry `10` the first stacked slice is
+        // invariant and the second one varies along `x`. A scan whose body does not use collectives binds per device
+        // through the eager rule, while the same body with an additional (unused) reduction over `x` runs in lockstep.
+        // Both widen the stack to the join of the variation of its slices and give the same outputs. The map returns
+        // the declared (invariant) outputs of the scan replicated, i.e., the values of the device at coordinate zero.
+        let mesh = manual_mesh();
+        let replicated = |rank| Sharding::replicated(mesh.clone(), rank);
+        let stacked = sharding(&mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]);
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![replicated(1), stacked.clone()],
+            vec![replicated(1), replicated(2)],
+            Vec::new(),
+        )
+        .unwrap();
+        let initial_type = shard_map.local_input_type(0, &f32_type(&[1], Some(replicated(1)))).unwrap();
+        let slices_type = shard_map.local_input_type(1, &f32_type(&[2, 2], Some(stacked))).unwrap();
+        let program = |collective: bool| {
+            let slice_type = ArrayIrType::Array(f32_type(&[1], None));
+            let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+            let scan_body = build_program(vec![index_type, slice_type.clone(), slice_type], |builder, inputs| {
+                if collective {
+                    let sum = ArrayOperation::ParallelReduce(ParallelReduceOperation::new(
+                        ReductionKind::Sum,
+                        "x".to_string(),
+                    ));
+                    builder.add_instruction(sum, Vec::new(), vec![inputs[2]], None).unwrap();
+                }
+                vec![inputs[2], inputs[1]]
+            });
+            let body = build_program(
+                vec![ArrayIrType::Array(initial_type.clone()), ArrayIrType::Array(slices_type.clone())],
+                |builder, inputs| {
+                    let scan_body = builder.import_program(scan_body);
+                    let scan = ScanOperation::<ArrayIrType>::new(1, 2usize);
+                    builder.add_instruction(scan, vec![scan_body], inputs.to_vec(), None).unwrap().to_vec()
+                },
+            );
+            let input_types =
+                vec![ArrayIrType::Array(f32_type(&[1], None)), ArrayIrType::Array(f32_type(&[2, 2], None))];
+            shard_map_program(body, input_types, shard_map.clone())
+        };
+        let inputs =
+            vec![f32_value(f32_type(&[1], None), &[10.0]), f32_value(f32_type(&[2, 2], None), &[1.0, 3.0, 2.0, 4.0])];
+        let expected = Ok(vec![
+            f32_value(f32_type(&[1], Some(replicated(1))), &[2.0]),
+            f32_value(f32_type(&[2, 1], Some(replicated(2))), &[10.0, 1.0]),
+        ]);
+        assert_eq!(program(false).interpret(inputs.clone()), expected);
+        assert_eq!(program(true).interpret(inputs), expected);
     }
 
     #[test]
@@ -2212,6 +2338,45 @@ mod tests {
                           collectives over the manual axes, so the collectives would not have matching participants"
                     .to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_condition_validates_applications() {
+        // The map body allocates two references and selects one of them through a condition whose `true` branch
+        // reduces over the manual axis, so the condition runs in lockstep. Its branches return different references,
+        // which the eager rule of `condition` rejects for every device before it selects a branch.
+        let mesh = manual_mesh();
+        let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
+        let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], Vec::new(), Vec::new()).unwrap();
+        let local_type = shard_map.local_input_type(0, &f32_type(&[2], Some(sharded))).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(local_type.clone()));
+        let branch_types = vec![reference_type.clone(), reference_type];
+        let reduce = build_program(branch_types.clone(), |builder, inputs| {
+            let value = builder.add_instruction(reference_read(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let sum = add_sum_over_x(builder, &mesh, value);
+            let write = ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+            builder.add_instruction(write, Vec::new(), vec![inputs[0], sum], None).unwrap();
+            vec![inputs[0]]
+        });
+        let select = build_program(branch_types, |_, inputs| vec![inputs[1]]);
+        let body = build_program(vec![ArrayIrType::Array(local_type)], |builder, inputs| {
+            let mut condition_inputs = vec![builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()))];
+            condition_inputs.extend((0..2).map(|_| {
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), inputs.to_vec(), None).unwrap()[0]
+            }));
+            let branches = vec![builder.import_program(reduce), builder.import_program(select)];
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            builder.add_instruction(condition, branches, condition_inputs, None).unwrap();
+            Vec::new()
+        });
+        let program = unchecked_shard_map_program(body, vec![ArrayIrType::Array(f32_type(&[2], None))], shard_map);
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`condition` reference output 0 must denote the same reference in both branches, but the `true` \
+                 branch returns region input 0 and the `false` branch returns region input 1",
+            ))),
         );
     }
 

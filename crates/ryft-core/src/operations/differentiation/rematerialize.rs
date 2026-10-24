@@ -314,14 +314,14 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
 
     fn prune_boundary(
         &self,
-        input_count: usize,
+        input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         // Instruction inputs map onto the body inputs one for one, so the inputs that the body does not use are dropped
         // together with its unused outputs.
         let kept_inputs = regions.used_region_inputs(0, used_outputs)?;
-        check_count!("input", kept_inputs, input_count, ProgramError);
+        check_count!("input", kept_inputs, input_types.len(), ProgramError);
         let operation = self.with_remapped_optimization_barrier(|selected| {
             selected.iter().zip(&kept_inputs).filter_map(|(selected, kept)| kept.then_some(*selected)).collect()
         });

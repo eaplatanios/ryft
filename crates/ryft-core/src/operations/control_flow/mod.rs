@@ -15,15 +15,14 @@
 //!     loop-carried state while the predicate is true. [`WhilePredicate`] also supports batched predicates through
 //!     per-item masking. An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) additionally permits
 //!     reverse-mode differentiation through a masked tangent scan.
-//!   - **Shape-Determined Loops:** [`ScanOperation`] threads loop-carried state through a body while consuming slices of
-//!     stacked array inputs and producing stacked outputs. Its body also receives the slice index; reference inputs
+//!   - **Shape-Determined Loops:** [`ScanOperation`] threads loop-carried state through a body while consuming slices
+//!     of stacked array inputs and producing stacked outputs. Its body also receives the slice index; reference inputs
 //!     supply complete roots. [`reverse`](ScanOperation::with_reverse) changes visit order without changing the pairing
 //!     of input and output slices, while [`unroll`](ScanOperation::with_unroll) controls backend lowering.
 //!
 //! Branch and loop computations are [`Region`](crate::Region)s attached to an instruction, rather than fields of its
 //! operation payload. [`WhileType`] and [`ScanType`] define their type-family contracts. The operation rules provide
-//! interpretation, reference discharge, partial evaluation, batching and differentiation; the shared
-//! [`transpose_primal_condition`] rule is also available to operation families that transpose conditions themselves.
+//! interpretation, reference discharge, partial evaluation, batching, differentiation, and transposition.
 //! Mapped-predicate batching evaluates both pure branches and selects their outputs per item, so branch computation
 //! that is only valid when selected needs care under batching. A concrete predicate known during partial evaluation
 //! instead specializes the condition to its selected branch.
@@ -63,11 +62,23 @@
 //! # }
 //! ```
 
+use std::fmt::Display;
+use std::ops::Range;
+
 use crate::arrays::{ArrayIrType, ArrayType};
+use crate::axes::Axis;
+use crate::batching::{
+    BatchAxis, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    ProgramBatchingOutputAxesPolicy,
+};
+use crate::contexts::Context;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
-use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition, TypeRefinements};
+use crate::programs::{
+    Operation, ProgramError, ReferenceId, ReferenceRoot, RegionRef, Type, TypeError, TypeIdentityPosition,
+    TypeRefinements, Value,
+};
 
 // TODO(eaplatanios): Review this module since it is mostly vibe coded and also add a module docstring that follows
 //  our established conventions.
@@ -77,10 +88,8 @@ pub mod scan;
 pub mod select;
 pub mod r#while;
 
-pub use condition::{
-    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, transpose_primal_condition,
-};
-pub use scan::{SCAN_OPERATION_NAME, ScanOperation, ScanType};
+pub use condition::{CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType};
+pub use scan::{SCAN_OPERATION_NAME, ScanMember, ScanOperation, ScanType};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
 
@@ -207,17 +216,32 @@ where
     }
 }
 
-/// Returns how an instruction input of type `input_type` fails to feed a region input of type `region_input_type` of a
-/// control-flow operation (i.e., `"does not refine"` or `"does not equal"`, for use in diagnostics), or [`None`] when it
-/// may feed it. Value inputs only need to refine the region input type (refer to [`Type::is_refined_by`]). Reference
-/// inputs must match it exactly: a reference denotes an allocation whose type is fixed, and reference discharge assigns
-/// that allocation to every region input that receives it, which requires their types to match the allocation's type.
-pub(crate) fn region_input_mismatch<T: Type>(region_input_type: &T, input_type: &T) -> Option<&'static str> {
-    if region_input_type.is_reference() || input_type.is_reference() {
-        (region_input_type != input_type).then_some("does not equal")
-    } else {
-        (!region_input_type.is_refined_by(input_type)).then_some("does not refine")
+/// Validates that instruction input `index` of the control-flow operation named `operation_name`, of type
+/// `input_type`, may feed a region input of type `region_input_type`, i.e., that it refines that type (refer to
+/// [`Type::is_refined_by`]). A reference input refines its region input type by its referent (e.g., a `ref<f32[5]>`
+/// input feeds a `ref<f32[extent]>` region input), so the facts that its referent establishes (here, `extent = 5`)
+/// take part in refining the operation's outputs exactly like the facts of a value input, and conflicting facts are
+/// rejected (refer to [`refine_output_types`]). Its allocation keeps its own type: a reference output that aliases it
+/// takes that type, and the region only sees the refined facts.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] that describes the region input type as `region_input_description` (e.g., `"state type"`)
+/// when the input does not refine it.
+pub(crate) fn validate_region_input<T: Type>(
+    operation_name: &str,
+    index: usize,
+    input_type: &T,
+    region_input_type: &T,
+    region_input_description: &str,
+) -> Result<(), TypeError> {
+    if region_input_type.is_refined_by(input_type) {
+        return Ok(());
     }
+    Err(TypeError::invalid(format!(
+        "`{operation_name}` input {index} has type `{input_type}`, which does not refine its \
+         {region_input_description} `{region_input_type}`",
+    )))
 }
 
 /// Returns the output types of a control-flow operation whose `input_types` refine the `declared_input_types` of its
@@ -226,10 +250,12 @@ pub(crate) fn region_input_mismatch<T: Type>(region_input_type: &T, input_type: 
 /// signature, so conflicting facts are rejected, but identities that an output type defines stay symbolic: a loop's
 /// first-class dimension carry may change its extent across iterations, and a branch produces the identities that its
 /// outputs define. A reference output whose aliased input is known (i.e., for which `aliased_input` returns that
-/// input's index) takes exactly that input's type, so an alias family never mixes refined and declared reference
-/// types, while any other reference output keeps its declared type (reference inputs match their region input types
-/// exactly, as [`region_input_mismatch`] requires, so both rules agree). Metadata that is not a fact about an
-/// identity (e.g., a sharding or layout that only the inputs carry) is never propagated to the outputs.
+/// input's index) takes exactly that input's type, so the output denotes the input's allocation at the allocation's own
+/// type. Any other reference output (e.g., a `condition` output that either branch may forward from a different input)
+/// is refined by the same facts as a value output: every reference input refines its region input type by its referent
+/// (refer to [`validate_region_input`]), so a `ref<f32[extent]>` output of a region entered with a `ref<f32[5]>` input
+/// becomes `ref<f32[5]>`. Metadata that is not a fact about an identity (e.g., a sharding or layout that only the
+/// inputs carry) is never propagated to the outputs.
 pub(crate) fn refine_output_types<T: Type>(
     declared_input_types: &[T],
     input_types: &[T],
@@ -237,21 +263,26 @@ pub(crate) fn refine_output_types<T: Type>(
     aliased_input: impl Fn(usize) -> Option<usize>,
 ) -> Result<Vec<T>, TypeError> {
     let refinements = T::Refinements::new(declared_input_types, input_types)?;
-    let symbolic_identities = declared_output_types
-        .iter()
-        .flat_map(Type::identities)
-        .filter_map(|(position, identity)| (position == TypeIdentityPosition::Definition).then(|| identity.clone()))
-        .collect::<Vec<_>>();
+    let symbolic_identities = defined_identities(declared_output_types);
     declared_output_types
         .iter()
         .enumerate()
-        .map(|(index, declared_output_type)| {
-            if declared_output_type.is_reference() {
-                return Ok(aliased_input(index)
-                    .map_or_else(|| declared_output_type.clone(), |input_index| input_types[input_index].clone()));
-            }
-            refinements.refine_declared(declared_output_type, symbolic_identities.as_slice())
+        .map(|(index, declared_output_type)| match aliased_input(index) {
+            Some(input_index) if declared_output_type.is_reference() => Ok(input_types[input_index].clone()),
+            _ => refinements.refine_declared(declared_output_type, symbolic_identities.as_slice()),
         })
+        .collect()
+}
+
+/// Returns the type identities that the `types` define (i.e., that occur at a [`TypeIdentityPosition::Definition`]
+/// position), in order of occurrence and with repetitions. These are the identities that a region produces through
+/// its outputs rather than receiving them through its inputs, so they stay symbolic when the facts that the inputs
+/// establish refine those outputs.
+pub(crate) fn defined_identities<T: Type>(types: &[T]) -> Vec<T::Identity> {
+    types
+        .iter()
+        .flat_map(Type::identities)
+        .filter_map(|(position, identity)| (position == TypeIdentityPosition::Definition).then(|| identity.clone()))
         .collect()
 }
 
@@ -267,17 +298,13 @@ pub(crate) fn validate_output_identities<T: Type>(
     input_types: &[T],
     output_types: &[T],
 ) -> Result<(), TypeError> {
-    let defined_identities = output_types
-        .iter()
-        .flat_map(Type::identities)
-        .filter_map(|(position, identity)| (position == TypeIdentityPosition::Definition).then_some(identity))
-        .collect::<Vec<_>>();
+    let defined_identities = defined_identities(output_types);
     let input_identities =
         input_types.iter().flat_map(Type::identities).map(|(_, identity)| identity).collect::<Vec<_>>();
     for (index, output_type) in output_types.iter().enumerate() {
         if let Some((_, identity)) = output_type
             .identities()
-            .find(|(_, identity)| !defined_identities.contains(identity) && !input_identities.contains(identity))
+            .find(|(_, identity)| !defined_identities.contains(*identity) && !input_identities.contains(identity))
         {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` output {index} has type `{output_type}`, which refers to the identity `{identity}` \
@@ -288,11 +315,266 @@ pub(crate) fn validate_output_identities<T: Type>(
     Ok(())
 }
 
+/// Reference that a root of the reference analysis of a control-flow region (refer to
+/// [`RegionRef::reference_analysis_with_configuration`]) denotes at the boundary of that region. Control-flow rules
+/// compare these sources to validate which reference a region returns (e.g., that a loop body returns every reference
+/// carry as the reference it entered with; refer to [`validate_reference_carry_roots`]).
+///
+/// [`Display`] describes sources relative to the region: input positions count region inputs independently of the
+/// enclosing instruction's input layout.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegionReferenceSource {
+    /// Input of the region at this position.
+    Input(usize),
+
+    /// Captured reference that names this capture position.
+    Capture(usize),
+
+    /// Concrete reference allocation embedded as a constant.
+    Constant(ReferenceId),
+
+    /// Reference allocated inside the region.
+    Allocation,
+}
+
+impl RegionReferenceSource {
+    /// Returns the [`RegionReferenceSource`] of every output of `region`, with [`None`] for each output that is not a
+    /// reference, as the reference analysis of `region` with the capture prefix `capture_input_count` reports it
+    /// (refer to [`Operation::region_capture_input_count`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference analysis of `region` fails, or when it reports a root that is an input of a
+    /// nested region or a constant that names neither a capture nor an allocation.
+    pub(crate) fn of_outputs<V: Value, O: Operation<Type = V::Type>>(
+        operation_name: &str,
+        region: RegionRef<'_, V, O>,
+        capture_input_count: Option<usize>,
+    ) -> Result<Vec<Option<Self>>, ProgramError> {
+        let analysis = region.reference_analysis_with_configuration(capture_input_count, true, &[])?;
+        analysis
+            .output_roots()
+            .iter()
+            .map(|root| root.map(|root| Self::from_root(operation_name, region, root)).transpose())
+            .collect()
+    }
+
+    /// Returns the [`RegionReferenceSource`] that `root`, a root of the reference analysis of `region`, denotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `root` is an input of a region other than `region`, or a
+    /// constant root whose atom is not a reference constant that names a capture or an allocation.
+    pub(crate) fn from_root<V: Value, O: Operation<Type = V::Type>>(
+        operation_name: &str,
+        region: RegionRef<'_, V, O>,
+        root: ReferenceRoot,
+    ) -> Result<Self, ProgramError> {
+        match root {
+            ReferenceRoot::RegionInput { region: owner, input_index } if owner == region.id() => {
+                Ok(Self::Input(input_index))
+            }
+            ReferenceRoot::RegionInput { .. } => Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` region reference analysis reports a root that is an input of a nested region at \
+                 the region boundary",
+            ))),
+            ReferenceRoot::Allocation { .. } => Ok(Self::Allocation),
+            ReferenceRoot::Constant { value } => {
+                let owner = region.with_id(value.region())?;
+                match owner.atoms()[value.atom().index()].as_constant() {
+                    Some(constant) => match (constant.capture_index(), constant.reference_id()) {
+                        (Some(index), _) => Ok(Self::Capture(index)),
+                        (None, Some(reference)) => Ok(Self::Constant(reference)),
+                        (None, None) => Err(ProgramError::MalformedProgram(format!(
+                            "`{operation_name}` region reference analysis reports a constant root that names neither \
+                             a capture nor an allocation",
+                        ))),
+                    },
+                    None => Err(ProgramError::MalformedProgram(format!(
+                        "`{operation_name}` region reference analysis reports a constant root whose atom is not a \
+                         constant",
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+impl Display for RegionReferenceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(index) => write!(formatter, "region input {index}"),
+            Self::Capture(index) => write!(formatter, "captured reference {index}"),
+            Self::Constant(_) => formatter.write_str("a reference constant"),
+            Self::Allocation => formatter.write_str("a reference allocated in the region"),
+        }
+    }
+}
+
+/// Validates that the `body` of the loop operation named `operation_name` returns every reference carry as the
+/// reference that it entered with, i.e., as its own body input: carry `i` enters `body` at input `carry_inputs.start
+/// + i` and leaves it at output `i`. A loop threads the allocation of a reference carry through every iteration and its
+/// output denotes that same allocation, so a body that returns another reference (e.g., another reference carry, a
+/// reference that it allocates, or a captured reference) gives the loop state no fixed point, and the outputs of a loop
+/// that runs no iteration would disagree with those of every other trip count. The rule is structural: it compares body
+/// positions rather than the allocations that the inputs of one application denote, so every rule (eager
+/// interpretation, reference discharge, and the staged transforms alike) accepts the same bodies. Aliased handles
+/// therefore satisfy it unless the body swaps them.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming the first carry that leaves the body as a different reference, and the errors of the
+/// reference analysis of `body` otherwise (refer to [`RegionReferenceSource::of_outputs`]).
+pub(crate) fn validate_reference_carry_roots<V: Value, O: Operation<Type = V::Type>>(
+    operation_name: &str,
+    body: RegionRef<'_, V, O>,
+    carry_inputs: Range<usize>,
+) -> Result<(), ProgramError> {
+    let body_input_types = body.input_types();
+    if !body_input_types[carry_inputs.clone()].iter().any(Type::is_reference) {
+        return Ok(());
+    }
+    let sources = RegionReferenceSource::of_outputs(operation_name, body, None)?;
+    for (position, input) in carry_inputs.enumerate() {
+        let entering = body_input_types[input].is_reference().then_some(RegionReferenceSource::Input(input));
+        if sources.get(position).copied().flatten() != entering {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` body does not return carry {position} as the reference it entered with, so the \
+                 loop state has no fixed point",
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether the body of a loop passes each of its carries through unchanged (i.e., returns the input atom of the
+/// carry as its next value), where carry `i` enters the body at the input position `carry_inputs.start + i` and
+/// leaves it at output position `i`. Such a carry holds its initial value on every iteration.
+pub(crate) fn passed_through_carries<V: Value, O: Operation<Type = V::Type>>(
+    body: RegionRef<'_, V, O>,
+    carry_inputs: Range<usize>,
+) -> Vec<bool> {
+    carry_inputs
+        .enumerate()
+        .map(|(output, input)| body.output_ids()[output] == body.input_ids()[input])
+        .collect()
+}
+
+/// Aligns every mapped carry among the `carries` of a batched loop to batch axis `0`, so that the fixed point over the
+/// carry batch axes (refer to [`stabilize_carry_axes`]) only distinguishes replicated carries from carries batched at
+/// axis `0`. A replicated carry stays replicated, and a reference carry keeps the batch axis that its referent fixes,
+/// because shared storage cannot be moved.
+pub(crate) fn canonicalize_carry_axes<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
+    context: &BatchingContext<C, P>,
+    driver: &D,
+    carries: &[P::Batch],
+) -> Result<Vec<P::Batch>, BatchingError> {
+    carries
+        .iter()
+        .map(|carry| {
+            if P::batch_axis(carry).is_replicated() || P::unbatched_type(carry).is_reference() {
+                Ok(carry.clone())
+            } else {
+                driver.align_batch_axis(context, carry.clone(), Axis::from(0))
+            }
+        })
+        .collect()
+}
+
+/// Batches the `body` of the loop operation named `operation_name` at `input_axes` while iterating the batch axes of
+/// its carries, the body inputs at the positions `carry_inputs`, to a fixed point, and returns the batched body of the
+/// pass that widens no carry. The leading body outputs are the next values of the carries. A loop's carry types are
+/// loop-invariant, so a replicated carry whose next value is batched becomes batched at axis `0`, which this function
+/// records in `input_axes`. Every pass instantiates the next-carry outputs at the current carry axes (refer to
+/// [`ProgramBatchingOutputAxesPolicy::AlignEachTo`], whose replicated entries are lower bounds that keep the natural
+/// axes of the other outputs), so the stabilizing pass is already aligned to the loop-invariant carry layout. A
+/// reference carry is never widened: its referent fixes its axis, so its body must return it at that axis (refer to
+/// [`validate_reference_carry_axis`]).
+///
+/// Every pass that does not converge widens at least one carry, so the fixed point converges within one more pass than
+/// there are carries. The returned [`None`] reports a fixed point that did not converge within those passes, which only
+/// a batching rule that reports widening non-monotonically can cause.
+pub(crate) fn stabilize_carry_axes<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
+    operation_name: &str,
+    context: &BatchingContext<C, P>,
+    driver: &D,
+    body: RegionRef<'_, C::Constant, C::Operation>,
+    input_axes: &mut [BatchAxis],
+    carry_inputs: Range<usize>,
+) -> Result<Option<P::BatchedProgram>, BatchingError> {
+    let body_input_types = body.input_types();
+    let carry_count = carry_inputs.len();
+    for _ in 0..=carry_count {
+        let output_axes = carry_inputs
+            .clone()
+            .map(|input| match body_input_types[input].is_reference() {
+                true => BatchAxis::replicated(),
+                false => input_axes[input],
+            })
+            .chain(std::iter::repeat_n(BatchAxis::replicated(), body.output_ids().len() - carry_count))
+            .collect();
+        let candidate = driver.batch_program(
+            context,
+            body,
+            input_axes,
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes),
+        )?;
+        let mut widened = false;
+        for (index, (input, output_axis)) in carry_inputs.clone().zip(candidate.output_axes()).enumerate() {
+            if body_input_types[input].is_reference() {
+                validate_reference_carry_axis(operation_name, index, input_axes[input], *output_axis)?;
+            } else if input_axes[input].is_replicated() && !output_axis.is_replicated() {
+                input_axes[input] = BatchAxis::new(0);
+                widened = true;
+            }
+        }
+        if !widened {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Requires a reference carry of a batched loop to leave its body carrying the batch axis it entered with. A
+/// reference's batch axis is fixed by its referent, so the fixed-point iteration over carry axes can neither widen nor
+/// move it, and a body that returns the carry at any other axis is rejected.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the looping operation, used in the rejection diagnostic.
+///   - `index`: Position of the reference carry among the loop's carries.
+///   - `entering`: Batch axis the carry enters the body with.
+///   - `returned`: Batch axis the batched body returns the carry with.
+///
+/// # Errors
+///
+/// Returns [`BatchingError::UnsupportedOperation`] when `returned` differs from `entering`.
+pub(crate) fn validate_reference_carry_axis(
+    operation_name: &str,
+    index: usize,
+    entering: BatchAxis,
+    returned: BatchAxis,
+) -> Result<(), BatchingError> {
+    if entering == returned {
+        return Ok(());
+    }
+    Err(BatchingError::UnsupportedOperation {
+        message: format!(
+            "`{operation_name}` reference carry {index} enters carrying `{entering}` but its body returns it carrying \
+             `{returned}`; a reference carry cannot change its batch axis, so pass the reference as a batched input at \
+             the axis the body produces",
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionType, DimensionValue};
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DimensionType, DimensionValue};
     use crate::axes::Axis;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
@@ -301,7 +583,58 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::Context;
     use crate::parameters::Placeholder;
-    use crate::programs::{Atom, Operation, Program, Region, RegionDriver, RegionRef, Value};
+    use crate::programs::{
+        Atom, Operation, Program, ProgramError, Region, RegionDriver, RegionLiveness, RegionRef, Value,
+    };
+
+    use super::{SCAN_OPERATION_NAME, validate_reference_carry_axis};
+
+    /// Composite array value, which admits references and first-class dimensions.
+    pub(super) type TestIrValue = ArrayIrValue<Array>;
+
+    /// Operation family of the composite array programs under test.
+    pub(super) type TestIrOperation = ArrayIrOperation<Array>;
+
+    /// Captured composite value of the reference discharge fixtures.
+    pub(super) type DischargeCapture = CaptureReference<ArrayIrType>;
+
+    /// Operation family of the captured composite programs in the reference discharge fixtures.
+    pub(super) type DischargeCaptureOperation = ArrayIrOperation<CaptureReference<ArrayType>>;
+
+    /// [`RegionLiveness`] of an operation with a single attached region, whose live inputs `used_inputs` derives from
+    /// the used outputs of each query. The fixture records every query, so that region data flow tests can pin the
+    /// fixed-point passes that a rule performs over its region.
+    pub(super) struct TestRegionLiveness<F: FnMut(&[bool]) -> Vec<bool>> {
+        /// Derives the live region inputs from the used region outputs.
+        used_inputs: F,
+
+        /// Used outputs of every query so far, in query order.
+        queries: Vec<Vec<bool>>,
+    }
+
+    impl<F: FnMut(&[bool]) -> Vec<bool>> TestRegionLiveness<F> {
+        /// Creates a new [`TestRegionLiveness`] whose live region inputs `used_inputs` derives.
+        pub(super) fn new(used_inputs: F) -> Self {
+            Self { used_inputs, queries: Vec::new() }
+        }
+
+        /// Returns the used outputs of every query so far, in query order.
+        pub(super) fn queries(&self) -> &[Vec<bool>] {
+            &self.queries
+        }
+    }
+
+    impl<F: FnMut(&[bool]) -> Vec<bool>> RegionLiveness for TestRegionLiveness<F> {
+        fn used_region_inputs(
+            &mut self,
+            region_index: usize,
+            used_outputs: &[bool],
+        ) -> Result<Vec<bool>, ProgramError> {
+            assert_eq!(region_index, 0);
+            self.queries.push(used_outputs.to_vec());
+            Ok((self.used_inputs)(used_outputs))
+        }
+    }
 
     /// Wraps an [`Array`] as an array [`ArrayIrValue`].
     pub(super) fn array(value: Array) -> ArrayIrValue<Array> {
@@ -424,5 +757,36 @@ mod tests {
         ) -> Result<P::Batch, BatchingError> {
             P::align_batch_axis(context, batch, axis)
         }
+    }
+
+    #[test]
+    fn test_validate_reference_carry_axis() {
+        // A reference carry that leaves the body at the axis it entered with is accepted whether mapped or replicated,
+        // while any change of axis is rejected because the referent fixes the axis.
+        assert_eq!(validate_reference_carry_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(0)), Ok(()));
+        assert_eq!(
+            validate_reference_carry_axis(SCAN_OPERATION_NAME, 1, BatchAxis::replicated(), BatchAxis::replicated()),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_reference_carry_axis(SCAN_OPERATION_NAME, 1, BatchAxis::new(0), BatchAxis::new(1)),
+            Err(BatchingError::UnsupportedOperation {
+                message:
+                    "`scan` reference carry 1 enters carrying `axis 0` but its body returns it carrying `axis 1`; a \
+                          reference carry cannot change its batch axis, so pass the reference as a batched input at \
+                          the axis the body produces"
+                        .to_string(),
+            }),
+        );
+        assert_eq!(
+            validate_reference_carry_axis(SCAN_OPERATION_NAME, 0, BatchAxis::replicated(), BatchAxis::new(0)),
+            Err(BatchingError::UnsupportedOperation {
+                message:
+                    "`scan` reference carry 0 enters carrying `replicated` but its body returns it carrying `axis \
+                          0`; a reference carry cannot change its batch axis, so pass the reference as a batched input \
+                          at the axis the body produces"
+                        .to_string(),
+            }),
+        );
     }
 }

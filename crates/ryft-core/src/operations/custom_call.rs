@@ -7,7 +7,8 @@
 //!     [`EffectClass`]. Backends resolve the target in their kernel registry and execute the kernel. The reference
 //!     [`Array`] backend has no such registry, and so it reports an unsupported-operation error.
 //!   - The [`CustomCall`] capability, which executes or stages a [`CustomCallOperation`] on concrete values and
-//!     transform tracers alike.
+//!     transform tracers alike, and [`CustomCallOperation::call`], which does the same through a context and so also
+//!     serves calls without inputs.
 //!   - The transform contracts that an opaque kernel cannot provide by itself: [`CustomCallBatching`] selects how
 //!     mapped inputs reach the kernel.
 //!
@@ -646,16 +647,17 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// # Effects
 ///
 /// A call is pure unless it declares an [`EffectClass`]. [`with_side_effect`](Self::with_side_effect) declares
-/// [`EffectClass::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its execution
-/// order relative to other ordered I/O effects across every participating device.
-/// [`with_effect_class`](Self::with_effect_class) selects a different contract: [`EffectClass::DeviceOrderedIo`]
-/// preserves program order only among the ordered I/O executing on the same device, which is what permits the call to
-/// execute once per device inside `shard_map` bodies, and [`EffectClass::UnorderedIo`] keeps the call observable
-/// without any ordering dependency (the contract of JAX's `has_side_effect=True`). Every effectful call is lowered
-/// with `has_side_effect = true`. Backends that sequence ordered effects through tokens (e.g., the XLA backend) pass a
-/// call with an *ordered* class one extra token input after its array inputs and expect one extra token output after
-/// its declared outputs, so the kernel's handler must accept and return that token; an unordered call carries no
-/// token, which makes [`EffectClass::UnorderedIo`] the class for handlers written against JAX's calling convention.
+/// [`EffectClass::UnorderedIo`], the contract of JAX's `has_side_effect=True`: the call stays alive through dead-code
+/// elimination and is observable, without any ordering dependency and without a token in the kernel's calling
+/// convention. [`with_effect_class`](Self::with_effect_class) selects a stronger contract: [`EffectClass::OrderedIo`]
+/// preserves the call's execution order relative to other ordered I/O effects across every participating device, and
+/// [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O executing on the same device,
+/// which is what permits the call to execute once per device inside `shard_map` bodies. Every effectful call is
+/// lowered with `has_side_effect = true`. Backends that sequence ordered effects through tokens (e.g., the XLA
+/// backend) pass a call with an *ordered* class one extra token input after its array inputs and expect one extra
+/// token output after its declared outputs, so the kernel's handler must accept and return that token; an unordered
+/// call carries no token. Renderings show every effectful call as `has_side_effect=true` and name the class with
+/// `effect_class=...` unless it is the unordered one.
 ///
 /// # Backend Contract
 ///
@@ -670,7 +672,12 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 ///
 /// Array layouts come from the canonical [`ArrayType`] descriptors of the results and from the declared input layouts
 /// (or the canonical descriptors of the inputs, for inputs without a declaration). Portable flat-array buffer aliases
-/// are declared with [`CustomCallInputOutputAlias`]. Backend-specific vocabulary must never grow on this payload:
+/// are declared with [`CustomCallInputOutputAlias`]. A backend that accepts array inputs with bounded dynamic
+/// dimensions hands the kernel each such input as a dense buffer at its inclusive bounds, exactly like the results of
+/// the mixed form are allocated, and never passes the runtime extent: the kernel sees the whole bound-sized buffer,
+/// whose elements beyond the runtime extent are unspecified, so a kernel that needs the live extent takes it as an
+/// ordinary array input. Dynamic inputs without a finite bound have no such buffer and are rejected. Backend-specific
+/// vocabulary must never grow on this payload:
 /// encodings such as XLA's FFI API version, `backend_config` representation, tuple alias paths, result tiling
 /// attributes, or called-computation references belong in the owning backend's lowering (or in a backend-owned
 /// operation). If a configuration knob only makes sense for one backend, it does not belong on this operation.
@@ -763,15 +770,14 @@ impl CustomCallOperation {
         Ok(self)
     }
 
-    /// Returns this call declaring [`EffectClass::OrderedIo`], replacing any earlier effect selection. This is the
-    /// strongest I/O contract: one execution order across every participating device, which restricts the program
-    /// to single-device placement. Because the class is ordered, backends that sequence effects through tokens hand
-    /// the kernel one extra token input and output (refer to [`with_effect_class`](Self::with_effect_class)); a
-    /// handler written for JAX's `has_side_effect=True`, which never receives a token, needs
-    /// [`EffectClass::UnorderedIo`] instead.
+    /// Returns this call declaring [`EffectClass::UnorderedIo`], replacing any earlier effect selection. This is the
+    /// contract of JAX's `has_side_effect=True`: the call is kept alive through dead-code elimination and remains
+    /// observable, but promises no ordering relative to other effects and adds no token to the kernel's calling
+    /// convention, so handlers written against JAX's convention work unchanged. Select an ordered class with
+    /// [`with_effect_class`](Self::with_effect_class) when the kernel's effects must execute in program order.
     #[inline]
     pub fn with_side_effect(self) -> Self {
-        self.with_effect_class(EffectClass::OrderedIo)
+        self.with_effect_class(EffectClass::UnorderedIo)
     }
 
     /// Returns this call declaring the provided observable effect class, replacing any earlier selection.
@@ -848,6 +854,19 @@ impl CustomCallOperation {
     #[inline]
     pub fn batching(&self) -> CustomCallBatching {
         self.batching
+    }
+
+    /// Calls the foreign kernel described by this operation in `context` with the provided inputs, returning one value
+    /// per declared output type. This binds the operation through [`Context::bind`] and is therefore available in
+    /// every context, eager and staged alike. It is the entry point for calls without array inputs (e.g., kernels that
+    /// act as sources), which the value-level [`CustomCall`] capability cannot dispatch because it routes a call
+    /// through the context of its first input.
+    pub fn call<C: Context<Operation: From<CustomCallOperation>>>(
+        &self,
+        context: &C,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        context.bind(self.clone(), Vec::new(), inputs)
     }
 
     /// Returns this payload with every declared output identity renamed according to `renaming`.
@@ -1424,7 +1443,7 @@ impl Operation for CustomCallOperation {
             }
             if let Some(effect_class) = self.effect_class {
                 operation.field("has_side_effect", true)?;
-                if effect_class != EffectClass::OrderedIo {
+                if effect_class != EffectClass::UnorderedIo {
                     operation.field("effect_class", effect_class)?;
                 }
             }
@@ -1567,7 +1586,9 @@ where
                     vec![Placeholder; carry_inputs.len() + self.output_types.len()],
                 )?;
 
-                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), P::axis_size(context)?);
+                // The stacked results take the batch axis's own placement, like every other batched value.
+                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), P::axis_size(context)?)
+                    .with_stacked_axis_sharding(context.axis_sharding().clone());
                 if let Some(unroll) = self.sequential_unroll(&P::axis_dimension(context)?)? {
                     scan = scan.with_unroll(unroll)?;
                 }
@@ -1889,7 +1910,8 @@ where
                     vec![Placeholder; carry_inputs.len() + self.output_types.len()],
                 )?;
 
-                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone());
+                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
+                    .with_stacked_axis_sharding(context.axis_sharding().clone());
                 if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
                     scan = scan.with_unroll(unroll)?;
                 }
@@ -2005,9 +2027,9 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>> Membe
 
 /// Represents the ability to call foreign kernels registered with the executing backend. [`CustomCall`] stages or
 /// executes a [`CustomCallOperation`]; refer to its documentation for the calling convention and transform rules.
-/// Context-carrying values dispatch through the first input's context, so zero-input calls in those contexts must be
-/// staged through a [`ProgramBuilder`]. Concrete eager values delegate to their backend, which determines whether
-/// zero-input kernels are supported.
+/// Context-carrying values dispatch through the first input's context, so a call without inputs goes through
+/// [`CustomCallOperation::call`] on the context itself instead. Concrete eager values delegate to their backend,
+/// which determines whether zero-input kernels are supported.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
@@ -2075,7 +2097,7 @@ where
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "the custom-call capability dispatches through its first input's context, so calling `{}` with \
-                     no inputs requires staging the operation through a program builder instead",
+                     no inputs requires `CustomCallOperation::call` on the context instead",
                     operation.target_name(),
                 ),
             });
@@ -2616,16 +2638,17 @@ mod tests {
 
     #[test]
     fn test_custom_call_with_side_effect() {
+        // The plain side effect is the unordered, tokenless contract of JAX's `has_side_effect=True`.
         let operation = CustomCallOperation::new("kernel", Vec::new()).with_side_effect();
         assert!(operation.has_side_effect());
-        assert_eq!(operation.effect_class(), Some(EffectClass::OrderedIo));
-        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
-        // The global ordered class renders as the bare `has_side_effect` flag.
+        assert_eq!(operation.effect_class(), Some(EffectClass::UnorderedIo));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        // The unordered class renders as the bare `has_side_effect` flag.
         assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true]");
         // The side effect replaces any earlier effect selection.
         assert_eq!(
-            operation.with_effect_class(EffectClass::UnorderedIo).with_side_effect().effect_class(),
-            Some(EffectClass::OrderedIo),
+            operation.with_effect_class(EffectClass::OrderedIo).with_side_effect().effect_class(),
+            Some(EffectClass::UnorderedIo),
         );
     }
 
@@ -2642,17 +2665,15 @@ mod tests {
             "custom_call [target=kernel, has_side_effect=true, effect_class=device_ordered_io]",
         );
 
-        let unordered = CustomCallOperation::new("kernel", Vec::new()).with_effect_class(EffectClass::UnorderedIo);
-        assert!(unordered.has_side_effect());
-        assert_eq!(unordered.effect_class(), Some(EffectClass::UnorderedIo));
-        assert_eq!(unordered.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
-        assert_eq!(
-            unordered.to_string(),
-            "custom_call [target=kernel, has_side_effect=true, effect_class=unordered_io]"
-        );
+        // Ordered classes name themselves in the rendering, unlike the unordered class of `with_side_effect`.
+        let ordered = CustomCallOperation::new("kernel", Vec::new()).with_effect_class(EffectClass::OrderedIo);
+        assert!(ordered.has_side_effect());
+        assert_eq!(ordered.effect_class(), Some(EffectClass::OrderedIo));
+        assert_eq!(ordered.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(ordered.to_string(), "custom_call [target=kernel, has_side_effect=true, effect_class=ordered_io]");
 
         // The last selection wins.
-        assert_eq!(unordered.with_effect_class(EffectClass::OrderedIo).effect_class(), Some(EffectClass::OrderedIo));
+        assert_eq!(ordered.with_effect_class(EffectClass::UnorderedIo).effect_class(), Some(EffectClass::UnorderedIo));
     }
 
     #[test]
@@ -2673,6 +2694,41 @@ mod tests {
         assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true, batching=broadcast_all]");
         let operation = operation.with_batching(CustomCallBatching::Rejected);
         assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true]");
+    }
+
+    #[test]
+    fn test_custom_call_call() {
+        // Calling through the context binds the operation like the capability does, and it is the entry point for
+        // calls without array inputs, which the capability cannot route through a first input.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = trace.input(ArrayType::new_static(DataType::F32, [2]));
+        let source = CustomCallOperation::new("ryft.test.source", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let [generated] = source.call(&trace, &[]).unwrap().try_into().unwrap();
+        let add = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let [output] = add.call(&trace, &[input, generated]).unwrap().try_into().unwrap();
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = custom_call [target=ryft.test.source]
+                    %2:f32[2] = custom_call [target=ryft.test.add] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // The reference backend still cannot execute kernels eagerly, with or without inputs.
+        assert!(matches!(
+            source.call(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "the reference array backend cannot execute the foreign kernel `ryft.test.source`",
+        ));
     }
 
     #[test]
@@ -2977,7 +3033,7 @@ mod tests {
                 {
                     input_types = [invariant_input.clone()],
                     error = "`custom_call` alias `0->0` requires matching input and output types but input 0 has \
-                             type `f32[2][sharding={mesh<['m'=2:manual]>, []}]` and output 0 has type `f32[2]`",
+                             type `f32[2][sharding={mesh<['m'=2:manual]>, [{}]}]` and output 0 has type `f32[2]`",
                 },
             ],
         );
@@ -3073,7 +3129,7 @@ mod tests {
                 },
                 {
                     input_types = [matrix_type.clone()],
-                    error = "`custom_call` declares 2 input layouts but the call has 1 array inputs",
+                    error = "`custom_call` declares 2 input layouts but the call has 1 array input",
                 },
                 {
                     input_types = [ArrayType::new_static(DataType::F32, [2]), ArrayType::scalar(DataType::I32)],
@@ -3307,7 +3363,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(evaluation.program().effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(evaluation.program().effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
     }
 
     #[test]
@@ -3541,7 +3597,8 @@ mod tests {
     #[test]
     fn test_custom_call_batching_array_ir_delegation() -> Result<(), ProgramError> {
         // An extent-free call over a static mapped extent is exactly the homogeneous contract, so the mixed rule
-        // delegates to the projected homogeneous rule and lifts its result back into the composite universe.
+        // delegates to the projected homogeneous rule and lifts its result back into the composite universe, where the
+        // projected policy materializes the replicated input through a dimension-valued broadcast.
         let operation = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])])
             .with_batching(CustomCallBatching::BroadcastAll);
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3565,9 +3622,11 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2] .
-                let %2:f32[3, 2] = broadcast [output_type=f32[3, 2], output_axes=[1]] %1
-                    %3:f32[3, 2] = custom_call [target=ryft.test.add, batching=broadcast_all] %0 %2
-                in (%3)
+                let %2:dimension<3> = const 3
+                    %3:dimension<2> = constant [value=2]
+                    %4:f32[3, 2] = broadcast [output_axes=[1]] %1 %2 %3
+                    %5:f32[3, 2] = custom_call [target=ryft.test.add, batching=broadcast_all] %0 %4
+                in (%5)
             "}
             .trim_end(),
         );
@@ -3625,7 +3684,7 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
-        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -3748,7 +3807,7 @@ mod tests {
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let operation =
                     CustomCallOperation::new("ryft.test.record", vec![ArrayType::new_static(DataType::F32, [2])])
-                        .with_effect_class(EffectClass::UnorderedIo)
+                        .with_effect_class(EffectClass::OrderedIo)
                         .with_batching(CustomCallBatching::Sequential { unroll: None });
                 Ok(CustomCall::custom_call(&operation, [&input])?.remove(0))
             },
@@ -3761,7 +3820,7 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
-        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -3772,7 +3831,7 @@ mod tests {
                         let %2:f32[2] = custom_call [
                             target=ryft.test.record,
                             has_side_effect=true,
-                            effect_class=unordered_io,
+                            effect_class=ordered_io,
                             batching=sequential,
                         ] %1
                         in (%2)
@@ -3806,27 +3865,27 @@ mod tests {
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        // The outer scan keeps its own axis in front and reports the outer batch axis at position 1.
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
         assert_eq!(
             outer.to_string(),
             indoc! {"
                 lambda %0:f32[2, 3, 2] .
                 let %1:f32[3, 2, 2] = transpose [permutation=[1, 0, 2]] %0
                     %2:f32[3, 2, 2] = scan [carry_count=0, length=3, reverse=false] %1 [
-                    body={
-                        lambda %0:i64[], %1:f32[2, 2] .
-                        let %2:f32[2, 2] = scan [carry_count=0, length=2, reverse=false] %1 [
-                            body={
-                                lambda %0:i64[], %1:f32[2] .
-                                let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential] %1
-                                in (%2)
-                            },
-                        ]
-                        in (%2)
-                    },
-                ]
-                    %3:f32[2, 3, 2] = transpose [permutation=[1, 0, 2]] %2
-                in (%3)
+                        body={
+                            lambda %0:i64[], %1:f32[2, 2] .
+                            let %2:f32[2, 2] = scan [carry_count=0, length=2, reverse=false] %1 [
+                                body={
+                                    lambda %0:i64[], %1:f32[2] .
+                                    let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential] %1
+                                    in (%2)
+                                },
+                            ]
+                            in (%2)
+                        },
+                    ]
+                in (%2)
             "}
             .trim_end(),
         );
@@ -3950,7 +4009,8 @@ mod tests {
         // Placing the batch axis on a manual mesh axis makes every per-item value vary along that axis. The scan body
         // of `Sequential` declares that variation on the call's declared output sharding, exactly as its per-item
         // inputs carry it, so an alias declared against the unbatched types keeps validating; `BroadcastAll` records
-        // the same variation through the batch-prefixed declaration.
+        // the same variation through the batch-prefixed declaration. Both strategies give the stacked results the batch
+        // axis's own placement: the scan declares it as its stacked-axis sharding.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
         let packed = invariant
@@ -3977,7 +4037,7 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:{packed} .
-                let %1:{packed} = scan [carry_count=0, length=2, reverse=false] %0 [
+                let %1:{packed} = scan [carry_count=0, length=2, reverse=false, stacked_axis_sharding={{'m'}}] %0 [
                     body={{
                         lambda %0:i64[], %1:{varying} .
                         let %2:{varying} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
@@ -4464,7 +4524,7 @@ mod tests {
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
-        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -4543,6 +4603,7 @@ mod tests {
                 output_axes=[0, 1]] %2
                     %5:f32[2, 2][layout=tiled{1,0:T(2)}], %6:f32[2, 2][layout=tiled{1,0:T(2)}] = custom_call [
                         target=ryft.test.aliased_layout,
+                        input_layouts=[default, tiled{1,0:T(2)}],
                         input_output_alias=0->0,
                         input_output_alias=1->1,
                         batching=broadcast_all,
@@ -4671,8 +4732,11 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2, 3][layout=tiled{0,1}] .
                 let %2:f32[3, 2, 3] = broadcast [output_type=f32[3, 2, 3], output_axes=[1, 2]] %1
-                    %3:f32[3, 2] = custom_call [target=ryft.test.scaled_add, input_layouts=[default, tiled{1,2,0}], \
-                batching=broadcast_all] %0 %2
+                    %3:f32[3, 2] = custom_call [
+                        target=ryft.test.scaled_add,
+                        input_layouts=[default, tiled{1,2,0}],
+                        batching=broadcast_all,
+                    ] %0 %2
                 in (%3)
             "}
             .trim_end(),
@@ -5077,7 +5141,7 @@ mod tests {
                 lambda %0:f32[3, 2], %1:f32[2] .
                 let %2:f32[1, 2] = broadcast [output_type=f32[1, 2], output_axes=[1]] %1
                     %3:f32[3, 2] = custom_call [target=ryft.test.record, has_side_effect=true, \
-                effect_class=unordered_io, batching=expand_dimensions] %0 %2
+                batching=expand_dimensions] %0 %2
                 in (%3)
             "}
             .trim_end(),
@@ -5222,8 +5286,12 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2] .
-                let %2:f32[3, 2] = custom_call [target=ryft.test.record, has_side_effect=true, \
-                effect_class=device_ordered_io, batching=vectorized] %0 %1
+                let %2:f32[3, 2] = custom_call [
+                    target=ryft.test.record,
+                    has_side_effect=true,
+                    effect_class=device_ordered_io,
+                    batching=vectorized,
+                ] %0 %1
                 in (%2)
             "}
             .trim_end(),
@@ -5637,8 +5705,8 @@ mod tests {
             ),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "the custom-call capability dispatches through its first input's context, so calling \
-                               `ryft.test.source` with no inputs requires staging the operation through a program \
-                               builder instead",
+                               `ryft.test.source` with no inputs requires `CustomCallOperation::call` on the context \
+                               instead",
         ));
     }
 }

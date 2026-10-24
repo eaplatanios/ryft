@@ -1323,12 +1323,15 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// axis along which the reference is replicated, after checking that all copies agree), and a forwarded reference
 /// output is the caller's reference input itself. Two reference inputs that denote the same allocation are rejected
 /// with [`ShardMapError::RepeatedReferenceInputAllocation`], as in reference discharge. The emulation deliberately
-/// supports only the lockstep region operations whose semantics it knows (i.e., `while`, `condition`, `scan` with a
-/// static length, `custom_function`, `linear_call`, `rematerialize`, and nested `shard_map`s) and rejects every other
-/// region operation whose regions use collectives over the emulated axes, a `scan` of dynamic length that does, and
-/// devices that diverge on a predicate around such collectives, with [`ProgramError::UnsupportedOperation`]. These are
+/// supports only the lockstep region operations whose semantics it knows (i.e., `while`, `condition`, `scan`,
+/// `custom_function`, `linear_call`, `rematerialize`, and nested `shard_map`s) and rejects, with
+/// [`ProgramError::UnsupportedOperation`], every other region operation whose regions use collectives over the
+/// emulated axes, as well as a `while`, `condition`, or `scan` around such collectives whose devices diverge on a
+/// predicate or on the type of an input (e.g., on the runtime length of a `scan`, which is its trip count). These are
 /// limitations of the reference emulation, not of `shard_map`. Backends with a device runtime execute the complete
 /// boundary through their own contexts instead (e.g., by compiling the whole manual computation for their devices).
+/// Whether its regions run in lockstep or once per device, a `scan` whose slices of one stacked output differ in manual
+/// variation widens the stack to the join of their variation, as eager interpretation does.
 ///
 /// # Boundary Validation
 ///
@@ -1847,7 +1850,7 @@ impl Operation for ShardMapOperation {
     // has effects that remain observable is retained with no outputs, and its effects keep their per-device order.
     fn prune_boundary(
         &self,
-        input_count: usize,
+        input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
@@ -1856,7 +1859,7 @@ impl Operation for ShardMapOperation {
         }
         check_count!("output", used_outputs, self.output_types.len(), ProgramError);
         let kept_inputs = regions.used_region_inputs(0, used_outputs)?;
-        check_count!("input", kept_inputs, input_count, ProgramError);
+        check_count!("input", kept_inputs, input_types.len(), ProgramError);
         check_count!("input", kept_inputs, self.input_types.len(), ProgramError);
         let input_indices = (0..self.input_types.len()).filter(|&index| kept_inputs[index]).collect::<Vec<_>>();
         let output_indices = (0..self.output_types.len()).filter(|&index| used_outputs[index]).collect::<Vec<_>>();
@@ -7789,7 +7792,7 @@ mod tests {
         // shardings and declared types with the used outputs.
         let (operation, body) = mixed_known_unknown_shard_map_body();
         let pruning = operation
-            .prune_boundary(2, &[true, false, false], &mut FixedRegionLiveness(vec![true, false]))
+            .prune_boundary(&operation.input_types, &[true, false, false], &mut FixedRegionLiveness(vec![true, false]))
             .unwrap()
             .unwrap();
         assert_eq!(pruning.kept_inputs, vec![true, false]);
@@ -8674,7 +8677,7 @@ mod tests {
                 .unwrap();
         let program = shard_map_program(operation, body).unwrap();
         let expected = Err(ProgramError::from(TypeError::invalid(
-            "`condition` `true` branch mutates instruction input 1 of type \
+            "`condition` `true` branch mutates region input 0 of type \
              `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual axis \
              that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies over, so \
              devices that take different branches would leave it different across devices; vary the referent over \
