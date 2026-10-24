@@ -431,23 +431,39 @@ impl Display for CustomCallInputOutputAlias {
     }
 }
 
+/// Lowering-only unrolling policy for [`CustomCallBatching::Sequential`]. Unrolling preserves the per-item kernel
+/// calls and their order while trading generated code size for loop overhead.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CustomCallUnrolling {
+    /// Keep one kernel call per loop trip. This is the default.
+    #[default]
+    Disabled,
+
+    /// Emit this many body copies per loop trip. The factor must be at least `1`.
+    Factor(usize),
+
+    /// Emit one straight-line kernel call per batch item, with no loop. This requires a statically known batch
+    /// extent and corresponds to JAX's `sequential_unrolled` mode.
+    Full,
+}
+
 // TODO(eaplatanios): Review from here onwards.
 
-/// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its inputs. Ryft cannot derive a
-/// batching rule for an opaque kernel, so the author of the call declares which of the few universally meaningful
+/// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its inputs. Ryft cannot derive
+/// a batching rule for an opaque kernel, so the author of the call declares which of the few universally meaningful
 /// strategies applies, using [`with_batching`](CustomCallOperation::with_batching). This mirrors JAX's `vmap_method`
 /// selection on [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). A call whose
-/// inputs are all replicated never consults this behavior: it is bound unchanged.
+/// inputs are all replicated never consults this behavior; it is bound unchanged.
 ///
-/// The single-call strategies require the kernel to understand batch-prefixed buffers. Every output gains the full
-/// mapped extent, so an input/output alias remains valid only when its input also carries that complete output shape.
-/// Aliases of replicated inputs are consequently rejected by [`ExpandDimensions`](Self::ExpandDimensions) when the
-/// batch extent exceeds one, and by [`Vectorized`](Self::Vectorized) whenever they would change the logical shape.
+/// Note that the single-call strategies require the kernel to understand batch-prefixed buffers. Every output gains the
+/// full mapped extent, so an input/output alias remains valid only when its input also carries that complete output
+/// shape. Aliases of replicated inputs are consequently rejected by [`ExpandDimensions`](Self::ExpandDimensions) when
+/// the batch extent exceeds one, and by [`Vectorized`](Self::Vectorized) whenever they would change the logical shape.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CustomCallBatching {
     /// Report a [`BatchingError::UnsupportedOperation`] naming the mapped input. This is the default because a foreign
-    /// kernel's contract is opaque: silently choosing a strategy could execute the kernel on buffers it never agreed to
-    /// accept.
+    /// kernel's contract is opaque and silently choosing a strategy could execute the kernel on buffers it never agreed
+    /// to accept.
     #[default]
     Rejected,
 
@@ -455,19 +471,12 @@ pub enum CustomCallBatching {
     /// inputs are realigned to batch axis `0` and sliced one row per iteration, replicated inputs become invariant loop
     /// carries, and the per-iteration results are stacked back on batch axis `0`. The kernel therefore observes exactly
     /// the buffers it would have seen without the transform, at the cost of `b` sequential calls; a side-effecting
-    /// kernel consequently runs `b` ordered times. The optional `unroll` factor is forwarded to
-    /// [`ScanOperation::with_unroll`], and is a lowering-only knob that trades code size for loop overhead.
+    /// kernel consequently runs `b` ordered times. The `unroll` policy selects the factor forwarded to
+    /// [`ScanOperation::with_unroll`]; full unrolling requires a statically known batch extent.
     Sequential {
-        /// Lowering-only number of body copies emitted per loop trip, or [`None`] to keep one call per trip. The
-        /// factor must be at least `1`.
-        unroll: Option<usize>,
+        /// Lowering-only unrolling policy for the staged scan.
+        unroll: CustomCallUnrolling,
     },
-
-    /// Apply the kernel once per batch item exactly like [`Sequential`](Self::Sequential), but fully unroll the
-    /// staged `scan` so that lowerings emit one straight-line kernel call per batch item and no loop at all. This is
-    /// the `sequential_unrolled` calling convention of `jax.ffi.ffi_call`. Full unrolling requires a statically known
-    /// batch extent, so batching over a dynamic extent reports a [`BatchingError::UnsupportedOperation`].
-    SequentialUnrolled,
 
     /// Align every input to batch axis `0` and call the kernel exactly once on batch-prefixed buffers, declaring
     /// batch-prefixed output types. The kernel must itself understand the leading batch axis. Replicated inputs are
@@ -477,13 +486,12 @@ pub enum CustomCallBatching {
 
     /// Align mapped inputs to batch axis `0`, insert a size-one leading axis into replicated inputs, and call the
     /// kernel exactly once. Every output gains the full mapped extent. The kernel must broadcast its size-one inputs
-    /// internally. This is the `expand_dims` calling convention of `jax.ffi.ffi_call`.
+    /// internally.
     ExpandDimensions,
 
     /// Align mapped inputs to batch axis `0`, keep replicated inputs unchanged, and call the kernel exactly once.
     /// Every output gains the full mapped extent. The kernel must distinguish batch-prefixed inputs from invariant
-    /// inputs and implement the required vectorization itself. This is the `legacy_vectorized` calling convention of
-    /// `jax.ffi.ffi_call`.
+    /// inputs and implement the required vectorization itself.
     Vectorized,
 }
 
@@ -491,9 +499,11 @@ impl Display for CustomCallBatching {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected => formatter.write_str("rejected"),
-            Self::Sequential { unroll: None } => formatter.write_str("sequential"),
-            Self::Sequential { unroll: Some(unroll) } => write!(formatter, "sequential(unroll={unroll})"),
-            Self::SequentialUnrolled => formatter.write_str("sequential_unrolled"),
+            Self::Sequential { unroll: CustomCallUnrolling::Disabled } => formatter.write_str("sequential"),
+            Self::Sequential { unroll: CustomCallUnrolling::Factor(unroll) } => {
+                write!(formatter, "sequential(unroll={unroll})")
+            }
+            Self::Sequential { unroll: CustomCallUnrolling::Full } => formatter.write_str("sequential(unroll=full)"),
             Self::BroadcastAll => formatter.write_str("broadcast_all"),
             Self::ExpandDimensions => formatter.write_str("expand_dimensions"),
             Self::Vectorized => formatter.write_str("vectorized"),
@@ -558,9 +568,9 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 ///     cannot observe the transform's named axis. A mapped input is governed by the [`CustomCallBatching`] behavior
 ///     selected with [`with_batching`](Self::with_batching): the default [`Rejected`](CustomCallBatching::Rejected)
 ///     reports an error naming that input, [`Sequential`](CustomCallBatching::Sequential) applies the kernel once per
-///     batch item through a `scan` (which [`SequentialUnrolled`](CustomCallBatching::SequentialUnrolled) fully
-///     unrolls), and [`BroadcastAll`](CustomCallBatching::BroadcastAll),
-///     [`ExpandDimensions`](CustomCallBatching::ExpandDimensions), and [`Vectorized`](CustomCallBatching::Vectorized)
+///     batch item through a `scan` with an explicit [`CustomCallUnrolling`] policy, and
+///     [`BroadcastAll`](CustomCallBatching::BroadcastAll), [`ExpandDimensions`](CustomCallBatching::ExpandDimensions),
+///     and [`Vectorized`](CustomCallBatching::Vectorized)
 ///     hand the kernel batch-prefixed buffers in a single call. A [`custom_function`](crate::custom_function) without
 ///     its own batching rule batches its primal region structurally, so a mapped input reaches this same operation
 ///     and meets this same contract. Single-call strategies shift declared input and output layouts so that the new
@@ -1111,13 +1121,14 @@ impl CustomCallOperation {
 
     /// Returns the lowering-only [`ScanOperation`] unroll factor that the selected sequential [`CustomCallBatching`]
     /// behavior requests for a mapped axis of extent `batch_dimension`, or [`None`] to keep one kernel call per loop
-    /// trip. [`SequentialUnrolled`](CustomCallBatching::SequentialUnrolled) uses the static batch extent itself, which
-    /// unrolls the scan completely (refer to [`ScanOperation::with_unroll`]), and so it rejects dynamic extents. The
-    /// single-call and rejecting behaviors stage no scan and request no unrolling.
+    /// trip. [`CustomCallUnrolling::Full`] uses the static batch extent itself, which unrolls the scan completely
+    /// (refer to [`ScanOperation::with_unroll`]), and so it rejects dynamic extents. The single-call and rejecting
+    /// behaviors stage no scan and request no unrolling.
     fn sequential_unroll(&self, batch_dimension: &Dimension) -> Result<Option<usize>, BatchingError> {
         match self.batching {
-            CustomCallBatching::Sequential { unroll } => Ok(unroll),
-            CustomCallBatching::SequentialUnrolled => match batch_dimension.value() {
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled } => Ok(None),
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(unroll) } => Ok(Some(unroll)),
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full } => match batch_dimension.value() {
                 Some(extent) => Ok(Some(extent.max(1))),
                 None => Err(BatchingError::UnsupportedOperation {
                     message: format!(
@@ -1434,17 +1445,17 @@ impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> Partial
 // [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that input and
 // its mapped axis, [`Sequential`](CustomCallBatching::Sequential) stages one [`ScanOperation`] whose body performs a
 // single unbatched call (mapped inputs realigned to batch axis `0` and sliced per iteration, replicated inputs threaded
-// as invariant carries), [`SequentialUnrolled`](CustomCallBatching::SequentialUnrolled) stages the same scan with an
-// unroll factor equal to the static batch extent, and [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every
-// input to batch axis `0` and rebinds one call whose declared outputs gain the same leading batch dimension. The other
+// as invariant carries), [`CustomCallUnrolling::Full`] sets its unroll factor to the static batch extent, and
+// [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every input to batch axis `0` and rebinds one call whose
+// declared outputs gain the same leading batch dimension. The other
 // single-call modes differ only in whether replicated inputs gain a singleton axis or remain unchanged. All mapped
 // behaviors keep the staged program's size independent of the batch extent (unrolling is lowering-only) and compose
 // with nested batching, because the rewritten instruction is bound through the parent context and carries the same
 // behavior selection.
 //
-// Both sequential behaviors require a statically known mapped extent: the scan trip count is a host `usize` in this
+// Sequential batching requires a statically known mapped extent here: the scan trip count is a host `usize` in this
 // universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip count is a first-class
-// dimension input (and which `SequentialUnrolled` rejects, because a dynamic trip count cannot be fully unrolled).
+// dimension input (and which full unrolling rejects, because a dynamic trip count cannot be fully unrolled).
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CustomCallOperation
 where
@@ -1465,7 +1476,7 @@ where
 
         match self.batching {
             CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
-            CustomCallBatching::Sequential { .. } | CustomCallBatching::SequentialUnrolled => {
+            CustomCallBatching::Sequential { .. } => {
                 // Realign every mapped input to batch axis 0 so the scan consumes one per-item row per iteration, and
                 // keep replicated inputs as invariant loop carries.
                 let mut carry_indices = Vec::new();
@@ -1727,9 +1738,8 @@ where
 // [`batch_projected_operation`]. A dynamic mapped extent stays here, because a first-class dimension is not an array
 // value and cannot cross the projected array boundary as a scan trip count or broadcast extent.
 //
-// [`Sequential`](CustomCallBatching::Sequential) and [`SequentialUnrolled`](CustomCallBatching::SequentialUnrolled)
-// thread the replicated extents as leading invariant scan carries and consume the mapped rows one per iteration, so the
-// body's call sees exactly the per-item extents it declared.
+// [`Sequential`](CustomCallBatching::Sequential) threads the replicated extents as leading invariant scan carries
+// and consumes the mapped rows one per iteration, so the body's call sees exactly the per-item extents it declared.
 // [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
 // batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
 // dimension is itself dynamic.
@@ -1779,7 +1789,7 @@ where
 
         match self.batching {
             CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
-            CustomCallBatching::Sequential { .. } | CustomCallBatching::SequentialUnrolled => {
+            CustomCallBatching::Sequential { .. } => {
                 let mut carry_indices = Vec::new();
                 let mut stacked_indices = Vec::new();
                 let mut aligned = Vec::with_capacity(arrays.len());
@@ -2399,16 +2409,25 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_variants() {
+        assert_eq!(CustomCallUnrolling::default(), CustomCallUnrolling::Disabled);
         assert_eq!(CustomCallBatching::default(), CustomCallBatching::Rejected);
         for (batching, display, debug) in [
             (CustomCallBatching::Rejected, "rejected", "Rejected"),
-            (CustomCallBatching::Sequential { unroll: None }, "sequential", "Sequential { unroll: None }"),
             (
-                CustomCallBatching::Sequential { unroll: Some(2) },
-                "sequential(unroll=2)",
-                "Sequential { unroll: Some(2) }",
+                CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled },
+                "sequential",
+                "Sequential { unroll: Disabled }",
             ),
-            (CustomCallBatching::SequentialUnrolled, "sequential_unrolled", "SequentialUnrolled"),
+            (
+                CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) },
+                "sequential(unroll=2)",
+                "Sequential { unroll: Factor(2) }",
+            ),
+            (
+                CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full },
+                "sequential(unroll=full)",
+                "Sequential { unroll: Full }",
+            ),
             (CustomCallBatching::BroadcastAll, "broadcast_all", "BroadcastAll"),
             (CustomCallBatching::ExpandDimensions, "expand_dimensions", "ExpandDimensions"),
             (CustomCallBatching::Vectorized, "vectorized", "Vectorized"),
@@ -2418,15 +2437,21 @@ mod tests {
         }
 
         // Unroll factors distinguish sequential behaviors, and equal behaviors hash identically.
-        assert_ne!(CustomCallBatching::Sequential { unroll: None }, CustomCallBatching::Sequential { unroll: Some(1) });
+        assert_ne!(
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled },
+            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(1) }
+        );
         assert_eq!(hash_of(&CustomCallBatching::BroadcastAll), hash_of(&CustomCallBatching::BroadcastAll));
         let behaviors = HashMap::from([
-            (CustomCallBatching::Sequential { unroll: Some(2) }, "sequential"),
+            (CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) }, "sequential"),
             (CustomCallBatching::Vectorized, "vectorized"),
         ]);
-        assert_eq!(behaviors.get(&CustomCallBatching::Sequential { unroll: Some(2) }), Some(&"sequential"));
+        assert_eq!(
+            behaviors.get(&CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) }),
+            Some(&"sequential")
+        );
         assert_eq!(behaviors.get(&CustomCallBatching::Vectorized), Some(&"vectorized"));
-        assert_eq!(behaviors.get(&CustomCallBatching::Sequential { unroll: None }), None);
+        assert_eq!(behaviors.get(&CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled }), None);
     }
 
     #[test]
@@ -2622,13 +2647,15 @@ mod tests {
         let operation = CustomCallOperation::new("kernel", Vec::new());
         assert_eq!(operation.batching(), CustomCallBatching::Rejected);
         assert_eq!(operation.to_string(), "custom_call [target=kernel]");
-        let operation = operation.with_batching(CustomCallBatching::Sequential { unroll: None });
-        assert_eq!(operation.batching(), CustomCallBatching::Sequential { unroll: None });
+        let operation =
+            operation.with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
+        assert_eq!(operation.batching(), CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential]");
-        let operation = operation.with_batching(CustomCallBatching::Sequential { unroll: Some(2) });
+        let operation =
+            operation.with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) });
         assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential(unroll=2)]");
-        let operation = operation.with_batching(CustomCallBatching::SequentialUnrolled);
-        assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential_unrolled]");
+        let operation = operation.with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
+        assert_eq!(operation.to_string(), "custom_call [target=kernel, batching=sequential(unroll=full)]");
         let operation = operation.with_batching(CustomCallBatching::BroadcastAll).with_side_effect();
         assert_eq!(operation.batching(), CustomCallBatching::BroadcastAll);
         assert_eq!(operation.to_string(), "custom_call [target=kernel, has_side_effect=true, batching=broadcast_all]");
@@ -3608,7 +3635,7 @@ mod tests {
                 let operation =
                     CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
                         .with_side_effect()
-                        .with_batching(CustomCallBatching::Sequential { unroll: None });
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
@@ -3651,7 +3678,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-            .with_batching(CustomCallBatching::Sequential { unroll: None });
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
@@ -3698,7 +3725,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-            .with_batching(CustomCallBatching::Sequential { unroll: None });
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
@@ -3748,7 +3775,7 @@ mod tests {
                 let operation =
                     CustomCallOperation::new("ryft.test.record", vec![ArrayType::new_static(DataType::F32, [2])])
                         .with_effect_class(EffectClass::OrderedIo)
-                        .with_batching(CustomCallBatching::Sequential { unroll: None });
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
                 Ok(CustomCall::custom_call(&operation, [&input])?.remove(0))
             },
             ArrayType::new_static(DataType::F32, [2]),
@@ -3791,7 +3818,7 @@ mod tests {
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation =
                     CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
-                        .with_batching(CustomCallBatching::Sequential { unroll: None });
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2])],
@@ -3839,7 +3866,7 @@ mod tests {
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation =
                     CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
-                        .with_batching(CustomCallBatching::Sequential { unroll: Some(2) });
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(2) });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2])],
@@ -3889,7 +3916,7 @@ mod tests {
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation =
                     CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
-                        .with_batching(CustomCallBatching::Sequential { unroll: Some(0) });
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(0) });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2])],
@@ -3915,7 +3942,7 @@ mod tests {
                 let operation =
                     CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
                         .with_input_output_alias(0, 0)?
-                        .with_batching(CustomCallBatching::Sequential { unroll: None });
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2])],
@@ -3965,7 +3992,9 @@ mod tests {
         let input = trace.input(packed.clone());
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2)
             .with_axis_sharding(ShardingDimension::Sharded(vec!["m".to_string()]));
-        let operation = aliased.clone().with_batching(CustomCallBatching::Sequential { unroll: None });
+        let operation = aliased
+            .clone()
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
         let output_id = outputs[0].value().atom_id()?;
         let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
@@ -4025,7 +4054,7 @@ mod tests {
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
             .with_input_output_alias(0, 0)?
-            .with_batching(CustomCallBatching::Sequential { unroll: None });
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
         let output_id = outputs[0].value().atom_id()?;
         let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
@@ -4068,7 +4097,7 @@ mod tests {
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
             .with_input_output_alias(0, 0)?
-            .with_batching(CustomCallBatching::Sequential { unroll: None });
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let outputs =
             operation.batch_in_parent(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?;
         let output_id = outputs[0].value().atom_id()?;
@@ -4117,7 +4146,7 @@ mod tests {
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
             .with_input_output_alias(0, 0)?
-            .with_batching(CustomCallBatching::Sequential { unroll: None });
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let inputs = [ArrayIrBatch::new(input, BatchAxis::new(0))?, ArrayIrBatch::replicated(rows_extent)];
         let outputs = operation.batch_in_parent(&context, &EmptyRegionDriver, &inputs)?;
         let output_id = outputs[0].value().atom_id()?;
@@ -4158,7 +4187,7 @@ mod tests {
                         Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
                         Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
                     ])
-                    .with_batching(CustomCallBatching::Sequential { unroll: None });
+                    .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [2, 3])],
@@ -4199,7 +4228,7 @@ mod tests {
                 Some(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
                 Some(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
             ])
-            .with_batching(CustomCallBatching::Sequential { unroll: None });
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         assert_eq!(
             batch_array_ir_custom_call(operation)?,
             indoc! {"
@@ -4220,13 +4249,13 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_call_batching_sequential_unrolled() {
+    fn test_custom_call_batching_sequential_full_unroll() {
         // Full unrolling stages the same scan as `Sequential`, with an unroll factor equal to the static batch extent.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation =
                     CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])])
-                        .with_batching(CustomCallBatching::SequentialUnrolled);
+                        .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
                 CustomCall::custom_call(&operation, inputs.iter())
             },
             vec![ArrayType::new_static(DataType::F32, [2])],
@@ -4243,7 +4272,7 @@ mod tests {
                 let %1:f32[4, 2] = scan [carry_count=0, length=4, reverse=false, unroll=4] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
-                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential_unrolled] %1
+                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=full)] %1
                         in (%2)
                     },
                 ]
@@ -4254,15 +4283,15 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_call_batching_array_ir_sequential_unrolled() -> Result<(), ProgramError> {
+    fn test_custom_call_batching_array_ir_sequential_full_unroll() -> Result<(), ProgramError> {
         // A dynamic batch extent cannot be fully unrolled.
         let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])])
-            .with_batching(CustomCallBatching::SequentialUnrolled);
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
         let error = batch_array_ir_custom_call(operation).unwrap_err();
         assert!(matches!(
             error.downcast_custom::<BatchingError>(),
             Some(BatchingError::UnsupportedOperation { message })
-                if message == "custom call `kernel` batching `sequential_unrolled` requires a statically known batch \
+                if message == "custom call `kernel` batching `sequential(unroll=full)` requires a statically known batch \
                                extent but the mapped axis has dynamic extent `batch`",
         ));
 
@@ -4270,7 +4299,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-            .with_batching(CustomCallBatching::SequentialUnrolled);
+            .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full });
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let [batch_extent] = trace
             .bind(ConstantOperation::new(DimensionValue::constant(4).unwrap()), Vec::new(), &[])?
@@ -4299,7 +4328,7 @@ mod tests {
                 unroll=4] %2 %1 [
                         body={
                             lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2] .
-                            let %3:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential_unrolled] \
+                            let %3:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential(unroll=full)] \
                 %2 %1
                             in (%1, %3)
                         },
