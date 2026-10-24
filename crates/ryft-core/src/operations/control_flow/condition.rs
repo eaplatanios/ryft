@@ -2064,12 +2064,12 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
 }
 
 /// Rebuilds both halves of a conditional over one shared residual signature: a known condition bound through
-/// `bind_known` and a residual condition bound through `bind_residual`, and returns the outputs of the original
+/// `bind_known_fn` and a residual condition bound through `bind_residual_fn`, and returns the outputs of the original
 /// condition in order. Unit-returning splits retain residual effects and deferred work without binding an empty known
 /// condition.
 ///
 /// Returns a rejection message in the inner result when the split would expose a reference, mistype a residual edge,
-/// fold nothing, or require a placeholder that `build_placeholder` cannot construct. Partial evaluation then keeps
+/// fold nothing, or require a placeholder that `build_placeholder_fn` cannot construct. Partial evaluation then keeps
 /// the original condition intact, while separate-context linearization, which has no whole-condition fallback, reports
 /// the message. Program errors propagate through the outer result. Both known branches are constructed before either
 /// condition is bound, so a rejection never leaves partially staged work behind.
@@ -2082,22 +2082,21 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
 ///   - `inputs`: Condition inputs, starting with the predicate, in the caller's value representation.
 ///   - `input_known`: Knownness mask over the branch inputs, which both partitions were split with.
 ///   - `partitions`: Partitions of the `true` and `false` branches into their known and residual programs.
-///   - `build_placeholder`: Stages a placeholder of the given edge type for a residual edge of the peer branch into a
+///   - `build_placeholder_fn`: Stages a placeholder of the given edge type for a residual edge of the peer branch into a
 ///     detached known-branch builder, given that branch's known input atoms. Returning `None` rejects the split with a
 ///     message identifying the missing placeholder's type.
-///   - `bind_known`: Binds the known condition over the predicate and the known inputs into the caller's known-side
+///   - `bind_known_fn`: Binds the known condition over the predicate and the known inputs into the caller's known-side
 ///     context and returns its outputs: the known outputs followed by both branches' residual edges.
-///   - `bind_residual`: Binds the residual condition over the predicate, the unknown inputs, and both branches' residual
-///     edges, and returns the residual outputs.
-// Keep placeholder construction and the two binding destinations explicit.
+///   - `bind_residual_fn`: Binds the residual condition over the predicate, the unknown inputs, and both branches'
+///     residual edges, and returns the residual outputs.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_partitioned_condition<
     V: Value<Type: ConditionType>,
     O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
     Input: Clone,
-    PlaceholderBuild: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
-    KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
-    ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    BuildPlaceholderFn: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
+    BindKnownFn: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    BindResidualFn: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
 >(
     predicate_type: &V::Type,
     branch_input_types: &[V::Type],
@@ -2105,9 +2104,9 @@ fn reconstruct_partitioned_condition<
     inputs: &[Input],
     input_known: &[bool],
     partitions: [PartitionedProgram<V, O>; 2],
-    mut build_placeholder: PlaceholderBuild,
-    mut bind_known: KnownBind,
-    mut bind_residual: ResidualBind,
+    mut build_placeholder_fn: BuildPlaceholderFn,
+    mut bind_known_fn: BindKnownFn,
+    mut bind_residual_fn: BindResidualFn,
 ) -> Result<Result<Vec<Input>, String>, ProgramError> {
     let [true_partition, false_partition] = partitions;
     let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
@@ -2176,18 +2175,19 @@ fn reconstruct_partitioned_condition<
     let known_outputs = if known_side_is_empty {
         Vec::new()
     } else {
-        let known_true = match true_split.known_branch(&false_split, true, &output_known, &mut build_placeholder)? {
+        let known_true = match true_split.known_branch(&false_split, true, &output_known, &mut build_placeholder_fn)? {
             Ok(branch) => branch,
             Err(rejection) => return Ok(Err(rejection)),
         };
-        let known_false = match false_split.known_branch(&true_split, false, &output_known, &mut build_placeholder)? {
-            Ok(branch) => branch,
-            Err(rejection) => return Ok(Err(rejection)),
-        };
+        let known_false =
+            match false_split.known_branch(&true_split, false, &output_known, &mut build_placeholder_fn)? {
+                Ok(branch) => branch,
+                Err(rejection) => return Ok(Err(rejection)),
+            };
         let mut known_condition_inputs = vec![predicate.clone()];
         known_condition_inputs
             .extend(branch_inputs.iter().zip(input_known).filter(|(_, known)| **known).map(|(input, _)| input.clone()));
-        let known_outputs = bind_known(
+        let known_outputs = bind_known_fn(
             O::from(ConditionOperation::new()),
             vec![known_true, known_false],
             known_condition_inputs.as_slice(),
@@ -2215,7 +2215,7 @@ fn reconstruct_partitioned_condition<
             branch_inputs.iter().zip(input_known).filter(|(_, known)| !**known).map(|(input, _)| input.clone()),
         );
         residual_condition_inputs.extend(known_outputs[known_output_count..].iter().cloned());
-        bind_residual(O::from(ConditionOperation::new()), residual_branches, residual_condition_inputs.as_slice())?
+        bind_residual_fn(O::from(ConditionOperation::new()), residual_branches, residual_condition_inputs.as_slice())?
     } else {
         Vec::new()
     };
