@@ -209,14 +209,16 @@ pub struct ConditionOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T: ConditionType> ConditionOperation<T> {
+impl<T: Type> ConditionOperation<T> {
     /// Creates a new [`ConditionOperation`]. The two branch [`Program`]s are supplied separately as the operation's
     /// attached regions via the region driver passed to [`Context::bind`]. [`Operation::infer_output_types`] validates
     /// that the branch interfaces agree and that the predicate input is a scalar Boolean.
     pub const fn new() -> Self {
         Self { marker: PhantomData }
     }
+}
 
+impl<T: ConditionType> ConditionOperation<T> {
     /// Validates that the two branches with interfaces `region_interfaces` declare the same input types. Both branches
     /// receive the same inputs, and staging can specialize a branch to the actual input types, which could otherwise
     /// make two different declarations equal (refer to [`Operation::validate_region_interfaces`]).
@@ -558,14 +560,14 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
 
     fn prune_boundary(
         &self,
-        input_count: usize,
+        input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         // Both branches keep one shared boundary, whose region inputs the instruction inputs after the predicate supply
         // positionally, so an instruction input is kept when either branch uses the region input it supplies (as in
         // JAX's `_cond_dce_rule`). The predicate is always kept.
-        let mut used_inputs = vec![false; input_count.saturating_sub(1)];
+        let mut used_inputs = vec![false; input_types.len().saturating_sub(1)];
         for region_index in 0..2 {
             let branch_inputs = regions.used_region_inputs(region_index, used_outputs)?;
             for (used, branch_used) in used_inputs.iter_mut().zip(branch_inputs) {
@@ -619,16 +621,8 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Interpretation validates the complete application before selecting a branch, including the unselected peer's
-// signature and reference contracts, because direct eager binding does not pass through program construction.
-// Region entry validates the complete runtime input signature, including shared dimensions and concrete reference
-// referents, and compares outputs using those same refinements. Only the selected branch runs (region 0 for `true`,
-// region 1 for `false`). The `shard_map` emulator uses this same rule with values holding one value per device.
-impl<C> InterpretableOperation<C> for ConditionOperation<C::Type>
-where
-    C: Domain<Type: ConditionType, Value: Concretizable<bool>>,
+impl<C: Domain<Type: ConditionType, Value: Concretizable<bool>>> InterpretableOperation<C>
+    for ConditionOperation<C::Type>
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -637,6 +631,12 @@ where
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Interpretation validates the complete application before selecting a branch, including the unselected peer's
+        // signature and reference contracts, because direct eager binding does not pass through program construction.
+        // Region entry validates the complete runtime input signature, including shared dimensions and concrete
+        // reference referents, and compares outputs using those same refinements. Only the selected branch runs (i.e.,
+        // region `0` for `true` and region `1` for `false`). The `shard_map` emulator uses this same rule with values
+        // holding one value per device.
         let branches = [driver.region(0)?, driver.region(1)?];
         let expected = branches[0].input_ids().len() + 1;
         if inputs.len() != expected {
@@ -649,32 +649,12 @@ where
     }
 }
 
-// Partial-evaluation override for [`ConditionOperation`], whose predicate is the operation's first input.
-//
-// With a [`Known`](PartialValue::Known) predicate that the known-side context can [`resolve`](Context::resolve) to a
-// [`Constant`](crate::ValueResolution::Constant) payload whose value can be concretized as a Boolean, it selects the
-// taken branch and always inlines it over the remaining inputs, so the condition disappears from the residual program.
-// Inlining enters the branch through the shared guarded region entry, which stages a guard for every relationship
-// between its inputs that their actual types leave unproven (e.g., a computed `dimension<2>` next to an unknown
-// `f32[n]`, both entering at `n`). The guard stays in the residual program when one of its members is unknown and keeps
-// later ordered known effects of the inlined body behind that check, so the residual program accepts and rejects the
-// same inputs that the branch entry would. A known predicate that is *not* concretizable (under a staging known-side
-// context, a genuine [`Tracer`] into the outer program) cannot select a branch at partial-evaluation time. The
-// condition is instead split by `split_condition_by_knownness`, after guarding its inputs through the same shared entry
-// contract, into a *known* condition bound in the enclosing known-side context (so known branch work stays behind the
-// conditional instead of being staged speculatively for both branches) and a *residual* condition over the unknown
-// work, connected by per-branch residual edges.
-//
-// With an [`Unknown`](PartialValue::Unknown) predicate the condition stays whole. Even pure known work must remain
-// behind its branch: evaluating an untaken branch speculatively can fail or never terminate, for example when it
-// contains an unbounded `while` whose condition is always true. Residualizing the whole conditional also preserves
-// reference placement, deferred work, and the ordering of effects with later operations.
-impl<C, O> PartiallyEvaluatableOperation<C> for ConditionOperation<C::Type>
-where
+impl<
     C: Context<Type: ConditionType, Constant: Concretizable<bool>, Operation = O>,
     O: Operation<Type = C::Type>
-        + From<ConditionOperation<C::Type>>
-        + OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = O>,
+        + OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = O>
+        + From<ConditionOperation<C::Type>>,
+> PartiallyEvaluatableOperation<C> for ConditionOperation<C::Type>
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -682,18 +662,38 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // With a `Known` predicate that the known-side context can `Context::resolve` to a `Constant` payload whose
+        // value can be concretized as a Boolean, it selects the taken branch and always inlines it over the remaining
+        // inputs, so the condition disappears from the residual program. Inlining enters the branch through the shared
+        // guarded region entry, which stages a guard for every relationship between its inputs that their actual types
+        // leave unproven (e.g., a computed `dimension<2>` next to an unknown `f32[n]`, both entering at `n`). The guard
+        // stays in the residual program when one of its members is unknown and keeps later ordered known effects of the
+        // inlined body behind that check, so the residual program accepts and rejects the same inputs that the branch
+        // entry would. A known predicate that is _not_ concretizable (under a staging known-side context, a genuine
+        // `Tracer` into the outer program) cannot select a branch at partial evaluation time. The condition is instead
+        // split after guarding its inputs through the same entry contract into a _known_ condition bound in the
+        // enclosing known-side context and a _residual_ condition over the unknown work, connected by per-branch
+        // residual edges. Keeping known branch work behind the known condition avoids staging it speculatively for
+        // both branches.
+        //
+        // With an `Unknown` predicate the condition stays whole. Even pure known work must remain behind its branch:
+        // evaluating an untaken branch speculatively can fail or never terminate, for example when it contains an
+        // unbounded `while` whose condition is always true. Residualizing the whole conditional also preserves
+        // reference placement, deferred work, and the ordering of effects with later operations.
+
         // Specializing a concrete predicate or splitting symbolic branches rewrites the original condition. Validate
         // the complete application first, including direct context binding and conditions that return no values, so
         // that a concrete predicate cannot skip the contracts of the branch that it does not select.
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, branches)?;
+
         // A known predicate selects a branch only when it resolves to a program constant: under a staging known-side
         // context "known" means known to the outer program, and a genuine tracer carries no boolean to branch on. A
         // known-but-symbolic predicate (or a program constant payload that exposes no concrete boolean, such as an
         // abstract backend capture reference) keeps the conditional on both sides of the split instead. The rule
-        // requests all nested-computation work through its region access (region 0 is the `true` branch and region 1
-        // the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
+        // requests all nested-computation work through its region access (region `0` is the `true` branch and region
+        // `1` the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
         let selected_branch = inputs[0]
             .as_known()
             .and_then(|predicate| context.parent().resolve(predicate).into_constant())
@@ -702,27 +702,73 @@ where
         if let Some(index) = selected_branch {
             return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
         }
+
         let mut inputs = Cow::Borrowed(inputs);
         if inputs[0].is_known() && !inputs.iter().all(PartialEvaluationValue::is_known) {
-            // The split replaces both branch entries, and each branch is partitioned at its declared input types, so
-            // neither half would check a relationship that the entry checks between a known and an unknown input
+            // The split replaces both branch entries, and each branch is partitioned at its declared input types,
+            // so neither half would check a relationship that the entry checks between a known and an unknown input
             // (e.g., a known `f32[3]` next to an unknown `f32[n]`, both entering at `n`). Guard the inputs through the
             // shared entry contract first, exactly as inlining a selected branch does. The split binds two conditions
             // that join both branches' partitions rather than the programs of one partition, so it guards here instead
             // of binding through `PartialEvaluationContext::inline_partitioned_program`. Both branches declare the
             // same input types, so one guard covers both entries, and the guarded inputs determine which inputs are
             // known. A condition that stays whole receives the guarded inputs as well.
+            let [true_branch, false_branch] = branches;
+            let branch_input_types = true_branch.input_types();
             let mut guarded_inputs = vec![inputs[0].clone()];
-            guarded_inputs.extend(context.guard_inputs(
-                &driver.region(0)?.input_types(),
-                inputs[1..].to_vec(),
-                false,
-            )?);
-            if let Some(outputs) = split_condition_by_knownness(context, driver, &guarded_inputs)? {
+            guarded_inputs.extend(context.guard_inputs(&branch_input_types, inputs[1..].to_vec(), false)?);
+            let input_known = guarded_inputs[1..].iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
+
+            // Partition each branch in its own fresh known-side context, whose inputs stand in for the known inputs,
+            // so no branch work is staged speculatively in the caller. The driver supplies the fresh-trace semantics.
+            // These partitions are not cached: they depend on the evaluation's effect-folding and residual-placement
+            // configuration, which the branch and knownness mask alone do not determine.
+            let true_partition = driver.partition_program(context, true_branch, &input_known)?;
+            let false_partition = driver.partition_program(context, false_branch, &input_known)?;
+
+            // An output is known only if both branches fold it. A value that only one branch folds crosses to the
+            // residual condition as an edge. Both known branches return the shared signature `[known outputs, true
+            // edges, false edges]`, and both residual branches receive `[unknown inputs, true edges, false edges]`,
+            // reading only their own edges. The peer's unused edge slots need placeholders of the same types.
+            if let Ok(outputs) = reconstruct_partitioned_condition(
+                guarded_inputs[0].r#type().as_ref(),
+                &branch_input_types,
+                true_branch.output_types().len(),
+                &guarded_inputs,
+                &input_known,
+                [true_partition, false_partition],
+                ConditionSplitJoin {
+                    build_placeholder: |builder: &mut ProgramBuilder<_, _>,
+                                        edge_type: &C::Type,
+                                        _known_inputs: &[AtomId]| {
+                        // Only identity-free types that admit zero can supply a placeholder. Inventing a reference or
+                        // a dimension identity here would change the residual program's contract, so reject the split.
+                        if edge_type.identities().next().is_some() || edge_type.validate_zero().is_err() {
+                            return Ok(None);
+                        }
+                        let zeros = builder.add_instruction(
+                            O::provide(ZeroOperation::new(edge_type.clone()), &[])?,
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        )?;
+                        check_count!("output", zeros, 1, ProgramError);
+                        Ok(Some(zeros[0]))
+                    },
+                    bind_known: |operation, programs, inputs: &[_]| {
+                        context.fold_or_residualize(operation, programs, inputs)
+                    },
+                    bind_residual: |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
+                },
+            )? {
                 return Ok(outputs);
             }
+
+            // Reconstruction rejects unsupported splits before binding either half. Preserve the entry guards when
+            // falling back to the whole condition, so it still checks the relationships of the original branch entry.
             inputs = Cow::Owned(guarded_inputs);
         }
+
         context.fold_or_residualize(
             O::from(*self),
             driver.regions().map(|region| region.to_program()).collect(),
@@ -731,22 +777,21 @@ where
     }
 }
 
-// Batching binds one condition into the parent context for a replicated predicate, whose items all take the same
-// branch (refer to `batch_condition_with_replicated_predicate`), and selects both branches' outputs per item for a
-// batch-varying predicate (refer to `batch_condition_with_mapped_predicate`), in which case both branches must be pure
-// (refer to `validate_mapped_predicate_branch_effects`), every input is gated, and every output is selected. Every
-// per-item primitive re-enters this operation family's batching rules against the same active context, so the rewrite
-// composes for eager and staging parents alike.
-impl<C, O, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for ConditionOperation<ArrayType>
-where
-    C: Context<Type = ArrayType, Operation = O>,
-    C::Value: Broadcast + Transpose + Select + StopGradient + ManualVariationAlignment<ArrayType>,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
         + From<SelectOperation<ArrayType>>
         + From<ConditionOperation<ArrayType>>,
+    C: Context<
+            Type = ArrayType,
+            Value: Broadcast + Transpose + Select + StopGradient + ManualVariationAlignment<ArrayType>,
+            Operation = O,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for ConditionOperation<ArrayType>
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -754,6 +799,13 @@ where
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Batching binds one condition into the parent context for a replicated predicate, whose items all take the
+        // same branch (refer to `batch_condition_with_replicated_predicate`), and selects both branches' outputs per
+        // item for a batch-varying predicate (refer to `batch_condition_with_mapped_predicate`), in which case both
+        // branches must be pure (refer to `validate_mapped_predicate_branch_effects`), every input is gated, and every
+        // output is selected. Every per-item primitive re-enters this operation family's batching rules against the
+        // same active context, so the rewrite composes for eager and staging parents alike.
+
         // Validate the original logical application after input refinement, before either lowering rewrites the
         // branches, so that a staging parent cannot skip it. Per-item types remove the mapped axis while retaining
         // input refinements.
@@ -1523,71 +1575,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
         let output_count = output_atoms.len();
         builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
     }
-}
-
-/// Splits a `condition` with a known but symbolic predicate into a *known* condition, bound in the enclosing known-side
-/// context, and a *residual* condition, emitted into the residual program, or returns `None` when the condition must
-/// stay whole (refer to [`ConditionSplitRejection`]). The `inputs` start with the predicate and must already
-/// have been guarded against the branch entry (refer to [`PartialEvaluationContext::guard_inputs`]), because
-/// each branch is partitioned at its declared input types.
-///
-/// Each branch is partitioned through its own fresh staging context, whose inputs stand in for the known inputs, so no
-/// branch work is staged speculatively into the caller's context. An output is known only when *both* branches fold
-/// it. An output that only one branch folds stays residual, and that branch passes its folded value to the residual
-/// condition as one more residual edge. The known condition's branches share the signature
-/// `[known inputs...] -> [known outputs..., true edges..., false edges...]`, each branch producing placeholders (typed
-/// zeros) for the *other* branch's edge slots, which are dead because only the taken branch's edges are consumed. The
-/// residual condition's branches share the signature `[unknown inputs..., true edges..., false edges...] -> [residual
-/// outputs...]`, each branch reading only its own edges.
-fn split_condition_by_knownness<C: Context, D: PartialEvaluationDriver<C>>(
-    context: &PartialEvaluationContext<C>,
-    driver: &D,
-    inputs: &[PartialEvaluationValue<C::Value>],
-) -> Result<Option<Vec<PartialEvaluationValue<C::Value>>>, ProgramError>
-where
-    C::Type: ConditionType,
-    C::Operation: From<ConditionOperation<C::Type>>
-        + OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
-{
-    let true_branch = driver.region(0)?;
-    let false_branch = driver.region(1)?;
-    let branch_input_types = true_branch.input_types();
-    check_count!("input", inputs[1..], branch_input_types.len(), ProgramError);
-    let input_known = inputs[1..].iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-    // Partition each branch through its own fresh known-side context, requested through the driver so that this rule
-    // carries no fresh-trace semantic bounds of its own. Unlike the branches' derived forward-mode and transposed
-    // programs, a partition is not retained by the branch region's transform cache: it depends on the configuration of
-    // the partial-evaluation context (e.g., effect folding and residual placement), so the branch and the knownness
-    // mask alone do not determine it.
-    let true_partition = driver.partition_program(context, true_branch, input_known.as_slice())?;
-    let false_partition = driver.partition_program(context, false_branch, input_known.as_slice())?;
-    reconstruct_partitioned_condition(
-        inputs[0].r#type().as_ref(),
-        &branch_input_types,
-        true_branch.output_types().len(),
-        inputs,
-        &input_known,
-        [true_partition, false_partition],
-        ConditionSplitJoin {
-            build_placeholder: |builder: &mut ProgramBuilder<_, _>, edge_type: &C::Type, _known_inputs: &[AtomId]| {
-                // Ordinary specialization does not invent values for identity-bearing edges or non-zeroable types.
-                if edge_type.identities().next().is_some() || edge_type.validate_zero().is_err() {
-                    return Ok(None);
-                }
-                let zeros = builder.add_instruction(
-                    C::Operation::provide(ZeroOperation::new(edge_type.clone()), &[])?,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                )?;
-                check_count!("output", zeros, 1, ProgramError);
-                Ok(Some(zeros[0]))
-            },
-            bind_known: |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs),
-            bind_residual: |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
-        },
-    )
-    .map(Result::ok)
 }
 
 /// Strategy with which [`reconstruct_partitioned_condition`] joins the partitions of the two branches of a split
