@@ -1,16 +1,16 @@
-//! Calls to foreign kernels registered with the executing backend, which are the analogue of
-//! [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). This module provides the
-//! following:
+//! Calls to foreign kernels registered with the executing backend, which are the Ryft analogue of
+//! [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html).
+//! This module provides the following:
 //!
-//!   - The [`CustomCallOperation`], which carries a target name, declared output types, typed
-//!     [`CustomCallAttribute`] configuration, and optional input layouts, buffer aliases, and observable
-//!     [`EffectClass`]. Backends resolve the target in their kernel registry and execute the kernel. The reference
-//!     [`Array`] backend has no such registry, and so it reports an unsupported-operation error.
+//!   - The [`CustomCallOperation`], which carries a target name, declared output types, typed [`CustomCallAttribute`]
+//!     configuration, and optional input layouts, buffer aliases, and observable [`EffectClass`]. Backends resolve the
+//!     target in their kernel registry and execute the kernel. The reference [`Array`] backend has no such registry,
+//!     and so it reports an unsupported-operation error.
 //!   - The [`CustomCall`] capability, which executes or stages a [`CustomCallOperation`] on concrete values and
 //!     transform tracers alike, and [`CustomCallOperation::call`], which does the same through a context and so also
 //!     serves calls without inputs.
-//!   - The transform contracts that an opaque kernel cannot provide by itself: [`CustomCallBatching`] selects how
-//!     mapped inputs reach the kernel.
+//!   - The transform contracts that an opaque kernel cannot provide by itself like [`CustomCallBatching`] which selects
+//!     how mapped inputs reach the kernel.
 //!
 //! Homogeneous array calls require static output shapes. Mixed [`ArrayIrType`] calls additionally accept trailing
 //! first-class dimension inputs that ground dynamic output axes without entering the kernel ABI. Undeclared output
@@ -19,21 +19,6 @@
 //! fold-or-residualize behavior of the executing context. Refer to [`CustomCallOperation`] for the complete calling
 //! convention and to the [StableHLO specification](https://openxla.org/stablehlo/spec#custom_call) for the operation
 //! that the XLA backend lowers it to.
-//!
-//! # Example
-//!
-//! ```rust
-//! # use ryft_core::{Array, ArrayType, CustomCall, CustomCallOperation, DataType, ProgramError};
-//! let operation = CustomCallOperation::new("example.kernel", vec![ArrayType::new_static(DataType::F32, [2])])
-//!     .with_attribute("scale", 2.0f32);
-//! let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
-//! assert!(matches!(
-//!     Array::custom_call(&operation, [&input]),
-//!     Err(ProgramError::UnsupportedOperation { .. }),
-//! ));
-//! ```
-
-// TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -73,6 +58,8 @@ use crate::programs::{
     OperationPayloadProjection, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields, where a
 /// configuration attribute of the same name would be indistinguishable from the field.
