@@ -516,22 +516,22 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields, where a
-/// configuration attribute of the same name would be indistinguishable from the field.
+/// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields,
+/// where a configuration attribute of the same name would be indistinguishable from the field.
 const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
     ["target", "input_layouts", "input_output_alias", "has_side_effect", "effect_class", "batching"];
 
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name. It is the
-/// analogue of [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). The operation
-/// is opaque to Ryft: its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s
-/// are forwarded verbatim to the kernel as its configuration.
+/// Ryft analogue of JAX's [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html).
+/// This operation is opaque to Ryft: its output types are declared up front instead of inferred, and typed
+/// [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration.
 ///
 /// This is an [`ArrayType`] operation that participates in two input contracts. In homogeneous array programs it
 /// accepts only the foreign kernel's array inputs, so every declared output must have a static shape. As a mixed member
-/// of the array IR (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one trailing first-class
-/// dimension input per dynamic axis occurrence in the declared outputs, ordered first by output and then by axis, and
-/// type inference verifies that each input either defines its corresponding output axis's variable or supplies an
-/// exact extent within that variable's bounds, refining the output axis to that extent.
+/// of the [`ArrayIrType`] operation family (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one
+/// trailing first-class dimension input per dynamic axis occurrence in the declared outputs, ordered first by output
+/// and then by axis, and type inference verifies that each input either defines its corresponding output axis's
+/// variable or supplies an exact extent within that variable's bounds, refining the output axis to that extent.
 /// These logical result extents do not enter the foreign kernel ABI: only the leading array inputs are passed to the
 /// kernel. Eager execution and backend lowering use the trailing inputs to verify or attach the declared logical sizes
 /// to the returned buffers. Both contracts share one payload with the same target, output declarations, attributes,
@@ -544,11 +544,12 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// Type inference also validates the configuration: attribute names must be unique (including within nested
 /// dictionaries) and must not reuse the names of the operation's own rendered fields (`target`, `input_layouts`,
 /// `input_output_alias`, `has_side_effect`, `effect_class`, and `batching`), declared input layouts must match the
-/// rank of their inputs, and each alias must connect an input and an output of identical types (and identical declared
-/// layouts). Output types declared without a sharding inherit the manual-axis variation of the inputs, placed
-/// replicated on their mesh, because opaque code cannot be assumed to produce the same result on every device. Aliases
-/// are compared against these effective output types, after extent refinement and sharding inheritance, so an input
-/// that carries the manual variation its output inherits can alias an output declared without a sharding.
+/// rank of their inputs, and each alias must connect an input and an output of identical types apart from their
+/// original layouts, with matching layouts at the kernel boundary. Output types declared without a sharding inherit
+/// the manual-axis variation of the inputs, placed replicated on their mesh, because opaque code cannot be assumed to
+/// produce the same result on every device. Aliases are compared against these effective output types after extent
+/// refinement and sharding inheritance, so an input that carries the manual variation its output inherits can alias an
+/// output declared without a sharding.
 ///
 /// The XLA backend lowers this operation to a
 /// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
@@ -607,9 +608,10 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// honors the declared effect class for side-effecting calls. Backends that cannot execute foreign kernels (like the
 /// reference array backend) reject interpretation with a clear error instead of guessing.
 ///
-/// Array layouts come from the canonical [`ArrayType`] descriptors of the results and from the declared input layouts
-/// (or the canonical descriptors of the inputs, for inputs without a declaration). Portable flat-array buffer aliases
-/// are declared with [`CustomCallInputOutputAlias`]. A backend that accepts array inputs with bounded dynamic
+/// Array layouts come from the canonical [`ArrayType`] descriptors of the results and from the declared input layouts.
+/// An input without a declared layout, including a [`None`] entry, uses dense row-major storage regardless of its
+/// original type's layout; an output without a layout also uses dense row-major storage. Portable flat-array buffer
+/// aliases are declared with [`CustomCallInputOutputAlias`]. A backend that accepts array inputs with bounded dynamic
 /// dimensions hands the kernel each such input as a dense buffer at its inclusive bounds, exactly like the results of
 /// the mixed form are allocated, and never passes the runtime extent: the kernel sees the whole bound-sized buffer,
 /// whose elements beyond the runtime extent are unspecified, so a kernel that needs the live extent takes it as an
@@ -674,14 +676,13 @@ impl CustomCallOperation {
 
     /// Returns this [`CustomCallOperation`] declaring the buffer layouts in which the kernel receives its array
     /// inputs, replacing any earlier declaration. The declaration has one entry per array input (excluding the
-    /// trailing dimension inputs of the mixed [`ArrayIrType`] form). [`None`] entries leave the corresponding input in
-    /// the layout of its own [`ArrayType`], and an empty declaration leaves every input that way. Backends convert each
-    /// declared input to its declared layout before invoking the kernel, so the kernel's buffer contract does not
+    /// trailing dimension inputs of the mixed [`ArrayIrType`] form). [`None`] entries request dense row-major storage,
+    /// and an empty declaration requests it for every input, regardless of the layouts of their [`ArrayType`]s. Backends
+    /// convert each input to the requested layout before invoking the kernel, so the kernel's buffer contract does not
     /// depend on how the input value happens to be stored. This holds after batching too, which shifts declared
-    /// layouts together with the inputs that gain a leading batch axis; an undeclared input whose own type carries an
-    /// explicit layout has that layout declared and shifted when it gains the axis, because alignment materializes
-    /// it in fresh storage. Count, rank, and alias compatibility are validated during type inference, when the input
-    /// types are available.
+    /// layouts together with the inputs that gain a leading batch axis. Row-major defaults remain row-major after
+    /// inserting that most-major axis. Count, rank, and alias compatibility are validated during type inference, when
+    /// the input types are available.
     #[inline]
     pub fn with_input_layouts<L: IntoIterator<Item = Option<Layout>>>(mut self, input_layouts: L) -> Self {
         self.input_layouts = input_layouts.into_iter().collect();
@@ -887,19 +888,16 @@ impl CustomCallOperation {
     /// Returns this call's declared output types with a leading batch dimension inserted, which is the declaration a
     /// single-call batching strategy hands to its kernel.
     ///
-    /// An output that aliases an input takes the aligned input's packed type verbatim when it has the complete
-    /// batch-prefixed shape. Otherwise the output keeps its full batch extent and normal alias validation rejects
-    /// the incompatible input shape. Every other output inserts the batch dimension itself as its most major axis,
-    /// shifting any explicit layout as described in [`batch_prefixed_layout`](Self::batch_prefixed_layout).
+    /// Each output inserts the batch dimension itself as its most major axis, shifting any explicit layout as described
+    /// in [`batch_prefixed_layout`](Self::batch_prefixed_layout). Alias validation compares the resulting types and kernel
+    /// layouts against the aligned inputs.
     ///
     /// # Parameters
     ///
-    ///   - `aligned_input_types`: Packed types of this call's array inputs after alignment to the batch axis.
     ///   - `batch_dimension`: Mapped-axis [`Dimension`] inserted as each output's new leading axis.
     ///   - `axis_sharding`: Placement assigned to the inserted axis of outputs that carry sharding metadata.
     fn batch_prefixed_output_types(
         &self,
-        aligned_input_types: &[ArrayType],
         batch_dimension: Dimension,
         axis_sharding: &ShardingDimension,
     ) -> Result<Vec<ArrayType>, BatchingError> {
@@ -908,15 +906,6 @@ impl CustomCallOperation {
             .enumerate()
             .map(|(output_index, output_type)| {
                 let batched_type = output_type.batched(0, batch_dimension.clone(), axis_sharding.clone())?;
-                if let Some(aligned_type) = self
-                    .input_output_aliases
-                    .iter()
-                    .find(|alias| alias.output_index == output_index)
-                    .and_then(|alias| aligned_input_types.get(alias.input_index))
-                    .filter(|aligned_type| aligned_type.shape() == batched_type.shape())
-                {
-                    return Ok(aligned_type.clone());
-                }
                 Ok(match output_type.layout() {
                     None => batched_type,
                     Some(layout) => {
@@ -927,67 +916,25 @@ impl CustomCallOperation {
             .collect()
     }
 
-    /// Returns the layout required by an aliased input at its unchanged or batch-prefixed logical shape. The declared
-    /// output shape may be dynamic in the mixed universe, where trailing extent inputs refine it to the input's shape
-    /// (e.g., an `f32[2]` input aliased to a declared `f32[rows]` output), so any shape that refines the declared one
-    /// is laid out. An incompatible shape is left to alias validation, rather than changing the shape to satisfy an
-    /// alias.
-    fn alias_input_layout(
-        &self,
-        input_index: usize,
-        input_type: &ArrayType,
-        batch_dimension: Option<&Dimension>,
-    ) -> Result<Option<Layout>, BatchingError> {
-        let Some(alias) = self.input_output_aliases.iter().find(|alias| alias.input_index == input_index) else {
-            return Ok(None);
-        };
-        let Some(output_type) = self.output_types.get(alias.output_index) else {
-            return Ok(None);
-        };
-        let expected_type = match batch_dimension {
-            Some(dimension) => output_type.with_inserted_dimension(0, dimension.clone())?,
-            None => output_type.clone(),
-        };
-        if !expected_type.shape().is_refined_by(input_type.shape()) {
-            return Ok(None);
-        }
-        Ok(match (output_type.layout(), batch_dimension) {
-            (None, _) => None,
-            (Some(layout), None) => Some(layout.clone()),
-            (Some(layout), Some(_)) => Some(self.batch_prefixed_layout("output", alias.output_index, layout)?),
-        })
-    }
-
     /// Returns this call's declared input layouts for a single-call batching strategy, in which the inputs selected by
     /// `batch_prefixed` gain a leading batch axis and their declared layouts shift accordingly. Refer to
-    /// [`batch_prefixed_layout`](Self::batch_prefixed_layout) for how layouts shift. A selected input without a
-    /// declaration whose per-item type (in `per_item_types`) carries an explicit layout has that layout declared and
-    /// shifted too: alignment materializes the input in fresh storage whose type no longer carries the layout, and an
-    /// undeclared layout is part of the kernel's buffer contract just like a declared one. Inputs that keep their shape
-    /// keep their declaration, and a call without any resulting declaration keeps an empty declaration.
+    /// [`batch_prefixed_layout`](Self::batch_prefixed_layout) for how layouts shift. Inputs that keep their shape keep
+    /// their declaration. Row-major defaults remain row-major when the new axis is most major, so empty declarations
+    /// and [`None`] entries stay unchanged.
     fn batch_prefixed_input_layouts<F: Fn(usize) -> bool>(
         &self,
-        per_item_types: &[ArrayType],
         batch_prefixed: F,
     ) -> Result<Vec<Option<Layout>>, BatchingError> {
-        let input_layouts = per_item_types
+        self.input_layouts
             .iter()
             .enumerate()
-            .map(|(input_index, per_item_type)| {
-                let declared = self.input_layouts.get(input_index).and_then(Option::as_ref);
-                if !batch_prefixed(input_index) {
-                    return Ok(declared.cloned());
+            .map(|(input_index, layout)| match layout {
+                Some(layout) if batch_prefixed(input_index) => {
+                    self.batch_prefixed_layout("input", input_index, layout).map(Some)
                 }
-                match declared.or_else(|| per_item_type.layout()) {
-                    Some(layout) => self.batch_prefixed_layout("input", input_index, layout).map(Some),
-                    None => Ok(None),
-                }
+                _ => Ok(layout.clone()),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        if self.input_layouts.is_empty() && input_layouts.iter().all(Option::is_none) {
-            return Ok(Vec::new());
-        }
-        Ok(input_layouts)
+            .collect()
     }
 
     /// Returns `layout` after inserting a new most-major batch axis into the array it describes. An explicit
@@ -1016,80 +963,6 @@ impl CustomCallOperation {
                 ),
             }),
         }
-    }
-
-    /// Restores explicit aliased layouts after ordinary dense alignment has cleared physical layout metadata.
-    fn align_array_alias_layouts<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-        inputs: Vec<ArrayBatch<C::Value>>,
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
-    where
-        C::Operation: From<BroadcastOperation>,
-    {
-        if self.input_output_aliases.is_empty() {
-            return Ok(inputs);
-        }
-        let batch_dimension = P::axis_dimension(context)?;
-        inputs
-            .into_iter()
-            .enumerate()
-            .map(|(input_index, input)| {
-                let input_type = input.r#type().into_owned();
-                let Some(layout) = self.alias_input_layout(input_index, &input_type, Some(&batch_dimension))? else {
-                    return Ok(input);
-                };
-                if input_type.layout() == Some(&layout) {
-                    return Ok(input);
-                }
-                // An identity broadcast materializes the required storage; changing type metadata alone would leave
-                // the kernel reading a buffer with a different physical layout.
-                let output_axes = (0..input_type.rank()).collect();
-                let operation = BroadcastOperation::new(input_type.with_layout(layout), output_axes);
-                let mut outputs = context.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
-                check_count!("output", outputs, 1, ProgramError);
-                ArrayBatch::new(outputs.remove(0), input.batch_axis())
-            })
-            .collect()
-    }
-
-    /// Restores explicit aliased layouts through dimension-valued identity broadcasts in the mixed universe.
-    fn align_array_ir_alias_layouts<C: Context<Type = ArrayIrType>>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        inputs: Vec<ArrayIrBatch<C::Value>>,
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
-    where
-        C::Value: DimensionSize,
-        C::Operation: From<DynamicBroadcastOperation>,
-    {
-        if self.input_output_aliases.is_empty() {
-            return Ok(inputs);
-        }
-        let batch_dimension =
-            <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
-        inputs
-            .into_iter()
-            .enumerate()
-            .map(|(input_index, input)| {
-                let input_type = <&ArrayType>::try_from(input.value().r#type().as_ref())?.clone();
-                let Some(layout) = self.alias_input_layout(input_index, &input_type, Some(&batch_dimension))? else {
-                    return Ok(input);
-                };
-                if input_type.layout() == Some(&layout) {
-                    return Ok(input);
-                }
-                let mut values = vec![input.value().clone(), context.axis_extent().clone()];
-                for axis in 1..input_type.rank() {
-                    values.push(input.value().dimension_size(axis)?);
-                }
-                let operation =
-                    DynamicBroadcastOperation::new((0..input_type.rank()).collect()).with_output_layout(layout);
-                let mut outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
-                check_count!("output", outputs, 1, ProgramError);
-                ArrayIrBatch::new(outputs.remove(0), input.batch_axis())
-            })
-            .collect()
     }
 
     /// Returns the call that the scan body of a sequential [`CustomCallBatching`] behavior stages when the mapped axis
@@ -1306,18 +1179,20 @@ impl CustomCallOperation {
                     output_types.len(),
                 )));
             };
-            if *input_type != output_type {
+            // The backend may convert the input's storage before the call. Aliases constrain its logical type and
+            // its layout at the kernel boundary, rather than the input value's original physical arrangement.
+            if (*input_type).clone().with_layout(None) != output_type.clone().with_layout(None) {
                 return Err(TypeError::invalid(format!(
                     "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` requires matching input and output types but \
                      input {} has type `{}` and output {} has type `{}`",
                     alias.input_index, input_type, alias.output_index, output_type,
                 )));
             }
-            if let Some(Some(input_layout)) = self.input_layouts.get(alias.input_index)
-                && Some(input_layout) != output_type.layout()
-            {
+            let row_major = Layout::Tiled(TiledLayout::new((0..input_type.rank()).rev().collect(), Vec::new()));
+            let input_layout = self.input_layouts.get(alias.input_index).and_then(Option::as_ref).unwrap_or(&row_major);
+            if input_layout != output_type.layout().unwrap_or(&row_major) {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` requires the declared layout `{input_layout}` of \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` requires the kernel layout `{input_layout}` of \
                      input {} to match the layout of output {}",
                     alias.input_index, alias.output_index,
                 )));
@@ -1512,24 +1387,7 @@ where
                     let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
                     call_inputs[index] = Some(builder.add_input(input_type));
                 }
-                let mut call_inputs = call_inputs.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-                for alias in &self.input_output_aliases {
-                    let Some(&input) = call_inputs.get(alias.input_index) else {
-                        continue;
-                    };
-                    let input_type = builder.atoms()[input.index()].r#type().into_owned();
-                    let Some(layout) = self.alias_input_layout(alias.input_index, &input_type, None)? else {
-                        continue;
-                    };
-                    if input_type.layout() != Some(&layout) {
-                        // Scan slices have unspecified storage. Materialize the original alias contract inside the
-                        // body, where it can preserve both the input buffer layout and the declared output layout.
-                        let output_axes = (0..input_type.rank()).collect();
-                        let operation = BroadcastOperation::new(input_type.with_layout(layout), output_axes);
-                        call_inputs[alias.input_index] =
-                            builder.add_instruction(operation, Vec::new(), vec![input], None)?[0];
-                    }
-                }
+                let call_inputs = call_inputs.into_iter().map(Option::unwrap).collect::<Vec<_>>();
                 let operation = self.per_item_operation(context.axis_sharding())?;
                 let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
@@ -1588,20 +1446,12 @@ where
                         P::broadcast_input(context, input, output_type, output_axes, Axis::from(0), dimension_sources)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let aligned = self.align_array_alias_layouts::<C, P>(context, aligned)?;
-                let aligned_types = aligned.iter().map(|batch| batch.r#type().into_owned()).collect::<Vec<_>>();
-                let output_types = self.batch_prefixed_output_types(
-                    aligned_types.as_slice(),
-                    P::axis_dimension(context)?,
-                    context.axis_sharding(),
-                )?;
+                let output_types =
+                    self.batch_prefixed_output_types(P::axis_dimension(context)?, context.axis_sharding())?;
                 let values = aligned.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
-                let per_item_types = inputs
-                    .iter()
-                    .map(|input| input.r#type().unbatched(input.batch_axis()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let input_layouts = self.batch_prefixed_input_layouts(per_item_types.as_slice(), |index| {
-                    self.batching != CustomCallBatching::Vectorized || !inputs[index].batch_axis().is_replicated()
+                let input_layouts = self.batch_prefixed_input_layouts(|index| {
+                    self.batching != CustomCallBatching::Vectorized
+                        || inputs.get(index).is_some_and(|input| !input.batch_axis().is_replicated())
                 })?;
                 let operation = Self { output_types, input_layouts, ..self.clone() };
                 let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
@@ -1826,33 +1676,11 @@ where
                         <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
                     call_inputs[index] = Some(builder.add_input(input_type.into()));
                 }
-                let mut call_inputs = call_inputs
+                let call_inputs = call_inputs
                     .into_iter()
                     .map(Option::unwrap)
                     .chain(carry_inputs[..extents.len()].iter().copied())
                     .collect::<Vec<_>>();
-                for alias in &self.input_output_aliases {
-                    let Some(&input) = call_inputs.get(alias.input_index) else {
-                        continue;
-                    };
-                    let input_type = <&ArrayType>::try_from(builder.atoms()[input.index()].r#type().as_ref())?.clone();
-                    let Some(layout) = self.alias_input_layout(alias.input_index, &input_type, None)? else {
-                        continue;
-                    };
-                    if input_type.layout() != Some(&layout) {
-                        // Resolve dimensions from the slice itself so a relayout preserves dynamic extents exactly.
-                        let mut broadcast_inputs = vec![input];
-                        for axis in 0..input_type.rank() {
-                            let dimension = DimensionSizeOperation::new(&input_type, axis)?;
-                            let extent = builder.add_instruction(dimension, Vec::new(), vec![input], None)?[0];
-                            broadcast_inputs.push(extent);
-                        }
-                        let operation =
-                            DynamicBroadcastOperation::new((0..input_type.rank()).collect()).with_output_layout(layout);
-                        call_inputs[alias.input_index] =
-                            builder.add_instruction(operation, Vec::new(), broadcast_inputs, None)?[0];
-                    }
-                }
                 let operation = self.per_item_operation(context.axis_sharding())?;
                 let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
@@ -1916,25 +1744,11 @@ where
                         ArrayIrBatch::new(value, BatchAxis::new(0))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let aligned = self.align_array_ir_alias_layouts::<C>(context, aligned)?;
-                let aligned_types = aligned
-                    .iter()
-                    .map(|batch| Ok(<&ArrayType>::try_from(batch.value().r#type().as_ref())?.clone()))
-                    .collect::<Result<Vec<_>, TypeError>>()?;
-                let output_types = self.batch_prefixed_output_types(
-                    aligned_types.as_slice(),
-                    batch_dimension.clone(),
-                    context.axis_sharding(),
-                )?;
-                let per_item_types = arrays
-                    .iter()
-                    .map(|input| -> Result<ArrayType, BatchingError> {
-                        let value_type = input.value().r#type();
-                        Ok(<&ArrayType>::try_from(value_type.as_ref())?.unbatched(input.batch_axis())?)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let input_layouts = self.batch_prefixed_input_layouts(per_item_types.as_slice(), |index| {
-                    self.batching != CustomCallBatching::Vectorized || !arrays[index].batch_axis().is_replicated()
+                let output_types =
+                    self.batch_prefixed_output_types(batch_dimension.clone(), context.axis_sharding())?;
+                let input_layouts = self.batch_prefixed_input_layouts(|index| {
+                    self.batching != CustomCallBatching::Vectorized
+                        || arrays.get(index).is_some_and(|input| !input.batch_axis().is_replicated())
                 })?;
                 let operation = Self { output_types, input_layouts, ..self.clone() };
 
@@ -3115,7 +2929,7 @@ mod tests {
                 .unwrap(),
             cases = [{
                 input_types = [matrix_type.clone()],
-                error = "`custom_call` alias `0->0` requires the declared layout `tiled{0,1}` of input 0 to match the \
+                error = "`custom_call` alias `0->0` requires the kernel layout `tiled{0,1}` of input 0 to match the \
                          layout of output 0",
             }],
         );
@@ -3125,7 +2939,40 @@ mod tests {
                 .with_input_layouts([Some(column_major.clone())])
                 .with_input_output_alias(0, 0)
                 .unwrap(),
-            cases = [{ input_types = [column_major_type.clone()], output_types = [column_major_type] }],
+            cases = [
+                { input_types = [column_major_type.clone()], output_types = [column_major_type.clone()] },
+                { input_types = [matrix_type.clone()], output_types = [column_major_type.clone()] },
+            ],
+        );
+
+        // Default layouts describe the kernel boundary independently of the input's original storage. Explicit
+        // row-major output metadata is equivalent to leaving the output layout unspecified.
+        let aliased =
+            CustomCallOperation::new("kernel", vec![matrix_type.clone()]).with_input_output_alias(0, 0).unwrap();
+        check_operation_type_inference!(
+            operation = aliased.clone(),
+            cases = [{ input_types = [column_major_type.clone()], output_types = [matrix_type.clone()] }],
+        );
+        check_operation_type_inference!(
+            operation = aliased.with_input_layouts([None]),
+            cases = [{ input_types = [column_major_type.clone()], output_types = [matrix_type.clone()] }],
+        );
+        let row_major_type = matrix_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new())));
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![row_major_type.clone()])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [{ input_types = [matrix_type.clone()], output_types = [row_major_type] }],
+        );
+        check_operation_type_inference!(
+            operation = CustomCallOperation::new("kernel", vec![column_major_type.clone()])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+            cases = [{
+                input_types = [column_major_type],
+                error = "`custom_call` alias `0->0` requires the kernel layout `tiled{1,0}` of input 0 to match the \
+                         layout of output 0",
+            }],
         );
 
         // Mixed calls declare layouts only for their leading array inputs, excluding trailing dimension inputs.
@@ -4048,13 +3895,14 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_sequential_aliased_layouts() -> Result<(), ProgramError> {
-        // Scan slices have unspecified storage, so the body restores the declared layout of an aliased input.
+        // The scan body carries the explicit input layout to the call, where the backend arranges the aliased buffer.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::F32, [2, 2]));
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
         let output_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
-        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
             .with_input_output_alias(0, 0)?
             .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
@@ -4071,11 +3919,13 @@ mod tests {
                 let %1:f32[2, 2] = scan [carry_count=0, length=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
-                        let %2:f32[2][layout=tiled{0:T(2)}] = broadcast [output_type=f32[2][layout=tiled{0:T(2)}], \
-                output_axes=[0]] %1
-                            %3:f32[2][layout=tiled{0:T(2)}] = custom_call [target=ryft.test.aliased_layout, \
-                input_output_alias=0->0, batching=sequential] %2
-                        in (%3)
+                        let %2:f32[2][layout=tiled{0:T(2)}] = custom_call [
+                            target=ryft.test.aliased_layout,
+                            input_layouts=[tiled{0:T(2)}],
+                            input_output_alias=0->0,
+                            batching=sequential,
+                        ] %1
+                        in (%2)
                     },
                 ]
                 in (%1)
@@ -4087,7 +3937,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_array_ir_sequential_aliased_layouts() -> Result<(), ProgramError> {
-        // The mixed body resolves the slice's dimensions so that the relayout preserves dynamic extents exactly.
+        // The mixed body carries the same explicit kernel layout contract as the homogeneous body.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = trace.input(DimensionType::from(batch.clone()).into());
@@ -4097,7 +3947,8 @@ mod tests {
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
         let output_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
-        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
             .with_input_output_alias(0, 0)?
             .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let outputs =
@@ -4115,12 +3966,13 @@ mod tests {
                 let %2:f32[batch, 2] = scan [carry_count=0, length=batch, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
-                        let %2:dimension<2> = dimension_size [axis=0] %1
-                            %3:f32[2][layout=tiled{0:T(2)}] = broadcast [output_axes=[0], output_layout=tiled{0:T(2)}] \
-                %1 %2
-                            %4:f32[2][layout=tiled{0:T(2)}] = custom_call [target=ryft.test.aliased_layout, \
-                input_output_alias=0->0, batching=sequential] %3
-                        in (%4)
+                        let %2:f32[2][layout=tiled{0:T(2)}] = custom_call [
+                            target=ryft.test.aliased_layout,
+                            input_layouts=[tiled{0:T(2)}],
+                            input_output_alias=0->0,
+                            batching=sequential,
+                        ] %1
+                        in (%2)
                     },
                 ]
                 in (%2)
@@ -4133,7 +3985,7 @@ mod tests {
     #[test]
     fn test_custom_call_batching_array_ir_sequential_refined_aliased_layouts() -> Result<(), ProgramError> {
         // The declared output `f32[rows]` aliases the `f32[2]` slice that each loop trip receives, and its trailing
-        // extent input refines it to `f32[2]`. The slice is therefore laid out like the declared output, so that the
+        // extent input refines it to `f32[2]`. Its explicit input layout matches the declared output's layout, so the
         // alias holds at the refined output type.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4))?);
@@ -4146,7 +3998,8 @@ mod tests {
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
-        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
             .with_input_output_alias(0, 0)?
             .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let inputs = [ArrayIrBatch::new(input, BatchAxis::new(0))?, ArrayIrBatch::replicated(rows_extent)];
@@ -4164,12 +4017,13 @@ mod tests {
                 let %3:dimension<2>, %4:f32[batch, 2] = scan [carry_count=1, length=batch, reverse=false] %2 %1 %0 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2] .
-                        let %3:dimension<2> = dimension_size [axis=0] %2
-                            %4:f32[2][layout=tiled{0:T(2)}] = broadcast [output_axes=[0], output_layout=tiled{0:T(2)}] \
-                %2 %3
-                            %5:f32[2][layout=tiled{0:T(2)}] = custom_call [target=ryft.test.aliased_layout, \
-                input_output_alias=0->0, batching=sequential] %4 %1
-                        in (%1, %5)
+                        let %3:f32[2][layout=tiled{0:T(2)}] = custom_call [
+                            target=ryft.test.aliased_layout,
+                            input_layouts=[tiled{0:T(2)}],
+                            input_output_alias=0->0,
+                            batching=sequential,
+                        ] %2 %1
+                        in (%1, %3)
                     },
                 ]
                 in (%4)
@@ -4345,7 +4199,7 @@ mod tests {
     #[test]
     fn test_custom_call_batching_broadcast_all() {
         // `BroadcastAll` materializes every input on the batch axis and rebinds exactly one call whose declared
-        // outputs gain the same leading extent. Output 0 aliases input 0 and therefore takes that input's packed type,
+        // outputs gain the same leading extent. Output 0 aliases input 0 and keeps its matching batch-prefixed type,
         // while output 1 keeps its declared tiled layout with every logical index shifted by one and the inserted
         // batch axis as its most major dimension.
         let column_major = ArrayType::new_static(DataType::F32, [2, 3])
@@ -4541,17 +4395,19 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_broadcast_all_aliased_layouts() -> Result<(), ProgramError> {
-        // Mapped and materialized replicated aliased inputs are both relaid out to the shifted output layout.
+        // Mapped and replicated aliases keep matching input and output layout declarations after inserting a batch axis.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let mapped = trace.input(ArrayType::new_static(DataType::F32, [2, 2]));
         let output_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         let replicated = trace.input(output_type.clone());
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
-        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone(), output_type])
-            .with_input_output_alias(0, 0)?
-            .with_input_output_alias(1, 1)?
-            .with_batching(CustomCallBatching::BroadcastAll);
+        let operation =
+            CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone(), output_type.clone()])
+                .with_input_layouts([output_type.layout().cloned(), output_type.layout().cloned()])
+                .with_input_output_alias(0, 0)?
+                .with_input_output_alias(1, 1)?
+                .with_batching(CustomCallBatching::BroadcastAll);
         let outputs = operation.batch(
             &context,
             &EmptyRegionDriver,
@@ -4568,18 +4424,14 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 2], %1:f32[2][layout=tiled{0:T(2)}] .
                 let %2:f32[2, 2] = broadcast [output_type=f32[2, 2], output_axes=[1]] %1
-                    %3:f32[2, 2][layout=tiled{1,0:T(2)}] = broadcast [output_type=f32[2, 2][layout=tiled{1,0:T(2)}], \
-                output_axes=[0, 1]] %0
-                    %4:f32[2, 2][layout=tiled{1,0:T(2)}] = broadcast [output_type=f32[2, 2][layout=tiled{1,0:T(2)}], \
-                output_axes=[0, 1]] %2
-                    %5:f32[2, 2][layout=tiled{1,0:T(2)}], %6:f32[2, 2][layout=tiled{1,0:T(2)}] = custom_call [
+                    %3:f32[2, 2][layout=tiled{1,0:T(2)}], %4:f32[2, 2][layout=tiled{1,0:T(2)}] = custom_call [
                         target=ryft.test.aliased_layout,
-                        input_layouts=[default, tiled{1,0:T(2)}],
+                        input_layouts=[tiled{1,0:T(2)}, tiled{1,0:T(2)}],
                         input_output_alias=0->0,
                         input_output_alias=1->1,
                         batching=broadcast_all,
-                    ] %3 %4
-                in (%5, %6)
+                    ] %0 %2
+                in (%3, %4)
             "}
             .trim_end(),
         );
@@ -4588,7 +4440,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_array_ir_broadcast_all_aliased_layouts() -> Result<(), ProgramError> {
-        // The mixed rule relays out aliased inputs through dimension-valued identity broadcasts.
+        // The mixed rule shifts the explicit input layout together with its aliased output's layout.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = trace.input(DimensionType::from(batch.clone()).into());
@@ -4598,7 +4450,8 @@ mod tests {
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
         let output_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
-        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type.clone()])
+            .with_input_layouts([output_type.layout().cloned()])
             .with_input_output_alias(0, 0)?
             .with_batching(CustomCallBatching::BroadcastAll);
         let outputs =
@@ -4613,12 +4466,13 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2] .
-                let %2:dimension<2> = constant [value=2]
-                    %3:f32[batch, 2][layout=tiled{1,0:T(2)}] = broadcast [output_axes=[0, 1], \
-                output_layout=tiled{1,0:T(2)}] %1 %0 %2
-                    %4:f32[batch, 2][layout=tiled{1,0:T(2)}] = custom_call [target=ryft.test.aliased_layout, \
-                input_output_alias=0->0, batching=broadcast_all] %3 %0
-                in (%4)
+                let %2:f32[batch, 2][layout=tiled{1,0:T(2)}] = custom_call [
+                    target=ryft.test.aliased_layout,
+                    input_layouts=[tiled{1,0:T(2)}],
+                    input_output_alias=0->0,
+                    batching=broadcast_all,
+                ] %1 %0
+                in (%2)
             "}
             .trim_end(),
         );
@@ -4668,10 +4522,8 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_broadcast_all_undeclared_input_layouts() {
-        // A replicated input without a declared layout whose own type carries one is materialized across the batch in
-        // fresh storage, so the rebound call declares that layout, shifted, to keep the kernel's buffer contract. A
-        // strided type layout cannot be shifted and is rejected instead of being silently dropped, and `Vectorized`
-        // leaves replicated inputs, and therefore their undeclared layouts, untouched.
+        // Undeclared layouts request row-major storage even when replicated inputs carry column-major or strided
+        // type metadata. Batching never turns that metadata into an implicit kernel layout declaration.
         let column_major = ArrayType::new_static(DataType::F32, [2, 3])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
         let trace_program = |batching: CustomCallBatching, replicated_type: ArrayType| {
@@ -4703,11 +4555,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2, 3][layout=tiled{0,1}] .
                 let %2:f32[3, 2, 3] = broadcast [output_type=f32[3, 2, 3], output_axes=[1, 2]] %1
-                    %3:f32[3, 2] = custom_call [
-                        target=ryft.test.scaled_add,
-                        input_layouts=[default, tiled{1,2,0}],
-                        batching=broadcast_all,
-                    ] %0 %2
+                    %3:f32[3, 2] = custom_call [target=ryft.test.scaled_add, batching=broadcast_all] %0 %2
                 in (%3)
             "}
             .trim_end(),
@@ -4732,17 +4580,25 @@ mod tests {
         );
         let strided =
             ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
-        assert!(matches!(
-            trace_program(CustomCallBatching::BroadcastAll, strided).batched(
+        let (batched, _) = trace_program(CustomCallBatching::BroadcastAll, strided)
+            .batched(
                 3,
                 ShardingDimension::Replicated,
                 &[BatchAxis::new(0), BatchAxis::replicated()],
                 ProgramBatchingOutputAxesPolicy::Natural,
-            ),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "custom call `ryft.test.scaled_add` cannot batch input 1 because its strided layout \
-                               `strided{12,4}` does not determine the byte stride of the inserted batch axis",
-        ));
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2], %1:f32[2, 3][layout=strided{12,4}] .
+                let %2:f32[3, 2, 3] = broadcast [output_type=f32[3, 2, 3], output_axes=[1, 2]] %1
+                    %3:f32[3, 2] = custom_call [target=ryft.test.scaled_add, batching=broadcast_all] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
