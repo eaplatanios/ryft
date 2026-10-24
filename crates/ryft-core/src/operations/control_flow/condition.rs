@@ -580,24 +580,10 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// A condition's branches mirror its input list after the leading predicate, and its results are each branch's own
-// outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both branches
-// therefore receive one shared state boundary: every root either branch touches enters, and only the roots one of them
-// mutates are published back, so a condition whose branches merely read keeps its source boundary unchanged.
-//
-// The rewrite needs every reference output to denote one allocation whichever branch runs, and a final state that a
-// branch publishes under a predicate that varies over manual mesh axes to vary over those axes as well. Both are
-// validated before the branches are rewritten (refer to `ConditionOperation::validate_reference_output_roots` and
-// `ConditionOperation::validate_reference_mutations`), so that a violation is reported as such instead of failing the
-// rebuilt condition with a diagnostic about one of its added outputs. A reference that partial discharge preserves
-// keeps its handle and publishes no final state, so its mutations are not checked here.
-impl<C, P> ReferenceDischargeableOperation<C, P> for ConditionOperation<C::Type>
-where
-    C: Context<Type: ConditionType, Operation: From<ConditionOperation<C::Type>>>,
-    C::Type: From<P::Referent>,
+impl<
+    C: Context<Type: ConditionType + From<P::Referent>, Operation: From<ConditionOperation<C::Type>>>,
     P: ReferenceDischargePolicy<C>,
+> ReferenceDischargeableOperation<C, P> for ConditionOperation<C::Type>
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -605,6 +591,17 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        // A condition's branches mirror its input list after the leading predicate, and its results are each branch's
+        // own outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both
+        // branches therefore receive one shared state boundary: every root either branch touches enters, and only the
+        // roots one of them mutates are published back, so a condition whose branches merely read keeps its source
+        // boundary unchanged. The rewrite needs every reference output to denote one allocation whichever branch runs,
+        // and a final state that a branch publishes under a predicate that varies over manual mesh axes to vary over
+        // those axes as well. Both are validated before the branches are rewritten (refer to
+        // `ConditionOperation::validate_reference_output_roots` and
+        // `ConditionOperation::validate_reference_mutations`), so that a violation is reported as such instead of
+        // failing the rebuilt condition with a diagnostic about one of its added outputs. A reference that partial
+        // discharge preserves keeps its handle and publishes no final state, so its mutations are not checked here.
         let branches = driver.condition_branches(inputs.len())?;
         self.validate_reference_output_roots(branches)?;
         let predicate_type = inputs[0].try_as_value("a condition predicate")?.r#type().into_owned();
@@ -621,6 +618,8 @@ where
         discharge_positional_region_operation(self, context, driver, inputs, 1, |_, _| Ok(*self))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Interpretation rule for [`ConditionOperation`]: extracts the concrete Boolean predicate from the first input and
 // interprets only the selected branch region over the remaining inputs (region 0 for `true` and region 1 for
