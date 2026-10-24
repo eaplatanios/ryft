@@ -211,8 +211,6 @@ pub struct ConditionOperation<T: Type> {
 
 impl<T: Type> Copy for ConditionOperation<T> {}
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: ConditionType> ConditionOperation<T> {
     /// Creates a new [`ConditionOperation`]. The two branch [`Program`]s are supplied separately as the operation's
     /// attached regions via the region driver passed to [`Context::bind`]. [`Operation::infer_output_types`] validates
@@ -229,6 +227,18 @@ impl<T: ConditionType> ConditionOperation<T> {
         Err(TypeError::invalid(format!(
             "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{predicate_type}`",
         )))
+    }
+
+    /// Validates that the two branches with interfaces `region_interfaces` declare the same input types. Both branches
+    /// receive the same inputs, and staging can specialize a branch to the actual input types, which could otherwise
+    /// make two different declarations equal (refer to [`Operation::validate_region_interfaces`]).
+    fn validate_branch_input_types(region_interfaces: &[RegionInterface<T>]) -> Result<(), TypeError> {
+        check_count!("region", region_interfaces, 2, TypeError);
+        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch input"), [
+            region_interfaces[0].input_types(),
+            region_interfaces[1].input_types(),
+        ]);
+        Ok(())
     }
 
     /// Validates the application of this condition to inputs of the types `input_types` (i.e., the predicate followed
@@ -251,74 +261,8 @@ impl<T: ConditionType> ConditionOperation<T> {
         Ok(output_types)
     }
 
-    /// Validates that the two branches with interfaces `region_interfaces` declare the same input types. Both branches
-    /// receive the same inputs, and staging can specialize a branch to the actual input types, which could otherwise
-    /// make two different declarations equal (refer to [`Operation::validate_region_interfaces`]).
-    fn validate_branch_input_types(region_interfaces: &[RegionInterface<T>]) -> Result<(), TypeError> {
-        check_count!("region", region_interfaces, 2, TypeError);
-        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch input"), [
-            region_interfaces[0].input_types(),
-            region_interfaces[1].input_types(),
-        ]);
-        Ok(())
-    }
-
-    /// Returns whether replaying both branches at the actual branch input types `input_types[1..]` preserves the
-    /// validity of this application, i.e., whether the two refined branch signatures agree and satisfy the predicate's
-    /// manual variation requirements. Replay can refine shapes, but cannot repair mismatched metadata or supply a
-    /// missing variation contract, so specialization is requested only when it cannot change which applications are
-    /// accepted. Branch input types are compared after refinement because `region_interfaces` may be partially
-    /// reconciled (i.e., one branch already specialized and its peer not yet), and reference outputs are refined too,
-    /// so that specializing the first branch does not prevent specializing its peer. The original branches are required
-    /// to declare the same input types separately (refer to [`Operation::validate_region_interfaces`]).
-    fn admits_specialization(input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> bool {
-        let refined_signatures = region_interfaces
-            .iter()
-            .map(|interface| {
-                // A pure identity substitution renames the branch identities to those of the caller. A valid mixed
-                // refinement admits none and keeps the declared identities, while an invalid signature fails the
-                // refinement below, so the derivation error itself carries no additional information here.
-                let renaming = T::derive_identity_renaming(interface.input_types(), &input_types[1..]).ok();
-                let rename = |types: &[T]| match &renaming {
-                    Some(renaming) => types.iter().map(|r#type| r#type.rename_identities(renaming)).collect(),
-                    None => Ok(types.to_vec()),
-                };
-                let (declared_inputs, declared_outputs) =
-                    (rename(interface.input_types())?, rename(interface.output_types())?);
-                let refinements = T::Refinements::new(&declared_inputs, &input_types[1..])?;
-                let symbolic = declared_outputs
-                    .iter()
-                    .flat_map(Type::identities)
-                    .filter(|&(position, identity)| position == TypeIdentityPosition::Definition)
-                    .map(|(position, identity)| identity.clone())
-                    .collect::<Vec<_>>();
-                let refine = |types: &[T], symbolic: &[T::Identity]| {
-                    types
-                        .iter()
-                        .map(|r#type| refinements.refine_declared(r#type, symbolic))
-                        .collect::<Result<Vec<_>, _>>()
-                };
-                Ok::<_, TypeError>((refine(&declared_inputs, &[])?, refine(&declared_outputs, &symbolic)?))
-            })
-            .collect::<Result<Vec<_>, _>>();
-        refined_signatures.is_ok_and(|signatures| {
-            signatures[0] == signatures[1]
-                && signatures[0].1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
-        })
-    }
-
-    /// Validates that the `true` and `false` branches declare the same output type signature, naming the first
-    /// difference in the error.
-    fn validate_branch_output_signatures(true_output_types: &[T], false_output_types: &[T]) -> Result<(), TypeError> {
-        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
-            true_output_types,
-            false_output_types,
-        ]);
-        Ok(())
-    }
-
     /// Validates that every reference output of the `true` and `false` `branches` denotes the same reference whichever
-    /// branch runs, i.e., the same instruction input or the same captured reference in both branches. Reference
+    /// branch runs (i.e., the same instruction input or the same captured reference in both branches). Reference
     /// outputs keep their declared types, so type inference cannot check this: which reference a branch returns is
     /// only visible in its body. Every consumer of the condition still relies on it, because the caller keeps using
     /// the handle that the output denotes and reference discharge publishes one allocation per output. A reference
@@ -327,15 +271,15 @@ impl<T: ConditionType> ConditionOperation<T> {
     /// # Errors
     ///
     /// Returns a [`TypeError`] when the branches disagree on which outputs are references (the signature mismatch that
-    /// type inference reports, so that the capability, which validates the branches before binding them, never
-    /// reports it as an internal error) or naming the first reference output whose branches denote different
-    /// references or return references that they allocate, and [`ProgramError::MalformedProgram`] when the reference
-    /// analysis of a branch reports a root that does not belong to that branch.
+    /// type inference reports, so that the capability, which validates the branches before binding them, never reports
+    /// it as an internal error) or naming the first reference output whose branches denote different references or
+    /// return references that they allocate, and [`ProgramError::MalformedProgram`] when the reference analysis of
+    /// a branch reports a root that does not belong to that branch.
     fn validate_reference_output_roots<V: Value<Type = T>, O: Operation<Type = T>>(
         &self,
         branches: [RegionRef<'_, V, O>; 2],
     ) -> Result<(), ProgramError> {
-        // Declared output types only agree after the input facts refine them, which inference checks; here only the
+        // Declared output types only agree after the input facts refine them, which inference checks. Here only the
         // reference kind of each output must agree, and a disagreement is that same signature mismatch rather than an
         // internal error, so that the capability, which validates the branches before binding them, reports it as one.
         let (true_output_types, false_output_types) = (branches[0].output_types(), branches[1].output_types());
@@ -345,11 +289,16 @@ impl<T: ConditionType> ConditionOperation<T> {
                 .zip(&false_output_types)
                 .any(|(true_type, false_type)| true_type.is_reference() != false_type.is_reference())
         {
-            Self::validate_branch_output_signatures(&true_output_types, &false_output_types)?;
+            check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
+                true_output_types,
+                false_output_types,
+            ]);
         }
+
         if !true_output_types.iter().any(Type::is_reference) {
             return Ok(());
         }
+
         let [true_analysis, false_analysis] = [0, 1].map(|index| {
             branches[index].reference_analysis_with_configuration(self.region_capture_input_count(index), true, &[])
         });
@@ -381,8 +330,8 @@ impl<T: ConditionType> ConditionOperation<T> {
         Ok(())
     }
 
-    /// Validates that the `true` and `false` `branches` mutate no reference whose referent does not vary over every
-    /// manual axis that the predicate of type `predicate_type` varies over. Such a predicate lets devices take
+    /// Validates that the `true` and `false` `branches` mutate no reference whose referent does not vary over
+    /// every manual axis that the predicate of type `predicate_type` varies over. Such a predicate lets devices take
     /// different branches, so a branch that mutates a reference input or a captured reference updates it on only some
     /// of those devices, and its final state must vary over those axes exactly like a condition output (refer to
     /// [`ConditionType::validate_condition_output`]). Reference analysis rather than the interface types of the
@@ -395,14 +344,14 @@ impl<T: ConditionType> ConditionOperation<T> {
     ///   - `predicate_type`: Type of the condition predicate.
     ///   - `branches`: The `true` and `false` branches of the condition.
     ///   - `is_published`: Returns whether the final state of a mutated reference is at stake. Staging and
-    ///     interpretation check every mutated reference, while partial reference discharge exempts the references that
-    ///     it preserves, because it publishes no final state for them.
+    ///     interpretation check every mutated reference, while partial reference discharge exempts the references
+    ///     that it preserves, because it publishes no final state for them.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] naming the branch and the first mutated reference that violates the rule, and
-    /// [`ProgramError::MalformedProgram`] when the reference analysis of a branch reports a root that does not belong
-    /// to that branch.
+    /// [`ProgramError::MalformedProgram`] when the reference analysis of a branch reports a root that does not
+    /// belong to that branch.
     fn validate_reference_mutations<V: Value<Type = T>, O: Operation<Type = T>>(
         &self,
         predicate_type: &T,
@@ -412,13 +361,14 @@ impl<T: ConditionType> ConditionOperation<T> {
         if !predicate_type.is_varying() {
             return Ok(());
         }
+
         for (index, (slot, branch)) in ["true", "false"].into_iter().zip(branches).enumerate() {
-            // Branches inherit lexical captures unless the operation declares a fresh capture prefix. Analyze that open
-            // scope directly instead of treating inherited captures as an empty explicit scope.
-            let analysis =
+            // Branches inherit lexical captures unless the operation declares a fresh capture prefix. Analyze
+            // that open scope directly instead of treating inherited captures as an empty explicit scope.
+            let reference_analysis =
                 branch.reference_analysis_with_configuration(self.region_capture_input_count(index), true, &[])?;
             let input_types = branch.input_types();
-            for root in analysis.roots().filter(|root| analysis.is_mutated(*root)) {
+            for root in reference_analysis.roots().filter(|root| reference_analysis.is_mutated(*root)) {
                 let reference_type = match root {
                     ReferenceRoot::RegionInput { region, input_index } if region == branch.id() => {
                         input_types[input_index].clone()
@@ -426,9 +376,11 @@ impl<T: ConditionType> ConditionOperation<T> {
                     ReferenceRoot::Constant { value } => {
                         branch.with_id(value.region())?.atoms()[value.atom().index()].r#type().into_owned()
                     }
-                    // Allocations and the inputs of nested regions are local to the branch, so their states never
-                    // cross the condition boundary.
-                    ReferenceRoot::RegionInput { .. } | ReferenceRoot::Allocation { .. } => continue,
+                    ReferenceRoot::RegionInput { .. } | ReferenceRoot::Allocation { .. } => {
+                        // Allocations and the inputs of nested regions are local to the branch,
+                        // so their states never cross the condition boundary.
+                        continue;
+                    }
                 };
                 let source = ConditionReferenceSource::from_root(branch, root)?;
                 if reference_type.validate_condition_output(predicate_type).is_err() && is_published(source)? {
@@ -442,9 +394,12 @@ impl<T: ConditionType> ConditionOperation<T> {
                 }
             }
         }
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type> Display for ConditionOperation<T> {
     #[inline]
@@ -489,7 +444,45 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
                 "`{CONDITION_OPERATION_NAME}` expects at least one input but got 0"
             )));
         }
-        if !Self::admits_specialization(input_types, region_interfaces) {
+        // Replay can refine shapes, but cannot repair mismatched metadata or supply a missing variation contract, so
+        // specialize only when both refined branch signatures agree and their outputs satisfy the predicate's manual
+        // variation requirements. Compare inputs after refinement because these interfaces may be partially reconciled
+        // (one branch already specialized and its peer not yet), and refine reference outputs too, so that specializing
+        // the first branch does not prevent specializing its peer. `Operation::validate_region_interfaces` separately
+        // requires the original branches to declare the same input types.
+        let refined_signatures = region_interfaces
+            .iter()
+            .map(|interface| {
+                // A pure identity substitution renames the branch identities to those of the caller. A valid mixed
+                // refinement admits none and keeps the declared identities, while an invalid signature fails the
+                // refinement below, so the derivation error itself carries no additional information here.
+                let renaming = T::derive_identity_renaming(interface.input_types(), &input_types[1..]).ok();
+                let rename = |types: &[T]| match &renaming {
+                    Some(renaming) => types.iter().map(|r#type| r#type.rename_identities(renaming)).collect(),
+                    None => Ok(types.to_vec()),
+                };
+                let (declared_inputs, declared_outputs) =
+                    (rename(interface.input_types())?, rename(interface.output_types())?);
+                let refinements = T::Refinements::new(&declared_inputs, &input_types[1..])?;
+                let symbolic = declared_outputs
+                    .iter()
+                    .flat_map(Type::identities)
+                    .filter(|&(position, _)| position == TypeIdentityPosition::Definition)
+                    .map(|(_, identity)| identity.clone())
+                    .collect::<Vec<_>>();
+                let refine = |types: &[T], symbolic: &[T::Identity]| {
+                    types
+                        .iter()
+                        .map(|r#type| refinements.refine_declared(r#type, symbolic))
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                Ok::<_, TypeError>((refine(&declared_inputs, &[])?, refine(&declared_outputs, &symbolic)?))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        if !refined_signatures.is_ok_and(|signatures| {
+            signatures[0] == signatures[1]
+                && signatures[0].1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
+        }) {
             return Ok(vec![None, None]);
         }
         if region_interfaces.iter().all(|interface| interface.input_types() == &input_types[1..]) {
@@ -526,7 +519,10 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
             refine_output_types(branch_input_types, &input_types[1..], interface.output_types(), |_| None)
         });
         let (true_output_types, false_output_types) = (true_output_types?, false_output_types?);
-        Self::validate_branch_output_signatures(&true_output_types, &false_output_types)?;
+        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
+            true_output_types,
+            false_output_types,
+        ]);
         for output_type in &true_output_types {
             output_type.validate_condition_output(&input_types[0])?;
         }
