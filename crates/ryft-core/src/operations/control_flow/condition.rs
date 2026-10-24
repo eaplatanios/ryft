@@ -149,8 +149,6 @@ impl ConditionType for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ConditionType for ArrayIrType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
@@ -158,21 +156,14 @@ impl ConditionType for ArrayIrType {
     }
 
     fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError> {
-        let Self::Array(predicate) = predicate else {
-            return Ok(());
-        };
-        match self {
-            Self::Array(output) => output.validate_condition_output(predicate),
-            Self::Reference(output) => output.referent().validate_condition_output(predicate),
-            Self::Dimension(_) => {
-                if !predicate.is_varying() {
-                    return Ok(());
-                }
-                Err(TypeError::invalid(format!(
-                    "`{CONDITION_OPERATION_NAME}` output `{self}` cannot record manual variation, so it cannot be \
-                     produced under the varying predicate `{predicate}`",
-                )))
-            }
+        match (self, predicate) {
+            (Self::Array(output), Self::Array(predicate)) => output.validate_condition_output(predicate),
+            (Self::Reference(output), Self::Array(predicate)) => output.referent().validate_condition_output(predicate),
+            (Self::Dimension(_), Self::Array(predicate)) if predicate.is_varying() => Err(TypeError::invalid(format!(
+                "`{CONDITION_OPERATION_NAME}` output `{self}` cannot record manual variation, so it cannot be \
+                 produced under the varying predicate `{predicate}`",
+            ))),
+            (Self::Dimension(_), Self::Array(_)) | (_, Self::Dimension(_) | Self::Reference(_)) => Ok(()),
         }
     }
 }
@@ -184,19 +175,20 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// predicate supplied as the first operation input (a scalar Boolean); the remaining operation inputs are forwarded
 /// to the selected branch.
 ///
-/// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
-/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots) order
-/// `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions with owned
-/// branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`]. The
+/// The branch computations are not part of this payload; they are [`Region`](crate::Region)s attached to the
+/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots)
+/// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions
+/// with owned branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`]. The
 /// [`Condition::condition`] function stages a condition from two branch functions instead, and aligns its inputs and
 /// branch outputs with a predicate that varies over manual mesh axes (refer to [`ConditionType`]).
 ///
-/// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
+/// A predicate that is already known while _building_ a program is naturally expressed with a plain Rust `if` that
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
-/// constant remains a conditional during ordinary staging, and the backend can fold its `stablehlo.if` away via
-/// [StableHLO canonicalization](https://openxla.org/stablehlo/generated/stablehlo_passes) and XLA's conditional
-/// simplification. Partial evaluation specializes a concrete known predicate by inlining the selected branch; a known
-/// symbolic predicate retains conditional execution of both the known and residual branch programs.
+/// constant remains a conditional during ordinary staging, and the XLA backend, for example, can fold its
+/// `stablehlo.if` operation away via [canonicalization](https://openxla.org/stablehlo/generated/stablehlo_passes)
+/// and XLA's conditional simplification. Partial evaluation specializes a concrete known predicate by inlining the
+/// selected branch; a known symbolic predicate retains conditional execution of both the known and residual branch
+/// programs.
 ///
 /// Batching a mapped predicate evaluates both pure branches and selects their outputs per item. The primal computations
 /// of inactive branches still execute and can fail, but gradient propagation into their inputs is stopped before branch
@@ -207,19 +199,21 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// one parent trace loses their separate definition scopes, and freshening those definitions alone would leave any
 /// dependent array shapes needing a runtime join. Dimension identities established by branch inputs remain supported.
 ///
-/// Each reference output must denote the same reference (i.e., the same instruction input or captured reference) in
-/// both branches. Forward-mode differentiation relies on this as well, because it gives both branches the same
+/// Each reference output must denote the same reference (i.e., the same instruction input or captured reference)
+/// in bot  branches. Forward-mode differentiation relies on this as well, because it gives both branches the same
 /// reference-output tangent slots: a reference tangent that only one branch carried could not be padded in its peer
 /// without inventing allocation state.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConditionOperation<T: Type> {
-    /// Type universe of the predicate and of the attached branch regions.
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
     marker: PhantomData<fn() -> T>,
 }
 
 impl<T: Type> Copy for ConditionOperation<T> {}
 
-impl<T: Type> ConditionOperation<T> {
+// TODO(eaplatanios): Review from here onwards.
+
+impl<T: ConditionType> ConditionOperation<T> {
     /// Creates a new [`ConditionOperation`]. The two branch [`Program`]s are supplied separately as the operation's
     /// attached regions (via the region driver passed to [`Context::bind`]); [`Operation::infer_output_types`]
     /// validates that the branch interfaces agree and that the predicate input is a scalar Boolean.
@@ -227,9 +221,7 @@ impl<T: Type> ConditionOperation<T> {
     pub const fn new() -> Self {
         Self { marker: PhantomData }
     }
-}
 
-impl<T: ConditionType> ConditionOperation<T> {
     /// Validates predicate admission before a rule or capability uses its sharding to align other values.
     fn validate_predicate_type(predicate_type: &T) -> Result<(), TypeError> {
         if predicate_type.is_condition_predicate() {
