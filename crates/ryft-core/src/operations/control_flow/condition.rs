@@ -1477,13 +1477,14 @@ where
 // TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to stage a [`ConditionOperation`] that applies one of two branch functions to structured
-/// inputs according to a scalar Boolean predicate, returning the outputs of the selected branch. This is the
-/// value-level analogue of [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). It binds
-/// the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or the
-/// operation-executing eager domain of a concrete value): each function is traced into a branch [`Program`] through a
-/// [`NestedTracingContext`] over the predicate's domain, and both branches must return values of the same types. An
-/// output that both branches forward from the same input equals that input whichever branch runs, so, as in JAX's
-/// `cond`, it is pruned from the branches and returned as the input itself instead of through the condition.
+/// inputs according to a scalar Boolean predicate, returning the outputs of the selected branch. This is the Ryft
+/// value-level analogue of JAX's [`lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). It
+/// binds the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or
+/// the operation-executing eager domain of a concrete value). Specifically, each function is traced into a branch
+/// [`Program`] through a [`NestedTracingContext`] over the predicate's domain, and both branches must return values
+/// of the same types. An output that both branches forward from the same input equals that input whichever branch runs,
+/// so, as in JAX's `cond`, it is pruned from the branches and returned as the input itself instead of through the
+/// condition.
 ///
 /// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. This
 /// function then aligns the condition boundary with the predicate. It varies every input over each manual axis of the
@@ -1523,33 +1524,34 @@ where
 /// ```
 #[capability]
 pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Domain: Context> {
-    /// Applies `true_function` or `false_function` to `inputs` according to this scalar Boolean predicate.
+    /// Applies `true_fn` or `false_fn` to `inputs` according to this scalar Boolean predicate.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: Structured values received by both branches, including their static fields.
-    ///   - `true_function`: Function traced for the `true` branch over the input family's nested tracers.
-    ///   - `false_function`: Function traced for the `false` branch over the same input family.
+    ///   - `true_fn`: Function traced for the `true` branch over the input family's nested tracers.
+    ///   - `false_fn`: Function traced for the `false` branch over the same input family.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] if branch output structures or static metadata differ. Also returns
     /// errors from manual-variation alignment, reconstruction, tracing, or binding (including invalid predicates and
     /// mismatched branch output types).
-    fn condition<Input, Output, True, False>(
+    fn condition<
+        Input: Parameterized<Self, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>>,
+        Output: Parameterized<
+                Tracer<NestedTracingContext<Self::Domain>>,
+                Family: ParameterizedFamily<Self>,
+                ParameterStructure: PartialEq,
+            >,
+        TrueFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+        FalseFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+    >(
         &self,
         inputs: Input,
-        true_function: True,
-        false_function: False,
-    ) -> Result<Output::To<Self>, ProgramError>
-    where
-        Input: Parameterized<Self>,
-        Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>,
-        Output: Parameterized<Tracer<NestedTracingContext<Self::Domain>>>,
-        Output::Family: ParameterizedFamily<Self>,
-        Output::ParameterStructure: PartialEq,
-        True: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
-        False: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>;
+        true_fn: TrueFn,
+        false_fn: FalseFn,
+    ) -> Result<Output::To<Self>, ProgramError>;
 }
 
 // Region authoring is shared by eager and staged values: interpretation executes the attached programs directly
@@ -1561,21 +1563,21 @@ where
         + ManualVariationAlignment,
     Tracer<NestedTracingContext<V::Domain>>: ManualVariationAlignment,
 {
-    fn condition<Input, Output, True, False>(
+    fn condition<
+        Input: Parameterized<Self, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>>,
+        Output: Parameterized<
+                Tracer<NestedTracingContext<Self::Domain>>,
+                Family: ParameterizedFamily<Self>,
+                ParameterStructure: PartialEq,
+            >,
+        TrueFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+        FalseFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+    >(
         &self,
         inputs: Input,
-        true_function: True,
-        false_function: False,
-    ) -> Result<Output::To<Self>, ProgramError>
-    where
-        Input: Parameterized<Self>,
-        Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>,
-        Output: Parameterized<Tracer<NestedTracingContext<Self::Domain>>>,
-        Output::Family: ParameterizedFamily<Self>,
-        Output::ParameterStructure: PartialEq,
-        True: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
-        False: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
-    {
+        true_fn: TrueFn,
+        false_fn: FalseFn,
+    ) -> Result<Output::To<Self>, ProgramError> {
         ConditionOperation::<V::Type>::validate_predicate_type(self.r#type().as_ref())?;
         let input_structure = inputs.parameter_structure();
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
@@ -1602,7 +1604,7 @@ where
                     input_structure.clone(),
                     inputs,
                 )?;
-                true_function(inputs).and_then(align_outputs)
+                true_fn(inputs).and_then(align_outputs)
             },
             input_types.clone(),
         )?;
@@ -1611,7 +1613,7 @@ where
             |inputs| {
                 let inputs =
                     Input::To::<Tracer<NestedTracingContext<Self::Domain>>>::from_parameters(input_structure, inputs)?;
-                false_function(inputs).and_then(align_outputs)
+                false_fn(inputs).and_then(align_outputs)
             },
             input_types,
         )?;
