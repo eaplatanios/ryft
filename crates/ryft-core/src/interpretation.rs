@@ -1564,7 +1564,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[] .
                 let %1:f32[] = const 3.0
-                    %2:f32[] = add %0, %1
+                    %2:f32[] = add %0 %1
                     %3:f32[] = neg %2
                 in (%3)
             "}
