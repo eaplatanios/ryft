@@ -205,14 +205,14 @@ impl Operation for XlaKernelExtension {
 
     fn prune_boundary(
         &self,
-        _input_count: usize,
+        _input_types: &[Self::Type],
         _used_outputs: &[bool],
         _regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => Ok(operation
-                .prune_boundary(_input_count, _used_outputs, _regions)?
+                .prune_boundary(_input_types, _used_outputs, _regions)?
                 .map(|pruning| pruning.map_operation(Self::Mosaic))),
         }
     }
@@ -358,13 +358,13 @@ impl Operation for XlaKernelOperation {
 
     fn prune_boundary(
         &self,
-        input_count: usize,
+        input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         Ok(self
             .0
-            .prune_boundary(input_count, used_outputs, regions)?
+            .prune_boundary(input_types, used_outputs, regions)?
             .map(|pruning| pruning.map_operation(Self)))
     }
 

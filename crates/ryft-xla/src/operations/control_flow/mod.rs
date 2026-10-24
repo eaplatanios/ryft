@@ -2,14 +2,14 @@ use std::rc::Rc;
 
 use ryft_core::{
     ArrayIrType, ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension,
-    EffectClass, EffectClasses, GuardOperation, IotaOperation, OneOperation, Parameterized, ProgramError,
+    EffectClass, EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
     RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed,
     WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Type, TypeRef,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
@@ -17,10 +17,13 @@ use crate::experimental::lowering::types::{
     lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output, physical_bound_type,
     reshape_dimension_i64,
 };
-use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, token_threaded_effects};
+use crate::experimental::lowering::{
+    CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects,
+};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
+use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{LowerableOperationFamily, LoweringError};
 
 /// StableHLO lowering of `condition`.
@@ -117,8 +120,7 @@ where
             } else if let Some(scan) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
                 let entry_types =
                     scan.declared_input_types(&first_region_input_types()?).map_err(ProgramError::from)?;
-                let entry_count = entry_types.len().min(input_types.len());
-                Some((SCAN_OPERATION_NAME, entry_types, &input_types[..entry_count]))
+                Some((SCAN_OPERATION_NAME, entry_types, input_types.as_slice()))
             } else {
                 None
             };
@@ -209,7 +211,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
             ),
             (Dimension::Dynamic(_), Dimension::Dynamic(_)) => {
                 let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
-                Some(size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref())
+                Some(size.result(0).unwrap().as_ref())
             }
         });
     }
@@ -237,7 +239,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         &vec![0; rank],
         location,
     )?)?;
-    let mut value = padded.result(0).expect("stablehlo.pad should return one result").as_ref();
+    let mut value = padded.result(0).unwrap().as_ref();
     let mut dimensions = physical_type.shape().dimensions().to_vec();
     for (axis, size) in runtime_sizes.into_iter().enumerate() {
         let Some(size) = size else { continue };
@@ -250,7 +252,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
             axis,
             location,
         )?)?;
-        value = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+        value = refined.result(0).unwrap().as_ref();
     }
     Ok(value)
 }
@@ -298,7 +300,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             runtime_sizes.push(match dimensions {
                 (Dimension::Dynamic(_), Dimension::Dynamic(_)) => {
                     let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
-                    Some(size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref())
+                    Some(size.result(0).unwrap().as_ref())
                 }
                 _ => None,
             });
@@ -321,7 +323,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             &vec![1; rank],
             location,
         )?)?;
-        let mut value = sliced.result(0).expect("stablehlo.slice should return one result").as_ref();
+        let mut value = sliced.result(0).unwrap().as_ref();
         let mut dimensions = limits.iter().copied().map(Dimension::Static).collect::<Vec<_>>();
         for (axis, size) in runtime_sizes.into_iter().enumerate() {
             let Some(size) = size else { continue };
@@ -334,7 +336,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
                 axis,
                 location,
             )?)?;
-            value = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+            value = refined.result(0).unwrap().as_ref();
         }
         converted.push(value);
     }
@@ -380,16 +382,7 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
             collective_state,
             &mut region_effect_tokens,
         )?;
-        for effect in [EffectClass::OrderedAssertion, EffectClass::OrderedIo] {
-            if !token_threaded_effects(threaded_effects).any(|threaded| threaded == effect)
-                && region_effect_tokens.get(effect) != entry_effect_tokens.get(effect)
-            {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "control-flow region lowering advanced the `{effect}` token, which the region does not thread",
-                ))
-                .into());
-            }
-        }
+        validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
         // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
         // common refined shapes even when their declared dynamic and static result types differ.
         outputs = lower_refined_region_outputs(
@@ -400,189 +393,233 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
             context,
             location,
         )?;
-        for effect in token_threaded_effects(threaded_effects) {
-            outputs.push(
-                region_effect_tokens
-                    .get(effect)
-                    .expect("token-returning control-flow regions receive one entry token per active class"),
-            );
-        }
+        outputs.extend(threaded_effect_token_values(region_effect_tokens, threaded_effects));
         block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location)?)?;
     }
     region.append_block(block)?;
     Ok(region)
 }
 
+/// Validates that lowering a control-flow region whose tokens were `entry_effect_tokens` when it started and are
+/// `region_effect_tokens` when it ends advanced no token of an ordered class outside `threaded_effects`. A region
+/// returns only the tokens of its threaded classes (refer to `token_threaded_effects`), so the advanced token of any
+/// other class would be dropped, leaving later effects of that class unordered with respect to the effects of the
+/// region. The threaded classes come from [`lowered_effect_classes`], which must predict every ordered class whose
+/// token lowering advances, so a violation is an internal error. A region that returns no token at all (e.g., the
+/// condition region of a `stablehlo.while`) validates with [`EffectClasses::NONE`].
+///
+/// # Errors
+///
+/// Returns [`ProgramError::MalformedProgram`] naming the first advanced token of an unthreaded class.
+pub(crate) fn validate_unthreaded_effect_tokens<'b, 'c: 'b, 't: 'c>(
+    entry_effect_tokens: EffectTokens<'b, 'c, 't>,
+    region_effect_tokens: EffectTokens<'b, 'c, 't>,
+    threaded_effects: EffectClasses,
+) -> Result<(), ProgramError> {
+    for effect in [EffectClass::OrderedAssertion, EffectClass::OrderedIo] {
+        if !token_threaded_effects(threaded_effects).any(|threaded| threaded == effect)
+            && region_effect_tokens.get(effect) != entry_effect_tokens.get(effect)
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "control-flow region lowering advanced the `{effect}` token, which the region does not thread",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Appends the current token of each class in `threaded_effects` to the initial `state_values` of a
+/// `stablehlo.while` and one token type per class to its `state_types`, in canonical effect order (refer to
+/// `token_threaded_effects`). A class without a current token gets a fresh one. The loop carries these tokens as its
+/// trailing state elements, so its regions read them with [`set_threaded_effect_tokens`] and its results become the
+/// current tokens of the enclosing scope the same way.
+pub(crate) fn append_loop_effect_tokens<'b, 'c: 'b, 't: 'c>(
+    threaded_effects: EffectClasses,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    state_values: &mut Vec<ValueRef<'b, 'c, 't>>,
+    state_types: &mut Vec<TypeRef<'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    for effect in token_threaded_effects(threaded_effects) {
+        state_values.push(current_or_new_token(effect, effect_tokens, block, location)?);
+        state_types.push(context.stable_hlo_token_type()?.as_ref());
+    }
+    Ok(())
+}
+
+/// Sets the token of each class in `threaded_effects` to `token(offset)`, where `offset` is the position of the class
+/// in canonical effect order (refer to `token_threaded_effects`), and keeps the tokens of all other classes.
+/// Control-flow regions and operations carry the tokens of their threaded classes as trailing block arguments or
+/// results in that order, so `token` reads them from the block arguments of a region that it enters, or from the
+/// results of the operation that it leaves.
+pub(crate) fn set_threaded_effect_tokens<'b, 'c: 'b, 't: 'c>(
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    threaded_effects: EffectClasses,
+    mut token: impl FnMut(usize) -> ValueRef<'b, 'c, 't>,
+) {
+    for (offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
+        effect_tokens.set(effect, token(offset));
+    }
+}
+
+/// Returns the current token of each class in `threaded_effects`, in canonical effect order (refer to
+/// `token_threaded_effects`), which a control-flow region returns as its trailing results. Every threaded class has a
+/// token in a region whose tokens entered through [`set_threaded_effect_tokens`] or that started from tokens returned
+/// by [`append_loop_effect_tokens`].
+pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
+    effect_tokens: EffectTokens<'b, 'c, 't>,
+    threaded_effects: EffectClasses,
+) -> Vec<ValueRef<'b, 'c, 't>> {
+    token_threaded_effects(threaded_effects).map(|effect| effect_tokens.get(effect).unwrap()).collect()
+}
+
+/// Constrains each of the lowered `outputs` of a control-flow operation whose array type in `output_types` carries a
+/// sharding over a mesh with at least one `Explicit` axis to that sharding with `sdy.sharding_constraint`, and returns
+/// the constrained values. This includes results that such a sharding replicates or shards only over the `Auto` axes
+/// of that mesh. Nothing inside a region needs to pin the placement of a result over a mesh with explicit axes (e.g., a
+/// region may return a replicated constant), so propagation could otherwise assign the result a placement other than
+/// the one that its type states. Results without a sharding, results whose mesh has no explicit axis (e.g., only `Auto`
+/// or `Manual` axes), references, and first-class dimensions remain unconstrained. Mesh axes in `bound_manual_axes`,
+/// which enclosing manual regions bind, are excluded from the constraints (refer to `lower_sharding_constraint`).
+pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
+    outputs: Vec<ValueRef<'b, 'c, 't>>,
+    output_types: &[ArrayIrType],
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let mut constrained = Vec::with_capacity(outputs.len());
+    for (output, output_type) in outputs.into_iter().zip(output_types) {
+        let explicit_sharding = match output_type {
+            ArrayIrType::Array(output_type) => output_type
+                .sharding()
+                .filter(|sharding| sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit)),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+        };
+        constrained.push(match explicit_sharding {
+            Some(sharding) => {
+                lower_sharding_constraint(&[output], sharding, bound_manual_axes, block, location)?.remove(0)
+            }
+            None => output,
+        });
+    }
+    Ok(constrained)
+}
+
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, CompareOperation, ComparisonDirection, ConditionOperation, Placeholder,
-        PrintOperation, ScanOperation, WhileOperation,
+        AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, ConditionOperation, Device,
+        DeviceMesh, LogicalMesh, MeshAxis, Placeholder, PrintOperation, ScanOperation, WhileOperation,
+        ZeroLikeOperation,
     };
     use ryft_mlir::Location;
+    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
-    use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::lowering::tests::{test_spmd_compilation_options, test_vector_type};
+    use crate::experimental::ops::{XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
     use crate::operations::jit_call::JitCallOperation;
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::{FromPjrt, XlaArray, XlaSession, to_mlir_module_for_program};
 
     use super::*;
 
-    #[test]
-    fn test_to_mlir_module_for_program_lowers_differentiated_composite_control_flow() {
-        let scalar_boolean = ArrayType::scalar(DataType::Boolean);
-        let scalar_f32 = ArrayType::scalar(DataType::F32);
-        let vector_f32 = test_vector_type(2);
+    /// Returns the [`XlaOperation`] that compares two arrays in `direction`.
+    pub(super) fn compare(direction: ComparisonDirection) -> XlaOperation {
+        XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(direction)))
+    }
 
-        let branch = |double: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            let operand = builder.add_input(scalar_f32.clone().into());
-            let output = if double {
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![operand, operand], None).unwrap()[0]
-            } else {
-                operand
-            };
-            builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
+    /// Stages whether each element of `value` is positive into `builder`. The mixed executable ABI of
+    /// `execute_mixed_program` has no boolean inputs, so control flow that executes for both predicate values derives
+    /// its predicate from a floating-point selector input.
+    pub(super) fn positive(builder: &mut CompositeXlaProgramBuilder, value: AtomId) -> AtomId {
+        let zero = builder
+            .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(compare(ComparisonDirection::GreaterThan), Vec::new(), vec![value, zero], None)
+            .unwrap()[0]
+    }
+
+    /// Lowers `program` with the boundary types of the mixed executable ABI of `execute_mixed_program`, in which
+    /// first-class dimensions cross the boundary as `i64` scalars.
+    pub(super) fn lowered_mixed_module(program: &FlatXlaProgram) -> String {
+        let boundary_type = |r#type: &ArrayIrType| match r#type {
+            ArrayIrType::Array(r#type) => r#type.clone(),
+            ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
+            ArrayIrType::Reference(_) => panic!("mixed execution fixtures have no reference values"),
         };
+        let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
+        let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
+        to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap()
+    }
 
-        let mut scan_body_builder = CompositeXlaProgramBuilder::new();
-        scan_body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = scan_body_builder.add_input(scalar_f32.clone().into());
-        let item = scan_body_builder.add_input(scalar_f32.clone().into());
-        let next_carry =
-            scan_body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
-        let scan_body = scan_body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![next_carry, next_carry],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
+    /// Returns a two-device CPU client and a device mesh over its devices with the single mesh axis `x` of `axis_type`.
+    pub(super) fn two_device_mesh(axis_type: MeshAxisType) -> (Client<'static>, DeviceMesh) {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        (client, mesh)
+    }
 
-        let mut while_condition_builder = CompositeXlaProgramBuilder::new();
-        let state = while_condition_builder.add_input(scalar_f32.clone().into());
-        let while_predicate = while_condition_builder
-            .add_instruction(
-                XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan))),
-                Vec::new(),
-                vec![state, state],
-                None,
-            )
-            .unwrap()[0];
-        let while_condition = while_condition_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![while_predicate], vec![Placeholder], vec![Placeholder])
+    /// Compiles the SPMD `module` for the devices of a [`two_device_mesh`], executes it on global `f32` inputs of the
+    /// given types and values, and returns the `f32` shard of each output on each device.
+    pub(super) fn execute_on_two_devices(
+        client: &Client<'static>,
+        mesh: &DeviceMesh,
+        module: &str,
+        inputs: &[(&ArrayType, &[f32])],
+    ) -> Vec<Vec<Vec<f32>>> {
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &test_spmd_compilation_options(2))
             .unwrap();
-        let mut while_body_builder = CompositeXlaProgramBuilder::new();
-        let state = while_body_builder.add_input(scalar_f32.clone().into());
-        let next_state = while_body_builder
-            .add_instruction(AddOperation::new(), Vec::new(), vec![state, state], None)
-            .unwrap()[0];
-        let while_body = while_body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next_state], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let true_region = builder.import_region(branch(true).entry_region_ref());
-        let false_region = builder.import_region(branch(false).entry_region_ref());
-        let scan_region = builder.import_region(scan_body.entry_region_ref());
-        let while_condition_region = builder.import_region(while_condition.entry_region_ref());
-        let while_body_region = builder.import_region(while_body.entry_region_ref());
-        let predicate = builder.add_input(scalar_boolean.clone().into());
-        let operand = builder.add_input(scalar_f32.clone().into());
-        let items = builder.add_input(vector_f32.clone().into());
-        let selected = builder
-            .add_instruction(
-                XlaOperation::Condition(ConditionOperation::new()),
-                vec![true_region, false_region],
-                vec![predicate, operand],
-                None,
-            )
-            .unwrap()[0];
-        let scan_outputs = builder
-            .add_instruction(
-                XlaOperation::Scan(ScanOperation::new(1, 2)),
-                vec![scan_region],
-                vec![selected, items],
-                None,
-            )
+        let domain = XlaSession::new(client).domain();
+        let device_ids = executable
+            .addressable_devices()
             .unwrap()
-            .to_vec();
-        let final_state = builder
-            .add_instruction(
-                XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
-                vec![while_condition_region, while_body_region],
-                vec![scan_outputs[0]],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![final_state, scan_outputs[1]],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-
-        // Keep the complete mixed control-flow program behind one compiled-call boundary. Linearization must preserve
-        // that boundary while deriving its primal and pullback callees, and lowering must still reach the nested
-        // condition and loop operations.
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let callee = builder.import_region(program.entry_region_ref());
-        let predicate = builder.add_input(scalar_boolean.clone().into());
-        let operand = builder.add_input(scalar_f32.clone().into());
-        let items = builder.add_input(vector_f32.clone().into());
-        let outputs = builder
-            .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![predicate, operand, items],
-                None,
-            )
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let inputs = inputs
+            .iter()
+            .map(|(r#type, values)| {
+                XlaArray::from_host_buffer(&domain, (*r#type).clone(), mesh.clone(), values_to_bytes(values)).unwrap()
+            })
+            .collect();
+        let arguments = XlaArray::into_execute_arguments(inputs, device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .block_until_ready()
             .unwrap();
-
-        let linearization = program.linearize().unwrap();
-        let primal = linearization.primal();
-        assert_eq!(linearization.residual_count(), 2);
-        assert_eq!(primal.instructions().len(), 1);
-        let primal_inputs = vec![scalar_boolean, scalar_f32.clone(), vector_f32.clone()];
-        let primal_outputs = primal
-            .output_types()
+        outputs
             .iter()
-            .map(|r#type| match r#type {
-                ArrayIrType::Array(r#type) => r#type.clone(),
-                ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
-                ArrayIrType::Reference(_) => panic!("this fixture has no reference residuals"),
+            .map(|output| {
+                output
+                    .outputs
+                    .iter()
+                    .map(|buffer| {
+                        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+                        values_from_bytes::<f32>(bytes.as_slice())
+                    })
+                    .collect()
             })
-            .collect::<Vec<_>>();
-        let primal_stablehlo =
-            to_mlir_module_for_program(primal, &[], &primal_inputs, &primal_outputs, "main", None, None).unwrap();
-        assert!(primal_stablehlo.contains("\"stablehlo.if\""), "{primal_stablehlo}");
-        assert!(primal_stablehlo.matches("stablehlo.while").count() >= 2, "{primal_stablehlo}");
-
-        let pullback = linearization.pullback().unwrap().into_program();
-        let pullback_inputs = pullback
-            .input_types()
-            .iter()
-            .map(|r#type| match r#type {
-                ArrayIrType::Array(r#type) => r#type.clone(),
-                ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
-                ArrayIrType::Reference(_) => panic!("this fixture has no reference residuals"),
-            })
-            .collect::<Vec<_>>();
-        let pullback_outputs = vec![scalar_f32, vector_f32];
-        let pullback_stablehlo =
-            to_mlir_module_for_program(&pullback, &[], &pullback_inputs, &pullback_outputs, "main", None, None)
-                .unwrap();
-        assert_eq!(pullback.instructions().len(), 1);
-        assert!(pullback_stablehlo.contains("\"stablehlo.if\""), "{pullback_stablehlo}");
-        assert!(pullback_stablehlo.contains("stablehlo.while"), "{pullback_stablehlo}");
+            .collect()
     }
 
     #[test]
@@ -624,5 +661,436 @@ mod tests {
             lower(EffectClasses::NONE),
             Err(LoweringError::Tracing(ProgramError::MalformedProgram(message))) if message == expected_message,
         ));
+    }
+
+    #[test]
+    fn test_validate_unthreaded_effect_tokens() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let token_type = context.stable_hlo_token_type().unwrap();
+        let block = context.block(&[(token_type, location), (token_type, location)]);
+        let entry_token = block.as_ref().argument(0).unwrap().as_ref();
+        let advanced_token = block.as_ref().argument(1).unwrap().as_ref();
+        let mut entry_effect_tokens = EffectTokens::default();
+        entry_effect_tokens.set(EffectClass::OrderedIo, entry_token);
+        let ordered_io = EffectClasses::single(EffectClass::OrderedIo);
+
+        // A region that leaves every token unchanged threads nothing it would have to return.
+        let threaded_effects = EffectClasses::NONE;
+        assert_eq!(
+            validate_unthreaded_effect_tokens(entry_effect_tokens, entry_effect_tokens, threaded_effects),
+            Ok(()),
+        );
+
+        // A region may advance the token of a class that it threads, and threading assertions threads I/O too.
+        let mut region_effect_tokens = entry_effect_tokens;
+        region_effect_tokens.set(EffectClass::OrderedIo, advanced_token);
+        assert_eq!(validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, ordered_io), Ok(()));
+        let threaded_effects = EffectClasses::single(EffectClass::OrderedAssertion);
+        assert_eq!(
+            validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects),
+            Ok(()),
+        );
+
+        // The advanced token of a class that the region does not thread would be dropped, and so would a token that the
+        // region creates for a class that had none when it started.
+        assert!(matches!(
+            validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, EffectClasses::NONE),
+            Err(ProgramError::MalformedProgram(message))
+                if message
+                    == "control-flow region lowering advanced the `ordered_io` token, which the region does not thread",
+        ));
+        let mut region_effect_tokens = entry_effect_tokens;
+        region_effect_tokens.set(EffectClass::OrderedAssertion, advanced_token);
+        assert!(matches!(
+            validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, ordered_io),
+            Err(ProgramError::MalformedProgram(message))
+                if message
+                    == "control-flow region lowering advanced the `ordered_assertion` token, which the region does \
+                        not thread",
+        ));
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_differentiated_composite_control_flow() {
+        let scalar_boolean = ArrayType::scalar(DataType::Boolean);
+        let scalar_f32 = ArrayType::scalar(DataType::F32);
+        let vector_f32 = test_vector_type(2);
+
+        let branch = |double: bool| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_f32.clone().into());
+            let output = if double {
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
+            } else {
+                input
+            };
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut scan_body_builder = CompositeXlaProgramBuilder::new();
+        scan_body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = scan_body_builder.add_input(scalar_f32.clone().into());
+        let item = scan_body_builder.add_input(scalar_f32.clone().into());
+        let next_carry =
+            scan_body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
+        let scan_body = scan_body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![next_carry, next_carry],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut while_condition_builder = CompositeXlaProgramBuilder::new();
+        let state = while_condition_builder.add_input(scalar_f32.clone().into());
+        let while_predicate = while_condition_builder
+            .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![state, state], None)
+            .unwrap()[0];
+        let while_condition = while_condition_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![while_predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut while_body_builder = CompositeXlaProgramBuilder::new();
+        let state = while_body_builder.add_input(scalar_f32.clone().into());
+        let next_state = while_body_builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![state, state], None)
+            .unwrap()[0];
+        let while_body = while_body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next_state], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_region(branch(true).entry_region_ref());
+        let false_region = builder.import_region(branch(false).entry_region_ref());
+        let scan_region = builder.import_region(scan_body.entry_region_ref());
+        let while_condition_region = builder.import_region(while_condition.entry_region_ref());
+        let while_body_region = builder.import_region(while_body.entry_region_ref());
+        let predicate = builder.add_input(scalar_boolean.clone().into());
+        let input = builder.add_input(scalar_f32.clone().into());
+        let items = builder.add_input(vector_f32.clone().into());
+        let selected = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, input],
+                None,
+            )
+            .unwrap()[0];
+        let scan_outputs = builder
+            .add_instruction(
+                XlaOperation::Scan(ScanOperation::new(1, 2)),
+                vec![scan_region],
+                vec![selected, items],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let final_state = builder
+            .add_instruction(
+                XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+                vec![while_condition_region, while_body_region],
+                vec![scan_outputs[0]],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![final_state, scan_outputs[1]],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Keep the complete mixed control-flow program behind one compiled-call boundary. Linearization must preserve
+        // that boundary while deriving its primal and pullback callees, and lowering must still reach the nested
+        // condition and loop operations.
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let callee = builder.import_region(program.entry_region_ref());
+        let predicate = builder.add_input(scalar_boolean.clone().into());
+        let input = builder.add_input(scalar_f32.clone().into());
+        let items = builder.add_input(vector_f32.clone().into());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![predicate, input, items],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let primal = linearization.primal();
+        let array_types = |types: Vec<ArrayIrType>| {
+            types.into_iter().map(|r#type| <&ArrayType>::try_from(&r#type).unwrap().clone()).collect::<Vec<_>>()
+        };
+        let primal_module = to_mlir_module_for_program(
+            primal,
+            &[],
+            &array_types(primal.input_types()),
+            &array_types(primal.output_types()),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let pullback_module = to_mlir_module_for_program(
+            &pullback,
+            &[],
+            &array_types(pullback.input_types()),
+            &array_types(pullback.output_types()),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        // The primal returns the predicate of the condition and the predicate of each loop iteration as residuals, and
+        // the pullback replays the loop and the condition backwards over them.
+        assert_eq!(
+            primal.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[], %2:f32[2] .
+                let %3:f32[], %4:f32[2], %5:bool[], %6:bool[2] = jit_call %0 %1 %2 [
+                    callee={
+                        lambda %0:bool[], %1:f32[], %2:f32[2] .
+                        let %3:f32[] = condition %0 %1 [
+                            true={
+                                lambda %0:f32[] .
+                                let %1:f32[] = add %0 %0
+                                in (%1)
+                            },
+                            false={
+                                lambda %0:f32[] .
+                                in (%0)
+                            },
+                        ]
+                            %4:f32[], %5:f32[2] = scan [carry_count=1, length=2, reverse=false] %3 %2 [
+                                body={
+                                    lambda %0:i64[], %1:f32[], %2:f32[] .
+                                    let %3:f32[] = add %1 %2
+                                    in (%3, %3)
+                                },
+                            ]
+                            %6:i64[] = zero [type=i64[]]
+                            %7:bool[2] = zero [type=bool[2]]
+                            %8:f32[], %9:i64[], %10:bool[2] = while [iteration_bound=2] %4 %6 %7 [
+                                condition={
+                                    lambda %0:f32[], %1:i64[], %2:bool[2] .
+                                    let %3:bool[] = compare [direction=LessThan] %0 %0
+                                    in (%3)
+                                },
+                                body={
+                                    lambda %0:f32[], %1:i64[], %2:bool[2] .
+                                    let %3:f32[] = add %0 %0
+                                        %4:i64[] = one [type=i64[]]
+                                        %5:i64[] = add %1 %4
+                                        %6:bool[] = one [type=bool[]]
+                                        %7:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %6
+                                        %8:bool[2] = dynamic_update_slice %2 %7 %1
+                                    in (%3, %5, %8)
+                                },
+                            ]
+                        in (%8, %5, %0, %10)
+                    },
+                ]
+                in (%3, %4, %5, %6)"},
+        );
+        assert_eq!(
+            primal_module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<f32>, %arg2: tensor<2xf32>) -> (tensor<f32>, \
+                tensor<2xf32>, tensor<i1>, tensor<2xi1>) {
+                    %0 = \"stablehlo.if\"(%arg0) ({
+                      %6 = stablehlo.add %arg1, %arg1 : tensor<f32>
+                      stablehlo.return %6 : tensor<f32>
+                    }, {
+                      stablehlo.return %arg1 : tensor<f32>
+                    }) : (tensor<i1>) -> tensor<f32>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                    %2:4 = stablehlo.while(%iterArg = %c, %iterArg_3 = %0, %iterArg_4 = %arg2, %iterArg_5 = %1) : \
+                tensor<i64>, tensor<f32>, tensor<2xf32>, tensor<2xf32>
+                    cond {
+                      %c_6 = stablehlo.constant dense<2> : tensor<i64>
+                      %6 = stablehlo.compare LT, %iterArg, %c_6, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %6 : tensor<i1>
+                    } do {
+                      %6 = stablehlo.dynamic_slice %iterArg_4, %iterArg, sizes = [1] : (tensor<2xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                      %7 = stablehlo.reshape %6 : (tensor<1xf32>) -> tensor<f32>
+                      %8 = stablehlo.add %iterArg_3, %7 : tensor<f32>
+                      %9 = stablehlo.reshape %8 : (tensor<f32>) -> tensor<1xf32>
+                      %10 = stablehlo.dynamic_update_slice %iterArg_5, %9, %iterArg : (tensor<2xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<2xf32>
+                      %c_6 = stablehlo.constant dense<1> : tensor<i64>
+                      %11 = stablehlo.add %iterArg, %c_6 : tensor<i64>
+                      stablehlo.return %11, %8, %iterArg_4, %10 : tensor<i64>, tensor<f32>, tensor<2xf32>, tensor<2xf32>
+                    }
+                    %c_0 = stablehlo.constant dense<0> : tensor<i64>
+                    %c_1 = stablehlo.constant dense<false> : tensor<i1>
+                    %3 = stablehlo.broadcast_in_dim %c_1, dims = [] : (tensor<i1>) -> tensor<2xi1>
+                    %c_2 = stablehlo.constant dense<0> : tensor<i64>
+                    %4 = stablehlo.compare LT, %2#1, %2#1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                    %5:5 = stablehlo.while(%iterArg = %c_2, %iterArg_3 = %2#1, %iterArg_4 = %c_0, %iterArg_5 = %3, \
+                %iterArg_6 = %4) : tensor<i64>, tensor<f32>, tensor<i64>, tensor<2xi1>, tensor<i1>
+                    cond {
+                      %c_7 = stablehlo.constant dense<2> : tensor<i64>
+                      %6 = stablehlo.compare LT, %iterArg, %c_7, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %7 = stablehlo.and %iterArg_6, %6 : tensor<i1>
+                      stablehlo.return %7 : tensor<i1>
+                    } do {
+                      %6 = stablehlo.add %iterArg_3, %iterArg_3 : tensor<f32>
+                      %c_7 = stablehlo.constant dense<1> : tensor<i64>
+                      %7 = stablehlo.add %iterArg_4, %c_7 : tensor<i64>
+                      %c_8 = stablehlo.constant dense<true> : tensor<i1>
+                      %8 = stablehlo.broadcast_in_dim %c_8, dims = [] : (tensor<i1>) -> tensor<1xi1>
+                      %c_9 = stablehlo.constant dense<0> : tensor<i64>
+                      %c_10 = stablehlo.constant dense<2> : tensor<i64>
+                      %9 = stablehlo.compare LT, %iterArg_4, %c_9, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %10 = stablehlo.add %iterArg_4, %c_10 : tensor<i64>
+                      %11 = stablehlo.select %9, %10, %iterArg_4 : tensor<i1>, tensor<i64>
+                      %12 = stablehlo.dynamic_update_slice %iterArg_5, %8, %11 : (tensor<2xi1>, tensor<1xi1>, \
+                tensor<i64>) -> tensor<2xi1>
+                      %c_11 = stablehlo.constant dense<1> : tensor<i64>
+                      %13 = stablehlo.add %iterArg, %c_11 : tensor<i64>
+                      %c_12 = stablehlo.constant dense<2> : tensor<i64>
+                      %14 = stablehlo.compare LT, %13, %c_12, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %15 = \"stablehlo.if\"(%14) ({
+                        %16 = stablehlo.compare LT, %6, %6, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                        stablehlo.return %16 : tensor<i1>
+                      }, {
+                        stablehlo.return %iterArg_6 : tensor<i1>
+                      }) : (tensor<i1>) -> tensor<i1>
+                      stablehlo.return %13, %6, %7, %12, %15 : tensor<i64>, tensor<f32>, tensor<i64>, tensor<2xi1>, \
+                tensor<i1>
+                    }
+                    return %5#1, %2#3, %arg0, %5#3 : tensor<f32>, tensor<2xf32>, tensor<i1>, tensor<2xi1>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
+                let %4:f32[], %5:f32[2] = jit_call %0 %1 %2 %3 [
+                    callee={
+                        lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
+                        let %4:f32[] = scan [carry_count=1, length=2, reverse=true] %0 %3 [
+                            body={
+                                lambda %0:i64[], %1:f32[], %2:bool[] .
+                                let %3:f32[] = condition %2 %1 [
+                                    true={
+                                        lambda %0:f32[] .
+                                        let %1:f32[] = add %0 %0
+                                        in (%1)
+                                    },
+                                    false={
+                                        lambda %0:f32[] .
+                                        in (%0)
+                                    },
+                                ]
+                                in (%3)
+                            },
+                        ]
+                            %5:f32[], %6:f32[2] = scan [carry_count=1, length=2, reverse=true] %4 %1 [
+                                body={
+                                    lambda %0:i64[], %1:f32[], %2:f32[] .
+                                    let %3:f32[] = add %1 %2
+                                    in (%3, %3)
+                                },
+                            ]
+                            %7:f32[] = condition %2 %5 [
+                                true={
+                                    lambda %0:f32[] .
+                                    let %1:f32[] = add %0 %0
+                                    in (%1)
+                                },
+                                false={
+                                    lambda %0:f32[] .
+                                    in (%0)
+                                },
+                            ]
+                        in (%7, %6)
+                    },
+                ]
+                in (%4, %5)"},
+        );
+        assert_eq!(
+            pullback_module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<2xf32>, %arg2: tensor<i1>, %arg3: tensor<2xi1>) -> \
+                (tensor<f32>, tensor<2xf32>) {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %0:3 = stablehlo.while(%iterArg = %c, %iterArg_1 = %arg0, %iterArg_2 = %arg3) : tensor<i64>, \
+                tensor<f32>, tensor<2xi1>
+                    cond {
+                      %c_3 = stablehlo.constant dense<2> : tensor<i64>
+                      %4 = stablehlo.compare LT, %iterArg, %c_3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %4 : tensor<i1>
+                    } do {
+                      %c_3 = stablehlo.constant dense<2> : tensor<i64>
+                      %c_4 = stablehlo.constant dense<1> : tensor<i64>
+                      %4 = stablehlo.subtract %c_3, %c_4 : tensor<i64>
+                      %5 = stablehlo.subtract %4, %iterArg : tensor<i64>
+                      %6 = stablehlo.dynamic_slice %iterArg_2, %5, sizes = [1] : (tensor<2xi1>, tensor<i64>) -> \
+                tensor<1xi1>
+                      %7 = stablehlo.reshape %6 : (tensor<1xi1>) -> tensor<i1>
+                      %8 = \"stablehlo.if\"(%7) ({
+                        %10 = stablehlo.add %iterArg_1, %iterArg_1 : tensor<f32>
+                        stablehlo.return %10 : tensor<f32>
+                      }, {
+                        stablehlo.return %iterArg_1 : tensor<f32>
+                      }) : (tensor<i1>) -> tensor<f32>
+                      %c_5 = stablehlo.constant dense<1> : tensor<i64>
+                      %9 = stablehlo.add %iterArg, %c_5 : tensor<i64>
+                      stablehlo.return %9, %8, %iterArg_2 : tensor<i64>, tensor<f32>, tensor<2xi1>
+                    }
+                    %c_0 = stablehlo.constant dense<0> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                    %2:4 = stablehlo.while(%iterArg = %c_0, %iterArg_1 = %0#1, %iterArg_2 = %arg1, %iterArg_3 = %1) : \
+                tensor<i64>, tensor<f32>, tensor<2xf32>, tensor<2xf32>
+                    cond {
+                      %c_4 = stablehlo.constant dense<2> : tensor<i64>
+                      %4 = stablehlo.compare LT, %iterArg, %c_4, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %4 : tensor<i1>
+                    } do {
+                      %c_4 = stablehlo.constant dense<2> : tensor<i64>
+                      %c_5 = stablehlo.constant dense<1> : tensor<i64>
+                      %4 = stablehlo.subtract %c_4, %c_5 : tensor<i64>
+                      %5 = stablehlo.subtract %4, %iterArg : tensor<i64>
+                      %6 = stablehlo.dynamic_slice %iterArg_2, %5, sizes = [1] : (tensor<2xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                      %7 = stablehlo.reshape %6 : (tensor<1xf32>) -> tensor<f32>
+                      %8 = stablehlo.add %iterArg_1, %7 : tensor<f32>
+                      %9 = stablehlo.reshape %8 : (tensor<f32>) -> tensor<1xf32>
+                      %10 = stablehlo.dynamic_update_slice %iterArg_3, %9, %5 : (tensor<2xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<2xf32>
+                      %c_6 = stablehlo.constant dense<1> : tensor<i64>
+                      %11 = stablehlo.add %iterArg, %c_6 : tensor<i64>
+                      stablehlo.return %11, %8, %iterArg_2, %10 : tensor<i64>, tensor<f32>, tensor<2xf32>, tensor<2xf32>
+                    }
+                    %3 = \"stablehlo.if\"(%arg2) ({
+                      %4 = stablehlo.add %2#1, %2#1 : tensor<f32>
+                      stablehlo.return %4 : tensor<f32>
+                    }, {
+                      stablehlo.return %2#1 : tensor<f32>
+                    }) : (tensor<i1>) -> tensor<f32>
+                    return %3, %2#3 : tensor<f32>, tensor<2xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(linearization.residual_count(), 2);
     }
 }

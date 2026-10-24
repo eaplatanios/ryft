@@ -873,7 +873,7 @@ impl<T: Type> Operation for JitCallOperation<T> {
 
     fn prune_boundary(
         &self,
-        input_count: usize,
+        input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
@@ -882,7 +882,7 @@ impl<T: Type> Operation for JitCallOperation<T> {
         // kept, because the captures in the callee refer to it by absolute position.
         let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
         kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
-        check_count!("input", kept_inputs, input_count, ProgramError);
+        check_count!("input", kept_inputs, input_types.len(), ProgramError);
         let mut operation = self.clone();
         operation.output_types =
             self.output_types.as_ref().map(|types| types.pruned(&kept_inputs, used_outputs)).transpose()?;

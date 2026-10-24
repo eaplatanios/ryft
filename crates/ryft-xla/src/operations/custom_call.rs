@@ -322,7 +322,7 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
             token_class,
             lowered
                 .result(output_types.len())
-                .expect("a side-effecting custom call should return one trailing token result")
+                .expect("an ordered custom call should return one trailing token result")
                 .as_ref(),
         );
     }
@@ -579,9 +579,9 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_custom_call() {
         use ryft_core::{CustomCallOperation, PrintOperation, StridedLayout, Tile, TileDimension, TiledLayout};
 
-        // A side-effecting custom call lowers its typed attributes, complete memory-layout lists, buffer alias,
-        // and one hidden ordered-I/O token. A second side-effecting call consumes that token even though the first
-        // call's array result is unused, while the final pure call remains token-free.
+        // An ordered-I/O custom call lowers its typed attributes, complete memory-layout lists, buffer alias, and one
+        // hidden ordered-I/O token. A second ordered-I/O call consumes that token even though the first call's array
+        // result is unused, while the final pure call remains token-free.
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let column_major_type = array_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
         let mut builder = XlaProgramBuilder::new();
@@ -595,14 +595,15 @@ mod tests {
                 .with_attribute("label", "x")
                 .with_input_output_alias(0, 1)
                 .unwrap()
-                .with_side_effect();
+                .with_effect_class(EffectClass::OrderedIo);
         builder.add_instruction(effectful, Vec::new(), vec![left, right], None).unwrap();
         let printed = builder
             .add_instruction(PrintOperation::<ArrayType>::new("between"), Vec::new(), vec![right], None)
             .unwrap()[0];
         let chained = builder
             .add_instruction(
-                CustomCallOperation::new("ryft.test.record", vec![array_type.clone()]).with_side_effect(),
+                CustomCallOperation::new("ryft.test.record", vec![array_type.clone()])
+                    .with_effect_class(EffectClass::OrderedIo),
                 Vec::new(),
                 vec![printed],
                 None,
