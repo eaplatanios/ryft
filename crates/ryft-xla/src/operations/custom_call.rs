@@ -13,7 +13,7 @@ use ryft_mlir::{
     Operation as MlirOperation, Region as MlirRegion, Size as MlirSize, StringRef, Type, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{lower_tensor_type, lower_unplaced_constant_output};
+use crate::experimental::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
@@ -164,6 +164,35 @@ fn lower_custom_call_attribute<'c, 't: 'c>(
             context.dictionary_attribute(&lower_custom_call_attributes(attributes, context, location)?).as_ref()
         }
     })
+}
+
+/// Returns the statically shaped buffer type that crosses the foreign boundary for one custom-call array `input` or
+/// `output` (as named by `role`): every bounded dynamic dimension is widened to its inclusive upper bound, because XLA
+/// custom calls accept only static operand and result shapes.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedOp`] for a dynamic dimension without a finite upper bound.
+fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType, LoweringError> {
+    let dimensions = r#type
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| match dimension {
+            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+            Dimension::Dynamic(variable) => {
+                variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
+                    || LoweringError::UnsupportedOp {
+                        op: format!(
+                            "custom-call {role} dimension `{variable}` needs a finite upper bound for physical buffer \
+                         allocation",
+                        ),
+                    },
+                )
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(r#type.clone().with_shape(Shape::new(dimensions)))
 }
 
 /// Returns the class of the effect token that a custom call threads for its effect class: the ordered-assertion token
@@ -387,35 +416,27 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
             context,
             location,
         )?;
+        let physical_input_types = array_input_types
+            .iter()
+            .map(|input_type| custom_call_physical_type(input_type, "input"))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut physical_output_types = refined_output_types
             .iter()
-            .map(|output_type| {
-                let dimensions = output_type
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .map(|dimension| match dimension {
-                        Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-                        Dimension::Dynamic(variable) => variable
-                            .bounds()
-                            .upper()
-                            .and_then(|upper| upper.checked_sub(1))
-                            .map(Dimension::Static)
-                            .ok_or_else(|| LoweringError::UnsupportedOp {
-                                op: format!(
-                                    "custom-call output dimension `{}` needs a finite upper bound for physical \
-                                     buffer allocation",
-                                    variable,
-                                ),
-                            }),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(output_type.clone().with_shape(Shape::new(dimensions)))
-            })
-            .collect::<Result<Vec<_>, LoweringError>>()?;
+            .map(|output_type| custom_call_physical_type(output_type, "output"))
+            .collect::<Result<Vec<_>, _>>()?;
         for alias in self.input_output_aliases() {
-            physical_output_types[alias.output_index()] = array_input_types[alias.input_index()].clone();
+            physical_output_types[alias.output_index()] = physical_input_types[alias.input_index()].clone();
         }
+        // XLA custom calls accept only static operands, so each bounded dynamic array input crosses the foreign
+        // boundary as its dense buffer at the inclusive bound, exactly like the results allocated above. The kernel
+        // therefore sees the whole bound-sized buffer, whose lanes beyond the runtime extent are unspecified. An
+        // aliased output reuses that static operand buffer, and its logical extent is reattached after the call. Static
+        // inputs pass through unchanged.
+        let physical_inputs = array_inputs
+            .iter()
+            .zip(&array_input_types)
+            .map(|(input, input_type)| lower_physical_storage(*input, input_type, block, context, location))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut results = if let Some(predicate) = validation {
             // A separate assertion token cannot gate a pure or nullary foreign ABI. The conditional keeps every
             // foreign effect in the valid branch. Its false results are unreachable because validation reports an
@@ -430,8 +451,8 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
                 let mut true_tokens = *effect_tokens;
                 let mut outputs = lower_custom_call_to_mlir(
                     self,
-                    array_inputs,
-                    &array_input_types,
+                    &physical_inputs,
+                    &physical_input_types,
                     &physical_output_types,
                     &mut true_tokens,
                     &mut true_block,
@@ -451,12 +472,12 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
                     .iter()
                     .enumerate()
                     .map(|(index, r#type)| {
-                        // Aliased outputs preserve their input's dynamic buffer shape. Forward that buffer instead
-                        // of trying to construct a constant with an unknown extent in this unreachable branch.
+                        // Aliased outputs share their input's bound-sized operand buffer. Forward that buffer instead
+                        // of constructing a placeholder in this unreachable branch.
                         if let Some(alias) =
                             self.input_output_aliases().iter().find(|alias| alias.output_index() == index)
                         {
-                            return Ok(array_inputs[alias.input_index()]);
+                            return Ok(physical_inputs[alias.input_index()]);
                         }
                         let value = i64::from(r#type.data_type() == DataType::F8E8M0FNU);
                         Ok(lower_unplaced_constant_output(
@@ -482,8 +503,8 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
         } else {
             lower_custom_call_to_mlir(
                 self,
-                array_inputs,
-                &array_input_types,
+                &physical_inputs,
+                &physical_input_types,
                 &physical_output_types,
                 effect_tokens,
                 block,
@@ -529,6 +550,9 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
@@ -536,9 +560,17 @@ mod tests {
         DimensionVariable, Memory, Placeholder, Shape,
     };
     use ryft_mlir::{Operation as MlirOperation, Value as MlirValue};
+    use ryft_pjrt::extensions::ffi::{
+        FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
+        FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+    };
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, test_matrix_type, unproject_plain_program};
+    use crate::experimental::lowering::tests::{
+        MixedValue, XlaProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
+    };
     use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::to_mlir_module_for_program;
 
     use super::*;
@@ -863,8 +895,8 @@ mod tests {
         use ryft_core::CustomCallOperation;
 
         // A composite custom call receives its declared extent as trailing scalar SSA metadata, but only the array
-        // operand enters the FFI call. An alias continues to refer to that leading array operand and the result is
-        // refined with the trailing logical extent after the call.
+        // operand enters the FFI call, as its static buffer at the bound. An alias continues to refer to that leading
+        // operand, and the static aliased result is refined with the trailing logical extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = CompositeXlaProgramBuilder::new();
@@ -898,15 +930,39 @@ mod tests {
                     %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
                     %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
-                    %3 = stablehlo.custom_call @ryft.test.dynamic(%0) {api_version = 4 : i32, backend_config = {}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]} : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<?xf32, #stablehlo.bounds<8>>
-                    %4 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %5 = stablehlo.set_dimension_size %3, %4, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
-                    %6 = stablehlo.get_dimension_size %5, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
-                    %7 = stablehlo.convert %6 : (tensor<i32>) -> tensor<i64>
-                    return %5, %7 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>
+                    %c = stablehlo.constant dense<8> : tensor<i32>
+                    %3 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<8xf32>
+                    %4 = stablehlo.custom_call @ryft.test.dynamic(%3) {api_version = 4 : i32, backend_config = {}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]} : (tensor<8xf32>) -> tensor<8xf32>
+                    %5 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                    %6 = stablehlo.set_dimension_size %4, %5, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %7 = stablehlo.get_dimension_size %6, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                    return %6, %8 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_rejects_unbounded_custom_call_input() {
+        // An unbounded dynamic input has no static buffer that could cross the foreign boundary.
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let operation = CustomCallOperation::new("ryft.test.unbounded", vec![output_type.clone()]);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
+            Err(LoweringError::UnsupportedOp {
+                op: "custom-call input dimension `size` needs a finite upper bound for physical buffer allocation"
+                    .to_string(),
+            }),
         );
     }
 
@@ -946,8 +1002,9 @@ mod tests {
 
     #[test]
     fn test_lower_custom_call_mixed_extents_preserve_dynamic_alias_false_branch() {
-        // The mixed output needs a guard, while the independent aliased output keeps its dynamic input type.
-        // Both conditional branches must return that same dynamic buffer type without constructing a dynamic zero.
+        // The mixed output needs a guard, while the independent aliased output shares the static bound-sized operand
+        // buffer of its dynamic input. The unreachable branch forwards that buffer, and the logical extent is
+        // reattached after the conditional.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(9)).unwrap());
         let alias_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
@@ -992,20 +1049,22 @@ mod tests {
                     %3 = stablehlo.compare EQ, %arg1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
                     %4 = stablehlo.after_all  : !stablehlo.token
                     %5 = stablehlo.custom_call @ryft.assert(%3, %arg1, %4) {api_version = 4 : i32, backend_config = {actor = "custom_call", kind = "generic", label_0 = "size", label_count = "1", message = "input dimension `size` expected 3"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
-                    %6 = stablehlo.after_all  : !stablehlo.token
-                    %7:3 = "stablehlo.if"(%3) ({
-                      %12:3 = stablehlo.custom_call @ryft.test.dynamic_guard(%0, %6) {api_version = 4 : i32, backend_config = {}, has_side_effect = true, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>]} : (tensor<?xf32, #stablehlo.bounds<8>>, !stablehlo.token) -> (tensor<?xf32, #stablehlo.bounds<8>>, tensor<3x3xf32>, !stablehlo.token)
-                      stablehlo.return %12#0, %12#1, %12#2 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<3x3xf32>, !stablehlo.token
+                    %c_0 = stablehlo.constant dense<8> : tensor<i32>
+                    %6 = stablehlo.set_dimension_size %0, %c_0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<8xf32>
+                    %7 = stablehlo.after_all  : !stablehlo.token
+                    %8:3 = "stablehlo.if"(%3) ({
+                      %13:3 = stablehlo.custom_call @ryft.test.dynamic_guard(%6, %7) {api_version = 4 : i32, backend_config = {}, has_side_effect = true, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>]} : (tensor<8xf32>, !stablehlo.token) -> (tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token)
+                      stablehlo.return %13#0, %13#1, %13#2 : tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token
                     }, {
                       %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                      %12 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
-                      stablehlo.return %0, %12, %6 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<3x3xf32>, !stablehlo.token
-                    }) : (tensor<i1>) -> (tensor<?xf32, #stablehlo.bounds<8>>, tensor<3x3xf32>, !stablehlo.token)
-                    %8 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %9 = stablehlo.set_dimension_size %7#0, %8, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
-                    %10 = stablehlo.get_dimension_size %9, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
-                    %11 = stablehlo.convert %10 : (tensor<i32>) -> tensor<i64>
-                    return %9, %7#1, %11 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<3x3xf32>, tensor<i64>
+                      %13 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+                      stablehlo.return %6, %13, %7 : tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token
+                    }) : (tensor<i1>) -> (tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token)
+                    %9 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                    %10 = stablehlo.set_dimension_size %8#0, %9, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %11 = stablehlo.get_dimension_size %10, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %12 = stablehlo.convert %11 : (tensor<i32>) -> tensor<i64>
+                    return %10, %8#1, %12 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<3x3xf32>, tensor<i64>
                   }
                 }
             "#},
@@ -1139,19 +1198,6 @@ mod tests {
 
     #[test]
     fn test_lower_custom_call_mixed_extents_validate_before_foreign_effects() {
-        use std::sync::OnceLock;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use ryft_pjrt::extensions::ffi::{
-            FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiOutput,
-            FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
-        };
-
-        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::operations::assertions::ensure_assertion_handler_registered;
-
         const TARGET: &str = "ryft.test.validated_nullary_extent";
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
@@ -1250,9 +1296,7 @@ mod tests {
             }
         }
         // A guarded call forwards its aliased input buffer from the unreachable branch. A valid extent runs the call
-        // on that buffer, while an invalid one fails before the call runs. The alias is static here because XLA
-        // rejects custom calls with dynamic operand or result dimensions at compile time, so the bounded dynamic
-        // alias of `test_lower_custom_call_mixed_extents_preserve_dynamic_alias_false_branch` cannot execute.
+        // on that buffer, while an invalid one fails before the call runs.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let alias_type = ArrayType::new_static(DataType::F64, [4]);
         let mixed_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
@@ -1281,5 +1325,80 @@ mod tests {
             .to_string();
         assert!(error.contains("input dimension `size` expected 3"), "{error}");
         assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
+    fn test_lower_custom_call_dynamic_alias_executes_on_bound_buffer() {
+        const TARGET: &str = "ryft.test.increment_bound_buffer";
+        static OPERAND_LENGTH: AtomicUsize = AtomicUsize::new(0);
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        /// Writes every element of the `f64` operand plus one into the result and records the operand length.
+        unsafe extern "C" fn handler(raw: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: XLA provides a valid call frame, operand buffer, and result allocation for this invocation, and
+            // the handler checks that the operand and result have the same `f64` type and extents.
+            unsafe {
+                let Ok(frame) = FfiCallFrame::from_c_api(raw) else { return std::ptr::null_mut() };
+                if frame.register_metadata(FfiTypeId::default()) || frame.stage() != FfiExecutionStage::Execution {
+                    return std::ptr::null_mut();
+                }
+                let Ok(api) = frame.api() else { return std::ptr::null_mut() };
+                let (Ok(FfiInput::Buffer { buffer: input }), Ok(FfiOutput::Buffer { buffer: output })) =
+                    (frame.input(0), frame.output(0))
+                else {
+                    return FfiError::invalid_argument("expected one operand and one result buffer").to_c_api(api);
+                };
+                if input.element_type() != FfiBufferType::F64
+                    || output.element_type() != FfiBufferType::F64
+                    || input.dimensions() != output.dimensions()
+                {
+                    return FfiError::invalid_argument("expected matching `f64` buffers").to_c_api(api);
+                }
+                let length = input.dimensions().iter().product::<i64>() as usize;
+                for index in 0..length {
+                    *(output.data() as *mut f64).add(index) = *(input.data() as *const f64).add(index) + 1.0;
+                }
+                OPERAND_LENGTH.store(length, Ordering::SeqCst);
+                std::ptr::null_mut()
+            }
+        }
+
+        // The handler accesses its buffers through host pointers, so this test always runs on the CPU client.
+        let client = load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+
+        // A bounded dynamic aliased input reaches the handler as its static buffer at the bound, and the aliased
+        // result regains the input's runtime extent after the call.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(dynamic_type.clone().into());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let operation = CustomCallOperation::new(TARGET, vec![dynamic_type]).with_input_output_alias(0, 0).unwrap();
+        let output = builder.add_instruction(operation, Vec::new(), vec![input, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input = MixedValue::Array((1..=8).map(f64::from).collect(), vec![8]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[input], &[3]),
+            Ok(vec![MixedValue::Array(vec![2.0, 3.0, 4.0], vec![3]), MixedValue::Dimension(3)]),
+        );
+        assert_eq!(OPERAND_LENGTH.load(Ordering::SeqCst), 8);
     }
 }

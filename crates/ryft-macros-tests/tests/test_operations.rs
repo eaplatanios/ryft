@@ -146,7 +146,7 @@ trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
 }
 
 /// Stand-in for `ryft_core::InterpretationDriver`.
-trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {}
+trait InterpretationDriver<C: Domain>: RegionDriver<C::Constant, C::Operation> {}
 
 /// Stand-in for `ryft_core::DifferentiationDriver`.
 trait DifferentiationDriver<C: Context> {}

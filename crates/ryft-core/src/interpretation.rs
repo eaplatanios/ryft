@@ -98,7 +98,8 @@ use crate::programs::{
 /// application. During [`Program`] replay, the application is exactly one [`Instruction`]. Direct rule invocation
 /// supplies an equivalent [`RegionDriver`] for that call. Region-free applications use an empty driver, while
 /// higher-order rules select borrowed attached regions and re-enter the active interpreter without materializing
-/// standalone programs.
+/// standalone programs. The borrowed regions store [`Domain::Constant`]s, while their interpreted inputs and
+/// outputs are [`Domain::Value`]s; the driver lifts constants into the runtime value family during replay.
 ///
 /// # Replay Pipeline
 ///
@@ -129,7 +130,7 @@ use crate::programs::{
 /// The driver is application-scoped rather than stored in the operation payload, so the same operation can receive
 /// owned, borrowed, replayed, or shared attached computations through one ordered region contract.
 #[cfg_attr(doc, aquamarine::aquamarine)]
-pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {
+pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Constant, C::Operation> {
     /// Interprets the [`Region`](crate::Region) at `index` over the provided input values, re-entering the active
     /// program interpreter, and returns the region's output values.
     fn interpret_region(&self, context: &C, index: usize, inputs: Vec<C::Value>)
@@ -198,8 +199,8 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
 
 /// Adapts the [`BindingRegionDriver`] supplied to one eager [`Context::bind`] operation application to the
 /// interpretation-specific recursion provided by [`InterpretationDriver`]. Its regions are exactly the nested
-/// computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a
-/// selected region through the [`EagerContext`] without taking ownership of it.
+/// computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a selected
+/// region through the active [`Context`] without taking ownership of it, lifting stored constants into runtime values.
 pub(crate) struct EagerInterpretationDriver<'r, D> {
     /// Binding [`RegionDriver`] supplied to the active [`Operation`] application.
     driver: &'r D,
@@ -226,32 +227,27 @@ impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver
     }
 }
 
-impl<
-    V: Value,
-    O: Operation<Type = V::Type>
-        + InterpretableOperation<EagerContext<V, O>>
-        + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
-    D: RegionDriver<V, O>,
-> InterpretationDriver<EagerContext<V, O>> for EagerInterpretationDriver<'_, D>
+impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> InterpretationDriver<C>
+    for EagerInterpretationDriver<'_, D>
 {
     #[inline]
     fn interpret_region(
         &self,
-        context: &EagerContext<V, O>,
+        context: &C,
         index: usize,
-        inputs: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError> {
+        inputs: Vec<C::Value>,
+    ) -> Result<Vec<C::Value>, ProgramError> {
         self.region(index)?.interpret_in_context(context, inputs)
     }
 
     #[inline]
-    fn bind<R: BindingRegionDriver<V, O>>(
+    fn bind<R: BindingRegionDriver<C::Constant, C::Operation>>(
         &self,
-        context: &EagerContext<V, O>,
-        operation: O,
+        context: &C,
+        operation: C::Operation,
         regions: R,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         context.bind(operation, regions, inputs)
     }
 }
@@ -1533,6 +1529,46 @@ mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_eager_interpretation_driver_interpret_region() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input_type = ArrayType::scalar(DataType::F32);
+        let input = builder.add_input(input_type.clone());
+        let constant = builder.add_constant(Array::scalar(3f32).unwrap());
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let regions = [program];
+        let driver = EagerInterpretationDriver::new(&regions);
+        assert_eq!(
+            driver.interpret_region(&TestArrayContext::new(), 0, vec![Array::scalar(2f32).unwrap()]),
+            Ok(vec![Array::scalar(5f32).unwrap()]),
+        );
+
+        // The same stored region retains Array constants when its runtime values are Tracers. This also exercises
+        // constant lifting and operation binding through the interpretation driver with distinct value families.
+        let (_, restaged) = TracingContext::<Array, TestArrayOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context().clone();
+                let outputs = driver.interpret_region(&context, 0, inputs)?;
+                driver.bind(&context, NegOperation::new().into(), Vec::new(), &outputs)
+            },
+            vec![input_type],
+        )
+        .unwrap();
+        assert_eq!(
+            restaged.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %2:f32[] = add %0, 3
+                    %3:f32[] = neg %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(restaged.interpret(vec![Array::scalar(2f32).unwrap()]), Ok(vec![Array::scalar(-5f32).unwrap()]));
     }
 
     #[test]

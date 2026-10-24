@@ -1,14 +1,23 @@
-use ryft_core::{
-    ArrayIrType, ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, MeshAxisType, Operation, ProgramError,
-};
+//! Lowering of [`ConditionOperation`] to [StableHLO `if`](https://openxla.org/stablehlo/spec#if).
+//!
+//! A condition lowers only from the composite [`ArrayIrType`] operation family, which stores its two branch regions;
+//! the homogeneous [`ArrayType`] payload carries no regions and is rejected. The predicate selects between two
+//! `stablehlo.if` regions that take no arguments and capture the lowered branch inputs implicitly. Each branch input is
+//! converted from its actual type to the shared declared type of its branch input, and an entry guard checks the input
+//! relationships that the actual input types leave unproven before either branch runs. Every ordered effect class that
+//! either branch uses is threaded through both branches as one trailing token result, so both branches return the same
+//! result types, and both branches normalize their results to the refined output types of the condition. Results whose
+//! types place them over explicit mesh axes are constrained to that placement.
+
+use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation, ProgramError};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::experimental::lowering::{current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::{
-    lower_control_flow_region, lower_refined_region_input, lower_region_guard, lowered_effect_classes,
+    lower_control_flow_region, lower_explicit_sharding_constraints, lower_refined_region_input, lower_region_guard,
+    lowered_effect_classes, set_threaded_effect_tokens,
 };
-use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 impl LowerableOperation for ConditionOperation<ArrayType> {
@@ -49,26 +58,17 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
         //      to the condition's refined `output_types`, so both branches return identical result types.
         //   4. The trailing token results of the `stablehlo.if` become the current tokens of the enclosing scope, and
         //      each result whose type places it over an explicit mesh axis is constrained to that placement.
-        let [true_branch, false_branch] = lowerer.regions.as_slice() else {
-            return Err(LoweringError::UnsupportedOp {
-                op: format!(
-                    "`{CONDITION_OPERATION_NAME}` expected 2 attached regions but got {}",
-                    lowerer.regions.len(),
-                ),
-            });
-        };
+        //
+        // The program that attaches the condition validated its region and input counts, so a mismatch here is an
+        // internal error, reported as the operation's own region contract and input count would report it.
+        self.validate_region_count(lowerer.regions.len())?;
+        let (true_branch, false_branch) = (&lowerer.regions[0], &lowerer.regions[1]);
         let branch_input_types = true_branch.input_types();
-        let expected_input_count = branch_input_types.len() + 1;
-        if input_values.len() != expected_input_count || input_types.len() != expected_input_count {
-            return Err(LoweringError::UnsupportedOp {
-                op: format!(
-                    "`{}` expected {} lowered inputs but got {} lowered inputs with {} input types",
-                    CONDITION_OPERATION_NAME,
-                    expected_input_count,
-                    input_values.len(),
-                    input_types.len(),
-                ),
-            });
+        let expected = branch_input_types.len() + 1;
+        for actual in [input_values.len(), input_types.len()] {
+            if actual != expected {
+                return Err(ProgramError::InvalidInputCount { expected, actual }.into());
+            }
         }
         // Branch inputs only need to refine the branch input types, so each one is converted to the lowered type of its
         // branch input first.
@@ -91,7 +91,7 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
         // what eager entry validation checks for the selected branch. The guard runs before the branch tokens are
         // captured.
         lower_region_guard(
-            CONDITION_OPERATION_NAME,
+            self.name(),
             &branch_input_types,
             &input_types[1..],
             &input_values[1..],
@@ -132,34 +132,17 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
             lowerer.location,
         )?)?;
         let output_count = output_types.len();
-        for (token_index, effect) in token_threaded_effects(threaded_effects).enumerate() {
-            lowerer.effect_tokens.set(effect, operation.result(output_count + token_index).unwrap().as_ref());
-        }
-        // Nothing inside either branch needs to pin the placement of a result over explicit mesh axes (e.g., a branch
-        // may return a replicated constant), so propagation could otherwise assign the result a placement other than
-        // the one its type states. Results whose placement involves no explicit mesh axis remain unconstrained.
-        let mut outputs = Vec::with_capacity(output_count);
-        for (index, output_type) in output_types.iter().enumerate() {
-            let output = operation.result(index).unwrap().as_ref();
-            let explicit_sharding = match output_type {
-                ArrayIrType::Array(output_type) => output_type.sharding().filter(|sharding| {
-                    sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit)
-                }),
-                ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
-            };
-            outputs.push(match explicit_sharding {
-                Some(sharding) => lower_sharding_constraint(
-                    &[output],
-                    sharding,
-                    &lowerer.collective_state.bound_manual_axes,
-                    &mut lowerer.block,
-                    lowerer.location,
-                )?
-                .remove(0),
-                None => output,
-            });
-        }
-        Ok(outputs)
+        set_threaded_effect_tokens(&mut lowerer.effect_tokens, threaded_effects, |offset| {
+            operation.result(output_count + offset).unwrap().as_ref()
+        });
+        let outputs = (0..output_count).map(|index| operation.result(index).unwrap().as_ref()).collect();
+        lower_explicit_sharding_constraints(
+            outputs,
+            output_types,
+            &lowerer.collective_state.bound_manual_axes,
+            &mut lowerer.block,
+            lowerer.location,
+        )
     }
 }
 
@@ -170,66 +153,33 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, ArrayType, AssertOperation, AtomId, BatchAxis, BatchedProgram, CompareOperation,
-        ComparisonDirection, ConditionOperation, CustomFunctionTransposeOperation, DataType, Device, DeviceMesh,
-        Dimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable,
-        DynamicBroadcastOperation, GuardOperation, LogicalMesh, MeshAxis, MulOperation, NegOperation, OneLikeOperation,
-        OneOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind,
-        ScanOperation, Shape, Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation,
-        ZeroLikeOperation, ZeroOperation,
+        AddOperation, ArrayOperation, ArrayType, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
+        ComparisonDirection, ConditionOperation, CustomFunctionTransposeOperation, DataType, Dimension,
+        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
+        GuardOperation, MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder,
+        PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape,
+        Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation, ZeroOperation,
     };
     use ryft_mlir::{Context as MlirContext, Location};
-    use ryft_pjrt::{
-        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
-        load_cpu_plugin,
-    };
+    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
-        test_spmd_compilation_options, unproject_plain_program, xla_identity_branch, xla_neg_branch,
+        unproject_plain_program, xla_identity_branch, xla_neg_branch,
     };
-    use crate::experimental::ops::{
-        FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
-    };
+    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
+    use crate::operations::control_flow::tests::{
+        compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
+    };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, XlaArray, XlaSession, to_mlir_module_for_program};
+    use crate::tests::execution_client;
+    use crate::to_mlir_module_for_program;
 
     use super::*;
 
-    /// Returns the [`XlaOperation`] that compares two arrays in `direction`.
-    fn compare(direction: ComparisonDirection) -> XlaOperation {
-        XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(direction)))
-    }
-
-    /// Stages whether the scalar `value` is positive into `builder`. The mixed executable ABI of
-    /// [`execute_mixed_program`] has no boolean inputs, so conditions that execute for both predicate values derive
-    /// their predicate from a floating-point selector input.
-    fn positive(builder: &mut CompositeXlaProgramBuilder, value: AtomId) -> AtomId {
-        let zero = builder
-            .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![value], None)
-            .unwrap()[0];
-        builder
-            .add_instruction(compare(ComparisonDirection::GreaterThan), Vec::new(), vec![value, zero], None)
-            .unwrap()[0]
-    }
-
-    /// Lowers `program` with the boundary types of the mixed executable ABI of [`execute_mixed_program`], in which
-    /// first-class dimensions cross the boundary as `i64` scalars.
-    fn lowered_mixed_module(program: &FlatXlaProgram) -> String {
-        let boundary_type = |r#type: &ArrayIrType| match r#type {
-            ArrayIrType::Array(r#type) => r#type.clone(),
-            ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
-            ArrayIrType::Reference(_) => panic!("mixed execution fixtures have no reference values"),
-        };
-        let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
-        let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
-        to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap()
-    }
-
     #[test]
-    fn test_to_mlir_module_for_program_lowers_condition_to_stablehlo_if() {
+    fn test_condition_lowering() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
         let mut builder = CompositeXlaProgramBuilder::new();
@@ -263,13 +213,26 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = "stablehlo.if"(%arg0) ({
+                      %1 = stablehlo.negate %arg1 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }, {
+                      stablehlo.return %arg1 : tensor<f32>
+                    }) : (tensor<i1>) -> tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_condition_threads_the_io_dependency_of_an_guard_out_of_its_branches() {
+    fn test_condition_threads_the_io_dependency_of_a_guard_out_of_its_branches() {
         // Each branch's only effect is an entry guard, which joins its assertion token into the ordered I/O chain so
         // that later I/O follows the check. The conditional must thread that chain out of its branches, so the print
         // after it consumes an I/O token that the conditional returns.
@@ -321,12 +284,34 @@ mod tests {
             None,
         )
         .unwrap();
-        let conditional = module.lines().find(|line| line.contains("\"stablehlo.if\"")).unwrap();
-        let conditional_results = conditional.trim().split_once(':').unwrap().0;
-        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
-        let print_token =
-            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
-        assert!(print_token.starts_with(&format!("{conditional_results}#")), "{module}");
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<i64>, %arg2: tensor<2xf64>) -> tensor<2xf64> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2:3 = "stablehlo.if"(%arg0) ({
+                      %c = stablehlo.constant dense<2> : tensor<i64>
+                      %4 = stablehlo.compare EQ, %c, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %5 = stablehlo.custom_call @ryft.assert(%4, %arg1, %c, %0) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `n` must have one extent at the entry of `branch`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      %6 = stablehlo.after_all %1, %5 : !stablehlo.token
+                      %7:3 = stablehlo.optimization_barrier %arg1, %arg2, %5 : tensor<i64>, tensor<2xf64>, !stablehlo.token
+                      stablehlo.return %arg2, %5, %6 : tensor<2xf64>, !stablehlo.token, !stablehlo.token
+                    }, {
+                      %c = stablehlo.constant dense<2> : tensor<i64>
+                      %4 = stablehlo.compare EQ, %c, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %5 = stablehlo.custom_call @ryft.assert(%4, %arg1, %c, %0) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `n` must have one extent at the entry of `branch`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      %6 = stablehlo.after_all %1, %5 : !stablehlo.token
+                      %7:3 = stablehlo.optimization_barrier %arg1, %arg2, %5 : tensor<i64>, tensor<2xf64>, !stablehlo.token
+                      stablehlo.return %arg2, %5, %6 : tensor<2xf64>, !stablehlo.token, !stablehlo.token
+                    }) : (tensor<i1>) -> (tensor<2xf64>, !stablehlo.token, !stablehlo.token)
+                    %3 = stablehlo.custom_call @ryft.print(%2#0, %2#2) {api_version = 4 : i32, backend_config = {label = "value"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    return %2#0 : tensor<2xf64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
@@ -397,16 +382,66 @@ mod tests {
             None,
         )
         .unwrap();
-        let conditional = module.lines().find(|line| line.contains("\"stablehlo.if\"")).unwrap();
-        let conditional_results = conditional.trim().split_once(':').unwrap().0;
-        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
-        let print_token =
-            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
-        assert!(print_token.starts_with(&format!("{conditional_results}#")), "{module}");
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<i64>, %arg2: tensor<2xf64>) -> tensor<2xf64> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2:3 = "stablehlo.if"(%arg0) ({
+                      %c = stablehlo.constant dense<2> : tensor<i32>
+                      %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                      %4 = stablehlo.pad %arg2, %cst, low = [0], high = [5], interior = [0] : (tensor<2xf64>, tensor<f64>) -> tensor<7xf64>
+                      %5 = stablehlo.set_dimension_size %4, %c, dim = 0 : (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
+                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                      %6 = stablehlo.compare EQ, %c_0, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %7 = stablehlo.custom_call @ryft.assert(%6, %arg1, %c_0, %0) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `n` must have one extent at the entry of `condition`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      %8 = stablehlo.after_all %1, %7 : !stablehlo.token
+                      %9 = "stablehlo.if"(%arg0) ({
+                        %c_1 = stablehlo.constant dense<7> : tensor<i32>
+                        %10 = stablehlo.set_dimension_size %5, %c_1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                        %11 = stablehlo.slice %10 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                        stablehlo.return %11 : tensor<2xf64>
+                      }, {
+                        %c_1 = stablehlo.constant dense<7> : tensor<i32>
+                        %10 = stablehlo.set_dimension_size %5, %c_1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                        %11 = stablehlo.slice %10 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                        stablehlo.return %11 : tensor<2xf64>
+                      }) : (tensor<i1>) -> tensor<2xf64>
+                      stablehlo.return %9, %7, %8 : tensor<2xf64>, !stablehlo.token, !stablehlo.token
+                    }, {
+                      %c = stablehlo.constant dense<2> : tensor<i32>
+                      %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                      %4 = stablehlo.pad %arg2, %cst, low = [0], high = [5], interior = [0] : (tensor<2xf64>, tensor<f64>) -> tensor<7xf64>
+                      %5 = stablehlo.set_dimension_size %4, %c, dim = 0 : (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
+                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                      %6 = stablehlo.compare EQ, %c_0, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %7 = stablehlo.custom_call @ryft.assert(%6, %arg1, %c_0, %0) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `n` must have one extent at the entry of `condition`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      %8 = stablehlo.after_all %1, %7 : !stablehlo.token
+                      %9 = "stablehlo.if"(%arg0) ({
+                        %c_1 = stablehlo.constant dense<7> : tensor<i32>
+                        %10 = stablehlo.set_dimension_size %5, %c_1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                        %11 = stablehlo.slice %10 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                        stablehlo.return %11 : tensor<2xf64>
+                      }, {
+                        %c_1 = stablehlo.constant dense<7> : tensor<i32>
+                        %10 = stablehlo.set_dimension_size %5, %c_1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                        %11 = stablehlo.slice %10 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                        stablehlo.return %11 : tensor<2xf64>
+                      }) : (tensor<i1>) -> tensor<2xf64>
+                      stablehlo.return %9, %7, %8 : tensor<2xf64>, !stablehlo.token, !stablehlo.token
+                    }) : (tensor<i1>) -> (tensor<2xf64>, !stablehlo.token, !stablehlo.token)
+                    %3 = stablehlo.custom_call @ryft.print(%2#0, %2#2) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    return %2#0 : tensor<2xf64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_constant_predicate_condition_to_stablehlo_if() {
+    fn test_condition_lowering_keeps_constant_predicates() {
         // A condition whose predicate input is fed by a staged constant still lowers to `stablehlo.if`; folding the
         // constant predicate away is the backend's job (StableHLO canonicalization and XLA's conditional
         // simplification), not ryft's.
@@ -432,13 +467,27 @@ mod tests {
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &input_type, &input_type, "main", None, None).unwrap();
 
-        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.constant"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
+                    %c = stablehlo.constant dense<true> : tensor<i1>
+                    %0 = "stablehlo.if"(%c) ({
+                      %1 = stablehlo.negate %arg0 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }, {
+                      stablehlo.return %arg0 : tensor<f32>
+                    }) : (tensor<i1>) -> tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_forwards_dimension_extent_through_condition() {
+    fn test_condition_lowering_forwards_dimension_extents() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
@@ -512,14 +561,37 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stablehlo.contains("stablehlo.get_dimension_size"), "{stablehlo}");
-        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 3, "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<8xf32>, %arg1: tensor<i1>, %arg2: tensor<f32>, %arg3: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg3, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = "stablehlo.if"(%arg1) ({
+                      %6 = stablehlo.broadcast_in_dim %arg2, dims = [] : (tensor<f32>) -> tensor<8xf32>
+                      %7 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                      %8 = stablehlo.set_dimension_size %6, %7, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                      stablehlo.return %8 : tensor<?xf32, #stablehlo.bounds<8>>
+                    }, {
+                      %6 = stablehlo.negate %arg2 : tensor<f32>
+                      %7 = stablehlo.broadcast_in_dim %6, dims = [] : (tensor<f32>) -> tensor<8xf32>
+                      %8 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                      %9 = stablehlo.set_dimension_size %7, %8, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                      stablehlo.return %9 : tensor<?xf32, #stablehlo.bounds<8>>
+                    }) : (tensor<i1>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %4 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    return %3, %5 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_condition_branch_print_with_token_result() {
+    fn test_condition_lowering_returns_branch_effect_tokens() {
         // A print inside one condition branch makes the lowered `stablehlo.if` return the branch's final effect
         // token as one extra trailing result: both branches capture the entry token implicitly, the effectful branch
         // returns its print custom call's token, and the pure branch returns the entry token unchanged.
@@ -581,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_threads_branch_effect_class_union_independently() {
+    fn test_condition_lowering_threads_the_union_of_branch_effect_classes() {
         // Each branch uses a different ordered class. StableHLO requires identical branch result signatures, so both
         // branches return the union's two tokens while forwarding the untouched entry token for the unused class.
         let scalar_type = ArrayType::scalar(DataType::I64);
@@ -652,16 +724,30 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stablehlo.matches("stablehlo.after_all").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("@ryft.assert").count(), 1, "{stablehlo}");
-        assert_eq!(stablehlo.matches("@ryft.print").count(), 1, "{stablehlo}");
-        let if_line = stablehlo.lines().find(|line| line.contains("\"stablehlo.if\"")).unwrap();
-        assert!(if_line.contains(":3 ="), "{stablehlo}");
-        assert!(stablehlo.contains("-> (tensor<i64>, !stablehlo.token, !stablehlo.token)"), "{stablehlo}",);
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<i64>) -> tensor<i64> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2:3 = "stablehlo.if"(%arg0) ({
+                      %3 = stablehlo.compare EQ, %arg1, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %4 = stablehlo.custom_call @ryft.assert(%3, %arg1, %0) {api_version = 4 : i32, backend_config = {actor = "assert", kind = "generic", label_0 = "scalar", label_count = "1", message = "scalar must equal itself"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      stablehlo.return %arg1, %4, %1 : tensor<i64>, !stablehlo.token, !stablehlo.token
+                    }, {
+                      %3 = stablehlo.custom_call @ryft.print(%arg1, %1) {api_version = 4 : i32, backend_config = {label = "false"}, has_side_effect = true} : (tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      stablehlo.return %arg1, %0, %3 : tensor<i64>, !stablehlo.token, !stablehlo.token
+                    }) : (tensor<i1>) -> (tensor<i64>, !stablehlo.token, !stablehlo.token)
+                    return %2#0 : tensor<i64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_transposed_condition_without_cotangent_outputs_executes_backward_effects_on_cpu() {
+    fn test_condition_execution_transposed_without_cotangent_outputs_runs_backward_effects() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let branch = |label| {
@@ -1026,6 +1112,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
+            // The runtime appends its own context to the assertion message.
             assert!(
                 error.contains("input dimension `extent` must have one extent at the entry of `condition`"),
                 "{error}",
@@ -1055,15 +1142,15 @@ mod tests {
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::UnsupportedOp { op }) if op == "`condition` expected 2 attached regions but got 1",
+            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+                if message == "operation `condition` declares 2 region slots but 1 regions were attached",
         ));
 
         // It also needs the predicate followed by one input per branch input.
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(LoweringError::UnsupportedOp { op })
-                if op == "`condition` expected 2 lowered inputs but got 0 lowered inputs with 0 input types",
+            Err(LoweringError::Tracing(ProgramError::InvalidInputCount { expected: 2, actual: 0 })),
         ));
     }
 
@@ -1412,6 +1499,7 @@ mod tests {
         let error = execute_mixed_program(&client, &program, &[MixedValue::Array(vec![-2.0], vec![])], &[])
             .unwrap_err()
             .to_string();
+        // The runtime appends its own context to the assertion message.
         assert!(error.contains("assertion failed: selector must be positive; selector=-2"), "{error}");
     }
 
@@ -2040,20 +2128,7 @@ mod tests {
     fn test_condition_lowering_constrains_explicit_output_shardings() {
         // The `true` branch negates a vector sharded over the explicit mesh axis `x`, and the `false` branch forwards
         // it. The result of the `stablehlo.if` is constrained to the placement that its type states.
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            client
-                .addressable_devices()
-                .unwrap()
-                .iter()
-                .map(|device| Device::from_pjrt(device).unwrap())
-                .collect(),
-        )
-        .unwrap();
+        let (client, mesh) = two_device_mesh(MeshAxisType::Explicit);
         let selector_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let vector_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -2126,41 +2201,21 @@ mod tests {
                 }
             "#},
         );
-        let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
-            .unwrap();
-        let domain = XlaSession::new(&client).domain();
-        let device_ids = executable
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| device.id().unwrap())
-            .collect::<Vec<_>>();
-        let values = [1f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         for (selector, expected) in [
-            (1f32, vec![vec![-1f32, -2.0, -3.0, -4.0], vec![-5.0, -6.0, -7.0, -8.0]]),
-            (-1.0, vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]),
+            (1.0, vec![vec![vec![-1.0, -2.0, -3.0, -4.0]], vec![vec![-5.0, -6.0, -7.0, -8.0]]]),
+            (-1.0, vec![vec![vec![1.0, 2.0, 3.0, 4.0]], vec![vec![5.0, 6.0, 7.0, 8.0]]]),
         ] {
-            let selector =
-                XlaArray::from_host_buffer(&domain, selector_type.clone(), mesh.clone(), values_to_bytes(&[selector]))
-                    .unwrap();
-            let input =
-                XlaArray::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), values_to_bytes(&values))
-                    .unwrap();
-            let arguments = XlaArray::into_execute_arguments(vec![selector, input], device_ids.as_slice()).unwrap();
-            let outputs = executable
-                .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
-                .unwrap()
-                .block_until_ready()
-                .unwrap();
-            let shards = outputs
-                .iter()
-                .map(|output| {
-                    let bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-                    values_from_bytes::<f32>(bytes.as_slice())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(shards, expected);
+            assert_eq!(
+                execute_on_two_devices(
+                    &client,
+                    &mesh,
+                    &module,
+                    &[(&selector_type, &[selector]), (&vector_type, &values)],
+                ),
+                expected,
+                "selector {selector}",
+            );
         }
     }
 }

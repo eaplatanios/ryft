@@ -47,6 +47,7 @@
 
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType,
@@ -76,8 +77,9 @@ use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_N
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::parameters::Parameter;
 use crate::programs::{
-    Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection, ProgramError, RegionRef,
-    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed, Value, ValueDirectDispatch,
+    BindingRegionDriver, Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection,
+    ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed, Value,
+    ValueDirectDispatch,
 };
 
 use super::{SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, boundary_array_type};
@@ -405,13 +407,13 @@ where
         let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
         operation.validate_region_interfaces(&regions.iter().map(|region| region.interface()).collect::<Vec<_>>())?;
         if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
-            return self.run_while(operation, regions[0], regions[1], inputs);
+            return self.run_lockstep(operation, &regions, inputs);
         }
         if let Some(operation) = operation.projected_payload::<ConditionOperation<ArrayIrType>>() {
-            return self.run_condition(operation, [regions[0], regions[1]], inputs);
+            return self.run_lockstep(operation, &regions, inputs);
         }
         if let Some(operation) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
-            return self.run_scan(operation, regions[0], inputs);
+            return self.run_lockstep(operation, &regions, inputs);
         }
         if let Some(operation) = operation.projected_payload::<ShardMapOperation>() {
             return self.run_shard_map(operation, regions[0], inputs.to_vec());
@@ -701,65 +703,26 @@ where
         Ok(Some(vec![outputs]))
     }
 
-    /// Runs a `while` loop whose condition or body uses collectives over the emulated axes in lockstep, through its
-    /// eager rule over [`LockstepValue`]s (refer to [`WhileOperation::interpret_with`]): the devices must agree on
-    /// whether the loop continues, and each device masks its own state with its own predicate.
-    fn run_while(
+    /// Runs a control-flow `operation` whose `regions` use collectives over the emulated axes through its ordinary
+    /// eager rule with one value per device. Devices agree on condition predicates and dynamic scan lengths, and scan
+    /// writes reconcile the manual variation of their slices.
+    fn run_lockstep(
         &self,
-        operation: &WhileOperation<ArrayIrType>,
-        condition: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
+        operation: &impl InterpretableOperation<LockstepDomain<C::Operation>>,
+        regions: &[RegionRef<'_, ArrayIrValue<Array>, C::Operation>],
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
         let inputs = lockstep_values(operation.name(), inputs)?;
-        let outputs = operation.interpret_with(
-            body,
-            &inputs,
-            |state| self.run_lockstep_region(condition, state),
-            |state| self.run_lockstep_region(body, state),
-        )?;
+        let context = LockstepDomain::<C::Operation>::new(self.grid.device_count());
+        let driver = LockstepInterpretationDriver {
+            regions,
+            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>, inputs: Vec<LockstepValue>| {
+                let outputs = self.run_region(region, inputs.into_iter().map(|input| input.0).collect())?;
+                Ok(outputs.into_iter().map(LockstepValue).collect())
+            },
+        };
+        let outputs = operation.interpret(&context, &driver, &inputs)?;
         Ok(outputs.into_iter().map(|output| output.0).collect())
-    }
-
-    /// Runs the branch of a `condition` whose branches use collectives over the emulated axes in lockstep, through its
-    /// eager rule over [`LockstepValue`]s (refer to [`ConditionOperation::interpret_with`]), which requires every
-    /// device to select the same branch.
-    fn run_condition(
-        &self,
-        operation: &ConditionOperation<ArrayIrType>,
-        branches: [RegionRef<'_, ArrayIrValue<Array>, C::Operation>; 2],
-        inputs: &[DeviceValues],
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let inputs = lockstep_values(operation.name(), inputs)?;
-        let outputs = operation
-            .interpret_with(branches, &inputs, |branch, inputs| self.run_lockstep_region(branches[branch], inputs))?;
-        Ok(outputs.into_iter().map(|output| output.0).collect())
-    }
-
-    /// Runs a `scan` whose body uses collectives over the emulated axes in lockstep, through its eager rule over
-    /// [`LockstepValue`]s (refer to [`ScanOperation::interpret_with`] and to the [`ScanIterationType`] implementation
-    /// for [`LockstepDomain`]).
-    fn run_scan(
-        &self,
-        operation: &ScanOperation<ArrayIrType>,
-        body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        inputs: &[DeviceValues],
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let inputs = lockstep_values(operation.name(), inputs)?;
-        let context = LockstepDomain { device_count: self.grid.device_count() };
-        let outputs =
-            operation.interpret_with(&context, body, &inputs, |inputs| self.run_lockstep_region(body, inputs))?;
-        Ok(outputs.into_iter().map(|output| output.0).collect())
-    }
-
-    /// Replays `region` over the [`LockstepValue`] `inputs` in lockstep and returns its outputs.
-    fn run_lockstep_region(
-        &self,
-        region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        inputs: Vec<LockstepValue>,
-    ) -> Result<Vec<LockstepValue>, ProgramError> {
-        let outputs = self.run_region(region, inputs.into_iter().map(|input| input.0).collect())?;
-        Ok(outputs.into_iter().map(LockstepValue).collect())
     }
 }
 
@@ -796,7 +759,7 @@ impl Value for LockstepValue {
 
     #[inline]
     fn domain(&self) -> LockstepDomain {
-        LockstepDomain { device_count: self.0.len() }
+        LockstepDomain::new(self.0.len())
     }
 }
 
@@ -823,17 +786,76 @@ impl WhilePredicate for LockstepValue {
     }
 }
 
-/// Passive [`Domain`] of the [`LockstepValue`]s of a fixed number of emulated devices.
-struct LockstepDomain {
+/// Passive [`Domain`] of the [`LockstepValue`]s of a fixed number of emulated devices. Regions retain their ordinary
+/// constants and operation family `O`; the emulator lifts each constant to one copy per device during replay.
+struct LockstepDomain<O: Operation<Type = ArrayIrType> = ArrayIrOperation<Array>> {
     /// Number of emulated devices.
     device_count: usize,
+
+    /// [`PhantomData`] marker tying this [`Domain`] to its stored [`Operation`] family.
+    marker: PhantomData<fn() -> O>,
 }
 
-impl Domain for LockstepDomain {
+impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
+    /// Creates a [`LockstepDomain`] for `device_count` devices.
+    fn new(device_count: usize) -> Self {
+        Self { device_count, marker: PhantomData }
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Domain for LockstepDomain<O> {
     type Type = ArrayIrType;
     type Value = LockstepValue;
-    type Constant = LockstepValue;
-    type Operation = ArrayIrOperation<Array>;
+    type Constant = ArrayIrValue<Array>;
+    type Operation = O;
+}
+
+/// Adapts the stored `regions` of one control-flow application to their lockstep replay. Condition, while, and scan
+/// eager rules only request region execution; the emulator dispatches the instructions inside those regions.
+struct LockstepInterpretationDriver<'r, O: Operation<Type = ArrayIrType>, F> {
+    /// Borrowed regions in operation-defined order, with their original constants.
+    regions: &'r [RegionRef<'r, ArrayIrValue<Array>, O>],
+
+    /// Replays one borrowed region over its per-device inputs.
+    interpret_region: F,
+}
+
+impl<O: Operation<Type = ArrayIrType>, F> RegionDriver<ArrayIrValue<Array>, O>
+    for LockstepInterpretationDriver<'_, O, F>
+{
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, ArrayIrValue<Array>, O>>
+    where
+        O: 'r,
+    {
+        self.regions.iter().copied()
+    }
+}
+
+impl<O, F> InterpretationDriver<LockstepDomain<O>> for LockstepInterpretationDriver<'_, O, F>
+where
+    O: Operation<Type = ArrayIrType>,
+    F: Fn(RegionRef<'_, ArrayIrValue<Array>, O>, Vec<LockstepValue>) -> Result<Vec<LockstepValue>, ProgramError>,
+{
+    fn interpret_region(
+        &self,
+        _context: &LockstepDomain<O>,
+        index: usize,
+        inputs: Vec<LockstepValue>,
+    ) -> Result<Vec<LockstepValue>, ProgramError> {
+        (self.interpret_region)(self.region(index)?, inputs)
+    }
+
+    fn bind<R: BindingRegionDriver<ArrayIrValue<Array>, O>>(
+        &self,
+        _context: &LockstepDomain<O>,
+        operation: O,
+        _regions: R,
+        _inputs: &[LockstepValue],
+    ) -> Result<Vec<LockstepValue>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("lockstep interpretation cannot bind `{}` outside region replay", operation.name()),
+        })
+    }
 }
 
 /// Eager composite array context whose scan iteration functions every emulated device applies to its own values.
@@ -844,12 +866,12 @@ type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 // every device, which the eager functions cannot do because a concrete array outside a manual region cannot vary (refer
 // to `vary_to_join`). The devices agree on a dynamic trip count, because they agree on the type of the runtime length
 // (refer to `lockstep_values`), which is its extent.
-impl ScanIterationType<LockstepDomain> for ArrayIrType {
+impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for ArrayIrType {
     fn runtime_length(runtime_length: &LockstepValue) -> Result<usize, ProgramError> {
         <Self as ScanIterationType<DeviceContext>>::runtime_length(&runtime_length.0[0])
     }
 
-    fn iteration_index(context: &LockstepDomain, iteration: usize) -> Result<LockstepValue, ProgramError> {
+    fn iteration_index(context: &LockstepDomain<O>, iteration: usize) -> Result<LockstepValue, ProgramError> {
         let index = <Self as ScanIterationType<DeviceContext>>::iteration_index(&DeviceContext::new(), iteration)?;
         Ok(LockstepValue(vec![index; context.device_count]))
     }
@@ -864,7 +886,7 @@ impl ScanIterationType<LockstepDomain> for ArrayIrType {
     }
 
     fn write_iteration(
-        context: &LockstepDomain,
+        context: &LockstepDomain<O>,
         output: usize,
         accumulator: Option<LockstepValue>,
         length: usize,
@@ -900,7 +922,7 @@ impl ScanIterationType<LockstepDomain> for ArrayIrType {
     }
 
     fn empty_stack(
-        context: &LockstepDomain,
+        context: &LockstepDomain<O>,
         output_type: &Self,
         body_input_types: &[Self],
         inputs: &[LockstepValue],
@@ -2039,17 +2061,19 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_scan_rejects_dynamic_lengths() {
-        // A scan whose body reduces over the manual axis runs in lockstep only over a static trip count. Here, the trip
-        // count is the first-class dimension `length` that the body derives from its replicated input `count`, which
-        // stacks the local value of each device `count` times.
+    fn test_shard_map_interpretation_scan_dynamic_lengths() {
+        // A scan whose body reduces over the manual axis runs in lockstep over a dynamic trip count on which every
+        // device agrees. Here, the trip count is the first-class dimension `length` that the body derives from its
+        // replicated input `count`, which stacks the local value of each device `count` times, and each iteration
+        // replaces the carry of every device by the sum of the carries of both devices.
         let mesh = manual_mesh();
         let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let shard_map =
             ShardMap::new(mesh.clone(), vec![sharded.clone(), replicated.clone()], vec![sharded.clone()], Vec::new());
         let shard_map = shard_map.unwrap();
-        let local_type = ArrayIrType::Array(shard_map.local_input_type(0, &f32_type(&[2], Some(sharded))).unwrap());
+        let local_type =
+            ArrayIrType::Array(shard_map.local_input_type(0, &f32_type(&[2], Some(sharded.clone()))).unwrap());
         let count_type = ArrayIrType::Array(shard_map.local_input_type(1, &f32_type(&[], Some(replicated))).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let varying = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap();
@@ -2078,11 +2102,62 @@ mod tests {
         assert_eq!(
             program
                 .interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0]), f32_value(f32_type(&[], None), &[2.0])]),
-            Err(ProgramError::UnsupportedOperation {
-                message: "`shard_map` interpretation cannot run `scan` with a dynamic length in lockstep across \
-                          devices"
-                    .to_string(),
-            }),
+            Ok(vec![f32_value(f32_type(&[2], Some(sharded)), &[6.0, 6.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_scan_widens_stacks_whose_manual_variation_changes_across_iterations() {
+        // The body declares its carry and slice without manual variation, returns the slice as the next carry, and
+        // stacks the carry that it receives, so with an invariant initial carry the first stacked slice is invariant
+        // and the second one varies along `x`. Running the scan rule over the values of both devices widens the stack
+        // to the join of the variation of its slices, as `parallel_vary` would, instead of rejecting the second slice.
+        let mesh = manual_mesh();
+        let replicated = |rank| Sharding::replicated(mesh.clone(), rank);
+        let varying = |rank| replicated(rank).with_varying_manual_axes(["x"]).unwrap();
+        let scalar_type = ArrayIrType::Array(f32_type(&[], None));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        let body =
+            build_program(vec![index_type, scalar_type.clone(), scalar_type], |_, inputs| vec![inputs[2], inputs[1]]);
+        let initial = f32_value(f32_type(&[], Some(replicated(0))), &[10.0]);
+        let inputs = vec![
+            LockstepValue(vec![initial.clone(), initial]),
+            LockstepValue(vec![
+                f32_value(f32_type(&[2], Some(varying(1))), &[1.0, 2.0]),
+                f32_value(f32_type(&[2], Some(varying(1))), &[3.0, 4.0]),
+            ]),
+        ];
+        let regions = [body.entry_region_ref()];
+        let driver = LockstepInterpretationDriver {
+            regions: &regions,
+            interpret_region: |region: RegionRef<'_, TestValue, TestOperation>, inputs: Vec<LockstepValue>| {
+                let mut outputs = vec![Vec::new(); 2];
+                for device in 0..2 {
+                    let device_inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
+                    for (output, value) in
+                        outputs.iter_mut().zip(region.interpret_in_context(&DeviceContext::new(), device_inputs)?)
+                    {
+                        output.push(value);
+                    }
+                }
+                Ok(outputs.into_iter().map(LockstepValue).collect())
+            },
+        };
+        let outputs = ScanOperation::<ArrayIrType>::new(1, 2usize)
+            .interpret(&LockstepDomain::new(2), &driver, &inputs)
+            .unwrap();
+        assert_eq!(
+            outputs.into_iter().map(|output| output.0).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    f32_value(f32_type(&[], Some(varying(0))), &[2.0]),
+                    f32_value(f32_type(&[], Some(varying(0))), &[4.0]),
+                ],
+                vec![
+                    f32_value(f32_type(&[2], Some(varying(1))), &[10.0, 1.0]),
+                    f32_value(f32_type(&[2], Some(varying(1))), &[10.0, 3.0]),
+                ],
+            ],
         );
     }
 

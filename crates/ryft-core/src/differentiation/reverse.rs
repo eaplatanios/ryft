@@ -2075,13 +2075,13 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     /// this for the result of [`Self::transpose_program`]; overriding implementations must uphold that contract.
     ///
     /// The default implementation validates and normalizes the arguments and serves every request through
-    /// [`Self::transpose_program`], so a driver that implements only that function also supports structural-zero output
-    /// cotangents. For a request that flags no non-reference output, it transposes `region` itself. Otherwise, it
-    /// transposes a standalone copy of `region` without the flagged outputs (refer to [`RegionRef::to_program`] and
-    /// [`Program::with_outputs`]), whose transposition has exactly the boundary described above. Such a copy is made
-    /// for every request, and the region that [`Self::transpose_program`] receives is then not one of
-    /// [`RegionDriver::regions`]. The built-in recursive driver instead serves every request through the source region's
-    /// retained transform cache, with the normalized flags as part of the cache key.
+    /// [`Self::transpose_program`], so a driver that implements only that function also supports structural-zero
+    /// output cotangents. For a request that flags no non-reference output, it transposes `region` itself. Otherwise,
+    /// it transposes a standalone copy of `region` without the flagged outputs (refer to [`RegionRef::to_program`] and
+    /// [`Program::with_outputs`]), whose transposition has exactly the boundary described above. It makes that copy
+    /// for every such request, and the region that [`Self::transpose_program`] then receives is not one of
+    /// [`RegionDriver::regions`]. The built-in recursive driver instead serves every request through the source
+    /// region's retained transform cache, with the normalized flags as part of the cache key.
     ///
     /// # Parameters
     ///

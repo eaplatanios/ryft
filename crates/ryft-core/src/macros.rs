@@ -83,12 +83,15 @@ macro_rules! check_types {
         let expected = &$expected[..];
         let actual = &$actual[..];
         if expected != actual {
-            return Err($crate::TypeError::invalid(format!(
+            return Err(
+                $crate::TypeError::invalid(format!(
                     "{} type signature mismatch: expected [{}] but got [{}]",
                     $descriptor,
                     expected.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                     actual.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-                )));
+                ))
+                .into(),
+            );
         }
     }};
 
@@ -6247,11 +6250,28 @@ mod tests {
             check_types!(@same, "test", [expected, actual]);
             Ok(())
         };
+        let check_program = |expected: &[DataType], actual: Vec<DataType>| -> Result<(), ProgramError> {
+            check_types!(@same, "test", [expected, actual]);
+            Ok(())
+        };
+        let check_differentiation =
+            |expected: &[DataType], actual: Vec<DataType>| -> Result<(), DifferentiationError> {
+                check_types!(@same, "test", [expected, actual]);
+                Ok(())
+            };
         let expected = [DataType::F32, DataType::F64];
+        let error = TypeError::invalid("test type signature mismatch: expected [f32, f64] but got [f32, i64]");
         assert_eq!(check(&expected, expected.to_vec()), Ok(()));
+        assert_eq!(check(&expected, vec![DataType::F32, DataType::I64]), Err(error.clone()));
+        assert_eq!(check_program(&expected, expected.to_vec()), Ok(()));
         assert_eq!(
-            check(&expected, vec![DataType::F32, DataType::I64]),
-            Err(TypeError::invalid("test type signature mismatch: expected [f32, f64] but got [f32, i64]".to_string())),
+            check_program(&expected, vec![DataType::F32, DataType::I64]),
+            Err(ProgramError::Type(error.clone())),
+        );
+        assert_eq!(check_differentiation(&expected, expected.to_vec()), Ok(()));
+        assert_eq!(
+            check_differentiation(&expected, vec![DataType::F32, DataType::I64]),
+            Err(DifferentiationError::Program(ProgramError::Type(error))),
         );
     }
 
