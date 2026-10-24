@@ -5,7 +5,7 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayType, DataType, DimensionType, LogicalMesh, MeshAxisType, Sharding,
+    ArrayType, DataType, DimensionType, LogicalMesh, MeshAxisType, ShardableType, Sharding,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
@@ -580,11 +580,12 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Manual
 /// Returns the manual mesh axes that any of `types` varies over, each with the mesh of the first type that varies over
 /// it, which is the variation that aligning values of these types makes every one of them carry. Both the value-level
 /// [`ManualVariationAlignment`] and the operation-level alignment of array reference discharge compute it here.
-pub(crate) fn manual_variation_axes<'t, T: IntoIterator<Item = &'t ArrayType>>(
-    types: T,
+/// Reference types expose their referent's variation; callers select which members participate in their alignment.
+pub(crate) fn manual_variation_axes<'t, T: 't + ShardableType>(
+    types: impl IntoIterator<Item = &'t T>,
 ) -> BTreeMap<String, LogicalMesh> {
     let mut axes = BTreeMap::<String, LogicalMesh>::new();
-    for sharding in types.into_iter().filter_map(ArrayType::sharding) {
+    for sharding in types.into_iter().filter_map(ShardableType::sharding) {
         for axis in sharding.varying_manual_axes() {
             axes.entry(axis.clone()).or_insert_with(|| sharding.mesh().clone());
         }
@@ -656,7 +657,7 @@ mod tests {
     use crate::operations::collectives::tests::eager_collective_context;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ReferenceType};
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;
@@ -1493,6 +1494,30 @@ mod tests {
                     %4:{varying} = parallel_vary [axis_name=\"devices\"] %3
                 in (%4, %1, %2)"
             },
+        );
+    }
+
+    #[test]
+    fn test_manual_variation_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let array = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let referent = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["y"]).unwrap())
+            .unwrap();
+        let types = [
+            ArrayIrType::Array(array),
+            ArrayIrType::Reference(ReferenceType::new(referent)),
+            ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3))),
+        ];
+        assert_eq!(
+            manual_variation_axes(&types),
+            BTreeMap::from([("x".to_string(), mesh.clone()), ("y".to_string(), mesh)])
         );
     }
 }
