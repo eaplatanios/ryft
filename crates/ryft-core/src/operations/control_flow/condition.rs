@@ -1876,54 +1876,6 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
     }
 }
 
-/// Reason why [`reconstruct_partitioned_condition`] keeps a condition whole instead of splitting it into a known and a
-/// residual condition. Partial evaluation then keeps the original condition, while separate-context linearization,
-/// which has no whole-condition fallback, reports the reason. Its [`Display`] implementation completes the sentence
-/// "the condition cannot be split, because ...".
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ConditionSplitRejection<T: Type> {
-    /// A branch partition feeds a known reference value into its residual program or embeds a reference-typed constant
-    /// in its known or residual program. Splitting the branches must not expose a reference through an edge or a
-    /// captured constant without accounting for its identity.
-    ReferenceResidual,
-
-    /// A residual edge does not vary over every manual axis that the predicate varies over. Devices whose predicates
-    /// differ take different branches, so the edge is a device-varying output of the known condition, and it cannot be
-    /// retyped without changing the residual program that consumes it.
-    InvariantResidual {
-        /// Type of the residual edge.
-        residual_type: T,
-
-        /// Type of the condition predicate.
-        predicate_type: T,
-    },
-
-    /// A value-returning split has no known outputs, and its known branches only forward known inputs or compute values
-    /// that depend on no input, so the known condition would fold nothing.
-    InertKnownSide,
-
-    /// No placeholder of this type could be constructed for a residual edge of the peer branch.
-    MissingPlaceholder(T),
-}
-
-impl<T: Type> Display for ConditionSplitRejection<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ReferenceResidual => write!(formatter, "a branch would pass a known reference as a residual"),
-            Self::InvariantResidual { residual_type, predicate_type } => write!(
-                formatter,
-                "a residual of type `{residual_type}` does not vary over every manual axis that the predicate \
-                 `{predicate_type}` varies over",
-            ),
-            Self::InertKnownSide => write!(formatter, "its known side would fold no work"),
-            Self::MissingPlaceholder(residual_type) => write!(
-                formatter,
-                "no known input determines a placeholder of type `{residual_type}` for a residual of the other branch",
-            ),
-        }
-    }
-}
-
 /// One branch's half of a known/residual condition split: the known and residual programs of the branch's partition,
 /// with the residual edges that the branch contributes to the shared residual boundary of the two rebuilt conditions.
 /// [`reconstruct_partitioned_condition`] builds one per branch, from a partition that partial evaluation or
@@ -2026,15 +1978,15 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
     /// into the detached builder of this branch given its known input atoms. They are dead outputs, because the
     /// residual branch that the same predicate selects reads only this branch's edges.
     ///
-    /// Returns [`ConditionSplitRejection::MissingPlaceholder`] when `build_placeholder` cannot construct a placeholder
-    /// for one of the edges of `peer`.
+    /// Returns a rejection message in the inner result when `build_placeholder` cannot construct a placeholder for one
+    /// of the edges of `peer`.
     fn known_branch<PlaceholderBuild>(
         &self,
         peer: &Self,
         is_true_branch: bool,
         output_known: &[bool],
         build_placeholder: &mut PlaceholderBuild,
-    ) -> Result<Result<Program<V, O, Vec<V>, Vec<V>>, ConditionSplitRejection<V::Type>>, ProgramError>
+    ) -> Result<Result<Program<V, O, Vec<V>, Vec<V>>, String>, ProgramError>
     where
         PlaceholderBuild: FnMut(&mut ProgramBuilder<V, O>, &V::Type, &[AtomId]) -> Result<Option<AtomId>, ProgramError>,
     {
@@ -2062,7 +2014,9 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
         let mut placeholder_atoms = Vec::with_capacity(peer.edge_types.len());
         for edge_type in &peer.edge_types {
             let Some(placeholder) = build_placeholder(&mut builder, edge_type, &known_inputs)? else {
-                return Ok(Err(ConditionSplitRejection::MissingPlaceholder(edge_type.clone())));
+                return Ok(Err(format!(
+                    "no known input determines a placeholder of type `{edge_type}` for a residual of the other branch",
+                )));
             };
             placeholder_atoms.push(placeholder);
         }
@@ -2156,8 +2110,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ConditionBranchSplit<V, O> {
 /// the residual condition into the caller's contexts.
 struct ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind> {
     /// Stages a placeholder of the given edge type for one of the peer branch's residual edges into the detached
-    /// builder of a known branch, given that branch's known input atoms. Returning `None` rejects the split with
-    /// [`ConditionSplitRejection::MissingPlaceholder`].
+    /// builder of a known branch, given that branch's known input atoms. Returning `None` rejects the split with a
+    /// message identifying the missing placeholder's type.
     build_placeholder: PlaceholderBuild,
 
     /// Binds the known condition over the predicate and the known inputs into the caller's known-side context and
@@ -2174,11 +2128,11 @@ struct ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind> {
 /// original condition in order. Unit-returning splits retain residual effects and deferred work without binding an
 /// empty known condition.
 ///
-/// Returns a [`ConditionSplitRejection`] instead, so that the caller keeps the original condition intact or reports
-/// why it cannot split it, when the split would expose a reference, mistype a residual edge, fold nothing, or needs a
-/// placeholder that `join.build_placeholder` cannot construct (refer to the variants of [`ConditionSplitRejection`]).
-/// Both known branches are constructed before either condition is bound, so a rejection never leaves partially staged
-/// work behind.
+/// Returns a rejection message in the inner result when the split would expose a reference, mistype a residual edge,
+/// fold nothing, or require a placeholder that `join.build_placeholder` cannot construct. Partial evaluation then keeps
+/// the original condition intact, while separate-context linearization, which has no whole-condition fallback, reports
+/// the message. Program errors propagate through the outer result. Both known branches are constructed before either
+/// condition is bound, so a rejection never leaves partially staged work behind.
 ///
 /// # Parameters
 ///
@@ -2204,7 +2158,7 @@ fn reconstruct_partitioned_condition<
     input_known: &[bool],
     partitions: [PartitionedProgram<V, O>; 2],
     join: ConditionSplitJoin<PlaceholderBuild, KnownBind, ResidualBind>,
-) -> Result<Result<Vec<Input>, ConditionSplitRejection<V::Type>>, ProgramError> {
+) -> Result<Result<Vec<Input>, String>, ProgramError> {
     let ConditionSplitJoin { mut build_placeholder, mut bind_known, mut bind_residual } = join;
     let [true_partition, false_partition] = partitions;
     let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
@@ -2215,7 +2169,7 @@ fn reconstruct_partitioned_condition<
         .into_iter()
         .any(|partition| partition.has_known_reference_inputs_or_constants())
     {
-        return Ok(Err(ConditionSplitRejection::ReferenceResidual));
+        return Ok(Err("a branch would pass a known reference as a residual".to_string()));
     }
 
     // An output is known only when both branches folded it.
@@ -2239,10 +2193,10 @@ fn reconstruct_partitioned_condition<
         .flat_map(|split| &split.edge_types)
         .find(|edge_type| edge_type.validate_condition_output(predicate_type).is_err())
     {
-        return Ok(Err(ConditionSplitRejection::InvariantResidual {
-            residual_type: edge_type.clone(),
-            predicate_type: predicate_type.clone(),
-        }));
+        return Ok(Err(format!(
+            "a residual of type `{edge_type}` does not vary over every manual axis that the predicate \
+             `{predicate_type}` varies over",
+        )));
     }
 
     // An empty known side (no outputs, edges, effects, or deferred work on either branch) folds nothing, and neither
@@ -2259,7 +2213,7 @@ fn reconstruct_partitioned_condition<
     let known_side_only_forwards =
         known_side_is_inert && splits.iter().all(|split| split.known_program_only_forwards());
     if (known_side_is_empty || known_side_only_forwards) && output_count != 0 {
-        return Ok(Err(ConditionSplitRejection::InertKnownSide));
+        return Ok(Err("its known side would fold no work".to_string()));
     }
 
     // Build both known branches before binding either condition, so that an unsupported placeholder can retain the
