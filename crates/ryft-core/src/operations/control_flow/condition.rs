@@ -44,10 +44,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ResidualZeroProvider, TangentActivity, TransposableOperation, TransposedProgram, TransposedProgramCotangent,
-    TranspositionContext, TranspositionDriver,
+    ResidualZeroProvider, TangentActivity, TransposableOperation, TransposedProgramCotangent, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -57,7 +57,9 @@ use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, PA
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::control_flow::select::{Select, SelectOperation};
-use crate::operations::control_flow::{refine_output_types, validate_output_identities, validate_region_input};
+use crate::operations::control_flow::{
+    RegionReferenceSource, refine_output_types, validate_output_identities, validate_region_input,
+};
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{
@@ -74,9 +76,9 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, EffectsSummary, EmptyRegionDriver, InputRegionProvenance, MaybeZero,
     Operation, OperationBoundaryPruning, OperationPayloadProjection, OperationProjection, OperationProvider,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceId,
-    ReferenceMemberType, ReferenceRoot, RegionDataFlow, RegionDriver, RegionInterface, RegionLiveness, RegionRef,
-    RegionSlot, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueProjection,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceMemberType,
+    ReferenceRoot, RegionDataFlow, RegionDriver, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
+    TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueProjection,
     discharge_positional_region_operation,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -309,8 +311,8 @@ impl<T: ConditionType> ConditionOperation<T> {
             let (true_source, false_source) = match (true_root, false_root) {
                 (None, None) => continue,
                 (Some(true_root), Some(false_root)) => (
-                    ConditionReferenceSource::from_root(branches[0], *true_root)?,
-                    ConditionReferenceSource::from_root(branches[1], *false_root)?,
+                    RegionReferenceSource::from_root(CONDITION_OPERATION_NAME, branches[0], *true_root)?,
+                    RegionReferenceSource::from_root(CONDITION_OPERATION_NAME, branches[1], *false_root)?,
                 ),
                 _ => {
                     return Err(ProgramError::MalformedProgram(format!(
@@ -318,7 +320,7 @@ impl<T: ConditionType> ConditionOperation<T> {
                     )));
                 }
             };
-            if true_source != false_source || true_source == ConditionReferenceSource::Allocation {
+            if true_source != false_source || true_source == RegionReferenceSource::Allocation {
                 return Err(TypeError::invalid(format!(
                     "`{CONDITION_OPERATION_NAME}` reference output {index} must denote the same reference in both \
                      branches, but the `true` branch returns {true_source} and the `false` branch returns \
@@ -356,7 +358,7 @@ impl<T: ConditionType> ConditionOperation<T> {
         &self,
         predicate_type: &T,
         branches: [RegionRef<'_, V, O>; 2],
-        mut is_published: impl FnMut(ConditionReferenceSource) -> Result<bool, ProgramError>,
+        mut is_published: impl FnMut(RegionReferenceSource) -> Result<bool, ProgramError>,
     ) -> Result<(), ProgramError> {
         if !predicate_type.is_varying() {
             return Ok(());
@@ -382,7 +384,7 @@ impl<T: ConditionType> ConditionOperation<T> {
                         continue;
                     }
                 };
-                let source = ConditionReferenceSource::from_root(branch, root)?;
+                let source = RegionReferenceSource::from_root(CONDITION_OPERATION_NAME, branch, root)?;
                 if reference_type.validate_condition_output(predicate_type).is_err() && is_published(source)? {
                     return Err(TypeError::invalid(format!(
                         "`{CONDITION_OPERATION_NAME}` `{slot}` branch mutates {source} of type `{reference_type}`, \
@@ -609,11 +611,12 @@ impl<
         let predicate_type = inputs[0].try_as_value("a condition predicate")?.r#type().into_owned();
         self.validate_reference_mutations(&predicate_type, branches, |source| {
             let allocation = match source {
-                ConditionReferenceSource::Input(index) => context.boundary_allocation(&inputs[index])?,
-                ConditionReferenceSource::Capture(index) => {
-                    context.captures().allocations().get(index).copied().flatten()
+                RegionReferenceSource::Input(index) => {
+                    // Branch input `index` is condition input `index + 1`, after the predicate.
+                    context.boundary_allocation(&inputs[index + 1])?
                 }
-                ConditionReferenceSource::Constant(_) | ConditionReferenceSource::Allocation => None,
+                RegionReferenceSource::Capture(index) => context.captures().allocations().get(index).copied().flatten(),
+                RegionReferenceSource::Constant(_) | RegionReferenceSource::Allocation => None,
             };
             allocation.map_or(Ok(true), |allocation| context.is_allocation_discharged(allocation))
         })?;
@@ -633,10 +636,11 @@ impl<C: Domain<Type: ConditionType, Value: Concretizable<bool>>> InterpretableOp
     ) -> Result<Vec<C::Value>, ProgramError> {
         // Interpretation validates the complete application before selecting a branch, including the unselected peer's
         // signature and reference contracts, because direct eager binding does not pass through program construction.
-        // Region entry validates the complete runtime input signature, including shared dimensions and concrete
-        // reference referents, and compares outputs using those same refinements. Only the selected branch runs (i.e.,
-        // region `0` for `true` and region `1` for `false`). The `shard_map` emulator uses this same rule with values
-        // holding one value per device.
+        // Only the selected branch runs (i.e., region `0` for `true` and region `1` for `false`). Eager region entry
+        // then validates the complete runtime input signature, including shared dimensions and concrete reference
+        // referents, and compares outputs using those same refinements. The `shard_map` emulator uses this same rule
+        // with values holding one value per device, but its lockstep region replay validates neither the region entry
+        // nor the region outputs, so only the validation of this rule applies there.
         let branches = [driver.region(0)?, driver.region(1)?];
         let expected = branches[0].input_ids().len() + 1;
         if inputs.len() != expected {
@@ -1012,13 +1016,13 @@ impl<
 // TODO(eaplatanios): Review from here onwards.
 
 // Forward-mode (JVP) rule for [`ConditionOperation`]. The predicate is the first input and carries no tangent (Boolean
-// predicates have no tangent space). The rule analyzes which branch inputs and outputs carry live tangents (refer to
-// `ConditionJvpActivity`) and differentiates each branch through its instruction-scoped differentiation driver. A
-// shared primal/tangent context stages one fused condition. Separate contexts stage a primal condition that records
-// the selected branch's residuals and a tangent condition that consumes them, joining the two branch linearizations
-// over one shared residual boundary as the known/residual split of partial evaluation does. Placeholders for the peer
-// branch's residual slots use live input extents or forward a known input of the identical type, and a residual that
-// admits no placeholder makes separate-context linearization fail.
+// predicates have no tangent space). The rule analyzes which branch inputs and outputs carry live tangents and
+// differentiates each branch through its instruction-scoped differentiation driver. A shared primal/tangent context
+// stages one fused condition. Separate contexts stage a primal condition that records the selected branch's residuals
+// and a tangent condition that consumes them, joining the two branch linearizations over one shared residual boundary
+// as the known/residual split of partial evaluation does. Placeholders for the peer branch's residual slots use live
+// input extents or forward a known input of the identical type, and a residual that admits no placeholder makes
+// separate-context linearization fail.
 impl<C> DifferentiableOperation<C> for ConditionOperation<C::Type>
 where
     TracingContext<C::Constant, C::Operation>:
@@ -1034,32 +1038,210 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // Direct differentiated binds can reach this rule before the original operation's output inference. Validate
         // the complete primal application before analyzing tangent slots or deriving either branch program;
-        // specializing the attached regions alone validates only their input interfaces. Matching primal signatures
-        // and reference roots give both branches the same tangent slots (refer to `ConditionJvpActivity::new`).
+        // specializing the attached regions alone validates only their input interfaces.
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
         let output_count = self.validate_application(&input_types, branches)?.len();
-        let activity = ConditionJvpActivity::new(driver, branches, &inputs[1..])?;
+        // Both branches receive the same live input tangents. Equal primal signatures and reference roots give them the
+        // same tangent slots, including reference tangents, which cannot be padded with invented allocation state.
+        let input_tangent_liveness = inputs[1..].iter().map(|input| !input.tangent().is_zero()).collect::<Vec<_>>();
+        let branch_activities = [
+            TangentActivity::new(driver, branches[0], &input_tangent_liveness)?,
+            TangentActivity::new(driver, branches[1], &input_tangent_liveness)?,
+        ];
+        // An output tangent is live when it depends on an active input in either branch. Both derivative paths use this
+        // shared layout, leaving inactive outputs as structural zeros.
+        let output_activity = branch_activities[0]
+            .output_tangent_liveness()
+            .iter()
+            .zip(branch_activities[1].output_tangent_liveness())
+            .map(|(&left, &right)| left || right)
+            .collect::<Vec<_>>();
+        let live_tangent_slots = branch_activities[0].live_tangent_slots(&output_activity);
         let mut condition_inputs = vec![inputs[0].primal().clone()];
         condition_inputs.extend(inputs[1..].iter().map(|input| input.primal().clone()));
         condition_inputs.extend(inputs[1..].iter().filter_map(|input| input.tangent().as_value().cloned()));
         let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-            activity.bind_fused(context.primal(), &condition_inputs, output_count)?
+            // One condition returns both primals and live tangents, selecting the same branch for both. Keep a cached
+            // branch handle when all of its outputs are already needed; otherwise project to the shared live slots.
+            let jvp_outputs = (0..output_count)
+                .chain(live_tangent_slots.iter().map(|&slot| output_count + slot))
+                .collect::<Vec<_>>();
+            let branches = branch_activities
+                .iter()
+                .map(|activity| {
+                    let program = activity.jvp_program();
+                    if jvp_outputs.iter().copied().eq(0..program.output_count()) {
+                        Ok(program.clone())
+                    } else {
+                        program.with_outputs(&jvp_outputs).map(Arc::new)
+                    }
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            context
+                .primal()
+                .bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), &condition_inputs)?
         } else {
-            activity.bind_linearized(context, driver, branches, &input_types[0], &condition_inputs, output_count)?
+            // Separate contexts require a primal condition that records the selected residuals and a tangent condition
+            // that consumes them. Treat the primals as known and the live input tangents as unknown in both partitions.
+            let primal_input_count = branches[0].input_types().len();
+            let input_indices = branch_activities[0].input_indices();
+            let live_input_count = input_indices.len();
+            let mut partitions = Vec::with_capacity(2);
+            for branch in branches {
+                let (primal, tangent, residual_count) = driver.linearize_program(branch, input_indices)?.into_parts();
+                partitions.push(PartitionedProgram::from_parts(
+                    Arc::unwrap_or_clone(primal),
+                    tangent.with_outputs(&live_tangent_slots)?,
+                    primal_input_count + live_input_count,
+                    (0..primal_input_count).collect(),
+                    (primal_input_count..primal_input_count + live_input_count)
+                        .map(ResidualInputSource::UnknownInput)
+                        .chain((0..residual_count).map(ResidualInputSource::ResidualEdge))
+                        .collect(),
+                    (0..output_count)
+                        .map(PartialEvaluationOutput::Known)
+                        .chain((0..live_tangent_slots.len()).map(PartialEvaluationOutput::Unknown))
+                        .collect(),
+                )?);
+            }
+            // The boundary of the joined branches is the branch primals followed by the live branch tangents, whose
+            // types the tangent program of either linearization declares first.
+            let mut branch_input_types = branches[0].input_types();
+            branch_input_types
+                .extend(partitions[0].residual_program().input_types().into_iter().take(live_input_count));
+            let input_known = (0..primal_input_count + live_input_count)
+                .map(|index| index < primal_input_count)
+                .collect::<Vec<_>>();
+            let false_partition = partitions.pop().unwrap();
+            let true_partition = partitions.pop().unwrap();
+            let bind_residual = |operation, programs, inputs: &[C::Value]| {
+                // The residual condition receives the predicate, the live tangents, and the residuals. The predicate
+                // and the residuals are primal values, which enter the tangent context explicitly.
+                let tangent_inputs = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if index == 0 || index > live_input_count {
+                            context.primal_to_tangent(value.clone()).map_err(ProgramError::from)
+                        } else {
+                            Ok(value.clone())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                context.tangent().bind(operation, programs, &tangent_inputs)
+            };
+            // Join both branch linearizations over one residual signature. Each known branch supplies placeholders for
+            // the peer's unused edges; a reference residual, invalid variation, or missing placeholder rejects the
+            // join.
+            let outputs = reconstruct_partitioned_condition(
+                &input_types[0],
+                &branch_input_types,
+                output_count + live_tangent_slots.len(),
+                &condition_inputs,
+                &input_known,
+                [true_partition, false_partition],
+                ConditionSplitJoin {
+                    build_placeholder: |builder: &mut ProgramBuilder<C::Constant, C::Operation>,
+                                        edge_type: &C::Type,
+                                        known_inputs: &[AtomId]| {
+                        // This value fills an unused residual slot of the peer branch. Its type and runtime identities
+                        // must still match: construct a zero using live extents when possible, or forward/capture a
+                        // known value instead.
+                        let placeholder_context = TracingContext::<C::Constant, C::Operation>::new();
+                        let sources = known_inputs
+                            .iter()
+                            .map(|input| {
+                                placeholder_context.input(builder.atoms()[input.index()].r#type().into_owned())
+                            })
+                            .collect::<Vec<_>>();
+                        // Non-zeroable types have no typed zero. Type-only zeros also cannot supply reference-position
+                        // identities such as the runtime extent of an array; the residual-zero protocol must capture
+                        // those from known inputs.
+                        let zero_is_constructible = edge_type.validate_zero().is_ok()
+                            && (!C::Operation::zero_residual_types(edge_type).is_empty()
+                                || edge_type
+                                    .identities()
+                                    .all(|(position, _)| position != TypeIdentityPosition::Reference));
+                        let placeholder = if zero_is_constructible {
+                            C::Operation::materialize_zero_from_residual_sources(
+                                &placeholder_context,
+                                MaybeZero::Zero(edge_type.clone()),
+                                &sources,
+                            )?
+                        } else if let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == edge_type)
+                        {
+                            source.clone()
+                        } else {
+                            // An input of another type may carry the required identity, for example an array carrying
+                            // an extent.
+                            let mut captured = None;
+                            for source in &sources {
+                                captured =
+                                    C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?;
+                                if captured.is_some() {
+                                    break;
+                                }
+                            }
+                            let Some(captured) = captured else {
+                                return Ok(None);
+                            };
+                            if captured.r#type().as_ref() != edge_type {
+                                return Err(ProgramError::MalformedProgram(format!(
+                                    "`{CONDITION_OPERATION_NAME}` residual placeholder has type `{}` but expected \
+                                     `{edge_type}`",
+                                    captured.r#type().as_ref(),
+                                )));
+                            }
+                            captured
+                        };
+                        // Build in a detached trace and splice into this known branch with its original inputs,
+                        // preserving identities.
+                        let placeholder_program = placeholder_context
+                            .builder()
+                            .borrow()
+                            .clone()
+                            .build::<Vec<C::Constant>, Vec<C::Constant>>(
+                                vec![placeholder.atom_id()?],
+                                vec![Placeholder; known_inputs.len()],
+                                vec![Placeholder],
+                            )?;
+                        let placeholders = builder.splice_program(&placeholder_program, known_inputs)?;
+                        check_count!("output", placeholders, 1, ProgramError);
+                        Ok(Some(placeholders[0]))
+                    },
+                    bind_known: |operation, programs, inputs: &[C::Value]| {
+                        context.primal().bind(operation, programs, inputs)
+                    },
+                    bind_residual,
+                },
+            )?;
+            outputs.map_err(|rejection| -> DifferentiationError {
+                ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{CONDITION_OPERATION_NAME}` linearization cannot join the residuals of its branches, because \
+                         {rejection}",
+                    ),
+                }
+                .into()
+            })?
         };
-        activity.into_duals(outputs, output_count)
+        // Reconstruct structural zeros from the actual primal outputs so runtime type identities remain intact.
+        check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
+        let mut primal_outputs = outputs;
+        let tangent_outputs = primal_outputs.split_off(output_count);
+        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &output_activity)
     }
 }
 
-// Partition-aware transpose rule for a *primal* [`ConditionOperation`], forwarding to `transpose_primal_condition`.
-// The predicate and the per-branch residuals ride as ordinary known inputs, and the branch recursion happens through
-// the instruction-scoped driver's transposition requests, so instantiating this implementation for a closed operation
-// enum introduces no recursive [`TransposableOperation`] obligation on `O`. Reference inputs accumulate through the
-// enclosing context's cotangent references, which are resolved (and allocated on first use when their state cotangent
-// is live) before the shared rule passes them into both transposed branches. A universe without reference types (e.g.,
-// [`ArrayType`], whose referent family is [`NoReferent`](crate::programs::NoReferent)) has no cotangent references, so
-// every needed cotangent is returned as a value.
+// Partition-aware transpose rule for a primal [`ConditionOperation`]. The predicate and the per-branch residuals ride
+// as ordinary known inputs, and the branch recursion happens through the instruction-scoped driver's transposition
+// requests, so instantiating this implementation for a closed operation enum introduces no recursive
+// [`TransposableOperation`] obligation on `O`. Reference inputs accumulate through the enclosing context's cotangent
+// references, which are resolved (and allocated on first use when their state cotangent is live) before the shared rule
+// passes them into both transposed branches. A universe without reference types (e.g., [`ArrayType`], whose referent
+// family is [`NoReferent`](crate::programs::NoReferent)) has no cotangent references, so every needed cotangent is
+// returned as a value.
 impl<T, V: Value<Type = T>, O> TransposableOperation<V, O> for ConditionOperation<T>
 where
     TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
@@ -1082,8 +1264,201 @@ where
         check_count!("input", inputs, 1 + branch.input_types().len(), ProgramError);
         check_count!("output", outputs, branch.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        // Resolve shared cotangent references before transposing either branch: the selected branch accumulates into
+        // those references in place, while ignored destinations own no slot in the transposed boundary.
         let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
-        let contributions = transpose_primal_condition(context, driver, inputs, outputs, &cotangents)?;
+        check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
+        let branches = [driver.region(0)?, driver.region(1)?];
+        let contributions = if cotangents.can_skip_transposition(outputs, branches) {
+            // A zero map contributes structural zeros, but live reference state, effects, or deferred work keep the
+            // transpose live even with zero output seeds. Accumulate the zero contributions below as usual.
+            inputs
+                .iter()
+                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                .collect::<Result<Vec<_>, ProgramError>>()?
+        } else {
+            // Linear branch inputs can occur at any boundary position. Preserve source order separately for the linear
+            // branch inputs and the known residual inputs, as the branch transposition driver does. The predicate is
+            // input `0` and the residuals are the known branch inputs; both are known values read from the pullback.
+            // The dispatch guarantees that a `Known` input carries its pullback value, so each tracer is read directly.
+            let branch_input_indices = inputs[1..]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| input.is_unknown().then_some(index))
+                .collect::<Vec<_>>();
+            let read_known = |index: usize| -> Result<Tracer<TracingContext<V, O>>, ProgramError> {
+                inputs[index]
+                    .as_known()
+                    .ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "`{CONDITION_OPERATION_NAME}` transpose input {index} has no known value",
+                        ))
+                    })
+                    .cloned()
+            };
+            let predicate = read_known(0)?;
+            let residuals = (1..inputs.len())
+                .filter(|&index| !inputs[index].is_unknown())
+                .map(read_known)
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Structural-zero output cotangents stay symbolic in both transposed branches, which receive no input for
+            // them.
+            let branch_destination_kinds =
+                branch_input_indices.iter().map(|&index| cotangents.kind(index + 1)).collect::<Vec<_>>();
+            let zero_outputs = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+            // Use retained region transforms and initially omit every structural-zero input cotangent. Output seeds
+            // that are structural zeros remain symbolic and own no input of either transposed branch.
+            let mut transposed_branches = [
+                driver.transpose_program_with_zero_seeds(
+                    branches[0],
+                    &branch_input_indices,
+                    &[],
+                    &zero_outputs,
+                    &branch_destination_kinds,
+                )?,
+                driver.transpose_program_with_zero_seeds(
+                    branches[1],
+                    &branch_input_indices,
+                    &[],
+                    &zero_outputs,
+                    &branch_destination_kinds,
+                )?,
+            ];
+            // Inspect the derived cotangent metadata before inserting zeros. This keeps branch-transposition errors
+            // ahead of variation errors, and variation errors ahead of zero-materialization failures.
+            let predicate_type = predicate.r#type();
+            if predicate_type.is_varying() {
+                // Devices may take different branches. A cotangent crossing this boundary must already vary with the
+                // predicate: summing it for an invariant input would put a collective inside diverging control flow.
+                // Both-zero cotangents cross no value boundary and impose no additional variation requirement.
+                let output_cotangent_count = branches[0]
+                    .output_types()
+                    .iter()
+                    .zip(outputs)
+                    .filter(|(output_type, cotangent)| !output_type.is_reference() && !cotangent.is_zero())
+                    .count();
+                let mut cotangent_reference_input = output_cotangent_count;
+                for (position, index) in branch_input_indices.iter().map(|&index| index + 1).enumerate() {
+                    // Returned values cross when either branch needs them. Reference-state cotangents retain state
+                    // effects; an ordinary gradient buffer crosses only when a branch actually mutates its
+                    // corresponding input.
+                    let crosses_boundary = match cotangents.kind(index) {
+                        CotangentDestinationKind::Return => transposed_branches
+                            .iter()
+                            .any(|branch| branch.cotangents()[position] == TransposedProgramCotangent::Output),
+                        CotangentDestinationKind::Reference if cotangents.is_reference_input(index) => true,
+                        CotangentDestinationKind::Reference => {
+                            let mut mutated = false;
+                            for branch in &transposed_branches {
+                                let region = branch.program().entry_region_ref();
+                                let analysis = region
+                                    .reference_analysis_with_configuration(None, true, &[])
+                                    .map_err(ProgramError::from)?;
+                                let root = ReferenceRoot::RegionInput {
+                                    region: region.id(),
+                                    input_index: cotangent_reference_input,
+                                };
+                                mutated |= analysis.is_mutated(root);
+                            }
+                            mutated
+                        }
+                        CotangentDestinationKind::Ignore => false,
+                    };
+                    if cotangents.kind(index) == CotangentDestinationKind::Reference {
+                        cotangent_reference_input += 1;
+                    }
+                    let input_type = inputs[index].r#type();
+                    if crosses_boundary
+                        && input_type.cotangent()?.validate_condition_output(predicate_type.as_ref()).is_err()
+                    {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "`{CONDITION_OPERATION_NAME}` transposition cannot produce the cotangent of input \
+                                 {index} of type `{input_type}`, which does not vary over every manual axis that the \
+                                 predicate `{predicate_type}` varies over; vary the input before the condition",
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+            // Only after variation validation, materialize a zero inside its branch when the peer returns a value.
+            // Compute both masks before changing either branch. Cotangents zero on both sides stay absent, and the
+            // resulting metadata must agree before the branches can share a condition output signature.
+            let materialize_zeros = [0, 1].map(|index| {
+                transposed_branches[index]
+                    .cotangents()
+                    .iter()
+                    .zip(transposed_branches[1 - index].cotangents())
+                    .map(|(slot, peer)| {
+                        *slot == TransposedProgramCotangent::Zero && *peer == TransposedProgramCotangent::Output
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (index, materialize) in materialize_zeros.iter().enumerate() {
+                if materialize.contains(&true) {
+                    transposed_branches[index] = driver.transpose_program_with_zero_seeds(
+                        branches[index],
+                        &branch_input_indices,
+                        materialize,
+                        &zero_outputs,
+                        &branch_destination_kinds,
+                    )?;
+                }
+            }
+            if transposed_branches[0].cotangents() != transposed_branches[1].cotangents() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{CONDITION_OPERATION_NAME}` branch transposition returned inconsistent cotangent metadata after \
+                     materializing one-sided zeros",
+                ))
+                .into());
+            }
+            // The selected transpose receives [predicate, live non-reference output cotangents, cotangent references,
+            // residuals]. Reference outputs use the supplying input's cotangent reference; zero outputs own no input.
+            let output_types = branches[0].output_types();
+            let mut transposed_inputs = Vec::with_capacity(1 + output_types.len() + residuals.len());
+            transposed_inputs.push(predicate);
+            transposed_inputs.extend(
+                outputs
+                    .iter()
+                    .zip(&output_types)
+                    .filter(|(_, output_type)| !output_type.is_reference())
+                    .filter_map(|(cotangent, _)| cotangent.as_value().cloned()),
+            );
+            transposed_inputs.extend(cotangents.references().iter().cloned());
+            transposed_inputs.extend(residuals);
+            // The shared transposed-branch handles are attached directly, so repeated binds of one transposed branch
+            // intern by `Arc` identity instead of copying it again.
+            let branch_cotangents = context.bind(
+                O::from(ConditionOperation::new()),
+                CalleeRegionDriver::new(&[
+                    transposed_branches[0].program().clone(),
+                    transposed_branches[1].program().clone(),
+                ]),
+                transposed_inputs.as_slice(),
+            )?;
+            let branch_cotangent_types = branch_input_indices
+                .iter()
+                .map(|&index| inputs[index + 1].r#type().cotangent())
+                .collect::<Result<Vec<_>, _>>()?;
+            let branch_cotangents =
+                transposed_branches[0].assemble_cotangents(&branch_cotangent_types, branch_cotangents)?;
+
+            // Predicate and residual inputs contribute nothing. Returned branch cotangents preserve both-zero slots as
+            // structural zeros; reference destinations have already accumulated in place and need no further
+            // contribution.
+            let mut input_cotangents = inputs
+                .iter()
+                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            for (&index, cotangent) in branch_input_indices.iter().zip(branch_cotangents) {
+                if cotangents.kind(index + 1) == CotangentDestinationKind::Return {
+                    input_cotangents[index + 1] = cotangent.unwrap();
+                }
+            }
+            input_cotangents
+        };
         check_count!("input", contributions, accumulators.len(), ProgramError);
         for (accumulator, contribution) in accumulators.iter().zip(contributions) {
             accumulator.accumulate(context, contribution)?;
@@ -1455,77 +1830,6 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
             .enumerate()
             .map(|(index, (true_output, false_output))| merge(index, true_output, false_output, &select))
             .collect()
-    }
-}
-
-/// Reference that the root of a `condition` branch's reference analysis denotes at the condition boundary. It is
-/// compared across the two branches by [`ConditionOperation::validate_reference_output_roots`] and named by the
-/// diagnostics of the condition's reference validations.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ConditionReferenceSource {
-    /// Instruction input at this position, which counts the predicate (i.e., region input `n` is instruction input
-    /// `n + 1`).
-    Input(usize),
-
-    /// Captured reference that names this capture position.
-    Capture(usize),
-
-    /// Concrete reference allocation embedded as a constant.
-    Constant(ReferenceId),
-
-    /// Reference allocated inside the branch.
-    Allocation,
-}
-
-impl ConditionReferenceSource {
-    /// Returns the [`ConditionReferenceSource`] that `root`, a root of the reference analysis of `branch`, denotes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `root` is an input of a region other than `branch`, or a
-    /// constant root whose atom is not a reference constant that names a capture or an allocation.
-    fn from_root<V: Value, O: Operation<Type = V::Type>>(
-        branch: RegionRef<'_, V, O>,
-        root: ReferenceRoot,
-    ) -> Result<Self, ProgramError> {
-        match root {
-            ReferenceRoot::RegionInput { region, input_index } if region == branch.id() => {
-                Ok(Self::Input(input_index + 1))
-            }
-            ReferenceRoot::RegionInput { .. } => Err(ProgramError::MalformedProgram(format!(
-                "`{CONDITION_OPERATION_NAME}` branch reference analysis reports a root that is an input of a nested \
-                 region at the branch boundary",
-            ))),
-            ReferenceRoot::Allocation { .. } => Ok(Self::Allocation),
-            ReferenceRoot::Constant { value } => {
-                let owner = branch.with_id(value.region())?;
-                match owner.atoms()[value.atom().index()].as_constant() {
-                    Some(constant) => match (constant.capture_index(), constant.reference_id()) {
-                        (Some(index), _) => Ok(Self::Capture(index)),
-                        (None, Some(reference)) => Ok(Self::Constant(reference)),
-                        (None, None) => Err(ProgramError::MalformedProgram(format!(
-                            "`{CONDITION_OPERATION_NAME}` branch reference analysis reports a constant root that names \
-                             neither a capture nor an allocation",
-                        ))),
-                    },
-                    None => Err(ProgramError::MalformedProgram(format!(
-                        "`{CONDITION_OPERATION_NAME}` branch reference analysis reports a constant root whose atom is \
-                         not a constant",
-                    ))),
-                }
-            }
-        }
-    }
-}
-
-impl Display for ConditionReferenceSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Input(index) => write!(formatter, "instruction input {index}"),
-            Self::Capture(index) => write!(formatter, "captured reference {index}"),
-            Self::Constant(_) => write!(formatter, "a reference constant"),
-            Self::Allocation => write!(formatter, "a reference that it allocates"),
-        }
     }
 }
 
@@ -2011,651 +2315,6 @@ fn gate_mapped_predicate_branch_inputs<B: Clone>(
         .collect()
 }
 
-/// Forward-mode activity of one `condition` application, shared by its fused and its separate-context derivative.
-///
-/// The instruction inputs after the predicate map onto the branch region inputs positionally, so each branch's
-/// activity mask is the liveness of their tangents: an input with a live tangent is active, while a structural zero, a
-/// plumbing reference input (a captured or inactive reference reaching the branch at any region input position), and a
-/// zero-space input are inactive and receive no tangent input. An output tangent is live when it has a tangent slot
-/// and depends on an active input in either branch. The others are structural zeros, so the branch derivatives are
-/// projected to the live output tangents and linearization never sees a tangent that depends on no tangent input.
-struct ConditionJvpActivity<C: Context> {
-    /// Forward-mode activities of the `true` and `false` branches, which select the same branch inputs.
-    branches: [TangentActivity<C>; 2],
-
-    /// Whether the tangent of each condition output is live.
-    output_activity: Vec<bool>,
-
-    /// Tangent slot of each live output tangent among the tangent outputs of the branch forward-mode programs, in
-    /// output order.
-    live_tangent_slots: Vec<usize>,
-}
-
-impl<C: Context<Type: ConditionType + DifferentiableType>> ConditionJvpActivity<C> {
-    /// Analyzes the forward-mode activity of a condition application whose `true` and `false` `branches` receive
-    /// `branch_inputs`, differentiating both branches through `driver`.
-    ///
-    /// The application must have been validated (refer to [`ConditionOperation::validate_application`]). Matching
-    /// primal signatures guarantee matching numeric tangent slots, but a reference output has a tangent slot only when
-    /// its root is an active input, so the tangent slots of both branches agree only because every reference output
-    /// denotes the same reference in both branches. A reference tangent that only one branch carried could not be
-    /// padded without inventing allocation state.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of differentiating either branch.
-    fn new<D: DifferentiationDriver<C>>(
-        driver: &D,
-        branches: [RegionRef<'_, C::Constant, C::Operation>; 2],
-        branch_inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Self, DifferentiationError> {
-        let input_tangent_liveness = branch_inputs.iter().map(|input| !input.tangent().is_zero()).collect::<Vec<_>>();
-        let branches = [
-            TangentActivity::new(driver, branches[0], &input_tangent_liveness)?,
-            TangentActivity::new(driver, branches[1], &input_tangent_liveness)?,
-        ];
-        // Both branches declare the same output types and denote the same reference by each reference output, so they
-        // have the same tangent slots, and an output tangent is live when it is live in either branch.
-        let output_activity = branches[0]
-            .output_tangent_liveness()
-            .iter()
-            .zip(branches[1].output_tangent_liveness())
-            .map(|(&left, &right)| left || right);
-        let output_activity = output_activity.collect::<Vec<_>>();
-        let live_tangent_slots = branches[0].live_tangent_slots(&output_activity);
-        Ok(Self { branches, output_activity, live_tangent_slots })
-    }
-
-    /// Binds one fused condition in `context`, which is both the primal and the tangent context, over
-    /// `condition_inputs` (i.e., the predicate, the branch primals, and the live branch tangents), whose branches are
-    /// the forward-mode programs of the branches projected to the `output_count` primal outputs and the live output
-    /// tangents. Pure forward mode therefore stages a single conditional and no residual plumbing, and the fused
-    /// conditional selects the same branch for both halves because they share the primal predicate.
-    fn bind_fused(
-        &self,
-        context: &C,
-        condition_inputs: &[C::Value],
-        output_count: usize,
-    ) -> Result<Vec<C::Value>, ProgramError>
-    where
-        C::Operation: From<ConditionOperation<C::Type>>,
-    {
-        let jvp_outputs = (0..output_count)
-            .chain(self.live_tangent_slots.iter().map(|&slot| output_count + slot))
-            .collect::<Vec<_>>();
-        let branches = self
-            .branches
-            .iter()
-            .map(|activity| {
-                let program = activity.jvp_program();
-                if jvp_outputs.iter().copied().eq(0..program.output_count()) {
-                    Ok(program.clone())
-                } else {
-                    program.with_outputs(&jvp_outputs).map(Arc::new)
-                }
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        context.bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), condition_inputs)
-    }
-
-    /// Stages the separate-context linearization of the condition whose `true` and `false` `branches` receive
-    /// `condition_inputs` (i.e., the predicate of type `predicate_type`, the branch primals, and the live branch
-    /// tangents) and produce `output_count` outputs. Each branch is linearized through `driver`, and the two
-    /// linearizations are joined over one shared residual boundary (refer to [`reconstruct_partitioned_condition`]):
-    /// the primal condition, bound in the primal context, produces the primal outputs and the selected branch's
-    /// residuals, with placeholders for the residual slots of its peer, and the tangent condition, bound in the tangent
-    /// context, computes the live output tangents from the live input tangents and the selected branch's residuals.
-    /// Returns the primal outputs followed by the live output tangents.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`] naming the residual that prevents joining the two linearizations
-    /// (i.e., a known reference residual, a residual that does not vary over every manual axis that the predicate
-    /// varies over, or a residual of the peer branch that has no placeholder), and the errors of linearizing either
-    /// branch.
-    fn bind_linearized<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        branches: [RegionRef<'_, C::Constant, C::Operation>; 2],
-        predicate_type: &C::Type,
-        condition_inputs: &[C::Value],
-        output_count: usize,
-    ) -> Result<Vec<C::Value>, DifferentiationError>
-    where
-        TracingContext<C::Constant, C::Operation>:
-            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<ConditionOperation<C::Type>>,
-    {
-        let primal_input_count = branches[0].input_types().len();
-        let input_indices = self.branches[0].input_indices();
-        let live_input_count = input_indices.len();
-        let mut partitions = Vec::with_capacity(2);
-        for branch in branches {
-            let (primal, tangent, residual_count) = driver.linearize_program(branch, input_indices)?.into_parts();
-            partitions.push(PartitionedProgram::from_parts(
-                Arc::unwrap_or_clone(primal),
-                tangent.with_outputs(&self.live_tangent_slots)?,
-                primal_input_count + live_input_count,
-                (0..primal_input_count).collect(),
-                (primal_input_count..primal_input_count + live_input_count)
-                    .map(ResidualInputSource::UnknownInput)
-                    .chain((0..residual_count).map(ResidualInputSource::ResidualEdge))
-                    .collect(),
-                (0..output_count)
-                    .map(PartialEvaluationOutput::Known)
-                    .chain((0..self.live_tangent_slots.len()).map(PartialEvaluationOutput::Unknown))
-                    .collect(),
-            )?);
-        }
-        // The boundary of the joined branches is the branch primals followed by the live branch tangents, whose types
-        // the tangent program of either linearization declares first.
-        let mut branch_input_types = branches[0].input_types();
-        branch_input_types.extend(partitions[0].residual_program().input_types().into_iter().take(live_input_count));
-        let input_known = (0..primal_input_count + live_input_count)
-            .map(|index| index < primal_input_count)
-            .collect::<Vec<_>>();
-        let false_partition = partitions.pop().unwrap();
-        let true_partition = partitions.pop().unwrap();
-        let bind_residual = |operation, programs, inputs: &[C::Value]| {
-            // The residual condition receives the predicate, the live tangents, and the residuals. The predicate
-            // and the residuals are primal values, which enter the tangent context explicitly.
-            let tangent_inputs = inputs
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    if index == 0 || index > live_input_count {
-                        context.primal_to_tangent(value.clone()).map_err(ProgramError::from)
-                    } else {
-                        Ok(value.clone())
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            context.tangent().bind(operation, programs, &tangent_inputs)
-        };
-        let outputs = reconstruct_partitioned_condition(
-            predicate_type,
-            &branch_input_types,
-            output_count + self.live_tangent_slots.len(),
-            condition_inputs,
-            &input_known,
-            [true_partition, false_partition],
-            ConditionSplitJoin {
-                build_placeholder: build_linearization_placeholder::<C>,
-                bind_known: |operation, programs, inputs: &[C::Value]| {
-                    context.primal().bind(operation, programs, inputs)
-                },
-                bind_residual,
-            },
-        )?;
-        outputs.map_err(|rejection| -> DifferentiationError {
-            ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{CONDITION_OPERATION_NAME}` linearization cannot join the residuals of its branches, because \
-                     {rejection}",
-                ),
-            }
-            .into()
-        })
-    }
-
-    /// Pairs the primal `outputs` of the condition (i.e., its `output_count` primal outputs followed by its live output
-    /// tangents) with their tangents. An inactive output receives a structural-zero tangent of the type its actual
-    /// primal determines, so that its runtime identities are kept.
-    fn into_duals(
-        self,
-        outputs: Vec<C::Value>,
-        output_count: usize,
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("output", outputs, output_count + self.live_tangent_slots.len(), ProgramError);
-        let mut primal_outputs = outputs;
-        let tangent_outputs = primal_outputs.split_off(output_count);
-        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &self.output_activity)
-    }
-}
-
-/// Stages into `builder`, the detached builder of a known branch of a linearized `condition`, a placeholder of type
-/// `edge_type` for one of the residual edges of the peer branch, given the known input atoms `known_inputs` of the
-/// branch. The placeholder is a dead output of the untaken branch, so any value of the edge type preserves the
-/// semantics. Zeroable edges use the residual-zero protocol, which reads their live extents from the known inputs. Two
-/// kinds of edges have no such zero. A non-zeroable edge type (e.g., a first-class dimension, a reference, a token, or
-/// an `F8E8M0FNU` array) has no typed zero at all, and a family that declares no zero residuals (e.g., homogeneous
-/// [`ArrayType`] operations) builds only type-only zeros, which cannot name a reference-position identity such as the
-/// `n` of `f32[n]`. The runtime values of such an edge's identities must then come from a known input: a known input
-/// of the identical type is forwarded, or else the family captures the edge from a known input that carries the
-/// quantity it names (e.g., a `dimension<n>` edge read from a known `f32[n]` array).
-///
-/// Returns `None` when neither exists, and propagates the error of a zeroable edge whose zero cannot be materialized.
-fn build_linearization_placeholder<C: Context>(
-    builder: &mut ProgramBuilder<C::Constant, C::Operation>,
-    edge_type: &C::Type,
-    known_inputs: &[AtomId],
-) -> Result<Option<AtomId>, ProgramError>
-where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
-{
-    let placeholder_context = TracingContext::<C::Constant, C::Operation>::new();
-    let sources = known_inputs
-        .iter()
-        .map(|input| placeholder_context.input(builder.atoms()[input.index()].r#type().into_owned()))
-        .collect::<Vec<_>>();
-    let zero_is_constructible = edge_type.validate_zero().is_ok()
-        && (!C::Operation::zero_residual_types(edge_type).is_empty()
-            || edge_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference));
-    let placeholder = if zero_is_constructible {
-        C::Operation::materialize_zero_from_residual_sources(
-            &placeholder_context,
-            MaybeZero::Zero(edge_type.clone()),
-            &sources,
-        )?
-    } else if let Some(source) = sources.iter().find(|source| source.r#type().as_ref() == edge_type) {
-        source.clone()
-    } else {
-        let mut captured = None;
-        for source in &sources {
-            captured = C::Operation::capture_zero_residual_value(&placeholder_context, source, edge_type)?;
-            if captured.is_some() {
-                break;
-            }
-        }
-        let Some(captured) = captured else {
-            return Ok(None);
-        };
-        if captured.r#type().as_ref() != edge_type {
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{CONDITION_OPERATION_NAME}` residual placeholder has type `{}` but expected `{edge_type}`",
-                captured.r#type().as_ref(),
-            )));
-        }
-        captured
-    };
-    let placeholder_program =
-        placeholder_context.builder().borrow().clone().build::<Vec<C::Constant>, Vec<C::Constant>>(
-            vec![placeholder.atom_id()?],
-            vec![Placeholder; known_inputs.len()],
-            vec![Placeholder],
-        )?;
-    let placeholders = builder.splice_program(&placeholder_program, known_inputs)?;
-    check_count!("output", placeholders, 1, ProgramError);
-    Ok(Some(placeholders[0]))
-}
-
-/// Partition-aware transpose rule for a *primal* [`ConditionOperation`], used when the direct reverse transposes a
-/// tangent program in the primal operation family `O`. The predicate and the per-branch residuals are ordinary
-/// *instruction inputs* (known values supplied through the pullback), so the rule reads them from the pullback and
-/// threads them back through as known inputs of a transposed condition.
-///
-/// The forward stages the tangent condition over `[predicate, branch_tangents..., residuals...]`, with the predicate
-/// and the joined residual set marked known, the branch tangents marked linear, and both branches already joined to the
-/// same input signature `[branch_tangents..., residuals...]` and output signature `[branch_tangent_outputs...]`. This
-/// rule therefore:
-///
-///   1. Splits the inputs into the known predicate (input `0`), the linear (i.e., unknown) branch inputs, and the
-///      known branch residuals, preserving source order within each group. The split does not rely on the forward's
-///      grouping because direct transposition also supports known and linear branch inputs interleaved in any order.
-///   2. Transposes each branch through the driver's region-transposition request, marking the branch tangent inputs
-///      linear and the residual inputs known (refer to `transpose_condition_branches`). Each transposed branch maps
-///      `[live_branch_tangent_output_cotangents..., branch_cotangent_references..., residuals...]` to
-///      `[nonzero_branch_tangent_input_cotangents...]`, where the structural-zero output cotangents stay symbolic and
-///      own no input, and only branch inputs with a [`Reference`](CotangentDestinationKind::Reference) cotangent
-///      destination own a cotangent reference slot. Both branches first omit structural-zero cotangents. After validating the manual variation of the cotangents that
-///      cross the condition boundary (refer to `validate_condition_cotangent_variation`), any zero opposite a peer's
-///      value output is materialized inside its branch, giving the transposed branches matching signatures while
-///      cotangents that are zero in both branches remain absent from their output boundaries.
-///   3. Re-stages a primal [`ConditionOperation`] selecting between the two transposed branches by the same known
-///      predicate, over `[predicate, outputs..., cotangent_references..., residuals...]`, where `outputs` holds the
-///      live cotangents of the non-reference condition outputs (refer to `stage_transposed_condition`). Its outputs are
-///      the branch-tangent input cotangents.
-///
-/// The returned cotangents place those branch-tangent cotangents at the linear-input positions, preserving cotangents
-/// that are zero in both branches as [`MaybeZero::Zero`]. The predicate and residual positions also carry structural
-/// zeros. The branch recursion happens through the instruction-scoped driver in the same operation family, so it
-/// introduces no recursive [`TransposableOperation`] obligation on `O`.
-///
-/// # Parameters
-///
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `driver`: Instruction-scoped driver that supplies the two branch regions and transposes them with the requested
-///     linear inputs and cotangent destinations.
-///   - `inputs`: Per-input [`PartialValue`] knowledge. The [`Unknown`](PartialValue::Unknown) entries are the branch
-///     tangents; the [`Known`](PartialValue::Known) entries carry the predicate and residual tracers the pullback
-///     reads.
-///   - `outputs`: Symbolic cotangents for the condition's outputs.
-///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). Both branches are transposed with the destination kinds of
-///     the inputs after the predicate. A [`Reference`](CotangentDestinationKind::Reference) destination passes the
-///     input's cotangent reference into both transposed branches, and the selected branch accumulates into it in
-///     place. For a reference-state input, the branch also returns that reference by identity; an ordinary value
-///     using a cotangent buffer produces no corresponding output. Both receive structural-zero contributions from this
-///     function. An [`Ignore`](CotangentDestinationKind::Ignore)-kind input has no slot in either transposed branch
-///     and receives a structural zero as well.
-///
-/// # Errors
-///
-/// Returns an error if the boundary counts disagree, the predicate has no known value, a branch cannot be transposed, a
-/// structural zero cannot be reconstructed from the available runtime extents, or the transposed condition cannot be
-/// bound in `context`. Manual-variation validation follows branch transposition because it needs the resulting
-/// cotangent metadata, so branch-transposition errors take precedence over manual-variation errors. Callers must supply
-/// a validated condition boundary with matching branch signatures.
-fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
-    context: &mut TracingContext<V, O>,
-    driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
-where
-    V: Value<Type: ConditionType + DifferentiableType>,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    // A condition with no live output cotangents and no live reference input is a zero linear map, so every input
-    // cotangent is zero. A live reference input keeps the rule live, because its accumulated state cotangent flows
-    // through the transposed branches even when no ordinary output cotangent does. Branches with deferred work or
-    // observable rule effects also keep it live, so that their obligations run with structural-zero seeds.
-    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
-    let branches = [driver.region(0)?, driver.region(1)?];
-    if cotangents.can_skip_transposition(outputs, branches) {
-        return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
-    }
-
-    // Linear branch inputs can occur at any boundary position. Preserve source order separately for the linear branch
-    // inputs and the known residual inputs, as the branch transposition driver does. The predicate is input `0` and the
-    // residuals are the known branch inputs; both are known values read from the pullback. The dispatch guarantees that
-    // a `Known` input carries its pullback value, so each tracer is read directly.
-    check_count!("input", inputs, 1 + branches[0].input_types().len(), ProgramError);
-    let branch_input_indices = inputs[1..]
-        .iter()
-        .enumerate()
-        .filter_map(|(index, input)| input.is_unknown().then_some(index))
-        .collect::<Vec<_>>();
-    let read_known = |index: usize| -> Result<Tracer<TracingContext<V, O>>, ProgramError> {
-        inputs[index]
-            .as_known()
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "`{CONDITION_OPERATION_NAME}` transpose input {index} has no known value",
-                ))
-            })
-            .cloned()
-    };
-    let predicate = read_known(0)?;
-    let residuals = (1..inputs.len())
-        .filter(|&index| !inputs[index].is_unknown())
-        .map(read_known)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Structural-zero output cotangents stay symbolic in both transposed branches, which receive no input for them.
-    let branch_destination_kinds =
-        branch_input_indices.iter().map(|&index| cotangents.kind(index + 1)).collect::<Vec<_>>();
-    let zero_outputs = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
-    let transposed_branches = transpose_condition_branches(
-        driver,
-        branches,
-        &branch_input_indices,
-        &zero_outputs,
-        &branch_destination_kinds,
-    )?;
-    // Manual-variation validation needs the cotangent metadata of the transposed branches, but must precede the
-    // materialization of one-sided zeros, which would otherwise hide which cotangents are zero in both branches.
-    validate_condition_cotangent_variation(
-        inputs,
-        cotangents,
-        &branch_input_indices,
-        &transposed_branches,
-        predicate.r#type().as_ref(),
-        branches[0]
-            .output_types()
-            .iter()
-            .zip(outputs)
-            .filter(|(output_type, cotangent)| !output_type.is_reference() && !cotangent.is_zero())
-            .count(),
-    )?;
-    let transposed_branches = materialize_one_sided_condition_cotangents(
-        driver,
-        branches,
-        &branch_input_indices,
-        &zero_outputs,
-        &branch_destination_kinds,
-        transposed_branches,
-    )?;
-    let branch_cotangents = stage_transposed_condition(
-        context,
-        &transposed_branches,
-        predicate,
-        outputs,
-        &branches[0].output_types(),
-        residuals,
-        cotangents,
-    )?;
-    let branch_cotangent_types = branch_input_indices
-        .iter()
-        .map(|&index| inputs[index + 1].r#type().cotangent())
-        .collect::<Result<Vec<_>, _>>()?;
-    let branch_cotangents = transposed_branches[0].assemble_cotangents(&branch_cotangent_types, branch_cotangents)?;
-
-    // Predicate and residual inputs contribute nothing. Returned branch cotangents preserve both-zero slots as
-    // structural zeros; reference destinations have already accumulated in place and need no further contribution.
-    let mut input_cotangents = inputs
-        .iter()
-        .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    for (&index, cotangent) in branch_input_indices.iter().zip(branch_cotangents) {
-        if cotangents.kind(index + 1) == CotangentDestinationKind::Return {
-            input_cotangents[index + 1] = cotangent.unwrap();
-        }
-    }
-    Ok(input_cotangents)
-}
-
-/// Transposes both `branches` of a primal condition with respect to the branch inputs at `branch_input_indices`, whose
-/// cotangents go to destinations of the kinds `destination_kinds`, while the other branch inputs are known residuals.
-/// Each branch is transposed through its region's retained transform cache, so that a branch shared by several
-/// programs is transposed once per selection of linear inputs. A live reference-typed branch tangent is transposed
-/// with a [`Reference`](CotangentDestinationKind::Reference) destination and a dead one with an
-/// [`Ignore`](CotangentDestinationKind::Ignore) destination, and the cotangent of every output that `zero_outputs`
-/// flags is a structural zero with no input. Each transposed branch therefore maps `[live_branch_output_cotangents...,
-/// branch_cotangent_references..., residuals...]` to `[branch_tangent_cotangents...]`, where a live reference tangent's
-/// cotangent is its cotangent reference itself and a dead reference tangent has no cotangent slot at all. Every
-/// structural-zero cotangent is omitted, including those that the peer branch returns as values (refer to
-/// [`materialize_one_sided_condition_cotangents`]).
-fn transpose_condition_branches<V, O, D: TranspositionDriver<V, O>>(
-    driver: &D,
-    branches: [RegionRef<'_, V, O>; 2],
-    branch_input_indices: &[usize],
-    zero_outputs: &[bool],
-    destination_kinds: &[CotangentDestinationKind],
-) -> Result<[TransposedProgram<V, O>; 2], DifferentiationError>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>,
-{
-    Ok([
-        driver.transpose_program_with_zero_seeds(
-            branches[0],
-            branch_input_indices,
-            &[],
-            zero_outputs,
-            destination_kinds,
-        )?,
-        driver.transpose_program_with_zero_seeds(
-            branches[1],
-            branch_input_indices,
-            &[],
-            zero_outputs,
-            destination_kinds,
-        )?,
-    ])
-}
-
-/// Validates that every cotangent that crosses the boundary of a primal condition whose predicate has type
-/// `predicate_type` varies over every manual axis that the predicate varies over. Devices whose predicates differ take
-/// different branches, so the cotangent of a linear input differs across them. An input that does not vary over the
-/// predicate's manual axes would need that cotangent summed across devices inside the branches, with collectives that
-/// devices reach differently, so such a condition is not transposed. Staging the condition through
-/// [`Condition::condition`] varies its inputs before the branches instead.
-///
-/// A cotangent crosses the boundary when either of the `transposed_branches` returns it as a value. A cotangent that is
-/// a structural zero in both branches crosses no value boundary, so its input needs no such variation. A gradient
-/// buffer (i.e., a [`Reference`](CotangentDestinationKind::Reference) destination of a non-reference input) crosses it
-/// when either transposed branch mutates the buffer, which the branch receives as one of its cotangent reference
-/// inputs after its `output_cotangent_count` output cotangents. The state cotangent of a reference input still carries
-/// branch-local state effects, so it crosses the boundary whenever its destination is not ignored.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::UnsupportedOperation`] naming the first input whose cotangent crosses the boundary without
-/// the required variation.
-fn validate_condition_cotangent_variation<V, O>(
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-    branch_input_indices: &[usize],
-    transposed_branches: &[TransposedProgram<V, O>; 2],
-    predicate_type: &V::Type,
-    output_cotangent_count: usize,
-) -> Result<(), ProgramError>
-where
-    V: Value<Type: ConditionType + DifferentiableType>,
-    O: Operation<Type = V::Type>,
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    if !predicate_type.is_varying() {
-        return Ok(());
-    }
-    let mut cotangent_reference_input = output_cotangent_count;
-    for (position, index) in branch_input_indices.iter().map(|&index| index + 1).enumerate() {
-        let crosses_boundary = match cotangents.kind(index) {
-            CotangentDestinationKind::Return => transposed_branches
-                .iter()
-                .any(|branch| branch.cotangents()[position] == TransposedProgramCotangent::Output),
-            CotangentDestinationKind::Reference if cotangents.is_reference_input(index) => true,
-            CotangentDestinationKind::Reference => {
-                let mut mutated = false;
-                for branch in transposed_branches {
-                    let region = branch.program().entry_region_ref();
-                    let analysis = region.reference_analysis_with_configuration(None, true, &[])?;
-                    let root =
-                        ReferenceRoot::RegionInput { region: region.id(), input_index: cotangent_reference_input };
-                    mutated |= analysis.is_mutated(root);
-                }
-                mutated
-            }
-            CotangentDestinationKind::Ignore => false,
-        };
-        if cotangents.kind(index) == CotangentDestinationKind::Reference {
-            cotangent_reference_input += 1;
-        }
-        let input_type = inputs[index].r#type();
-        if crosses_boundary && input_type.cotangent()?.validate_condition_output(predicate_type).is_err() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{CONDITION_OPERATION_NAME}` transposition cannot produce the cotangent of input {index} of type \
-                     `{input_type}`, which does not vary over every manual axis that the predicate `{predicate_type}` \
-                     varies over; vary the input before the condition",
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Returns `transposed_branches`, the transpositions of the two `branches` of a primal condition (refer to
-/// [`transpose_condition_branches`]), with every structural-zero cotangent that the peer branch returns as a value
-/// materialized inside its branch, so that both transposed branches have the same output signature. Cotangents that
-/// are zero in both branches remain absent from their output boundaries.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] when the transposed branches still disagree on their cotangent metadata
-/// after the materialization, and the errors of transposing the branches again.
-fn materialize_one_sided_condition_cotangents<V, O, D: TranspositionDriver<V, O>>(
-    driver: &D,
-    branches: [RegionRef<'_, V, O>; 2],
-    branch_input_indices: &[usize],
-    zero_outputs: &[bool],
-    destination_kinds: &[CotangentDestinationKind],
-    mut transposed_branches: [TransposedProgram<V, O>; 2],
-) -> Result<[TransposedProgram<V, O>; 2], DifferentiationError>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>,
-{
-    let materialize_zeros = [0, 1].map(|index| {
-        transposed_branches[index]
-            .cotangents()
-            .iter()
-            .zip(transposed_branches[1 - index].cotangents())
-            .map(|(slot, peer)| {
-                *slot == TransposedProgramCotangent::Zero && *peer == TransposedProgramCotangent::Output
-            })
-            .collect::<Vec<_>>()
-    });
-    for (index, materialize) in materialize_zeros.iter().enumerate() {
-        if materialize.contains(&true) {
-            transposed_branches[index] = driver.transpose_program_with_zero_seeds(
-                branches[index],
-                branch_input_indices,
-                materialize,
-                zero_outputs,
-                destination_kinds,
-            )?;
-        }
-    }
-    if transposed_branches[0].cotangents() != transposed_branches[1].cotangents() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`{CONDITION_OPERATION_NAME}` branch transposition returned inconsistent cotangent metadata after \
-             materializing one-sided zeros",
-        ))
-        .into());
-    }
-    Ok(transposed_branches)
-}
-
-/// Stages the transposed condition of a primal condition into `context`, selecting between the `transposed_branches`
-/// by the same known `predicate`, and returns its outputs (i.e., the cotangents that the transposed branches return).
-/// Its inputs are `[predicate, outputs..., cotangent_references..., residuals...]`, where `outputs` holds the live
-/// cotangents of the `outputs` of the primal condition whose `output_types` are not references, the cotangent
-/// references are those of `cotangents`, and the residuals are the known branch inputs. A reference output forwards a
-/// branch input whose state cotangent lives in the cotangent reference of the instruction input that supplies it, so it
-/// owns no cotangent input, and a structural-zero output cotangent stays symbolic in both transposed branches (refer to
-/// [`transpose_condition_branches`]), so it owns none either.
-fn stage_transposed_condition<V, O>(
-    context: &mut TracingContext<V, O>,
-    transposed_branches: &[TransposedProgram<V, O>; 2],
-    predicate: Tracer<TracingContext<V, O>>,
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    output_types: &[V::Type],
-    residuals: Vec<Tracer<TracingContext<V, O>>>,
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<Tracer<TracingContext<V, O>>>, ProgramError>
-where
-    V: Value<Type: ConditionType + DifferentiableType>,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V::Type>>,
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    check_count!("output", outputs, output_types.len(), ProgramError);
-    let mut transposed_inputs = Vec::with_capacity(1 + output_types.len() + residuals.len());
-    transposed_inputs.push(predicate);
-    transposed_inputs.extend(
-        outputs
-            .iter()
-            .zip(output_types)
-            .filter(|(_, output_type)| !output_type.is_reference())
-            .filter_map(|(cotangent, _)| cotangent.as_value().cloned()),
-    );
-    transposed_inputs.extend(cotangents.references().iter().cloned());
-    transposed_inputs.extend(residuals);
-    // The shared transposed-branch handles are attached directly, so repeated binds of one transposed branch intern
-    // by `Arc` identity instead of copying it again.
-    context.bind(
-        O::from(ConditionOperation::new()),
-        CalleeRegionDriver::new(&[transposed_branches[0].program().clone(), transposed_branches[1].program().clone()]),
-        transposed_inputs.as_slice(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -2677,7 +2336,8 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
-        Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
+        Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, TransposedProgram,
+        differentiate_at,
     };
     use crate::kernels::{KernelOperation, NoKernelExtension};
     use crate::macros::{check_gradient, check_operation_batching};
@@ -5115,7 +4775,8 @@ mod tests {
 
         let expected = Err(ProgramError::Type(TypeError::invalid(
             "`condition` reference output 0 must denote the same reference in both branches, but the `true` branch \
-             returns a reference that it allocates and the `false` branch returns a reference that it allocates",
+             returns a reference allocated in the region and the `false` branch returns a reference allocated in the \
+             region",
         )));
         assert_eq!(source.clone().discharge_references(0).map(|_| ()), expected);
         assert_eq!(
@@ -5151,7 +4812,7 @@ mod tests {
         );
         let expected = Err(ProgramError::Type(TypeError::invalid(
             "`condition` reference output 0 must denote the same reference in both branches, but the `true` branch \
-             returns instruction input 1 and the `false` branch returns instruction input 2",
+             returns region input 0 and the `false` branch returns region input 1",
         )));
         assert_eq!(source.clone().discharge_references(0).map(|_| ()), expected);
         for predicate in [true, false] {
@@ -5521,7 +5182,7 @@ mod tests {
         assert_eq!(
             program(false).discharge_references(0).map(|_| ()),
             Err(TypeError::invalid(
-                "`condition` `true` branch mutates instruction input 1 of type \
+                "`condition` `true` branch mutates region input 0 of type \
                  `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
                  axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
                  over, so devices that take different branches would leave it different across devices; vary the \
@@ -5635,7 +5296,7 @@ mod tests {
             Ok::<_, ProgramError>((invariant.read().unwrap(), varying.read().unwrap()))
         };
         let expected = Err(ProgramError::Type(TypeError::invalid(
-            "`condition` `false` branch mutates instruction input 1 of type \
+            "`condition` `false` branch mutates region input 0 of type \
              `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual axis \
              that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies over, so \
              devices that take different branches would leave it different across devices; vary the referent over \
@@ -6825,7 +6486,7 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let expected = Err(ProgramError::Type(TypeError::invalid(
             "`condition` reference output 0 must denote the same reference in both branches, but the `true` branch \
-             returns instruction input 1 and the `false` branch returns instruction input 2",
+             returns region input 0 and the `false` branch returns region input 1",
         )));
         for predicate in [true, false] {
             let evaluation = program.partially_evaluate(&[
@@ -6854,7 +6515,7 @@ mod tests {
         let (value_type, _) = manual_mutation_types(true);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type));
         let expected = Err(ProgramError::Type(TypeError::invalid(
-            "`condition` `true` branch mutates instruction input 1 of type \
+            "`condition` `true` branch mutates region input 0 of type \
              `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
              axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
              over, so devices that take different branches would leave it different across devices; vary the \
@@ -10940,7 +10601,7 @@ mod tests {
                 .map(|_| ()),
             Err(BatchingError::Program(ProgramError::Type(TypeError::invalid(
                 "`condition` reference output 0 must denote the same reference in both branches, but the `true` \
-                 branch returns instruction input 1 and the `false` branch returns instruction input 2",
+                 branch returns region input 0 and the `false` branch returns region input 1",
             )))),
         );
         assert_eq!(driver.batch_program_calls(), 0);
@@ -12393,16 +12054,16 @@ mod tests {
         let root_mismatch = |output: usize, true_input: usize, false_input: usize| {
             DifferentiationError::Program(ProgramError::Type(TypeError::invalid(format!(
                 "`condition` reference output {output} must denote the same reference in both branches, but the \
-                 `true` branch returns instruction input {true_input} and the `false` branch returns instruction \
-                 input {false_input}",
+                 `true` branch returns region input {true_input} and the `false` branch returns region input \
+                 {false_input}",
             ))))
         };
         for input_indices in [&[1][..], &[2], &[1, 2]] {
-            assert_eq!(program.jvp_with_respect_to(input_indices).map(|_| ()), Err(root_mismatch(0, 1, 2)));
+            assert_eq!(program.jvp_with_respect_to(input_indices).map(|_| ()), Err(root_mismatch(0, 0, 1)));
         }
         let reversed = condition_program(&[1], &[0]);
         for input_indices in [&[1][..], &[2], &[1, 2]] {
-            assert_eq!(reversed.jvp_with_respect_to(input_indices).map(|_| ()), Err(root_mismatch(0, 2, 1)));
+            assert_eq!(reversed.jvp_with_respect_to(input_indices).map(|_| ()), Err(root_mismatch(0, 1, 0)));
         }
 
         // Both branches can have one compact tangent output while assigning it to different primal output positions.
@@ -12425,10 +12086,10 @@ mod tests {
                 in (%3, %4)"},
         );
         for input_indices in [&[1][..], &[2], &[1, 2]] {
-            assert_eq!(swapped.jvp_with_respect_to(input_indices).map(|_| ()), Err(root_mismatch(0, 1, 2)));
+            assert_eq!(swapped.jvp_with_respect_to(input_indices).map(|_| ()), Err(root_mismatch(0, 0, 1)));
         }
         let reversed_swapped = condition_program(&[1, 0], &[0, 1]);
-        assert_eq!(reversed_swapped.jvp_with_respect_to(&[1]).map(|_| ()), Err(root_mismatch(0, 2, 1)));
+        assert_eq!(reversed_swapped.jvp_with_respect_to(&[1]).map(|_| ()), Err(root_mismatch(0, 1, 0)));
     }
 
     #[test]
@@ -12461,7 +12122,7 @@ mod tests {
                 in (%3)"},
         );
         let expected = Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid(
-            "`condition` `true` branch mutates instruction input 1 of type \
+            "`condition` `true` branch mutates region input 0 of type \
              `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
              axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
              over, so devices that take different branches would leave it different across devices; vary the \
@@ -14081,6 +13742,103 @@ mod tests {
                     Some(MaybeZero::Value(Array::scalar(expected).unwrap())),
                 ]),
             );
+        }
+    }
+
+    #[test]
+    fn test_condition_transposition_with_a_transpose_program_only_driver() {
+        /// A downstream driver that implements only `transpose_program`, so that the condition rule requests the
+        /// transposition of its branches through the default `transpose_program_with_zero_seeds`.
+        struct Driver([Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>; 2]);
+
+        impl RegionDriver<Array, ArrayOperation<Array>> for Driver {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
+            where
+                Array: 'r,
+                ArrayOperation<Array>: 'r,
+            {
+                self.0.iter().map(Program::entry_region_ref)
+            }
+        }
+
+        impl TranspositionDriver<Array, ArrayOperation<Array>> for Driver {
+            fn transpose_program(
+                &self,
+                region: RegionRef<'_, Array, ArrayOperation<Array>>,
+                input_indices: &[usize],
+                materialize_zeros: &[bool],
+                destination_kinds: &[CotangentDestinationKind],
+            ) -> Result<TransposedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
+                region.transpose(input_indices, materialize_zeros, destination_kinds)
+            }
+        }
+
+        // The branches return their input, negated in the `false` branch, followed by a second output that is dead,
+        // so the condition rule flags its cotangent as a structural zero. Program transposition, whose recursive
+        // driver serves that request symbolically, and the rule invoked directly with the custom driver give the same
+        // cotangents.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let branch = |negate| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let value = builder.add_input(scalar_type.clone());
+            let output = if negate {
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![value], None).unwrap()[0]
+            } else {
+                value
+            };
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output, value], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let value = builder.add_input(scalar_type.clone());
+        let branches = vec![builder.import_program(branch(false)), builder.import_program(branch(true))];
+        let output =
+            builder.add_instruction(ConditionOperation::new(), branches, vec![predicate, value], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let recursive = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
+        let (_, custom) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |tracers: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                let mut context = TranspositionContext::new(tracers[0].context().clone());
+                let inputs = [PartialValue::Known(tracers[1].clone()), PartialValue::Unknown(scalar_type.clone())];
+                let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+                ConditionOperation::<ArrayType>::new()
+                    .transpose(
+                        &mut context,
+                        &Driver([branch(false), branch(true)]),
+                        &inputs,
+                        &[MaybeZero::Value(tracers[0].clone()), MaybeZero::Zero(scalar_type.clone())],
+                        &accumulators,
+                    )
+                    .unwrap();
+                Ok(vec![context.take_cotangents(&accumulators).unwrap()[1].as_value().unwrap().clone()])
+            },
+            vec![scalar_type.clone(), ArrayType::scalar(DataType::Boolean)],
+        )
+        .unwrap();
+        let rendering = indoc! {"
+            lambda %0:f32[], %1:bool[] .
+            let %2:f32[] = condition %1 %0 [
+                true={
+                    lambda %0:f32[] .
+                    in (%0)
+                },
+                false={
+                    lambda %0:f32[] .
+                    let %1:f32[] = neg %0
+                    in (%1)
+                },
+            ]
+            in (%2)"};
+        assert_eq!(recursive.program().to_string(), rendering);
+        assert_eq!(custom.to_string(), rendering);
+        for (predicate, expected) in [(true, 3.0f32), (false, -3.0f32)] {
+            let inputs = vec![Array::scalar(3.0f32).unwrap(), Array::scalar(predicate).unwrap()];
+            assert_eq!(recursive.program().interpret(inputs.clone()), Ok(vec![Array::scalar(expected).unwrap()]));
+            assert_eq!(custom.interpret(inputs), Ok(vec![Array::scalar(expected).unwrap()]));
         }
     }
 
@@ -15876,7 +15634,7 @@ mod tests {
         assert_eq!(
             trace(true).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`condition` `false` branch mutates instruction input 1 of type \
+                "`condition` `false` branch mutates region input 0 of type \
                  `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
                  axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
                  over, so devices that take different branches would leave it different across devices; vary the \
