@@ -61,35 +61,25 @@ use crate::programs::{
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields, where a
-/// configuration attribute of the same name would be indistinguishable from the field.
-const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
-    ["target", "input_layouts", "input_output_alias", "has_side_effect", "effect_class", "batching"];
-
-/// Returns `count` followed by `noun`, pluralized with a trailing `s` unless `count` is one, for diagnostics.
-fn pluralize(count: usize, noun: &str) -> String {
-    if count == 1 { format!("{count} {noun}") } else { format!("{count} {noun}s") }
-}
-
-/// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
-/// The variants cover every attribute kind that a typed foreign-function interface can decode: UTF-8 strings,
-/// arbitrary binary data, Booleans, signed and unsigned integers of 8, 16, 32, and 64 bits, 32-bit and 64-bit
+/// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the underlying foreign
+/// kernel. The variants cover every attribute kind that a typed Foreign Function Interface (FFI) can decode: UTF-8
+/// strings, arbitrary binary data, Booleans, signed and unsigned integers of 8, 16, 32, and 64 bits, 32-bit and 64-bit
 /// floating-point values, one-dimensional [`CustomCallArrayAttribute`]s of those numeric types, and nested
 /// dictionaries. Kernels decode scalars strictly by type, so a kernel that expects, for example, a 32-bit float must
-/// receive [`F32`](Self::F32) rather than [`F64`](Self::F64). Binary payloads preserve every byte, including NUL and
-/// invalid UTF-8, without an implicit text encoding. Backends must preserve these values or reject unsupported
-/// variants.
+/// receive [`F32`](Self::F32) rather than [`F64`](Self::F64). Binary payloads preserve every byte, including
+/// zero-valued bytes and invalid UTF-8, without an implicit text encoding. Backends must preserve these values or
+/// reject unsupported variants.
 ///
-/// The `From` conversions allow direct arguments to [`CustomCallOperation::with_attribute`]: `&str` and `String`
-/// become [`String`](Self::String), `&[u8]` and `Vec<u8>` become [`Bytes`](Self::Bytes), every supported scalar
-/// type becomes its corresponding scalar variant, and every other supported `Vec<T>` becomes an
-/// [`Array`](Self::Array). Unsigned 8-bit arrays must therefore be spelled out explicitly as
-/// [`CustomCallArrayAttribute::U8`]. Unsuffixed integer and floating-point literals follow Rust's default literal
-/// types (i.e., `i32` and `f64`), so use suffixes such as `4i64` or `2.5f32` to select another width.
+/// The `From` conversions allow direct arguments to [`CustomCallOperation::with_attribute`]: `&str` and `String` become
+/// [`String`](Self::String), `&[u8]` and `Vec<u8>` become [`Bytes`](Self::Bytes), every supported scalar type becomes
+/// its corresponding scalar variant, and every other supported `Vec<T>` becomes an [`Array`](Self::Array). Unsigned
+/// 8-bit arrays must therefore be spelled out explicitly as [`CustomCallArrayAttribute::U8`]. Unsuffixed integer and
+/// floating-point literals follow Rust's default literal types (i.e., `i32` and `f64`), so use suffixes such as `4i64`
+/// or `2.5f32` to select another width.
 ///
 /// Equality and hashing compare floating-point values bitwise, so that attributes are faithful keys of the values
-/// that backends receive (e.g., `-0.0` and `+0.0` are distinct, and every NaN equals itself). [`I64`](Self::I64) and
-/// [`F64`](Self::F64) render as bare literals, while the other scalar variants render with a Rust type suffix
+/// that backends receive (e.g., `-0.0` and `+0.0` are distinct, and every NaN equals itself). [`I64`](Self::I64)
+/// and [`F64`](Self::F64) render as bare literals, while the other scalar variants render with a Rust type suffix
 /// (e.g., `4i32` or `2.5f32`), and [`String`](Self::String) renders as a quoted and escaped Rust string literal
 /// (e.g., `"fast"`), so that renderings distinguish every scalar type and keep string contents apart from the
 /// surrounding operation syntax.
@@ -575,6 +565,11 @@ impl Display for CustomCallBatching {
 /// Canonical operation name for [`CustomCallOperation`].
 pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 
+/// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields, where a
+/// configuration attribute of the same name would be indistinguishable from the field.
+const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
+    ["target", "input_layouts", "input_output_alias", "has_side_effect", "effect_class", "batching"];
+
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name. It is the
 /// analogue of [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). The operation
 /// is opaque to Ryft: its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s
@@ -889,9 +884,10 @@ impl CustomCallOperation {
             .collect::<Vec<_>>();
         let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
             return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} but received only {}",
-                pluralize(dynamic_output_dimensions.len(), "trailing output-extent dimension"),
-                pluralize(input_types.len(), "input"),
+                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimension(s) but received only \
+                 {} input(s)",
+                dynamic_output_dimensions.len(),
+                input_types.len(),
             )));
         };
         let mut refinements = DimensionRefinements::default();
@@ -1296,9 +1292,9 @@ impl CustomCallOperation {
         }
         if self.input_layouts.len() != input_types.len() {
             return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` declares {} but the call has {}",
-                pluralize(self.input_layouts.len(), "input layout"),
-                pluralize(input_types.len(), "array input"),
+                "`{CUSTOM_CALL_OPERATION_NAME}` declares {} input layout(s) but the call has {} array input(s)",
+                self.input_layouts.len(),
+                input_types.len(),
             )));
         }
         for (input_index, (layout, input_type)) in self.input_layouts.iter().zip(input_types).enumerate() {
@@ -1328,16 +1324,17 @@ impl CustomCallOperation {
         for alias in &self.input_output_aliases {
             let Some(input_type) = input_types.get(alias.input_index) else {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to input {} but the call has {}",
+                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to input {} but the call has \
+                     {} array input(s)",
                     alias.input_index,
-                    pluralize(input_types.len(), "array input"),
+                    input_types.len(),
                 )));
             };
             let Some(output_type) = output_types.get(alias.output_index) else {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to output {} but the call has {}",
+                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to output {} but the call has {} output(s)",
                     alias.output_index,
-                    pluralize(output_types.len(), "output"),
+                    output_types.len(),
                 )));
             };
             if *input_type != output_type {
@@ -2753,7 +2750,7 @@ mod tests {
                 },
                 {
                     input_types = [],
-                    error = "`custom_call` alias `0->0` refers to input 0 but the call has 0 array inputs",
+                    error = "`custom_call` alias `0->0` refers to input 0 but the call has 0 array input(s)",
                 },
             ],
         );
@@ -2763,7 +2760,7 @@ mod tests {
                 .unwrap(),
             cases = [{
                 input_types = [ArrayType::new_static(DataType::F32, [2])],
-                error = "`custom_call` alias `0->1` refers to output 1 but the call has 1 output",
+                error = "`custom_call` alias `0->1` refers to output 1 but the call has 1 output(s)",
             }],
         );
 
@@ -2840,7 +2837,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "`custom_call` expects 2 trailing output-extent dimensions but received only 1 input",
+                "`custom_call` expects 2 trailing output-extent dimension(s) but received only 1 input(s)",
             )),
         );
 
@@ -3116,7 +3113,7 @@ mod tests {
                 },
                 {
                     input_types = [matrix_type.clone()],
-                    error = "`custom_call` declares 2 input layouts but the call has 1 array input",
+                    error = "`custom_call` declares 2 input layout(s) but the call has 1 array input(s)",
                 },
                 {
                     input_types = [ArrayType::new_static(DataType::F32, [2]), ArrayType::scalar(DataType::I32)],
@@ -3157,7 +3154,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_parent_output_types(&[matrix_type.clone().into(), matrix_type.into(), length.into()], &[]),
-            Err(TypeError::invalid("`custom_call` declares 1 input layout but the call has 2 array inputs")),
+            Err(TypeError::invalid("`custom_call` declares 1 input layout(s) but the call has 2 array input(s)")),
         );
     }
 
