@@ -59,8 +59,6 @@ use crate::programs::{
     TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the underlying foreign
 /// kernel. The variants cover every attribute kind that a typed Foreign Function Interface (FFI) can decode: UTF-8
 /// strings, arbitrary binary data, Booleans, signed and unsigned integers of 8, 16, 32, and 64 bits, 32-bit and 64-bit
@@ -68,7 +66,7 @@ use crate::programs::{
 /// dictionaries. Kernels decode scalars strictly by type, so a kernel that expects, for example, a 32-bit float must
 /// receive [`F32`](Self::F32) rather than [`F64`](Self::F64). Binary payloads preserve every byte, including
 /// zero-valued bytes and invalid UTF-8, without an implicit text encoding. Backends must preserve these values or
-/// reject unsupported variants.
+/// reject unsupported variants. Dictionaries retain insertion order and require unique names within each dictionary.
 ///
 /// The `From` conversions allow direct arguments to [`CustomCallOperation::with_attribute`]: `&str` and `String` become
 /// [`String`](Self::String), `&[u8]` and `Vec<u8>` become [`Bytes`](Self::Bytes), every supported scalar type becomes
@@ -104,65 +102,21 @@ use crate::programs::{
 /// ```
 #[derive(Clone, Debug)]
 pub enum CustomCallAttribute {
-    /// UTF-8 string value.
     String(String),
-
-    /// Opaque binary data with no UTF-8 requirement.
     Bytes(Vec<u8>),
-
-    /// Boolean value.
     Boolean(bool),
-
-    /// 8-bit signed-integer value.
     I8(i8),
-
-    /// 16-bit signed-integer value.
     I16(i16),
-
-    /// 32-bit signed-integer value.
     I32(i32),
-
-    /// 64-bit signed-integer value.
     I64(i64),
-
-    /// 8-bit unsigned-integer value.
     U8(u8),
-
-    /// 16-bit unsigned-integer value.
     U16(u16),
-
-    /// 32-bit unsigned-integer value.
     U32(u32),
-
-    /// 64-bit unsigned-integer value.
     U64(u64),
-
-    /// 32-bit floating-point value.
     F32(f32),
-
-    /// 64-bit floating-point value.
     F64(f64),
-
-    /// One-dimensional array of numeric values.
     Array(CustomCallArrayAttribute),
-
-    /// Nested dictionary of named attributes, in insertion order. Names must be unique within each dictionary.
     Dictionary(Vec<(String, CustomCallAttribute)>),
-}
-
-impl CustomCallAttribute {
-    /// Returns the first attribute name that `attributes`, or any dictionary nested in them, declares more than once.
-    fn duplicate_name(attributes: &[(String, Self)]) -> Option<&str> {
-        attributes.iter().enumerate().find_map(|(index, (name, value))| {
-            if attributes[..index].iter().any(|(existing, _)| existing == name) {
-                return Some(name.as_str());
-            }
-            match value {
-                Self::Dictionary(attributes) => Self::duplicate_name(attributes),
-                _ => None,
-            }
-        })
-    }
 }
 
 impl Display for CustomCallAttribute {
@@ -245,48 +199,55 @@ impl Hash for CustomCallAttribute {
 }
 
 impl From<&str> for CustomCallAttribute {
+    #[inline]
     fn from(value: &str) -> Self {
         Self::String(value.to_string())
     }
 }
 
 impl From<String> for CustomCallAttribute {
+    #[inline]
     fn from(value: String) -> Self {
         Self::String(value)
     }
 }
 
 impl From<&[u8]> for CustomCallAttribute {
+    #[inline]
     fn from(value: &[u8]) -> Self {
         Self::Bytes(value.to_vec())
     }
 }
 
 impl From<Vec<u8>> for CustomCallAttribute {
+    #[inline]
     fn from(value: Vec<u8>) -> Self {
         Self::Bytes(value)
     }
 }
 
 impl From<bool> for CustomCallAttribute {
+    #[inline]
     fn from(value: bool) -> Self {
         Self::Boolean(value)
     }
 }
 
 impl From<CustomCallArrayAttribute> for CustomCallAttribute {
+    #[inline]
     fn from(value: CustomCallArrayAttribute) -> Self {
         Self::Array(value)
     }
 }
 
-/// Implements the scalar and array `From` conversions into [`CustomCallAttribute`] for one numeric element type.
+/// Implements the scalar and array `From` conversions into [`CustomCallAttribute`] for a numeric element type.
 macro_rules! impl_custom_call_attribute_conversions {
     // This branch converts both scalars and vectors of the element type.
     ($type:ty, $variant:ident) => {
         impl_custom_call_attribute_conversions!(@scalar $type, $variant);
 
         impl From<Vec<$type>> for CustomCallAttribute {
+            #[inline]
             fn from(value: Vec<$type>) -> Self {
                 Self::Array(CustomCallArrayAttribute::$variant(value))
             }
@@ -296,6 +257,7 @@ macro_rules! impl_custom_call_attribute_conversions {
     // This branch converts only scalars of the element type, for `u8`, whose vectors are binary data.
     (@scalar $type:ty, $variant:ident) => {
         impl From<$type> for CustomCallAttribute {
+            #[inline]
             fn from(value: $type) -> Self {
                 Self::$variant(value)
             }
@@ -313,6 +275,8 @@ impl_custom_call_attribute_conversions!(u32, U32);
 impl_custom_call_attribute_conversions!(u64, U64);
 impl_custom_call_attribute_conversions!(f32, F32);
 impl_custom_call_attribute_conversions!(f64, F64);
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One-dimensional numeric array carried by [`CustomCallAttribute::Array`]. The element types are exactly the numeric
 /// array element types that a typed foreign-function interface can decode (e.g., as a `Span<const int32_t>` in XLA's
@@ -1267,7 +1231,20 @@ impl CustomCallOperation {
     /// Validates the attributes, declared input layouts, and aliases of this operation against its
     /// array input types and effective output types, which both universes share.
     fn validate_configuration(&self, input_types: &[&ArrayType], output_types: &[ArrayType]) -> Result<(), TypeError> {
-        if let Some(name) = CustomCallAttribute::duplicate_name(self.attributes.as_slice()) {
+        /// Returns the first duplicate attribute name, including names in nested dictionaries.
+        fn duplicate_name(attributes: &[(String, CustomCallAttribute)]) -> Option<&str> {
+            attributes.iter().enumerate().find_map(|(index, (name, value))| {
+                if attributes[..index].iter().any(|(existing, _)| existing == name) {
+                    return Some(name.as_str());
+                }
+                match value {
+                    CustomCallAttribute::Dictionary(attributes) => duplicate_name(attributes),
+                    _ => None,
+                }
+            })
+        }
+
+        if let Some(name) = duplicate_name(self.attributes.as_slice()) {
             return Err(TypeError::invalid(format!(
                 "`{CUSTOM_CALL_OPERATION_NAME}` declares attribute `{name}` more than once",
             )));
