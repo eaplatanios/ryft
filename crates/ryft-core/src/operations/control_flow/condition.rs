@@ -215,9 +215,8 @@ impl<T: Type> Copy for ConditionOperation<T> {}
 
 impl<T: ConditionType> ConditionOperation<T> {
     /// Creates a new [`ConditionOperation`]. The two branch [`Program`]s are supplied separately as the operation's
-    /// attached regions (via the region driver passed to [`Context::bind`]); [`Operation::infer_output_types`]
-    /// validates that the branch interfaces agree and that the predicate input is a scalar Boolean.
-    #[inline]
+    /// attached regions via the region driver passed to [`Context::bind`]. [`Operation::infer_output_types`] validates
+    /// that the branch interfaces agree and that the predicate input is a scalar Boolean.
     pub const fn new() -> Self {
         Self { marker: PhantomData }
     }
@@ -230,21 +229,6 @@ impl<T: ConditionType> ConditionOperation<T> {
         Err(TypeError::invalid(format!(
             "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{predicate_type}`",
         )))
-    }
-
-    /// Returns the `true` and `false` branches attached to an application of a condition through `driver`, after
-    /// validating that the application has exactly two regions and `input_count` inputs (i.e., the predicate followed
-    /// by one input per branch input).
-    fn branches<V: Value<Type = T>, O: Operation<Type = T>, D: RegionDriver<V, O>>(
-        driver: &D,
-        input_count: usize,
-    ) -> Result<[RegionRef<V, O>; 2], ProgramError> {
-        let branches = [driver.region(0)?, driver.region(1)?];
-        let expected = branches[0].input_ids().len() + 1;
-        if input_count != expected {
-            return Err(ProgramError::InvalidInputCount { expected, actual: input_count });
-        }
-        Ok(branches)
     }
 
     /// Validates the application of this condition to inputs of the types `input_types` (i.e., the predicate followed
@@ -618,7 +602,7 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        let branches = Self::branches(driver, inputs.len())?;
+        let branches = driver.condition_branches(inputs.len())?;
         self.validate_reference_output_roots(branches)?;
         let predicate_type = inputs[0].try_as_value("a condition predicate")?.r#type().into_owned();
         self.validate_reference_mutations(&predicate_type, branches, |source| {
@@ -726,7 +710,7 @@ where
         // Specializing a concrete predicate or splitting symbolic branches rewrites the original condition. Validate
         // the complete application first, including direct context binding and conditions that return no values, so
         // that a concrete predicate cannot skip the contracts of the branch that it does not select.
-        let branches = Self::branches(driver, inputs.len())?;
+        let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, branches)?;
         // A known predicate selects a branch only when it resolves to a program constant: under a staging known-side
@@ -798,7 +782,7 @@ where
         // Validate the original logical application after input refinement, before either lowering rewrites the
         // branches, so that a staging parent cannot skip it. Per-item types remove the mapped axis while retaining
         // input refinements.
-        let branches = Self::branches(driver, inputs.len())?;
+        let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
         self.validate_application(&input_types, branches)?;
         let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
@@ -870,7 +854,7 @@ where
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Validate the complete per-item application before structural batching or per-item selection rewrites it, so
         // that a staging parent cannot skip it.
-        let branches = Self::branches(driver, inputs.len())?;
+        let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>();
         self.validate_application(&input_types, branches)?;
         let (predicate, branch_inputs) = (&inputs[0], &inputs[1..]);
@@ -944,7 +928,7 @@ where
         // the complete primal application before analyzing tangent slots or deriving either branch program;
         // specializing the attached regions alone validates only their input interfaces. Matching primal signatures
         // and reference roots give both branches the same tangent slots (refer to `ConditionJvpActivity::new`).
-        let branches = Self::branches(driver, inputs.len())?;
+        let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
         let output_count = self.validate_application(&input_types, branches)?.len();
         let activity = ConditionJvpActivity::new(driver, branches, &inputs[1..])?;
@@ -1197,6 +1181,28 @@ where
         Ok(Output::To::<Self>::from_parameters(true_structure, outputs)?)
     }
 }
+
+/// Condition-specific branch lookup for a [`RegionDriver`].
+trait ConditionRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> {
+    /// Returns the `true` and `false` branches (i.e., regions `0` and `1`) attached to this condition application,
+    /// checking that `input_count` counts the predicate followed by one input per `true` branch input.
+    /// [`ConditionOperation`] validates the branch signatures separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] if either branch is missing, or [`ProgramError::InvalidInputCount`]
+    /// if `input_count` does not match the `true` branch's input count plus the predicate.
+    fn condition_branches(&self, input_count: usize) -> Result<[RegionRef<'_, V, O>; 2], ProgramError> {
+        let branches = [self.region(0)?, self.region(1)?];
+        let expected = branches[0].input_ids().len() + 1;
+        if input_count != expected {
+            return Err(ProgramError::InvalidInputCount { expected, actual: input_count });
+        }
+        Ok(branches)
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, D: ?Sized + RegionDriver<V, O>> ConditionRegionDriver<V, O> for D {}
 
 /// Reference that the root of a `condition` branch's reference analysis denotes at the condition boundary. It is
 /// compared across the two branches by [`ConditionOperation::validate_reference_output_roots`] and named by the
