@@ -1080,8 +1080,10 @@ enum ReferenceDischargeBinding<V> {
 /// Represents what a declared input of a rebuilt [`Region`](crate::Region) carries across a
 /// [`ReferenceDischargeRegionBoundary`] (i.e., a value, the complete handle of a caller allocation, or an independently
 /// processed part of its state). This describes the discharge rewrite, rather than the original operation's input
-/// contract. For example, `scan` discharge can normalize explicit indexing of a reference root into a slice-sized state
-/// input, then stack the resulting slices to reconstruct the caller's allocation.
+/// contract. For example, `scan` discharge declares a reference stack as the complete handle of its allocation, whose
+/// whole state the rebuilt body then threads as a carry and indexes with its own index input, while `shard_map`
+/// discharge gives its body the local shard of a reference input as an independently processed part of the caller's
+/// global allocation and commits each device's final shard back into it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReferenceDischargeRegionInput {
     /// The input carries a value and no reference.
@@ -1095,9 +1097,10 @@ pub enum ReferenceDischargeRegionInput {
     /// The rebuilt region processes a selected part of this caller allocation, typed by the region input rather than
     /// by the complete allocation. The owning rule proves that this state can be processed independently, requests its
     /// final value through [`ReferenceDischargeRegionOutput::View`] when mutated, and integrates that value into the
-    /// caller allocation. This permits slice-sized `scan` discharge without exposing an implicit view in the source
-    /// `scan`'s body contract. Other handles must not observe overlapping state independently. A preserved allocation
-    /// retains its reference input and cannot publish an explicit state value.
+    /// caller allocation. This permits discharging a region whose input is typed by a part of the allocation (e.g., the
+    /// local shard that a `shard_map` body receives for a global reference input) without exposing an implicit view in
+    /// the source operation's region contract. Other handles must not observe overlapping state independently. A
+    /// preserved allocation retains its reference input and cannot publish an explicit state value.
     View(ReferenceDischargeAllocationId),
 }
 

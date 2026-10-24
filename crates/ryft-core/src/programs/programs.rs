@@ -2588,7 +2588,7 @@ pub(crate) struct AttachedRegionLiveness<'o, 'a, V: Value, O: Operation<Type = V
     /// Identities of each attached region's input signature types whose relationships the application of the
     /// instruction does not prove, in attachment order. This is an [`Option`] as it is computed on the first query.
     /// This is a performance optimization because most pruned instructions never ask for this.
-    unproven_region_identities: Option<Vec<Vec<<V::Type as Type>::Identity>>>,
+    region_identities_needing_runtime_checks: Option<Vec<Vec<<V::Type as Type>::Identity>>>,
 }
 
 impl<'o, 'a, V: Value, O: Operation<Type = V::Type>> AttachedRegionLiveness<'o, 'a, V, O> {
@@ -2603,7 +2603,7 @@ impl<'o, 'a, V: Value, O: Operation<Type = V::Type>> AttachedRegionLiveness<'o, 
         input_types: Vec<V::Type>,
         regions: &'o [RegionId],
     ) -> Self {
-        Self { analysis, operation, input_types, regions, unproven_region_identities: None }
+        Self { analysis, operation, input_types, regions, region_identities_needing_runtime_checks: None }
     }
 
     /// Returns the identities of each attached region's input signature whose relationships the application of the
@@ -2617,8 +2617,11 @@ impl<'o, 'a, V: Value, O: Operation<Type = V::Type>> AttachedRegionLiveness<'o, 
     /// [`Operation::input_region_provenance`] forwards from an instruction input whose type refines the declared one
     /// enters with that type. Any other region input (e.g., a slice of a stacked input, or an operation-local input)
     /// has an unknown entry type, which leaves every identity that it carries unproven.
-    fn unproven_region_identities(&mut self) -> Result<&[Vec<<V::Type as Type>::Identity>], ProgramError> {
-        if self.unproven_region_identities.is_none() {
+    fn region_identities_needing_runtime_checks(
+        &mut self,
+    ) -> Result<&[Vec<<V::Type as Type>::Identity>], ProgramError> {
+        if self.region_identities_needing_runtime_checks.is_none() {
+            let unforwarded_types = self.unforwarded_input_types()?;
             let sources = self
                 .regions
                 .iter()
@@ -2634,10 +2637,10 @@ impl<'o, 'a, V: Value, O: Operation<Type = V::Type>> AttachedRegionLiveness<'o, 
                     sources.len(),
                 )));
             }
-            let mut unproven_region_identities = Vec::with_capacity(sources.len());
+            let mut region_identities_needing_runtime_checks = Vec::with_capacity(sources.len());
             for (region_index, (source, inferred_entry_types)) in sources.iter().zip(inferred_entry_types).enumerate() {
-                let declared_types = source.input_types();
-                let entry_types = match inferred_entry_types.as_ref() {
+                let mut declared_types = source.input_types();
+                let mut entry_types = match inferred_entry_types.as_ref() {
                     Some(entry_types) => {
                         if entry_types.len() != declared_types.len() {
                             return Err(ProgramError::MalformedProgram(format!(
@@ -2663,16 +2666,49 @@ impl<'o, 'a, V: Value, O: Operation<Type = V::Type>> AttachedRegionLiveness<'o, 
                         })
                         .collect(),
                 };
-                unproven_region_identities.push(type_identities_needing_runtime_checks(&declared_types, &entry_types)?);
+
+                // The instruction inputs that no region receives take part in the boundary's relationships with
+                // their actual types (e.g., a `scan` carry declared `f32[length]` relates to the runtime length
+                // `dimension<length>`), so they join the comparison as members whose entry type is known exactly.
+                declared_types.extend(unforwarded_types.iter().map(|r#type| (*r#type).clone()));
+                entry_types.extend(unforwarded_types.iter().map(|r#type| Some(*r#type)));
+                region_identities_needing_runtime_checks
+                    .push(type_identities_needing_runtime_checks(&declared_types, &entry_types)?);
             }
-            self.unproven_region_identities = Some(unproven_region_identities);
+            self.region_identities_needing_runtime_checks = Some(region_identities_needing_runtime_checks);
         }
-        Ok(self.unproven_region_identities.as_deref().unwrap())
+        Ok(self.region_identities_needing_runtime_checks.as_deref().unwrap())
+    }
+
+    /// Returns the types of the instruction inputs that no attached region receives through
+    /// [`Operation::input_region_provenance`] (e.g., the runtime length of a `scan`). The operation consumes such an
+    /// input itself and keeps it whatever its regions use, so it takes part in the boundary's identity relationships
+    /// as a member whose actual type is known exactly, and the region inputs that share an unproven identity with it
+    /// are its validation peers: dropping one would erase the runtime check that relates it to the kept input.
+    fn unforwarded_input_types(&self) -> Result<Vec<&V::Type>, ProgramError> {
+        let mut forwarded = vec![false; self.input_types.len()];
+        for (region_index, &region) in self.regions.iter().enumerate() {
+            let input_count = RegionRef::new(self.analysis.arena, region)?.input_ids().len();
+            for input_index in 0..input_count {
+                if let InputRegionProvenance::Input { index } =
+                    self.operation.input_region_provenance(region_index, input_index)
+                    && let Some(is_forwarded) = forwarded.get_mut(index)
+                {
+                    *is_forwarded = true;
+                }
+            }
+        }
+        Ok(self
+            .input_types
+            .iter()
+            .zip(&forwarded)
+            .filter(|(_, is_forwarded)| !**is_forwarded)
+            .map(|(r#type, _)| r#type)
+            .collect())
     }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLiveness<'_, '_, V, O> {
-    #[inline]
     fn used_region_inputs(&mut self, region_index: usize, used_outputs: &[bool]) -> Result<Vec<bool>, ProgramError> {
         let region = *self.regions.get(region_index).ok_or_else(|| {
             ProgramError::MalformedProgram(format!("the instruction has no attached region {region_index}"))
@@ -2684,12 +2720,20 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
         let pruning = self.analysis.region_pruning(region, used_outputs)?;
         let mut live = source.input_ids().iter().map(|input| pruning.live_atoms[input.index()]).collect::<Vec<_>>();
 
+        // Collect the identities of the instruction inputs that no attached region receives, which seed the retention
+        // below in the same way as live region inputs (refer to `unforwarded_input_types`).
+        let unforwarded_identities = self
+            .unforwarded_input_types()?
+            .into_iter()
+            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
         // The region boundary validates the identities that its inputs share. When the application leaves such a
-        // relationship unproven (refer to `unproven_region_identities`), every peer of a retained input remains live
-        // even if the body never reads it: dropping one would erase a runtime equality check without necessarily
-        // changing any output type. Proven relationships and independent inputs follow ordinary data and effect
-        // liveness, so redundant peers (e.g., two carries fed by the same `f32[n]` value) stay prunable.
-        let identities_needing_runtime_checks = &self.unproven_region_identities()?[region_index];
+        // relationship unproven (refer to `region_identities_needing_runtime_checks`), every peer of a retained input
+        // remains live even if the body never reads it: dropping one would erase a runtime equality check without
+        // necessarily changing any output type. Proven relationships and independent inputs follow ordinary data and
+        // effect liveness, so redundant peers (e.g., two carries fed by the same `f32[n]` value) stay prunable.
+        let identities_needing_runtime_checks = &self.region_identities_needing_runtime_checks()?[region_index];
 
         // Record which identities each declared input carries. An input such as `f32[m, n]` connects two groups
         // of peers, so retaining it can make inputs carrying either `m` or `n` necessary for validation.
@@ -2715,6 +2759,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
                 retain(identities, &mut retained_identities);
             }
         }
+
+        // Inputs consumed by the instruction itself (e.g., a scan's runtime length) remain live independently of
+        // region liveness. Seed their unchecked identities too, so the loop below retains region inputs that share
+        // those identities and preserves the runtime equality checks between them.
+        retain(&unforwarded_identities, &mut retained_identities);
 
         // Retain peers of those inputs, collecting any further unproven identities they introduce. Repeat until no
         // input is added: with unproven `m` and `n` in `[f32[m], f32[m, n], f32[n]]`, keeping the last input retains
@@ -2752,7 +2801,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Shape,
+        DimensionBounds, DimensionType, DimensionVariable, Shape,
     };
     use crate::contexts::EagerContext;
     use crate::macros::check_count;
@@ -5707,6 +5756,33 @@ mod tests {
         let mut analysis = RegionPruningAnalysis::new(&effectful.regions);
         let mut liveness = AttachedRegionLiveness::new(&mut analysis, &operation, Vec::new(), &attached);
         assert_eq!(liveness.used_region_inputs(0, &[]), Ok(vec![true, true, false, true]));
+    }
+
+    #[test]
+    fn test_attached_region_liveness_keeps_peers_of_unforwarded_instruction_inputs() {
+        // The runtime length of a dynamic-length `scan` is an instruction input that no region receives, so the
+        // operation keeps it whatever the body uses. A carry declared `f32[length]` but fed `f32[3]` is checked only
+        // at the scan boundary against that length, so it stays live as the length's validation peer even though
+        // the body never reads it, while the index input that nothing reads is pruned as usual.
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let mut body = ProgramBuilder::<TestValue, TestIrOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let related =
+            body.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
+        let sum = body.add_input(ArrayType::scalar(DataType::F32).into());
+        let body = body
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![related, sum], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let operation = TestIrOperation::from(ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length.clone())));
+        let input_types = vec![
+            ArrayType::new_static(DataType::F32, [3]).into(),
+            ArrayType::scalar(DataType::F32).into(),
+            DimensionType::from(length).into(),
+        ];
+        let attached = [body.entry()];
+        let mut analysis = RegionPruningAnalysis::new(&body.regions);
+        let mut liveness = AttachedRegionLiveness::new(&mut analysis, &operation, input_types, &attached);
+        assert_eq!(liveness.used_region_inputs(0, &[false, true]), Ok(vec![false, true, true]));
     }
 
     #[test]
