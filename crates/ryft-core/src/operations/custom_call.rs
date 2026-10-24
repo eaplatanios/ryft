@@ -634,8 +634,6 @@ pub struct CustomCallOperation {
     batching: CustomCallBatching,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl CustomCallOperation {
     /// Creates a new [`CustomCallOperation`] with the provided target name and declared output types.
     ///
@@ -658,8 +656,9 @@ impl CustomCallOperation {
 
     /// Returns this [`CustomCallOperation`] with the provided typed configuration attribute appended. Attribute names
     /// must be unique (including within nested [`Dictionary`](CustomCallAttribute::Dictionary) attributes) and must
-    /// not reuse the names of the operation's own rendered fields (`target`, `input_layouts`, `input_output_alias`,
-    /// `has_side_effect`, `effect_class`, and `batching`), both of which type inference validates.
+    /// not reuse the names of the operation's own rendered fields (i.e., `target`, `input_layouts`,
+    /// `input_output_alias`, `has_side_effect`, `effect_class`, and `batching`), both of which type
+    /// inference validates.
     #[inline]
     pub fn with_attribute<N: Into<String>, V: Into<CustomCallAttribute>>(mut self, name: N, value: V) -> Self {
         self.attributes.push((name.into(), value.into()));
@@ -667,24 +666,23 @@ impl CustomCallOperation {
     }
 
     /// Returns this [`CustomCallOperation`] declaring the buffer layouts in which the kernel receives its array
-    /// inputs, replacing any earlier declaration. The declaration has one entry per array input (excluding the
-    /// trailing dimension inputs of the mixed [`ArrayIrType`] form). [`None`] entries request dense row-major storage,
-    /// and an empty declaration requests it for every input, regardless of the layouts of their [`ArrayType`]s. Backends
+    /// inputs, replacing any earlier declaration. The declaration has one entry per array input (excluding the trailing
+    /// dimension inputs of the mixed [`ArrayIrType`] form). [`None`] entries request dense row-major storage, and an
+    /// empty declaration requests it for every input, regardless of the layouts of their [`ArrayType`]s. Backends
     /// convert each input to the requested layout before invoking the kernel, so the kernel's buffer contract does not
-    /// depend on how the input value happens to be stored. This holds after batching too, which shifts declared
-    /// layouts together with the inputs that gain a leading batch axis. Row-major defaults remain row-major after
-    /// inserting that most-major axis. Count, rank, and alias compatibility are validated during type inference, when
-    /// the input types are available.
+    /// depend on how the input value happens to be stored. This holds after batching too, which shifts declared layouts
+    /// together with the inputs that gain a leading batch axis. Row-major defaults remain row-major after inserting
+    /// that most-major axis. Count, rank, and alias compatibility are validated during type inference, when the input
+    /// types are available.
     #[inline]
     pub fn with_input_layouts<L: IntoIterator<Item = Option<Layout>>>(mut self, input_layouts: L) -> Self {
         self.input_layouts = input_layouts.into_iter().collect();
         self
     }
 
-    /// Returns this operation with an alias from array input `input_index` to array output `output_index`.
-    ///
-    /// Index bounds and type compatibility are validated during type inference, when the input types are available.
-    /// Each input and output can participate in at most one alias.
+    /// Returns this operation with an alias from array input `input_index` to array output `output_index`. Index bounds
+    /// and type compatibility are validated during type inference, when the input types are available. Each input and
+    /// output can participate in at most one alias.
     pub fn with_input_output_alias(mut self, input_index: usize, output_index: usize) -> Result<Self, TypeError> {
         if let Some(alias) = self
             .input_output_aliases
@@ -701,7 +699,7 @@ impl CustomCallOperation {
     }
 
     /// Returns this call declaring [`EffectClass::UnorderedIo`], replacing any earlier effect selection. This is the
-    /// contract of JAX's `has_side_effect=True`: the call is kept alive through dead-code elimination and remains
+    /// same contract as JAX's `has_side_effect=True`: the call is kept alive through dead-code elimination and remains
     /// observable, but promises no ordering relative to other effects and adds no token to the kernel's calling
     /// convention, so handlers written against JAX's convention work unchanged. Select an ordered class with
     /// [`with_effect_class`](Self::with_effect_class) when the kernel's effects must execute in program order.
@@ -710,17 +708,16 @@ impl CustomCallOperation {
         self.with_effect_class(EffectClass::UnorderedIo)
     }
 
-    /// Returns this call declaring the provided observable effect class, replacing any earlier selection.
-    ///
-    /// Every class keeps the call alive through dead-code elimination and marks the lowered call `has_side_effect`.
-    /// The I/O classes differ in ordering scope: [`EffectClass::OrderedIo`] promises one order across devices,
-    /// [`EffectClass::DeviceOrderedIo`] promises program order only among the ordered I/O executing on the same
-    /// device and therefore permits the handler to run once per device (the handler must tolerate that
-    /// replication), and [`EffectClass::UnorderedIo`] promises no ordering. The ordered classes change the kernel's
-    /// calling convention on backends that sequence effects through tokens (e.g., the XLA backend): the handler
-    /// receives one token input after the array inputs and returns one token output after the declared outputs. An
-    /// unordered call carries no token. The effect class does not supply batching or differentiation rules, and does
-    /// not determine whether execution blocks the calling thread.
+    /// Returns this call declaring the provided observable effect class, replacing any earlier selection. Every class
+    /// keeps the call alive through dead-code elimination and marks the lowered call `has_side_effect`. The I/O classes
+    /// differ in ordering scope: [`EffectClass::OrderedIo`] promises one order across devices,
+    /// [`EffectClass::DeviceOrderedIo`] promises program order only among the ordered I/O executing on the same device
+    /// and therefore permits the handler to run once per device (the handler must tolerate that replication), and
+    /// [`EffectClass::UnorderedIo`] promises no ordering. The ordered classes change the kernel's calling convention
+    /// on backends that sequence effects through tokens (e.g., the XLA backend): the handler receives one token input
+    /// after the array inputs and returns one token output after the declared outputs. An unordered call carries no
+    /// token. The effect class does not supply batching or differentiation rules, and does not determine whether
+    /// execution blocks the calling thread.
     #[inline]
     pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
         self.effect_class = Some(effect_class);
@@ -779,12 +776,14 @@ impl CustomCallOperation {
         self.effect_class
     }
 
-    /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one of this call's
-    /// inputs.
+    /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one
+    /// of this call's inputs.
     #[inline]
     pub fn batching(&self) -> CustomCallBatching {
         self.batching
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Calls the foreign kernel described by this operation in `context` with the provided inputs, returning one value
     /// per declared output type. This binds the operation through [`Context::bind`] and is therefore available in
