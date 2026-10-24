@@ -1474,8 +1474,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to stage a [`ConditionOperation`] that applies one of two branch functions to structured
 /// inputs according to a scalar Boolean predicate, returning the outputs of the selected branch. This is the Ryft
 /// value-level analogue of JAX's [`lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). It
@@ -1516,9 +1514,9 @@ where
 /// # use ryft_core::{Array, Condition, ProgramError};
 /// let predicate = Array::scalar(true)?;
 /// let output = predicate.condition(
-///     (Array::scalar(2.0f32)?, Array::scalar(3.0f32)?),
 ///     |(first, second)| Ok(first + second),
 ///     |(first, second)| Ok(first * second),
+///     (Array::scalar(2.0f32)?, Array::scalar(3.0f32)?),
 /// )?;
 /// assert_eq!(output, Array::scalar(5.0f32)?);
 /// # Ok::<(), ProgramError>(())
@@ -1529,9 +1527,9 @@ pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Doma
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: Structured values received by both branches, including their static fields.
     ///   - `true_fn`: Function traced for the `true` branch over the input family's nested tracers.
     ///   - `false_fn`: Function traced for the `false` branch over the same input family.
+    ///   - `inputs`: Structured values received by both branches, including their static fields.
     ///
     /// # Errors
     ///
@@ -1549,19 +1547,19 @@ pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Doma
         FalseFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
     >(
         &self,
-        inputs: Input,
         true_fn: TrueFn,
         false_fn: FalseFn,
+        inputs: Input,
     ) -> Result<Output::To<Self>, ProgramError>;
 }
 
-// Region authoring is shared by eager and staged values: interpretation executes the attached programs directly
-// rather than re-entering this authoring capability, so direct values use the same domain-based implementation.
-impl<T, V> Condition<T> for V
-where
+impl<
+    T,
     V: Value<Type: ConditionType, Domain: Context<Operation: From<ConditionOperation<V::Type>>>>
         + Capability<Universe = T>
         + ManualVariationAlignment,
+> Condition<T> for V
+where
     Tracer<NestedTracingContext<V::Domain>>: ManualVariationAlignment,
 {
     fn condition<
@@ -1575,20 +1573,30 @@ where
         FalseFn: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
     >(
         &self,
-        inputs: Input,
         true_fn: TrueFn,
         false_fn: FalseFn,
+        inputs: Input,
     ) -> Result<Output::To<Self>, ProgramError> {
+        // Reject invalid predicates before either branch function is traced.
         ConditionOperation::<V::Type>::validate_predicate_type(self.r#type().as_ref())?;
+
+        // Preserve the input structure and its static fields separately from the runtime leaves that become region
+        // inputs. The original leaves also supply any outputs that both branches forward unchanged.
         let input_structure = inputs.parameter_structure();
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
         let context = self.domain();
+
+        // Vary inputs over the predicate's manual axes before tracing the branches. The transpose can then sum an
+        // invariant input's cotangents outside branches that different devices may take differently.
         let predicate_sharding = self.r#type().sharding().cloned();
         let aligned_inputs = match &predicate_sharding {
             Some(sharding) => Self::align_manual_variation_to(&inputs, sharding)?,
             None => inputs.clone(),
         };
         let input_types = aligned_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+
+        // Align branch outputs before they leave the nested trace: even an invariant branch result may be selected
+        // differently across devices. Preserve the output structure and static fields around its aligned leaves.
         let align_outputs = |outputs: Output| {
             let structure = outputs.parameter_structure();
             let outputs = outputs.into_parameters().collect::<Vec<_>>();
@@ -1598,6 +1606,9 @@ where
             };
             Ok::<_, ProgramError>(Output::from_parameters(structure, outputs)?)
         };
+
+        // Trace both functions in separate nested contexts over the predicate's domain, rebuilding their structured
+        // arguments from the same input structure and aligned types. Eager and staged values share this tracing path.
         let (true_structure, true_branch) = NestedTracingContext::trace(
             context.clone(),
             |inputs| {
@@ -1619,6 +1630,8 @@ where
             input_types,
         )?;
 
+        // A runtime predicate selects value leaves; the Rust structure and static metadata must already agree when
+        // tracing finishes so either branch's values can reconstruct the same output structure.
         if true_structure != false_structure {
             return Err(ProgramError::InvalidArgument {
                 message: format!(
@@ -1661,10 +1674,16 @@ where
             &condition_input_types,
             [branches[0].entry_region_ref(), branches[1].entry_region_ref()],
         )?;
+
+        // Bind the validated branch programs in the predicate's domain, which stages or executes the condition
+        // according to that domain. With no forwarded outputs, its results already have the original leaf order.
         let outputs = context.bind(condition, branches, &condition_inputs)?;
         if forwarded_inputs.iter().all(Option::is_none) {
             return Ok(Output::To::<Self>::from_parameters(true_structure, outputs)?);
         }
+
+        // Reinsert pruned leaves at their original positions using the unaligned inputs, preserving their variation.
+        // Each remaining slot consumes one bound output, as guaranteed by the validated branch signatures.
         let mut outputs = outputs.into_iter();
         let outputs = forwarded_inputs
             .into_iter()
@@ -1698,6 +1717,8 @@ trait ConditionRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDrive
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, D: ?Sized + RegionDriver<V, O>> ConditionRegionDriver<V, O> for D {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
     /// Batches an application of a condition whose `predicate` is replicated, so that every batch item takes the same
@@ -2731,16 +2752,9 @@ mod tests {
         let true_branch = scalar_branch(ArrayOperation::Add(AddOperation::new()));
         let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation::new()));
 
-        // Operation identity, declared region slots, output provenance, and payload-free rendering.
+        // Operation identity, declared region slots, and payload-free rendering.
         assert_eq!(operation.name(), CONDITION_OPERATION_NAME);
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("true"), RegionSlot::computation("false")]);
-        assert_eq!(
-            operation.output_region_provenance(0),
-            vec![
-                OutputRegionProvenance { region_index: 0, output_index: 0 },
-                OutputRegionProvenance { region_index: 1, output_index: 0 },
-            ],
-        );
         assert_eq!(format!("{operation}"), "condition");
         assert_eq!(
             format!("{operation:?}"),
@@ -2750,9 +2764,6 @@ mod tests {
         assert_eq!(operation, ConditionOperation::default());
         let identities = HashMap::from([(operation, "condition")]);
         assert_eq!(identities.get(&ConditionOperation::new()), Some(&"condition"));
-        assert_eq!(operation.input_region_provenance(0, 2), InputRegionProvenance::Input { index: 3 });
-        assert_eq!(operation.input_region_provenance(1, 2), InputRegionProvenance::Input { index: 3 });
-        assert_eq!(operation.input_region_provenance(2, 0), InputRegionProvenance::None);
 
         // Program rendering shows the attached branch regions at the instruction with their declared slot names.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2806,7 +2817,7 @@ mod tests {
         // branch output types.
         assert_eq!(
             operation
-                .infer_region_input_types(&[predicate_type.clone(), branch_input_type.clone()], interfaces.as_slice(),),
+                .infer_region_input_types(&[predicate_type.clone(), branch_input_type.clone()], interfaces.as_slice()),
             Ok(vec![None, None]),
         );
         assert_eq!(
@@ -2918,7 +2929,8 @@ mod tests {
             )),
         );
 
-        // Inference dispatches through the closed operation enum exactly like through the bare operation.
+        // Inference dispatches through boxed, closed-enum, and kernel operation wrappers exactly like through the bare
+        // operation. The derive tests own this delegation; this block keeps one representative check per wrapper.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let identity_branch =
@@ -2930,6 +2942,55 @@ mod tests {
                 &[identity_branch.interface(), identity_branch.interface()],
             ),
             Ok(vec![ArrayType::scalar(DataType::F64)]),
+        );
+        let branches = refinable_dynamic_branches();
+        let interfaces = branches.each_ref().map(Program::interface);
+        let composite_branches =
+            branches.map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
+        let composite_interfaces = composite_branches.each_ref().map(Program::interface);
+        let refined_input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [3])];
+        let refined_composite_input_types = refined_input_types.clone().map(ArrayIrType::Array);
+        let mismatched_input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [4])];
+        let mismatched_composite_input_types = mismatched_input_types.clone().map(ArrayIrType::Array);
+        let mismatch =
+            TypeError::invalid("`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]");
+        assert_eq!(
+            Box::new(ConditionOperation::<ArrayType>::new()).infer_output_types(&refined_input_types, &interfaces),
+            Ok(vec![ArrayType::new_static(DataType::F64, [3])]),
+        );
+        assert_eq!(
+            Box::new(ConditionOperation::<ArrayType>::new()).infer_output_types(&mismatched_input_types, &interfaces),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(
+            ArrayOperation::<Array>::Condition(ConditionOperation::new())
+                .infer_output_types(&refined_input_types, &interfaces),
+            Ok(vec![ArrayType::new_static(DataType::F64, [3])]),
+        );
+        assert_eq!(
+            ArrayOperation::<Array>::Condition(ConditionOperation::new())
+                .infer_output_types(&mismatched_input_types, &interfaces),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(
+            TestIrOperation::Condition(ConditionOperation::new())
+                .infer_output_types(&refined_composite_input_types, &composite_interfaces),
+            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]),
+        );
+        assert_eq!(
+            TestIrOperation::Condition(ConditionOperation::new())
+                .infer_output_types(&mismatched_composite_input_types, &composite_interfaces),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(
+            KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
+                .infer_output_types(&refined_composite_input_types, &composite_interfaces),
+            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]),
+        );
+        assert_eq!(
+            KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
+                .infer_output_types(&mismatched_composite_input_types, &composite_interfaces),
+            Err(mismatch),
         );
     }
 
@@ -2950,107 +3011,123 @@ mod tests {
             in (%1)"}
         );
         let interfaces = branches.each_ref().map(Program::interface);
-        for extent in [3, 4] {
-            let input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [extent])];
-            let expected = if extent == 3 {
-                Ok(vec![ArrayType::new_static(DataType::F64, [3])])
-            } else {
-                Err(TypeError::invalid(
-                    "`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]",
-                ))
-            };
-            assert_eq!(ConditionOperation::<ArrayType>::new().infer_output_types(&input_types, &interfaces), expected);
-            assert_eq!(
-                Box::new(ConditionOperation::<ArrayType>::new()).infer_output_types(&input_types, &interfaces),
-                expected
-            );
-            assert_eq!(
-                ArrayOperation::<Array>::Condition(ConditionOperation::new())
-                    .infer_output_types(&input_types, &interfaces),
-                expected
-            );
-            let composite_branches =
-                branches.clone().map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
-            let composite_interfaces = composite_branches.each_ref().map(Program::interface);
-            let composite_inputs = input_types.map(ArrayIrType::Array);
-            let composite_expected = expected.map(|outputs| outputs.into_iter().map(ArrayIrType::Array).collect());
-            assert_eq!(
-                TestIrOperation::Condition(ConditionOperation::new())
-                    .infer_output_types(&composite_inputs, &composite_interfaces),
-                composite_expected
-            );
-            assert_eq!(
-                KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
-                    .infer_output_types(&composite_inputs, &composite_interfaces),
-                composite_expected
-            );
-        }
+
+        // An `f64[3]` input refines the `true` branch's output to the `false` branch's `f64[3]`, so the refined
+        // branch outputs agree. An `f64[4]` input refines it to `f64[4]`, which the `false` branch does not produce.
+        assert_eq!(
+            ConditionOperation::<ArrayType>::new().infer_output_types(
+                &[ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [3])],
+                &interfaces,
+            ),
+            Ok(vec![ArrayType::new_static(DataType::F64, [3])]),
+        );
+        assert_eq!(
+            ConditionOperation::<ArrayType>::new().infer_output_types(
+                &[ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [4])],
+                &interfaces,
+            ),
+            Err(TypeError::invalid(
+                "`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]",
+            )),
+        );
     }
 
     #[test]
     fn test_condition_type_inference_agrees_across_builder_eager_and_tracing() {
+        // Builder construction, tracing, and eager binding refine the branch outputs by the actual inputs in the same
+        // way: an `f64[3]` input makes the refined branch outputs agree on `f64[3]`, and an `f64[4]` input makes them
+        // disagree, which every entry point rejects with the same error.
         let branches = refinable_dynamic_branches();
+        let refined_type = ArrayType::new_static(DataType::F64, [3]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let regions = branches.each_ref().map(|branch| builder.import_region(branch.entry_region_ref()));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(refined_type.clone());
+        let outputs = builder
+            .add_instruction(ConditionOperation::new(), regions.to_vec(), vec![predicate, input], None)
+            .unwrap()
+            .to_vec();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        assert_eq!(program.output_types(), vec![refined_type.clone()]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:bool[], %1:f64[3] .
+            let %2:f64[3] = condition %0 %1 [
+                true={
+                    lambda %0:f64[extent] .
+                    in (%0)
+                },
+                false={
+                    lambda %0:f64[extent] .
+                    let %1:f64[3] = const [2.0, 2.0, 2.0]
+                    in (%1)
+                },
+            ]
+            in (%2)"},
+        );
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean));
+        let input = context.input(refined_type.clone());
+        let traced = context.bind(ConditionOperation::new(), branches.clone(), &[predicate, input]).unwrap();
+        assert_eq!(traced[0].r#type().as_ref(), &refined_type);
+        let input = Array::vector(vec![1.0f64; 3]).unwrap();
+        assert_eq!(
+            EagerContext::<Array, ArrayOperation<Array>>::new().bind(
+                ConditionOperation::new(),
+                branches.clone(),
+                &[Array::scalar(false).unwrap(), input.clone()],
+            ),
+            Ok(vec![Array::vector(vec![2.0f64; 3]).unwrap()]),
+        );
+        assert_eq!(
+            EagerContext::<Array, ArrayOperation<Array>>::new().bind(
+                ConditionOperation::new(),
+                branches.clone(),
+                &[Array::scalar(true).unwrap(), input.clone()],
+            ),
+            Ok(vec![input]),
+        );
+
         let expected_error =
             TypeError::invalid("`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]");
-        for extent in [3, 4] {
-            let input_type = ArrayType::new_static(DataType::F64, [extent]);
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let regions = branches.each_ref().map(|branch| builder.import_region(branch.entry_region_ref()));
-            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-            let input = builder.add_input(input_type.clone());
-            let built = builder
+        let mismatched_type = ArrayType::new_static(DataType::F64, [4]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let regions = branches.each_ref().map(|branch| builder.import_region(branch.entry_region_ref()));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(mismatched_type.clone());
+        assert_eq!(
+            builder
                 .add_instruction(ConditionOperation::new(), regions.to_vec(), vec![predicate, input], None)
-                .map(|outputs| outputs.to_vec());
-            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-            let predicate = context.input(ArrayType::scalar(DataType::Boolean));
-            let input = context.input(input_type.clone());
-            let traced = context.bind(ConditionOperation::new(), branches.clone(), &[predicate, input]);
-            if extent == 3 {
-                let program = builder
-                    .build::<Vec<Array>, Vec<Array>>(built.unwrap(), vec![Placeholder; 2], vec![Placeholder])
-                    .unwrap();
-                assert_eq!(program.output_types(), vec![input_type.clone()]);
-                assert_eq!(
-                    program.to_string(),
-                    indoc! {"
-                    lambda %0:bool[], %1:f64[3] .
-                    let %2:f64[3] = condition %0 %1 [
-                        true={
-                            lambda %0:f64[extent] .
-                            in (%0)
-                        },
-                        false={
-                            lambda %0:f64[extent] .
-                            let %1:f64[3] = const [2.0, 2.0, 2.0]
-                            in (%1)
-                        },
-                    ]
-                    in (%2)"}
-                );
-                assert_eq!(traced.unwrap()[0].r#type().as_ref(), &input_type);
-            } else {
-                assert_eq!(built, Err(ProgramError::Type(expected_error.clone())));
-                assert_eq!(traced.map(|_| ()), Err(ProgramError::Type(expected_error.clone())));
-                assert!(context.builder().borrow().instructions().is_empty());
-            }
-            for predicate in [false, true] {
-                let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-                let input = Array::vector(vec![1.0f64; extent]).unwrap();
-                let output = context.bind(
-                    ConditionOperation::new(),
-                    branches.clone(),
-                    &[Array::scalar(predicate).unwrap(), input.clone()],
-                );
-                if extent == 3 {
-                    assert_eq!(
-                        output,
-                        Ok(vec![if predicate { input } else { Array::vector(vec![2.0f64; 3]).unwrap() }])
-                    );
-                } else {
-                    assert_eq!(output, Err(ProgramError::Type(expected_error.clone())));
-                }
-            }
-        }
+                .map(|outputs| outputs.to_vec()),
+            Err(ProgramError::Type(expected_error.clone())),
+        );
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean));
+        let input = context.input(mismatched_type);
+        assert_eq!(
+            context.bind(ConditionOperation::new(), branches.clone(), &[predicate, input]).map(|_| ()),
+            Err(ProgramError::Type(expected_error.clone())),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
+        let input = Array::vector(vec![1.0f64; 4]).unwrap();
+        assert_eq!(
+            EagerContext::<Array, ArrayOperation<Array>>::new().bind(
+                ConditionOperation::new(),
+                branches.clone(),
+                &[Array::scalar(false).unwrap(), input.clone()],
+            ),
+            Err(ProgramError::Type(expected_error.clone())),
+        );
+        assert_eq!(
+            EagerContext::<Array, ArrayOperation<Array>>::new().bind(
+                ConditionOperation::new(),
+                branches,
+                &[Array::scalar(true).unwrap(), input],
+            ),
+            Err(ProgramError::Type(expected_error)),
+        );
     }
 
     #[test]
@@ -3266,7 +3343,10 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_type_inference_retains_declared_output_variation() {
+    fn test_condition_type_inference_rejects_outputs_invariant_under_varying_predicates() {
+        // An identity branch declares an invariant `f64[]` input and output. A varying input refines the branch input,
+        // but the output keeps the declared invariant type, so under a predicate that varies over `devices` tracing
+        // rejects the condition before staging it, because devices may take different branches.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let predicate_type = ArrayType::scalar(DataType::Boolean)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
@@ -3305,7 +3385,11 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_type_inference_specialization_preserves_output_metadata() {
+    fn test_condition_type_inference_rejects_branch_outputs_that_differ_in_metadata() {
+        // The `true` branch returns a constant that varies over `devices`, while the `false` branch returns its
+        // invariant `f64[]` input. Refining the branches by a varying input does not carry its sharding metadata into
+        // the `false` branch output, so the outputs differ in that metadata alone. Inference, tracing, and eager
+        // binding all reject the branches, and region input inference declines to specialize them.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let declared_type = ArrayType::scalar(DataType::F64);
         let varying_type = declared_type
@@ -3411,64 +3495,6 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_type_inference_retains_declared_branches_for_mixed_dimension_refinements() {
-        // A symbolic first-class dimension and a static array sharing its extent are a valid refinement that admits
-        // no structural identity substitution. Staging keeps both branches declared instead of replaying them, which
-        // would erase the relationship between the two inputs, and the refined output still comes from inference.
-        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent_type.dimension().clone()]));
-        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        builder.add_input(extent_type.clone().into());
-        let vector = builder.add_input(vector_type.into());
-        let branch = builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![vector], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
-        let inputs = [
-            context.input(ArrayType::scalar(DataType::Boolean).into()),
-            context.input(extent_type.clone().into()),
-            context.input(ArrayType::new_static(DataType::F32, [3]).into()),
-        ];
-        let outputs = context.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs).unwrap();
-        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::new_static(DataType::F32, [3]).into());
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![outputs[0].atom_id().unwrap()],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f32[3] .
-                let %3:f32[3] = condition %0 %1 %2 [
-                    true={
-                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
-                        in (%1)
-                    },
-                    false={
-                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
-                        in (%1)
-                    },
-                ]
-                in (%3)"},
-        );
-        assert_eq!(
-            program.interpret(vec![
-                array(Array::scalar(true).unwrap()),
-                dimension(&extent_type, 3),
-                array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()),
-            ]),
-            Ok(vec![array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap())]),
-        );
-    }
-
-    #[test]
     fn test_condition_validate_region_interfaces() {
         let branches = mismatched_input_branches();
         let interfaces = branches.each_ref().map(Program::interface);
@@ -3562,6 +3588,16 @@ mod tests {
         assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
         assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 2 });
         assert_eq!(operation.input_region_provenance(1, 1), InputRegionProvenance::Input { index: 2 });
+        assert_eq!(operation.input_region_provenance(0, 2), InputRegionProvenance::Input { index: 3 });
+        assert_eq!(operation.input_region_provenance(1, 2), InputRegionProvenance::Input { index: 3 });
+        assert_eq!(operation.input_region_provenance(2, 0), InputRegionProvenance::None);
+        assert_eq!(
+            operation.output_region_provenance(0),
+            vec![
+                OutputRegionProvenance { region_index: 0, output_index: 0 },
+                OutputRegionProvenance { region_index: 1, output_index: 0 },
+            ],
+        );
         assert_eq!(
             operation.output_region_provenance(1),
             vec![
@@ -5939,6 +5975,64 @@ mod tests {
     fn test_condition_interpretation_preserves_mixed_dimension_constraints() {
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent_type.dimension().clone()]));
+
+        // A symbolic first-class dimension and a static array sharing its extent are a valid refinement that admits
+        // no structural identity substitution. Staging keeps both branches declared instead of replaying them, which
+        // would erase the relationship between the two inputs, and the refined output still comes from inference.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        builder.add_input(extent_type.clone().into());
+        let vector = builder.add_input(vector_type.clone().into());
+        let identity_branch = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![vector], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let inputs = [
+            context.input(ArrayType::scalar(DataType::Boolean).into()),
+            context.input(extent_type.clone().into()),
+            context.input(ArrayType::new_static(DataType::F32, [3]).into()),
+        ];
+        let outputs = context
+            .bind(ConditionOperation::new(), vec![identity_branch.clone(), identity_branch], &inputs)
+            .unwrap();
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::new_static(DataType::F32, [3]).into());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![outputs[0].atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f32[3] .
+                let %3:f32[3] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                        in (%1)
+                    },
+                ]
+                in (%3)"},
+        );
+        assert_eq!(
+            program.interpret(vec![
+                array(Array::scalar(true).unwrap()),
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()),
+            ]),
+            Ok(vec![array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap())]),
+        );
+
+        // A branch that squares its vector input keeps the same contract under a renamed dimension identity, and its
+        // retained declared branches validate the dimension extent at runtime entry.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         builder.add_input(extent_type.clone().into());
         let input = builder.add_input(vector_type.into());
@@ -5953,86 +6047,108 @@ mod tests {
         let branch = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let expected_rendering = indoc! {"
-            lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f32[3] .
-            let %3:f32[3] = condition %0 %1 %2 [
-                true={
-                    lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
-                    let %2:f32[extent] = mul %1 %1
-                    in (%2)
-                },
-                false={
-                    lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
-                    let %2:f32[extent] = mul %1 %1
-                    in (%2)
-                },
-            ]
-            in (%3)"};
+        let expected_rendering = |caller_extent: &str| {
+            formatdoc! {"
+                lambda %0:bool[], %1:dimension<{caller_extent} ∈ [1, 8)>, %2:f32[3] .
+                let %3:f32[3] = condition %0 %1 %2 [
+                    true={{
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                        let %2:f32[extent] = mul %1 %1
+                        in (%2)
+                    }},
+                    false={{
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                        let %2:f32[extent] = mul %1 %1
+                        in (%2)
+                    }},
+                ]
+                in (%3)"}
+        };
+        let input = array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let expected = vec![array(Array::vector(vec![1.0f32, 4.0, 9.0]).unwrap())];
+        let is_extent_mismatch = |result: &Result<Vec<TestIrValue>, ProgramError>| {
+            matches!(
+                result,
+                Err(ProgramError::Type(error))
+                    if error.downcast_custom::<DimensionError>()
+                        == Some(&DimensionError::InputDimensionMismatch {
+                            dimension: "extent".to_string(),
+                            expected: 4,
+                            actual: 3,
+                        }),
+            )
+        };
+        let eager = TestEagerContext::new();
 
         // The primitive accepts a broad dimension together with a concrete array, but one structural identity
         // renaming cannot preserve their shared extent. Retain the declared branches, including after a caller's
         // dimension definition changes identity, while ordinary output inference still produces a concrete shape.
-        let renamed_extent_type = DimensionType::new("renamed", extent_type.bounds());
-        for actual_extent_type in [&extent_type, &renamed_extent_type] {
-            let context = TracingContext::<TestIrValue, TestIrOperation>::new();
-            let inputs = [
-                context.input(ArrayType::scalar(DataType::Boolean).into()),
-                context.input(actual_extent_type.clone().into()),
-                context.input(ArrayType::new_static(DataType::F32, [3]).into()),
-            ];
-            let outputs =
-                context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs).unwrap();
-            let output_ids = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
-            let program = context
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 3], vec![Placeholder])
-                .unwrap();
-            let expected_rendering = if actual_extent_type == &extent_type {
-                expected_rendering.to_string()
-            } else {
-                expected_rendering.replacen("%1:dimension<extent", "%1:dimension<renamed", 1)
-            };
-            assert_eq!(program.to_string(), expected_rendering);
+        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let inputs = [
+            context.input(ArrayType::scalar(DataType::Boolean).into()),
+            context.input(extent_type.clone().into()),
+            context.input(ArrayType::new_static(DataType::F32, [3]).into()),
+        ];
+        let outputs = context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs).unwrap();
+        let output_ids = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.to_string(), expected_rendering("extent"));
 
-            let eager = TestEagerContext::new();
-            let input = array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
-            let expected = vec![array(Array::vector(vec![1.0f32, 4.0, 9.0]).unwrap())];
-            let is_extent_mismatch = |result: &Result<Vec<TestIrValue>, ProgramError>| {
-                matches!(
-                    result,
-                    Err(ProgramError::Type(error))
-                        if error.downcast_custom::<DimensionError>()
-                            == Some(&DimensionError::InputDimensionMismatch {
-                                dimension: "extent".to_string(),
-                                expected: 4,
-                                actual: 3,
-                            }),
-                )
-            };
-            for predicate in [true, false] {
-                // The retained declared branches validate the exact type of the dimension value at runtime entry, so
-                // the application succeeds only when its extent agrees with the array's extent.
-                let inputs =
-                    vec![array(Array::scalar(predicate).unwrap()), dimension(actual_extent_type, 3), input.clone()];
-                assert_eq!(
-                    eager.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
-                    Ok(expected.clone()),
-                );
-                assert_eq!(program.interpret(inputs), Ok(expected.clone()));
-            }
-
-            // A conflicting extent is rejected before either branch runs, in direct binding and in program replay
-            // alike, because the static type of the dimension value binds the branch identity to its extent.
-            let inputs = vec![array(Array::scalar(true).unwrap()), dimension(actual_extent_type, 4), input.clone()];
-            assert!(is_extent_mismatch(&eager.bind(
-                ConditionOperation::new(),
-                vec![branch.clone(), branch.clone()],
-                &inputs,
-            )));
-            assert!(is_extent_mismatch(&program.interpret(inputs)));
+        // The retained declared branches validate the exact type of the dimension value at runtime entry, so the
+        // application succeeds only when its extent agrees with the array's extent.
+        for predicate in [true, false] {
+            let inputs = vec![array(Array::scalar(predicate).unwrap()), dimension(&extent_type, 3), input.clone()];
+            assert_eq!(
+                eager.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+                Ok(expected.clone()),
+            );
+            assert_eq!(program.interpret(inputs), Ok(expected.clone()));
         }
+
+        // A conflicting extent is rejected before either branch runs, in direct binding and in program replay alike,
+        // because the static type of the dimension value binds the branch identity to its extent.
+        let inputs = vec![array(Array::scalar(true).unwrap()), dimension(&extent_type, 4), input.clone()];
+        assert!(is_extent_mismatch(&eager.bind(
+            ConditionOperation::new(),
+            vec![branch.clone(), branch.clone()],
+            &inputs,
+        )));
+        assert!(is_extent_mismatch(&program.interpret(inputs)));
+
+        // A caller dimension with a renamed identity keeps the same declared branches and runtime validation.
+        let renamed_extent_type = DimensionType::new("renamed", extent_type.bounds());
+        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let inputs = [
+            context.input(ArrayType::scalar(DataType::Boolean).into()),
+            context.input(renamed_extent_type.clone().into()),
+            context.input(ArrayType::new_static(DataType::F32, [3]).into()),
+        ];
+        let outputs = context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs).unwrap();
+        let output_ids = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.to_string(), expected_rendering("renamed"));
+        for predicate in [true, false] {
+            let inputs =
+                vec![array(Array::scalar(predicate).unwrap()), dimension(&renamed_extent_type, 3), input.clone()];
+            assert_eq!(
+                eager.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+                Ok(expected.clone()),
+            );
+            assert_eq!(program.interpret(inputs), Ok(expected.clone()));
+        }
+        let inputs = vec![array(Array::scalar(true).unwrap()), dimension(&renamed_extent_type, 4), input];
+        assert!(is_extent_mismatch(&eager.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs,)));
+        assert!(is_extent_mismatch(&program.interpret(inputs)));
     }
 
     #[test]
@@ -11376,7 +11492,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, input): (ArrayTracer, ArrayTracer)| {
-                predicate.condition(input, |input| Ok(input.clone() * input), |input| Ok(input))
+                predicate.condition(|input| Ok(input.clone() * input), |input| Ok(input), input)
             },
             (ArrayType::scalar(DataType::Boolean), vector_type),
         )
@@ -11547,7 +11663,7 @@ mod tests {
         let cast_type = ArrayIrType::from(pair_type.clone());
         let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
             |(predicate, x, y): (TestTracer, TestTracer, TestTracer)| {
-                predicate.condition((x, y), |(x, _)| x.cast(cast_type.clone(), &[]), |(_, y)| Ok(y))
+                predicate.condition(|(x, _)| x.cast(cast_type.clone(), &[]), |(_, y)| Ok(y), (x, y))
             },
             (
                 ArrayIrType::from(ArrayType::scalar(DataType::Boolean)),
@@ -13406,9 +13522,9 @@ mod tests {
                             )?
                             .remove(0);
                         predicate.condition(
-                            (ignored, input),
                             |(_, value)| Ok(value.clone() * value),
                             |(_, value)| Ok(value.clone() * value.clone() * value),
+                            (ignored, input),
                         )
                     })?;
                     Ok(gradient)
@@ -13434,9 +13550,9 @@ mod tests {
                             )?
                             .remove(0);
                         predicate.condition(
-                            (ignored, input),
                             |(_, value)| Ok(value.clone() * value),
                             |(_, value)| Ok(value.clone() * value.clone() * value),
+                            (ignored, input),
                         )
                     })?;
                     Ok(gradient)
@@ -13458,9 +13574,9 @@ mod tests {
                     let (_, pullback) = context.vjp(
                         |(ignored, live), predicate| {
                             predicate.condition(
-                                (ignored, live),
                                 |(_, live)| Ok(live.clone() * live),
                                 |(_, live)| Ok(live),
+                                (ignored, live),
                             )
                         },
                         (ignored, live),
@@ -13836,7 +13952,7 @@ mod tests {
         let cast_type = pair_type.clone();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, x, y): (ArrayTracer, ArrayTracer, ArrayTracer)| {
-                predicate.condition((x, y), |(x, _)| x.cast(cast_type.clone(), &[]), |(_, y)| Ok(y))
+                predicate.condition(|(x, _)| x.cast(cast_type.clone(), &[]), |(_, y)| Ok(y), (x, y))
             },
             (ArrayType::scalar(DataType::Boolean), vector_type, pair_type),
         )
@@ -15059,9 +15175,9 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
                     |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+                    vec![inputs[1].clone()],
                 )
             },
             vec![ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64)],
@@ -15092,9 +15208,9 @@ mod tests {
             );
             assert_eq!(
                 Array::scalar(predicate).unwrap().condition(
-                    vec![Array::scalar(3.0).unwrap()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
                     |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+                    vec![Array::scalar(3.0).unwrap()],
                 ),
                 Ok(vec![Array::scalar(expected).unwrap()]),
             );
@@ -15106,9 +15222,9 @@ mod tests {
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, first, second): (Tracer<_>, Tracer<_>, Tracer<_>)| {
                 predicate.condition(
-                    (first, second),
                     |(first, second)| Ok((first.clone() * second, vec![first])),
                     |(first, second)| Ok((first + second.clone(), vec![second])),
+                    (first, second),
                 )
             },
             (ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)),
@@ -15175,7 +15291,7 @@ mod tests {
 
         /// A Condition bound alone provides the authoring capability to ordinary generic value callers.
         fn choose<V: Condition>(predicate: &V, input: V) -> Result<V, ProgramError> {
-            predicate.condition(input, Ok, Ok)
+            predicate.condition(Ok, Ok, input)
         }
 
         // Eager values keep the static fields of structured inputs and outputs, and branches must agree on them.
@@ -15184,18 +15300,18 @@ mod tests {
         assert_eq!(choose(&predicate, input.clone()), Ok(input.clone()));
         let output = predicate
             .condition(
-                Payload { value: input.clone(), label: "shared" },
                 |input| Ok(Payload { value: input.value.clone() + input.value, label: input.label }),
                 Ok,
+                Payload { value: input.clone(), label: "shared" },
             )
             .unwrap();
         assert_eq!(output.value, Array::scalar(6.0f32).unwrap());
         assert_eq!(output.label, "shared");
 
         let result = predicate.condition(
-            Payload { value: input, label: "input" },
             |input| Ok(Payload { value: input.value, label: "true" }),
             |input| Ok(Payload { value: input.value, label: "false" }),
+            Payload { value: input, label: "input" },
         );
         assert!(matches!(
             result,
@@ -15207,9 +15323,9 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, input): (Tracer<_>, Tracer<_>)| {
                 let result = predicate.condition(
-                    Payload { value: input.clone(), label: "input" },
                     |input| Ok(Payload { value: input.value, label: "true" }),
                     |input| Ok(Payload { value: input.value, label: "false" }),
+                    Payload { value: input.clone(), label: "input" },
                 );
                 assert!(matches!(
                     result,
@@ -15229,8 +15345,8 @@ mod tests {
             in (%1)"},
         );
 
-        assert_eq!(predicate.condition((), |()| Ok(()), |()| Ok(())), Ok(()));
-        assert_eq!(predicate.condition(Vec::<Array>::new(), Ok, Ok), Ok(Vec::<Array>::new()));
+        assert_eq!(predicate.condition(|()| Ok(()), |()| Ok(()), ()), Ok(()));
+        assert_eq!(predicate.condition(Ok, Ok, Vec::<Array>::new()), Ok(Vec::<Array>::new()));
 
         // Composite values carry arrays, dimensions, and references through the same structure.
         let predicate = TestIrValue::Array(Array::scalar(true).unwrap());
@@ -15238,9 +15354,9 @@ mod tests {
         let reference = TestIrValue::Reference(ArrayReference::new(Array::scalar(4.0f32).unwrap()));
         assert_eq!(
             predicate.condition(
-                (TestIrValue::Array(Array::scalar(3.0f32).unwrap()), dimension.clone(), reference.clone()),
                 |(input, dimension, reference)| Ok((input.clone() + input, dimension, reference)),
                 Ok,
+                (TestIrValue::Array(Array::scalar(3.0f32).unwrap()), dimension.clone(), reference.clone()),
             ),
             Ok((TestIrValue::Array(Array::scalar(6.0f32).unwrap()), dimension, reference)),
         );
@@ -15249,16 +15365,16 @@ mod tests {
         let predicate = Array::scalar(true).unwrap();
         let input = Array::scalar(3.0f32).unwrap();
         let result =
-            predicate.condition(input.clone(), |input| Ok(vec![input]), |input| Ok(vec![input.clone(), input]));
+            predicate.condition(|input| Ok(vec![input]), |input| Ok(vec![input.clone(), input]), input.clone());
         assert!(matches!(
             result,
             Err(ProgramError::InvalidArgument { message, .. })
                 if message == "`condition` branches must return the same parameter structure and static metadata",
         ));
         let result = predicate.condition(
-            input,
             |input| Ok(BTreeMap::from([("left", input)])),
             |input| Ok(BTreeMap::from([("right", input)])),
+            input,
         );
         assert!(matches!(
             result,
@@ -15271,14 +15387,16 @@ mod tests {
     fn test_condition_condition_validation() {
         let input = Array::scalar(3.0f32).unwrap();
         assert_eq!(
-            Array::scalar(1.0f32).unwrap().condition(input, Ok, Ok),
+            Array::scalar(1.0f32).unwrap().condition(Ok, Ok, input),
             Err(TypeError::invalid("`condition` predicate type must be a scalar boolean, but got `f32[]`").into()),
         );
         for predicate in [true, false] {
             assert_eq!(
-                Array::scalar(predicate).unwrap().condition(Array::scalar(3.0f32).unwrap(), Ok, |input| {
-                    Ok(StagingContext::constant(input.context(), Array::scalar(true).unwrap()))
-                }),
+                Array::scalar(predicate).unwrap().condition(
+                    Ok,
+                    |input| Ok(StagingContext::constant(input.context(), Array::scalar(true).unwrap())),
+                    Array::scalar(3.0f32).unwrap(),
+                ),
                 Err(TypeError::invalid(
                     "`condition` branch output type signature mismatch: expected [f32[]] but got [bool[]]",
                 )
@@ -15286,7 +15404,7 @@ mod tests {
             );
         }
         let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(predicate, input): (Tracer<_>, Tracer<_>)| predicate.condition(input, Ok, Ok),
+            |(predicate, input): (Tracer<_>, Tracer<_>)| predicate.condition(Ok, Ok, input),
             (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)),
         );
         assert!(matches!(
@@ -15296,9 +15414,11 @@ mod tests {
         ));
         let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, input): (Tracer<_>, Tracer<_>)| {
-                predicate.condition(input, Ok, |input| {
-                    Ok(StagingContext::constant(input.context(), Array::scalar(true).unwrap()))
-                })
+                predicate.condition(
+                    Ok,
+                    |input| Ok(StagingContext::constant(input.context(), Array::scalar(true).unwrap())),
+                    input,
+                )
             },
             (ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F32)),
         );
@@ -15313,13 +15433,17 @@ mod tests {
         // bound, rather than an internal error from the reference checks that staging performs first.
         let result = TracingContext::<TestIrValue, TestIrOperation>::trace(
             |inputs: Vec<Tracer<_>>| {
-                inputs[0].condition(inputs[1].clone(), Ok, |reference| {
-                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
-                    Ok(reference
-                        .context()
-                        .bind(TestIrOperation::from(read), Vec::new(), &[reference.clone()])?
-                        .remove(0))
-                })
+                inputs[0].condition(
+                    Ok,
+                    |reference| {
+                        let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                        Ok(reference
+                            .context()
+                            .bind(TestIrOperation::from(read), Vec::new(), &[reference.clone()])?
+                            .remove(0))
+                    },
+                    inputs[1].clone(),
+                )
             },
             vec![
                 ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
@@ -15346,15 +15470,15 @@ mod tests {
         let input = context.input(ArrayType::scalar(DataType::F32).into());
         let traced = Cell::new(false);
         let result = predicate.condition(
+            |input| {
+                traced.set(true);
+                Ok(input)
+            },
+            |input| {
+                traced.set(true);
+                Ok(input)
+            },
             input,
-            |input| {
-                traced.set(true);
-                Ok(input)
-            },
-            |input| {
-                traced.set(true);
-                Ok(input)
-            },
         );
         assert_eq!(
             result.map(|_| ()),
@@ -15376,7 +15500,6 @@ mod tests {
         let (_, program) = TracingContext::<TestIrValue, KernelOperation>::trace(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone()],
                     |inputs| {
                         true_calls.set(true_calls.get() + 1);
                         inputs[0].context().bind(
@@ -15393,6 +15516,7 @@ mod tests {
                             &inputs,
                         )
                     },
+                    vec![inputs[1].clone()],
                 )
             },
             vec![
@@ -15446,9 +15570,9 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone(), inputs[2].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone()]),
                     |inputs| Ok(vec![StagingContext::constant(inputs[0].context(), Array::scalar(1.0f32).unwrap())]),
+                    vec![inputs[1].clone(), inputs[2].clone()],
                 )
             },
             vec![predicate_type.clone(), invariant_type.clone(), varying_type.clone()],
@@ -15487,9 +15611,9 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
                     |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+                    vec![inputs[1].clone()],
                 )
             },
             vec![invariant_predicate_type, invariant_type],
@@ -15550,7 +15674,6 @@ mod tests {
                             Ok::<_, ProgramError>(())
                         };
                     inputs[0].condition(
-                        vec![inputs[1].clone(), inputs[2].clone()],
                         |inputs| {
                             access(&inputs[0], false)?;
                             access(&inputs[1], false)
@@ -15559,6 +15682,7 @@ mod tests {
                             access(&inputs[0], mutate_invariant)?;
                             access(&inputs[1], true)
                         },
+                        vec![inputs[1].clone(), inputs[2].clone()],
                     )
                 },
                 input_types.clone(),
@@ -15616,9 +15740,9 @@ mod tests {
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone(), inputs[2].clone()],
                     |inputs| Ok(vec![inputs[0].clone(), inputs[0].clone() * inputs[1].clone()]),
                     |inputs| Ok(vec![inputs[0].clone(), inputs[1].clone()]),
+                    vec![inputs[1].clone(), inputs[2].clone()],
                 )
             },
             vec![predicate_type, invariant_type.clone(), varying_type.clone()],
@@ -15664,9 +15788,9 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone(), inputs[2].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone()]),
                     |inputs| Ok(vec![inputs[0].clone()]),
+                    vec![inputs[1].clone(), inputs[2].clone()],
                 )
             },
             vec![predicate_type, invariant_type, varying_type],
@@ -15747,12 +15871,12 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].condition(
-                    vec![inputs[1].clone()],
                     |inputs| {
                         let factor = StagingContext::constant(inputs[0].context(), Array::scalar(2.0f32).unwrap());
                         Ok(vec![inputs[0].clone() * factor.sin()?])
                     },
                     |inputs| Ok(vec![inputs[0].clone()]),
+                    vec![inputs[1].clone()],
                 )
             },
             vec![predicate_type, varying_type],
