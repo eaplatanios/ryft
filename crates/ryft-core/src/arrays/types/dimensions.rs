@@ -9,6 +9,8 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::sharding::ShardableType;
+use crate::arrays::sharding::shardings::Sharding;
 use crate::axes::Axis;
 use crate::parameters::Parameter;
 use crate::programs::types::type_signature_pairs;
@@ -523,6 +525,13 @@ impl Type for DimensionType {
     #[inline]
     fn is_complex(&self) -> bool {
         false
+    }
+}
+
+impl ShardableType for DimensionType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        None
     }
 }
 

@@ -6,9 +6,9 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::broadcasting::Broadcastable;
-use crate::arrays::sharding::ShardingError;
 use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
+use crate::arrays::sharding::{ShardableType, ShardingError};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{
     Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionVariable, Shape,
@@ -621,6 +621,13 @@ impl Type for ArrayType {
     #[inline]
     fn is_complex(&self) -> bool {
         self.data_type.is_complex()
+    }
+}
+
+impl ShardableType for ArrayType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        self.sharding()
     }
 }
 

@@ -3,6 +3,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ShardableType, Sharding};
 use crate::parameters::Parameter;
 use crate::programs::identities::{NoIdentity, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
@@ -93,6 +94,13 @@ impl<T: Type> Type for ReferenceType<T> {
     #[inline]
     fn is_reference(&self) -> bool {
         true
+    }
+}
+
+impl<T: ShardableType> ShardableType for ReferenceType<T> {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        self.referent().sharding()
     }
 }
 

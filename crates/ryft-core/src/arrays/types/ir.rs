@@ -3,6 +3,8 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::sharding::ShardableType;
+use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements, AsArrayType};
 use crate::arrays::types::dimensions::{
     AsDimensionType, Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionType,
@@ -268,6 +270,17 @@ impl Type for ArrayIrType {
     #[inline]
     fn is_reference(&self) -> bool {
         matches!(self, Self::Reference(_))
+    }
+}
+
+impl ShardableType for ArrayIrType {
+    #[inline]
+    fn sharding(&self) -> Option<&Sharding> {
+        match self {
+            Self::Array(r#type) => r#type.sharding(),
+            Self::Dimension(r#type) => r#type.sharding(),
+            Self::Reference(r#type) => r#type.sharding(),
+        }
     }
 }
 

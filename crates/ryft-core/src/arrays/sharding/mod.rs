@@ -1,10 +1,6 @@
 use thiserror::Error;
 
-use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::data::DataType;
-use crate::arrays::types::dimensions::DimensionType;
-use crate::arrays::types::ir::ArrayIrType;
-use crate::programs::{ReferenceType, Type, TypeError};
+use crate::programs::{Type, TypeError};
 
 pub mod meshes;
 pub mod shardings;
@@ -96,50 +92,15 @@ pub trait ShardableType: Type {
     }
 }
 
-impl<T: ShardableType> ShardableType for ReferenceType<T> {
-    #[inline]
-    fn sharding(&self) -> Option<&Sharding> {
-        self.referent().sharding()
-    }
-}
-
-impl ShardableType for DataType {
-    #[inline]
-    fn sharding(&self) -> Option<&Sharding> {
-        None
-    }
-}
-
-impl ShardableType for ArrayType {
-    #[inline]
-    fn sharding(&self) -> Option<&Sharding> {
-        self.sharding()
-    }
-}
-
-impl ShardableType for DimensionType {
-    #[inline]
-    fn sharding(&self) -> Option<&Sharding> {
-        None
-    }
-}
-
-impl ShardableType for ArrayIrType {
-    #[inline]
-    fn sharding(&self) -> Option<&Sharding> {
-        match self {
-            Self::Array(r#type) => r#type.sharding(),
-            Self::Dimension(r#type) => r#type.sharding(),
-            Self::Reference(r#type) => r#type.sharding(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::types::dimensions::Dimension;
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionType};
+    use crate::arrays::types::ir::ArrayIrType;
+    use crate::programs::ReferenceType;
 
     use super::*;
 
