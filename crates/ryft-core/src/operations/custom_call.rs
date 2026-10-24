@@ -431,8 +431,10 @@ impl Display for CustomCallInputOutputAlias {
     }
 }
 
-/// Lowering-only unrolling policy for [`CustomCallBatching::Sequential`]. Unrolling preserves the per-item kernel
-/// calls and their order while trading generated code size for loop overhead.
+/// Unrolling policy for the scan used by [`CustomCallBatching::Sequential`]. Batching stages one scan whose body makes
+/// one unbatched kernel call. When compiling that scan, the backend expands consecutive iterations according to this
+/// policy, trading compiled code size for loop overhead while preserving the number, order, and inputs of the kernel
+/// calls. Eager interpretation executes one item per iteration regardless of this policy.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CustomCallUnrolling {
     /// Keep one kernel call per loop trip. This is the default.
@@ -446,8 +448,6 @@ pub enum CustomCallUnrolling {
     /// extent and corresponds to JAX's `sequential_unrolled` mode.
     Full,
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its inputs. Ryft cannot derive
 /// a batching rule for an opaque kernel, so the author of the call declares which of the few universally meaningful
@@ -474,7 +474,7 @@ pub enum CustomCallBatching {
     /// kernel consequently runs `b` ordered times. The `unroll` policy selects the factor forwarded to
     /// [`ScanOperation::with_unroll`]; full unrolling requires a statically known batch extent.
     Sequential {
-        /// Lowering-only unrolling policy for the staged scan.
+        /// Policy controlling how the staged scan's iterations are unrolled during compilation.
         unroll: CustomCallUnrolling,
     },
 
@@ -513,6 +513,8 @@ impl Display for CustomCallBatching {
 
 /// Canonical operation name for [`CustomCallOperation`].
 pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Attribute names that [`CustomCallOperation`] rejects because its rendering uses them for its own fields, where a
 /// configuration attribute of the same name would be indistinguishable from the field.
@@ -621,9 +623,6 @@ pub struct CustomCallOperation {
     /// Name under which the foreign kernel is registered with the executing backend.
     target_name: String,
 
-    /// Declared output types of the call; inference adds inherited manual variation to undeclared shardings.
-    output_types: Vec<ArrayType>,
-
     /// Typed configuration attributes forwarded to the kernel, in insertion order.
     attributes: Vec<(String, CustomCallAttribute)>,
 
@@ -632,6 +631,9 @@ pub struct CustomCallOperation {
 
     /// Flat array input/output buffer aliases, in declaration order.
     input_output_aliases: Vec<CustomCallInputOutputAlias>,
+
+    /// Declared output types of the call; inference adds inherited manual variation to undeclared shardings.
+    output_types: Vec<ArrayType>,
 
     /// Observable effect of the call, or `None` for a pure call.
     effect_class: Option<EffectClass>,
@@ -651,10 +653,10 @@ impl CustomCallOperation {
     pub fn new<N: Into<String>>(target_name: N, output_types: Vec<ArrayType>) -> Self {
         Self {
             target_name: target_name.into(),
-            output_types,
             attributes: Vec::new(),
             input_layouts: Vec::new(),
             input_output_aliases: Vec::new(),
+            output_types,
             effect_class: None,
             batching: CustomCallBatching::default(),
         }
@@ -747,12 +749,6 @@ impl CustomCallOperation {
         self.target_name.as_str()
     }
 
-    /// Returns the declared output types of the call.
-    #[inline]
-    pub fn output_types(&self) -> &[ArrayType] {
-        self.output_types.as_slice()
-    }
-
     /// Returns the typed configuration attributes forwarded to the kernel, in insertion order.
     #[inline]
     pub fn attributes(&self) -> &[(String, CustomCallAttribute)] {
@@ -770,6 +766,12 @@ impl CustomCallOperation {
     #[inline]
     pub fn input_output_aliases(&self) -> &[CustomCallInputOutputAlias] {
         self.input_output_aliases.as_slice()
+    }
+
+    /// Returns the declared output types of the call.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        self.output_types.as_slice()
     }
 
     /// Returns whether the call has observable side effects beyond its returned outputs.
@@ -808,14 +810,14 @@ impl CustomCallOperation {
     fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         Ok(Self {
             target_name: self.target_name.clone(),
+            attributes: self.attributes.clone(),
+            input_layouts: self.input_layouts.clone(),
+            input_output_aliases: self.input_output_aliases.clone(),
             output_types: self
                 .output_types
                 .iter()
                 .map(|r#type| r#type.rename_identities(renaming))
                 .collect::<Result<Vec<_>, _>>()?,
-            attributes: self.attributes.clone(),
-            input_layouts: self.input_layouts.clone(),
-            input_output_aliases: self.input_output_aliases.clone(),
             effect_class: self.effect_class,
             batching: self.batching,
         })
@@ -1119,11 +1121,11 @@ impl CustomCallOperation {
         Ok(Self { output_types, ..self.clone() })
     }
 
-    /// Returns the lowering-only [`ScanOperation`] unroll factor that the selected sequential [`CustomCallBatching`]
-    /// behavior requests for a mapped axis of extent `batch_dimension`, or [`None`] to keep one kernel call per loop
-    /// trip. [`CustomCallUnrolling::Full`] uses the static batch extent itself, which unrolls the scan completely
-    /// (refer to [`ScanOperation::with_unroll`]), and so it rejects dynamic extents. The single-call and rejecting
-    /// behaviors stage no scan and request no unrolling.
+    /// Returns the [`ScanOperation`] unroll factor that the selected sequential [`CustomCallBatching`] behavior requests
+    /// for a mapped axis of extent `batch_dimension`, or [`None`] to keep one kernel call per loop trip.
+    /// [`CustomCallUnrolling::Full`] uses the static batch extent itself, which unrolls the scan completely (refer to
+    /// [`ScanOperation::with_unroll`]), and so it rejects dynamic extents. The single-call and rejecting behaviors stage
+    /// no scan and request no unrolling.
     fn sequential_unroll(&self, batch_dimension: &Dimension) -> Result<Option<usize>, BatchingError> {
         match self.batching {
             CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled } => Ok(None),
@@ -1449,9 +1451,9 @@ impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> Partial
 // [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every input to batch axis `0` and rebinds one call whose
 // declared outputs gain the same leading batch dimension. The other
 // single-call modes differ only in whether replicated inputs gain a singleton axis or remain unchanged. All mapped
-// behaviors keep the staged program's size independent of the batch extent (unrolling is lowering-only) and compose
-// with nested batching, because the rewritten instruction is bound through the parent context and carries the same
-// behavior selection.
+// behaviors keep the staged program's size independent of the batch extent: unrolling expands the scan during backend
+// compilation. They compose with nested batching, because the rewritten instruction is bound through the parent context
+// and carries the same behavior selection.
 //
 // Sequential batching requires a statically known mapped extent here: the scan trip count is a host `usize` in this
 // universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip count is a first-class
@@ -2459,10 +2461,10 @@ mod tests {
         let operation = CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::new_static(DataType::F32, [2])]);
         assert_eq!(operation.name(), CUSTOM_CALL_OPERATION_NAME);
         assert_eq!(operation.target_name(), "ryft.test.add_one");
-        assert_eq!(operation.output_types(), &[ArrayType::new_static(DataType::F32, [2])]);
         assert!(operation.attributes().is_empty());
         assert!(operation.input_layouts().is_empty());
         assert!(operation.input_output_aliases().is_empty());
+        assert_eq!(operation.output_types(), &[ArrayType::new_static(DataType::F32, [2])]);
         assert!(!operation.has_side_effect());
         assert_eq!(operation.effect_class(), None);
         assert!(operation.effects().is_pure());
@@ -2476,8 +2478,8 @@ mod tests {
         assert_ne!(operation, operation.clone().with_batching(CustomCallBatching::BroadcastAll));
         assert_eq!(
             format!("{:?}", CustomCallOperation::new("kernel", Vec::new())),
-            "CustomCallOperation { target_name: \"kernel\", output_types: [], attributes: [], input_layouts: [], \
-             input_output_aliases: [], effect_class: None, batching: Rejected }",
+            "CustomCallOperation { target_name: \"kernel\", attributes: [], input_layouts: [], input_output_aliases: [], \
+             output_types: [], effect_class: None, batching: Rejected }",
         );
 
         // Every configured field renders in declaration order, one field per line once the section is long.
@@ -3860,7 +3862,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_sequential_unroll() {
-        // The lowering-only unroll factor is forwarded to the staged `scan`, even when it does not divide the batch
+        // The unroll factor is forwarded to the staged `scan`, even when it does not divide the batch
         // extent (lowerings run the remaining iterations after the unrolled loop).
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
