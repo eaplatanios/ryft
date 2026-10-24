@@ -256,12 +256,13 @@ impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> InterpretationDrive
 //  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
 //  context type is built from `Self` (E0284), and a per-method `where Self: Operation<Type = C::Type>` clause
 //  reproduces the same failure for the composite eager dispatcher for `ArrayIrOperation`.
-/// Eager execution rule for an [`Operation`] over a chosen value semantics. The interpretation [`Domain`] `C` is the
-/// source of the input, output, and attached-region value families. Implementations add only the capabilities they
-/// actually consume, such as zero construction for a nullary rule. The contract requires [`Domain`] rather than
-/// [`Context`] because [`EagerContext`]'s [`Context`] implementation itself requires `O: InterpretableOperation<Self>`;
-/// reaching [`Context`] through this trait would make that obligation recursive. Rules that need to apply operations
-/// themselves bind them through [`InterpretationDriver::bind`] instead.
+/// Eager execution rule for an [`Operation`] over a chosen value semantics. The interpretation [`Domain`] `C` is
+/// the source of runtime input and output [`Value`]s and of the stored [`Domain::Constant`]s of attached regions.
+/// Implementations add only the capabilities they actually consume, such as zero construction for a nullary rule.
+/// The contract requires [`Domain`] rather than [`Context`] because [`EagerContext`]'s [`Context`] implementation
+/// itself requires `O: InterpretableOperation<Self>`; reaching [`Context`] through this trait would make that
+/// obligation recursive. Rules that need to apply operations themselves bind them through
+/// [`InterpretationDriver::bind`] instead.
 ///
 /// # Type Compatibility
 ///
@@ -1486,7 +1487,7 @@ mod tests {
         RegionSlot, TypeError,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation, TestRegionOperation};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -1550,7 +1551,7 @@ mod tests {
         // The same stored region retains Array constants when its runtime values are Tracers. This also exercises
         // constant lifting and operation binding through the interpretation driver with distinct value families.
         let (_, restaged) = TracingContext::<Array, TestArrayOperation>::trace(
-            |inputs: Vec<_>| {
+            |inputs: Vec<Tracer<TracingContext<Array, TestArrayOperation>>>| {
                 let context = inputs[0].context().clone();
                 let outputs = driver.interpret_region(&context, 0, inputs)?;
                 driver.bind(&context, NegOperation::new().into(), Vec::new(), &outputs)
@@ -1562,7 +1563,8 @@ mod tests {
             restaged.to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %2:f32[] = add %0, 3
+                let %1:f32[] = const 3.0
+                    %2:f32[] = add %0, %1
                     %3:f32[] = neg %2
                 in (%3)
             "}
