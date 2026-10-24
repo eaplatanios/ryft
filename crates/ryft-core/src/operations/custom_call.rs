@@ -276,11 +276,11 @@ impl_custom_call_attribute_conversions!(u64, U64);
 impl_custom_call_attribute_conversions!(f32, F32);
 impl_custom_call_attribute_conversions!(f64, F64);
 
-/// One-dimensional numeric array carried by [`CustomCallAttribute::Array`]. The element types are exactly the numeric
-/// array element types that a typed Foreign Function Interface (FFI) can decode (e.g., as a `Span<const int32_t>` in
-/// XLA's FFI). Boolean arrays are deliberately absent because those interfaces cannot decode them. Equality and hashing
-/// compare floating-point elements bitwise, like [`CustomCallAttribute`] does for scalars, and arrays render with
-/// their element type (e.g., `array<i32: 1, 2>`).
+/// One-dimensional numeric array carried by [`CustomCallAttribute::Array`]. The supported element types
+/// match the numeric array attributes that XLA's typed Foreign Function Interface (FFI) can decode (e.g., as
+/// a `Span<const int32_t>`). Boolean arrays are omitted because XLA's typed FFI does not support Boolean array
+/// attributes. Equality and hashing compare floating-point elements bitwise, like [`CustomCallAttribute`] does
+/// for scalars, and arrays render with their element type (e.g., `array<i32: 1, 2>`).
 #[derive(Clone, Debug)]
 pub enum CustomCallArrayAttribute {
     I8(Vec<i8>),
@@ -397,47 +397,41 @@ impl Hash for CustomCallArrayAttribute {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Declares that one flat array output of a [`CustomCallOperation`] aliases one flat array input.
-///
-/// Aliasing requires the input and output to describe the same logical array. It allows a backend to reuse the input
-/// buffer for the output without changing Ryft's functional SSA semantics. The indices never include mixed trailing
-/// dimension inputs or backend-internal effect tokens.
+/// Declares that an output of a [`CustomCallOperation`] aliases an input.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallInputOutputAlias {
-    /// Index of the aliased array input.
+    /// Index of the aliased input.
     input_index: usize,
 
-    /// Index of the array output that aliases the input.
+    /// Index of the output that aliases the input.
     output_index: usize,
 }
 
 impl CustomCallInputOutputAlias {
-    /// Creates an alias from the array input at `input_index` to the array output at `output_index`.
-    #[inline]
-    pub fn new(input_index: usize, output_index: usize) -> Self {
+    /// Creates an alias from the input at `input_index` to the output at `output_index`.
+    pub const fn new(input_index: usize, output_index: usize) -> Self {
         Self { input_index, output_index }
     }
 
-    /// Returns the index of the aliased array input.
-    #[inline]
-    pub fn input_index(&self) -> usize {
+    /// Returns the index of the aliased input.
+    pub const fn input_index(&self) -> usize {
         self.input_index
     }
 
-    /// Returns the index of the array output that aliases the input.
-    #[inline]
-    pub fn output_index(&self) -> usize {
+    /// Returns the index of the output that aliases the input.
+    pub const fn output_index(&self) -> usize {
         self.output_index
     }
 }
 
 impl Display for CustomCallInputOutputAlias {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}->{}", self.input_index, self.output_index)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its inputs. Ryft cannot derive a
 /// batching rule for an opaque kernel, so the author of the call declares which of the few universally meaningful
@@ -530,6 +524,10 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// kernel. Eager execution and backend lowering use the trailing inputs to verify or attach the declared logical sizes
 /// to the returned buffers. Both contracts share one payload with the same target, output declarations, attributes,
 /// layouts, aliases, effects, rendering, and backend-kernel semantics.
+///
+/// Input/output aliases allow a backend to reuse an input array's buffer for an output without changing Ryft's
+/// functional SSA semantics. Alias indices address only array inputs and outputs; trailing dimension inputs and
+/// backend-internal effect tokens are excluded.
 ///
 /// Type inference also validates the configuration: attribute names must be unique (including within nested
 /// dictionaries) and must not reuse the names of the operation's own rendered fields (`target`, `input_layouts`,
