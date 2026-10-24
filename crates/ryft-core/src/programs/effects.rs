@@ -477,7 +477,8 @@ impl Effects {
         self.summary.classes
     }
 
-    /// Returns `true` if the aggregate [`classes`](Self::classes) are [`EffectClasses::NONE`].
+    /// Returns `true` if the aggregate [`classes`](Self::classes) are [`EffectClasses::NONE`]. Deferred work is
+    /// independent of these classes; [`EffectsSummary::is_pure`] additionally requires no deferred work.
     #[inline]
     pub fn is_pure(&self) -> bool {
         self.summary.classes.is_empty()
@@ -625,8 +626,8 @@ pub struct EffectsSummary {
 }
 
 impl EffectsSummary {
-    /// [`EffectsSummary`] of a pure [`Operation`](crate::Operation) application (i.e., no effect classes and nothing
-    /// observable when the [`Operation`](crate::Operation) application result is unused).
+    /// [`EffectsSummary`] of a pure [`Operation`](crate::Operation) application (i.e., no effect classes, observable
+    /// consequences when its result is unused, or deferred work).
     pub const PURE: EffectsSummary = EffectsSummary {
         classes: EffectClasses::NONE,
         has_observable_effects_when_unused: false,
@@ -647,6 +648,13 @@ impl EffectsSummary {
     /// Returns the aggregate [`EffectClasses`] of this [`EffectsSummary`].
     pub const fn classes(self) -> EffectClasses {
         self.classes
+    }
+
+    /// Returns whether this summary has no effect classes and carries no [deferred work](Effects#deferred-work).
+    /// Unlike [`Effects::is_pure`], this also excludes unresolved transformation obligations. An unused reference
+    /// allocation can be eliminated but still has an effect class, so it is not pure.
+    pub const fn is_pure(self) -> bool {
+        self.classes.is_empty() && !self.has_deferred_work
     }
 
     /// Returns whether an application with no live output still has an observable consequence and must be retained by
@@ -1123,6 +1131,23 @@ mod tests {
         assert!(allocation_and_io.has_observable_effects_when_unused());
         assert_eq!(allocation.summary().union(allocation.summary()), allocation.summary());
         assert!(!allocation.summary().union(allocation.summary()).has_observable_effects_when_unused());
+    }
+
+    #[test]
+    fn test_effects_summary_is_pure() {
+        assert!(EffectsSummary::PURE.is_pure());
+
+        // An unused allocation is discardable, but allocating state is still an effect.
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        assert!(!allocation.summary().has_observable_effects_when_unused());
+        assert!(!allocation.summary().is_pure());
+
+        // A declaration can have no runtime effects while its summary retains a transformation obligation.
+        let deferred = Effects::empty().clone().with_deferred_work();
+        assert!(deferred.is_pure());
+        assert!(!deferred.summary().is_pure());
+        assert!(!EffectsSummary::PURE.union(deferred.summary()).is_pure());
     }
 
     #[test]

@@ -73,8 +73,8 @@ use crate::partial::{
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, Concretizable, EffectsSummary, EmptyRegionDriver, InputRegionProvenance, MaybeZero,
-    Operation, OperationBoundaryPruning, OperationPayloadProjection, OperationProjection, OperationProvider,
+    AtomId, CalleeRegionDriver, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
+    OperationBoundaryPruning, OperationPayloadProjection, OperationProjection, OperationProvider,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceMemberType,
     ReferenceRoot, RegionDataFlow, RegionDriver, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
@@ -825,7 +825,7 @@ impl<
 
         // Both branches run for a mapped predicate, including work that an item does not select. Effects and
         // deferred transformation obligations cannot be selected per item, so both branches must be pure.
-        if branches.iter().any(|branch| !is_pure(branch.effects())) {
+        if branches.iter().any(|branch| !branch.effects().is_pure()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that have \
@@ -924,7 +924,7 @@ impl<
 
         // Check other effects and deferred work only after reference accesses, so the reference diagnostic names
         // the cause when both restrictions apply. Selecting outputs cannot suppress work in an inactive branch.
-        if branches.iter().any(|branch| !is_pure(branch.effects())) {
+        if branches.iter().any(|branch| !branch.effects().is_pure()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that have \
@@ -1743,12 +1743,11 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
     /// can be evaluated together: both must be pure, have no deferred work, and satisfy the type family's reference and
     /// identity constraints.
     ///
-    /// Each branch is batched through `driver.batch_region` over gated inputs (refer to
-    /// [`gate_mapped_predicate_branch_inputs`]): an input for which `stop_gradient` returns its gradient-stopped copy
-    /// enters each branch as a per-item selection between itself and that copy, so primal values are unchanged but an
-    /// inactive branch contributes no derivatives, and in particular no non-finite ones, while an input for which it
-    /// returns `None` passes through unchanged. `merge` then combines output `index` of the two branches, given the
-    /// per-item selection.
+    /// Each branch is batched through `driver.batch_region` over gated inputs: an input for which `stop_gradient`
+    /// returns its gradient-stopped copy enters each branch as a per-item selection between itself and that copy, so
+    /// primal values are unchanged but an inactive branch contributes no derivatives, and in particular no non-finite
+    /// ones, while an input for which it returns `None` passes through unchanged. `merge` then combines output `index`
+    /// of the two branches, given the per-item selection.
     ///
     /// Each selection binds the predicate and its two candidates through `bind_select`, after aligning their manual
     /// variation, because [`Context::bind`] does not align it. The candidates are aligned with each other and with the
@@ -1819,9 +1818,26 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
                 P::batch(candidates.next().unwrap(), P::batch_axis(on_false))?,
             ])
         };
-        let true_inputs = gate_mapped_predicate_branch_inputs(0, branch_inputs, &stopped_inputs, select)?;
+        // Each branch sees its original primal inputs, but gradients enter only where the predicate selects it.
+        // Selecting outputs alone can pass zero cotangents through inactive non-finite derivatives and produce NaNs.
+        // Structural inputs without a stopped copy pass through unchanged.
+        let true_inputs = branch_inputs
+            .iter()
+            .zip(&stopped_inputs)
+            .map(|(input, stopped)| match stopped {
+                Some(stopped) => select(input, stopped),
+                None => Ok(input.clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let true_outputs = driver.batch_region(self, 0, true_inputs)?;
-        let false_inputs = gate_mapped_predicate_branch_inputs(1, branch_inputs, &stopped_inputs, select)?;
+        let false_inputs = branch_inputs
+            .iter()
+            .zip(&stopped_inputs)
+            .map(|(input, stopped)| match stopped {
+                Some(stopped) => select(stopped, input),
+                None => Ok(input.clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let false_outputs = driver.batch_region(self, 1, false_inputs)?;
         check_count!("output", false_outputs, true_outputs.len(), ProgramError);
         true_outputs
@@ -2212,7 +2228,7 @@ where
     // Unit-returning branches still need their residual effects reconstructed, without binding an empty known
     // condition.
     let known_side_is_inert =
-        !output_known.contains(&true) && splits.iter().all(|split| is_pure(split.known_program.effects()));
+        !output_known.contains(&true) && splits.iter().all(|split| split.known_program.effects().is_pure());
     let known_side_is_empty = known_side_is_inert && splits.iter().all(|split| split.edge_program_outputs.is_empty());
     let known_side_only_forwards =
         known_side_is_inert && splits.iter().all(|split| split.known_program_only_forwards());
@@ -2256,7 +2272,7 @@ where
     // returns the `true` branch's edges and then the `false` branch's edges after its known outputs, which is the order
     // in which the residual condition receives them after the unknown inputs.
     let needs_residual_condition =
-        output_known.contains(&false) || splits.iter().any(|split| !is_pure(split.residual_program.effects()));
+        output_known.contains(&false) || splits.iter().any(|split| !split.residual_program.effects().is_pure());
     let residual_outputs = if needs_residual_condition {
         let edge_types = [true_split.edge_types.as_slice(), false_split.edge_types.as_slice()];
         let residual_branches = [(&true_split, true), (&false_split, false)]
@@ -2283,36 +2299,6 @@ where
         .iter()
         .map(|&known| if known { known_values.next() } else { residual_values.next() }.unwrap())
         .collect()))
-}
-
-/// Returns whether a computation whose effects are summarized by `effects` is pure, i.e., has no effects and carries
-/// no deferred work.
-fn is_pure(effects: EffectsSummary) -> bool {
-    effects.classes().is_empty() && !effects.has_deferred_work()
-}
-
-/// Returns the inputs of the branch at `branch_index` (i.e., `0` for the `true` branch and `1` for the `false` branch)
-/// of a condition whose predicate is batch-varying. Each input `x` of `branch_inputs` whose entry of `stopped_inputs`
-/// holds `stop_gradient(x)` enters the `true` branch as `select(predicate, x, stop_gradient(x))` and the `false` branch
-/// as `select(predicate, stop_gradient(x), x)`, through `select`, so that its primal value is unchanged while gradients
-/// enter only the branch that each item takes. Selecting only the branch outputs would instead send zero cotangents
-/// through the inactive branch's derivatives, which produce NaNs where they are not finite. An input whose entry of
-/// `stopped_inputs` is `None` passes through unchanged.
-fn gate_mapped_predicate_branch_inputs<B: Clone>(
-    branch_index: usize,
-    branch_inputs: &[B],
-    stopped_inputs: &[Option<B>],
-    select: impl Fn(&B, &B) -> Result<B, BatchingError>,
-) -> Result<Vec<B>, BatchingError> {
-    branch_inputs
-        .iter()
-        .zip(stopped_inputs)
-        .map(|(input, stopped)| match stopped {
-            Some(stopped) if branch_index == 0 => select(input, stopped),
-            Some(stopped) => select(stopped, input),
-            None => Ok(input.clone()),
-        })
-        .collect()
 }
 
 #[cfg(test)]
