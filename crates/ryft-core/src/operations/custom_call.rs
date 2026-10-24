@@ -538,75 +538,73 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// layouts, aliases, effects, rendering, and backend-kernel semantics.
 ///
 /// Input/output aliases allow a backend to reuse an input array's buffer for an output without changing Ryft's
-/// functional SSA semantics. Alias indices address only array inputs and outputs; trailing dimension inputs and
-/// backend-internal effect tokens are excluded.
+/// functional Single Static Assignment (SSA) semantics. Alias indices address only array inputs and outputs; trailing
+/// dimension inputs and backend-internal effect tokens are excluded.
 ///
 /// Type inference also validates the configuration: attribute names must be unique (including within nested
-/// dictionaries) and must not reuse the names of the operation's own rendered fields (`target`, `input_layouts`,
-/// `input_output_alias`, `has_side_effect`, `effect_class`, and `batching`), declared input layouts must match the
-/// rank of their inputs, and each alias must connect an input and an output of identical types apart from their
-/// original layouts, with matching layouts at the kernel boundary. Output types declared without a sharding inherit
-/// the manual-axis variation of the inputs, placed replicated on their mesh, because opaque code cannot be assumed to
+/// dictionaries) and must not reuse the names of the operation's own rendered fields (i.e., `target`, `input_layouts`,
+/// `input_output_alias`, `has_side_effect`, `effect_class`, and `batching`), declared input layouts must match the rank
+/// of their inputs, and each alias must connect an input and an output of identical types apart from their original
+/// layouts, with matching layouts at the kernel boundary. Output types declared without a sharding inherit the
+/// manual-axis variation of the inputs, placed replicated on their mesh, because opaque code cannot be assumed to
 /// produce the same result on every device. Aliases are compared against these effective output types after extent
-/// refinement and sharding inheritance, so an input that carries the manual variation its output inherits can alias an
-/// output declared without a sharding.
+/// refinement and sharding inheritance, so an input that carries the manual variation its output inherits can alias
+/// an output declared without a sharding.
 ///
-/// The XLA backend lowers this operation to a
-/// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
-/// (`api_version = 4`), with the attributes carried as the `backend_config` dictionary. Handlers are registered with
-/// the executing PJRT client under the same target name (e.g., via `ryft-pjrt`'s `Client::register_ffi_handler`).
-/// The reference array backend cannot execute foreign kernels, so eager interpretation on it reports an error.
+/// The XLA backend lowers this operation to a [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call)
+/// using the typed Foreign Function Interface (FFI) calling convention (i.e., `api_version = 4`), with the attributes
+/// carried as the `backend_config` dictionary. Handlers are registered with the executing PJRT client under the same
+/// target name (e.g., via `ryft-pjrt`'s `Client::register_ffi_handler`). The reference array backend cannot execute
+/// foreign kernels, so eager interpretation on it reports an error.
 ///
 /// # Transformations
 ///
-/// Because the kernel is opaque, Ryft cannot derive its transform rules:
+/// Because the kernel is opaque, Ryft cannot derive its transform rules automatically:
 ///
-///   - **Differentiation:** Forward-mode differentiation binds the call unchanged and returns structural zero
-///     tangents when every input tangent is a structural zero (including when the call has no inputs). Any other
-///     derivative reports an error directing users to call the kernel through a
-///     [`custom_function`](crate::custom_function) with derivative rules (refer to
-///     [`CustomFunction::from_custom_call`](crate::CustomFunction::from_custom_call)). The call is not linear, so it
-///     never transposes.
+///   - **Differentiation:** Forward-mode differentiation binds the call unchanged and returns structural zero tangents
+///     when every input tangent is a structural zero (including when the call has no inputs). Any other derivative
+///     reports an error directing users to call the kernel through a [`custom_function`](crate::custom_function) with
+///     derivative rules (refer to [`CustomFunction::from_custom_call`](crate::CustomFunction::from_custom_call)). The
+///     call is not linear, so it never transposes.
 ///   - **Batching:** A call whose inputs are all replicated is bound unchanged, because a region-free foreign kernel
 ///     cannot observe the transform's named axis. A mapped input is governed by the [`CustomCallBatching`] behavior
 ///     selected with [`with_batching`](Self::with_batching): the default [`Rejected`](CustomCallBatching::Rejected)
 ///     reports an error naming that input, [`Sequential`](CustomCallBatching::Sequential) applies the kernel once per
 ///     batch item through a `scan` with an explicit [`CustomCallUnrolling`] policy, and
 ///     [`BroadcastAll`](CustomCallBatching::BroadcastAll), [`ExpandDimensions`](CustomCallBatching::ExpandDimensions),
-///     and [`Vectorized`](CustomCallBatching::Vectorized)
-///     hand the kernel batch-prefixed buffers in a single call. A [`custom_function`](crate::custom_function) without
-///     its own batching rule batches its primal region structurally, so a mapped input reaches this same operation
-///     and meets this same contract. Single-call strategies shift declared input and output layouts so that the new
-///     batch axis is the most major one.
-///   - **Partial evaluation:** Known calls execute or stage through the parent context when it supports them, and pure
+///     and [`Vectorized`](CustomCallBatching::Vectorized) hand the kernel batch-prefixed buffers in a single call.
+///     A [`custom_function`](crate::custom_function) without its own batching rule batches its primal region
+///     structurally, so a mapped input reaches this same operation and meets this same contract. Single-call strategies
+///     shift declared input and output layouts so that the new batch axis is the most major one.
+///   - **Partial Evaluation:** Known calls execute or stage through the parent context when it supports them, and pure
 ///     calls remain residual when an eager parent cannot execute them. Residual calls retain their declared effects
 ///     through dead-code elimination.
 ///
 /// # Effects
 ///
 /// A call is pure unless it declares an [`EffectClass`]. [`with_side_effect`](Self::with_side_effect) declares
-/// [`EffectClass::UnorderedIo`], the contract of JAX's `has_side_effect=True`: the call stays alive through dead-code
-/// elimination and is observable, without any ordering dependency and without a token in the kernel's calling
-/// convention. [`with_effect_class`](Self::with_effect_class) selects a stronger contract: [`EffectClass::OrderedIo`]
-/// preserves the call's execution order relative to other ordered I/O effects across every participating device, and
-/// [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O executing on the same device,
-/// which is what permits the call to execute once per device inside `shard_map` bodies. Every effectful call is
-/// lowered with `has_side_effect = true`. Backends that sequence ordered effects through tokens (e.g., the XLA
-/// backend) pass a call with an *ordered* class one extra token input after its array inputs and expect one extra
-/// token output after its declared outputs, so the kernel's handler must accept and return that token; an unordered
-/// call carries no token. Renderings show every effectful call as `has_side_effect=true` and name the class with
-/// `effect_class=...` unless it is the unordered one.
+/// [`EffectClass::UnorderedIo`] (i.e., the contract of JAX's `has_side_effect=True`) meaning that the call stays alive
+/// through dead-code elimination and is observable, without any ordering dependency and without a token in the kernel's
+/// calling convention. [`with_effect_class`](Self::with_effect_class) enables selecting a stronger contract:
+/// [`EffectClass::OrderedIo`] preserves the call's execution order relative to other ordered I/O effects across every
+/// participating device, and [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O
+/// executing on the same device, which is what permits the call to execute once per device inside `shard_map` bodies.
+/// Every effectful call is lowered with `has_side_effect = true`. Backends that sequence ordered effects through tokens
+/// (e.g., the XLA backend) pass a call with an *ordered* class one extra token input after its array inputs and expect
+/// one extra token output after its declared outputs, so the kernel's handler must accept and return that token; an
+/// unordered call carries no token. Renderings show every effectful call as `has_side_effect=true` and name the class
+/// with `effect_class=...` unless it is the unordered one.
 ///
 /// # Backend Contract
 ///
-/// This operation is backend-independent by design, and this payload is the entire portable contract: a target
-/// name resolved in the executing backend's kernel registry, declared output types, typed configuration
-/// attributes, optional input layouts and buffer aliases, and an optional effect class. A backend supports the
-/// operation by providing (1) a process- or client-level registry that resolves target names to executable kernels at
-/// execution time, (2) a calling convention that hands the kernel its input buffers (in their declared layouts),
-/// output buffers matching the declared output types, and the decoded attributes, and (3) an execution engine that
-/// honors the declared effect class for side-effecting calls. Backends that cannot execute foreign kernels (like the
-/// reference array backend) reject interpretation with a clear error instead of guessing.
+/// This operation is backend-independent by design, and this payload is the entire portable contract: a target name
+/// resolved in the executing backend's kernel registry, declared output types, typed configuration attributes, optional
+/// input layouts and buffer aliases, and an optional effect class. A backend supports the operation by providing (1) a
+/// process- or client-level registry that resolves target names to executable kernels at execution time, (2) a calling
+/// convention that hands the kernel its input buffers (in their declared layouts), output buffers matching the declared
+/// output types, and the decoded attributes, and (3) an execution engine that honors the declared effect class for
+/// side-effecting calls. Backends that cannot execute foreign kernels (like the reference array backend) reject
+/// interpretation with a clear error instead of guessing.
 ///
 /// Array layouts come from the canonical [`ArrayType`] descriptors of the results and from the declared input layouts.
 /// An input without a declared layout, including a [`None`] entry, uses dense row-major storage regardless of its
@@ -616,10 +614,10 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// the mixed form are allocated, and never passes the runtime extent: the kernel sees the whole bound-sized buffer,
 /// whose elements beyond the runtime extent are unspecified, so a kernel that needs the live extent takes it as an
 /// ordinary array input. Dynamic inputs without a finite bound have no such buffer and are rejected. Backend-specific
-/// vocabulary must never grow on this payload:
-/// encodings such as XLA's FFI API version, `backend_config` representation, tuple alias paths, result tiling
-/// attributes, or called-computation references belong in the owning backend's lowering (or in a backend-owned
-/// operation). If a configuration knob only makes sense for one backend, it does not belong on this operation.
+/// vocabulary must never grow on this payload: encodings such as XLA's FFI API version, `backend_config`
+/// representation, tuple alias paths, result tiling attributes, or called-computation references belong in the owning
+/// backend's lowering (or in a backend-owned operation). If a configuration knob only makes sense for one backend,
+/// it does not belong on this operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallOperation {
     /// Name under which the foreign kernel is registered with the executing backend.
