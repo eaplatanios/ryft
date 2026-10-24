@@ -866,16 +866,6 @@ impl CustomCallOperation {
         Ok((array_input_count, refinements, output_types))
     }
 
-    /// Returns the number of trailing first-class output-extent inputs this call consumes in the mixed universe, which
-    /// is one per dynamic axis occurrence across its declared outputs.
-    fn dynamic_output_dimension_count(&self) -> usize {
-        self.output_types
-            .iter()
-            .flat_map(|output_type| output_type.shape().dimensions())
-            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-            .count()
-    }
-
     /// Returns this call's declared output types with a leading batch dimension inserted, which is the declaration a
     /// single-call batching strategy hands to its kernel.
     ///
@@ -1113,47 +1103,34 @@ impl CustomCallOperation {
                  fields",
             )));
         }
-        self.validate_input_layouts(input_types)?;
-        self.validate_input_output_aliases(input_types, output_types)?;
-        Ok(())
-    }
-
-    /// Validates the declared input layouts against the array inputs of this operation.
-    fn validate_input_layouts(&self, input_types: &[&ArrayType]) -> Result<(), TypeError> {
-        if self.input_layouts.is_empty() {
-            return Ok(());
-        }
-        if self.input_layouts.len() != input_types.len() {
-            return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` declares {} input layout(s) but the call has {} array input(s)",
-                self.input_layouts.len(),
-                input_types.len(),
-            )));
-        }
-        for (input_index, (layout, input_type)) in self.input_layouts.iter().zip(input_types).enumerate() {
-            let Some(layout) = layout else {
-                continue;
-            };
-            let layout_rank = match layout {
-                Layout::Tiled(layout) => layout.rank(),
-                Layout::Strided(layout) => layout.rank(),
-            };
-            if layout_rank != input_type.rank() {
+        // A non-empty layout declaration names every array input. Validate its count and ranks before comparing
+        // the layouts of aliased buffers; an empty declaration still leaves the aliases to validate below.
+        if !self.input_layouts.is_empty() {
+            if self.input_layouts.len() != input_types.len() {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` input layout `{layout}` has rank {layout_rank} but input \
-                     {input_index} has type `{input_type}`",
+                    "`{CUSTOM_CALL_OPERATION_NAME}` declares {} input layout(s) but the call has {} array input(s)",
+                    self.input_layouts.len(),
+                    input_types.len(),
                 )));
             }
+            for (input_index, (layout, input_type)) in self.input_layouts.iter().zip(input_types).enumerate() {
+                let Some(layout) = layout else {
+                    continue;
+                };
+                let layout_rank = match layout {
+                    Layout::Tiled(layout) => layout.rank(),
+                    Layout::Strided(layout) => layout.rank(),
+                };
+                if layout_rank != input_type.rank() {
+                    return Err(TypeError::invalid(format!(
+                        "`{CUSTOM_CALL_OPERATION_NAME}` input layout `{layout}` has rank {layout_rank} but input \
+                         {input_index} has type `{input_type}`",
+                    )));
+                }
+            }
         }
-        Ok(())
-    }
 
-    /// Validates flat input/output aliases against the array inputs, effective outputs, and declared input layouts.
-    fn validate_input_output_aliases(
-        &self,
-        input_types: &[&ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<(), TypeError> {
+        // Alias indices exclude trailing dimension inputs and refer to the effective output types supplied by inference.
         for alias in &self.input_output_aliases {
             let Some(input_type) = input_types.get(alias.input_index) else {
                 return Err(TypeError::invalid(format!(
@@ -1609,7 +1586,13 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-        let extent_count = self.dynamic_output_dimension_count();
+        // Each dynamic output axis occurrence contributes one trailing extent input, including repeated identities.
+        let extent_count = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            .count();
         let Some(array_input_count) = inputs.len().checked_sub(extent_count) else {
             return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
         };
