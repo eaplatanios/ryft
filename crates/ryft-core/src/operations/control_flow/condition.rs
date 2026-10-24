@@ -4,12 +4,12 @@
 //!
 //! A condition application takes the predicate followed by one input per branch input. Both branches receive the
 //! same inputs and must return outputs of the same types after the facts that those inputs establish refine them.
-//! [`ConditionType`] defines which types are predicates in each type universe, and the manual variation that a
-//! predicate which varies over manual mesh axes requires of every output. Each reference output must denote the same
-//! reference in both branches, and under such a predicate a branch may only mutate references whose referents vary
-//! over the predicate's axes. Every transformation rule validates this complete contract before it selects, rewrites,
-//! or stages either branch, so whether an application is accepted depends neither on the transformation nor on the
-//! value of the predicate. The rules are:
+//! [`ConditionType`] defines which types may be predicates and which output types are valid under each predicate in a
+//! type universe. For example, an array output must record every manual mesh axis that its predicate varies over.
+//! Each reference output must denote the same reference in both branches, and under a varying predicate a branch may
+//! only mutate references whose referents vary over the predicate's axes. Every transformation rule validates this
+//! complete contract before it selects, rewrites, or stages either branch, so acceptance depends neither on the
+//! transformation nor on the value of the predicate. The rules are:
 //!
 //!   - **Interpretation:** Only the selected branch runs.
 //!   - **Reference Discharge:** Both branches receive one shared state boundary, and only the references that either
@@ -36,7 +36,7 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DimensionValue, Sharding,
+    ArrayType, DimensionValue, ShardableType, Sharding,
 };
 use crate::batching::{
     BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -81,13 +81,17 @@ use crate::programs::{
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Type-family predicate semantics for [`ConditionOperation`].
+/// Type-family predicate and output semantics for [`ConditionOperation`].
 ///
-/// [`ArrayType`] accepts rank-zero Boolean predicates, while a composite [`ArrayIrType`] accepts only its rank-zero
-/// Boolean array member. A first-class dimension describes an array extent rather than Boolean data, even though its
-/// runtime representation is scalar, and a reference is a mutable state handle rather than a predicate value.
+/// Implementations define which types represent valid predicates and which output types are valid in a condition
+/// controlled by a given predicate. These rules depend on the type family; agreement between the two branches' output
+/// types alone does not establish that the selected result is valid under that predicate.
+///
+/// # Array Type Families
+///
+/// For example, [`ArrayType`] accepts rank-zero Boolean predicates, while a composite [`ArrayIrType`] accepts only its
+/// rank-zero Boolean array member. A first-class dimension describes an array extent rather than Boolean data, despite
+/// its scalar runtime representation, and a reference is a mutable state handle rather than a predicate value.
 ///
 /// A manual region is a [`ShardMapOperation`](crate::ShardMapOperation) body. It runs per device on local shards, with
 /// explicit collectives for communication along the operation's selected mesh axes (its active manual mesh axes). A
@@ -104,31 +108,22 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// Transposing it with respect to such an input fails as well, because the input's cotangent differs across devices and
 /// its mesh sum would run inside the branches. As for a `while` loop with a varying predicate, keeping collectives out
 /// of branches that devices may take differently is the program's responsibility.
-pub trait ConditionType: Type {
-    /// Returns whether this type is a valid condition predicate (i.e., represents scalar Boolean value).
+pub trait ConditionType: ShardableType {
+    /// Returns whether this type represents a valid scalar Boolean predicate for [`ConditionOperation`].
     fn is_condition_predicate(&self) -> bool;
 
-    /// Returns the [`Sharding`] of this type when it is used as a condition predicate (i.e., when it represents scalar
-    /// Boolean value), whose varying manual axes every condition output must vary over, or `None` if it carries no
-    /// sharding (e.g., outside of manual regions).
-    fn condition_predicate_sharding(&self) -> Option<&Sharding>;
-
-    /// Returns whether a condition predicate of this type varies over at least one manual mesh axis, so that devices
-    /// may take different branches.
-    #[inline]
-    fn is_varying_condition_predicate(&self) -> bool {
-        self.condition_predicate_sharding()
-            .is_some_and(|sharding| !sharding.varying_manual_axes().is_empty())
-    }
-
-    /// Validates that a branch output of this type is well-typed under a predicate of type `predicate`: because
-    /// devices whose predicates differ may take different branches, the output must vary over every manual mesh axis
-    /// that the predicate varies over.
+    /// Validates the type family's restrictions on returning a value of this type from a condition whose predicate
+    /// has type `predicate`. [`ConditionOperation`] validates predicate admission and branch signature agreement
+    /// separately; matching branch output types alone need not make their selected result valid under the predicate.
+    ///
+    /// For example, [`ArrayType`] outputs must record variation over every manual mesh axis that the predicate varies
+    /// over, because devices may take different branches. [`ArrayIrType`] applies the same check to reference referents
+    /// and rejects first-class dimension outputs under a varying predicate because they cannot record that variation.
+    /// Type families without additional output restrictions can return `Ok(())`.
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] if the output lacks one of the predicate's varying manual axes, or if it cannot record
-    /// manual variation at all (e.g., a first-class dimension) while the predicate varies.
+    /// Returns a [`TypeError`] if this output type is invalid under `predicate` according to the type family's rules.
     fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError>;
 }
 
@@ -136,11 +131,6 @@ impl ConditionType for ArrayType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
         self.is_scalar() && self.data_type().is_boolean()
-    }
-
-    #[inline]
-    fn condition_predicate_sharding(&self) -> Option<&Sharding> {
-        self.sharding()
     }
 
     fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError> {
@@ -152,25 +142,19 @@ impl ConditionType for ArrayType {
             return Ok(());
         }
         Err(TypeError::invalid(format!(
-            "`{CONDITION_OPERATION_NAME}` output `{self}` must vary over every manual axis that the predicate \
-             `{predicate}` varies over, because devices may take different branches; insert \
-             `{PARALLEL_VARY_OPERATION_NAME}` on the branch outputs",
+            "`{CONDITION_OPERATION_NAME}` output `{self}` must vary over every manual axis that the \
+             predicate `{predicate}` varies over, because devices may take different branches; \
+             insert `{PARALLEL_VARY_OPERATION_NAME}` on the branch outputs",
         )))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ConditionType for ArrayIrType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
         matches!(self, Self::Array(r#type) if r#type.is_condition_predicate())
-    }
-
-    #[inline]
-    fn condition_predicate_sharding(&self) -> Option<&Sharding> {
-        match self {
-            Self::Array(r#type) => r#type.condition_predicate_sharding(),
-            Self::Dimension(_) | Self::Reference(_) => None,
-        }
     }
 
     fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError> {
@@ -181,7 +165,7 @@ impl ConditionType for ArrayIrType {
             Self::Array(output) => output.validate_condition_output(predicate),
             Self::Reference(output) => output.referent().validate_condition_output(predicate),
             Self::Dimension(_) => {
-                if !predicate.is_varying_condition_predicate() {
+                if !predicate.is_varying() {
                     return Ok(());
                 }
                 Err(TypeError::invalid(format!(
@@ -246,6 +230,16 @@ impl<T: Type> ConditionOperation<T> {
 }
 
 impl<T: ConditionType> ConditionOperation<T> {
+    /// Validates predicate admission before a rule or capability uses its sharding to align other values.
+    fn validate_predicate_type(predicate_type: &T) -> Result<(), TypeError> {
+        if predicate_type.is_condition_predicate() {
+            return Ok(());
+        }
+        Err(TypeError::invalid(format!(
+            "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{predicate_type}`",
+        )))
+    }
+
     /// Returns the `true` and `false` branches attached to an application of a condition through `driver`, after
     /// validating that the application has exactly two regions and `input_count` inputs (i.e., the predicate followed
     /// by one input per branch input).
@@ -439,7 +433,7 @@ impl<T: ConditionType> ConditionOperation<T> {
         branches: [RegionRef<'_, V, O>; 2],
         mut is_published: impl FnMut(ConditionReferenceSource) -> Result<bool, ProgramError>,
     ) -> Result<(), ProgramError> {
-        if !predicate_type.is_varying_condition_predicate() {
+        if !predicate_type.is_varying() {
             return Ok(());
         }
         for (index, (slot, branch)) in ["true", "false"].into_iter().zip(branches).enumerate() {
@@ -544,12 +538,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         let (true_interface, false_interface) = (&region_interfaces[0], &region_interfaces[1]);
         let branch_input_types = true_interface.input_types();
         check_count!("input", input_types, branch_input_types.len() + 1, TypeError);
-        if !input_types[0].is_condition_predicate() {
-            return Err(TypeError::invalid(format!(
-                "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{}`",
-                input_types[0],
-            )));
-        }
+        Self::validate_predicate_type(&input_types[0])?;
         for (index, (declared, actual)) in branch_input_types.iter().zip(&input_types[1..]).enumerate() {
             validate_region_input(CONDITION_OPERATION_NAME, index + 1, actual, declared, "branch input type")?;
         }
@@ -657,28 +646,55 @@ where
 // Interpretation rule for [`ConditionOperation`]: extracts the concrete Boolean predicate from the first input and
 // interprets only the selected branch region over the remaining inputs (region 0 for `true` and region 1 for
 // `false`), so the untaken branch never runs.
+impl<T: ConditionType> ConditionOperation<T> {
+    /// Interprets this condition over `inputs` (i.e., the predicate followed by one input per branch input) with the
+    /// `true` and `false` `branches`, running the branch that the predicate selects through `interpret_branch`, which
+    /// receives the index of that branch and its inputs, and returns its outputs. This is the eager rule of the
+    /// operation (refer to its [`InterpretableOperation`] implementation), which the `shard_map` emulator shares with
+    /// values that hold one value per device.
+    ///
+    /// Direct eager binding does not pass through program construction, so the complete application is validated
+    /// before a branch is selected: otherwise the unselected peer could conceal a signature or a reference contract that
+    /// program construction or another transform rejects. Entering the selected branch validates the runtime inputs as
+    /// one complete signature against its declared input types before any of its work executes. That check accepts the
+    /// concrete referents of live reference handles as refinements of symbolic allocation types, and requires shared
+    /// dimension identities to agree across arrays and reference referents. The outputs are compared after applying
+    /// those same input facts, so eager binding and program construction accept the same shapes.
+    pub(crate) fn interpret_with<V, R, O>(
+        &self,
+        branches: [RegionRef<'_, R, O>; 2],
+        inputs: &[V],
+        interpret_branch: impl FnOnce(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        V: Clone + Typed<Type = T> + Concretizable<bool>,
+        R: Value<Type = T>,
+        O: Operation<Type = T>,
+    {
+        let expected = branches[0].input_ids().len() + 1;
+        if inputs.len() != expected {
+            return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
+        }
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.validate_application(&input_types, branches)?;
+        let branch = if inputs[0].concretize()? { 0 } else { 1 };
+        interpret_branch(branch, inputs[1..].to_vec())
+    }
+}
+
 impl<C> InterpretableOperation<C> for ConditionOperation<C::Type>
 where
     C: Domain<Type: ConditionType, Value: Concretizable<bool>>,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Direct eager binding does not pass through program construction, so validate the complete application before
-        // selecting a branch: otherwise the unselected peer could conceal a signature or a reference contract that
-        // program construction or another transform rejects. Entering the selected branch validates the runtime inputs
-        // as one complete signature against its declared input types before any of its work executes. That check
-        // accepts the concrete referents of live reference handles as refinements of symbolic allocation types, and
-        // requires shared dimension identities to agree across arrays and reference referents. The outputs are compared
-        // after applying those same input facts, so eager binding and program construction accept the same shapes.
-        let branches = Self::branches(driver, inputs.len())?;
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, branches)?;
-        let (predicate, branch_inputs) = (inputs[0].concretize()?, &inputs[1..]);
-        driver.interpret_region(context, if predicate { 0 } else { 1 }, branch_inputs.to_vec())
+        let branches = [driver.region(0)?, driver.region(1)?];
+        self.interpret_with(branches, inputs, |branch, inputs| driver.interpret_region(context, branch, inputs))
     }
 }
 
@@ -1092,10 +1108,11 @@ where
         True: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
         False: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
     {
+        ConditionOperation::<V::Type>::validate_predicate_type(self.r#type().as_ref())?;
         let input_structure = inputs.parameter_structure();
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
         let context = self.domain();
-        let predicate_sharding = self.r#type().condition_predicate_sharding().cloned();
+        let predicate_sharding = self.r#type().sharding().cloned();
         let aligned_inputs = match &predicate_sharding {
             Some(sharding) => Self::align_manual_variation_to(&inputs, sharding)?,
             None => inputs.clone(),
@@ -1871,7 +1888,7 @@ where
 {
     let stopped_inputs = branch_inputs.iter().map(stop_gradient).collect::<Result<Vec<_>, _>>()?;
     let predicate_type = P::value(predicate).r#type().into_owned();
-    let predicate_sharding = predicate_type.condition_predicate_sharding();
+    let predicate_sharding = predicate_type.sharding();
     let varies_beyond_predicate = |sharding: &Sharding| {
         let predicate_axes = predicate_sharding.map(Sharding::varying_manual_axes);
         sharding
@@ -1889,7 +1906,7 @@ where
         // The aligned candidates vary over every axis that the predicate or either candidate varies over, and so must
         // the predicate. Both aligned candidates vary over the same axes, so the first one determines them.
         let candidate_type = candidates[0].r#type().into_owned();
-        let predicate_value = match candidate_type.condition_predicate_sharding() {
+        let predicate_value = match candidate_type.sharding() {
             Some(target) if varies_beyond_predicate(target) => {
                 let mut varied_predicates = varied_predicates.borrow_mut();
                 match varied_predicates.iter().find(|(axes, _)| axes == target.varying_manual_axes()) {
@@ -2581,7 +2598,7 @@ where
     O: Operation<Type = V::Type>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    if !predicate_type.is_varying_condition_predicate() {
+    if !predicate_type.is_varying() {
         return Ok(());
     }
     let mut cotangent_reference_input = output_cotangent_count;
@@ -15379,21 +15396,6 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_type_predicate_sharding() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap();
-        let predicate = ArrayType::scalar(DataType::Boolean).with_sharding(sharding.clone()).unwrap();
-        assert_eq!(predicate.condition_predicate_sharding(), Some(&sharding));
-        assert_eq!(ArrayType::scalar(DataType::Boolean).condition_predicate_sharding(), None);
-        assert_eq!(ArrayIrType::Array(predicate).condition_predicate_sharding(), Some(&sharding));
-        assert_eq!(
-            ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()))
-                .condition_predicate_sharding(),
-            None,
-        );
-    }
-
-    #[test]
     fn test_condition_type_validate_condition_output() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant =
@@ -15714,6 +15716,39 @@ mod tests {
                 if error.to_string()
                     == "`condition` branch output type signature mismatch: expected [ref<f32[]>] but got [f32[]]",
         ));
+    }
+
+    #[test]
+    fn test_condition_condition_rejects_reference_predicate_before_alignment() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let referent = ArrayType::scalar(DataType::Boolean)
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        let predicate_type = ArrayIrType::Reference(ReferenceType::new(referent));
+        let context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let predicate = context.input(predicate_type.clone());
+        let input = context.input(ArrayType::scalar(DataType::F32).into());
+        let traced = Cell::new(false);
+        let result = predicate.condition(
+            input,
+            |input| {
+                traced.set(true);
+                Ok(input)
+            },
+            |input| {
+                traced.set(true);
+                Ok(input)
+            },
+        );
+        assert_eq!(
+            result.map(|_| ()),
+            Err(TypeError::invalid(format!(
+                "`condition` predicate type must be a scalar boolean, but got `{predicate_type}`",
+            ))
+            .into()),
+        );
+        assert!(!traced.get());
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]
