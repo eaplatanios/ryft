@@ -807,7 +807,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
         let region = program.entry_region_ref();
-        let inputs = self.guard_region_inputs(region, inputs, true)?;
+        let inputs = self.guard_inputs(&region.input_types(), inputs, !region.effects().classes().is_empty())?;
         self.inline_region(region, inputs, &HashSet::new(), None, None)
     }
 
@@ -815,13 +815,13 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Input binding and output ordering follow [`inline_program`](Self::inline_program). Each call tracks its own
     /// source instruction indices, including recursive calls into shared regions.
     ///
-    /// The caller must have prepared `inputs` for the region's entry through
-    /// [`guard_region_inputs`](Self::guard_region_inputs) or [`prepare_root_inputs`](Self::prepare_root_inputs),
-    /// which check the supplied signature against the entry and guard every relationship that it leaves unproven, so
-    /// replay performs no entry check of its own. The prepared types can still differ from the declared ones (e.g.,
-    /// they can rename array axes or carry the exact facts that the entry proves), so replay relates them to the
-    /// region's declarations through scoped facts (refer to [`TypeRefinements::from_local_declarations`]), which
-    /// treat the declared identities as local to the region instead of as names that the prepared types may share.
+    /// The caller must have prepared `inputs` for the region's entry through [`guard_inputs`](Self::guard_inputs) or
+    /// [`prepare_root_inputs`](Self::prepare_root_inputs), which check the supplied signature against the entry and
+    /// guard every relationship that it leaves unproven, so replay performs no entry check of its own. The prepared
+    /// types can still differ from the declared ones (e.g., they can rename array axes or carry the exact facts that
+    /// the entry proves), so replay relates them to the region's declarations through scoped facts (refer to
+    /// [`TypeRefinements::from_local_declarations`]), which treat the declared identities as local to the
+    /// region instead of as names that the prepared types may share.
     ///
     /// # Parameters
     ///
@@ -973,10 +973,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Partitioning seeds both programs at the declared input types of `region`, so neither side checks a relationship
     /// that the region's entry checks between a known and an unknown input (e.g., a known `f32[3]` next to an unknown
     /// `f32[n]`, both entering at `n`). This function therefore guards `inputs` through
-    /// [`guard_region_inputs`](Self::guard_region_inputs) (with `separate_invocation` unset, because both operations
-    /// are bound within this evaluation) before binding either operation, and both operations consume the guarded
-    /// values. A known input that the guard leaves unknown makes the known-side operation residual instead of folding
-    /// it.
+    /// [`guard_inputs`](Self::guard_inputs) (with `guard_shared_identities` unset, because both operations are bound
+    /// within this evaluation) before binding either operation, and both operations consume the guarded values. A
+    /// known input that the guard leaves unknown makes the known-side operation residual instead of folding it.
     ///
     /// # Parameters
     ///
@@ -1010,7 +1009,7 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         // Guard the region's entry before either operation is bound, so that the guard precedes all known work.
         let inputs = match region {
-            Some(region) => self.guard_region_inputs(region, inputs.to_vec(), false)?,
+            Some(region) => self.guard_inputs(&region.input_types(), inputs.to_vec(), false)?,
             None => inputs.to_vec(),
         };
 
@@ -1154,7 +1153,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     }
 
     /// Prepares the inputs of `region` for replay at the root of a fresh residual program (refer to
-    /// [`Self::guard_region_inputs`] for the shared entry contract; the residual program's unknown inputs are supplied
+    /// [`Self::guard_inputs`] for the shared entry contract; the residual program's unknown inputs are supplied
     /// by a separate invocation). Returns one seed value per region input (known values narrowed by the facts that the
     /// entry proves, and unknowns allocated as residual inputs of their supplied types). Known values whose identities
     /// connect, directly or through other known values, to an identity of an unknown input are also retained as
@@ -1176,13 +1175,13 @@ impl<C: Context> PartialEvaluationContext<C> {
         // residual program accepts every value that the source program accepts. The unknown inputs are the residual
         // program's own inputs, supplied by a separate invocation.
         let seed = self.prepare_entry_inputs(
-            region,
+            &region.input_types(),
             inputs
                 .iter()
                 .map(|input| input.as_known().map(|value| PartialEvaluationValue::known_input(value.clone())))
                 .collect(),
             inputs.iter().map(|input| input.r#type().into_owned()).collect(),
-            true,
+            !region.effects().classes().is_empty(),
         )?;
 
         // A symbolic known value can constrain the extent of an unknown's dimension without fixing it (e.g., a known
@@ -1217,55 +1216,64 @@ impl<C: Context> PartialEvaluationContext<C> {
         Ok(seed)
     }
 
-    /// Replaces the entry of `region` for the values in `inputs`, which are bound to its inputs in input order, so that
-    /// the caller can replay the region's body in its place (e.g., when inlining it). This is the one entry contract of
-    /// every consumer that removes a region's entry: when the types of `inputs` leave identity relationships of the
-    /// entry unproven (refer to [`GuardOperation::for_entry`]), entry guards are staged before anything that the
-    /// body stages, so that no known-side effect folds before them. The relationships among known inputs alone are
-    /// checked first, by a guard that folds into the known side and whose narrowed outputs replace the known inputs.
-    /// The remaining relationships are checked by a guard whose narrowed outputs replace unknown inputs and known
-    /// inputs whose required representation changes. Reference identities take precedence over known representations.
-    /// An unknown input can connect otherwise independent known classes, so changing a known representation can require
-    /// the residual check even without references. A guard with an unknown input stays in the residual program together
-    /// with its known witnesses, and its ordered effect defers later ordered known effects. A partial-evaluation rule
-    /// that splits an attached region by knownness and binds operations that it rebuilds from the partitions itself
-    /// (i.e., neither through [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)
-    /// nor through [`inline_partitioned_program`](Self::inline_partitioned_program), which both guard their entries)
-    /// must call this function on the inputs that it binds those operations over, choosing `separate_invocation`
-    /// as described below.
+    /// Guards the values in `inputs` against `declared_types` before replaying, splitting, or rebuilding a boundary.
+    /// Region callers supply the region's input types; operation rules supply the complete boundary types, including
+    /// inputs and relationships that no region declares (e.g., a `scan`'s runtime length and its stacked leading axes).
+    /// When the types of `inputs` leave identity relationships of the boundary unproven (refer to
+    /// [`GuardOperation::for_entry`]), entry guards are staged before anything that the body stages, so that no
+    /// known-side effect folds before them. The relationships among known inputs alone are checked first, by a guard
+    /// that folds into the known side and whose narrowed outputs replace the known inputs. The remaining relationships
+    /// are checked by a guard whose narrowed outputs replace unknown inputs and known inputs whose required
+    /// representation changes. Reference identities take precedence over known representations. An unknown input can
+    /// connect otherwise independent known classes, so changing a known representation can require the residual check
+    /// even without references. A guard with an unknown input stays in the residual program together with its known
+    /// witnesses, and its ordered effect defers later ordered known effects. A partial-evaluation rule that splits an
+    /// attached region by knownness and binds operations that it rebuilds from the partitions itself (i.e., neither
+    /// through [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region) nor through
+    /// [`inline_partitioned_program`](Self::inline_partitioned_program), which both guard their entries) must call this
+    /// function on the inputs that it binds those operations over. The returned values replace `inputs` in every
+    /// operation that the caller binds in place of the boundary.
     ///
-    /// When `separate_invocation` is set, the unknown inputs are inputs of a residual program that is invoked
-    /// separately from the known side, so that an identity which a known input and an unknown input share relates
-    /// values that only that invocation supplies. The residual entry checks such a relationship, but only when the
-    /// residual program runs, after any effect of the body that partial evaluation folds into the known side. When the
-    /// body has effects, the guard therefore checks such relationships too, so that it defers those effects behind the
-    /// check. Its callers choose the flag as follows:
+    /// Set `guard_shared_identities` when the unknown inputs are supplied by a separate residual-program invocation
+    /// and the body has effects. An identity shared by a known and an unknown input then relates values that only that
+    /// invocation supplies. Its entry checks the relationship when it runs, after any effects that partial evaluation
+    /// folds into the known side. The guard additionally checks such relationships, even when the input types prove
+    /// them, so that those effects wait for the check. Callers choose the flag as follows:
     ///
     ///   - Attached-region inlining from an operation's partial-evaluation rule (i.e., through
     ///     [`partially_evaluate_region`](crate::PartialEvaluationDriver::partially_evaluate_region)) passes `false`:
     ///     the region is inlined within one evaluation, whose unknown values were already checked where they entered
     ///     it, so the identities that they share with known inputs need no additional check.
-    ///   - Splitting a `condition` with a symbolic known predicate into a known and a residual condition passes `false`
-    ///     for the same reason (the split replaces the branch entries within one evaluation, like inlining a branch).
-    ///   - [`inline_partitioned_program`](Self::inline_partitioned_program) passes `false` for the same reason (it
-    ///     binds both operations of a partitioned region within one evaluation).
-    ///   - [`inline_program`](Self::inline_program) passes `true`: it replays a program at the root of the residual
-    ///     program, whose unknown inputs are the residual program's own inputs, supplied by a separate invocation.
+    ///   - Splitting a `condition` or a `scan`, and [`inline_partitioned_program`](Self::inline_partitioned_program),
+    ///     pass `false` for the same reason: their rebuilt operations replace the boundary within one evaluation.
+    ///   - [`inline_program`](Self::inline_program) sets the flag when the program has effects: it replays a program
+    ///     at the root of the residual program, whose unknown inputs are supplied by a separate invocation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared_types`: Declared types of the boundary, in input order.
+    ///   - `inputs`: Partially evaluated values bound to the boundary, in input order.
+    ///   - `guard_shared_identities`: Whether to also guard identities shared by known and unknown inputs,
+    ///     to defer effects until a separate residual invocation checks them, as described above.
     ///
     /// # Errors
     ///
-    /// Returns an error when the inputs do not refine the entry, or when the entry needs a guard but this context's
-    /// operation family cannot provide one (refer to [`OperationProvider`]): removing the entry would then drop the
-    /// check of its unproven relationships.
+    /// Returns an error when the inputs do not refine `declared_types`, or when the boundary needs a guard but this
+    /// context's operation family cannot provide one (refer to [`OperationProvider`]).
     #[inline]
-    pub fn guard_region_inputs(
+    pub fn guard_inputs(
         &self,
-        region: RegionRef<'_, C::Constant, C::Operation>,
+        declared_types: &[C::Type],
         inputs: Vec<PartialEvaluationValue<C::Value>>,
-        separate_invocation: bool,
+        guard_shared_identities: bool,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
-        self.prepare_entry_inputs(region, inputs.into_iter().map(Some).collect(), input_types, separate_invocation)
+        self.prepare_entry_inputs(
+            declared_types,
+            inputs.into_iter().map(Some).collect(),
+            input_types,
+            guard_shared_identities,
+        )
     }
 
     /// Prepares one complete entry before replay. Existing values keep their shared materialization state. [`None`]
@@ -1273,16 +1281,22 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// the one over the known inputs alone and the one over the complete entry that [`Self::plan_entry_guard`] plans)
     /// are requested from the operation family before anything is folded, residualized, or allocated, so that a
     /// rejection leaves this context unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Declared input types of the entry.
+    ///   - `inputs`: Entry values in input order, with [`None`] marking root unknowns that are not allocated yet.
+    ///   - `input_types`: Actual types of `inputs`, in input order.
+    ///   - `guard_shared_identities`: Refer to [`Self::plan_entry_guard`] for information on this argument.
     fn prepare_entry_inputs(
         &self,
-        region: RegionRef<'_, C::Constant, C::Operation>,
+        declared: &[C::Type],
         mut inputs: Vec<Option<PartialEvaluationValue<C::Value>>>,
         mut input_types: Vec<C::Type>,
-        separate_invocation: bool,
+        guard_shared_identities: bool,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        check_count!("input", inputs, region.input_ids().len(), ProgramError);
+        check_count!("input", inputs, declared.len(), ProgramError);
         check_count!("input", input_types, inputs.len(), ProgramError);
-        let declared = region.input_types();
 
         // Plan the narrowing of the known members of the entry by the relationships among the known inputs alone.
         // Known values keep their types in the body that partial evaluation replays, so a known symbolic value that
@@ -1328,7 +1342,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             for (index, r#type) in &outputs {
                 narrowed_types[*index] = r#type.clone();
             }
-            Self::plan_entry_guard(region, &declared, &inputs, &mut narrowed_types, separate_invocation)?;
+            Self::plan_entry_guard(declared, &inputs, &mut narrowed_types, guard_shared_identities)?;
 
             // Apply the known guard, replacing only the known members whose types it changes.
             let guarded = members.iter().map(|&index| inputs[index].clone().unwrap()).collect::<Vec<_>>();
@@ -1343,8 +1357,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
 
         // Plan and apply the guard over the complete entry, whose known members are now narrowed.
-        let (members, guard) =
-            Self::plan_entry_guard(region, &declared, &inputs, &mut input_types, separate_invocation)?;
+        let (members, guard) = Self::plan_entry_guard(declared, &inputs, &mut input_types, guard_shared_identities)?;
         let mut inputs = inputs
             .into_iter()
             .zip(input_types)
@@ -1368,11 +1381,11 @@ impl<C: Context> PartialEvaluationContext<C> {
         Ok(inputs)
     }
 
-    /// Determines the guard over the complete entry of `region` without applying it. This function stages, folds, and
-    /// allocates nothing, so that [`Self::prepare_entry_inputs`] can request every entry guard from the operation
-    /// family before it applies any of them, and a rejected guard leaves the context unchanged. Returns the positions
-    /// of the guarded members, in increasing order, together with the guard operation that this context's operation
-    /// family provides for them, or [`None`] when the input types leave no relationship of the entry unproven.
+    /// Determines the guard over a complete entry without applying it. This function stages, folds, and allocates
+    /// nothing, so that [`Self::prepare_entry_inputs`] can request every entry guard from the operation family before
+    /// it applies any of them, and a rejected guard leaves the context unchanged. Returns the positions of the guarded
+    /// members, in increasing order, together with the guard operation that this context's operation family provides
+    /// for them, or [`None`] when the input types leave no relationship of the entry unproven.
     ///
     /// The guard re-checks the known members of every class that an unknown input joins, even though the known-input
     /// guard of [`Self::prepare_entry_inputs`] has already established their relationships among themselves. Dropping
@@ -1382,19 +1395,20 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     /// # Parameters
     ///
-    ///   - `region`: Region whose entry is guarded.
-    ///   - `declared`: Declared input types of `region`.
+    ///   - `declared`: Declared input types of the entry.
     ///   - `inputs`: Current entry values in input order, with known members already narrowed among themselves and
     ///     [`None`] marking root unknowns that are not allocated yet.
     ///   - `input_types`: Actual types of `inputs`, in input order. Unallocated root unknowns outside the guard are
     ///     narrowed in place, by the singleton bounds of their own identities only.
-    ///   - `separate_invocation`: Refer to [`Self::guard_region_inputs`] for information on this argument.
+    ///   - `guard_shared_identities`: Whether the guard also checks every input that carries an identity which a known
+    ///     input and an unknown input share, even when the input types prove its relationships. Callers set it when
+    ///     the unknown inputs are supplied by a separate invocation and the entry's body has effects (refer to
+    ///     [`Self::guard_inputs`]).
     fn plan_entry_guard(
-        region: RegionRef<'_, C::Constant, C::Operation>,
         declared: &[C::Type],
         inputs: &[Option<PartialEvaluationValue<C::Value>>],
         input_types: &mut [C::Type],
-        separate_invocation: bool,
+        guard_shared_identities: bool,
     ) -> Result<(Vec<usize>, Option<C::Operation>), ProgramError> {
         let mut members = GuardOperation::for_entry("partial evaluation", declared, input_types)?
             .map(|(_, members)| members)
@@ -1417,7 +1431,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
         }
 
-        if separate_invocation && !region.effects().classes().is_empty() {
+        if guard_shared_identities {
             let identities_of = |known: bool| {
                 inputs
                     .iter()
@@ -3460,7 +3474,9 @@ mod tests {
         let array = context.known_value(outer.constant(TestValue::Array(Array::vector(vec![1f32; 3]).unwrap())));
         let scalar = context.known_value(scalar);
         let region = program.entry_region_ref();
-        let inputs = context.guard_region_inputs(region, vec![reference, array, scalar], true).unwrap();
+        let inputs = context
+            .guard_inputs(&region.input_types(), vec![reference, array, scalar], !region.effects().classes().is_empty())
+            .unwrap();
         let analysis = region.reference_analysis(0).unwrap();
         let outputs = context.inline_region(region, inputs, &HashSet::new(), None, Some(&analysis)).unwrap();
         let evaluation = context.into_evaluation(outputs).unwrap();
@@ -3854,7 +3870,46 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_guard_region_inputs_preserves_known_inputs_behind_deferred_guards() {
+    fn test_partial_evaluation_context_guard_inputs() {
+        // The boundary `[dimension<n>, dimension<n>, dimension<m>, dimension<m>]` belongs to no region. A known
+        // `dimension<b>` next to an unknown `dimension<a>` leaves `n` unproven, so a residual guard checks them:
+        // the known value becomes a residual input of that guard and stays known, and the unknown takes the known
+        // representation. A known and an unknown `dimension<c>` share one identity, which needs no guard.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, m, a, b, c] = ["n", "m", "a", "b", "c"].map(|name| DimensionType::new(name, bounds));
+        let declared_types = [n.clone(), n, m.clone(), m].map(ArrayIrType::from);
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let known_b = outer.input(b.clone().into());
+        let known_c = outer.input(c.clone().into());
+        let context = PartialEvaluationContext::new(outer);
+        let known_b = context.known_value(known_b);
+        let known_c = context.known_value(known_c);
+        let unknown_a = context.unknown_input(a.into(), 0);
+        let unknown_c = context.unknown_input(c.clone().into(), 1);
+        let inputs = vec![known_b.clone(), unknown_a, known_c.clone(), unknown_c.clone()];
+        let outputs = context.guard_inputs(&declared_types, inputs, false).unwrap();
+        assert_eq!(outputs[0].as_known(), known_b.as_known());
+        assert!(outputs[1].is_unknown());
+        assert_eq!(outputs[1].r#type().into_owned(), ArrayIrType::from(b));
+        assert_eq!(outputs[2].as_known(), known_c.as_known());
+        assert!(outputs[3].is_unknown());
+        assert_eq!(outputs[3].r#type(), unknown_c.r#type());
+        let evaluation = context.into_evaluation(vec![outputs[1].clone(), outputs[3].clone()]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<c ∈ [1, 8)>, %2:dimension<b ∈ [1, 8)> .
+                let %3:dimension<b ∈ [1, 8)>, %4:dimension<b ∈ [1, 8)> = guard [
+                    boundary="partial evaluation",
+                    declared_types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
+                    retained_identities=[b],
+                ] %2 %0
+                in (%4, %1)"#},
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_guard_inputs_preserves_known_inputs_behind_deferred_guards() {
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
         let [n, a, b] = ["n", "a", "b"].map(|name| DimensionType::new(name, bounds));
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -3872,8 +3927,7 @@ mod tests {
         let context = PartialEvaluationContext::new(outer).with_allow_effect_folding(false);
         let first = context.known_value(first);
         let second = context.known_value(second);
-        let outputs =
-            context.guard_region_inputs(program.entry_region_ref(), vec![first.clone(), second], true).unwrap();
+        let outputs = context.guard_inputs(&program.input_types(), vec![first.clone(), second], false).unwrap();
         assert_eq!(outputs[0].as_known(), first.as_known());
         assert!(outputs[1].is_unknown());
         assert_eq!(outputs[1].r#type(), first.r#type());
@@ -3907,8 +3961,7 @@ mod tests {
                 &[unknown, second.clone()],
             )
             .unwrap();
-        let outputs =
-            context.guard_region_inputs(program.entry_region_ref(), vec![first.clone(), second], true).unwrap();
+        let outputs = context.guard_inputs(&program.input_types(), vec![first.clone(), second], false).unwrap();
         assert_eq!(outputs[0].as_known(), first.as_known());
         assert!(outputs[1].is_unknown());
         assert_eq!(outputs[1].r#type(), first.r#type());
@@ -3933,7 +3986,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_guard_region_inputs_rechecks_known_members_of_unknown_classes() {
+    fn test_partial_evaluation_context_guard_inputs_rechecks_known_members_of_unknown_classes() {
         // A known `dimension<b>` and a known `dimension<c>` next to an unknown `dimension<a>` enter
         // `[dimension<n>, dimension<n>, dimension<n>]`. The guard over the known pair establishes their relationship,
         // and the guard over the complete entry checks the unknown input against that class. The latter re-checks both
@@ -3956,7 +4009,7 @@ mod tests {
         let second = outer.input(c.into());
         let context = PartialEvaluationContext::new(outer).with_allow_effect_folding(false);
         let inputs = vec![context.known_value(first), context.known_value(second), context.unknown_input(a.into(), 2)];
-        let outputs = context.guard_region_inputs(program.entry_region_ref(), inputs, false).unwrap();
+        let outputs = context.guard_inputs(&program.input_types(), inputs, false).unwrap();
         let evaluation = context.into_evaluation(vec![outputs[2].clone()]).unwrap();
         assert_eq!(
             evaluation.program().to_string(),
@@ -3977,7 +4030,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_guard_region_inputs_requests_every_guard_before_mutating_state() {
+    fn test_partial_evaluation_context_guard_inputs_requests_every_guard_before_mutating_state() {
         /// Operation family that represents guards with at most two members, so that it accepts the guard over the
         /// known inputs below and rejects the guard over the complete entry.
         #[derive(Clone, Debug)]
@@ -4041,7 +4094,7 @@ mod tests {
             context.unknown_input(a.into(), 2),
         ];
         assert_eq!(
-            context.guard_region_inputs(program.entry_region_ref(), inputs, false).map(|_| ()),
+            context.guard_inputs(&program.input_types(), inputs, false).map(|_| ()),
             Err(ProgramError::UnsupportedOperation {
                 message: "the input types of `partial evaluation` leave identity relationships unproven, but the \
                           operation family cannot represent the guard required to preserve these input checks"

@@ -49,7 +49,7 @@ pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Oper
     /// seeded at the declared input types of `region`, without checking the relationships that its entry checks
     /// between the actual inputs. A rule binds a partition's known program over the evaluation's inputs only after
     /// guarding them, which [`PartialEvaluationContext::inline_partitioned_program`] does (refer to
-    /// [`PartialEvaluationContext::guard_region_inputs`] for rules that bind operations they rebuild from partitions).
+    /// [`PartialEvaluationContext::guard_inputs`] for rules that bind operations they rebuild from partitions).
     ///
     /// The new evaluation uses `context`'s execution configuration but tracks effect ordering and pending errors
     /// separately. For example, a loop rule can try a partition, discover that a loop-carried value must be unknown,
@@ -255,7 +255,7 @@ where
         let region = self.region(index)?;
 
         // Both replays below take the place of the region's entry, so they follow the shared entry contract.
-        let inputs = context.guard_region_inputs(region, inputs, false)?;
+        let inputs = context.guard_inputs(&region.input_types(), inputs, false)?;
 
         // Inlining during ordinary specialization shares the caller's residual builder and accumulated effect
         // ordering. It needs no separate allocation discovery or per-reference ordering analysis.

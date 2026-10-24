@@ -3,13 +3,18 @@ use std::convert::Infallible;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use indoc::indoc;
+use pretty_assertions::assert_eq;
+
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
     Accuracy, Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, CastOperation, CastType,
-    CompiledCallOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation, DimensionType,
-    DimensionVariable, EagerContext, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation, ParallelVary,
-    Parameter, Placeholder, Program, ProgramBuilder, ProgramError, Region, RegionInterface, RegionSlot, Sin,
-    SinOperation, Type, TypeError, Typed, Value, ValueDirectDispatch,
+    CompiledCallOperation, Context, DataType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, DimensionBounds, DimensionFromScalarOperation, DimensionType,
+    DimensionVariable, EagerContext, Linearization, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation,
+    ParallelVary, Parameter, PartitionedProgram, Placeholder, Program, ProgramBuilder, ProgramError, Region,
+    RegionDriver, RegionInterface, RegionRef, RegionSlot, Sin, SinOperation, TangentActivity, Type, TypeError, Typed,
+    Value, ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.
@@ -93,6 +98,105 @@ fn test_external_region_transform_uses_public_cache_extension_point() {
         .transform::<ExternalIdentityTransform, _, Infallible>(ExternalArguments { variant: 0 }, derive_identity)
         .unwrap();
     assert!(!Arc::ptr_eq(&first.programs()[0], &from_independent.programs()[0]));
+}
+
+#[test]
+fn test_external_tangent_activity_uses_custom_differentiation_driver() {
+    type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+
+    /// Downstream driver that derives fused JVPs through the public region API.
+    struct Driver;
+
+    impl RegionDriver<Array, ArrayOperation<Array>> for Driver {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
+        where
+            Array: 'r,
+            ArrayOperation<Array>: 'r,
+        {
+            std::iter::empty()
+        }
+    }
+
+    impl DifferentiationDriver<ArrayContext> for Driver {
+        fn jvp_program(
+            &self,
+            region: RegionRef<'_, Array, ArrayOperation<Array>>,
+            input_indices: &[usize],
+        ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError> {
+            region.jvp_shared(input_indices)
+        }
+
+        fn linearize_program(
+            &self,
+            region: RegionRef<'_, Array, ArrayOperation<Array>>,
+            input_indices: &[usize],
+        ) -> Result<Linearization<Array, ArrayOperation<Array>>, DifferentiationError> {
+            region.linearize_shared(input_indices)
+        }
+
+        fn partition_jvp_program(
+            &self,
+            _region: RegionRef<'_, Array, ArrayOperation<Array>>,
+            _input_known: &[bool],
+            _required_known_outputs: &[usize],
+        ) -> Result<PartitionedProgram<Array, ArrayOperation<Array>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "partitioning is not supported by the activity test driver".to_string(),
+            }
+            .into())
+        }
+
+        fn bind_jvp_operation<P: DifferentiationPolicy<ArrayContext>>(
+            &self,
+            _context: &DifferentiationContext<ArrayContext, P>,
+            _operation: &ArrayOperation<Array>,
+            _programs: Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+            _inputs: &[DifferentiationDual<Array>],
+        ) -> Result<Vec<DifferentiationDual<Array>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "operation binding is not supported by the activity test driver".to_string(),
+            }
+            .into())
+        }
+    }
+
+    let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+    let first = builder.add_input(ArrayType::scalar(DataType::F64));
+    let second = builder.add_input(ArrayType::scalar(DataType::F64));
+    let program = builder
+        .build::<Vec<Array>, Vec<Array>>(vec![second, first], vec![Placeholder; 2], vec![Placeholder; 2])
+        .unwrap();
+    let region = program.entry_region_ref();
+    let activity: ryft_core::differentiation::TangentActivity<ArrayContext> =
+        TangentActivity::new(&Driver, region, &[true, false]).unwrap();
+    assert_eq!(activity.input_indices(), &[0]);
+    assert_eq!(activity.output_tangent_liveness(), &[false, true]);
+    assert_eq!(activity.live_tangent_slots(activity.output_tangent_liveness()), vec![1]);
+    assert_eq!(
+        activity.jvp_program().to_string(),
+        indoc! {"
+            lambda %0:f64[], %1:f64[], %2:f64[] .
+            let %3:f64[] = zero [type=f64[]]
+            in (%1, %0, %3, %2)
+        "}
+        .trim_end(),
+    );
+
+    // Swapping the two carries propagates activity from the first carry to the second on the next iteration.
+    let (input_tangent_liveness, activity) =
+        TangentActivity::<ArrayContext>::from_loop_body(&Driver, region, vec![true, false], 0..2, 0..2).unwrap();
+    assert_eq!(input_tangent_liveness, vec![true, true]);
+    assert_eq!(activity.input_indices(), &[0, 1]);
+    assert_eq!(activity.output_tangent_liveness(), &[true, true]);
+    assert_eq!(activity.live_tangent_slots(activity.output_tangent_liveness()), vec![0, 1]);
+    assert_eq!(
+        activity.jvp_program().to_string(),
+        indoc! {"
+            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+            in (%1, %0, %3, %2)
+        "}
+        .trim_end(),
+    );
 }
 
 /// Downstream value that implements capabilities directly even though its domain can bind the operations that the

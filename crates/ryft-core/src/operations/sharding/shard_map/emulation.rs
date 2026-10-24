@@ -33,9 +33,11 @@
 //!     a `while` loop iterates until every device's predicate is false, a `condition` runs the branch that every
 //!     device selects, a `scan` iterates over its static length (passing reference carries and stacks through, as its
 //!     eager rule does), `custom_function`, `linear_call`, and `rematerialize` replay their primal region, and a nested
-//!     `shard_map` extends the device set by its own active manual axes. Devices whose `while` or `condition`
-//!     predicates diverge cannot run such regions in lockstep, and every other region operation that needs lockstep
-//!     execution (including a `scan` with a dynamic length) is rejected with [`ProgramError::UnsupportedOperation`].
+//!     `shard_map` extends the device set by its own active manual axes. A `while` or `scan` first validates on every
+//!     device what its eager rule validates before the first iteration (e.g., that its body returns each reference
+//!     carry as the reference that it entered with). Devices whose `while` or `condition` predicates diverge cannot run
+//!     such regions in lockstep, and every other region operation that needs lockstep execution (including a `scan`
+//!     with a dynamic length) is rejected with [`ProgramError::UnsupportedOperation`].
 //!
 //! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region
 //! operation in lockstep requires knowing how its regions are sequenced (e.g., how many times and with which inputs),
@@ -63,9 +65,7 @@ use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOper
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
-use crate::operations::control_flow::scan::{
-    SCAN_OPERATION_NAME, ScanOperation, read_scan_iteration, stacked_scan_type, write_scan_iteration,
-};
+use crate::operations::control_flow::scan::{ScanIterationType, ScanOperation};
 use crate::operations::control_flow::r#while::{WhileOperation, WhilePredicate};
 use crate::operations::custom_functions::operations::CUSTOM_FUNCTION_OPERATION_NAME;
 use crate::operations::differentiation::linear_call::LINEAR_CALL_OPERATION_NAME;
@@ -73,7 +73,7 @@ use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_N
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::programs::{
     Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection, ProgramError, RegionRef,
-    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed, Value,
 };
 
 use super::{SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, boundary_array_type};
@@ -698,7 +698,8 @@ where
     }
 
     /// Runs a `while` loop whose condition or body uses collectives over the emulated axes in lockstep, applying the
-    /// same masked state update as the eager rule on every device.
+    /// same masked state update as the eager rule on every device. Like the eager rule, it first validates on every
+    /// device that the body returns each reference carry as the reference that it entered with.
     fn run_while(
         &self,
         operation: &WhileOperation<ArrayIrType>,
@@ -706,6 +707,10 @@ where
         body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
+        for device in 0..self.grid.device_count() {
+            let input_references = inputs.iter().map(|values| values[device].reference_id()).collect::<Vec<_>>();
+            operation.validate_live_reference_carries(body, &input_references)?;
+        }
         let mut state = inputs.to_vec();
         let mut completed_iterations = 0;
         loop {
@@ -756,36 +761,41 @@ where
     }
 
     /// Runs a `scan` whose body uses collectives over the emulated axes in lockstep, following the eager rule for
-    /// static trip counts: every iteration receives the slice of each array stack, while reference carries and stacks
-    /// pass through as the roots that the body indexes itself.
+    /// static trip counts: the complete application is validated on every device at its actual input types before any
+    /// iteration runs (including that the body returns each reference carry as the reference that it entered with),
+    /// every iteration receives the slice of each array stack, while reference carries and stacks pass through as the
+    /// roots that the body indexes itself, and each output stack is allocated from the actual type of its first slice.
     fn run_scan(
         &self,
         operation: &ScanOperation<ArrayIrType>,
         body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let name = operation.name();
+        let device_count = self.grid.device_count();
+        let device_inputs = (0..device_count)
+            .map(|device| inputs.iter().map(|values| values[device].clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut output_types = Vec::with_capacity(device_count);
+        for values in &device_inputs {
+            let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+            let input_references = values.iter().map(Value::reference_id).collect::<Vec<_>>();
+            output_types.push(operation.validate_application(&input_types, body, Some(&input_references))?);
+        }
         let &Dimension::Static(length) = operation.length() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{SHARD_MAP_OPERATION_NAME}` interpretation cannot run `{name}` with a dynamic length in \
-                     lockstep across devices",
+                    "`{SHARD_MAP_OPERATION_NAME}` interpretation cannot run `{}` with a dynamic length in lockstep \
+                     across devices",
+                    operation.name(),
                 ),
             });
         };
+        // The emulated devices share one eager scan rule, whose iteration functions use no state of this context.
+        let context = EagerContext::<ArrayIrValue<Array>, C::Operation>::new();
         let carry_count = operation.carry_count();
-        check_count!("input", inputs, body.input_ids().len().saturating_sub(1), ProgramError);
-        let device_count = self.grid.device_count();
-        let zero_context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let mut accumulators = body.output_types()[carry_count..]
-            .iter()
-            .map(|slice_type| {
-                let stacked_type = stacked_scan_type(<&ArrayType>::try_from(slice_type)?, length);
-                (0..device_count).map(|_| zero_context.zero(&stacked_type)).collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
         let (carries, stacks) = inputs.split_at(carry_count);
         let mut carries = carries.to_vec();
+        let mut accumulators = vec![vec![None; device_count]; output_types[0].len() - carry_count];
         for visit in 0..length {
             let iteration = if operation.reverse() { length - 1 - visit } else { visit };
             let mut iteration_inputs = vec![vec![ArrayIrValue::Array(Array::scalar(iteration as i64)?); device_count]];
@@ -794,41 +804,43 @@ where
                 iteration_inputs.push(
                     stack
                         .iter()
-                        .map(|value| match value {
-                            ArrayIrValue::Reference(_) => Ok(value.clone()),
-                            _ => Ok(ArrayIrValue::Array(read_scan_iteration(array_value(value, name)?, iteration)?)),
+                        .map(|value| {
+                            <ArrayIrType as ScanIterationType<EagerContext<_, C::Operation>>>::read_iteration(
+                                value, iteration,
+                            )
                         })
-                        .collect::<Result<Vec<_>, ProgramError>>()?,
+                        .collect::<Result<Vec<_>, _>>()?,
                 );
             }
             let mut outputs = self.run_region(body, iteration_inputs)?;
             check_count!("output", outputs, carry_count + accumulators.len(), ProgramError);
             let stacked_outputs = outputs.split_off(carry_count);
-            for (position, (carried, next)) in carries.iter().zip(&outputs).enumerate() {
-                for (carried, next) in carried.iter().zip(next) {
-                    if let ArrayIrValue::Reference(carried) = carried
-                        && !matches!(next, ArrayIrValue::Reference(next) if next.id() == carried.id())
-                    {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "operation `{SCAN_OPERATION_NAME}` does not return carry {position} as the reference it \
-                             entered with, so its `{SCAN_OPERATION_NAME}` state has no fixed point",
-                        )));
-                    }
-                }
-            }
             carries = outputs;
             for (accumulators, outputs) in accumulators.iter_mut().zip(stacked_outputs) {
                 for (accumulator, output) in accumulators.iter_mut().zip(outputs) {
-                    let output = array_value(&output, name)?.clone();
-                    *accumulator = write_scan_iteration(accumulator.clone(), iteration, output)?;
+                    *accumulator =
+                        Some(ArrayIrType::write_iteration(&context, accumulator.take(), length, iteration, output)?);
                 }
             }
         }
-        carries.extend(
-            accumulators
-                .into_iter()
-                .map(|accumulators| accumulators.into_iter().map(ArrayIrValue::Array).collect()),
-        );
+        let body_input_types = body.input_types();
+        for (position, accumulators) in accumulators.into_iter().enumerate() {
+            carries.push(
+                accumulators
+                    .into_iter()
+                    .zip(device_inputs.iter().zip(&output_types))
+                    .map(|(accumulator, (values, output_types))| match accumulator {
+                        Some(stack) => Ok(stack),
+                        None => ArrayIrType::empty_stack(
+                            &context,
+                            &output_types[carry_count + position],
+                            &body_input_types,
+                            values,
+                        ),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
         Ok(carries)
     }
 }
@@ -1236,7 +1248,9 @@ mod tests {
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
     use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
     use crate::operations::reductions::ReduceOperation;
-    use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
+    use crate::operations::references::{
+        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation,
+    };
     use crate::operations::sharding::shard_map::{ShardMapContext, ShardMapTracer, shard_map, shard_map_in_context};
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicyReference;
@@ -1320,6 +1334,24 @@ mod tests {
     /// a program whose inputs carry those global input types.
     fn shard_map_program(body: TestProgram, global_input_types: Vec<ArrayIrType>, shard_map: ShardMap) -> TestProgram {
         let operation = ShardMapOperation::from_program(&body, global_input_types.clone(), shard_map).unwrap();
+        build_program(global_input_types, |builder, inputs| {
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        })
+    }
+
+    /// Stages the `shard_map` that `body` and `shard_map` define for `global_input_types` like [`shard_map_program`],
+    /// but builds its boundary without the checks of [`ShardMapOperation::from_program`], as transform rules do when
+    /// they rebuild a validated boundary. A `body` without reference inputs or outputs then reaches the emulator even
+    /// when the reference analysis of checked construction rejects it (e.g., when it contains a loop whose body swaps
+    /// two reference carries that the map body allocates). The `body` must have no outputs.
+    fn unchecked_shard_map_program(
+        body: TestProgram,
+        global_input_types: Vec<ArrayIrType>,
+        shard_map: ShardMap,
+    ) -> TestProgram {
+        let operation =
+            ShardMapOperation::from_boundary(shard_map, global_input_types.clone(), Vec::<ArrayIrType>::new());
         build_program(global_input_types, |builder, inputs| {
             let body = builder.import_program(body);
             builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
@@ -1731,6 +1763,48 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_while_rejects_bodies_that_swap_reference_carries() {
+        // The map body allocates two references and runs a loop over them whose body reduces over the manual axis, so
+        // the loop runs in lockstep. Its body returns the two reference carries swapped, so the loop state has no fixed
+        // point, which every device rejects before the first iteration, as the eager rule does.
+        let mesh = manual_mesh();
+        let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
+        let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], Vec::new(), Vec::new()).unwrap();
+        let local_type = shard_map.local_input_type(0, &f32_type(&[2], Some(sharded))).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(local_type.clone()));
+        let state_types = vec![reference_type.clone(), reference_type];
+        let condition = build_program(state_types.clone(), |builder, _| {
+            vec![builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()))]
+        });
+        let swap = build_program(state_types, |builder, inputs| {
+            let value = builder.add_instruction(reference_read(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let sum = add_sum_over_x(builder, &mesh, value);
+            let write = ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+            builder.add_instruction(write, Vec::new(), vec![inputs[0], sum], None).unwrap();
+            vec![inputs[1], inputs[0]]
+        });
+        let body = build_program(vec![ArrayIrType::Array(local_type)], |builder, inputs| {
+            let state = (0..2)
+                .map(|_| {
+                    builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), inputs.to_vec(), None).unwrap()[0]
+                })
+                .collect::<Vec<_>>();
+            let regions = vec![builder.import_program(condition), builder.import_program(swap)];
+            let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(1).unwrap();
+            builder.add_instruction(operation, regions, state, None).unwrap();
+            Vec::new()
+        });
+        let program = unchecked_shard_map_program(body, vec![ArrayIrType::Array(f32_type(&[2], None))], shard_map);
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`while` body does not return carry 0 as the reference it entered with, so the loop state has no fixed \
+                 point",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_scan() {
         // A scan whose body reduces over the manual axis runs its iterations in lockstep on both devices. Every
         // iteration replaces the carry of each device by the sum of the carries of both devices and stacks it.
@@ -1792,6 +1866,46 @@ mod tests {
             Ok(vec![ArrayIrValue::Reference(reference.clone())]),
         );
         assert_eq!(reference.read(), Ok(Array::from_elements(global_type, &[6.0f32, 6.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_scan_validates_reference_carry_roots_at_zero_trips() {
+        // The map body allocates two references and runs a scan over them whose body reduces over the manual axis, so
+        // the scan runs in lockstep. Its body returns the two reference carries swapped, so the scan state has no fixed
+        // point, which every device rejects before the first iteration, as the eager rule does, even though this scan
+        // runs no iteration.
+        let mesh = manual_mesh();
+        let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
+        let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], Vec::new(), Vec::new()).unwrap();
+        let local_type = shard_map.local_input_type(0, &f32_type(&[2], Some(sharded))).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(local_type.clone()));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        let scan_body = build_program(vec![index_type, reference_type.clone(), reference_type], |builder, inputs| {
+            let value = builder.add_instruction(reference_read(), Vec::new(), vec![inputs[1]], None).unwrap()[0];
+            let sum = add_sum_over_x(builder, &mesh, value);
+            let write = ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+            builder.add_instruction(write, Vec::new(), vec![inputs[1], sum], None).unwrap();
+            vec![inputs[2], inputs[1]]
+        });
+        let body = build_program(vec![ArrayIrType::Array(local_type)], |builder, inputs| {
+            let carries = (0..2)
+                .map(|_| {
+                    builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), inputs.to_vec(), None).unwrap()[0]
+                })
+                .collect::<Vec<_>>();
+            let scan_body = builder.import_program(scan_body);
+            let scan = ScanOperation::<ArrayIrType>::new(2, 0usize);
+            builder.add_instruction(scan, vec![scan_body], carries, None).unwrap();
+            Vec::new()
+        });
+        let program = unchecked_shard_map_program(body, vec![ArrayIrType::Array(f32_type(&[2], None))], shard_map);
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no fixed \
+                 point",
+            ))),
+        );
     }
 
     #[test]
