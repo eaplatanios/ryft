@@ -217,6 +217,41 @@ impl<T: ConditionType> ConditionOperation<T> {
         Self { marker: PhantomData }
     }
 
+    // TODO(eaplatanios): Why do we need this function? Can it not be inlined in the `InterpretableOperation`
+    //  implementation and be invoked directly through that one?
+    /// Interprets this condition over `inputs` (i.e., the predicate followed by one input per branch input) with the
+    /// `true` and `false` `branches`, running the branch that the predicate selects through `interpret_branch`, which
+    /// receives the index of that branch and its inputs, and returns its outputs. This is the eager rule of the
+    /// operation (refer to its [`InterpretableOperation`] implementation), which the `shard_map` emulator shares with
+    /// values that hold one value per device.
+    ///
+    /// Direct eager binding does not pass through program construction, so the complete application is validated before
+    /// a branch is selected: otherwise the unselected peer could conceal a signature or a reference contract that
+    /// program construction or another transform rejects. Entering the selected branch validates the runtime inputs as
+    /// one complete signature against its declared input types before any of its work executes. That check accepts the
+    /// concrete referents of live reference handles as refinements of symbolic allocation types, and requires shared
+    /// dimension identities to agree across arrays and reference referents. The outputs are compared after applying
+    /// those same input facts, so eager binding and program construction accept the same shapes.
+    pub(crate) fn interpret_with<
+        V: Clone + Typed<Type = T> + Concretizable<bool>,
+        R: Value<Type = T>,
+        O: Operation<Type = T>,
+    >(
+        &self,
+        branches: [RegionRef<'_, R, O>; 2],
+        inputs: &[V],
+        interpret_branch: impl FnOnce(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
+    ) -> Result<Vec<V>, ProgramError> {
+        let expected = branches[0].input_ids().len() + 1;
+        if inputs.len() != expected {
+            return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
+        }
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.validate_application(&input_types, branches)?;
+        let branch = if inputs[0].concretize()? { 0 } else { 1 };
+        interpret_branch(branch, inputs[1..].to_vec())
+    }
+
     /// Validates that the two branches with interfaces `region_interfaces` declare the same input types. Both branches
     /// receive the same inputs, and staging can specialize a branch to the actual input types, which could otherwise
     /// make two different declarations equal (refer to [`Operation::validate_region_interfaces`]).
@@ -624,42 +659,6 @@ impl<
 // Interpretation rule for [`ConditionOperation`]: extracts the concrete Boolean predicate from the first input and
 // interprets only the selected branch region over the remaining inputs (region 0 for `true` and region 1 for
 // `false`), so the untaken branch never runs.
-impl<T: ConditionType> ConditionOperation<T> {
-    /// Interprets this condition over `inputs` (i.e., the predicate followed by one input per branch input) with the
-    /// `true` and `false` `branches`, running the branch that the predicate selects through `interpret_branch`, which
-    /// receives the index of that branch and its inputs, and returns its outputs. This is the eager rule of the
-    /// operation (refer to its [`InterpretableOperation`] implementation), which the `shard_map` emulator shares with
-    /// values that hold one value per device.
-    ///
-    /// Direct eager binding does not pass through program construction, so the complete application is validated
-    /// before a branch is selected: otherwise the unselected peer could conceal a signature or a reference contract that
-    /// program construction or another transform rejects. Entering the selected branch validates the runtime inputs as
-    /// one complete signature against its declared input types before any of its work executes. That check accepts the
-    /// concrete referents of live reference handles as refinements of symbolic allocation types, and requires shared
-    /// dimension identities to agree across arrays and reference referents. The outputs are compared after applying
-    /// those same input facts, so eager binding and program construction accept the same shapes.
-    pub(crate) fn interpret_with<V, R, O>(
-        &self,
-        branches: [RegionRef<'_, R, O>; 2],
-        inputs: &[V],
-        interpret_branch: impl FnOnce(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        V: Clone + Typed<Type = T> + Concretizable<bool>,
-        R: Value<Type = T>,
-        O: Operation<Type = T>,
-    {
-        let expected = branches[0].input_ids().len() + 1;
-        if inputs.len() != expected {
-            return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
-        }
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, branches)?;
-        let branch = if inputs[0].concretize()? { 0 } else { 1 };
-        interpret_branch(branch, inputs[1..].to_vec())
-    }
-}
-
 impl<C> InterpretableOperation<C> for ConditionOperation<C::Type>
 where
     C: Domain<Type: ConditionType, Value: Concretizable<bool>>,
