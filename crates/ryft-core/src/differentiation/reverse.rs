@@ -2074,9 +2074,14 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     /// The returned program must have one cotangent slot per selected input. The default implementation validates
     /// this for the result of [`Self::transpose_program`]; overriding implementations must uphold that contract.
     ///
-    /// The default implementation validates and normalizes the arguments, serves requests that flag no non-reference
-    /// output through [`Self::transpose_program`], and rejects the others. The built-in recursive driver serves every
-    /// request through the region's retained transform cache, with the normalized flags as part of the cache key.
+    /// The default implementation validates and normalizes the arguments and serves every request through
+    /// [`Self::transpose_program`], so a driver that implements only that function also supports structural-zero output
+    /// cotangents. For a request that flags no non-reference output, it transposes `region` itself. Otherwise, it
+    /// transposes a standalone copy of `region` without the flagged outputs (refer to [`RegionRef::to_program`] and
+    /// [`Program::with_outputs`]), whose transposition has exactly the boundary described above. Such a copy is made
+    /// for every request, and the region that [`Self::transpose_program`] receives is then not one of
+    /// [`RegionDriver::regions`]. The built-in recursive driver instead serves every request through the source region's
+    /// retained transform cache, with the normalized flags as part of the cache key.
     ///
     /// # Parameters
     ///
@@ -2090,10 +2095,10 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::InvalidArgument`] for invalid selected inputs, destination kinds, or mask lengths,
-    /// [`ProgramError::UnsupportedOperation`] when a driver without structural-zero output cotangent support receives
-    /// a flagged non-reference output, and [`ProgramError::MalformedProgram`] when the default implementation receives
-    /// a cotangent slot count from [`Self::transpose_program`] that differs from the number of selected inputs.
+    /// Returns [`ProgramError::InvalidArgument`] for invalid selected inputs, destination kinds, or mask lengths, the
+    /// errors of [`Self::transpose_program`], and [`ProgramError::MalformedProgram`] when the default implementation
+    /// receives a cotangent slot count from [`Self::transpose_program`] that differs from the number of selected
+    /// inputs.
     fn transpose_program_with_zero_seeds(
         &self,
         region: RegionRef<'_, V, O>,
@@ -2110,15 +2115,22 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
             destination_kinds,
         )?;
 
-        if arguments.zero_output_cotangents.contains(&true) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "this transposition driver does not support structural-zero output cotangents".to_string(),
-            }
-            .into());
-        }
+        // A flagged output seeds no part of the pullback, so the region without it has the same transposition,
+        // with the cotangents of the remaining non-reference outputs as the only cotangent inputs.
+        let pruned = if arguments.zero_output_cotangents.contains(&true) {
+            let outputs = arguments
+                .zero_output_cotangents
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &zero)| (!zero).then_some(index))
+                .collect::<Vec<_>>();
+            Some(region.to_program().with_outputs(&outputs)?)
+        } else {
+            None
+        };
 
         let transposed = self.transpose_program(
-            region,
+            pruned.as_ref().map_or(region, Program::entry_region_ref),
             &arguments.input_indices,
             &arguments.materialize_zeros,
             &arguments.destination_kinds,
@@ -4832,6 +4844,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`TranspositionDriver`] that implements only [`TranspositionDriver::transpose_program`], used to exercise the
+    /// default [`TranspositionDriver::transpose_program_with_zero_seeds`]. It expects the normalized default flags,
+    /// records the rendering of every region that it receives, and returns `result` when one is provided or the
+    /// transposition of the received region otherwise.
+    struct TestTranspositionDriver {
+        result: Option<TransposedProgram<ReferenceTestValue, ReferenceTestOperation>>,
+        regions: RefCell<Vec<String>>,
+    }
+
+    impl RegionDriver<ReferenceTestValue, ReferenceTestOperation> for TestTranspositionDriver {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, ReferenceTestValue, ReferenceTestOperation>>
+        where
+            ReferenceTestValue: 'r,
+            ReferenceTestOperation: 'r,
+        {
+            std::iter::empty()
+        }
+    }
+
+    impl TranspositionDriver<ReferenceTestValue, ReferenceTestOperation> for TestTranspositionDriver {
+        fn transpose_program(
+            &self,
+            region: RegionRef<'_, ReferenceTestValue, ReferenceTestOperation>,
+            input_indices: &[usize],
+            materialize_zeros: &[bool],
+            destination_kinds: &[CotangentDestinationKind],
+        ) -> Result<TransposedProgram<ReferenceTestValue, ReferenceTestOperation>, DifferentiationError> {
+            assert_eq!(materialize_zeros, vec![false; input_indices.len()]);
+            assert_eq!(destination_kinds, vec![CotangentDestinationKind::Return; input_indices.len()]);
+            self.regions.borrow_mut().push(region.to_program().to_string());
+            match &self.result {
+                Some(result) => Ok(result.clone()),
+                None => region.transpose(input_indices, materialize_zeros, destination_kinds),
+            }
+        }
+    }
+
     type ReferenceTestValue = ArrayIrValue<Array>;
     type ReferenceTestOperation = ArrayIrOperation<Array>;
     type ReferenceTestContext = EagerContext<ReferenceTestValue, ReferenceTestOperation>;
@@ -6467,37 +6516,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_transposition_driver_transpose_program_with_zero_seeds() {
-        struct Driver {
-            result: TransposedProgram<ReferenceTestValue, ReferenceTestOperation>,
-            calls: Cell<usize>,
-        }
-
-        impl RegionDriver<ReferenceTestValue, ReferenceTestOperation> for Driver {
-            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, ReferenceTestValue, ReferenceTestOperation>>
-            where
-                ReferenceTestValue: 'r,
-                ReferenceTestOperation: 'r,
-            {
-                std::iter::empty()
-            }
-        }
-
-        impl TranspositionDriver<ReferenceTestValue, ReferenceTestOperation> for Driver {
-            fn transpose_program(
-                &self,
-                _region: RegionRef<'_, ReferenceTestValue, ReferenceTestOperation>,
-                input_indices: &[usize],
-                materialize_zeros: &[bool],
-                destination_kinds: &[CotangentDestinationKind],
-            ) -> Result<TransposedProgram<ReferenceTestValue, ReferenceTestOperation>, DifferentiationError>
-            {
-                assert_eq!(materialize_zeros, vec![false; input_indices.len()]);
-                assert_eq!(destination_kinds, vec![CotangentDestinationKind::Return; input_indices.len()]);
-                self.calls.set(self.calls.get() + 1);
-                Ok(self.result.clone())
-            }
-        }
-
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let value = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
@@ -6509,7 +6527,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         let region = program.entry_region_ref();
-        let driver = Driver { result: region.transpose_shared(&[0], &[], &[]).unwrap(), calls: Cell::new(0) };
+        let driver = TestTranspositionDriver {
+            result: Some(region.transpose_shared(&[0], &[], &[]).unwrap()),
+            regions: RefCell::new(Vec::new()),
+        };
         let transposed = driver.transpose_program_with_zero_seeds(region, &[0], &[], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Output]);
         assert_eq!(
@@ -6523,7 +6544,7 @@ pub(crate) mod tests {
         let flagged_reference =
             driver.transpose_program_with_zero_seeds(region, &[0], &[], &[false, true], &[]).unwrap();
         assert!(Arc::ptr_eq(flagged_reference.program(), transposed.program()));
-        assert_eq!(driver.calls.get(), 2);
+        assert_eq!(driver.regions.borrow().len(), 2);
 
         assert!(matches!(
             driver.transpose_program_with_zero_seeds(region, &[0], &[], &[false], &[]),
@@ -6536,11 +6557,6 @@ pub(crate) mod tests {
                 if message == "transposition received 1 structural-zero output cotangent flags for 2 outputs",
         ));
         assert!(matches!(
-            driver.transpose_program_with_zero_seeds(region, &[0], &[], &[true, false], &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "this transposition driver does not support structural-zero output cotangents",
-        ));
-        assert!(matches!(
             driver.transpose_program_with_zero_seeds(region, &[0], &[false; 2], &[], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition received 2 zero-materialization flags for 1 selected inputs",
@@ -6550,12 +6566,73 @@ pub(crate) mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition received 2 destination kinds for 1 selected inputs",
         ));
-        assert_eq!(driver.calls.get(), 2);
+        assert_eq!(driver.regions.borrow().len(), 2);
         assert!(matches!(
             driver.transpose_program_with_zero_seeds(region, &[], &[], &[], &[]),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "transposition driver returned 1 cotangent slots for 0 selected inputs",
         ));
+    }
+
+    #[test]
+    fn test_transposition_driver_transpose_program_with_zero_seeds_prunes_flagged_outputs() {
+        let r#type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let add = || ReferenceTestOperation::Array(ArrayOperation::Add(AddOperation::new()));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let first = builder.add_input(r#type.clone());
+        let second = builder.add_input(r#type.clone());
+        let third = builder.add_input(r#type);
+        let sum = builder.add_instruction(add(), Vec::new(), vec![first, second], None).unwrap()[0];
+        let live = builder.add_instruction(add(), Vec::new(), vec![sum, first], None).unwrap()[0];
+        let dead = builder.add_instruction(add(), Vec::new(), vec![second, third], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![live, dead],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let expected = indoc! {"
+            lambda %0:f32[] .
+            let %1:f32[] = add %0 %0
+            in (%1, %0)
+        "}
+        .trim_end();
+
+        // A driver implementing only `transpose_program` transposes the region without the flagged output, so the
+        // flagged cotangent has no input and the input that only the flagged output reaches keeps a structural zero.
+        let driver = TestTranspositionDriver { result: None, regions: RefCell::new(Vec::new()) };
+        let transposed =
+            driver.transpose_program_with_zero_seeds(region, &[0, 1, 2], &[], &[false, true], &[]).unwrap();
+        assert_eq!(
+            driver.regions.borrow().as_slice(),
+            &[indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[] .
+                let %3:f32[] = add %0 %1
+                    %4:f32[] = add %3 %0
+                in (%4)
+            "}
+            .trim_end()
+            .to_string()],
+        );
+        assert_eq!(
+            transposed.cotangents(),
+            &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero],
+        );
+        assert_eq!(transposed.program().to_string(), expected);
+        assert_eq!(
+            transposed.program().interpret(vec![reference_test_scalar(3.0)]),
+            Ok(vec![reference_test_scalar(6.0), reference_test_scalar(3.0)]),
+        );
+
+        // The recursive driver serves the same request symbolically through the source region's transform cache.
+        let recursive = RecursiveTranspositionDriver::new(region, 0)
+            .unwrap()
+            .transpose_program_with_zero_seeds(region, &[0, 1, 2], &[], &[false, true], &[])
+            .unwrap();
+        assert_eq!(recursive.cotangents(), transposed.cotangents());
+        assert_eq!(recursive.program().to_string(), expected);
     }
 
     #[test]
