@@ -1,9 +1,9 @@
-//! Conditional execution through [`ConditionOperation`], which evaluates one of two attached branch
-//! [`Region`](crate::Region)s according to a scalar Boolean predicate, and through the [`Condition`] capability, which
-//! traces two branch functions over structured inputs and stages a condition that selects between them.
+//! Conditional execution through [`ConditionOperation`], which evaluates one of two attached [`Region`](crate::Region)s
+//! according to a scalar Boolean predicate, and through the [`Condition`] capability, which traces two branch functions
+//! over structured inputs and stages a condition that selects between them.
 //!
-//! A condition application takes the predicate followed by one input per branch input. Both branches receive the same
-//! inputs and must return outputs of the same types after the facts that those inputs establish refine them.
+//! A condition application takes the predicate followed by one input per branch input. Both branches receive the
+//! same inputs and must return outputs of the same types after the facts that those inputs establish refine them.
 //! [`ConditionType`] defines which types are predicates in each type universe, and the manual variation that a
 //! predicate which varies over manual mesh axes requires of every output. Each reference output must denote the same
 //! reference in both branches, and under such a predicate a branch may only mutate references whose referents vary
@@ -23,7 +23,7 @@
 //!     linearization joins the linearizations of both branches over one shared residual boundary, and transposition
 //!     selects between the transposed branches with the same predicate.
 //!
-//! XLA lowers a condition to [StableHLO `if`](https://openxla.org/stablehlo/spec#if).
+//! The XLA backend lowers a condition to StableHLO [`if`](https://openxla.org/stablehlo/spec#if) operation.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -81,7 +81,7 @@ use crate::programs::{
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this since it is mostly vibe coded.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";
