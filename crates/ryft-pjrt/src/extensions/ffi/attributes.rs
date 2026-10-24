@@ -411,15 +411,29 @@ impl<'a, 'o> Iterator for FfiAttributesIterator<'a, 'o> {
 /// Attribute value in an XLA [`FfiCallFrame`].
 #[derive(Copy, Clone)]
 pub enum FfiAttribute<'o> {
+    /// Scalar attribute value.
     Scalar { scalar: FfiScalar },
+
+    /// String attribute value whose payload is valid UTF-8.
     String { string: &'o str },
+
+    /// String attribute value whose payload is not necessarily valid UTF-8. XLA FFI has a single string attribute type
+    /// whose payload is an arbitrary byte sequence (e.g., an MLIR `StringAttr` holding raw bytes, as produced for byte
+    /// attributes of custom calls), so payloads that do not decode as UTF-8 are exposed as raw bytes instead of being
+    /// rejected. Use [`FfiAttribute::bytes`] to read the payload of either string variant as bytes.
+    Bytes { bytes: &'o [u8] },
+
+    /// Array attribute value that contains [`FfiScalar`]s.
     Array { array: FfiArray<'o> },
+
+    /// Dictionary attribute value that maps names to nested [`FfiAttribute`]s.
     Dictionary { dictionary: FfiAttributes<'o> },
 }
 
-impl FfiAttribute<'_> {
+impl<'o> FfiAttribute<'o> {
     /// Constructs a new [`FfiAttribute`] from the provided [`XLA_FFI_AttrType`](ffi::XLA_FFI_AttrType)
-    /// and raw attribute value pointer that came from a function in the XLA FFI API.
+    /// and raw attribute value pointer that came from a function in the XLA FFI API. String attributes whose payload
+    /// is valid UTF-8 become [`FfiAttribute::String`], and all other string attributes become [`FfiAttribute::Bytes`].
     pub unsafe fn from_c_api(r#type: ffi::XLA_FFI_AttrType, value: *mut std::ffi::c_void) -> Result<Self, FfiError> {
         unsafe {
             match r#type {
@@ -443,10 +457,10 @@ impl FfiAttribute<'_> {
                         return Err(FfiError::invalid_argument("encountered null string pointer for attribute"));
                     }
                     let bytes = std::slice::from_raw_parts((*span).ptr as *const u8, (*span).len);
-                    let string = std::str::from_utf8(bytes).map_err(|error| {
-                        FfiError::invalid_argument(format!("XLA FFI attribute is not a valid UTF-8 string: {error}"))
-                    })?;
-                    Ok(Self::String { string })
+                    match std::str::from_utf8(bytes) {
+                        Ok(string) => Ok(Self::String { string }),
+                        Err(_) => Ok(Self::Bytes { bytes }),
+                    }
                 }
                 ffi::XLA_FFI_AttrType_ARRAY => {
                     Ok(Self::Array { array: FfiArray::from_c_api(value as *const ffi::XLA_FFI_Array)? })
@@ -456,6 +470,18 @@ impl FfiAttribute<'_> {
                 }
                 _ => Err(FfiError::invalid_argument(format!("invalid XLA FFI attribute type '{}'", r#type))),
             }
+        }
+    }
+
+    /// Returns the raw payload bytes of a string attribute, which is either an [`FfiAttribute::String`] (whose payload
+    /// is valid UTF-8) or an [`FfiAttribute::Bytes`], and [`None`] for every other attribute. Handlers that accept
+    /// arbitrary byte payloads should read them through this function, because whether a given payload decodes as
+    /// UTF-8 depends on its contents rather than on the attribute declaration.
+    pub fn bytes(&self) -> Option<&'o [u8]> {
+        match *self {
+            Self::String { string } => Some(string.as_bytes()),
+            Self::Bytes { bytes } => Some(bytes),
+            Self::Scalar { .. } | Self::Array { .. } | Self::Dictionary { .. } => None,
         }
     }
 }
@@ -605,15 +631,17 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use crate::extensions::ffi::buffers::ffi::XLA_FFI_DataType_S32;
     use crate::extensions::ffi::errors::FfiError;
     use crate::extensions::ffi::tests::with_test_ffi_call_frame;
 
+    use super::ffi::{XLA_FFI_AttrType_SCALAR, XLA_FFI_AttrType_STRING, XLA_FFI_ByteSpan, XLA_FFI_Scalar};
     use super::{FfiAttribute, FfiScalar};
 
     #[test]
     fn test_ffi_attribute() {
         with_test_ffi_call_frame(|call_frame| {
-            assert_eq!(call_frame.attribute_count(), 4);
+            assert_eq!(call_frame.attribute_count(), 5);
             for name_and_attribute in call_frame.attributes() {
                 assert!(name_and_attribute.is_ok());
                 let (name, attribute) = name_and_attribute.unwrap();
@@ -704,10 +732,44 @@ mod tests {
                     }
                     ("scalar_attr", FfiAttribute::Scalar { scalar }) => assert_eq!(scalar, FfiScalar::I32(7)),
                     ("string_attr", FfiAttribute::String { string }) => assert_eq!(string, "value"),
+                    // String payloads that are not valid UTF-8 decode as raw bytes instead of being rejected.
+                    ("bytes_attr", FfiAttribute::Bytes { bytes }) => assert_eq!(bytes, &[0x00, 0xff, 0x80]),
                     ("api_version", FfiAttribute::Scalar { scalar }) => assert_eq!(scalar, FfiScalar::I32(4)),
                     _ => panic!("encountered unexpected XLA FFI attribute"),
                 }
             }
         });
+    }
+
+    #[test]
+    fn test_ffi_attribute_bytes() {
+        // Valid UTF-8 string payloads decode as strings and invalid ones as raw bytes, while both expose their payload
+        // through `FfiAttribute::bytes`.
+        let string = "value";
+        let mut string_span = XLA_FFI_ByteSpan::from(string);
+        let string_attribute = unsafe {
+            FfiAttribute::from_c_api(XLA_FFI_AttrType_STRING, (&mut string_span as *mut XLA_FFI_ByteSpan).cast())
+        }
+        .unwrap();
+        assert!(matches!(string_attribute, FfiAttribute::String { string } if string == "value"));
+        assert_eq!(string_attribute.bytes(), Some(b"value".as_slice()));
+
+        let bytes = [0x00u8, 0xff, 0x80];
+        let mut bytes_span = XLA_FFI_ByteSpan { ptr: bytes.as_ptr().cast(), len: bytes.len() };
+        let bytes_attribute = unsafe {
+            FfiAttribute::from_c_api(XLA_FFI_AttrType_STRING, (&mut bytes_span as *mut XLA_FFI_ByteSpan).cast())
+        }
+        .unwrap();
+        assert!(matches!(bytes_attribute, FfiAttribute::Bytes { bytes } if bytes == [0x00, 0xff, 0x80]));
+        assert_eq!(bytes_attribute.bytes(), Some([0x00u8, 0xff, 0x80].as_slice()));
+
+        // Non-string attributes have no byte payload.
+        let mut value = 7i32;
+        let mut scalar = XLA_FFI_Scalar { data_type: XLA_FFI_DataType_S32, value: (&mut value as *mut i32).cast() };
+        let scalar_attribute =
+            unsafe { FfiAttribute::from_c_api(XLA_FFI_AttrType_SCALAR, (&mut scalar as *mut XLA_FFI_Scalar).cast()) }
+                .unwrap();
+        assert!(matches!(scalar_attribute, FfiAttribute::Scalar { scalar: FfiScalar::I32(7) }));
+        assert_eq!(scalar_attribute.bytes(), None);
     }
 }
