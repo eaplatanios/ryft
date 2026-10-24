@@ -73,11 +73,11 @@ use crate::partial::{
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, EffectsSummary, EmptyRegionDriver, InputRegionProvenance, MaybeZero,
     Operation, OperationBoundaryPruning, OperationPayloadProjection, OperationProjection, OperationProvider,
-    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAnalysis, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceId, ReferenceMemberType, ReferenceRoot, RegionDataFlow, RegionDriver, RegionId, RegionInterface,
-    RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value,
-    ValueProjection, discharge_positional_region_operation,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceId,
+    ReferenceMemberType, ReferenceRoot, RegionDataFlow, RegionDriver, RegionInterface, RegionLiveness, RegionRef,
+    RegionSlot, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueProjection,
+    discharge_positional_region_operation,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -846,41 +846,31 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// A replicated predicate binds one condition whose batched branches explicitly thread the mapped extent (refer to
-// `BatchingContext::batch_condition_with_replicated_predicate`). A batch-varying predicate evaluates both branches and
-// selects their outputs per item, as for homogeneous arrays (refer to
-// `BatchingContext::batch_condition_with_mapped_predicate`), except that only array inputs are gated and only array
-// outputs are selected. Dimension and reference inputs pass through unchanged, a dimension output is replicated and
-// equal in both branches, and a reference output must forward the same branch input in both branches (refer to
-// `merge_mapped_predicate_composite_output`). The branches must not access or allocate references, and a staging parent
-// rejects branch-local type identities before either branch is replayed.
-impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
-where
+impl<
     C: ContextProjection<
             ArrayType,
             Type = ArrayIrType,
-            Operation: From<DynamicBroadcastOperation>
+            Value: DimensionSize
+                       + DynamicBroadcast
+                       + ValueProjection<
+                ArrayType,
+                Projected: Broadcast
+                               + Select
+                               + StopGradient
+                               + Transpose
+                               + ManualVariationAlignment<ArrayType>
+                               + Value<Type = ArrayType>,
+            >,
+            Operation: OperationPayloadProjection
+                           + OperationProjection<
+                ArrayType,
+                Projected: From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
+            > + From<DynamicBroadcastOperation>
                            + From<ConditionOperation<ArrayIrType>>
                            + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>,
+                           + From<DimensionSizeOperation>,
         >,
-    C::Operation: OperationPayloadProjection,
-    C::Value: DimensionSize
-        + DynamicBroadcast
-        + ValueProjection<
-            ArrayType,
-            Projected: Broadcast
-                           + Select
-                           + StopGradient
-                           + Transpose
-                           + ManualVariationAlignment<ArrayType>
-                           + Value<Type = ArrayType>,
-        >,
-    <C::Operation as OperationProjection<ArrayType>>::Projected:
-        From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
+> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -888,8 +878,15 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-        // Validate the complete per-item application before structural batching or per-item selection rewrites it, so
-        // that a staging parent cannot skip it.
+        // A replicated predicate binds one condition whose batched branches explicitly thread the mapped extent.
+        // A batch-varying predicate evaluates both branches and selects their outputs per item, as for homogeneous
+        // arrays,except that only array inputs are gated and only array outputs are selected. Dimension and reference
+        // inputs pass through unchanged, a dimension output is replicated and equal in both branches, and a reference
+        // output must forward the same branch input in both branches. The branches must not access or allocate
+        // references, and a staging parent rejects branch-local type identities before either branch is replayed.
+
+        // Validate the complete per-item application before structural batching or per-item selection rewrites it,
+        // so that a staging parent cannot skip it.
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>();
         self.validate_application(&input_types, branches)?;
@@ -902,6 +899,7 @@ where
                 branch_inputs,
             );
         }
+
         // Both branches run, so even a read in the inactive branch would be ordered against writes in the selected
         // branch, and allocating a reference is itself an effect. Reject accesses and allocations before generic
         // purity; forwarding an untouched reference remains valid and its output roots are checked when merging.
@@ -919,8 +917,9 @@ where
                 });
             }
         }
-        // Check other effects and deferred work only after reference accesses, so the reference diagnostic names the
-        // cause when both restrictions apply. Selecting outputs cannot suppress work in an inactive branch.
+
+        // Check other effects and deferred work only after reference accesses, so the reference diagnostic names
+        // the cause when both restrictions apply. Selecting outputs cannot suppress work in an inactive branch.
         if branches.iter().any(|branch| !is_pure(branch.effects())) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -930,6 +929,7 @@ where
                 ),
             });
         }
+
         // Staging both branches into one trace would collide their local identities across branches or invocations.
         // Freshening those identities would instead give dependent arrays unrelated shapes at selection. Identities
         // established by the inputs keep their existing authority; eager execution has concrete output dimensions.
@@ -946,14 +946,15 @@ where
                 }
             }
         }
+
         let branch_ids = branches.map(|branch| branch.id());
         context.batch_condition_with_mapped_predicate(
             driver,
             predicate,
             branch_inputs,
-            // Array inputs keep their primal values in both branches but gradients enter only the selected one.
-            // Dimensions and untouched references describe shared structural state and pass through unchanged.
             |input| {
+                // Array inputs keep their primal values in both branches but gradients enter only the selected one.
+                // Dimensions and untouched references describe shared structural state and pass through unchanged.
                 if !matches!(input.unbatched_type(), ArrayIrType::Array(_)) {
                     return Ok(None);
                 }
@@ -965,20 +966,50 @@ where
                 check_count!("output", selected, 1, ProgramError);
                 Ok(selected.remove(0))
             },
-            |index, true_output, false_output, select| {
-                merge_mapped_predicate_composite_output(
-                    index,
-                    true_output,
-                    false_output,
-                    branch_ids,
-                    &analyses,
-                    branch_inputs,
-                    select,
-                )
+            |index, true_output, false_output, select| match true_output.unbatched_type() {
+                ArrayIrType::Array(_) => {
+                    <&ArrayType>::try_from(&false_output.unbatched_type())?;
+                    select(&true_output, &false_output)
+                }
+                ArrayIrType::Dimension(_) => {
+                    // Refined branch signatures already agree. Staged dimensions can name only input-established
+                    // identities, and eager dimension types fix their exact values, so these replicated dimensions
+                    // are equal without a runtime comparison.
+                    true_output.validate_replicated_dimension()?;
+                    false_output.validate_replicated_dimension()?;
+                    Ok(true_output)
+                }
+                ArrayIrType::Reference(_) => {
+                    // References cannot be selected per item. Forward the original input with its referent's batch
+                    // axis only when both branches return that input. Check the root's region as well as its position
+                    // so an input of a foreign region cannot index this condition's inputs.
+                    let [true_root, false_root] =
+                        [0, 1].map(|branch| analyses[branch].output_roots().get(index).copied().flatten());
+                    match (true_root, false_root) {
+                        (
+                            Some(ReferenceRoot::RegionInput { region: true_region, input_index: true_input }),
+                            Some(ReferenceRoot::RegionInput { region: false_region, input_index: false_input }),
+                        ) if true_region == branch_ids[0]
+                            && false_region == branch_ids[1]
+                            && true_input == false_input
+                            && true_input < branch_inputs.len() =>
+                        {
+                            Ok(branch_inputs[true_input].clone())
+                        }
+                        _ => Err(BatchingError::UnsupportedOperation {
+                            message: format!(
+                                "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose \
+                                 reference output {index} does not forward the same region input in both branches",
+                            ),
+                        }),
+                    }
+                }
             },
         )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Forward-mode (JVP) rule for [`ConditionOperation`]. The predicate is the first input and carries no tangent (Boolean
 // predicates have no tangent space). The rule analyzes which branch inputs and outputs carry live tangents (refer to
@@ -1978,60 +2009,6 @@ fn gate_mapped_predicate_branch_inputs<B: Clone>(
             None => Ok(input.clone()),
         })
         .collect()
-}
-
-/// Merges output `index` of the two branches of a composite condition whose predicate is batch-varying, given the
-/// branches' outputs `true_output` and `false_output`. An array output is selected per item through `select`. A
-/// dimension output is replicated, and both branches produce the same dimension value without a runtime comparison:
-/// type inference proved the two refined output types equal, and batching rejected every branch-local identity for a
-/// staging parent, so an equal type names only input-established identities. An eager parent produces exact dimension
-/// types, which determine their values. A reference output
-/// is never selected: both branches must forward the same branch input, according to their reference `analyses`, and
-/// the batch of the corresponding entry of `branch_inputs` then passes through unchanged, with the axis that its
-/// referent fixes. A root must be an input of its own branch (whose identifier `branch_ids` lists), so that a root of
-/// some other region fails loudly instead of indexing the branch inputs with a foreign region input position.
-fn merge_mapped_predicate_composite_output<V: Value<Type = ArrayIrType>>(
-    index: usize,
-    true_output: ArrayIrBatch<V>,
-    false_output: ArrayIrBatch<V>,
-    branch_ids: [RegionId; 2],
-    analyses: &[Arc<ReferenceAnalysis>; 2],
-    branch_inputs: &[ArrayIrBatch<V>],
-    select: impl Fn(&ArrayIrBatch<V>, &ArrayIrBatch<V>) -> Result<ArrayIrBatch<V>, BatchingError>,
-) -> Result<ArrayIrBatch<V>, BatchingError> {
-    match true_output.unbatched_type() {
-        ArrayIrType::Array(_) => {
-            <&ArrayType>::try_from(&false_output.unbatched_type())?;
-            select(&true_output, &false_output)
-        }
-        ArrayIrType::Dimension(_) => {
-            true_output.validate_replicated_dimension()?;
-            false_output.validate_replicated_dimension()?;
-            Ok(true_output)
-        }
-        ArrayIrType::Reference(_) => {
-            let [true_root, false_root] =
-                [0, 1].map(|branch| analyses[branch].output_roots().get(index).copied().flatten());
-            match (true_root, false_root) {
-                (
-                    Some(ReferenceRoot::RegionInput { region: true_region, input_index: true_input }),
-                    Some(ReferenceRoot::RegionInput { region: false_region, input_index: false_input }),
-                ) if true_region == branch_ids[0]
-                    && false_region == branch_ids[1]
-                    && true_input == false_input
-                    && true_input < branch_inputs.len() =>
-                {
-                    Ok(branch_inputs[true_input].clone())
-                }
-                _ => Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose reference \
-                         output {index} does not forward the same region input in both branches",
-                    ),
-                }),
-            }
-        }
-    }
 }
 
 /// Forward-mode activity of one `condition` application, shared by its fused and its separate-context derivative.
