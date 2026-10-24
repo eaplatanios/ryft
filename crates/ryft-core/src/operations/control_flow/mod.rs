@@ -40,9 +40,9 @@
 //! # fn main() -> Result<(), ProgramError> {
 //! let predicate = Array::scalar(true)?;
 //! let output = predicate.condition(
-//!     (Array::scalar(2f32)?, Array::scalar(3f32)?),
 //!     |(first, second)| Ok(first + second),
 //!     |(first, second)| Ok(first * second),
+//!     (Array::scalar(2f32)?, Array::scalar(3f32)?),
 //! )?;
 //! assert_eq!(output, Array::scalar(5f32)?);
 //! # Ok(())

@@ -2375,8 +2375,10 @@ mod tests {
 
     /// Eager context over the composite test universe.
     type TestEagerContext = EagerContext<TestIrValue, TestIrOperation>;
+
     /// Staged value of a branch traced over the composite test universe.
     type TestTracer = Tracer<TracingContext<TestIrValue, TestIrOperation>>;
+
     /// Staged value of a branch traced over the array universe.
     type ArrayTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 
@@ -9036,7 +9038,7 @@ mod tests {
         let program = refined_vector_condition_program();
         let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         assert_eq!(program.output_types(), vec![vector_type.clone()]);
-        let arguments = vec![
+        let arguments = [
             array(Array::scalar(true).unwrap()),
             array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             array(Array::vector(vec![10.0, 20.0, 30.0]).unwrap()),
@@ -13205,6 +13207,7 @@ mod tests {
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
         let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
+
         // In the composite family, the projection of `stop_gradient` materializes the severed tangent of the last
         // instruction input as a zero shaped by its primal's runtime extent, so that tangent reaches the condition
         // rule as a live value rather than as a structural zero.
@@ -14270,6 +14273,7 @@ mod tests {
             )
             .unwrap()
             .to_vec();
+
         // Keeping only the doubled output leaves the third branch output dead, so its dynamic cotangent reaches the
         // transposed condition as a structural zero that no type-only constructor can build. It stays symbolic: both
         // branches are transposed without a seed for it, so the pullback neither materializes it nor adds it.
