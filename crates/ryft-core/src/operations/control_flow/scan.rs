@@ -1480,8 +1480,6 @@ impl<T: ScanType> Operation for ScanOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
     fn input_sources(
         &self,
@@ -1491,6 +1489,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
     ) -> Result<RegionDataFlowSources, ProgramError> {
         // The region data-flow dispatcher validates `region_index` and `input_index` before calling this rule.
         self.validate_data_flow_boundary(boundary)?;
+
         // The loop creates its index. Other body inputs come from caller inputs; carries additionally receive the
         // matching body output on later iterations. These are possible producers, independently of reference identity.
         let sources = if input_index == 0 {
@@ -1506,6 +1505,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         } else {
             vec![RegionDataFlowSource::InstructionInput(input_index - 1)]
         };
+
         Ok(RegionDataFlowSources::Known(sources))
     }
 
@@ -1515,6 +1515,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         boundary: RegionDataFlowBoundary<'_>,
     ) -> Result<RegionDataFlowSources, ProgramError> {
         self.validate_data_flow_boundary(boundary)?;
+
         // A statically empty scan bypasses its body, forwarding initial carries and creating empty stacked results.
         // Otherwise a carry may come from its initial binding or any body iteration, modeled through its body input.
         let sources = if self.iteration_count.value() == Some(0) {
@@ -1528,6 +1529,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         } else {
             vec![RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index })]
         };
+
         Ok(RegionDataFlowSources::Known(sources))
     }
 
@@ -1541,6 +1543,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         if self.iteration_count.value() == Some(0) {
             return Ok(vec![None]);
         }
+
         // The carry fixed point that boundary pruning keeps already accounts for inputs demanded by retained effects.
         // Sharing it keeps replay demand and boundary pruning governed by one operation-owned rule.
         let (kept_carries, _) = self.live_carries(used_outputs, regions)?;
@@ -1548,6 +1551,8 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         Ok(vec![Some(kept_carries.into_iter().chain(used_stacked_outputs.iter().copied()).collect())])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation> + From<ScanOperation<ArrayIrType>>>
