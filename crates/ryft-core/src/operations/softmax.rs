@@ -71,9 +71,8 @@ use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
-use crate::operations::custom_functions::functions::{CustomFunction, CustomFunctionJvp, WithJvp, custom_function};
+use crate::operations::custom_functions::functions::{CustomFunction, WithJvp, custom_function};
 use crate::operations::custom_functions::operations::CustomFunctionOperation;
-use crate::operations::custom_functions::rules::CustomRuleRegistration;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::exponential::{Exp, ExpM1, Ln1p};
 use crate::operations::logical::{And, Or};
@@ -441,25 +440,14 @@ where
 impl<
     D: Domain<
             Type = ArrayType,
-            Constant: 'static,
-            Operation: 'static + From<CustomFunctionOperation<D::Constant, D::Operation>>,
+            Constant: 'static + Send + Sync,
+            Operation: 'static + Send + Sync + From<CustomFunctionOperation<D::Constant, D::Operation>>,
         >,
 > SoftmaxCrossEntropyWithTargetLogits<D>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
     <ArrayType as BatchableType>::Policy:
         RecursiveBatchingPolicy<DomainTracingContext<D>> + CotangentBatchingPolicy<DomainTracingContext<D>>,
-    CustomRuleRegistration<D::Constant, D::Operation>: Send,
-    WithJvp<
-        Box<
-            dyn Fn(
-                    (DomainTracer<D>, DomainTracer<D>),
-                    (DomainTracer<D>, DomainTracer<D>),
-                ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-                + Send
-                + Sync,
-        >,
-    >: CustomFunctionJvp<D::Constant, D::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
 {
     /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
     /// reducing the class axes. Both inputs must have the same real floating-point element type and static shape.
