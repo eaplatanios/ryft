@@ -5,17 +5,18 @@
 //! A scan application takes the initial carries followed by the stacked inputs and, when its length is dynamic, a
 //! trailing first-class dimension that supplies the trip count. It returns the final carries followed by the stacked
 //! outputs. The body maps the iteration index, the carries, and the current slices (or whole reference stacks) to the
-//! next carries and the slices of the stacked outputs, and it must return each reference carry as the reference that
-//! it entered with. [`ScanType`] states this contract once over the [`ScanMember`]s of a type universe, including that
-//! every stacked leading axis has the trip count as its extent. Conflicting static extents are type errors, while the
-//! scan boundary checks at runtime the relationships between its inputs that their types leave unproven (e.g., two
-//! carries that the body declares as `f32[n]` but that are supplied as `f32[n]` and `f32[3]`, or an `f32[3]` stack
-//! next to a runtime length of type `dimension<length>`). A rule that removes or splits the boundary first stages an
-//! entry guard that performs the same checks. Every transformation rule validates this complete contract before it
-//! executes, rewrites, or stages the body (reference discharge over the allocations that it threads), so whether an
-//! application is accepted depends neither on the transformation nor on the trip count. The exception is dead-code
-//! elimination (e.g., [`Program::into_simplified`]), which removes an unused scan together with its boundary checks,
-//! like any other pure instruction, whereas partial evaluation keeps those checks in its entry guard. The rules are:
+//! next carries and the slices of the stacked outputs, and it must return each reference carry as the reference that it
+//! entered with. [`ScanType`] states this contract once using the type universe's array, dimension, and reference
+//! projections, including that every stacked leading axis has the trip count as its extent. Conflicting static extents
+//! are type errors, while the scan boundary checks at runtime the relationships between its inputs that their types
+//! leave unproven (e.g., two carries that the body declares as `f32[n]` but that are supplied as `f32[n]` and `f32[3]`,
+//! or an `f32[3]` stack next to a runtime length of type `dimension<length>`). A rule that removes or splits the
+//! boundary first stages an entry guard that performs the same checks. Every transformation rule validates this
+//! complete contract before it executes, rewrites, or stages the body (reference discharge over the allocations that it
+//! threads), so whether an application is accepted depends neither on the transformation nor on the trip count. The
+//! exception is dead-code elimination (e.g., [`Program::into_simplified`]), which removes an unused scan together with
+//! its boundary checks, like any other pure instruction, whereas partial evaluation keeps those checks in its entry
+//! guard. The rules are:
 //!
 //!   - **Interpretation:** The body runs once per iteration in visit order (from the last slice to the first for a
 //!     reversed scan), and each output stack is allocated from the type of its first slice, with its leading axis
@@ -43,8 +44,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionType, DimensionVariable,
-    MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding, ShardingDimension,
+    ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AsArrayType, AsDimensionType, DataType, Dimension,
+    DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -94,49 +95,17 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Member of a [`ScanType`] family, which decides the role that a value of that type can play on a scan boundary.
-#[derive(Copy, Clone, Debug)]
-pub enum ScanMember<'t> {
-    /// Array of the provided type.
-    Array(&'t ArrayType),
-
-    /// Reference to an array of the provided type.
-    Reference(&'t ArrayType),
-
-    /// First-class dimension of the provided type.
-    Dimension(&'t DimensionType),
-}
-
-impl<'t> ScanMember<'t> {
-    /// Returns the [`DimensionType`] of this member when it is the trailing runtime length input of a dynamic-length
-    /// scan, which must be a first-class dimension.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] when this member is not a first-class dimension.
-    fn runtime_length_type(self) -> Result<&'t DimensionType, TypeError> {
-        let kind_name = match self {
-            Self::Dimension(r#type) => return Ok(r#type),
-            Self::Array(_) => "an array",
-            Self::Reference(_) => "a reference",
-        };
-        Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` runtime length input must be a first-class dimension but got {kind_name}",
-        )))
-    }
-}
-
 /// Type-family semantics for [`ScanOperation`].
 ///
 /// These rules are independent of the execution domain, so inference, transforms, and lowering can validate scans
 /// without requiring any runtime value representation or iteration capabilities.
 ///
-/// A family describes each of its types as a [`ScanMember`]: an array, a reference to an array, or a first-class
-/// dimension. The scan contract is stated once over those members, and each family only restricts it: [`ArrayType`]
-/// stacks per-iteration arrays along a static leading axis and requires a static length and fully static bodies, while
-/// [`ArrayIrType`] additionally permits references and first-class dimensions in carry positions and a dynamic length
-/// supplied by a trailing dimension input. Every family requires the body's first input to be a scalar
-/// [`I64`](DataType::I64) slice index.
+/// The shared [`AsArrayType`], [`AsDimensionType`], and [`ReferenceMemberType`] projections distinguish arrays,
+/// references to arrays, and first-class dimensions. The scan contract is stated once over those views, and each family
+/// only restricts it: [`ArrayType`] stacks per-iteration arrays along a static leading axis and requires a static
+/// length and fully static bodies, while [`ArrayIrType`] additionally permits references and first-class dimensions in
+/// carry positions and a dynamic length supplied by a trailing dimension input. Every family requires the body's first
+/// input to be a scalar [`I64`](DataType::I64) slice index.
 ///
 /// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the body
 /// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
@@ -146,10 +115,13 @@ impl<'t> ScanMember<'t> {
 /// leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type that carries
 /// no identity that such a check could relate to the runtime length, so its leading extent must be provably equal to
 /// the trip count.
-pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
-    /// Returns the [`ScanMember`] that this type describes.
-    fn scan_member(&self) -> ScanMember<'_>;
-
+pub trait ScanType:
+    Type<Identity = DimensionVariable>
+    + From<ArrayType>
+    + AsArrayType
+    + AsDimensionType
+    + ReferenceMemberType<Referent: AsArrayType>
+{
     /// Returns the type of the trailing runtime length input of a scan whose trip count is the dynamic `length` (i.e.,
     /// the first-class `dimension<length>`).
     ///
@@ -247,31 +219,32 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
             TypeError
         );
         for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
-            match (body_input_types[index].scan_member(), actual.scan_member()) {
-                (ScanMember::Array(declared), ScanMember::Array(actual)) if index >= carry_count => {
-                    // Validate the slice the body receives, including its placement and manual variation, rather than
-                    // comparing whole-stack metadata with the declared boundary type.
-                    if actual.rank() == 0 {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have rank at least 1 but has type \
-                             `{actual}`",
-                        )));
-                    }
-                    let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
-                    if !length.is_refined_by(&leading_dimension) {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` \
-                             but has type `{actual}`",
-                        )));
-                    }
-                    if !declared.is_refined_by(&slice_type) {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` stacked input {index} has type `{actual}`, whose slice type \
-                             `{slice_type}` does not refine its body input type `{declared}`",
-                        )));
-                    }
+            if index >= carry_count
+                && let (Ok(declared), Ok(actual)) = (body_input_types[index].as_array_type(), actual.as_array_type())
+            {
+                // Validate the slice the body receives, including its placement and manual variation, rather than
+                // comparing whole-stack metadata with the declared boundary type.
+                if actual.rank() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` stacked input {index} must have rank at least 1 but has type \
+                         `{actual}`",
+                    )));
                 }
-                _ => validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?,
+                let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
+                if !length.is_refined_by(&leading_dimension) {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` \
+                         but has type `{actual}`",
+                    )));
+                }
+                if !declared.is_refined_by(&slice_type) {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` stacked input {index} has type `{actual}`, whose slice type \
+                         `{slice_type}` does not refine its body input type `{declared}`",
+                    )));
+                }
+            } else {
+                validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?;
             }
         }
         validate_scan_runtime_length_type(length, input_types)?;
@@ -309,16 +282,16 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
             // Arrays enter as slices. References enter as whole roots, so the body can form its own indexed view: only
             // their leading extent must be the scan length, whatever the placement of that axis (as
             // `scan_boundary_types` and `validate_scan_input_type_signature` admit it), so a referent is not sliced.
-            let (stacked_type, is_reference) = match r#type.scan_member() {
-                ScanMember::Array(stacked_type) => (stacked_type, false),
-                ScanMember::Reference(stacked_type) => (stacked_type, true),
-                ScanMember::Dimension(_) => {
-                    return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` stacked input {} must be an array or a reference but got `{type}`",
-                        carry_count + index,
-                        r#type = r#type,
-                    )));
-                }
+            let (stacked_type, is_reference) = if let Some(referent) = r#type.referent() {
+                (referent.as_array_type()?, true)
+            } else if let Ok(stacked_type) = r#type.as_array_type() {
+                (stacked_type, false)
+            } else {
+                return Err(TypeError::invalid(format!(
+                    "`{SCAN_OPERATION_NAME}` stacked input {} must be an array or a reference but got `{type}`",
+                    carry_count + index,
+                    r#type = r#type,
+                )));
             };
             if stacked_type.rank() == 0 {
                 return Err(TypeError::invalid(format!(
@@ -404,7 +377,7 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
         // while one that carries the length's own identity establishes nothing beyond the declared bounds. Only the
         // carries preserve the identities of reference inputs.
         let nominal_runtime_length = length.variable().is_some_and(|variable| {
-            matches!(input_types.last().map(Self::scan_member), Some(ScanMember::Dimension(r#type))
+            matches!(input_types.last().map(Self::as_dimension_type), Some(Ok(r#type))
                 if r#type.variable() == Some(variable))
         });
         let fact_count = expected_input_types.len() - usize::from(nominal_runtime_length);
@@ -418,11 +391,6 @@ pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
 }
 
 impl ScanType for ArrayType {
-    #[inline]
-    fn scan_member(&self) -> ScanMember<'_> {
-        ScanMember::Array(self)
-    }
-
     fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
         Err(TypeError::invalid(format!(
             "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use an array IR \
@@ -453,15 +421,6 @@ impl ScanType for ArrayType {
 }
 
 impl ScanType for ArrayIrType {
-    #[inline]
-    fn scan_member(&self) -> ScanMember<'_> {
-        match self {
-            Self::Array(r#type) => ScanMember::Array(r#type),
-            Self::Reference(r#type) => ScanMember::Reference(r#type.referent()),
-            Self::Dimension(r#type) => ScanMember::Dimension(r#type),
-        }
-    }
-
     #[inline]
     fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
         Ok(Self::Dimension(DimensionType::from(length.clone())))
@@ -1201,14 +1160,19 @@ impl<T: ScanType> Operation for ScanOperation<T> {
                  {trailing_count}",
             )));
         }
-        let runtime_length = input_types.get(carry_count + stacked_count).map(ScanType::scan_member);
+        let runtime_length = input_types.get(carry_count + stacked_count);
         let keeps_dead_stack = |r#type: &T| {
             let Some(runtime_length) = runtime_length else {
                 return false;
             };
-            let (ScanMember::Array(stack) | ScanMember::Reference(stack), ScanMember::Dimension(runtime_length)) =
-                (r#type.scan_member(), runtime_length)
-            else {
+            let Ok(runtime_length) = runtime_length.as_dimension_type() else {
+                return true;
+            };
+            let stack = match r#type.referent() {
+                Some(referent) => referent.as_array_type(),
+                None => r#type.as_array_type(),
+            };
+            let Ok(stack) = stack else {
                 return true;
             };
             stack.rank() == 0 || !stack.dimension(0).has_equal_extents(runtime_length.dimension())
@@ -1862,7 +1826,7 @@ where
 }
 
 impl<
-    T: ScanType + DifferentiableType + ReferenceMemberType,
+    T: ScanType + DifferentiableType,
     V: Value<Type = T>,
     O: Operation<Type = T>
         + ResidualZeroProvider<T, Operation = O>
@@ -2199,12 +2163,12 @@ where
                         && cotangents.kind(*index) == CotangentDestinationKind::Return
                         && input_cotangent_slots[*index] == TransposedProgramCotangent::Output
                 })
-                .map(|(_, input)| match input.r#type().scan_member() {
-                    ScanMember::Array(stack) => stack
+                .map(|(_, input)| match input.r#type().as_array_type() {
+                    Ok(stack) => stack
                         .sharding()
                         .map(|sharding| sharding.dimensions()[0].clone())
                         .unwrap_or(ShardingDimension::Replicated),
-                    _ => ShardingDimension::Replicated,
+                    Err(_) => ShardingDimension::Replicated,
                 })
                 .collect();
 
@@ -2347,64 +2311,68 @@ fn scan_boundary_types<T: ScanType>(
     let mut boundary_types = body_types[..carry_count].to_vec();
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
         let index = carry_count + index;
-        boundary_types.push(match (r#type.scan_member(), side) {
-            (ScanMember::Array(slice_type), ScanBoundarySide::Input) => {
-                // Entry guards relate stack identities, but its own slice determines the admitted sharding.
-                let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-                dimensions.push(length.clone());
-                dimensions.extend(slice_type.shape().dimensions().iter().cloned());
-                T::from(ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory()))
-            }
-            (ScanMember::Array(slice_type), ScanBoundarySide::Output) => {
-                // Replicated insertion preserves the slice's placement without adding variation. Other placements use
-                // `batched`, which records manual-axis variation and rejects axes absent from the slice's mesh.
-                let stacked_axis_sharding =
-                    stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
-                let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
-                    // Inserting a replicated dimension into a valid sharding cannot fail.
-                    slice_type.with_inserted_dimension(0, length.clone()).unwrap()
-                } else {
-                    slice_type.batched(0, length.clone(), stacked_axis_sharding.clone()).map_err(|error| {
-                        TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
-                             `{slice_type}` on `{stacked_axis_sharding}` ({error})",
-                        ))
-                    })?
-                };
-                T::from(stacked_type)
-            }
-            (ScanMember::Reference(referent), ScanBoundarySide::Input) => {
-                // Reference access paths require a static root shape even in the array IR family.
-                for (axis, dimension) in referent.shape().dimensions().iter().enumerate() {
-                    if dimension.value().is_none() {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` body input {} must have a fully static type but axis {axis} of \
-                             `{type}` has size `{dimension}`",
-                            index + 1,
-                            r#type = referent,
-                        )));
-                    }
-                }
-                if referent.rank() == 0 || !length.is_refined_by(&referent.dimension(0)) {
-                    return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` reference input {index} must have leading dimension `{length}`",
-                    )));
-                }
-                r#type.clone()
-            }
-            (ScanMember::Reference(_), ScanBoundarySide::Output) => {
+        boundary_types.push(if let Some(referent) = r#type.referent() {
+            if side == ScanBoundarySide::Output {
                 return Err(TypeError::invalid(format!(
                     "`{SCAN_OPERATION_NAME}` stacked body output {index} must be an array but got `{type}`; a body \
                      cannot return a per-iteration reference view",
                     r#type = r#type,
                 )));
             }
-            (ScanMember::Dimension(_), _) => {
+            let referent = referent.as_array_type()?;
+            // Reference access paths require a static root shape even in the array IR family.
+            for (axis, dimension) in referent.shape().dimensions().iter().enumerate() {
+                if dimension.value().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` body input {} must have a fully static type but axis {axis} of \
+                         `{type}` has size `{dimension}`",
+                        index + 1,
+                        r#type = referent,
+                    )));
+                }
+            }
+            if referent.rank() == 0 || !length.is_refined_by(&referent.dimension(0)) {
+                return Err(TypeError::invalid(format!(
+                    "`{SCAN_OPERATION_NAME}` reference input {index} must have leading dimension `{length}`",
+                )));
+            }
+            r#type.clone()
+        } else {
+            let Ok(slice_type) = r#type.as_array_type() else {
                 return Err(TypeError::invalid(format!(
                     "`{SCAN_OPERATION_NAME}` stacked body {side} {} must be an array but got `{type}`",
                     index + usize::from(side == ScanBoundarySide::Input),
                     r#type = r#type,
                 )));
+            };
+            match side {
+                ScanBoundarySide::Input => {
+                    // Entry guards relate stack identities, but its own slice determines the admitted sharding.
+                    let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
+                    dimensions.push(length.clone());
+                    dimensions.extend(slice_type.shape().dimensions().iter().cloned());
+                    T::from(
+                        ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory()),
+                    )
+                }
+                ScanBoundarySide::Output => {
+                    // Replicated insertion preserves the slice's placement without adding variation. Other placements use
+                    // `batched`, which records manual-axis variation and rejects axes absent from the slice's mesh.
+                    let stacked_axis_sharding =
+                        stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
+                    let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
+                        // Inserting a replicated dimension into a valid sharding cannot fail.
+                        slice_type.with_inserted_dimension(0, length.clone()).unwrap()
+                    } else {
+                        slice_type.batched(0, length.clone(), stacked_axis_sharding.clone()).map_err(|error| {
+                            TypeError::invalid(format!(
+                                "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
+                                 `{slice_type}` on `{stacked_axis_sharding}` ({error})",
+                            ))
+                        })?
+                    };
+                    T::from(stacked_type)
+                }
             }
         });
     }
@@ -2434,7 +2402,7 @@ fn validate_scan_runtime_length_type<T: ScanType>(
     let Some(variable) = length.variable() else {
         return Ok(None);
     };
-    let runtime_length_type = input_types.last().unwrap().scan_member().runtime_length_type()?;
+    let runtime_length_type = input_types.last().unwrap().as_dimension_type()?;
     if runtime_length_type.variable() == Some(variable) {
         return Ok(None);
     }
@@ -2476,12 +2444,13 @@ fn validate_scan_runtime_length<T: ScanType>(
     if length.variable().is_none() {
         return Ok(None);
     }
-    let runtime_length_type = input_types.last().unwrap().scan_member().runtime_length_type()?;
+    let runtime_length_type = input_types.last().unwrap().as_dimension_type()?;
     let extent = validate_scan_runtime_length_type(length, input_types)?;
     for (index, r#type) in input_types[carry_count..input_types.len() - 1].iter().enumerate() {
-        let ScanMember::Reference(referent) = r#type.scan_member() else {
+        let Some(referent) = r#type.referent() else {
             continue;
         };
+        let referent = referent.as_array_type()?;
         let matches_length = referent.rank() > 0 && {
             let dimension = referent.dimension(0);
             match extent {
@@ -5277,7 +5246,7 @@ mod tests {
                 &[dimension_type.clone(), symbolic_stacked_type.clone(), ArrayType::scalar(DataType::I64).into()],
                 std::slice::from_ref(&body_interface),
             ),
-            Err(TypeError::invalid("`scan` runtime length input must be a first-class dimension but got an array")),
+            Err(TypeError::invalid("expected dimension type but got array type")),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -21764,33 +21733,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_scan_member() {
-        // A homogeneous array type is always an array member, while an array IR type describes an array, the referent
-        // of a reference, or a first-class dimension. Only a first-class dimension can be a runtime length.
-        let array_type = ArrayType::new_static(DataType::F32, [3]);
-        let dimension_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        assert!(matches!(array_type.scan_member(), ScanMember::Array(r#type) if r#type == &array_type));
-        assert!(matches!(
-            ArrayIrType::Array(array_type.clone()).scan_member(),
-            ScanMember::Array(r#type) if r#type == &array_type,
-        ));
-        assert!(matches!(reference_type.scan_member(), ScanMember::Reference(r#type) if r#type == &array_type));
-        assert!(matches!(
-            ArrayIrType::Dimension(dimension_type.clone()).scan_member(),
-            ScanMember::Dimension(r#type) if r#type == &dimension_type,
-        ));
-        assert_eq!(
-            ArrayIrType::Dimension(dimension_type.clone()).scan_member().runtime_length_type(),
-            Ok(&dimension_type),
-        );
-        assert_eq!(
-            reference_type.scan_member().runtime_length_type(),
-            Err(TypeError::invalid("`scan` runtime length input must be a first-class dimension but got a reference")),
-        );
-    }
-
-    #[test]
     fn test_scan_type_runtime_length_type() {
         // An array IR scan takes a dynamic trip count from a trailing `dimension<length>` input, which a homogeneous
         // array scan does not admit.
@@ -21951,7 +21893,7 @@ mod tests {
                 &length,
                 &[stacked_type.clone().into(), stacked_type.into()],
             ),
-            Err(TypeError::invalid("`scan` runtime length input must be a first-class dimension but got an array")),
+            Err(TypeError::invalid("expected dimension type but got array type")),
         );
     }
 

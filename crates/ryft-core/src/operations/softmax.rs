@@ -58,9 +58,9 @@
 
 use ryft_macros::capability;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType};
+use crate::arrays::{ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType};
 use crate::axes::{Axes, AxisError, NamedAxes};
-use crate::batching::{BatchableType, RecursiveBatchingPolicy};
+use crate::batching::RecursiveBatchingPolicy;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{CotangentBatchingPolicy, DifferentiableType};
 use crate::operations::Capability;
@@ -446,7 +446,7 @@ impl<
 > SoftmaxCrossEntropyWithTargetLogits<D>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
-    <ArrayType as BatchableType>::Policy:
+    ArrayBatchingPolicy:
         RecursiveBatchingPolicy<DomainTracingContext<D>> + CotangentBatchingPolicy<DomainTracingContext<D>>,
 {
     /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
