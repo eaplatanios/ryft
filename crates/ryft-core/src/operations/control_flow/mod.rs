@@ -108,12 +108,35 @@ pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTyp
 /// needed. [`Self::residual_storage_type`] infers the type of one stored slice from the save operation. References
 /// cannot be stored as residual-stack entries; they must be threaded as loop carries.
 ///
-/// If a consumer input already carries a saved dimension's identity, the consumer reuses that input or calls
-/// [`Self::residual_from_carrier`] to recover the dimension from it. This avoids creating a second definition
-/// of the same identity.
-pub(crate) trait ResidualStackOperation<T: Type>: Operation<Type = T> {
-    /// Returns the per-iteration storage type, inferred from [`Self::residual_to_storage`] when conversion is needed,
-    /// and [`None`] otherwise.
+/// If a consumer's dimension or ordinary array input already carries a saved dimension's identity, the consumer reuses
+/// that input or calls [`Self::residual_from_carrier`] to recover the dimension from it. This avoids creating a second
+/// definition of the same identity.
+///
+/// # Backend Integration
+///
+/// Operation families over [`ArrayType`] receive a blanket implementation that stores arrays unchanged.
+/// Families over [`ArrayIrType`] receive one when they implement [`From`] for [`DimensionToScalarOperation`],
+/// [`DimensionFromScalarOperation`], and [`DimensionSizeOperation`]. Those conversions give ordinary custom backends
+/// the same array passthrough and first-class dimension encoding as the built-in array IR family; they do not need a
+/// separate implementation of this trait and cannot supply one that overlaps the blanket implementation.
+///
+/// A backend with its own type universe can implement this trait on its operation family to provide the residual
+/// representation used by scan partial evaluation and separate-context differentiation. The storage representation must
+/// be an ordinary array in that universe, so callers can prepend the loop axis and recover individual slices. Save and
+/// restore must preserve the logical value and its type, including nominal dimension identities. Array passthrough
+/// preserves all array metadata. References must be rejected rather than encoded as array data. Carrier recovery is
+/// optional; it must preserve the identity already carried by its input rather than introduce an independent identity.
+/// This protocol supplies conversions only, and does not imply that the family supports every loop or differentiation
+/// rule that consumes them.
+pub trait ResidualStackOperation<T: Type>: Operation<Type = T> {
+    /// Returns the type of one stored residual slice, inferred from [`Self::residual_to_storage`] when conversion is
+    /// needed; otherwise returns `residual_type` unchanged. This is the type before the caller prepends the loop axis,
+    /// not the type of the complete residual stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns conversion selection or type inference errors, or a [`TypeError`] when the save operation does not
+    /// return exactly one output.
     fn residual_storage_type(residual_type: &T) -> Result<T, TypeError> {
         let Some(operation) = Self::residual_to_storage(residual_type)? else {
             return Ok(residual_type.clone());
@@ -123,19 +146,37 @@ pub(crate) trait ResidualStackOperation<T: Type>: Operation<Type = T> {
         Ok(output_types.remove(0))
     }
 
-    /// Returns the operation that converts a residual to the storage representation used for stacking, if conversion
-    /// is required, and [`None`] otherwise.
+    /// Returns the region-free unary operation that converts a value of type `residual_type` to its array storage
+    /// representation, or [`None`] when that type already is its storage representation. The operation must return
+    /// exactly one output, whose type determines [`Self::residual_storage_type`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this residual cannot be stored in an array stack, including for reference types.
     fn residual_to_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 
-    /// Returns the operation that restores a residual from its storage representation,  if conversion is required,
-    /// and [`None`] otherwise.
+    /// Returns the region-free unary operation that restores a value of logical type `residual_type` from
+    /// one stored array slice, or [`None`] when no conversion is needed. Its input type must be the result of
+    /// [`Self::residual_storage_type`] for `residual_type`, and its single output must have `residual_type`,
+    /// preserving that type's nominal identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this residual has no supported storage representation or restoration, including for
+    /// reference types.
     fn residual_from_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 
     /// Returns the operation that recovers a residual of type `residual_type` from a value of type `carrier_type`
     /// that already carries the residual's identity (e.g., the size of the array axis that a first-class dimension
-    /// describes), or [`None`] when `carrier_type` carries no such identity. A rebuilt loop body uses this instead of
-    /// restoring the residual from its stored value when one of its inputs already establishes that identity, because
-    /// the restored residual would define the identity a second time.
+    /// describes), or [`None`] when no supported recovery exists. The operation must be region-free, consume one value
+    /// of `carrier_type`, and return one value of `residual_type` with the existing identity. Callers reuse a carrier
+    /// of exactly `residual_type` directly. A rebuilt loop body uses recovery instead of restoring another definition
+    /// of that identity from storage. The array IR implementation recovers dimensions from ordinary array axes and
+    /// never reads a reference referent for this purpose.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when constructing a supported recovery operation fails.
     fn residual_from_carrier(residual_type: &T, carrier_type: &T) -> Result<Option<Self>, TypeError>;
 }
 
