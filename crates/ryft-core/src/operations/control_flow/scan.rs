@@ -63,7 +63,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::GuardOperation;
 use crate::operations::collectives::parallel_vary::{
-    ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
+    ManualVariationAlignment, ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
 };
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero};
@@ -76,7 +76,7 @@ use crate::operations::manipulation::conversions::{CastOperation, CastType};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::references::ReferenceNewOperation;
-use crate::parameters::Placeholder;
+use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
@@ -90,7 +90,7 @@ use crate::programs::{
     RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError,
     TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 /// Type-family semantics for [`ScanOperation`].
 ///
@@ -1239,6 +1239,25 @@ impl<T: ScanType> ScanOperation<T> {
         validate_reference_carry_roots(SCAN_OPERATION_NAME, body, 1..1 + self.carry_count)?;
         Ok(output_types)
     }
+
+    /// Replaces the output of every non-reference carry that `body` passes through unchanged with that carry's input.
+    /// Such a carry ends with its initial value regardless of the iteration count, so forwarding the input lets later
+    /// work depend on it instead of on the scan, keeps a known initial value known under partial evaluation, and
+    /// preserves a symbolic-zero tangent under differentiation. Reference carries are never forwarded, because their
+    /// later uses must stay ordered after the effects of the scan.
+    fn forward_carries<V: Value<Type = T>, O: Operation<Type = T>, Carry: Clone>(
+        &self,
+        body: RegionRef<'_, V, O>,
+        inputs: &[Carry],
+        outputs: &mut [Carry],
+    ) {
+        let body_input_types = body.input_types();
+        for (index, passes_through) in passed_through_carries(body, 1..1 + self.carry_count).into_iter().enumerate() {
+            if passes_through && !body_input_types[index + 1].is_reference() {
+                outputs[index] = inputs[index].clone();
+            }
+        }
+    }
 }
 
 impl<T: ScanType> Display for ScanOperation<T> {
@@ -1989,14 +2008,14 @@ impl<
             {
                 // The split forwards the known passed-through carries itself; the unknown ones are forwarded here,
                 // exactly as for a scan that stays whole.
-                forward_scan_carries(body, carry_count, &inputs, &mut outputs);
+                self.forward_carries(body, &inputs, &mut outputs);
                 return Ok(outputs);
             }
         }
         let mut outputs = context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], &inputs)?;
 
         // Forwarding keeps a known initial value of a passed-through carry known.
-        forward_scan_carries(body, carry_count, &inputs, &mut outputs);
+        self.forward_carries(body, &inputs, &mut outputs);
         Ok(outputs)
     }
 }
@@ -2094,7 +2113,7 @@ where
         let output_live = fused.activity.output_tangent_liveness();
         let tangent_outputs = primal_outputs.split_off(output_live.len());
         let mut outputs = DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, output_live)?;
-        forward_scan_carries(body, self.carry_count, &inputs, &mut outputs);
+        self.forward_carries(body, &inputs, &mut outputs);
         Ok(outputs)
     }
 }
@@ -2644,25 +2663,6 @@ fn scan_entry_guard<T: ScanType>(
     };
     let member_types = members.iter().map(|&index| actual[index].clone()).collect::<Vec<_>>();
     Ok(Some((guard.retaining(&member_types, &[])?, members)))
-}
-
-/// Replaces the output of every non-reference carry that `body` passes through unchanged with that carry's input. Such
-/// a carry ends with its initial value regardless of the iteration count, so forwarding the input lets later work
-/// depend on it instead of on the scan, keeps a known initial value known under partial evaluation, and preserves a
-/// symbolic-zero tangent under differentiation. Reference carries are never forwarded, because their later uses must
-/// stay ordered after the effects of the scan.
-fn forward_scan_carries<V: Value, O: Operation<Type = V::Type>, Carry: Clone>(
-    body: RegionRef<'_, V, O>,
-    carry_count: usize,
-    inputs: &[Carry],
-    outputs: &mut [Carry],
-) {
-    let body_input_types = body.input_types();
-    for (index, passes_through) in passed_through_carries(body, 1..1 + carry_count).into_iter().enumerate() {
-        if passes_through && !body_input_types[index + 1].is_reference() {
-            outputs[index] = inputs[index].clone();
-        }
-    }
 }
 
 /// Returns the type of the stack of `iteration_count` slices of type `slice_type` that an eager scan assembles. When
@@ -3481,7 +3481,7 @@ impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
         // The bound scan checks its complete boundary. Forwarding a carry would detach its value from that check,
         // so forward only when the input types already prove every relationship and no entry guard is needed.
         if scan_entry_guard(&operation.declared_input_types(&body_input_types)?, &input_types)?.is_none() {
-            forward_scan_carries(body, carry_count, inputs, &mut outputs);
+            operation.forward_carries(body, inputs, &mut outputs);
         }
         Ok(outputs)
     }
@@ -4751,6 +4751,51 @@ mod tests {
                  point",
             ))),
         );
+    }
+
+    #[test]
+    fn test_scan_forward_carries() {
+        // The body maps `[scale, accumulator, reference]` to `[scale, accumulator + scale, reference]`. Only the
+        // non-reference carry that the body passes through unchanged is forwarded from its input: an updated carry
+        // keeps its scan output, and a reference carry keeps its scan output so that its later uses stay ordered after
+        // the effects of the scan.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let _index = body.add_input(ArrayType::scalar(DataType::I64).into());
+        let scale = body.add_input(scalar_type.clone());
+        let accumulator = body.add_input(scalar_type);
+        let reference = body.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let next = body
+            .add_instruction(
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
+                Vec::new(),
+                vec![accumulator, scale],
+                None,
+            )
+            .unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![scale, next, reference],
+                vec![Placeholder; 4],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let mut outputs = vec!["final scale", "final accumulator", "final reference"];
+        ScanOperation::<ArrayIrType>::new(3, 1).forward_carries(
+            body.entry_region_ref(),
+            &["scale", "accumulator", "reference"],
+            &mut outputs,
+        );
+        assert_eq!(outputs, vec!["scale", "final accumulator", "final reference"]);
+
+        // Only the leading carry positions are considered.
+        let mut outputs = vec!["final scale", "final accumulator", "final reference"];
+        ScanOperation::<ArrayIrType>::new(0, 1).forward_carries(
+            body.entry_region_ref(),
+            &["scale", "accumulator", "reference"],
+            &mut outputs,
+        );
+        assert_eq!(outputs, vec!["final scale", "final accumulator", "final reference"]);
     }
 
     #[test]
@@ -22240,43 +22285,6 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [3, 2]).into(),
             ]),
         );
-    }
-
-    #[test]
-    fn test_forward_scan_carries() {
-        // The body maps `[scale, accumulator, reference]` to `[scale, accumulator + scale, reference]`. Only the
-        // non-reference carry that the body passes through unchanged is forwarded from its input: an updated carry
-        // keeps its scan output, and a reference carry keeps its scan output so that its later uses stay ordered after
-        // the effects of the scan.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let _index = body.add_input(ArrayType::scalar(DataType::I64).into());
-        let scale = body.add_input(scalar_type.clone());
-        let accumulator = body.add_input(scalar_type);
-        let reference = body.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let next = body
-            .add_instruction(
-                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
-                Vec::new(),
-                vec![accumulator, scale],
-                None,
-            )
-            .unwrap()[0];
-        let body = body
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![scale, next, reference],
-                vec![Placeholder; 4],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-        let mut outputs = vec!["final scale", "final accumulator", "final reference"];
-        forward_scan_carries(body.entry_region_ref(), 3, &["scale", "accumulator", "reference"], &mut outputs);
-        assert_eq!(outputs, vec!["scale", "final accumulator", "final reference"]);
-
-        // Only the leading carry positions are considered.
-        let mut outputs = vec!["final scale", "final accumulator", "final reference"];
-        forward_scan_carries(body.entry_region_ref(), 0, &["scale", "accumulator", "reference"], &mut outputs);
-        assert_eq!(outputs, vec!["final scale", "final accumulator", "final reference"]);
     }
 
     #[test]
