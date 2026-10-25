@@ -40,8 +40,7 @@ use crate::differentiation::{
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation, describe_composite,
-    describe_composite_transpose,
+    COMPOSITE_OPERATION_NAME, CompositeTransposeOperation, describe_composite, describe_composite_transpose,
 };
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, Placeholder};
@@ -2260,7 +2259,7 @@ impl UnavailableCustomRules {
             message: format!(
                 "{} was converted from a family whose values its current family \
                  cannot represent, so its derivative rules are unavailable",
-                describe_composite(self.name),
+                describe_composite(&self.name),
             ),
         }
         .into()
