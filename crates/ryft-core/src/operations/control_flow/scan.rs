@@ -781,13 +781,11 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
         iteration: usize,
         value: ArrayIrValue<Array>,
     ) -> Result<ArrayIrValue<Array>, ProgramError> {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
         let stack = match stack {
             Some(stack) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stack)?,
-            None => {
-                let stack_type = placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?;
-                EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
-            }
+            None => context.zero(&placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?)?,
         };
 
         // Join manual variation across iterations (and the variation that the placement of the stacked axis gives
@@ -810,14 +808,9 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
         let stack = joined.pop().unwrap();
 
         // Both arrays now have matching manual variation, so the homogeneous writer can perform the update.
-        Ok(ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::new().write_iteration(
-            output_index,
-            Some(stack),
-            iteration_count,
-            axis_sharding,
-            iteration,
-            value,
-        )?))
+        context
+            .write_iteration(output_index, Some(stack), iteration_count, axis_sharding, iteration, value)
+            .map(ArrayIrValue::Array)
     }
 }
 
@@ -860,10 +853,10 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// discharge carries the state of a discharged reference stack whole, as a carry that the body indexes with its index.
 ///
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
-/// **lowering-only** attribute: interpretation and every transform rule (differentiation, transposition, batching)
-/// ignore it semantically but preserve it on whatever scan they re-stage, while lowerings emit `unroll` body copies per
-/// loop trip followed by the `length % unroll` remaining iterations, and no loop at all when `unroll` is at least a
-/// static `length`.
+/// **lowering_only** attribute: interpretation and every transform rule (e.g., differentiation, transposition,
+/// batching, etc.) ignore it semantically but preserve it on whatever scan they re-stage, while lowerings emit `unroll`
+/// body copies per loop trip followed by the `length % unroll` remaining iterations, and no loop at all when `unroll`
+/// is at least a static `length`.
 ///
 /// The body computation is not part of this payload: it is a [`Region`](crate::Region) attached to the
 /// [`Instruction`](crate::Instruction) applying the operation (the single [`region_slots`](Operation::region_slots)
