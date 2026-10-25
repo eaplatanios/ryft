@@ -74,6 +74,10 @@ unqualified as required by the Rust conventions. For example, elementwise operat
 Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when constructing
 or updating operation output types, and propagate validation errors through existing conversions.
 
+Keep operation payload fields private when constructors, builders, and accessors cover their callers. For a single
+type-universe `PhantomData` marker, use the standard field documentation (adapted as needed):
+``[`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.``
+
 ## Terminology
 
 In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,
