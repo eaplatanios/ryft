@@ -1800,9 +1800,8 @@ impl CustomCall for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
     fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
         operation: &CustomCallOperation,
         inputs: I,
@@ -1818,9 +1817,8 @@ impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<
     }
 }
 
-impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch>> CustomCall<T> for V
-where
-    V::Domain: Context<Operation: From<CustomCallOperation>>,
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<CustomCallOperation>>>>
+    CustomCall<T> for V
 {
     fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
         operation: &CustomCallOperation,
@@ -1832,8 +1830,8 @@ where
         // Any context-carrying value calls foreign kernels by binding a `CustomCallOperation` through its own context,
         // in either universe, because the operation is also a native member operation of the composite array IR
         // universe. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement
-        // the capability directly, so it covers the transform tracers and backend-owned values without conflicting with
-        // the concrete implementations above.
+        // the capability directly, so it covers the transform tracers and backend-owned values without conflicting
+        // with the concrete implementations above.
         let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(ProgramError::UnsupportedOperation {
