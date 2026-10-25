@@ -873,14 +873,31 @@ impl CustomCallOperation {
         Ok((array_input_count, refinements, output_types))
     }
 
-    // TODO(eaplatanios): Review from here onwards.
+    /// Returns this call's declared input layouts for a single-call batching strategy, in which the inputs
+    /// selected by `batch_prefixed` gain a leading batch axis and their declared layouts shift accordingly. Refer to
+    /// [`batch_prefixed_layout`](Self::batch_prefixed_layout) for how layouts shift. Inputs that keep their shape keep
+    /// their declaration. Row-major defaults remain row-major when the new axis is most major, so empty declarations
+    /// and [`None`] entries stay unchanged.
+    fn batch_prefixed_input_layouts<F: Fn(usize) -> bool>(
+        &self,
+        batch_prefixed: F,
+    ) -> Result<Vec<Option<Layout>>, BatchingError> {
+        self.input_layouts
+            .iter()
+            .enumerate()
+            .map(|(input_index, layout)| match layout {
+                Some(layout) if batch_prefixed(input_index) => {
+                    self.batch_prefixed_layout("input", input_index, layout).map(Some)
+                }
+                _ => Ok(layout.clone()),
+            })
+            .collect()
+    }
 
     /// Returns this call's declared output types with a leading batch dimension inserted, which is the declaration a
-    /// single-call batching strategy hands to its kernel.
-    ///
-    /// Each output inserts the batch dimension itself as its most major axis, shifting any explicit layout as described
-    /// in [`batch_prefixed_layout`](Self::batch_prefixed_layout). Alias validation compares the resulting types and kernel
-    /// layouts against the aligned inputs.
+    /// single-call batching strategy hands to its kernel. Each output inserts the batch dimension itself as its most
+    /// major axis, shifting any explicit layout as described in [`batch_prefixed_layout`](Self::batch_prefixed_layout).
+    /// Alias validation compares the resulting types and kernel layouts against the aligned inputs.
     ///
     /// # Parameters
     ///
@@ -906,33 +923,12 @@ impl CustomCallOperation {
             .collect()
     }
 
-    /// Returns this call's declared input layouts for a single-call batching strategy, in which the inputs selected by
-    /// `batch_prefixed` gain a leading batch axis and their declared layouts shift accordingly. Refer to
-    /// [`batch_prefixed_layout`](Self::batch_prefixed_layout) for how layouts shift. Inputs that keep their shape keep
-    /// their declaration. Row-major defaults remain row-major when the new axis is most major, so empty declarations
-    /// and [`None`] entries stay unchanged.
-    fn batch_prefixed_input_layouts<F: Fn(usize) -> bool>(
-        &self,
-        batch_prefixed: F,
-    ) -> Result<Vec<Option<Layout>>, BatchingError> {
-        self.input_layouts
-            .iter()
-            .enumerate()
-            .map(|(input_index, layout)| match layout {
-                Some(layout) if batch_prefixed(input_index) => {
-                    self.batch_prefixed_layout("input", input_index, layout).map(Some)
-                }
-                _ => Ok(layout.clone()),
-            })
-            .collect()
-    }
-
     /// Returns `layout` after inserting a new most-major batch axis into the array it describes. An explicit
-    /// [`TiledLayout`] shifts each logical dimension index by one and gains the new axis as its most major physical
-    /// dimension, which keeps its tiles valid because tiling applies to the most minor dimensions. Layouts are part of
-    /// the foreign kernel's buffer contract and must not be silently dropped, so a
-    /// [`StridedLayout`](crate::arrays::StridedLayout) is rejected instead, because a correct batch stride depends on
-    /// element sizes that the layout does not carry.
+    /// [`TiledLayout`] shifts each logical dimension index by one and gains the new axis as its most major
+    /// physical dimension, which keeps its tiles valid because tiling applies to the most minor dimensions.
+    /// Layouts are part of the foreign kernel's buffer contract and must not be silently dropped, so a
+    /// [`StridedLayout`](crate::StridedLayout) is rejected instead, because a correct batch stride depends
+    /// on element sizes that the layout does not carry.
     ///
     /// # Parameters
     ///
@@ -947,42 +943,15 @@ impl CustomCallOperation {
             ))),
             Layout::Strided(_) => Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "custom call `{}` cannot batch {role} {index} because its strided layout `{layout}` does not \
+                    "custom call `{}` cannot batch {} {} because its strided layout `{}` does not \
                      determine the byte stride of the inserted batch axis",
-                    self.target_name,
+                    self.target_name, role, index, layout,
                 ),
             }),
         }
     }
 
-    /// Returns the call that the scan body of a sequential [`CustomCallBatching`] behavior stages when the mapped axis
-    /// is placed on `axis_sharding`. Every declared output sharding gains the manual mesh axes of that placement as
-    /// varying manual axes, exactly as [`ArrayType::unbatched`] exposes them on the body's per-item inputs, because the
-    /// per-item call then executes once per position along those axes and its outputs can differ per position. Output
-    /// types declared without a sharding need no change: inference gives them the inputs' variation. Single-call
-    /// behaviors do not use this, because [`ArrayType::batched`] records the same variation on their batch-prefixed
-    /// declarations.
-    fn per_item_operation(&self, axis_sharding: &ShardingDimension) -> Result<Self, BatchingError> {
-        let output_types = self
-            .output_types
-            .iter()
-            .map(|output_type| {
-                let Some(sharding) = output_type.sharding() else {
-                    return Ok(output_type.clone());
-                };
-                let manual_axes = axis_sharding.manual_axes(sharding.mesh());
-                if manual_axes.is_empty() {
-                    return Ok(output_type.clone());
-                }
-                let mut sharding = sharding.clone();
-                sharding
-                    .extend_varying_manual_axes(manual_axes)
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        Ok(Self { output_types, ..self.clone() })
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Batches this call through a scan over `arrays`, whose mapped axes have already been aligned to axis 0.
     /// Replicated arrays and trailing output `extents` are invariant carries. The body restores the call's original
@@ -1024,7 +993,28 @@ impl CustomCallOperation {
             .map(Option::unwrap)
             .chain(carry_inputs[..extents.len()].iter().copied())
             .collect::<Vec<_>>();
-        let operation = self.per_item_operation(context.axis_sharding())?;
+        // Per-item outputs can vary over the mapped axis's manual mesh axes, just as `ArrayType::unbatched` exposes
+        // on input slices. Extend declared shardings accordingly; outputs without a sharding inherit input variation
+        // during inference. Single-call batching records this variation through `ArrayType::batched` instead.
+        let output_types = self
+            .output_types
+            .iter()
+            .map(|output_type| {
+                let Some(sharding) = output_type.sharding() else {
+                    return Ok(output_type.clone());
+                };
+                let manual_axes = context.axis_sharding().manual_axes(sharding.mesh());
+                if manual_axes.is_empty() {
+                    return Ok(output_type.clone());
+                }
+                let mut sharding = sharding.clone();
+                sharding
+                    .extend_varying_manual_axes(manual_axes)
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let operation = Self { output_types, ..self.clone() };
         let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
         let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
         let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
