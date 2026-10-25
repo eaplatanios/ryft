@@ -1185,7 +1185,7 @@ macro_rules! define_elementwise_operation {
 /// The generated trait is parameterized by its universe (i.e., `$capability<T = <Self as Capability>::Universe>`; refer
 /// to the documentation of [`Capability`](crate::Capability) for more information on that), its generic implementation
 /// covers every [`ValueDomainDispatch`](crate::ValueDomainDispatch) value whose domain can bind the operation for that
-/// value's own universe, and composite array IR values implement it through their array members (refer to the
+/// value's own universe, and array IR values implement it through their array members (refer to the
 /// `#[capability]` attribute documented on [`Capability`](crate::Capability)). [`Parameterwise`](crate::Parameterwise)
 /// structures implement it parameter-by-parameter (i.e., by zipping the parameters of both inputs for binary
 /// capabilities).
@@ -1258,7 +1258,7 @@ macro_rules! define_elementwise_capability {
         #[doc = ""]
         #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
-        #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
         #[::ryft_macros::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
@@ -1322,7 +1322,7 @@ macro_rules! define_elementwise_capability {
         #[doc = ""]
         #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
-        #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
         #[::ryft_macros::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
@@ -1393,7 +1393,7 @@ macro_rules! define_elementwise_capability {
         #[doc = ""]
         #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
-        #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
         #[::ryft_macros::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
@@ -3783,10 +3783,10 @@ macro_rules! impl_nullary_batchable_operation {
 /// later at tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer),
 /// [`DifferentiationTracer`](crate::DifferentiationTracer), [`PartialTracer`](crate::PartialTracer) (for which a
 /// mixed known/unknown bind residualizes rather than fails, so a failure is a genuine type error), projected member
-/// views, and concrete composite [`ArrayIrValue`](crate::ArrayIrValue)s (which also get the operators here) have no
-/// deferral point and panic with the capability's error immediately. Every operator applies for whichever universe
-/// the capability covers, so tracers over composite contexts and over any [`BatchingPolicy`](crate::BatchingPolicy)
-/// gain the operator together with the capability.
+/// views, and concrete [`ArrayIrValue`](crate::ArrayIrValue)s (which also get the operators here) have no deferral
+/// point and panic with the capability's error immediately. Every operator applies for whichever universe the
+/// capability covers, so tracers over array IR contexts and over any [`BatchingPolicy`](crate::BatchingPolicy) gain the
+/// operator together with the capability.
 ///
 /// # Parameters
 ///
@@ -7607,15 +7607,15 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_tracer_operator_binary_composite_values() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_impl_tracer_operator_binary_array_ir_values() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // Composite tracers stage operators through the composite capabilities, and a failed capability poisons the
+        // Array IR tracers stage operators through the array IR capabilities, and a failed capability poisons the
         // trace, which reports the error at its boundary.
         let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
-        let (_, program) = CompositeContext::trace(
-            |inputs: Vec<Tracer<CompositeContext>>| Ok(inputs[0].clone() * inputs[1].clone() - inputs[1].clone()),
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| Ok(inputs[0].clone() * inputs[1].clone() - inputs[1].clone()),
             vec![array_type.clone(), array_type.clone()],
         )
         .unwrap();
@@ -7629,8 +7629,8 @@ mod tests {
             },
         );
         assert!(matches!(
-            CompositeContext::trace(
-                |inputs: Vec<Tracer<CompositeContext>>| Ok(inputs[0].clone() + inputs[1].clone()),
+            ArrayIrContext::trace(
+                |inputs: Vec<Tracer<ArrayIrContext>>| Ok(inputs[0].clone() + inputs[1].clone()),
                 vec![
                     array_type,
                     ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::new(0, Some(4)).unwrap())),
@@ -7639,7 +7639,7 @@ mod tests {
             Err(ProgramError::Type(error)) if error == TypeError::invalid("expected array type but got dimension type"),
         ));
 
-        // Concrete composite values and composite batching tracers apply the operators to their array members.
+        // Concrete array IR values and array IR batching tracers apply the operators to their array members.
         let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
         assert_eq!(left.clone() + right.clone(), ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap()));
@@ -7647,7 +7647,7 @@ mod tests {
         assert_eq!(left * right, ArrayIrValue::Array(Array::vector(vec![3.0f32, 8.0]).unwrap()));
         assert_eq!(
             batch(
-                |item: BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>| Ok(item.clone() * item),
+                |item: BatchingTracer<EagerArrayIrContext, ArrayIrBatchingPolicy>| Ok(item.clone() * item),
                 ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
@@ -7659,8 +7659,8 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "expected array type but got dimension type")]
-    fn test_impl_tracer_operator_binary_composite_value_failure() {
-        // Concrete composite values have no deferral point, and so a failed capability panics immediately.
+    fn test_impl_tracer_operator_binary_array_ir_value_failure() {
+        // Concrete array IR values have no deferral point, and so a failed capability panics immediately.
         let _ = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())
             + ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
     }

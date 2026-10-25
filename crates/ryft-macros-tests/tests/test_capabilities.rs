@@ -10,7 +10,7 @@ use ryft::{
     Array, ArrayIrType, ArrayIrValue, ArrayType, Capability, DimensionValue, ProgramError, TypeError, capability,
 };
 
-/// Doubles values, implemented for composite values by projecting onto their array members.
+/// Doubles values, implemented for array IR values by projecting onto their array members.
 #[capability(projection(ArrayIrType => ArrayType))]
 trait Double<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns twice this value.

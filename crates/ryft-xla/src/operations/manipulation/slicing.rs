@@ -641,7 +641,7 @@ mod tests {
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
-        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::operations::constants::dynamic_constructor_types;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
@@ -755,7 +755,7 @@ mod tests {
         crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, [4]);
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let mut bounds = Vec::new();
         for name in ["start", "size"] {
@@ -1127,7 +1127,7 @@ mod tests {
 
         // The runtime index remains an input after transposition. Functionalizing the buffer update must keep
         // only the selected-block addition, without constructing a full-size zero cotangent first.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F64, [5])));
         let start = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I32)));
         let output = builder

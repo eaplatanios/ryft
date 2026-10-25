@@ -1569,7 +1569,7 @@ mod tests {
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
     use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
-    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::to_mlir_module_for_program;
 
@@ -1582,7 +1582,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
@@ -1644,7 +1644,7 @@ mod tests {
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
@@ -1741,7 +1741,7 @@ mod tests {
         let declared: Vec<ArrayIrType> =
             vec![n.clone().into(), ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into()];
         let array_type = ArrayType::new_static(DataType::F64, [2]);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let dimension = builder.add_input(m.into());
         let array = builder.add_input(array_type.clone().into());
         builder
@@ -1803,7 +1803,7 @@ mod tests {
         let vector = |dimension: &DimensionType| -> ArrayIrType {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
         let third = builder.add_input(vector(&k));
@@ -1852,7 +1852,7 @@ mod tests {
         let vector = |dimension: &DimensionType| -> ArrayIrType {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(vector(&k));
         let guard =
@@ -1887,7 +1887,7 @@ mod tests {
         let array_type = ArrayType::new_static(DataType::F64, [3]);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let value = builder.add_input(array_type.clone().into());
@@ -1981,7 +1981,7 @@ mod tests {
         use crate::tests::execution_client;
 
         let client = execution_client();
-        for composite in [false, true] {
+        for array_ir in [false, true] {
             // Both members fit the declared bound. Only the guard proves that the wider member fits the retained
             // member's smaller physical buffer; an invalid extent of 6 must fail before it can be restored on bound 4.
             let wide = DimensionBounds::positive(Some(9)).unwrap();
@@ -1992,7 +1992,7 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()]))
             };
             let input_types = vec![vector(&retained), vector(&other)];
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let first = builder.add_input(ReferenceType::new(input_types[0].clone()).into());
             let second = builder.add_input(ReferenceType::new(input_types[1].clone()).into());
             let reads = [first, second]
@@ -2002,7 +2002,7 @@ mod tests {
                         [0]
                 })
                 .collect();
-            let guard: XlaOperation = if composite {
+            let guard: XlaOperation = if array_ir {
                 GuardOperation::<ArrayIrType>::new("region", vec![vector(&declared).into(), vector(&declared).into()])
                     .with_retained_identities(vec![retained.to_variable()])
                     .into()
@@ -2060,11 +2060,11 @@ mod tests {
 
             // The tangent cast has its own data input. The converted primal proof must remain a dependency even
             // though it is not numerically used; that proof already depends on the assertion token. The homogeneous
-            // tangent cast is witnessed by the primal input and the converted primal themselves, whereas the composite
+            // tangent cast is witnessed by the primal input and the converted primal themselves, whereas the array IR
             // one is witnessed by their extents, read as first-class dimensions with `dimension_size`, of which the
             // second one still depends on the proof.
             let jvp = program.jvp().unwrap();
-            let expected_jvp = if composite {
+            let expected_jvp = if array_ir {
                 indoc! {"
                     lambda %0:f64[m], %1:f64[k], %2:f64[m], %3:f64[k] .
                     let %4:f64[m], %5:f64[m] = guard [boundary=\"region\", declared_types=[f64[n], f64[n]], \
@@ -2099,7 +2099,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            let expected_tangent_module = if composite {
+            let expected_tangent_module = if array_ir {
                 indoc! {"
                     module {
                       func.func @main(%arg0: tensor<4xf64>, %arg1: tensor<8xf64>, %arg2: tensor<4xf64>, %arg3: \

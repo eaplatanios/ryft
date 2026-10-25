@@ -605,9 +605,9 @@ impl_logistic_for_primitive!(f64);
 /// [`LogAddExp`], and [`Logistic`]. It is implemented automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and composite array IR
-/// values implement it for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their
-/// own universes.
+/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and array IR values
+/// implement it for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their own
+/// universes.
 pub trait ExponentialOperations<T = <Self as Capability>::Universe>:
     Capability + Exp<T> + ExpM1<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>
 {
@@ -1051,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exp_m1_composite_and_parameterwise() {
+    fn test_exp_m1_array_ir_and_parameterwise() {
         assert_eq!(
             ArrayIrValue::Array(Array::scalar(1e-20f32).unwrap()).exp_m1(),
             Ok(ArrayIrValue::Array(Array::scalar(1e-20f32).unwrap())),

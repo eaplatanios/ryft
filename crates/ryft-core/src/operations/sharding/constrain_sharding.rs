@@ -300,11 +300,11 @@ impl_differentiable_operation! {
 /// Domain-dispatched array values bind the operation in their own context while direct eager arrays execute its checked
 /// semantics without binding it again. Backend authors can implement this trait on [`ValueDirectDispatch`] for their
 /// own value types. Implementations must validate targets through the operation's type inference contract and preserve
-/// the input's elements, shape, data type, and domain. Composite implementations project the array member and lift the
+/// the input's elements, shape, data type, and domain. Array IR implementations project the array member and lift the
 /// result back, so dimensions and references retain their existing projection diagnostics.
 ///
 /// `T` is the value's type descriptor, and `V` is its representation. Including `T` keeps dispatch over homogeneous
-/// arrays and composite array IR values disjoint.
+/// arrays and array IR values disjoint.
 pub trait ConstrainShardingDispatch<T: Type, V: Value<Type = T>> {
     /// Applies the primitive sharding operation to `input` and returns its value.
     fn constrain_sharding(input: &V, sharding: &Sharding) -> Result<V, ProgramError>;
@@ -370,10 +370,10 @@ impl<
 /// The leaf parameter `P` defaults to `Self`: a value is a one-leaf structure accepting one `Sharding`, while nested
 /// tuples, vectors, maps, and custom structures accept the corresponding `Self::To<Sharding>`. Parameter paths must
 /// agree, and the receiver's structure and static fields are preserved without requiring the receiver to be `Clone`.
-/// Homogeneous and composite array values share this API through their [`ConstrainShardingDispatch`] implementations.
+/// Homogeneous and array IR values share this API through their [`ConstrainShardingDispatch`] implementations.
 ///
 /// The universe parameter `T` defaults to the leaf's [`Capability`] universe, so that homogeneous array leaves use
-/// [`ArrayType`] and composite array IR leaves use [`ArrayIrType`]. A structure uses the same universe as its leaves.
+/// [`ArrayType`] and array IR leaves use [`ArrayIrType`]. A structure uses the same universe as its leaves.
 /// Implementations tie `T` to that universe, which selects their primitive dispatch family; specifying a different
 /// universe does not grant the capability. The universe is distinct from `P`, which identifies the structural leaves.
 pub trait ConstrainSharding<P: Parameter + Capability = Self, T = <P as Capability>::Universe>: Sized {
@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn test_constrain_sharding_structured_composite_tracing() {
+    fn test_constrain_sharding_structured_array_ir_tracing() {
         // Every leaf of a structured value is constrained by its own sharding, and its tracked type is unchanged.
         let mesh = mesh();
         let tracked = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -966,7 +966,7 @@ mod tests {
             input.constrain_sharding(&constraint),
         );
 
-        // Composite array members dispatch through the same leaf capability.
+        // Array members of array IR values dispatch through the same leaf capability.
         let inputs = vec![ArrayIrValue::Array(input)];
         let expected = vec![inputs[0].constrain_sharding(&constraint).unwrap()];
         assert_eq!(inputs.constrain_sharding(&vec![constraint]).unwrap(), expected);

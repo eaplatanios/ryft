@@ -1088,7 +1088,7 @@ where
 /// so they also support dynamically shaped inputs.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1837,7 +1837,7 @@ impl_non_transposable_operation!(ArgMaxOperation);
 /// through their own context. The indices are integers, and so their derivative is a structural zero.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -2050,7 +2050,7 @@ impl_non_transposable_operation!(ArgMinOperation);
 /// through their own context. The indices are integers, and so their derivative is a structural zero.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -2275,8 +2275,8 @@ fn batch_index_reduction<
 /// for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`].
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`].
 pub trait ReductionOperations<T = <Self as Capability>::Universe>:
     Capability + Reduce<T> + ArgMax<T> + ArgMin<T>
 {

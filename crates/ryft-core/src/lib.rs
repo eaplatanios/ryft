@@ -481,7 +481,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test-only composite storage type with three distinct member kinds.
+    /// Test-only heterogeneous storage type with three distinct member kinds.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum ProjectedProgramType {
         /// First member kind, used by the ordinary projection tests.
@@ -541,7 +541,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test-only composite storage value mirroring [`ProjectedProgramType`].
+    /// Test-only heterogeneous storage value mirroring [`ProjectedProgramType`].
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum ProjectedProgramValue {
         /// First member value, used by the ordinary projection tests.
@@ -587,7 +587,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Implements type/value conversion and projection for one named member of the test composite family.
+    /// Implements type/value conversion and projection for one named member of the heterogeneous test family.
     macro_rules! impl_projected_test_member {
         ($member:literal, $variant:ident) => {
             impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
@@ -742,7 +742,7 @@ pub(crate) mod tests {
 
     impl_guardless_operation!(<const MEMBER: u8> ProjectedMemberOperation<MEMBER>);
 
-    /// Test-only composite operation family embedding all three member families.
+    /// Test-only heterogeneous operation family embedding all three member families.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum ProjectedProgramOperation {
         /// First member operation, used by the ordinary projection tests.
@@ -754,7 +754,7 @@ pub(crate) mod tests {
         /// Third member operation, used by transform tests to prove that generic machinery is member-kind-agnostic.
         Third(ProjectedMemberOperation<2>),
 
-        /// Adds two values of the same composite member type.
+        /// Adds two values of the same member type.
         Add,
     }
 
@@ -765,7 +765,7 @@ pub(crate) mod tests {
     }
 
     impl ProjectedProgramOperation {
-        /// Delegates composite inference to one member operation. Fixture operations declare no region slots,
+        /// Delegates family-level inference to one member operation. Fixture operations declare no region slots,
         /// so staging rejects attached regions before inference and the member sees none.
         fn infer_member<const MEMBER: u8>(
             operation: &ProjectedMemberOperation<MEMBER>,

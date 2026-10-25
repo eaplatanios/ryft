@@ -486,8 +486,8 @@ impl<'b, 'c: 'b, 't: 'c, O> XlaLowerer<'b, 'c, 't, O> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Each operation type implements this trait at the type universe of its [`Operation`] contract: homogeneous array
-/// operations at [`ArrayType`], composite array IR operations at [`ArrayIrType`], and first-class dimension operations
-/// at [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and [`XlaOperation`]) implement this trait by
+/// operations at [`ArrayType`], array IR operations at [`ArrayIrType`], and first-class dimension operations at
+/// [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and [`XlaOperation`]) implement this trait by
 /// dispatching each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which
 /// also handles payloads that a family stores as projected or mixed members. A family whose type universe is
 /// [`ArrayIrType`] and that implements [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs

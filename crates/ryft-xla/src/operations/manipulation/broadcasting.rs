@@ -323,7 +323,7 @@ mod tests {
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::operations::sharding::shard_map::to_mlir_module;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
@@ -631,7 +631,7 @@ mod tests {
         let integer_type = ArrayType::new(DataType::I64, shape.clone());
         let complex_type = ArrayType::new(DataType::C64, shape.clone());
         let output_shape = Shape::new(vec![Dimension::Static(2), shape.dimensions()[0].clone()]);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let integer_input = builder.add_input(integer_type.clone().into());
         let complex_input = builder.add_input(complex_type.clone().into());
         let size = builder
@@ -801,7 +801,7 @@ mod tests {
             let unit = DimensionVariable::new("unit", DimensionBounds::new(1, Some(2)).unwrap());
             let fixed = DimensionVariable::new("fixed", DimensionBounds::new(2, Some(3)).unwrap());
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![unit.into(), fixed.into()]));
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(input_type.into());
             let normalized = if explicit_extents {
                 let one = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(1).unwrap()));
@@ -1065,7 +1065,7 @@ mod tests {
     fn test_lower_dynamic_broadcast_output_layout() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
         // Dimension constants have exact types, so the bounded dynamic extents are program inputs.
         let rows_input = builder.add_input(DimensionType::from(rows.clone()).into());
@@ -1127,7 +1127,7 @@ mod tests {
             (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
         ] {
             let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let dimension = builder.add_constant(XlaConstant::Dimension(
                 DimensionValue::new(DimensionType::from(size.clone()), 2).unwrap(),

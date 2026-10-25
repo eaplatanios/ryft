@@ -163,9 +163,9 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///
 /// The bundle is parameterized by the [`Capability`] universe `T` of its values, which defaults to that of the
 /// implementing value. Homogeneous array values (e.g., [`Array`] and the tracers over [`ArrayType`]) implement
-/// `ArrayOperations<ArrayType>`, and composite array IR values (e.g., [`ArrayIrValue`] and the tracers over
-/// [`ArrayIrType`]) implement `ArrayOperations<ArrayIrType>` by applying the array capabilities to their array members
-/// (a first-class dimension or reference member fails with the projection's [`TypeError`]). Generic code bounded by
+/// `ArrayOperations<ArrayType>`, and array IR values (e.g., [`ArrayIrValue`] and the tracers over [`ArrayIrType`])
+/// implement `ArrayOperations<ArrayIrType>` by applying the array capabilities to their array members (a first-class
+/// dimension or reference member fails with the projection's [`TypeError`]). Generic code bounded by
 /// `V: ArrayOperations` therefore works for values of either universe without projecting them.
 ///
 /// The bundle deliberately does not pin `Value<Type = T>`. A value's capability universe is its own [`Typed::Type`] by
@@ -305,7 +305,7 @@ impl<
 /// dimensions, and array references. Homogeneous operations project their complete boundary into [`ArrayOperation`] or
 /// [`DimensionOperation`], delegate to that family's rule, and lift the result types back into [`ArrayIrType`]. Mixed
 /// signatures need explicit variants. For example, [`DimensionSizeOperation`] consumes an array and produces a
-/// dimension. Reference operations also stay composite-native so that their array/reference boundaries,
+/// dimension. Reference operations also stay family-native so that their array/reference boundaries,
 /// [`ArrayReferenceTransform`] access paths, and ordered effects remain visible to program passes.
 ///
 /// Mixed array constructors and shape-changing operations receive runtime extents as explicit first-class dimension
@@ -340,8 +340,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Iota(IotaOperation<ArrayType>),
 
     /// Region-free [`ArrayOperation`] member, reached by projecting the complete instruction boundary to [`ArrayType`].
-    /// Attached regions belong to the composite universe and cannot pass through this projection. Region-carrying
-    /// operations must instead use dedicated composite-family variants that retain access to their regions. Transforms
+    /// Attached regions belong to the array IR universe and cannot pass through this projection. Region-carrying
+    /// operations must instead use dedicated array IR family variants that retain access to their regions. Transforms
     /// reject a region-carrying payload constructed here directly, with a diagnostic naming its operation.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
@@ -417,21 +417,21 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Slices using first-class dimension inputs for starts and output sizes.
     DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
-    /// Manual SPMD computation whose composite body runs once per device coordinate along its active manual axes.
+    /// Manual SPMD computation whose array IR body runs once per device coordinate along its active manual axes.
     /// Refer to [`ShardMapOperation`] for array/reference boundaries and first-class dimensions inside the body.
     ShardMap(ShardMapOperation),
 
-    /// Branches between composite regions.
+    /// Branches between array IR regions.
     Condition(ConditionOperation<ArrayIrType>),
 
-    /// Loops over composite condition and body regions.
+    /// Loops over array IR condition and body regions.
     While(WhileOperation<ArrayIrType>),
 
-    /// Scans a composite body, including first-class dimension carries, dynamic trip counts, reference carries, and
+    /// Scans an array IR body, including first-class dimension carries, dynamic trip counts, reference carries, and
     /// reference stacks; refer to [`ScanOperation`].
     Scan(ScanOperation<ArrayIrType>),
 
-    /// Rematerialized call with a composite body.
+    /// Rematerialized call with an array IR body.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
@@ -453,8 +453,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
 
-    /// Custom function call with a composite primal region and attached rules or retained rules registered in this family.
-    /// Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are rejected.
+    /// Custom function call with an array IR primal region and attached rules or retained rules registered in this
+    /// family. Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are
+    /// rejected.
     CustomFunction(CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
     /// Reverse-mode carrier of [`CustomFunction`](Self::CustomFunction), replaced by the call's backward rule during
@@ -475,16 +476,16 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ),
 }
 
-/// Value-level capability bundle that groups every operation Ryft supports on composite array IR values, so that
-/// generic composite code can state one bound instead of listing each capability it uses. It is implemented
-/// automatically for every value that implements all of its members, and so it must never be implemented manually.
+/// Value-level capability bundle that groups every operation Ryft supports on array IR values, so that generic array
+/// IR code can state one bound instead of listing each capability it uses. It is implemented automatically for every
+/// value that implements all of its members, and so it must never be implemented manually.
 ///
-/// The bundle extends [`ArrayOperations<ArrayIrType>`](ArrayOperations), through which composite values apply every
+/// The bundle extends [`ArrayOperations<ArrayIrType>`](ArrayOperations), through which array IR values apply every
 /// array capability to their array members, with the mixed capabilities whose signatures cross the array and
 /// first-class-dimension member kinds (e.g., [`DimensionSize`] and [`DynamicManipulationOperations`]), the
 /// [`ReferenceOperations`] over [`ArrayReferenceTransform`] paths, and the dynamic random bit generator. It also
 /// requires that the [`ValueProjection<ArrayType>`](ValueProjection) of a value satisfies [`ArrayOperations`] and that
-/// its [`ValueProjection<DimensionType>`](ValueProjection) satisfies [`DimensionOperations`], so that generic composite
+/// its [`ValueProjection<DimensionType>`](ValueProjection) satisfies [`DimensionOperations`], so that generic array IR
 /// code that projects explicitly (e.g., to compute in the array universe over several operations) does not have to
 /// restate `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds. That projected guarantee is not
 /// implied by the member bound: a blanket implementation that derives `V: X` from `V::Projected: X` cannot be
@@ -497,7 +498,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// transforms stage on behalf of values, namely control flow, rematerialization, linear calls, custom functions, and
 /// shard maps.
 ///
-/// Array capabilities apply directly to composite values, and checked arithmetic over first-class dimensions uses
+/// Array capabilities apply directly to array IR values, and checked arithmetic over first-class dimensions uses
 /// their member projection:
 ///
 /// ```rust
@@ -980,31 +981,31 @@ mod tests {
     fn test_array_operations_holds_for_every_canonical_array_value() {
         // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
         // compile-time assertion that the listed value families implement the complete `ArrayOperation` surface in
-        // their own universe, including nested tracers over both homogeneous and composite contexts.
+        // their own universe, including nested tracers over both homogeneous and array IR contexts.
         fn requires_array_operations<V: ArrayOperations>() {}
 
-        type CompositeTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type ArrayIrTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
-        type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type NestedContext<C> = DifferentiationContext<PartialEvaluationContext<C>, PartitionedDifferentiationPolicy>;
 
         requires_array_operations::<Array>();
         requires_array_operations::<ArrayIrValue<Array>>();
         requires_array_operations::<Tracer<TracingContext<Array, ArrayOperation<Array>>>>();
-        requires_array_operations::<Tracer<CompositeTracingContext>>();
+        requires_array_operations::<Tracer<ArrayIrTracingContext>>();
         requires_array_operations::<LinearizationTracer<EagerArrayContext>>();
-        requires_array_operations::<LinearizationTracer<EagerCompositeContext>>();
+        requires_array_operations::<LinearizationTracer<EagerArrayIrContext>>();
         requires_array_operations::<BatchingTracer<EagerArrayContext, ArrayBatchingPolicy>>();
-        requires_array_operations::<BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>>();
+        requires_array_operations::<BatchingTracer<EagerArrayIrContext, ArrayIrBatchingPolicy>>();
         requires_array_operations::<
             BatchingTracer<NestedContext<TracingContext<Array, ArrayOperation<Array>>>, ArrayBatchingPolicy>,
         >();
-        requires_array_operations::<BatchingTracer<NestedContext<CompositeTracingContext>, ArrayIrBatchingPolicy>>();
+        requires_array_operations::<BatchingTracer<NestedContext<ArrayIrTracingContext>, ArrayIrBatchingPolicy>>();
     }
 
     #[test]
-    fn test_composite_value_and_gradient_with_captures() {
-        // A captured scalar gradient over composite values reaches the projected member rules of the capabilities it
+    fn test_array_ir_value_and_gradient_with_captures() {
+        // A captured scalar gradient over array IR values reaches the projected member rules of the capabilities it
         // uses: `f(x; c) = (x + c) · c` has the gradient `c` with respect to `x`, while `c` is a runtime capture.
         let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
         let (value, gradient) = differentiate_at(vector(vec![1.0, 2.0]))
@@ -1054,7 +1055,7 @@ mod tests {
         requires_dimension_operations::<Tracer<TracingContext<DimensionValue, DimensionOperation<DimensionValue>>>>();
 
         // `ArrayIrOperations` pins this bundle on its first-class-dimension member profile, so the dimension member
-        // projected out of every canonical composite value must satisfy it as well.
+        // projected out of every canonical array IR value must satisfy it as well.
         requires_dimension_operations::<<ArrayIrValue<Array> as ValueProjection<DimensionType>>::Projected>();
         requires_dimension_operations::<
             <Tracer<TracingContext<TestValue, TestOperation>> as ValueProjection<DimensionType>>::Projected,
@@ -1478,7 +1479,7 @@ mod tests {
         requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
 
         // The bundle's member profiles make one bound enough to reach ordinary array math through projection, checked
-        // dimension arithmetic, and composite-native reference capabilities, with no projection bounds restated here.
+        // dimension arithmetic, and family-native reference capabilities, with no projection bounds restated here.
         fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
             // The array member carries both the fallible capability and its panicking operator sugar, so the
             // capability is named explicitly here.
@@ -1508,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_pullback_preserves_a_dynamic_zero_space_input_cotangent() {
+    fn test_array_ir_pullback_preserves_a_dynamic_zero_space_input_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let context = TracingContext::<TestValue, TestOperation>::new();
@@ -1527,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_pushforward_materializes_a_dynamic_zero_space_output_tangent() {
+    fn test_array_ir_pushforward_materializes_a_dynamic_zero_space_output_tangent() {
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type = ArrayType::new(DataType::U64, Shape::new(vec![extent_type.dimension().clone()]));
         let context = TracingContext::<TestValue, TestOperation>::new();
@@ -1566,7 +1567,7 @@ mod tests {
             Err(TypeError::invalid("expected array type but got reference type")),
         );
 
-        // Member control-flow operations promote to their direct composite carriers, preserving every semantic and
+        // Member control-flow operations promote to their direct array IR carriers, preserving every semantic and
         // lowering attribute.
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new())),
@@ -1582,7 +1583,7 @@ mod tests {
         let scan_operation = ScanOperation::<ArrayType>::new(1, 4).with_reverse(true).with_unroll(2).unwrap();
         let promoted_scan = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(scan_operation));
         let ArrayIrOperation::Scan(promoted_scan) = promoted_scan else {
-            panic!("expected a direct composite scan operation");
+            panic!("expected a direct array IR scan operation");
         };
         assert_eq!(promoted_scan.carry_count(), 1);
         assert_eq!(promoted_scan.length(), &Dimension::Static(4));
@@ -1607,7 +1608,7 @@ mod tests {
         let assertion = ArrayIrOperation::<Array>::from(AssertOperation::<ArrayIrType>::new("dimensions must match"));
         assert_eq!(assertion.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
-        // Each dimension operation also lifts directly, so generic composite code never has to name the member family.
+        // Each dimension operation also lifts directly, so generic array IR code never has to name the member family.
         let product = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&left_type, &right_type).unwrap());
         assert!(matches!(product, ArrayIrOperation::Dimension(DimensionOperation::Mul(_))));
         assert_eq!(product.name(), "dimension_mul");
@@ -1622,7 +1623,7 @@ mod tests {
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
 
-        // The direct composite condition preserves the complete higher-order interface, including effects.
+        // The direct array IR condition preserves the complete higher-order interface, including effects.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let interface = RegionInterface::new(
             vec![array_type.clone().into()],
@@ -1894,7 +1895,7 @@ mod tests {
     #[test]
     fn test_array_ir_operation_forwards_payload_effects() {
         // A statically proven mixed concatenate is pure. The derived dispatcher must read that payload classification
-        // rather than declaring the composite family effectful.
+        // rather than declaring the array IR family effectful.
         let concatenate = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[
@@ -1924,7 +1925,7 @@ mod tests {
         assert_eq!(operation.effects(), concatenate.effects());
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
-        // Assertion effects reach the composite family unchanged. Predicate proofs belong to comparison and
+        // Assertion effects reach the array IR family unchanged. Predicate proofs belong to comparison and
         // assertion staging rather than the operation's unconditional effect declaration.
         let assertion = AssertOperation::<ArrayIrType>::new("dimensions must match");
         let operation = ArrayIrOperation::<Array>::from(assertion.clone());
@@ -2407,9 +2408,9 @@ mod tests {
         );
     }
 
-    /// Builds a composite scalar `f64` [`Program`] from `build`, which receives the region builder together with its
+    /// Builds an array IR scalar `f64` [`Program`] from `build`, which receives the region builder together with its
     /// `input_count` scalar inputs and returns the region's output atoms.
-    fn composite_scalar_program<BuildFn>(input_count: usize, build: BuildFn) -> TestProgram
+    fn array_ir_scalar_program<BuildFn>(input_count: usize, build: BuildFn) -> TestProgram
     where
         BuildFn: FnOnce(&mut ProgramBuilder<TestValue, TestOperation>, &[AtomId]) -> Vec<AtomId>,
     {
@@ -2422,39 +2423,39 @@ mod tests {
     }
 
     /// Stages `input * scale` in `builder` and returns its result atom.
-    fn composite_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
+    fn array_ir_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
         let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale).unwrap()));
         builder
             .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale], None)
             .unwrap()[0]
     }
 
-    /// Builds the `["primal", "jvp"]` regions of a composite `custom_function` call with a JVP rule, implementing
+    /// Builds the `["primal", "jvp"]` regions of an array IR `custom_function` call with a JVP rule, implementing
     /// `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving
     /// custom-function boundary stays detectable in a transformed program's numbers.
-    fn composite_custom_jvp_regions() -> Vec<TestProgram> {
+    fn array_ir_custom_jvp_regions() -> Vec<TestProgram> {
         vec![
-            composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
-            composite_scalar_program(2, |builder, inputs| {
-                vec![composite_scaled(builder, inputs[0], 2.0), composite_scaled(builder, inputs[1], 3.0)]
+            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
+            array_ir_scalar_program(2, |builder, inputs| {
+                vec![array_ir_scaled(builder, inputs[0], 2.0), array_ir_scaled(builder, inputs[1], 3.0)]
             }),
         ]
     }
 
-    /// Builds the `["primal", "forward", "backward"]` regions of a composite `custom_function` call with reverse-mode
+    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `custom_function` call with reverse-mode
     /// rules, implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule
     /// `backward(r, ȳ) = 3 * ȳ`.
-    fn composite_custom_vjp_regions() -> Vec<TestProgram> {
+    fn array_ir_custom_vjp_regions() -> Vec<TestProgram> {
         vec![
-            composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
-            composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0), inputs[0]]),
-            composite_scalar_program(2, |builder, inputs| vec![composite_scaled(builder, inputs[1], 3.0)]),
+            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
+            array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0), inputs[0]]),
+            array_ir_scalar_program(2, |builder, inputs| vec![array_ir_scaled(builder, inputs[1], 3.0)]),
         ]
     }
 
-    /// Batches one composite region-carrying payload over a single input mapped along axis zero and returns the
+    /// Batches one array IR region-carrying payload over a single input mapped along axis zero and returns the
     /// rendered staged program together with the result's [`BatchAxis`].
-    fn batched_composite_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
+    fn batched_array_ir_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
         let extent = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let trace = TracingContext::<TestValue, TestOperation>::new();
         let extent_input = trace.input(DimensionType::from(extent.clone()).into());
@@ -2477,8 +2478,8 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_lift_promotes_every_region_carrying_array_payload() {
-        // Every region-carrying array payload has a composite carrier, so none of them reaches the region-free
+    fn test_array_ir_lift_promotes_every_region_carrying_array_payload() {
+        // Every region-carrying array payload has an array IR carrier, so none of them reaches the region-free
         // projected `Array` variant. Custom-function calls carry their rule layout and non-differentiated input split,
         // and rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
         for jvp_rule in [CustomFunctionJvpRule::Absent, CustomFunctionJvpRule::Explicit, CustomFunctionJvpRule::Primal]
@@ -2514,7 +2515,7 @@ mod tests {
             ArrayIrOperation::LinearCall(operation) if operation.residual_count() == 1,
         ));
 
-        // A carrier with an attached backward rule maps its stored tangent types into the composite type universe and
+        // A carrier with an attached backward rule maps its stored tangent types into the array IR type universe and
         // follows its region into the native carrier variant.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let promoted = TestOperation::from(ArrayOperation::CustomFunctionTranspose(
@@ -2525,7 +2526,7 @@ mod tests {
             ),
         ));
         let ArrayIrOperation::CustomFunctionTranspose(promoted) = promoted else {
-            panic!("expected a promoted composite custom function carrier");
+            panic!("expected a promoted array IR custom function carrier");
         };
         assert_eq!(
             promoted,
@@ -2538,15 +2539,15 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_function_jvp_rule_payload() {
-        // The composite carrier batches both regions structurally and threads the first-class mapped extent into
+    fn test_array_ir_batching_of_a_custom_function_jvp_rule_payload() {
+        // The array IR carrier batches both regions structurally and threads the first-class mapped extent into
         // them as one additional leading non-differentiated input of the batched call.
-        let (program, batch_axis) = batched_composite_payload(
+        let (program, batch_axis) = batched_array_ir_payload(
             ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                 CustomFunctionJvpRule::Explicit,
                 false,
             )),
-            composite_custom_jvp_regions(),
+            array_ir_custom_jvp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
         assert_eq!(
@@ -2579,15 +2580,15 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_function_vjp_rule_payload() {
+    fn test_array_ir_batching_of_a_custom_function_vjp_rule_payload() {
         // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
         // with the differentiated inputs only.
-        let (program, batch_axis) = batched_composite_payload(
+        let (program, batch_axis) = batched_array_ir_payload(
             ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                 CustomFunctionJvpRule::Absent,
                 true,
             )),
-            composite_custom_vjp_regions(),
+            array_ir_custom_vjp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
         assert_eq!(
@@ -2624,12 +2625,12 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_function_payload() {
+    fn test_array_ir_batching_of_a_custom_function_payload() {
         // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
         // keeping every rule attached in region order.
-        let mut regions = composite_custom_jvp_regions();
-        regions.extend(composite_custom_vjp_regions().into_iter().skip(1));
-        let (program, batch_axis) = batched_composite_payload(
+        let mut regions = array_ir_custom_jvp_regions();
+        regions.extend(array_ir_custom_vjp_regions().into_iter().skip(1));
+        let (program, batch_axis) = batched_array_ir_payload(
             ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                 CustomFunctionJvpRule::Explicit,
                 true,
@@ -2681,12 +2682,12 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_rematerialize_payload() {
+    fn test_array_ir_batching_of_a_rematerialize_payload() {
         // The body is rebuilt around the threaded extent, which becomes a leading body input, keeping the
         // rematerialization boundary intact.
-        let (program, batch_axis) = batched_composite_payload(
+        let (program, batch_axis) = batched_array_ir_payload(
             ArrayOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
-            vec![composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)])],
+            vec![array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)])],
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
         assert_eq!(
@@ -2709,7 +2710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_linear_call_payload() {
+    fn test_array_ir_batching_of_a_linear_call_payload() {
         // The executable linear call threads the mapped extent as one more leading residual, which is the precedent
         // the custom-function carriers follow with their non-differentiated input split.
         let array_type = ArrayType::scalar(DataType::F64);
@@ -2743,10 +2744,10 @@ mod tests {
         assert_eq!(output, linear);
     }
 
-    /// Builds a composite program holding one `custom_function` call with a JVP rule over a scalar input.
-    fn composite_custom_jvp_program() -> TestProgram {
+    /// Builds an array IR program holding one `custom_function` call with a JVP rule over a scalar input.
+    fn array_ir_custom_jvp_program() -> TestProgram {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let regions = composite_custom_jvp_regions()
+        let regions = array_ir_custom_jvp_regions()
             .into_iter()
             .map(|region| builder.import_region(region.entry_region_ref()))
             .collect::<Vec<_>>();
@@ -2766,12 +2767,12 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_differentiation_of_a_region_carrying_array_payload() {
-        // Forward mode reaches the composite carrier with its regions attached, so it replays the user JVP rule
+    fn test_array_ir_differentiation_of_a_region_carrying_array_payload() {
+        // Forward mode reaches the array IR carrier with its regions attached, so it replays the user JVP rule
         // instead of failing without region access. The rule's deliberately wrong tangent scale of three is what
         // proves the custom derivative governed the staged result.
         assert_eq!(
-            composite_custom_jvp_program().jvp().unwrap().to_string(),
+            array_ir_custom_jvp_program().jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = const 2.0
@@ -2785,8 +2786,8 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_transposition_of_a_region_carrying_array_payload() {
-        // Reverse mode linearizes first, and the composite carrier's JVP rule replaces the call with plain staged
+    fn test_array_ir_transposition_of_a_region_carrying_array_payload() {
+        // Reverse mode linearizes first, and the array IR carrier's JVP rule replaces the call with plain staged
         // operations, so transposition reaches a tangent program the payload has already left. The gradient is the
         // user rule's deliberately wrong scale of three rather than the primal's true derivative of two.
         let context = EagerContext::<TestValue, TestOperation>::new();
@@ -2800,7 +2801,7 @@ mod tests {
                                 CustomFunctionJvpRule::Explicit,
                                 false,
                             )),
-                            composite_custom_jvp_regions(),
+                            array_ir_custom_jvp_regions(),
                             &[input],
                         )?
                         .remove(0))
@@ -2813,10 +2814,10 @@ mod tests {
         assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64).unwrap()));
         assert_eq!(gradient, MaybeZero::Value(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())));
 
-        // Transposing the raw, un-linearized call directly is still rejected, but now by the composite payload's own
+        // Transposing the raw, un-linearized call directly is still rejected, but now by the array IR payload's own
         // non-transposable rule instead of by a projected adapter that never received its regions.
         assert_eq!(
-            composite_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
+            array_ir_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message: "operation `custom_function` is not transposable".to_string(),
             }),
@@ -3216,7 +3217,7 @@ mod tests {
         let expected = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(program.interpret(vec![input_value.clone(), extent_value.clone()]), Ok(vec![expected.clone()]));
 
-        // Composite partial evaluation folds dimension multiplication and substitutes its output identity in both
+        // Array IR partial evaluation folds dimension multiplication and substitutes its output identity in both
         // shape consumers, even when the extent remains unknown.
         let unknown = program
             .partially_evaluate(&[
@@ -3331,9 +3332,9 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_stages_one_composite_graph() {
+    fn test_array_ir_batching_stages_one_graph() {
         // Batching a body that mixes ordinary array arithmetic with first-class dimension arithmetic stages exactly
-        // one composite graph. The array instructions gain a packed batch axis, the dimension instructions stay
+        // one array IR graph. The array instructions gain a packed batch axis, the dimension instructions stay
         // replicated shape values, and both kinds live in the same program with a single flat region: nothing is
         // split into a second universe and no shape is recovered from ambient metadata.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
@@ -3387,7 +3388,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Batch the body under a staging parent so that the composite graph batching produces is observable as a
+        // Batch the body under a staging parent so that the array IR graph batching produces is observable as a
         // program rather than as concrete per-item values. The per-item extent stays symbolic, so the batched graph
         // remains shape polymorphic in `rows` even though the mapped axis itself has a known size.
         type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -3413,7 +3414,7 @@ mod tests {
         assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
         let batched_output_id = batched_output.into_batch().into_value().atom_id().unwrap();
 
-        // One composite graph: the batched body is a flat instruction sequence over the single composite operation
+        // One array IR graph: the batched body is a flat instruction sequence over the single array IR operation
         // family, in source order, with array and dimension instructions interleaved and no nested region.
         let builder = trace.builder().borrow();
         assert_eq!(
@@ -3422,7 +3423,7 @@ mod tests {
         );
         assert!(builder.instructions().iter().all(|instruction| instruction.regions().is_empty()));
         let [add, dimension_size, dimension_add, broadcast, reduce] = builder.instructions() else {
-            panic!("expected one batched composite graph with five instructions");
+            panic!("expected one batched array IR graph with five instructions");
         };
         assert_eq!(add.inputs(), &[packed_id, packed_id]);
         assert_eq!(dimension_size.inputs(), &[add.outputs()[0]]);
@@ -3514,11 +3515,11 @@ mod tests {
         /// Returns each input at another type of the same member kind, never converting between member kinds.
         KindPreserving,
 
-        /// Forwards composite regions whose bodies may carry every admitted member kind.
+        /// Forwards array IR regions whose bodies may carry every admitted member kind.
         RegionForwarding,
     }
 
-    /// Classifies one composite operation by its member-kind signature.
+    /// Classifies one array IR operation by its member-kind signature.
     ///
     /// The match is deliberately exhaustive with no wildcard arm, so adding an [`ArrayIrOperation`] variant fails to
     /// compile until its member-kind signature is declared here and recorded in the expected table of
@@ -3579,7 +3580,7 @@ mod tests {
         let first_type = DimensionType::from(first.clone());
         let second_type = DimensionType::from(second.clone());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
-        let composite_rules = CustomRuleRegistration::new(CustomRuleDefinition::<
+        let array_ir_rules = CustomRuleRegistration::new(CustomRuleDefinition::<
             ArrayIrValue<Array>,
             ArrayIrOperation<Array>,
         >::new("ir"));
@@ -3590,7 +3591,7 @@ mod tests {
 
         // One instance of every variant, in declaration order, paired with its hand-maintained expected member-kind
         // signature. Exactly two variants may turn a dimension value into array data (the explicit
-        // `dimension_to_scalar` gateway and the deliberately composite-level dimension comparison) and exactly one may
+        // `dimension_to_scalar` gateway and the deliberately family-level dimension comparison) and exactly one may
         // turn array data into a dimension value (the checked `dimension_from_scalar` gateway). Everything else either
         // stays inside one homogeneous member family, treats dimensions as extents, observes them in an assertion,
         // returns each input at another type of the same member kind, or forwards regions.
@@ -3765,12 +3766,12 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(composite_rules.reference())),
+                ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(array_ir_rules.reference())),
                 MemberKindSignature::RegionForwarding,
             ),
             (
                 ArrayIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::new(
-                    composite_rules.reference(),
+                    array_ir_rules.reference(),
                     0,
                     Vec::new(),
                     Vec::new(),

@@ -462,7 +462,7 @@ mod tests {
         test_vector_type,
     };
     use crate::experimental::lowering::{MlirLowerableValue, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::to_mlir_module_for_program;
@@ -503,7 +503,7 @@ mod tests {
         // (which a dimension constant would supply instead), so the constructors keep it dynamic.
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(
@@ -560,7 +560,7 @@ mod tests {
         // validate identities shared by boundary inputs. Both axes therefore stay dynamic without any assertion.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_input(DimensionType::from(size.clone()).into());
         let second = builder.add_input(DimensionType::from(size).into());
         let output = builder
@@ -615,7 +615,7 @@ mod tests {
         // Reusing one operand for every axis of a symbolic identity needs no assertion either.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(DimensionType::from(size).into());
         let output = builder
             .add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![input, input], None)
@@ -665,7 +665,7 @@ mod tests {
         // reach the lowered constructor.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
         let second = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
@@ -703,7 +703,7 @@ mod tests {
         // constructors share the mixed boundary and cover both operand orders.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
         let zero = builder
@@ -792,7 +792,7 @@ mod tests {
             DataType::F64,
             Shape::new(vec![size.clone().into(), size.clone().into(), size.clone().into()]),
         );
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(2).unwrap()));
         let output = builder
@@ -846,7 +846,7 @@ mod tests {
         // output must nevertheless report its own logical extent.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(

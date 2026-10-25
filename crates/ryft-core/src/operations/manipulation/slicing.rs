@@ -577,7 +577,7 @@ where
 /// other output preserves the input memory space and clears explicit physical layout metadata.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1146,7 +1146,7 @@ where
 /// from the update is included in the result because the written block may vary even when the input is invariant.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -2442,7 +2442,7 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// and to [`DynamicSliceWithDimensions`] for windows whose starts and sizes are first-class dimension values.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -2801,10 +2801,10 @@ where
 /// Backends may require finite bounds on dimension-sized windows (e.g., the XLA backend). That is, accepting a dynamic
 /// shape in the core does not imply support for unbounded allocation or runtime byte strides for all backends.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
-/// universes with array and dimension members can implement it as well.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
+/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
+/// array and dimension members can implement it as well.
 ///
 /// # Example
 ///
@@ -3700,7 +3700,7 @@ where
 /// Start indices cannot carry reduction state.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -5344,7 +5344,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_slice_axis() {
-        // Composite values slice one axis of their array members, and first-class dimensions are rejected.
+        // Array IR valuesslice one axis of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).slice_axis(1, 0, 2, 1),
@@ -5367,7 +5367,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_index_axis() {
-        // Composite values index one axis of their array members, and first-class dimensions are rejected.
+        // Array IR valuesindex one axis of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).index_axis(0, 1, false),

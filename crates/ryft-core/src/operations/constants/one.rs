@@ -32,7 +32,7 @@ pub const ONE_OPERATION_NAME: &str = "one";
 /// array of the right type and shape filled with ones.
 ///
 /// This operation also serves as an [`OperationProvider`] request: it carries the requested output type while the
-/// provider receives no input types. Composite operation families select the appropriate member operation from this
+/// provider receives no input types. Heterogeneous operation families select the appropriate member operation from this
 /// type; homogeneous families use their ordinary `From<OneOperation<T>>` conversion.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OneOperation<T: Type> {
@@ -530,7 +530,7 @@ mod tests {
                                shaped values exist only in array programs over `ArrayIrOperation`",
         ));
 
-        // Composite eager one materialization delegates array members and rejects first-class dimensions.
+        // Eager array IR one materialization delegates array members and rejects first-class dimensions.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(context.one(&ArrayIrType::Array(output_type)), Ok(ArrayIrValue::Array(expected)));
         let dimension_type = ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::unbounded()));
@@ -664,11 +664,11 @@ mod tests {
     }
 
     #[test]
-    fn test_one_differentiation_composite_gradient_seed() {
-        // Reverse-mode gradient terminals seed the output cotangent by binding a `one` of the composite cotangent
-        // type through the fallible provider, which constructs the canonical array member encoding. The differentiated
+    fn test_one_differentiation_array_ir_gradient_seed() {
+        // Reverse-mode gradient terminals seed the output cotangent by binding a `one` of the array IR cotangent type
+        // through the fallible provider, which constructs the canonical array member encoding. The differentiated
         // function reaches ordinary array math through the array member projection, because homogeneous array
-        // capabilities deliberately do not exist at the composite level.
+        // capabilities deliberately do not exist at the array IR level.
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
         let squared_sum = |input: LinearizationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
             let input = <_ as ValueProjection<ArrayType>>::into_projected(input)?;
@@ -739,19 +739,19 @@ mod tests {
             ArrayOperation::<Array>::provide(OneOperation::new(static_type.clone()), &[&static_type]).unwrap_err(),
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
         );
-        let composite_type = ArrayIrType::Array(static_type.clone());
+        let array_ir_type = ArrayIrType::Array(static_type.clone());
         assert_eq!(
-            ArrayIrOperation::<Array>::provide(OneOperation::new(composite_type.clone()), &[&composite_type])
+            ArrayIrOperation::<Array>::provide(OneOperation::new(array_ir_type.clone()), &[&array_ir_type])
                 .unwrap_err(),
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
         );
 
-        // The composite provider projects a valid input-free array one into the homogeneous member family.
+        // The array IR provider projects a valid input-free array one into the homogeneous member family.
         let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
             ArrayIrOperation::<Array>::provide(OneOperation::new(ArrayIrType::Array(static_type.clone())), &[])
                 .unwrap()
         else {
-            panic!("expected a composite homogeneous one operation");
+            panic!("expected an array IR homogeneous one operation");
         };
         assert_eq!(operation.r#type(), &static_type);
 

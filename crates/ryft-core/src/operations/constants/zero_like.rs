@@ -95,10 +95,10 @@ impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
 impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_: ZeroLikeOperation<ArrayIrType>) -> Self {
-        // A `zero_like` reads its complete output type, including every runtime extent, from its exemplar input, so
-        // the composite family needs no mixed encoding for it: the homogeneous member constructor already expresses
-        // the dynamic case. This conversion exists so that type-generic transform drivers can name the exemplar-based
-        // zero in the composite universe with a plain `From<ZeroLikeOperation<C::Type>>` bound. A first-class dimension
+        // A `zero_like` reads its complete output type, including every runtime extent, from its exemplar input, so the
+        // array IR family needs no mixed encoding for it: the homogeneous member constructor already expresses the
+        // dynamic case. This conversion exists so that type-generic transform drivers can name the exemplar-based zero
+        // in the array IR universe with a plain `From<ZeroLikeOperation<C::Type>>` bound. A first-class dimension
         // exemplar is rejected by member type inference, which is correct because a dimension has no zero.
         Self::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new()))
     }
@@ -115,7 +115,7 @@ impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayI
 /// result, so differentiation returns zero for its tangent or cotangent.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -399,10 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_like_composite() {
+    fn test_zero_like_array_ir() {
         let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
 
-        // Concrete composite values, composite batching, and composite differentiation all reach the homogeneous
+        // Concrete array IR values, array IR batching, and array IR differentiation all reach the homogeneous
         // exemplar-based zero through the array member.
         assert_eq!(vector(vec![2.0, 3.0]).zero_like(), Ok(vector(vec![0.0, 0.0])));
         assert_eq!(

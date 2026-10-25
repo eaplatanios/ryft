@@ -197,7 +197,7 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 
     #[inline]
     fn provide(request: TransferToMemoryOperation, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        // Composite families select the transfer through their array projection, so that the provided operation is
+        // Array IR families select the transfer through their array projection, so that the provided operation is
         // the canonical array member (e.g., `ArrayIrOperation::Array(ArrayOperation::TransferToMemory(_))`).
         check_count!("input", input_types, 1, ProgramError);
         Ok(<Self as OperationProjection<ArrayType>>::Projected::from(request).into())
@@ -211,7 +211,7 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// Native scalar values have no memory placement metadata and are returned unchanged.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Examples
 ///
@@ -716,7 +716,7 @@ mod tests {
             ProgramError::InvalidInputCount { expected: 1, actual: 0 },
         );
 
-        // Composite families provide the transfer through their array projection.
+        // Array IR families provide the transfer through their array projection.
         let ir_type = ArrayIrType::Array(array_type);
         let operation =
             ArrayIrOperation::<Array>::provide(TransferToMemoryOperation::new(PINNED_HOST), &[&ir_type]).unwrap();

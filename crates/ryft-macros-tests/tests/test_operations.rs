@@ -562,7 +562,7 @@ where
     operation.prune_boundary(&input_types, used_outputs, regions)
 }
 
-/// Projects a stand-in composite inference boundary to one member type.
+/// Projects a stand-in heterogeneous inference boundary to one member type.
 fn project_operation_boundary<T: Type, U: Type>(
     input_types: &[U],
     region_interfaces: &[RegionInterface<U>],
@@ -586,7 +586,7 @@ trait InterpretableOperation<C: Domain>: Operation {
     ) -> Result<Vec<C::Value>, ProgramError>;
 }
 
-/// Interprets a stand-in projected operation and lifts its outputs into the composite value family.
+/// Interprets a stand-in projected operation and lifts its outputs into the heterogeneous value family.
 fn interpret_projected_operation<C: Domain, T: Type, O, D>(
     _context: &C,
     operation: &O,
@@ -1034,7 +1034,7 @@ impl<const MEMBER: u8> Type for ProjectedMemberType<MEMBER> {
     type Identity = NoIdentity;
 }
 
-/// Composite type containing two unrelated projected member kinds.
+/// Heterogeneous type containing two unrelated projected member kinds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProjectedProgramType {
     First(ProjectedMemberType<0>),
@@ -1053,7 +1053,7 @@ impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
     type Type = ProjectedMemberType<MEMBER>;
 }
 
-/// Composite value containing the same two member kinds as [`ProjectedProgramType`].
+/// Heterogeneous value containing the same two member kinds as [`ProjectedProgramType`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProjectedProgramValue<A: Value<Type = ProjectedMemberType<0>> = ProjectedMemberValue<0>> {
     First(A),
@@ -1065,7 +1065,7 @@ impl<A: Value<Type = ProjectedMemberType<0>>> Value for ProjectedProgramValue<A>
 }
 
 macro_rules! impl_projected_test_member {
-    // Generates the type and value projection vocabulary for one test-only composite member.
+    // Generates the type and value projection vocabulary for one test-only family member.
     ($member:literal, $variant:ident, $projected:ty) => {
         impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
             fn from(r#type: ProjectedMemberType<$member>) -> Self {
@@ -1567,7 +1567,7 @@ fn test_operation_generates_projected_member_dispatch() {
     let third_type = ProjectedProgramType::Third(ProjectedMemberType);
 
     // Base operation metadata and inference project both computational and structural members to their declared type
-    // and lift results back into the composite family.
+    // and lift results back into the heterogeneous family.
     assert_eq!(first.name(), "projected");
     assert_eq!(first.to_string(), "projected");
     assert_eq!(first.infer_output_types(std::slice::from_ref(&first_type), &[]), Ok(vec![first_type.clone()]));
@@ -1587,7 +1587,7 @@ fn test_operation_generates_projected_member_dispatch() {
         Err(TypeError::invalid("wrong projected member type")),
     );
 
-    // Eager interpretation executes in the selected member universe and lifts the result into the composite value.
+    // Eager interpretation executes in the selected member universe and lifts the result into the heterogeneous value.
     assert_eq!(
         third.interpret(
             &Context { marker: PhantomData },
@@ -2061,7 +2061,7 @@ mod structural_batching {
         type Context = EagerContext<ArrayIrValue<Array>, StructuralBatchingOperation>;
 
         // Replicated dimension inputs are bound once through the parent context, and the result is rebuilt as a
-        // replicated composite carrier.
+        // replicated array IR carrier.
         let three = DimensionValue::constant(3).unwrap();
         let four = DimensionValue::constant(4).unwrap();
         let operation = StructuralBatchingOperation::from(DimensionOperation::Add(
@@ -2539,7 +2539,7 @@ mod mixed_members {
         type Operation = MixedProgramOperation<Array>;
 
         // The homogeneous interleaved rule returns output contributions, while the member rule submits no contributions.
-        // Receiving zeros here proves that transposition kept the composite boundary and selected the member rule.
+        // Receiving zeros here proves that transposition kept the array IR boundary and selected the member rule.
         let (array_type, _) = fixture_types();
         let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let output = context.input(array_type.clone().into());
@@ -3726,7 +3726,7 @@ fn test_operation_generates_reference_discharge_dispatch() {
         policy: PhantomData,
     };
 
-    // A composite-native variant delegates to its payload's own discharge rule.
+    // A family-native variant delegates to its payload's own discharge rule.
     let constant = Operation::from(ConstantOperation {
         value: ProjectedProgramValue::First(ProjectedMemberValue(3)),
         marker: PhantomData,
@@ -3736,7 +3736,7 @@ fn test_operation_generates_reference_discharge_dispatch() {
         vec![ReferenceDischargeValue::labeled("constant_rule")],
     );
 
-    // A member variant has no composite-context discharge rule, so the complete enum replays verbatim through the
+    // A member variant has no family-level discharge rule, so the complete enum replays verbatim through the
     // reference-free replay fallback, which needs no projected payload rule at all.
     let first = Operation::from(ProjectedMemberOperation::<0>);
     assert_eq!(

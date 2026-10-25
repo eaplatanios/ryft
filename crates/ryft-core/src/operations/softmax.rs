@@ -109,7 +109,7 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// replicas.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Examples
 ///
@@ -514,8 +514,8 @@ where
 /// This implements the cancellation-resistant derivative in
 /// [A Fix for Softmax and Cross-Entropy](https://jonbarron.info/softmaxfix/) as a differentiable JVP, so prediction
 /// Hessians remain available. The returned function retains its rules and should be reused across calls; refer to
-/// [`SoftmaxCrossEntropyWithTargetLogits`]. To embed its staged calls and retained rules in a composite value universe,
-/// use [`Program::into_unprojected`](crate::programs::Program::into_unprojected).
+/// [`SoftmaxCrossEntropyWithTargetLogits`]. To embed its staged calls and retained rules in a heterogeneous value
+/// universe, use [`Program::into_unprojected`](crate::programs::Program::into_unprojected).
 ///
 /// # Example
 ///
@@ -983,13 +983,13 @@ mod tests {
     /// Eager array domain used to trace, partially evaluate, and execute the staged programs.
     type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
-    /// Eager composite array domain, whose `shard_map` invocations the reference emulation executes device by device.
+    /// Eager array IR domain, whose `shard_map` invocations the reference emulation executes device by device.
     type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Tracing context of [`ArrayIrContext`], whose array projections are the input leaves of `shard_map`.
     type ArrayIrTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Returns the array held by a composite value.
+    /// Returns the array held by an array IR value.
     fn array(value: ArrayIrValue<Array>) -> Array {
         let ArrayIrValue::Array(array) = value else { panic!("expected an array") };
         array
@@ -1022,9 +1022,9 @@ mod tests {
             Array::matrix(0, 2, Vec::<f32>::new()).unwrap().softmax(1),
             Ok(Array::matrix(0, 2, Vec::<f32>::new()).unwrap())
         );
-        // The composite universe projects to the same contract, including the singleton and empty edge cases.
-        let composite = ArrayIrValue::Array(input.clone());
-        assert_eq!(composite.softmax(0), Ok(ArrayIrValue::Array(input.softmax(0).unwrap())));
+        // The array IR universe projects to the same contract, including the singleton and empty edge cases.
+        let array_ir = ArrayIrValue::Array(input.clone());
+        assert_eq!(array_ir.softmax(0), Ok(ArrayIrValue::Array(input.softmax(0).unwrap())));
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap()).softmax(0),
             Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap()))
@@ -1354,9 +1354,9 @@ mod tests {
                 .masked_softmax(&Array::vector(vec![true, true]).unwrap(), 0),
             Ok(Array::vector(vec![0.0f32, 1.0]).unwrap())
         );
-        let composite = ArrayIrValue::Array(logits.clone());
+        let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
-            composite.masked_softmax(&ArrayIrValue::Array(mask.clone()), 0),
+            array_ir.masked_softmax(&ArrayIrValue::Array(mask.clone()), 0),
             Ok(ArrayIrValue::Array(logits.masked_softmax(&mask, 0).unwrap()))
         );
     }
@@ -1411,8 +1411,8 @@ mod tests {
             .elements::<bf16>()
             .unwrap();
         assert!(output[0].to_f32() < 0.0);
-        let composite = ArrayIrValue::Array(logits.clone());
-        assert_eq!(composite.log_softmax(0), Ok(ArrayIrValue::Array(logits.log_softmax(0).unwrap())));
+        let array_ir = ArrayIrValue::Array(logits.clone());
+        assert_eq!(array_ir.log_softmax(0), Ok(ArrayIrValue::Array(logits.log_softmax(0).unwrap())));
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![f32::NEG_INFINITY, 0.0]).unwrap()).log_softmax(0),
             Ok(ArrayIrValue::Array(Array::vector(vec![f32::NEG_INFINITY, 0.0]).unwrap()))
@@ -1586,9 +1586,9 @@ mod tests {
                 .masked_log_softmax(&Array::vector(vec![false, false]).unwrap(), 0),
             Ok(Array::vector(vec![f32::NEG_INFINITY, f32::NEG_INFINITY]).unwrap())
         );
-        let composite = ArrayIrValue::Array(logits.clone());
+        let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
-            composite.masked_log_softmax(&ArrayIrValue::Array(mask.clone()), 0),
+            array_ir.masked_log_softmax(&ArrayIrValue::Array(mask.clone()), 0),
             Ok(ArrayIrValue::Array(logits.masked_log_softmax(&mask, 0).unwrap()))
         );
     }
@@ -1682,9 +1682,9 @@ mod tests {
         let loss = logits.softmax_cross_entropy(&targets, 0).unwrap();
         assert_eq!(loss.r#type().data_type(), DataType::BF16);
         assert_abs_diff_eq!(loss.to_f64s()[0], (1.0f64).exp().ln_1p() - 0.5, epsilon = 1e-2);
-        let composite = ArrayIrValue::Array(logits.clone());
+        let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
-            composite.softmax_cross_entropy(&ArrayIrValue::Array(targets.clone()), 0),
+            array_ir.softmax_cross_entropy(&ArrayIrValue::Array(targets.clone()), 0),
             Ok(ArrayIrValue::Array(logits.softmax_cross_entropy(&targets, 0).unwrap()))
         );
         assert_eq!(
@@ -1978,9 +1978,9 @@ mod tests {
             logits.masked_softmax_cross_entropy(&targets, &Array::vector(vec![false; 3]).unwrap(), 0),
             Ok(Array::scalar(0.0f64).unwrap())
         );
-        let composite = ArrayIrValue::Array(logits.clone());
+        let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
-            composite.masked_softmax_cross_entropy(
+            array_ir.masked_softmax_cross_entropy(
                 &ArrayIrValue::Array(targets.clone()),
                 &ArrayIrValue::Array(mask.clone()),
                 0
@@ -2050,9 +2050,9 @@ mod tests {
                     .is_nan()
             );
         }
-        let composite = ArrayIrValue::Array(logits.clone());
+        let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
-            composite.softmax_cross_entropy_with_integer_labels(&ArrayIrValue::Array(labels.clone()), -1),
+            array_ir.softmax_cross_entropy_with_integer_labels(&ArrayIrValue::Array(labels.clone()), -1),
             Ok(ArrayIrValue::Array(logits.softmax_cross_entropy_with_integer_labels(&labels, -1).unwrap()))
         );
         assert_eq!(
@@ -2540,9 +2540,9 @@ indoc! {"
                 .iter()
                 .all(|value| value.is_nan())
         );
-        let composite = ArrayIrValue::Array(logits.clone());
+        let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
-            composite.masked_softmax_cross_entropy_with_integer_labels(
+            array_ir.masked_softmax_cross_entropy_with_integer_labels(
                 &ArrayIrValue::Array(labels.clone()),
                 &ArrayIrValue::Array(mask.clone()),
                 1

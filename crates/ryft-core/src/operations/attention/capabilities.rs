@@ -9,7 +9,7 @@ use super::*;
 ///
 /// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
 /// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
-/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+/// and array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
 #[capability]
 pub trait DotProductAttention<T = <Self as Capability>::Universe>: Capability + Parameter + Sized {
     /// Computes attention from its canonical input structure and semantic configuration.
@@ -132,9 +132,9 @@ where
     }
 }
 
-// Composite values compute attention through the array views of their inputs. Attention takes its inputs as one
+// Array IR values compute attention through the array views of their inputs. Attention takes its inputs as one
 // `AttentionInputs` structure without a receiver, which the shared projection macro cannot express, and so this
-// projection is written out. It covers composite tracers and concrete composite values alike.
+// projection is written out. It covers array IR tracers and concrete array IR values alike.
 impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> DotProductAttention<ArrayIrType> for V
 where
     V::Projected: DotProductAttention<ArrayType>,

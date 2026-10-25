@@ -179,10 +179,11 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     explicitly with `#[ryft(type(T), constant(C))]`. Here, `T` is the enum's primary operation type and `C` is
 ///     the concrete value type stored as constants in programs using the enum. Both attributes must be supplied
 ///     together, and each declares exactly one complete Rust type (e.g., a generic, qualified, or tuple type). For
-///     example, a composite operation enum parameterized by an array-member value `A` can declare
-///     `#[ryft(type(CompositeType), constant(CompositeValue<A>))]` without adding a phantom composite-value generic.
-///     Composite families declare them explicitly because their stored constants live in a member universe, so no
-///     single `Value<Type = T>` bound mentions the composite type the family's instructions actually flow.
+///     example, a heterogeneous operation enum parameterized by an array-member value `A` can declare
+///     `#[ryft(type(HeterogeneousType), constant(HeterogeneousValue<A>))]` without adding a phantom
+///     heterogeneous-value generic. Heterogeneous families declare them explicitly because their stored constants
+///     live in a member universe, so no single `Value<Type = T>` bound mentions the heterogeneous type the family's
+///     instructions actually flow.
 ///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T`
 ///     from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
 ///     ArrayType>`. Multiple generic parameters may use the same `T`. For example, `V: Value<Type = ArrayType>,
@@ -297,8 +298,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// | Mixed           | `#[ryft(mixed(U))]`     | `#[ryft(mixed(U, structural))]`     |
 ///
 ///   - A **projected** boundary means that every input and result of the instruction belongs to `U`, so inference and
-///     eager execution project the composite boundary down to `U` and lift the results back into `T`. The member type
-///     may occur only once per boundary because [`OperationProjection<U>`] names one canonical projected family.
+///     eager execution project the heterogeneous boundary down to `U` and lift the results back into `T`. The member
+///     type may occur only once per boundary because [`OperationProjection<U>`] names one canonical projected family.
 ///   - A **mixed** boundary means the instruction crosses member kinds: the payload keeps its native `Operation<Type =
 ///     U>` contract while its parent instruction also consumes inputs belonging to other members of `T` (e.g., the
 ///     first-class dimensions that supply a dynamic result shape) and may produce results in those members too. The
@@ -355,9 +356,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// A variant may additionally use `#[ryft(skip_from)]` to suppress its generated owned `From<Payload>` conversion.
 /// Its borrowed `TryFrom<&Enum>` projection is still generated. Use this only when the enum provides a handwritten
 /// `From<Payload>` implementation whose result is not always that variant (e.g., because conversion promotes a member
-/// operation into a composite carrier or selects a static versus dynamic representation from payload metadata). Without
-/// the marker, that handwritten implementation would conflict with the generated implementation, and the generated
-/// direct wrapper would bypass the required normalization.
+/// operation into a family-level carrier or selects a static versus dynamic representation from payload metadata).
+/// Without the marker, that handwritten implementation would conflict with the generated implementation, and the
+/// generated direct wrapper would bypass the required normalization.
 ///
 /// ## Generated Implementations
 ///
@@ -390,7 +391,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     statically expected payload type.
 ///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
 ///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
-///     composite-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
+///     family-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
 ///     requires its operation family to provide guard requests, so this lets a family that stores no guard serve as a
 ///     context's family without a handwritten provider. A family with a native guard variant instead provides guards
 ///     through the blanket implementation over its generated `From<GuardOperation<T>>` conversion.
@@ -413,13 +414,13 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     family rather than declared as separate outer variants. Mixed-boundary variants do not claim that projection,
 ///     so they may repeat a member type freely.
 ///   - A payload type that [`OperationPayloadProjection::from_payload`] constructs (i.e., one that is `'static`
-///     independently of the enum's generic parameters) may be held by at most one composite-native variant, so that
+///     independently of the enum's generic parameters) may be held by at most one family-native variant, so that
 ///     construction is unambiguous.
 ///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
 ///     generic payload by adding an `Extension: Operation<Type = T>` bound.
-///   - Native guard variants are recognized syntactically, as composite-native variants whose payload type (after
+///   - Native guard variants are recognized syntactically, as family-native variants whose payload type (after
 ///     unboxing) is a path whose last segment is `GuardOperation`. Projected and mixed member guards belong to their
 ///     member universe and do not count. A guard payload named through a type alias is therefore not recognized, and
 ///     a family that stores no recognized guard but has a handwritten `From<GuardOperation<T>>` conversion fails to
@@ -454,10 +455,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// assert_eq!(operation.name(), "zero");
 /// ```
 ///
-/// A composite operation family declares its operation and constant types explicitly, declares its member universes
-/// once with `members(...)`, and marks each non-native variant with its class. Unmarked variants are native to the
-/// composite type, `projected(U)` variants embed a whole member family behind a projection, and `mixed` variants
-/// default their data universe to the family's unique computational member:
+/// A heterogeneous operation family declares its operation and constant types explicitly, declares its member
+/// universes once with `members(...)`, and marks each non-native variant with its class. Unmarked variants are native
+/// to the heterogeneous type, `projected(U)` variants embed a whole member family behind a projection, and `mixed`
+/// variants default their data universe to the family's unique computational member:
 ///
 /// ```rust
 /// # use ryft_core as ryft;
@@ -470,7 +471,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// #[derive(Clone, Debug, Operation)]
 /// #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
 /// #[ryft(members(ArrayType, structural(DimensionType)))]
-/// enum CompositeOperation<A: Value<Type = ArrayType>> {
+/// enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
 ///     /// Mixed structural constructor whose inputs are the stored type's dynamic extents, its data universe
 ///     /// defaults to `ArrayType` (i.e., the unique computational member), and its transforms are fully generated.
 ///     #[ryft(mixed(structural))]
@@ -489,7 +490,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// }
 ///
 /// let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-/// let operation = CompositeOperation::<Array>::from(DimensionSizeOperation::new(&input_type, 0).unwrap());
+/// let operation = HeterogeneousOperation::<Array>::from(DimensionSizeOperation::new(&input_type, 0).unwrap());
 /// assert_eq!(operation.name(), "dimension_size");
 /// ```
 pub trait Operation: Clone {
@@ -1173,18 +1174,19 @@ impl<O: Operation> Operation for Box<O> {
     }
 }
 
-/// Names the `T`-typed member [`Operation`] family embedded in a composite [`Operation`] family. [`Program`]s that
-/// store several kinds of values in one composite [`Type`] still keep most of their operations narrow. For example,
+/// Names the `T`-typed member [`Operation`] family embedded in a heterogeneous [`Operation`] family. [`Program`]s that
+/// store several kinds of values in one heterogeneous [`Type`] still keep most of their operations narrow. For example,
 /// in a program mixing arrays with first-class runtime dimensions, array-only operations implement `Operation<Type =
-/// ArrayType>` and dimension-only operations implement `Operation<Type = DimensionType>`, while the composite operation
-/// family merely stores and dispatches them, providing one [`From`] implementation per member family to lift member
-/// operations into it. Those [`From`] implementations cannot, however, answer the reverse question that generic code
-/// needs: *given* the composite family and a member type `T`, which family is *the* `T`-typed member? [`From`] is
-/// many-to-one (a composite family is [`From`] many payload types), so the answer must be a type-level function from
-/// `(composite family, T)` to the member family. The [`Projected`](Self::Projected) associated type is that function.
-/// This trait adds no methods as lifting a member operation into the composite family remains the [`From`] trait's job.
+/// ArrayType>` and dimension-only operations implement `Operation<Type = DimensionType>`, while the heterogeneous
+/// operation family merely stores and dispatches them, providing one [`From`] implementation per member family to lift
+/// member operations into it. Those [`From`] implementations cannot, however, answer the reverse question that generic
+/// code needs: *given* the heterogeneous family and a member type `T`, which family is *the* `T`-typed member? [`From`]
+/// is many-to-one (a heterogeneous family is [`From`] many payload types), so the answer must be a type-level function
+/// from `(heterogeneous family, T)` to the member family. The [`Projected`](Self::Projected) associated type is that
+/// function. This trait adds no methods as lifting a member operation into the heterogeneous family remains the
+/// [`From`] trait's job.
 ///
-/// A composite operation family implements this trait once per member kind, pointing at the member family that its
+/// A heterogeneous operation family implements this trait once per member kind, pointing at the member family that its
 /// corresponding [`From`] implementation lifts. For example:
 ///
 /// ```rust,ignore
@@ -1198,25 +1200,25 @@ impl<O: Operation> Operation for Box<O> {
 /// ```
 ///
 /// The consumers are the projection adapters that must *name* the member family rather than merely convert into the
-/// composite one: [`ProjectedContext`](crate::ProjectedContext) defines its member-typed
+/// heterogeneous one: [`ProjectedContext`](crate::ProjectedContext) defines its member-typed
 /// [`Domain::Operation`](crate::Domain::Operation) as `<C::Operation as OperationProjection<T>>::Projected` so that
-/// member-typed operations bind directly through the composite parent context, and
+/// member-typed operations bind directly through the heterogeneous parent context, and
 /// [`ProjectedValue`](crate::ProjectedValue)'s blanket [`Value`] implementation derives its domain the same way. Code
-/// that only needs to convert a known operation into the composite family should keep writing plain `Operation:
+/// that only needs to convert a known operation into the heterogeneous family should keep writing plain `Operation:
 /// From<X>` bounds instead of this trait. Genuinely mixed operations, whose signatures cross member kinds, belong to no
-/// member family and are deliberately not projectable; dispatchers that inspect a composite operation must classify
+/// member family and are deliberately not projectable; dispatchers that inspect a heterogeneous operation must classify
 /// their own variants explicitly.
 pub trait OperationProjection<T: Type>: From<Self::Projected> {
-    /// The `T`-typed member [`Operation`] family embedded in this composite family. This is the operation-side
+    /// The `T`-typed member [`Operation`] family embedded in this heterogeneous family. This is the operation-side
     /// counterpart of [`ValueProjection::Projected`](crate::ValueProjection::Projected). Lifting a member operation
-    /// into the composite family goes through the [`From`] super-trait, and trait coherence guarantees that each
-    /// composite family names at most one member family per member type `T`.
+    /// into the heterogeneous family goes through the [`From`] super-trait, and trait coherence guarantees that each
+    /// heterogeneous family names at most one member family per member type `T`.
     type Projected: Operation<Type = T>;
 }
 
 /// Projection of the values of an [`Operation`] family into the concrete payload operations that they hold, and back,
 /// without naming the family. This is the runtime, type-erased counterpart of [`OperationProjection`]. It looks through
-/// the projected member variants of composite families at any depth, and it identifies payloads by [`TypeId`].
+/// the projected member variants of heterogeneous families at any depth, and it identifies payloads by [`TypeId`].
 ///
 /// Code that must recognize or stage a particular payload without naming the family that holds
 /// it uses this trait. For example, a residual policy that saves the outputs of dot products must
@@ -1237,14 +1239,14 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
 ///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
 ///     such as `CustomFunctionOperation<V, ArrayOperation<V>>` are not exposed.
-///   - [`from_payload`](Self::from_payload) tries the family's own (composite-native) variants first, in declaration
+///   - [`from_payload`](Self::from_payload) tries the family's own (family-native) variants first, in declaration
 ///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
 ///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
-///     their instruction boundaries differ from those of their payloads, and the derive rejects two composite-native
+///     their instruction boundaries differ from those of their payloads, and the derive rejects two family-native
 ///     variants that hold the same constructible payload type.
 ///
 /// There is exactly one implementation per family, so a payload held both directly and through a member family (e.g.,
-/// a composite-native `ZeroOperation<ArrayType>` next to a member family that also holds one) cannot cause conflicting
+/// a family-native `ZeroOperation<ArrayType>` next to a member family that also holds one) cannot cause conflicting
 /// implementations. Handwritten families must implement this trait with the same semantics.
 pub trait OperationPayloadProjection {
     /// Returns the payload operation whose [`TypeId`] is `payload`, if this operation holds one directly or
@@ -1324,7 +1326,7 @@ impl std::fmt::Debug for ErasedOperation {
 /// The default `Request = ()` needs no construction arguments beyond input types, as used by elementwise capabilities.
 /// A caller can instead pass an operation payload as a request to its context's operation family. For example,
 /// `ZeroOperation::new(output_type)` requests a zero with no inputs. The selected operation may differ from the request
-/// (e.g., composite families select their member operations, and unsupported families return an error).
+/// (e.g., heterogeneous families select their member operations, and unsupported families return an error).
 ///
 /// Explicit requests use the same payload types as ordinary operation construction. The default unit request keeps
 /// self-provision separate from family selection, including when a family is a single operation.
@@ -1368,7 +1370,7 @@ impl<O: Default + Operation> OperationProvider<O::Type> for O {
 /// of [`MemberBatchableOperation`](crate::MemberBatchableOperation) and
 /// [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation).
 ///
-/// Most [`Operation`] enum variants do not need this capability. Composite-native payloads already implement
+/// Most [`Operation`] enum variants do not need this capability. Family-native payloads already implement
 /// `Operation<Type = U>`, while homogeneous member payloads use projected boundary helpers like
 /// [`infer_projected_operation_region_input_types`] and [`infer_projected_operation_output_types`]. A mixed member
 /// needs this trait only when it deliberately retains a native payload type `T` but its enclosing instruction has a
@@ -1597,9 +1599,9 @@ impl<O: Operation> OperationBoundaryPruning<O> {
     }
 }
 
-/// Validates the region interfaces of a member [`Operation`] through a composite type boundary, using
+/// Validates the region interfaces of a member [`Operation`] through a heterogeneous type boundary, using
 /// [`Operation::validate_region_interfaces`] semantics. Every attached-region [`RegionInterface`] is first
-/// projected to `T`. Projection fails with the composite type's canonical wrong-member [`TypeError`].
+/// projected to `T`. Projection fails with the heterogeneous type's canonical wrong-member [`TypeError`].
 ///
 /// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
 /// transform role. Operation implementations normally call their payload's [`Operation::validate_region_interfaces`]
@@ -1608,7 +1610,7 @@ impl<O: Operation> OperationBoundaryPruning<O> {
 /// # Parameters
 ///
 ///   - `operation`: Member operation whose native type is `T`.
-///   - `region_interfaces`: Composite interfaces of regions attached to the enclosing operation.
+///   - `region_interfaces`: Heterogeneous interfaces of regions attached to the enclosing operation.
 pub fn validate_projected_operation_region_interfaces<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
     operation: &O,
     region_interfaces: &[RegionInterface<I>],
@@ -1623,9 +1625,9 @@ where
     operation.validate_region_interfaces(&region_interfaces)
 }
 
-/// Infers the region input types of a member [`Operation`] through a composite type boundary. Every composite input
-/// and attached-region [`RegionInterface`] is first projected to `T`; the inferred member types are then lifted back
-/// into `U`. Projection fails with the composite type's canonical wrong-member [`TypeError`].
+/// Infers the region input types of a member [`Operation`] through a heterogeneous type boundary. Every heterogeneous
+/// input and attached-region [`RegionInterface`] is first projected to `T`; the inferred member types are then lifted
+/// back into `U`. Projection fails with the heterogeneous type's canonical wrong-member [`TypeError`].
 ///
 /// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
 /// transform role. Operation implementations normally call their payload's [`Operation::infer_region_input_types`]
@@ -1634,8 +1636,8 @@ where
 /// # Parameters
 ///
 ///   - `operation`: Member operation whose native type is `T`.
-///   - `input_types`: Composite input types supplied to the enclosing operation.
-///   - `region_interfaces`: Composite interfaces of regions attached to the enclosing operation.
+///   - `input_types`: Heterogeneous input types supplied to the enclosing operation.
+///   - `region_interfaces`: Heterogeneous interfaces of regions attached to the enclosing operation.
 pub fn infer_projected_operation_region_input_types<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
     operation: &O,
     input_types: &[I],
@@ -1652,9 +1654,9 @@ where
         .collect())
 }
 
-/// Infers the output types of a member [`Operation`] through a composite type boundary. Every composite input and
-/// attached-region [`RegionInterface`] is first projected to `T`; the inferred member outputs are then lifted back
-/// into `U`. Projection fails with the composite type's canonical wrong-member [`TypeError`].
+/// Infers the output types of a member [`Operation`] through a heterogeneous type boundary. Every heterogeneous input
+/// and attached-region [`RegionInterface`] is first projected to `T`; the inferred member outputs are then lifted back
+/// into `U`. Projection fails with the heterogeneous type's canonical wrong-member [`TypeError`].
 ///
 /// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
 /// transform role. Operation implementations normally call their payload's [`Operation::infer_output_types`] method
@@ -1663,8 +1665,8 @@ where
 /// # Parameters
 ///
 ///   - `operation`: Member operation whose native type is `T`.
-///   - `input_types`: Composite input types supplied to the enclosing operation.
-///   - `region_interfaces`: Composite interfaces of regions attached to the enclosing operation.
+///   - `input_types`: Heterogeneous input types supplied to the enclosing operation.
+///   - `region_interfaces`: Heterogeneous interfaces of regions attached to the enclosing operation.
 pub fn infer_projected_operation_output_types<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
     operation: &O,
     input_types: &[I],
@@ -1710,10 +1712,10 @@ where
     operation.prune_boundary(&input_types, used_outputs, regions)
 }
 
-/// Projects one member [`Operation`]'s complete inference boundary from the enclosing composite type `U` to its native
-/// member type `T`. This includes every ordinary input type and both the input and output types of every attached
-/// [`RegionInterface`]. Region effects are structural metadata rather than member-typed values, so they are preserved
-/// unchanged.
+/// Projects one member [`Operation`]'s complete inference boundary from the enclosing heterogeneous type `U` to its
+/// native member type `T`. This includes every ordinary input type and both the input and output types of every
+/// attached [`RegionInterface`]. Region effects are structural metadata rather than member-typed values, so they are
+/// preserved unchanged.
 ///
 /// Projection is atomic: if any boundary type belongs to another member kind, this function returns that conversion's
 /// [`TypeError`] before the member operation's inference rule runs. The returned collections are owned because the
@@ -1722,8 +1724,8 @@ where
 ///
 /// # Parameters
 ///
-///   - `input_types`: Composite types of the member operation's ordinary inputs.
-///   - `region_interfaces`: Composite input/output type contracts and effects of its attached regions.
+///   - `input_types`: Heterogeneous types of the member operation's ordinary inputs.
+///   - `region_interfaces`: Heterogeneous input/output type contracts and effects of its attached regions.
 fn project_operation_boundary<T: Type, U: Type>(
     input_types: &[U],
     region_interfaces: &[RegionInterface<U>],
@@ -2215,7 +2217,7 @@ mod tests {
 
     #[test]
     fn test_operation_payload_projection() {
-        // Payloads are recognized directly in a family, through the projected array member of a composite family,
+        // Payloads are recognized directly in a family, through the projected array member of an array IR family,
         // and through trait objects.
         let sin = ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new());
         let tag = ArrayIrOperation::<Array>::from(ArrayOperation::<Array>::from(TagOperation::new("residual")));
@@ -2252,7 +2254,7 @@ mod tests {
 
     #[test]
     fn test_operation_payload_projection_from_payload() {
-        // Native payloads construct their own variants, including in a composite family.
+        // Native payloads construct their own variants, including in an array IR family.
         let sin = ArrayOperation::<Array>::from_payload(ErasedOperation::new(SinOperation::<ArrayType>::new()));
         assert!(matches!(sin, Ok(ArrayOperation::Sin(_))));
         let reference = ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(ReferenceNewOperation::<
@@ -2264,9 +2266,9 @@ mod tests {
             ArrayOperation::<Array>::from_payload(ErasedOperation::new(ConditionOperation::<ArrayType>::new()));
         assert!(matches!(condition, Ok(ArrayOperation::Condition(_))));
 
-        // Array payloads construct through the projected array member, whose result the composite family's `From`
+        // Array payloads construct through the projected array member, whose result the array IR family's `From`
         // conversion lifts. The mixed `Zero` variant is never constructed directly, so the zero constructor reaches
-        // the composite family through that same conversion.
+        // the array IR family through that same conversion.
         let tag =
             ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(TagOperation::<ArrayType>::new("residual")));
         assert!(matches!(tag, Ok(ArrayIrOperation::Array(ArrayOperation::Tag(_)))));

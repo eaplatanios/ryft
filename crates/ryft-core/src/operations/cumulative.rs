@@ -336,7 +336,7 @@ impl_differentiable_operation! {
             // A cumulative sum is linear in its input, so its tangent is the same prefix sum of the input tangent.
             // Every other kind is non-linear, so its rule differentiates through the associative-scan decomposition
             // with the kind's own combining operator, and every primitive that construction stages contributes its
-            // own forward-mode rule. The composite array universe reaches this rule through the default projected
+            // own forward-mode rule. The array IR universe reaches this rule through the default projected
             // fall-through of `MemberDifferentiableOperation`, because the operation is shape-preserving and its
             // input never needs the replication that a broadcasting elementwise member does.
             check_count!("input", inputs, 1, ProgramError);
@@ -483,7 +483,7 @@ impl_differentiable_operation! {
 /// per kind, which all share the axis, direction, and error contract of [`Self::cumulative`].
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait Cumulative<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Accumulates `self` along `axis` using the combining operator selected by `kind`.

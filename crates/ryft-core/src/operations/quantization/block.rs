@@ -43,7 +43,7 @@ use crate::programs::{ProgramError, TypeError, Value};
 /// instead of producing a zero or infinite scale.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Quantizes `self` into `(elements, scales)` per block of `block_size` trailing-dimension values, where

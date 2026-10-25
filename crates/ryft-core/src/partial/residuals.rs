@@ -675,8 +675,8 @@ impl<T: Type> ErasedResidualPolicy<T> for CombinedNativeResidualPolicy<T> {
 /// `ArrayIrType` instantiation, which simply saves them).
 ///
 /// [`SaveFromBothPolicies`](crate::SaveFromBothPolicies) derives its instantiations from those of its two policies.
-/// and so it has a native instantiation in every type universe in which both of them have one. Other composite policies
-/// register their instantiations explicitly through [`with`](Self::with), which requires the composite policy to
+/// and so it has a native instantiation in every type universe in which both of them have one. Other combined policies
+/// register their instantiations explicitly through [`with`](Self::with), which requires the combined policy to
 /// implement [`ResidualPolicy`] in each registered universe.
 #[derive(Clone, Default)]
 pub struct NativeResidualPolicies {
@@ -735,7 +735,7 @@ impl NativeResidualPolicies {
 /// [`NativeResidualPolicies::save_from_both`]. The registries erase their type universes, so the
 /// composition is deferred until a lookup supplies the destination universe. The lookup then instantiates a
 /// [`CombinedNativeResidualPolicy`] from the native policies of both children. This is the only supported way to
-/// combine registries; another composite policy that needs instantiations derived from erased child registries
+/// combine registries; another combined policy that needs instantiations derived from erased child registries
 /// requires its own recipe.
 struct NativeResidualPolicyComposition {
     /// Name of the composed policy, used in rejection diagnostics.
@@ -2882,7 +2882,7 @@ mod tests {
 
     #[test]
     fn test_native_residual_policies_save_from_both() {
-        /// Returns one native policy over the composite test universe with a fixed decision.
+        /// Returns one native policy over the array IR universe with a fixed decision.
         fn native(decision: ResidualDecision<NoStorage>) -> NativeResidualPolicies {
             NativeResidualPolicies::default().with(TestPolicy {
                 name: "native",

@@ -425,7 +425,7 @@ impl ScanType for ArrayType {
 
     fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
         Err(TypeError::invalid(format!(
-            "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use a composite \
+            "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use an array IR \
              `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
         )))
     }
@@ -475,8 +475,8 @@ impl ScanType for ArrayIrType {
 
 /// Runtime iteration of a [`ScanOperation`] in a domain. [`ScanType`] describes the type-family contract independently
 /// of execution; this interface supplies the index, slices, and accumulators in the domain's own value representation.
-/// The same type family can use different representations, such as eager composite values and per-device bundles in
-/// the lockstep `shard_map` emulator, without changing its inference or transform rules.
+/// The same type family can use different representations, such as eager array IR values and per-device bundles in the
+/// lockstep `shard_map` emulator, without changing its inference or transform rules.
 pub(crate) trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// Returns the trip count that the trailing runtime length input of a dynamic-length scan, `runtime_length`,
     /// supplies.
@@ -618,7 +618,7 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
     }
 }
 
-// Composite scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
+// Array IR scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
 // count from the trailing first-class dimension input. A concrete [`Array`] relabels its type without changing its
 // elements, so a slice whose manual variation differs from that of its stack widens both to the join of their
 // variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its stacks the
@@ -747,15 +747,15 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// obtains the index from the reversed loop, without storing a stack of indices.
 ///
 /// The explicit [`length`](Self::length) also supports scans with no stacked inputs. Homogeneous [`ArrayType`] scans
-/// require a static length. Composite [`ArrayIrType`] scans may use a dynamic dimension identity and consume its
-/// matching first-class dimension value as a trailing runtime input. Every stacked leading axis must then have the
-/// runtime length as its extent, which the scan boundary checks at runtime when the input types leave it unproven
-/// (e.g., for an `f32[3]` stack next to a runtime length of type `dimension<length>`). A runtime length of an unrelated
-/// identity is admitted only when its bounds fix one exact extent, which then is the trip count. Reference stacks have
-/// static types that carry no identity that a runtime check could relate to the runtime length, so their leading
-/// extents must be provably equal to the trip count.
+/// require a static length. [`ArrayIrType`] scans may use a dynamic dimension identity and consume its matching
+/// first-class dimension value as a trailing runtime input. Every stacked leading axis must then have the runtime
+/// length as its extent, which the scan boundary checks at runtime when the input types leave it unproven (e.g., for an
+/// `f32[3]` stack next to a runtime length of type `dimension<length>`). A runtime length of an unrelated identity is
+/// admitted only when its bounds fix one exact extent, which then is the trip count. Reference stacks have static types
+/// that carry no identity that a runtime check could relate to the runtime length, so their leading extents must be
+/// provably equal to the trip count.
 ///
-/// A composite body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index
+/// An array IR body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index
 /// transform to each access, with the body's index input as the first transform binding. Reference operations and their
 /// transforms preserve that access path. The root parameter must not be consumed or frozen inside the body. Stacked
 /// reference outputs remain unsupported: a scan cannot assemble a reference value from per-iteration handles. Reference
@@ -2374,7 +2374,7 @@ fn scan_boundary_types<T: ScanType>(
                 T::from(stacked_type)
             }
             (ScanMember::Reference(referent), ScanBoundarySide::Input) => {
-                // Reference access paths require a static root shape even in the composite family.
+                // Reference access paths require a static root shape even in the array IR family.
                 for (axis, dimension) in referent.shape().dimensions().iter().enumerate() {
                     if dimension.value().is_none() {
                         return Err(TypeError::invalid(format!(
@@ -3748,16 +3748,16 @@ mod tests {
     /// Homogeneous array scan operation.
     type TestScanOperation = ScanOperation<ArrayType>;
 
-    /// Composite array program, used both for scan bodies and for the programs that apply scans.
+    /// Array IR program, used both for scan bodies and for the programs that apply scans.
     type TestIrProgram = Program<TestIrValue, TestIrOperation, Vec<TestIrValue>, Vec<TestIrValue>>;
 
-    /// Eager composite array context.
+    /// Eager array IR context.
     type TestIrEagerContext = EagerContext<TestIrValue, TestIrOperation>;
 
-    /// Staging composite array context.
+    /// Staging array IR context.
     type TestIrTracingContext = TracingContext<TestIrValue, TestIrOperation>;
 
-    /// Staged composite array value of [`TestIrTracingContext`].
+    /// Staged array IR value of [`TestIrTracingContext`].
     type TestIrStagedTracer = Tracer<TestIrTracingContext>;
 
     /// Linearization tracer over [`TestIrEagerContext`].
@@ -3974,7 +3974,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Builds a composite scan body over a stacked reference root that maps `[carry, stack: ref<f32[length]>]` to
+    /// Builds an array IR scan body over a stacked reference root that maps `[carry, stack: ref<f32[length]>]` to
     /// `[carry + stack[index]]` after accumulating the carry into `stack[index]`, so that both the carry and the
     /// referent depend on the order of iteration.
     fn stacked_reference_body(length: usize) -> TestIrProgram {
@@ -4010,7 +4010,7 @@ mod tests {
         builder.build(vec![next_carry], vec![Placeholder; 3], vec![Placeholder]).unwrap()
     }
 
-    /// Builds a composite scan body over a stacked reference root that maps `[carry, stack: ref<f32[3]>]` to `[carry +
+    /// Builds an array IR scan body over a stacked reference root that maps `[carry, stack: ref<f32[3]>]` to `[carry +
     /// stack[index]]` without mutating the stack.
     fn stack_reading_body() -> TestIrProgram {
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -4118,10 +4118,9 @@ mod tests {
         builder.build(vec![squares, frozen], vec![Placeholder], vec![Placeholder; 2]).unwrap()
     }
 
-    /// Builds a program whose composite `scan` runs the unspecialized body `[c, x] -> [c + x, x * x]` over a
-    /// `f64[rows]` carry and `f64[rows]` slices for two iterations while the program feeds it a static `f64[3]` carry
-    /// and static `f64[2, 3]` stacked input, so the scan's outputs are refined by its inputs rather than by a re-typed
-    /// body.
+    /// Builds a program whose array IR `scan` runs the unspecialized body `[c, x] -> [c + x, x * x]` over a `f64[rows]`
+    /// carry and `f64[rows]` slices for two iterations while the program feeds it a static `f64[3]` carry and static
+    /// `f64[2, 3]` stacked input, so the scan's outputs are refined by its inputs rather than by a re-typed body.
     fn refined_vector_scan_program() -> TestIrProgram {
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)]));
@@ -4159,7 +4158,7 @@ mod tests {
         )
     }
 
-    /// Builds a composite scan body over `[index, n: dimension<n>, vector: f32[n]]` that returns both carries unchanged
+    /// Builds an array IR scan body over `[index, n: dimension<n>, vector: f32[n]]` that returns both carries unchanged
     /// and, when `stacks_vector` is set, also stacks `vector`, so that its stacked output type `f32[n]` refers to the
     /// dimension carry's identity.
     fn dimension_carry_body(n_type: &DimensionType, stacks_vector: bool) -> TestIrProgram {
@@ -4173,7 +4172,7 @@ mod tests {
         builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; output_count]).unwrap()
     }
 
-    /// Builds a composite scan body over `[index, carries...]` with the provided carry types that returns every carry
+    /// Builds an array IR scan body over `[index, carries...]` with the provided carry types that returns every carry
     /// unchanged.
     fn pass_through_body(carry_types: &[ArrayIrType]) -> TestIrProgram {
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -4199,7 +4198,7 @@ mod tests {
         scan_program(ScanOperation::new(carry_count, length), body.clone(), input_types)
     }
 
-    /// Builds a composite scan body over `[state: f64[], counter: u64[]]` that broadcasts the state to the first-class
+    /// Builds an array IR scan body over `[state: f64[], counter: u64[]]` that broadcasts the state to the first-class
     /// extent `iteration` computed from the counter, sums it back, and increments the counter, returning
     /// `[sum(broadcast(state, counter)), counter + 1, sum(broadcast(state, counter))]`. The extent changes on every
     /// iteration, so any transform that splits the body must stack it per iteration.
@@ -4756,7 +4755,7 @@ mod tests {
             TestScanOperation::new(1, Dimension::Dynamic(length))
                 .infer_output_types(&[scalar_type, stacked_type], interfaces.as_slice()),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use a composite `scan` with a \
+                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             )),
         );
@@ -5095,7 +5094,7 @@ mod tests {
 
     #[test]
     fn test_scan_type_inference_dimension_carries() {
-        // A composite scan admits first-class dimension carries. The body is requested at the instantiated input types
+        // An array IR scan admits first-class dimension carries. The body is requested at the instantiated input types
         // exactly when the actual inputs carry type identities other than the declared ones.
         let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
@@ -5515,7 +5514,7 @@ mod tests {
 
     #[test]
     fn test_scan_type_inference_stacked_references() {
-        // A composite scan admits stacked reference inputs, which enter the body as whole roots whose leading axis is
+        // An array IR scan admits stacked reference inputs, which enter the body as whole roots whose leading axis is
         // the scan axis.
         let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let slice_type = ArrayType::new_static(DataType::F32, [2]);
@@ -9010,7 +9009,7 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use a composite `scan` with a \
+                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             ))),
         );
@@ -9234,7 +9233,7 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_places_stacked_outputs_over_manual_axes() {
-        // A placement over a manual mesh axis makes the stack vary over it. Concrete composite arrays relabel each
+        // A placement over a manual mesh axis makes the stack vary over it. Concrete array IR values relabel each
         // written slice to vary over it as well, while the homogeneous family, whose values cannot be relabeled,
         // rejects a slice that does not already vary over the axis.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -9303,7 +9302,7 @@ mod tests {
     fn test_scan_interpretation_widens_stacks_whose_manual_variation_changes_across_iterations() {
         // The body declares its carry and slice without manual variation, returns the slice as the next carry, and
         // stacks the carry that it receives. An invariant initial carry makes the first stacked slice invariant and the
-        // second one varying, so a composite scan widens the stack to the join of their variation, as `parallel_vary`
+        // second one varying, so an array IR scan widens the stack to the join of their variation, as `parallel_vary`
         // would, and returns the same values and types as when the carry enters varying. A carry that enters varying
         // keeps its variation, and its slices stack as usual.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -9481,10 +9480,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        let composite_body = builder
+        let array_ir_body = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
-        assert_eq!(composite_body.to_string(), body.to_string());
+        assert_eq!(array_ir_body.to_string(), body.to_string());
         for reverse in [false, true] {
             let expected = AssertionError::Failed {
                 message: "first iteration".to_string(),
@@ -9506,7 +9505,7 @@ mod tests {
             let error = TestIrEagerContext::new()
                 .bind(
                     ScanOperation::<ArrayIrType>::new(0, MAX_DIMENSION_EXTENT).with_reverse(reverse),
-                    vec![composite_body.clone()],
+                    vec![array_ir_body.clone()],
                     &[],
                 )
                 .unwrap_err();
@@ -12416,7 +12415,7 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_dynamic_length() {
-        // A dynamic-length composite scan folds its loop-invariant known carry like a static one, and the rewritten
+        // A dynamic-length array IR scan folds its loop-invariant known carry like a static one, and the rewritten
         // residual scan keeps the dynamic length and its trailing runtime length input. The body maps
         // `[scale, accumulator, x]` to `[scale, accumulator + scale * x, scale * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
@@ -13367,11 +13366,11 @@ mod tests {
 
     #[test]
     fn test_scan_batching_validates_direct_body_and_input_contracts() {
-        // A direct rule invocation must not repair the body's index or index past an excessive carry count, and
-        // even a passed-through zero-trip carry must satisfy the original logical input contract. The homogeneous and
-        // composite families share the batching rule, so both report the same errors.
+        // A direct rule invocation must not repair the body's index or index past an excessive carry count, and even a
+        // passed-through zero-trip carry must satisfy the original logical input contract. The homogeneous and array IR
+        // families share the batching rule, so both report the same errors.
         let context = BatchingContext::new(TestEagerContext::new(), 2);
-        let composite_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+        let array_ir_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             TestIrEagerContext::new(),
             TestIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
@@ -13413,7 +13412,7 @@ mod tests {
             let driver = RecursiveBatchingDriver::new(&regions);
             assert_eq!(
                 ScanOperation::<ArrayIrType>::new(carry_count, 0)
-                    .batch(&composite_context, &driver, &[ArrayIrBatch::replicated(array(input))])
+                    .batch(&array_ir_context, &driver, &[ArrayIrBatch::replicated(array(input))])
                     .unwrap_err(),
                 BatchingError::from(ProgramError::from(TypeError::invalid(message))),
             );
@@ -13424,7 +13423,7 @@ mod tests {
         );
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(0, 0)
-                .batch(&composite_context, &EmptyRegionDriver, &[])
+                .batch(&array_ir_context, &EmptyRegionDriver, &[])
                 .unwrap_err(),
             BatchingError::from(ProgramError::MalformedProgram("region index 0 is out of range".to_string())),
         );
@@ -14360,8 +14359,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_preserves_reverse_and_unroll() {
-        // The composite rule threads the mapped extent as a leading replicated carry and keeps the dynamic length, its
+    fn test_scan_batching_array_ir_preserves_reverse_and_unroll() {
+        // The array IR rule threads the mapped extent as a leading replicated carry and keeps the dynamic length, its
         // trailing runtime length input, the visit order, and the unroll factor of the source scan. The body maps
         // `[carry, x]` to `[carry + x, carry]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
@@ -14433,7 +14432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_keeps_runtime_lengths_replicated() {
+    fn test_scan_batching_array_ir_keeps_runtime_lengths_replicated() {
         // A runtime length mapped over the batch would give each batch item its own trip count, which one scan over the
         // packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch construction
         // rejects it before any rule runs, as the `ArrayIrBatch` tests pin), so the rule always receives a replicated
@@ -14509,7 +14508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_validates_concrete_eager_runtime_extents() {
+    fn test_scan_batching_array_ir_validates_concrete_eager_runtime_extents() {
         // An eager runtime length and the packed eager arrays it describes have exact types, so valid direct binding
         // executes and unequal lengths are rejected before they can truncate or over-read the packed stack.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
@@ -14569,7 +14568,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_retains_relationships_of_passed_through_carries() {
+    fn test_scan_batching_array_ir_retains_relationships_of_passed_through_carries() {
         // The body declares both carries as `f32[n]`, while the program feeds a concrete `f32[3]` carry and a symbolic
         // `f32[n]` carry, so only the scan boundary validates that their extents agree at runtime. Both carries pass
         // through unchanged, so forwarding their outputs from the batched inputs would leave the staged batched scan
@@ -14619,7 +14618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_retains_relationships_of_stacks_beside_passed_through_carries() {
+    fn test_scan_batching_array_ir_retains_relationships_of_stacks_beside_passed_through_carries() {
         // An `f32[3]` stack next to a runtime length of type `dimension<length>` is checked only at the scan boundary,
         // and the only carry passes through unchanged. Forwarding the carry from its batched input would leave the
         // staged batched scan dead and drop that check, so the batched scan keeps producing it and rejects a runtime
@@ -14689,7 +14688,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_refines_outputs_of_unspecialized_bodies() {
+    fn test_scan_batching_array_ir_refines_outputs_of_unspecialized_bodies() {
         // Batching a scan whose refined outputs come from an unspecialized body keeps its batched outputs refined. The
         // carry is mapped and the stacked input is replicated, so each item computes `[c + x[0] + x[1], x * x]`.
         let extent = DimensionValue::constant(2).unwrap();
@@ -14737,7 +14736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_rejects_mapped_shape_computation() {
+    fn test_scan_batching_array_ir_rejects_mapped_shape_computation() {
         // Computing a first-class extent from a mapped carry would give each batch item its own array shape, so the
         // scalar-to-dimension gateway rejects the first structural pass over the body and its error propagates
         // unchanged before the parent stages anything.
@@ -14768,7 +14767,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_threads_reference_carries() {
+    fn test_scan_batching_array_ir_threads_reference_carries() {
         // A reference carry threads positionally with the batch axis of the allocation that produced it, and the body
         // accumulates each item's own elements into it, so batching the stateful scan directly agrees with batching
         // its discharged counterpart: the stacked snapshots gain the scan axis in front of the batch axis and the
@@ -14888,7 +14887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_threads_aliased_reference_carries() {
+    fn test_scan_batching_array_ir_threads_aliased_reference_carries() {
         // The allocation that `aliased_reference_scan_program` passes as both a reference carry and a stacked reference
         // is batched behind its scan axis (`ref<f32[3, 2]>` at axis 1), so the carry keeps its axis and the stack's
         // per-iteration view stays mapped at axis 0. Each batch item updates and reads its own rows through the one
@@ -14933,7 +14932,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_composite_threads_reference_stacks() {
+    fn test_scan_batching_array_ir_threads_reference_stacks() {
         // Batching the elements behind the scan axis packs the stack as `ref<f32[3, 2]>` at axis 1, so each
         // per-iteration view is `ref<f32[2]>` at axis 0 and the batched carry accumulates into its own item.
         let axis_extent = DimensionValue::constant(2).unwrap();
@@ -16513,7 +16512,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_dynamic_length() {
-        // A dynamic-length composite scan differentiates through its fused scan like a static one, threading its
+        // A dynamic-length array IR scan differentiates through its fused scan like a static one, threading its
         // trailing runtime length input, which has no tangent. The body maps `[carry, x]` to `[carry * x, carry * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -19621,8 +19620,8 @@ mod tests {
             Ok(vec![Array::scalar(2f64).unwrap(), Array::vector(vec![2f64; 3]).unwrap()]),
         );
 
-        // A composite scan supports symbolic per-iteration types. Its unused input needs neither an extent residual
-        // nor a zero stack, even though no live cotangent names that extent.
+        // An array IR scan supports symbolic per-iteration types. Its unused input needs neither an extent residual nor
+        // a zero stack, even though no live cotangent names that extent.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let item_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -19636,7 +19635,7 @@ mod tests {
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![next], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
-        let composite = scan_program(
+        let array_ir_program = scan_program(
             ScanOperation::new(1, 3),
             body,
             vec![
@@ -19645,7 +19644,7 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [3]).into(),
             ],
         );
-        let transposed = composite.entry_region_ref().transpose(&[0, 1, 2], &[], &[]).unwrap();
+        let transposed = array_ir_program.entry_region_ref().transpose(&[0, 1, 2], &[], &[]).unwrap();
         assert_eq!(
             transposed.cotangents(),
             &[TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output],
@@ -19689,7 +19688,7 @@ mod tests {
             Ok(vec![Array::scalar(0f64).unwrap(), Array::vector(vec![0f64, 0.0, 2.0]).unwrap()]),
         );
 
-        // A composite scan with a symbolic carry type shapes that zero from the carry cotangent's runtime extent.
+        // An array IR scan with a symbolic carry type shapes that zero from the carry cotangent's runtime extent.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let item_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -21766,7 +21765,7 @@ mod tests {
 
     #[test]
     fn test_scan_type_scan_member() {
-        // A homogeneous array type is always an array member, while a composite type describes an array, the referent
+        // A homogeneous array type is always an array member, while an array IR type describes an array, the referent
         // of a reference, or a first-class dimension. Only a first-class dimension can be a runtime length.
         let array_type = ArrayType::new_static(DataType::F32, [3]);
         let dimension_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -21793,7 +21792,7 @@ mod tests {
 
     #[test]
     fn test_scan_type_runtime_length_type() {
-        // A composite scan takes a dynamic trip count from a trailing `dimension<length>` input, which a homogeneous
+        // An array IR scan takes a dynamic trip count from a trailing `dimension<length>` input, which a homogeneous
         // array scan does not admit.
         let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
         assert_eq!(
@@ -21803,7 +21802,7 @@ mod tests {
         assert_eq!(
             <ArrayType as ScanType>::runtime_length_type(&length),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use a composite `scan` with a \
+                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             )),
         );
@@ -21812,7 +21811,7 @@ mod tests {
     #[test]
     fn test_scan_type_validate_scan_body_members() {
         // Homogeneous array bodies must be fully static, and their errors report body positions (i.e., counting the
-        // index input), while composite bodies admit dynamic shapes.
+        // index input), while array IR bodies admit dynamic shapes.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let static_type = ArrayType::new_static(DataType::F32, [2]);
         let dynamic_type =
@@ -21866,7 +21865,7 @@ mod tests {
         assert_eq!(
             ArrayType::validate_scan_body_type_signature(&body_input_types[1..], &[scalar_type.clone()], 0, &length),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use a composite `scan` with a \
+                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             )),
         );

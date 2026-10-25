@@ -521,7 +521,7 @@ mod tests {
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
     use crate::experimental::lowering::tests::{test_spmd_compilation_options, test_vector_type};
-    use crate::experimental::ops::{XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{FromPjrt, XlaArray, XlaSession, to_mlir_module_for_program};
@@ -536,7 +536,7 @@ mod tests {
     /// Stages whether each element of `value` is positive into `builder`. The mixed executable ABI of
     /// `execute_mixed_program` has no boolean inputs, so control flow that executes for both predicate values derives
     /// its predicate from a floating-point selector input.
-    pub(super) fn positive(builder: &mut CompositeXlaProgramBuilder, value: AtomId) -> AtomId {
+    pub(super) fn positive(builder: &mut ArrayIrXlaProgramBuilder, value: AtomId) -> AtomId {
         let zero = builder
             .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![value], None)
             .unwrap()[0];
@@ -628,7 +628,7 @@ mod tests {
         // advanced token, whereas a region that threads no class could not return it, so lowering it would leave later
         // I/O unordered with respect to the print.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
@@ -712,13 +712,13 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_differentiated_composite_control_flow() {
+    fn test_to_mlir_module_for_program_lowers_differentiated_array_ir_control_flow() {
         let scalar_boolean = ArrayType::scalar(DataType::Boolean);
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let vector_f32 = test_vector_type(2);
 
         let branch = |double: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_f32.clone().into());
             let output = if double {
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
@@ -730,7 +730,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut scan_body_builder = CompositeXlaProgramBuilder::new();
+        let mut scan_body_builder = ArrayIrXlaProgramBuilder::new();
         scan_body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = scan_body_builder.add_input(scalar_f32.clone().into());
         let item = scan_body_builder.add_input(scalar_f32.clone().into());
@@ -744,7 +744,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut while_condition_builder = CompositeXlaProgramBuilder::new();
+        let mut while_condition_builder = ArrayIrXlaProgramBuilder::new();
         let state = while_condition_builder.add_input(scalar_f32.clone().into());
         let while_predicate = while_condition_builder
             .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![state, state], None)
@@ -752,7 +752,7 @@ mod tests {
         let while_condition = while_condition_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![while_predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut while_body_builder = CompositeXlaProgramBuilder::new();
+        let mut while_body_builder = ArrayIrXlaProgramBuilder::new();
         let state = while_body_builder.add_input(scalar_f32.clone().into());
         let next_state = while_body_builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![state, state], None)
@@ -761,7 +761,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next_state], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(branch(true).entry_region_ref());
         let false_region = builder.import_region(branch(false).entry_region_ref());
         let scan_region = builder.import_region(scan_body.entry_region_ref());
@@ -806,7 +806,7 @@ mod tests {
         // Keep the complete mixed control-flow program behind one compiled-call boundary. Linearization must preserve
         // that boundary while deriving its primal and pullback callees, and lowering must still reach the nested
         // condition and loop operations.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(program.entry_region_ref());
         let predicate = builder.add_input(scalar_boolean.clone().into());
         let input = builder.add_input(scalar_f32.clone().into());

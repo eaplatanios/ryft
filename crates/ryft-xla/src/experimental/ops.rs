@@ -407,7 +407,7 @@ where
     #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
-    /// Homogeneous array operation. Member zero constructors are promoted to their mixed composite carrier when an
+    /// Homogeneous array operation. Member zero constructors are promoted to their mixed array IR carrier when an
     /// array operation is lifted into this family.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>),
@@ -553,7 +553,7 @@ where
     JitCall(JitCallOperation<ArrayIrType>),
 
     /// Core `shard_map` operation (refer to [`ShardMapOperation`]), which lowering emits as a Shardy
-    /// `sdy.manual_computation` through its dedicated path rather than through the core composite lowering.
+    /// `sdy.manual_computation` through its dedicated path rather than through the core array IR lowering.
     ShardMap(Box<ShardMapOperation>),
 }
 
@@ -643,9 +643,9 @@ where
 {
     #[inline]
     fn from(operation: ArrayOperation<Constant::Projected>) -> Self {
-        // Delegating to the composite family's conversion keeps constructor normalization and member control-flow
-        // promotion identical across both families: `Condition`, `While`, and `Scan` must become composite carriers
-        // because the projected `Array` variant cannot own composite regions.
+        // Delegating to the array IR family's conversion keeps constructor normalization and member control-flow
+        // promotion identical across both families: `Condition`, `While`, and `Scan` must become array IR carriers
+        // because the projected `Array` variant cannot own array IR regions.
         ArrayIrOperation::<Constant::Projected>::from(operation).into()
     }
 }
@@ -736,10 +736,10 @@ where
     }
 }
 
-macro_rules! impl_composite_operation_conversion {
-    // Generates the composite-operation conversions the derive cannot generate directly: the canonical constructors
+macro_rules! impl_array_ir_operation_conversion {
+    // Generates the array IR operation conversions the derive cannot generate directly: the canonical constructors
     // whose lift selects between the homogeneous member carrier and the mixed dimension-operand carrier, and the
-    // homogeneous-array payload forms of mixed operations whose canonical composite payload is type-promoted.
+    // homogeneous-array payload forms of mixed operations whose canonical array IR payload is type-promoted.
     ($($operation:ty),+ $(,)?) => {
         $(
             impl<Constant> From<$operation> for XlaOperation<Constant>
@@ -755,9 +755,9 @@ macro_rules! impl_composite_operation_conversion {
     };
 }
 
-// Every first-class dimension arithmetic operation lifts directly, mirroring the composite family, so that generic
+// Every first-class dimension arithmetic operation lifts directly, mirroring the array IR family, so that generic
 // staging code can bound `From<DimensionMulOperation>`-style conversions without naming this family's dimension member.
-impl_composite_operation_conversion!(
+impl_array_ir_operation_conversion!(
     DimensionAddOperation,
     DimensionSubOperation,
     SaturatingSubOperation<DimensionType>,
@@ -769,7 +769,7 @@ impl_composite_operation_conversion!(
     DimensionMaxOperation,
 );
 
-impl_composite_operation_conversion!(
+impl_array_ir_operation_conversion!(
     ZeroLikeOperation<ArrayIrType>,
     OneLikeOperation<ArrayIrType>,
     ZeroOperation<ArrayType>,
@@ -911,8 +911,8 @@ where
     }
 }
 
-// Composite operations whose generic capabilities bind them through any context lift into the array member exactly as
-// they do in the core composite family.
+// Array IR operations whose generic capabilities bind them through any context lift into the array member exactly as
+// they do in the core array IR family.
 impl<Constant> From<SelectOperation<ArrayIrType>> for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1317,7 +1317,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_core_composite_control_flow_promotes_to_xla_control_flow() {
+    fn test_core_array_ir_control_flow_promotes_to_xla_control_flow() {
         let condition: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
         assert!(matches!(condition, XlaOperation::Condition(_)));
@@ -1345,8 +1345,8 @@ pub(crate) mod tests {
         .into();
         assert!(matches!(zero, XlaOperation::Zero(_)));
 
-        // Member control flow must also promote to the composite carriers when it enters through the member family
-        // conversion: the projected `Array` variant cannot own composite regions, so landing there would make the
+        // Member control flow must also promote to the array IR carriers when it enters through the member family
+        // conversion: the projected `Array` variant cannot own array IR regions, so landing there would make the
         // staged regions unprojectable.
         let condition: XlaOperation<XlaConstant> =
             ArrayOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
@@ -1488,14 +1488,12 @@ pub(crate) mod tests {
 
         // Calls registered in the array IR family itself cannot follow their program, because constants of this family
         // cannot represent array IR values. Their primal still executes, but their explicit rules are unavailable.
-        let composite = CustomRuleRegistration::new(
-            CustomRuleDefinition::<ArrayIrValue<XlaArrayConstant>, ArrayIrOperation<XlaArrayConstant>>::new(
-                "composite",
-            )
-            .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
+        let array_ir = CustomRuleRegistration::new(
+            CustomRuleDefinition::<ArrayIrValue<XlaArrayConstant>, ArrayIrOperation<XlaArrayConstant>>::new("array_ir")
+                .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
         );
         let promoted: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::CustomFunction(CustomFunctionOperation::new(composite.reference()))
+            ArrayIrOperation::<XlaArrayConstant>::CustomFunction(CustomFunctionOperation::new(array_ir.reference()))
                 .into();
         assert!(matches!(
             &promoted,
@@ -1516,7 +1514,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             program.jvp().unwrap_err().to_string(),
-            "`custom_function` `composite` was converted from a family whose values its current family cannot \
+            "`custom_function` `array_ir` was converted from a family whose values its current family cannot \
              represent, so its derivative rules are unavailable",
         );
     }

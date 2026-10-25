@@ -53,13 +53,13 @@
 //! determine the rewrite, while the innermost eager or staging context determines whether the final operation executes
 //! now or becomes part of a program.
 //!
-//! # Composite Domains and Projection
+//! # Heterogeneous Domains and Projection
 //!
-//! [`ProjectedContext`] presents one member kind of a composite domain as an ordinary context while forwarding every
-//! lift, bind, resolution, and eagerness query to the composite parent. It preserves symbolic identity and creates no
-//! second interpreter or program. The regions of a bound member operation are member-family programs, so projection
-//! lifts them into the composite family together with the operation, while operations whose regions mix several member
-//! kinds belong to the composite operation contract and never reach the projection.
+//! [`ProjectedContext`] presents one member kind of a heterogeneous domain as an ordinary context while forwarding
+//! every lift, bind, resolution, and eagerness query to the heterogeneous parent. It preserves symbolic identity and
+//! creates no second interpreter or program. The regions of a bound member operation are member-family programs, so
+//! projection lifts them into the heterogeneous family together with the operation, while operations whose regions mix
+//! several member kinds belong to the family-level operation contract and never reach the projection.
 //!
 //! # Value Resolution
 //!
@@ -120,7 +120,7 @@ pub trait Domain: Sized {
     type Operation: Operation<Type = Self::Type>;
 }
 
-/// Projection of a composite [`Domain`] onto its `T`-typed member kind, which a [`ProjectedContext`] presents as
+/// Projection of a heterogeneous [`Domain`] onto its `T`-typed member kind, which a [`ProjectedContext`] presents as
 /// an ordinary domain. This is the domain-level counterpart of [`ValueProjection`] and [`OperationProjection`]: the
 /// domain's values, constants, and operations each project onto that member kind, and its type family embeds the member
 /// types, which lifting the regions of bound member operations requires. It names these requirements once, so that code
@@ -505,22 +505,23 @@ impl<
     }
 }
 
-/// [`Context`] adapter that presents one member kind of a composite parent context as an ordinary context of that
-/// member kind. [`Program`]s that mix several value kinds store one composite [`Type`] / [`Value`] / [`Operation`]
+/// [`Context`] adapter that presents one member kind of a heterogeneous parent context as an ordinary context of that
+/// member kind. [`Program`]s that mix several value kinds store one heterogeneous [`Type`] / [`Value`] / [`Operation`]
 /// universe, but most operations, transform rules, and capability implementations are written against exactly one
 /// member kind (e.g., array-only rules bind through a context whose values are `Value<Type = ArrayType>`). Without an
-/// adapter, every such rule would need a second, composite-typed implementation. `ProjectedContext<C, T>` is that
+/// adapter, every such rule would need a second, heterogeneous-typed implementation. `ProjectedContext<C, T>` is that
 /// adapter. It *is* a context of the `T`-typed member (its [`Domain`] associated types are the member value, constant,
 /// and operation families selected by [`ValueProjection<T>`] and [`OperationProjection<T>`]), while every actual
-/// effect happens in the composite parent `C`.
+/// effect happens in the heterogeneous parent `C`.
 ///
-/// [`bind`](Context::bind) works by round-tripping through the parent. It lifts each member input into the composite
-/// value family (i.e., using [`ValueProjection::from_projected`]), lifts the member operation into the composite
-/// operation family (i.e., using the [`From`] super-trait of [`OperationProjection`]), binds *once* through the parent
-/// context, and projects the results back to the member kind (i.e., using [`ValueProjection::into_projected`]). Staged
-/// member values are identity-preserving views of composite tracers and so the [`Instruction`](crate::Instruction)
-/// recorded in the parent consumes the original Single Static Assignment (SSA) [`Atom`](crate::Atom)s (i.e., projection
-/// adds no copies, no new instructions, and no indirection in the staged program).
+/// [`bind`](Context::bind) works by round-tripping through the parent. It lifts each member input into the
+/// heterogeneous value family (i.e., using [`ValueProjection::from_projected`]), lifts the member operation into the
+/// heterogeneous operation family (i.e., using the [`From`] super-trait of [`OperationProjection`]), binds *once*
+/// through the parent context, and projects the results back to the member kind (i.e., using
+/// [`ValueProjection::into_projected`]). Staged member values are identity-preserving views of heterogeneous tracers
+/// and so the [`Instruction`](crate::Instruction) recorded in the parent consumes the original Single Static Assignment
+/// (SSA) [`Atom`](crate::Atom)s (i.e., projection adds no copies, no new instructions, and no indirection in the staged
+/// program).
 ///
 /// The adapter is deliberately zero-state. It stores its parent and nothing else. It never inspects a staged program,
 /// never reconstructs dependencies, and never carries dimensions, source arrays, identity mappings, or replay
@@ -530,11 +531,11 @@ impl<
 /// A bound member operation may carry [`Region`](crate::Region)s (e.g., a
 /// [`CustomFunctionOperation`](crate::CustomFunctionOperation) and its primal program). Those regions are programs of
 /// the member family, so every value that they carry is of the member kind by construction, and `bind` lifts them into
-/// the composite family with [`Program::into_unprojected`] before binding the lifted operation. Higher-order operations
-/// whose regions mix member kinds are composite operations rather than member operations, so they never reach this
-/// adapter.
+/// the heterogeneous family with [`Program::into_unprojected`] before binding the lifted operation. Higher-order
+/// operations whose regions mix member kinds are family-level operations rather than member operations, so they never
+/// reach this adapter.
 pub struct ProjectedContext<C: Domain, T: Type> {
-    /// Composite parent [`Domain`] or [`Context`].
+    /// Heterogeneous parent [`Domain`] or [`Context`].
     parent: C,
 
     /// [`PhantomData`] marker tying this context to its associated type.
@@ -592,8 +593,8 @@ impl<C: ContextProjection<T>, T: Type> Context for ProjectedContext<C, T> {
         let operation: C::Operation = operation.into().into();
 
         // `Context::bind` borrows its inputs while embedding a projected member consumes it, so clone each member
-        // representation to construct temporary composite values for the parent. Keep the common nullary, unary, and
-        // binary cases on the stack; only uncommon wider homogeneous operations allocate an input vector. Symbolic
+        // representation to construct temporary heterogeneous values for the parent. Keep the common nullary, unary,
+        // and binary cases on the stack; only uncommon wider homogeneous operations allocate an input vector. Symbolic
         // projected values retain their parent value and therefore preserve SSA identity through this clone. Concrete
         // eager values ordinarily dispatch through their native member contexts rather than through this adapter.
         let outputs = match inputs {
@@ -631,13 +632,13 @@ impl<C: ContextProjection<T>, T: Type> Context for ProjectedContext<C, T> {
     #[inline]
     fn provenance(&self) -> Provenance {
         // Projection changes the value vocabulary, not the staging boundary, so provenance state lives with the
-        // composite parent that actually records instructions.
+        // heterogeneous parent that actually records instructions.
         self.parent.provenance()
     }
 
     #[inline]
     fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
-        // Resolution must ask the parent about the original composite value. For the symbolic values that use this
+        // Resolution must ask the parent about the original heterogeneous value. For the symbolic values that use this
         // context through `ProjectedValue`, cloning preserves the same underlying tracer or transform state.
         let value = <C::Value as ValueProjection<T>>::from_projected(value.clone());
         match self.parent.resolve(&value) {
@@ -1355,9 +1356,9 @@ mod tests {
         type TestEagerContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
         type TestTracingContext = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
 
-        // This is the additional-member extensibility gate. Adding another member kind to a composite family requires
-        // only that member's composite type/value conversions and operation-family projection. The generic projected
-        // values for ordinary tracing and both transform carriers remain usable without any changes.
+        // This is the additional-member extensibility gate. Adding another member kind to a heterogeneous family
+        // requires only that member's family-level type/value conversions and operation-family projection. The generic
+        // projected values for ordinary tracing and both transform carriers remain usable without any changes.
         fn assert_value<V: Value>() {}
         assert_value::<ProjectedValue<ProjectedMemberType<1>, Tracer<TestTracingContext>>>();
         assert_value::<ProjectedValue<ProjectedMemberType<1>, PartialTracer<TestEagerContext>>>();

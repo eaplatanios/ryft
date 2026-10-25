@@ -163,14 +163,14 @@ mod tests {
             RngBitGeneratorOperation,
         };
 
-        use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+        use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
 
         // An exact extent refines the declared dynamic bits axis to a static one, so the generator lowers at that
         // static shape and its redundant extent operand does not reach `stablehlo.rng_bit_generator`.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let state_type = RandomAlgorithm::ThreeFry.state_type();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let state = builder.add_input(state_type.clone().into());
         let extent =
             builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
@@ -213,7 +213,7 @@ mod tests {
         };
 
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+        use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
         use crate::operations::assertions::ensure_assertion_handler_registered;
         use crate::tests::execution_client;
 
@@ -221,7 +221,7 @@ mod tests {
         // The two generators cover both operand orders and consume the same state, so they produce the same bits.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
         let state = builder

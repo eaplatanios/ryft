@@ -28,7 +28,7 @@ relative to the repository root, not a requirement to read every file for every 
 | Operation, provider, member, and projection contracts   | `crates/ryft-core/src/programs/operations.rs`                                |
 | Interpretation and reference discharge                  | `crates/ryft-core/src/interpretation.rs`, `src/programs/references/`         |
 | Capability universes and value dispatch                 | `crates/ryft-core/src/operations/mod.rs`, `src/programs/values.rs`           |
-| Families, bundles, composite values, and batch extents  | `crates/ryft-core/src/arrays/{operations,ir,batching}.rs`                    |
+| Families, bundles, array IR values, and batch extents   | `crates/ryft-core/src/arrays/{operations,ir,batching}.rs`                    |
 | Simple operations and tests                             | `crates/ryft-core/src/operations/arithmetic.rs`, especially `AddOperation`   |
 | Construction and shape changes                          | `crates/ryft-core/src/operations/constants/`, `src/operations/manipulation/` |
 | Shared production and testing macros                    | `crates/ryft-core/src/macros.rs`, `src/arrays/macros.rs`                     |
@@ -42,7 +42,7 @@ current checkout; examples are implementation references, not permission to perp
 Load the references that apply before editing:
 
 - [Capabilities and Providers](references/capabilities.md): Used for capability APIs, universe bounds, providers,
-  composite projections, dispatch, generic transform-policy bounds, or backend value integration, including work
+  array IR projections, dispatch, generic transform-policy bounds, or backend value integration, including work
   outside operation modules.
 - [Transform Invariants](references/transforms.md): Used for operation replay, reference validation, partial evaluation,
   batching, differentiation, transposition, sharding/manual variation, dynamic extents, or explicit dense-buffer kernel
@@ -87,7 +87,7 @@ that calls every input an operand (e.g., most StableHLO operations or XLA custom
 ## Integration and Verification
 
 For a new operation, trace the nearest analogous operation through exports, operation families, providers,
-capability bundles, composite lifting/projection, backend conversions, and lowering dispatch. Update the pieces
+capability bundles, array IR lifting/projection, backend conversions, and lowering dispatch. Update the pieces
 needed by the requested operation; a leaf implementation alone does not establish support. Keep explicit unsupported
 paths and document their actual technical blockers. Review backend contracts as well as core type inference.
 

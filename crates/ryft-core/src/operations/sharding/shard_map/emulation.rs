@@ -877,10 +877,10 @@ where
     }
 }
 
-/// Eager composite array context whose scan iteration functions every emulated device applies to its own values.
+/// Eager array IR context whose scan iteration functions every emulated device applies to its own values.
 type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-// Every device applies the eager composite iteration functions to its own values, so a slice whose manual variation
+// Every device applies the eager array IR iteration functions to its own values, so a slice whose manual variation
 // differs from that of its stack widens both to the join of their variation exactly as when the scan binds per device.
 // The devices agree on a dynamic trip count, because they agree on the type of the runtime length (refer to
 // `lockstep_values`), which is its extent.
@@ -1420,7 +1420,7 @@ mod tests {
         ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding).unwrap()
     }
 
-    /// Composite `f32` array value of `type` with the provided logical elements.
+    /// Array IR `f32` value of `type` with the provided logical elements.
     fn f32_value(r#type: ArrayType, elements: &[f32]) -> TestValue {
         ArrayIrValue::Array(Array::from_elements(r#type, elements).unwrap())
     }

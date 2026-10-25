@@ -10,7 +10,7 @@ struct MemberOperation<V>(V);
 
 #[derive(ryft::Operation)]
 enum BadOperation<V: Value<Type = DataType>> {
-    #[ryft(composite_member(ArrayType))]
+    #[ryft(family_member(ArrayType))]
     UnknownClass(MemberOperation<V>),
 
     #[ryft(projected(ArrayType, replicated))]

@@ -331,7 +331,7 @@ mod tests {
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::lowering::types::lower_static_index_constants;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{ToPjrt, to_mlir_module_for_program};
 
@@ -544,7 +544,7 @@ mod tests {
                     };
                     let input_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("input", Some(5))]));
                     let padding_type = ArrayType::scalar(data_type);
-                    let mut builder = CompositeXlaProgramBuilder::new();
+                    let mut builder = ArrayIrXlaProgramBuilder::new();
                     let array = builder.add_input(input_type.clone().into());
                     let scalar = builder.add_input(padding_type.clone().into());
                     let extent = builder

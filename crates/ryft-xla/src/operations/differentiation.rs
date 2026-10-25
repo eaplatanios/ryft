@@ -130,7 +130,7 @@ mod tests {
     use crate::experimental::domains::XlaTracer;
     use crate::experimental::lowering::tests::test_vector_type;
     use crate::experimental::ops::{
-        XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::{LoweringError, XlaDomain, to_mlir_module_for_program};
 
@@ -142,7 +142,7 @@ mod tests {
         // immediately before, inside, and after the call must form one ordered-I/O token chain.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
@@ -151,7 +151,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let before = builder
@@ -194,7 +194,7 @@ mod tests {
         // value happens to occupy the referenced slot.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let captured = builder
                 .add_constant(XlaConstant::Captured(CaptureReference::new(0, ArrayIrType::Array(scalar_type.clone()))));
@@ -204,7 +204,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
@@ -241,7 +241,7 @@ mod tests {
         // XLA from merging the recomputation with the original computation.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             builder
@@ -249,7 +249,7 @@ mod tests {
                 .unwrap()
         };
         let lower = |operation: RematerializeOperation<ArrayIrType>| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let body = builder.import_region(body.entry_region_ref());
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
@@ -564,7 +564,7 @@ mod tests {
 
         let vector_type = test_vector_type(4);
         let forward = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let tangent = builder.add_input(vector_type.clone().into());
             let residual = builder.add_input(vector_type.clone().into());
             let output =
@@ -578,7 +578,7 @@ mod tests {
                 .unwrap()
         };
         let transpose = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let output =
@@ -591,7 +591,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone().into());

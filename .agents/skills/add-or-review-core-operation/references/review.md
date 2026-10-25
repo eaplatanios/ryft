@@ -12,7 +12,7 @@ uncertainty. Mark a case inapplicable only with a reason. Include:
 
 - Payload, constructors/accessors, formatting, and public capability/provider APIs.
 - Input/output type inference, region signatures, effects, placement, and validation contracts.
-- Interpretation and eager/staged dispatch, including composite members.
+- Interpretation and eager/staged dispatch, including array IR members.
 - Reference discharge, identity preservation, and aliasing/access contracts where applicable.
 - Partial evaluation, known/unknown values, residuals, and deferred work.
 - Batching, differentiation, and transposition, including their interactions.

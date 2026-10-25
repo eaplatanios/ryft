@@ -470,7 +470,7 @@ impl DifferentiationRule {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "projected operation `{}` carries regions and cannot be differentiated through its member family; \
-                     differentiate it through a composite carrier for that operation instead",
+                     differentiate it through a family-level carrier for that operation instead",
                     operation.name(),
                 ),
             }

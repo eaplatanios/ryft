@@ -1,4 +1,4 @@
-//! Session-carrying composite values of the [`XlaDomain`].
+//! Session-carrying array IR values of the [`XlaDomain`].
 //!
 //! [`XlaValue`] is the [`XlaDomain`] counterpart of [`ArrayIrValue`]: it holds an [`XlaArray`], a first-class runtime
 //! dimension ([`XlaDimension`]), or an array reference ([`XlaReference`]). Unlike [`ArrayIrValue`], whose dimension and
@@ -19,7 +19,7 @@
 //!
 //! Host-side semantics that do not depend on the session (e.g., which members can act as `while` predicates, assertion
 //! observations, and the reference handle lifecycle) delegate to the generic [`ArrayIrValue`] implementations in
-//! `ryft-core` through a lossless conversion, so that both composite value types share one source of truth.
+//! `ryft-core` through a lossless conversion, so that both array IR value types share one source of truth.
 
 use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
@@ -110,7 +110,7 @@ impl Typed for XlaDimension<'_> {
 }
 
 // Comparing two dimensions yields a Boolean array, which is materialized in this dimension's domain by binding the
-// composite comparison there. The domain decides the predicate on the host from the two extents.
+// array IR comparison there. The domain decides the predicate on the host from the two extents.
 impl<'c> Compare<XlaValue<'c>, DimensionType> for XlaDimension<'c> {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<XlaValue<'c>, ProgramError> {
         let inputs = [XlaValue::Dimension(self.clone()), XlaValue::Dimension(other.clone())];
@@ -202,7 +202,7 @@ impl Typed for XlaReference<'_> {
     }
 }
 
-/// Composite runtime value of the [`XlaDomain`] (i.e., its [`Domain::Value`](ryft_core::Domain::Value)), and the
+/// Array IR runtime value of the [`XlaDomain`] (i.e., its [`Domain::Value`](ryft_core::Domain::Value)), and the
 /// [`XlaDomain`] counterpart of [`ArrayIrValue`] in which every member carries the [`XlaDomain`] session that it
 /// belongs to. Refer to the [module documentation](self) for why the session is part of every member.
 ///
@@ -305,7 +305,7 @@ impl Typed for XlaValue<'_> {
 }
 
 impl<'c> Value for XlaValue<'c> {
-    // Every member carries its `XlaDomain`, so composite values dispatch and execute through it directly: capability
+    // Every member carries its `XlaDomain`, so array IR values dispatch and execute through it directly: capability
     // blankets in `ryft-core` bind `XlaOperation`s into this domain, and free transform entry points recover it here.
     type Dispatch = ValueDomainDispatch;
     type Domain = XlaDomain<'c>;
@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn test_xla_value_reference_capabilities() {
         // Top-level reference operations execute eagerly on their host-side handles, with the validation and locking of
-        // the generic composite reference implementations.
+        // the generic array IR reference implementations.
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);
@@ -1145,7 +1145,7 @@ mod tests {
         assert!(alias.read().is_err());
         assert!(alias.write(&vector(&[1.0, 1.0])).is_err());
 
-        // Reference operands of array operations are rejected by the array projection of the composite capabilities.
+        // Reference operands of array operations are rejected by the array projection of the array IR capabilities.
         let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
         assert_eq!(
             Add::add(&reference, &vector(&[1.0, 2.0])),
@@ -1156,7 +1156,7 @@ mod tests {
     #[test]
     fn test_xla_value_projected_capabilities() {
         // Capabilities without a receiver-shaped signature project onto the array member through the generalized
-        // composite implementations in `ryft-core`.
+        // array IR implementations in `ryft-core`.
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);

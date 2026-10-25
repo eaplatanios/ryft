@@ -339,7 +339,7 @@ mod tests {
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{XlaProgramBuilder, add_xla_jit_call, unproject_plain_program};
     use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaProgram, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        XlaArrayConstant, XlaConstant, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::to_mlir_module_for_program;
 
@@ -663,7 +663,7 @@ mod tests {
             callee_builder.build(vec![callee_output], vec![Placeholder; 4], vec![Placeholder]).unwrap(),
         ));
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone().into()),
             builder.add_input(element_type.clone().into()),

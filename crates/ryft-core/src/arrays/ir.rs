@@ -27,7 +27,7 @@ use crate::programs::{
 ///
 /// This type lets arrays, checked host-side dimensions, and array references share one storage universe, while
 /// [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume only the member
-/// it understands. Reference operations remain composite-native because their signatures cross member kinds. Ordinary
+/// it understands. Reference operations remain family-native because their signatures cross member kinds. Ordinary
 /// numeric operations still project only the array member.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
@@ -42,7 +42,7 @@ pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
 }
 
 impl<A: Value<Type = ArrayType>> ArrayIrValue<A> {
-    /// Returns this composite member's diagnostic kind name.
+    /// Returns this array IR member's diagnostic kind name.
     fn kind_name(&self) -> &'static str {
         match self {
             Self::Array(_) => "array",
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_singleton() {
-        // Only the dimension member determines a value from its type; the composite value keeps that type's identity.
+        // Only the dimension member determines a value from its type; the array IR value keeps that type's identity.
         let singleton_type = DimensionType::new("batch", DimensionBounds::new(4, Some(5)).unwrap());
         assert_eq!(
             ArrayIrValue::<Array>::singleton(&ArrayIrType::Dimension(singleton_type.clone())),

@@ -1560,9 +1560,9 @@ impl<V: CustomCall> CustomFunction<Vec<V>, Vec<V>, CustomCallPrimal<V>> {
     /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) or
     /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
     ///
-    /// The function takes and returns vectors of values, and it is named after the operation's target, which labels
-    /// its staged calls. Interpretation and backend lowering execute the kernel, while derivative requests replay the
-    /// rules. The values must be arrays (i.e., implement [`CustomCall`]), so composite contexts (e.g., array IR
+    /// The function takes and returns vectors of values, and it is named after the operation's target, which labels its
+    /// staged calls. Interpretation and backend lowering execute the kernel, while derivative requests replay the
+    /// rules. The values must be arrays (i.e., implement [`CustomCall`]), so heterogeneous contexts (e.g., array IR
     /// contexts) call the function through their [`ProjectedContext`](crate::ProjectedContext) onto arrays, and every
     /// call requires at least one input, whose context the kernel call dispatches through.
     pub fn from_custom_call(operation: CustomCallOperation) -> Self {
@@ -2399,7 +2399,7 @@ mod tests {
     /// Eager context whose values are arrays.
     type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
-    /// Eager composite context whose values may be arrays or references.
+    /// Eager array IR context whose values may be arrays or references.
     type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Tracer of [`EagerArrayIrContext`] values.
@@ -5226,8 +5226,8 @@ mod tests {
 
     #[test]
     fn test_custom_function_with_batching_differentiate_then_batch_projection() {
-        // Projections of composite contexts lift the regions of the member operations that they bind, so a function
-        // written against a projection stages its derived call in the composite family.
+        // Projections of array IR contexts lift the regions of the member operations that they bind, so a function
+        // written against a projection stages its derived call in the array IR family.
         type Tracer = DomainTracer<ProjectedContext<EagerArrayIrContext, ArrayType>>;
         let function = custom_function(|x: Tracer| Ok(x.sin()?)).with_batching(
             |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)),

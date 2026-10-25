@@ -608,7 +608,7 @@ mod tests {
         lower_replicated_shard_map_body, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_spmd_compilation_options, test_vector_type,
     };
-    use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
+    use crate::experimental::ops::XlaProgramBuilder as ArrayIrXlaProgramBuilder;
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{FromPjrt, ToMlir, XlaArray, XlaSession};
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_device_ordered_effects_cross_manual_computation_boundary() {
         let vector_type = test_vector_type(4);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(vector_type.into());
         for label in ["first", "second"] {
             builder
@@ -682,7 +682,7 @@ mod tests {
         use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
         use crate::tests::{values_from_bytes, values_to_bytes};
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let device_index = builder
             .add_instruction(

@@ -5461,7 +5461,7 @@ mod tests {
     /// Array IR operations used by the discharge integration fixtures.
     type DischargeOperation = ArrayIrOperation<Array>;
 
-    /// Captured composite value in the reference discharge fixtures.
+    /// Captured array IR value in the reference discharge fixtures.
     type DischargeCapture = CaptureReference<ArrayIrType>;
 
     /// Captured array payload in the reference discharge fixtures.

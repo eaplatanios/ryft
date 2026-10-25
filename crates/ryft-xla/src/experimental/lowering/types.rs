@@ -769,7 +769,7 @@ pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Lower
     })
 }
 
-/// Lowers a composite array IR type to its physical StableHLO tensor type.
+/// Lowers an array IR type to its physical StableHLO tensor type.
 pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
     r#type: &ArrayIrType,
     context: &'c MlirContext<'t>,

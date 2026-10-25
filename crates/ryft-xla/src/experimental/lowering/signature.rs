@@ -375,7 +375,7 @@ mod tests {
 
     use crate::experimental::lowering::tests::dynamic_dimension;
     use crate::experimental::lowering::to_mlir_module_for_program;
-    use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
 
     use super::*;
 
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -432,7 +432,7 @@ mod tests {
         use ryft_core::PrintOperation;
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
         let output = builder
             .add_instruction(PrintOperation::<ArrayType>::new("zero"), Vec::new(), vec![input], None)
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -474,7 +474,7 @@ mod tests {
     fn test_to_mlir_module_for_program_isolates_bounded_dynamic_results_behind_one_barrier() {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(4))]));
         let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let dynamic = builder.add_input(dynamic_type.clone().into());
         let r#static = builder.add_input(static_type.clone().into());
         let program: FlatXlaProgram =

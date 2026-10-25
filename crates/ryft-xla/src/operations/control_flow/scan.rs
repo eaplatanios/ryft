@@ -1,8 +1,8 @@
 //! Lowering of [`ScanOperation`] to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 //!
-//! A scan lowers only from the composite [`ArrayIrType`] operation family, which stores its body region; the
-//! homogeneous [`ArrayType`] payload carries no region and is rejected. StableHLO has no scan primitive, so a scan
-//! lowers to a `stablehlo.while` over the loop state `[counter, carries..., stacks..., ys...]`: an `i64` counter, the
+//! A scan lowers only from the [`ArrayIrType`] operation family, which stores its body region; the homogeneous
+//! [`ArrayType`] payload carries no region and is rejected. StableHLO has no scan primitive, so a scan lowers to a
+//! `stablehlo.while` over the loop state `[counter, carries..., stacks..., ys...]`: an `i64` counter, the
 //! carries, the stacked inputs, and one zero accumulator per stacked output, preallocated at the declared stacked
 //! output type. Logical iteration `i` reads one slice of every stacked input at its iteration index (`i`, or
 //! `length - 1 - i` when the scan is reversed) with `stablehlo.dynamic_slice`, inlines the body program over
@@ -651,7 +651,7 @@ mod tests {
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
     };
     use crate::experimental::ops::{
-        FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
@@ -666,7 +666,7 @@ mod tests {
     /// `item` before adding it to the sum `c`.
     fn printing_sum_body() -> FlatXlaProgram {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
         let sum = builder.add_input(scalar_type.clone().into());
         let item = builder.add_input(scalar_type.into());
@@ -684,7 +684,7 @@ mod tests {
     fn product_scan_program(length: usize, unroll: usize) -> FlatXlaProgram {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -697,7 +697,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(test_vector_type(length).into());
@@ -718,7 +718,7 @@ mod tests {
     fn binary_digits_scan_program(length: Dimension, reverse: bool, unroll: usize) -> FlatXlaProgram {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -733,7 +733,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()])).into());
@@ -796,7 +796,7 @@ mod tests {
         let block = context.block_with_no_arguments();
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
@@ -808,7 +808,7 @@ mod tests {
                 .unwrap()
         };
 
-        // The plain array family cannot carry a body region, so scans lower only from the composite family.
+        // The plain array family cannot carry a body region, so scans lower only from the array IR family.
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
         let expected_message =
             "higher-order operation `scan` must be stored directly in the enclosing backend operation family";
@@ -817,7 +817,7 @@ mod tests {
             Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message })) if message == expected_message,
         ));
 
-        // A composite scan needs exactly one body region.
+        // An array IR scan needs exactly one body region.
         let mut lowerer =
             XlaLowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatXlaProgram>::new());
         assert!(matches!(
@@ -870,14 +870,14 @@ mod tests {
         let slice_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let scan_program = |length: usize| {
             let body = {
-                let mut builder = CompositeXlaProgramBuilder::new();
+                let mut builder = ArrayIrXlaProgramBuilder::new();
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
                 let slice = builder.add_input(slice_type.clone().into());
                 builder
                     .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap()
             };
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let body = builder.import_region(body.entry_region_ref());
             let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]);
             let stack = builder.add_input(stacked_type.clone().into());
@@ -932,7 +932,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let stack_type = ArrayType::new_static(DataType::F64, [3]);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(scalar_type.clone().into());
             let slice = builder
@@ -992,7 +992,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let first = builder.add_input(carry_type.clone().into());
             let second = builder.add_input(carry_type.clone().into());
@@ -1011,7 +1011,7 @@ mod tests {
         for (length, unroll, expected) in
             [(0, 1, vec![10.0, 20.0, 30.0]), (2, 1, vec![12.0, 24.0, 36.0]), (2, 2, vec![12.0, 24.0, 36.0])]
         {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
             let dynamic_input = builder.add_input(carry_type.clone().into());
             let static_input = builder.add_input(static_type.clone().into());
@@ -1058,7 +1058,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.into());
             let doubled =
@@ -1067,7 +1067,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
@@ -1159,7 +1159,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -1172,7 +1172,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let stack = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -1283,7 +1283,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let related = builder
                 .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
@@ -1297,7 +1297,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let related = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let sum = builder.add_input(scalar_type.into());
@@ -1409,7 +1409,7 @@ mod tests {
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let mut body_builder = CompositeXlaProgramBuilder::new();
+        let mut body_builder = ArrayIrXlaProgramBuilder::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let body = body_builder
@@ -1420,7 +1420,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.clone().into());
         let runtime_length = builder.add_input(length_type.into());
@@ -1713,7 +1713,7 @@ mod tests {
         // condition, adding two to its counter (`i64::MAX - 1`) would wrap and incorrectly continue the loop.
         // The body has only a scalar carry, so lowering this boundary case requires no enormous array allocations.
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut body_builder = CompositeXlaProgramBuilder::new();
+        let mut body_builder = ArrayIrXlaProgramBuilder::new();
         let index = body_builder.add_input(scalar_type.clone().into());
         body_builder.add_input(scalar_type.clone().into());
         let body = body_builder
@@ -1721,7 +1721,7 @@ mod tests {
             .unwrap();
         let scan = ScanOperation::new(1, i64::MAX as usize).with_unroll(3).unwrap();
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let outputs = builder
@@ -1779,7 +1779,7 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
 
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
@@ -1790,7 +1790,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.clone().into());
         let runtime_length = builder.add_input(length_type.clone().into());
@@ -1868,7 +1868,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let root = builder.add_input(ReferenceType::new(empty_type.clone()).into());
@@ -1886,7 +1886,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.clone().into());
         let elements = builder.add_input(empty_type.clone().into());
@@ -2081,7 +2081,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let slice = builder.add_input(scalar_type.clone().into());
@@ -2092,7 +2092,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let stack = builder.add_input(ArrayType::new_static(DataType::F64, [4]).into());
@@ -2130,7 +2130,7 @@ mod tests {
         let dynamic_vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
 
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let extent = builder.add_input(extent_type.into());
             let value = builder.add_input(dynamic_vector_type.clone().into());
@@ -2143,7 +2143,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let values = builder.add_input(dynamic_vector_type.clone().into());
         let extent = builder
@@ -2234,7 +2234,7 @@ mod tests {
             ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
 
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let state = builder.add_input(state_type.into());
             let outputs = builder
@@ -2254,7 +2254,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let states = builder.add_input(stacked_state_type.clone().into());
         let runtime_batch = builder.add_input(batch_type.into());
@@ -2415,7 +2415,7 @@ mod tests {
         // The scan body uses both ordered classes: the scalar check contributes an assertion and the print
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut body_builder = CompositeXlaProgramBuilder::new();
+        let mut body_builder = ArrayIrXlaProgramBuilder::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let value = body_builder.add_input(scalar_type.clone().into());
@@ -2444,7 +2444,7 @@ mod tests {
         let scan = ScanOperation::new(1, 3);
 
         let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let stacked = builder.add_input(stacked_type.clone().into());
@@ -2515,7 +2515,7 @@ mod tests {
         // chain (unused here because the program ends right after the scan). Each iteration prints its item, in
         // iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(printing_sum_body().entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -2577,7 +2577,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -2595,7 +2595,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder
@@ -2694,7 +2694,7 @@ mod tests {
         let memory = Memory::Host { pinned: true };
         let slice_type = ArrayType::new_static(DataType::F64, [3]).with_memory(memory);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(slice_type.clone().into());
             builder
@@ -2755,7 +2755,7 @@ mod tests {
             ),
         ] {
             let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]).with_memory(memory);
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
@@ -2792,7 +2792,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let slice_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(slice_type.clone().into());
             builder
@@ -2846,7 +2846,7 @@ mod tests {
             let stacked_type = ArrayType::new_static(DataType::F64, [length])
                 .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
                 .unwrap();
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let region = builder.import_region(body.entry_region_ref());
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
@@ -2885,7 +2885,7 @@ mod tests {
                 .unwrap();
         let stack_type = ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(stack_sharding.clone()).unwrap();
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let row = builder.add_input(slice_type.into());
             let row = builder.add_instruction(NegOperation::new(), Vec::new(), vec![row], None).unwrap()[0];
@@ -2893,7 +2893,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![row], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let rows = builder.add_input(stack_type.clone().into());
         let rows = builder
@@ -3002,7 +3002,7 @@ mod tests {
                 .unwrap();
         let stack_type = ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(stack_sharding.clone()).unwrap();
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.clone().into());
             let row = builder.add_input(slice_type.into());
@@ -3015,7 +3015,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(carry_type.clone().into());
         let rows = builder.add_input(stack_type.clone().into());
@@ -3130,7 +3130,7 @@ mod tests {
             .with_sharding(items_sharding.local_sharding(&manual_axes).unwrap())
             .unwrap();
         let scan_body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(local_sum_type.clone().into());
             let item = builder.add_input(local_sum_type.clone().into());
@@ -3140,7 +3140,7 @@ mod tests {
                 .unwrap()
         };
         let shard_map_body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let scan_body_region = builder.import_region(scan_body.entry_region_ref());
             let sum = builder.add_input(local_sum_type.into());
             let items = builder.add_input(local_items_type.into());
@@ -3164,7 +3164,7 @@ mod tests {
             ShardMap::new(logical_mesh, shardings.clone(), shardings.clone(), manual_axes).unwrap(),
         )
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let shard_map_body_region = builder.import_program(shard_map_body);
         let sum = builder.add_input(sum_type.clone().into());
         let items = builder.add_input(items_type.clone().into());
@@ -3279,7 +3279,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let items_type = ArrayType::new_static(DataType::F64, [3]);
         let true_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let body_region = builder.import_region(printing_sum_body().entry_region_ref());
             let sum = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
@@ -3296,14 +3296,14 @@ mod tests {
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let sum = builder.add_input(scalar_type.clone().into());
             builder.add_input(items_type.clone().into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -3417,7 +3417,7 @@ mod tests {
         let items_type = ArrayType::new_static(DataType::F64, [2]);
         let state_types = [scalar_type.clone(), scalar_type.clone(), scalar_type.clone(), items_type.clone()];
         let loop_condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![inputs[0], inputs[1]], None)
@@ -3427,7 +3427,7 @@ mod tests {
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let scan_body_region = builder.import_region(printing_sum_body().entry_region_ref());
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let (index, limit, sum, items) = (inputs[0], inputs[1], inputs[2], inputs[3]);
@@ -3451,7 +3451,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
@@ -3559,7 +3559,7 @@ mod tests {
         // The body `(i, c, x) -> (c + x, c)` sums the items and stacks the running sums that it received.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -3572,7 +3572,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -3685,7 +3685,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -3698,7 +3698,7 @@ mod tests {
                 .unwrap()
         };
         let value_and_gradient = |scan: ScanOperation<ArrayIrType>, items_type: ArrayType| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let body_region = builder.import_region(body.entry_region_ref());
             let carry = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
@@ -3717,7 +3717,7 @@ mod tests {
                 .unwrap();
             let linearization = program.linearize_with_respect_to(&[1]).unwrap();
             let pullback = linearization.pullback().unwrap().into_program();
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let inputs = program.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
             let cotangent = builder.add_input(scalar_type.clone().into());
             let primal_outputs = builder.splice_program(linearization.primal(), &inputs).unwrap();

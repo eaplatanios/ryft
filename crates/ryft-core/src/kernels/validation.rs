@@ -467,7 +467,7 @@ mod tests {
     /// Concrete core values for portable kernel validation fixtures.
     type TestValue = ArrayIrValue<Array>;
 
-    /// Existing composite array operation family, including references and attached regions.
+    /// Existing array IR operation family, including references and attached regions.
     type TestOperation = ArrayIrOperation<Array>;
 
     /// Core builder used by portable kernel validation fixtures.

@@ -1043,7 +1043,7 @@ where
 /// The general [`Self::gather`] function exposes the mapping below.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # From Indices to Output Axes
 ///
@@ -1846,9 +1846,9 @@ where
     }
 }
 
-// Composite values gather through their array views. The capability's stored-constant parameter precedes its universe,
-// which the shared projection macro cannot express, and so this projection is written out. It covers composite tracers
-// and concrete composite values alike.
+// Array IR values gather through their array views. The capability's stored-constant parameter precedes its universe,
+// which the shared projection macro cannot express, and so this projection is written out. It covers array IR tracers
+// and concrete array IR values alike.
 impl<
     Stored: Value<Type = ArrayType>,
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Gather<Stored, ArrayType>>,
@@ -1874,9 +1874,8 @@ impl<
 /// according to their bounds. The output retains the exact runtime dimensions of the input and queries. Like
 /// [`Gather::gather_axis`], negative indices are out of bounds rather than indexing backward from the end.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents.
 ///
 /// # Examples
 ///
@@ -4057,7 +4056,7 @@ mod tests {
             .unwrap();
         let linearization = program.linearize().unwrap();
 
-        // A dynamically shaped input reaches the mixed member rule, never the homogeneous array rule: the composite
+        // A dynamically shaped input reaches the mixed member rule, never the homogeneous array rule: the array IR
         // rule intercepts it and delegates only fully static inputs downward. That routing is what keeps the
         // homogeneous `gather` and `slice` transpose rules static-only, and it is observable in the residual
         // signature, because retaining a runtime extent as a first-class dimension is something the homogeneous rule
@@ -4633,8 +4632,8 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_composite() {
-        // Concrete composite values gather through their array members, including through the provided functions.
+    fn test_gather_array_ir() {
+        // Concrete array IR values gather through their array members, including through the provided functions.
         let input = Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap();
         let indices = Array::vector(vec![2i32, 0]).unwrap();
         let gathered = input.gather_axis(&indices, 1, GatherMode::Clip).unwrap();

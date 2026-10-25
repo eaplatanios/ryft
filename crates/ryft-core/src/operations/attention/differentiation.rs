@@ -207,7 +207,7 @@ where
 ///
 /// The returned function retains its rules (refer to [`DifferentiableDotProductAttention`]), so it should be created
 /// once and called many times, which shares the traced rule specializations across its calls. To embed the resulting
-/// programs in a composite value universe, use
+/// programs in a heterogeneous value universe, use
 /// [`Program::into_unprojected`](crate::programs::Program::into_unprojected), which converts the staged calls together
 /// with their rules.
 ///

@@ -114,9 +114,9 @@ pub use shard_map::{
 /// for a single value; structured receivers use the same bundle with their nested leaf type.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// leaves use [`ArrayType`] and composite array IR leaves use [`ArrayIrType`], the two universes that implement this
-/// bundle (for a structured receiver, the universe of its leaf `P`). Both members execute in that universe, and generic
-/// operation bundles forward it explicitly rather than discarding their execution-family constraint.
+/// leaves use [`ArrayType`] and array IR leaves use [`ArrayIrType`], the two universes that implement this bundle (for
+/// a structured receiver, the universe of its leaf `P`). Both members execute in that universe, and generic operation
+/// bundles forward it explicitly rather than discarding their execution-family constraint.
 pub trait ShardingOperations<P: Parameter + Capability = Self, T = <P as Capability>::Universe>:
     Reshard<P, T> + ConstrainSharding<P, T>
 {

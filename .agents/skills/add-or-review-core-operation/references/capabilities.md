@@ -26,10 +26,10 @@ different role; inspect their existing contract instead of mechanically giving t
   functions bound a type view instead (e.g., `Self: Value<Type: AsArrayType + AsDimensionType>`), implementations name
   their universe explicitly (e.g., `DynamicPad<ArrayIrType>`), and a blanket implementation that serves several
   universes introduces the universe as its own type parameter (e.g., `impl<U, V: Value<Type = U>> X<U> for V`).
-- Capability traits carry the `#[capability]` attribute that checks those conventions, and declare exactly one composite
+- Capability traits carry the `#[capability]` attribute that checks those conventions, and declare exactly one array IR
   strategy: a projection through `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into
-  the composite family plus an eager `ArrayIrValue` delegation (S2), an existing composite-native path (S3), or
-  member-kind dispatch through an operation provider (S4).
+  the array IR family plus an eager `ArrayIrValue` delegation (S2), an existing family-native path (S3), or member-kind
+  dispatch through an operation provider (S4).
 - Give capability functions default bodies only when the default is correct for every implementor (e.g., by composing
   required functions), and make implementor-dependent functions required instead.
 - Only elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations
@@ -48,13 +48,13 @@ different role; inspect their existing contract instead of mechanically giving t
   the implementor, so that ..." and names the universes that actually implement it (e.g., `ArrayType` and
   `ArrayIrType`). Place it as the last paragraph before the first section heading of the trait documentation.
 
-## Composite Projection and Backend State
+## Array IR Projection and Backend State
 
-- Hand-written composite projections (i.e., capabilities whose irregular signatures the `#[capability]` attribute cannot
+- Hand-written array IR projections (i.e., capabilities whose irregular signatures the `#[capability]` attribute cannot
   project) bound the projected member by the capability (e.g., `V::Projected: Sort<ArrayType>`) and rebuild results
-  through `from_projected`. Never pin `Projected = ProjectedValue<ArrayType, V>`: that serves only composite tracers and
-  forces concrete composite values (e.g., `ArrayIrValue<A>` or a backend's composite value) to duplicate the forwarding.
-- Backend composite values that dispatch through a stateful rich domain (e.g., `ryft-xla`'s `XlaValue`) carry that state
+  through `from_projected`. Never pin `Projected = ProjectedValue<ArrayType, V>`: that serves only array IR tracers and
+  forces concrete array IR values (e.g., `ArrayIrValue<A>` or a backend's array IR value) to duplicate the forwarding.
+- Backend array IR values that dispatch through a stateful rich domain (e.g., `ryft-xla`'s `XlaValue`) carry that state
   (e.g., the session) in every member and in every projected representation, because `ValueProjection::from_projected`
   is infallible and receives no state. Host-side values enter such a domain through its constants (`Context::lift`),
   never through a state-less constructor, and host-side semantics that do not depend on the state (e.g., predicate and
@@ -65,7 +65,7 @@ different role; inspect their existing contract instead of mechanically giving t
 Values have one `Value::Domain`; `Value::Dispatch` controls whether domain-binding blanket capabilities apply. Binding
 blankets, including those that bind through a delegating helper, require `Value<Dispatch = ValueDomainDispatch>` and
 bind through `domain()`. Blankets that only compose other capabilities must remain available to `ValueDirectDispatch`
-values, as must composite projection blankets. `ValueDirectDispatch` excludes a value only from domain-binding blankets;
+values, as must array IR projection blankets. `ValueDirectDispatch` excludes a value only from domain-binding blankets;
 it does not require every capability to be implemented directly. Do not use the removed execution/dispatch-domain split
 or obsolete marker spellings from historical plans.
 

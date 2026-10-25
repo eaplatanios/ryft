@@ -387,7 +387,7 @@ mod tests {
     use ryft_core::{ArrayType, DataType, DimensionBounds, DimensionVariable, Placeholder};
 
     use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_saturating_sub_operation_lower() {
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let left = builder.add_input(DimensionType::new("left", DimensionBounds::non_negative(None).unwrap()).into());
         let right = builder.add_input(DimensionType::new("right", DimensionBounds::non_negative(None).unwrap()).into());
         let output = builder
@@ -450,7 +450,7 @@ mod tests {
             let right_variable = DimensionVariable::new("right", right_bounds);
             let left_type = DimensionType::from(left_variable.clone());
             let right_type = DimensionType::from(right_variable.clone());
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let left = builder.add_input(scalar_type.clone().into());
             let right = builder.add_input(scalar_type.clone().into());
             let left = builder

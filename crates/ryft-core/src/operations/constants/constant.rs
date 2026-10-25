@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(nan, same_nan);
         assert_eq!(hash_of(&nan), hash_of(&same_nan));
 
-        // Composite literals follow the identity of their kind.
+        // Array IR literals follow the identity of their kind.
         let dimension = DimensionValue::constant(3).unwrap();
         let dimension_operation = ConstantOperation::new(ArrayIrValue::<Array>::Dimension(dimension.clone()));
         assert_eq!(dimension_operation, ConstantOperation::new(ArrayIrValue::Dimension(dimension)));

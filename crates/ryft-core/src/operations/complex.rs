@@ -586,8 +586,8 @@ impl Imaginary for Array {
 /// It is implemented automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`](crate::ArrayIrType).
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`](crate::ArrayIrType).
 pub trait ComplexOperations<T = <Self as Capability>::Universe>:
     Capability + Complex<T> + Real<T> + Imaginary<T> + Conjugate<T>
 {

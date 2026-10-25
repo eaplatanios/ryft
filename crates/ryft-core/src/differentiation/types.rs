@@ -302,7 +302,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
 
     /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the values
-    /// of the outer forward Jacobian rather than through a Hessian-specific extractor, so this composite layout check
+    /// of the outer forward Jacobian rather than through a Hessian-specific extractor, so this combined layout check
     /// is the one block validation that cannot live inside
     /// [`extract_forward_jacobian_block`](Self::extract_forward_jacobian_block) or
     /// [`extract_reverse_jacobian_block`](Self::extract_reverse_jacobian_block), which validate their own results.

@@ -107,7 +107,7 @@ impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIr
 /// result, so differentiation returns zero for its tangent or cotangent.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///

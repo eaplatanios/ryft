@@ -553,7 +553,7 @@ mod tests {
     use crate::experimental::lowering::tests::{
         MixedValue, XlaProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
     };
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::to_mlir_module_for_program;
 
@@ -883,12 +883,12 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_dynamic_custom_call_alias() {
         use ryft_core::CustomCallOperation;
 
-        // A composite custom call receives its declared extent as trailing scalar SSA metadata, but only the array
+        // An array IR custom call receives its declared extent as trailing scalar SSA metadata, but only the array
         // operand enters the FFI call, as its static buffer at the bound. An alias continues to refer to that leading
         // operand, and the static aliased result is refined with the trailing logical extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
@@ -939,7 +939,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let operation = CustomCallOperation::new("ryft.test.unbounded", vec![output_type.clone()]);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
@@ -963,7 +963,7 @@ mod tests {
         // extent and its redundant extent operand does not refine the result.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let extent =
             builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.exact", vec![dynamic_type]);
@@ -998,7 +998,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(9)).unwrap());
         let alias_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
         let mixed_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(alias_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let alias_extent = builder
@@ -1114,7 +1114,7 @@ mod tests {
         ] {
             let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
             let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let symbolic = builder.add_input(DimensionType::from(size).into());
             let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
             let operation = CustomCallOperation::new("ryft.test.guarded", vec![output_type]).with_effect_class(effect);
@@ -1143,7 +1143,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]))
             .with_memory(Memory::Host { pinned: true });
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.guarded", vec![output_type]);
@@ -1259,7 +1259,7 @@ mod tests {
                 let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
                 let output_type =
                     ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-                let mut builder = CompositeXlaProgramBuilder::new();
+                let mut builder = ArrayIrXlaProgramBuilder::new();
                 let symbolic = builder.add_input(DimensionType::from(size).into());
                 let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
                 let inputs = if exact_first { vec![exact, symbolic] } else { vec![symbolic, exact] };
@@ -1289,7 +1289,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let alias_type = ArrayType::new_static(DataType::F64, [4]);
         let mixed_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(alias_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
@@ -1373,7 +1373,7 @@ mod tests {
         // result regains the input's runtime extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)

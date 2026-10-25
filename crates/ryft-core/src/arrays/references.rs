@@ -345,7 +345,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// allocation.
     ///
     /// This function borrows the handle, whereas the value-level [`ReferenceFreeze`](crate::ReferenceFreeze)
-    /// capability above it consumes one. The asymmetry is mechanical rather than semantic: the composite implementation
+    /// capability above it consumes one. The asymmetry is mechanical rather than semantic: the array IR implementation
     /// reaches this handle through a projection of its owned value, which yields a borrow, and the capability already
     /// enforces the linearity one layer up.
     ///
@@ -1696,9 +1696,9 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
 /// slice.
 ///
 /// The carrier lifts each of these array operations into the context's operation family through that family's
-/// [`OperationProjection<ArrayType>`](OperationProjection) member family. Any composite family that embeds the array
-/// operations (e.g., one that derives `#[ryft(members(ArrayType))]`) therefore supports array reference discharge,
-/// and core array IR and backend-owned supersets share one traversal without matching operation names.
+/// [`OperationProjection<ArrayType>`](OperationProjection) member family. Any heterogeneous family that embeds the
+/// array operations (e.g., one that derives `#[ryft(members(ArrayType))]`) therefore supports array reference
+/// discharge, and core array IR and backend-owned supersets share one traversal without matching operation names.
 struct ContextTransformCarrier<'c, C> {
     /// Context in which the slice, reshape, and update-slice operations are bound.
     context: &'c C,

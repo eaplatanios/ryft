@@ -394,11 +394,11 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
 /// Represents the ability to permute values across the participants of a named axis. Refer to the documentation
 /// of [`ParallelPermuteOperation`] for the semantics of this operation and its transformation rules.
 ///
-/// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
-/// values, which permute through their array views, share the same call syntax.
+/// The type-family parameter defaults to this value's type, so that homogeneous array values and array IR values, which
+/// permute through their array views, share the same call syntax.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -549,7 +549,7 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Parall
         axis_name: &str,
         source_target_pairs: Vec<(usize, usize)>,
     ) -> Result<Self, ProgramError> {
-        // A composite value permutes through its array view, which owns named-axis resolution and manual-axis
+        // An array IR value permutes through its array view, which owns named-axis resolution and manual-axis
         // variation, so that every permutation shares one staging path.
         Ok(V::from_projected(
             ValueProjection::<ArrayType>::into_projected(self.clone())?
@@ -1373,7 +1373,7 @@ mod tests {
             Ok(Array::vector(vec![3.0, 0.0, 1.0]).unwrap()),
         );
 
-        // A composite value permutes through its array view.
+        // An array IR value permutes through its array view.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
@@ -1488,9 +1488,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_permute_parallel_permute_composite() {
-        // Concrete composite values permute through their array members, which for concrete arrays outside a
-        // named-axis environment reports the unbound axis.
+    fn test_parallel_permute_parallel_permute_array_ir() {
+        // Concrete array IR values permute through their array members, which for concrete arrays outside a named-axis
+        // environment reports the unbound axis.
         let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(vector.clone()).parallel_permute("x", vec![(0, 1)]),
@@ -1501,7 +1501,7 @@ mod tests {
     #[test]
     fn test_parallel_permute_parallel_permute_preserves_unrelated_pending_sums() {
         // Over a manual mesh axis, an invariant value is made varying over the permuted axis while it keeps its pending
-        // sum over an unrelated axis, and a composite value stages the same permutation through its array view.
+        // sum over an unrelated axis, and an array IR value stages the same permutation through its array view.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -1597,7 +1597,7 @@ mod tests {
             Ok(Array::vector(vec![0.0f32, 0.0, 0.0]).unwrap()),
         );
 
-        // A composite value shuffles through its array view in the same way, and a permutation shorter than the axis
+        // An array IR value shuffles through its array view in the same way, and a permutation shorter than the axis
         // gives every remaining item zeros.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),

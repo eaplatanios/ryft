@@ -116,9 +116,9 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
 impl_non_differentiable_operation!(<T> StopGradientOperation<T> where T: Type);
 impl_non_transposable_operation!(<T> StopGradientOperation<T> where T: Type);
 
-// Composite tracers stop gradients by lifting the type-generic barrier into the homogeneous array member, whose
-// batching and differentiation rules then apply through the member projection. A first-class dimension input is
-// rejected by member type inference.
+// Array IR tracers stop gradients by lifting the type-generic barrier into the homogeneous array member, whose batching
+// and differentiation rules then apply through the member projection. A first-class dimension input is rejected by
+// member type inference.
 impl<A: Value<Type = ArrayType>> From<StopGradientOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_: StopGradientOperation<ArrayIrType>) -> Self {
@@ -130,7 +130,7 @@ impl<A: Value<Type = ArrayType>> From<StopGradientOperation<ArrayIrType>> for Ar
 /// that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability]
 pub trait StopGradient<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value unchanged while marking it as a constant for differentiation purposes, and a [`ProgramError`]
@@ -165,7 +165,7 @@ impl StopGradient for Array {
     }
 }
 
-// A concrete composite value stops the gradients of its array member. It uses `ValueDirectDispatch`, so the generic
+// A concrete array IR value stops the gradients of its array member. It uses `ValueDirectDispatch`, so the generic
 // implementation above never applies to it.
 impl<A: Value<Type = ArrayType> + StopGradient<ArrayType>> StopGradient<ArrayIrType> for ArrayIrValue<A> {
     #[inline]
@@ -414,13 +414,13 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_gradient_composite() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_stop_gradient_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
 
-        // Composite tracers stage the barrier as an array-member instruction.
-        let (_, program) = CompositeContext::trace(
-            |input: Tracer<CompositeContext>| input.stop_gradient(),
+        // Array IR tracers stage the barrier as an array-member instruction.
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| input.stop_gradient(),
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
         )
         .unwrap();
@@ -433,7 +433,7 @@ mod tests {
             },
         );
 
-        // Concrete composite values pass their array member through, while first-class dimension members are rejected.
+        // Concrete array IR values pass their array member through, while first-class dimension members are rejected.
         assert_eq!(vector(vec![2.0, 3.0]).stop_gradient(), Ok(vector(vec![2.0, 3.0])));
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(

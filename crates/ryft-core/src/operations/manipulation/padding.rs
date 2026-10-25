@@ -145,7 +145,7 @@ impl<T: Type> PadOperation<T> {
         self.interior_padding.as_slice()
     }
 
-    /// Renders this payload independently of its homogeneous or composite operation contract.
+    /// Renders this payload independently of its homogeneous or array IR operation contract.
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PAD_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("edge_padding_low", format_args!("{:?}", self.edge_padding_low))?;
@@ -1402,7 +1402,7 @@ impl_differentiable_operation! {
 /// of `s` corresponds to inserting `s - 1` padding elements between adjacent input elements.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1639,10 +1639,10 @@ where
 /// padded sizes or supplied dimensions that disagree with the padding formula. The padding configuration itself is
 /// static; this capability does not represent StableHLO's separate runtime-padding-amount operation `dynamic_pad`.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
-/// universes with array and dimension members can implement it as well.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
+/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
+/// array and dimension members can implement it as well.
 ///
 /// # Example
 ///

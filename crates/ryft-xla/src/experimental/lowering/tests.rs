@@ -14,7 +14,7 @@ use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as Pj
 
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::lowering::types::lower_array_ir_type;
-use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as CompositeXlaProgramBuilder};
+use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
 use crate::operations::assertions::ensure_assertion_handler_registered;
 use crate::operations::jit_call::JitCallOperation;
 use crate::operations::sharding::shard_map::to_mlir_module;
@@ -103,7 +103,7 @@ pub(crate) enum MixedValue {
     Dimension(i64),
 }
 
-/// Compiles one composite program for the mixed executable ABI and executes it once on `client`. Each logical
+/// Compiles one array IR program for the mixed executable ABI and executes it once on `client`. Each logical
 /// input receives the matching entry of `inputs` (array storage sized to the allocation bound, or one dimension),
 /// and every bounded dynamic input axis then receives its runtime extent from `extents` in boundary order.
 pub(crate) fn execute_mixed_program(
@@ -221,7 +221,7 @@ pub(crate) fn xla_neg_branch(input_type: ArrayType) -> PlainXlaProgram {
     builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
 }
 
-/// Lifts an array-only test fixture into the production composite XLA program representation.
+/// Lifts an array-only test fixture into the production array IR XLA program representation.
 pub(crate) fn unproject_plain_program(program: PlainXlaProgram) -> FlatXlaProgram {
     program.into_unprojected::<XlaConstant, XlaOperation>().unwrap()
 }
@@ -290,7 +290,7 @@ fn test_collect_nested_sharding_mesh() {
             CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
         )),
     ] {
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         builder.add_instruction(operation, vec![], vec![input], None).unwrap();
         let program = builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
@@ -320,7 +320,7 @@ fn test_collect_nested_sharding_mesh() {
 }
 
 #[test]
-fn test_composite_lowering_rejects_unresolved_reference_type() {
+fn test_array_ir_lowering_rejects_unresolved_reference_type() {
     use ryft_core::ReferenceType;
 
     let context = MlirContext::new();
@@ -333,8 +333,8 @@ fn test_composite_lowering_rejects_unresolved_reference_type() {
 }
 
 #[test]
-fn test_composite_lowering_rejects_bound_manual_output_placement() {
-    // A composite `XlaOperation::Cast` (i.e., a `CastOperation<ArrayIrType>` rather than a projected
+fn test_array_ir_lowering_rejects_bound_manual_output_placement() {
+    // An array IR `XlaOperation::Cast` (i.e., a `CastOperation<ArrayIrType>` rather than a projected
     // `ArrayOperation::Cast`) lowers without passing through `ArrayOperation::lower`, so only the family-level validation
     // of `XlaOperation::lower` sees its output placement. Its first output requests a mesh that redefines the bound manual
     // axis `x` as explicit and shards a local dimension over it, which only the region boundary may do.
@@ -349,7 +349,7 @@ fn test_composite_lowering_rejects_bound_manual_output_placement() {
             CastOperation::unchecked(output_type.clone().into(), vec![input_type.clone().into()]).unwrap(),
         )
     };
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let input = builder.add_input(vector_type.clone().into());
     let placed = builder.add_instruction(cast(&explicit_type, &vector_type), Vec::new(), vec![input], None).unwrap()[0];
     let output =
@@ -699,7 +699,7 @@ fn test_to_mlir_module_for_program_preserves_boundary_layouts() {
     let array_type =
         ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
     let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let input = builder.add_input(array_type.clone().into());
     let zero = builder.add_input(zero_type.clone().into());
     let program = builder
@@ -732,7 +732,7 @@ fn test_to_mlir_module_for_program_preserves_boundary_layouts() {
 #[test]
 fn test_to_mlir_module_for_program_lowers_captures_as_hidden_arguments() {
     let array_type = test_vector_type(4);
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let input = builder.add_input(array_type.clone().into());
     let capture = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
     let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
@@ -762,7 +762,7 @@ fn test_to_mlir_module_for_program_lowers_immediate_dimension_constants_in_place
     // capture argument. That is exactly what makes first-class extents usable where no capture table is
     // reachable, such as inside a `shard_map` manual region.
     let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let extent = builder.add_constant(XlaConstant::Dimension(DimensionValue::new(extent_type, 4).unwrap()));
     let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![extent], None).unwrap()[0];
     let program = builder
@@ -787,7 +787,7 @@ fn test_to_mlir_module_for_program_lowers_immediate_dimension_constants_in_place
 #[test]
 fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() {
     let array_type = test_vector_type(4);
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
     let program = builder
         .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
@@ -814,13 +814,13 @@ fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() 
 fn test_to_mlir_module_for_program_forwards_capture_into_nested_regions() {
     let array_type = test_vector_type(4);
     let branch = || {
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap()
     };
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let true_region = builder.import_program(branch());
     let false_region = builder.import_program(branch());
     let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -857,7 +857,7 @@ fn test_to_mlir_module_for_program_forwards_capture_into_nested_regions() {
 
 /// Stages one `jit_call` to `callee` (interned as a shared callee root region) over `inputs` in `builder`.
 pub(crate) fn add_xla_jit_call(
-    builder: &mut CompositeXlaProgramBuilder,
+    builder: &mut ArrayIrXlaProgramBuilder,
     callee: &Arc<FlatXlaProgram>,
     inputs: Vec<AtomId>,
 ) -> AtomId {
@@ -883,7 +883,7 @@ pub(crate) fn lower_replicated_shard_map_body(
         ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]).unwrap(),
     )
     .unwrap();
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let input = builder.add_input(vector_type.clone().into());
     let body = builder.import_program(body_program);
     let output =
@@ -1232,7 +1232,7 @@ fn test_xla_lowering_rejects_preserved_reference_entries() {
     use ryft_core::kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_core::{ReferenceReadOperation, ReferenceType};
 
-    let mut builder = CompositeXlaProgramBuilder::new();
+    let mut builder = ArrayIrXlaProgramBuilder::new();
     let scalar_type = ArrayType::scalar(DataType::F32);
     let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
     let snapshot =

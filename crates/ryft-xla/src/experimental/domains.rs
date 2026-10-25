@@ -913,7 +913,7 @@ fn ensure_effect_dispatch_allowed() -> Result<(), XlaDomainError> {
 /// than an execution domain without a client.
 ///
 /// The concrete values of this domain are [`XlaValue`]s, every member of which carries the domain that it belongs to.
-/// Composite values therefore dispatch their capabilities through this domain eagerly, free transform entry points
+/// Array IR values therefore dispatch their capabilities through this domain eagerly, free transform entry points
 /// recover it from their inputs, and first-class dimensions can produce arrays (e.g., when compared or converted to
 /// scalars) without an explicit context.
 pub struct XlaDomain<'c> {
@@ -4107,7 +4107,7 @@ impl<'c> XlaDomain<'c> {
         }
         for (declared, input) in executable.input_types().iter().zip(request.inputs()) {
             let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
-            // Array inputs borrow their types, while the composite type of other inputs is built only to report them.
+            // Array inputs borrow their types, while the array IR type of other inputs is built only to report them.
             match input {
                 XlaValue::Array(array) => validate_xla_input_type(declared, &array.r#type())?,
                 input => validate_xla_input_type(
@@ -5519,7 +5519,7 @@ fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Opti
     }
 }
 
-/// Applies an optional per-leaf sharding override to a public composite signature. When overrides are provided, every
+/// Applies an optional per-leaf sharding override to a public array IR signature. When overrides are provided, every
 /// overridden leaf must be an array: first-class dimensions are internal SSA values, and references must be discharged
 /// into explicit array state before either kind can cross the PJRT ABI. Note that without overrides the signature
 /// passes through unchecked here; non-array boundary leaves are rejected by the later array-only conversions on the
@@ -10403,7 +10403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_production_composite_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
+    fn test_production_array_ir_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
@@ -10618,7 +10618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_production_composite_lowering_executes_dynamic_slice_with_dimensions() {
+    fn test_production_array_ir_lowering_executes_dynamic_slice_with_dimensions() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
@@ -14070,7 +14070,7 @@ mod tests {
                     result,
                     Err(ProgramError::Concretization {
                         message: "host dimension `cast` cannot retain an array witness producer; bind the cast \
-                                  through a composite context"
+                                  through an array IR context"
                             .to_owned(),
                     })
                 );

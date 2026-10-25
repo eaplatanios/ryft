@@ -630,10 +630,10 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// [`broadcast_input`](ArrayExtentBatchingPolicy::broadcast_input). [`ArrayBatchingPolicy`] runs the rule
 /// with its own extent policy. [`ArrayIrBatchingPolicy`] runs it over the array inputs of its projected
 /// [`DynamicArrayExtentBatchingPolicy`] view, whose implementation of this trait binds the extent computations
-/// in the composite parent context, and then reinserts replicated dimension observations, which have no array view.
+/// in the array IR parent context, and then reinserts replicated dimension observations, which have no array view.
 ///
 /// [`StaticArrayExtentBatchingPolicy`] implements this trait for every array context and
-/// [`DynamicArrayExtentBatchingPolicy`] for projected composite contexts. Both implementations are generic over `P`, so
+/// [`DynamicArrayExtentBatchingPolicy`] for projected array IR contexts. Both implementations are generic over `P`, so
 /// a custom extent policy can reuse either one for its context without restricting its extent's Rust type. Individual
 /// ordinary operation rules and guard/cast batching do not require this trait. An operation family's generated batching
 /// implementation still requires support for every variant, including assertions when present.
@@ -756,9 +756,9 @@ where
     V: ValueProjection<ArrayType, Projected: Select>,
     P: ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>, Extent = C::Value>,
 {
-    // A projected dynamic batch uses the same first-class extent as its composite parent. That extent and the
-    // dimensions derived from it exist only as composite dimension values, so these functions bind their extent
-    // computations in the composite parent context and project the resulting arrays back into the array view.
+    // A projected dynamic batch uses the same first-class extent as its array IR parent. That extent and the
+    // dimensions derived from it exist only as array IR dimension values, so these functions bind their extent
+    // computations in the array IR parent context and project the resulting arrays back into the array view.
 
     fn batch_item_indices(
         context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<P>>,
@@ -849,7 +849,7 @@ where
 /// is known to pass.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability]
 pub trait Assert<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Requires this scalar Boolean value to be true. A failure reports the message and named scalar observations.
@@ -3905,7 +3905,7 @@ mod tests {
                 in ()"#},
         );
 
-        // A known success stages no assertion, including through the projected array of a composite value.
+        // A known success stages no assertion, including through the projected array of an array IR value.
         let (_, folded) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
                 let condition = input.domain().lift(Array::scalar(true).unwrap())?;
@@ -4074,7 +4074,7 @@ mod tests {
         assert_eq!(Array::scalar(3.25f32).unwrap().assertion_observation(), Ok("3.25".to_owned()));
         assert_eq!(Array::scalar(-4.75f64).unwrap().assertion_observation(), Ok("-4.75".to_owned()));
 
-        // Composite values preserve array formatting and render dimensions as scalar extents.
+        // Array IR values preserve array formatting and render dimensions as scalar extents.
         let array = ArrayIrValue::Array(Array::scalar(12i32).unwrap());
         assert_eq!(array.assertion_observation(), Ok("12".to_owned()));
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(7).unwrap());
@@ -4106,7 +4106,7 @@ mod tests {
 
     #[test]
     fn test_assertion_value_assertion_array() {
-        // Both scalar and shaped arrays retain their concrete representation through the composite wrapper.
+        // Both scalar and shaped arrays retain their concrete representation through the array IR wrapper.
         let scalar = Array::scalar(true).unwrap();
         assert_eq!(scalar.assertion_array(), Ok(Some(scalar.clone())));
         assert_eq!(ArrayIrValue::Array(scalar.clone()).assertion_array(), Ok(Some(scalar)));
@@ -5147,7 +5147,7 @@ mod tests {
     #[test]
     fn test_guard_batching_manual_sharding() {
         // Removing the physical batch placement exposes manual variation in the per-item type. Lifting the checked
-        // declaration must restore that placement for homogeneous arrays, composite arrays, and reference referents.
+        // declaration must restore that placement for homogeneous arrays, array IR values, and reference referents.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let packed = ArrayType::new_static(DataType::F32, [3, 2])
             .with_sharding(
@@ -5559,11 +5559,11 @@ mod tests {
             ArrayOperation::<Array>::provide(guard.clone(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
-        let composite_type = ArrayIrType::from(r#type.clone());
-        let composite_guard = GuardOperation::new("region", vec![composite_type.clone()]);
+        let array_ir_type = ArrayIrType::from(r#type.clone());
+        let array_ir_guard = GuardOperation::new("region", vec![array_ir_type.clone()]);
         assert!(matches!(
-            ArrayIrOperation::<Array>::provide(composite_guard.clone(), &[&composite_type]),
-            Ok(ArrayIrOperation::Guard(actual)) if actual == composite_guard,
+            ArrayIrOperation::<Array>::provide(array_ir_guard.clone(), &[&array_ir_type]),
+            Ok(ArrayIrOperation::Guard(actual)) if actual == array_ir_guard,
         ));
         assert!(matches!(
             ConstantOperation::<Array>::provide(guard.clone(), &[]),

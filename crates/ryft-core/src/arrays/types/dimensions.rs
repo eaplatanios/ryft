@@ -673,9 +673,9 @@ impl From<&DimensionVariable> for Dimension {
 }
 
 /// [`TypeRefinements`] for a complete [`DimensionType`] signature. They follow the rules of first-class dimension
-/// members in the composite array universe: each actual dimension must have bounds within its declared bounds, a
-/// differently named actual identity is linked to the declared one, and each connected class shares its exact fact, so
-/// that a repeated declared identity rejects actual inputs of different extents (e.g., `[dimension<n>, dimension<n>]`
+/// members in the array IR universe: each actual dimension must have bounds within its declared bounds, a differently
+/// named actual identity is linked to the declared one, and each connected class shares its exact fact, so that a
+/// repeated declared identity rejects actual inputs of different extents (e.g., `[dimension<n>, dimension<n>]`
 /// supplied with extents `2` and `3`). The declared and actual facts stay in separate scopes, as documented on
 /// [`DimensionRefinements`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -805,7 +805,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
     }
 }
 
-/// Shared dimension identity facts used by array, first-class dimension, and composite array IR [`TypeRefinements`].
+/// Shared dimension identity facts used by array, first-class dimension, and array IR [`TypeRefinements`].
 /// [`Type`]-specific [`TypeRefinements`] implementations validate their input signatures and collect these facts.
 /// Operations can also construct an empty set with [`Default`] and record exact extents with
 /// [`Self::record_declared_extent`] or [`Self::record_input_refinement`]. To apply such facts
@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn test_dimension_type_programs_check_repeated_identities() {
         // A standalone dimension program and an entry guard over dimensions both reject different extents for a
-        // repeated identity, like their composite counterparts.
+        // repeated identity, like their array IR counterparts.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let first = builder.add_input(n.clone());

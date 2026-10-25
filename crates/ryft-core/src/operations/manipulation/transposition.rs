@@ -348,7 +348,7 @@ impl_differentiable_operation! {
 /// their corresponding arithmetic [`Operation`]s.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Examples
 ///
@@ -1405,8 +1405,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_transpose_reversed_composite() {
-        // Composite values reverse the axes of their array members, and first-class dimensions are rejected.
+    fn test_transpose_transpose_reversed_array_ir() {
+        // Array IR valuesreverse the axes of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).transpose_reversed(),
@@ -1457,8 +1457,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_matrix_transpose_composite() {
-        // Composite values transpose their array members as matrices, and first-class dimensions are rejected.
+    fn test_transpose_matrix_transpose_array_ir() {
+        // Array IR valuestranspose their array members as matrices, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).matrix_transpose(),
@@ -1567,8 +1567,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_move_axis_composite() {
-        // Composite values move the axes of their array members, and first-class dimensions are rejected.
+    fn test_transpose_move_axis_array_ir() {
+        // Array IR valuesmove the axes of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).move_axis(0, 1),
@@ -1635,8 +1635,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_swap_axes_composite() {
-        // Composite values swap the axes of their array members, and first-class dimensions are rejected.
+    fn test_transpose_swap_axes_array_ir() {
+        // Array IR valuesswap the axes of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).swap_axes(0, -1),

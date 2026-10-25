@@ -1772,7 +1772,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>> Membe
 /// which determines whether zero-input kernels are supported.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability]
 pub trait CustomCall<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Calls the foreign kernel described by `operation` with the provided inputs, returning one value per
@@ -1809,7 +1809,7 @@ impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<
     where
         Self: 'o,
     {
-        // A concrete composite value executes the kernel on its array members through the mixed-universe interpretation
+        // A concrete array IR value executes the kernel on its array members through the mixed-universe interpretation
         // rule, which also verifies the extents of dynamic outputs against the trailing dimension inputs. It uses
         // `ValueDirectDispatch`, so the generic implementation below never applies to it.
         let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
@@ -1828,10 +1828,10 @@ impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context
         Self: 'o,
     {
         // Any context-carrying value calls foreign kernels by binding a `CustomCallOperation` through its own context,
-        // in either universe, because the operation is also a native member operation of the composite array IR
-        // universe. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement
-        // the capability directly, so it covers the transform tracers and backend-owned values without conflicting
-        // with the concrete implementations above.
+        // in either universe, because the operation is also a native member operation of the array IR universe. The
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers and backend-owned values without conflicting with the concrete
+        // implementations above.
         let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(ProgramError::UnsupportedOperation {
@@ -2824,7 +2824,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_type_inference_array_ir() {
-        // Composite output extents are positional instruction inputs: output-major and then axis-major.
+        // Array IR output extents are positional instruction inputs: output-major and then axis-major.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(17)).unwrap());
         let dynamic_output_type = ArrayType::new(
@@ -3416,7 +3416,7 @@ mod tests {
     #[test]
     fn test_custom_call_batching_array_ir_delegation() -> Result<(), ProgramError> {
         // An extent-free call over a static mapped extent is exactly the homogeneous contract, so the mixed rule
-        // delegates to the projected homogeneous rule and lifts its result back into the composite universe, where the
+        // delegates to the projected homogeneous rule and lifts its result back into the array IR universe, where the
         // projected policy materializes the replicated input through a dimension-valued broadcast.
         let operation = CustomCallOperation::new("ryft.test.add", vec![ArrayType::new_static(DataType::F32, [2])])
             .with_batching(CustomCallBatching::BroadcastAll);
@@ -5292,7 +5292,7 @@ mod tests {
 
     #[test]
     fn test_custom_call_transposition_array_ir() {
-        // Transposition of the mixed carrier routes through the composite dispatch to the projected nonlinear rule.
+        // Transposition of the mixed carrier routes through the array IR dispatch to the projected nonlinear rule.
         check_operation_transposition!(
             @rejected,
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
@@ -5319,7 +5319,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_custom_call() {
-        // Concrete composite values call the kernel on their array members.
+        // Concrete array IR values call the kernel on their array members.
         let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])]);
         assert!(matches!(
             ArrayIrValue::custom_call(&operation, [&ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap())]),

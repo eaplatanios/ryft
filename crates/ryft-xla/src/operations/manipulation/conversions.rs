@@ -257,7 +257,7 @@ impl LowerableOperation for CastOperation<ArrayIrType> {
     }
 }
 
-/// Lowers the same complete cast contract for native and composite type families. Witness producers are explicit
+/// Lowers the same complete cast contract for native and array IR type families. Witness producers are explicit
 /// dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered after preceding
 /// assertions: its dependency barrier consumes the current assertion token, without advancing it, whether or not the
 /// cast emits a check of its own (it emits none when the actual input types prove its relationship), whereas an
@@ -1035,7 +1035,7 @@ mod tests {
     use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::to_mlir_module_for_program;
 
@@ -1243,7 +1243,7 @@ mod tests {
         use crate::tests::execution_client;
 
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let value = builder.add_input(n.clone().into());
         let output = builder
             .add_instruction(
@@ -1434,7 +1434,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let body = |index, checked| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             if index {
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
             }
@@ -1469,7 +1469,7 @@ mod tests {
                 if wrapper == 0 && !entered {
                     continue;
                 }
-                let mut builder = CompositeXlaProgramBuilder::new();
+                let mut builder = ArrayIrXlaProgramBuilder::new();
                 let input = builder.add_input(symbolic.clone());
                 let region = builder.import_program(body(wrapper >= 3, true));
                 let output = match wrapper {
@@ -1499,7 +1499,7 @@ mod tests {
                             .unwrap()[0]
                     }
                     2 => {
-                        let mut condition = CompositeXlaProgramBuilder::new();
+                        let mut condition = ArrayIrXlaProgramBuilder::new();
                         condition.add_input(symbolic.clone());
                         let predicate = condition.add_constant(XlaConstant::Boolean(entered));
                         let condition = condition
@@ -1592,7 +1592,7 @@ mod tests {
             sharding,
         )
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(scalar.into());
         let body = builder.import_region(traced.body().entry_region_ref());
         let output = builder.add_instruction(traced.operation().clone(), vec![body], vec![input], None).unwrap()[0];
@@ -1625,7 +1625,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         let output = ArrayType::new_static(DataType::F64, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let value = builder.add_input(input.clone().into());
         let result = builder
             .add_instruction(
@@ -1705,7 +1705,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_input(exact);
         let second = builder.add_input(symbolic.clone());
         let narrowed = builder
@@ -1800,7 +1800,7 @@ mod tests {
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
         let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(array.clone().into());
         let input = builder
             .add_instruction(
@@ -1811,7 +1811,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        // Exercise the homogeneous-array rule inside the composite program, including empty dense shapes.
+        // Exercise the homogeneous-array rule inside the array IR program, including empty dense shapes.
         let output = builder
             .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
@@ -1909,7 +1909,7 @@ mod tests {
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(array.clone().into());
         let input = builder
             .add_instruction(
@@ -2395,7 +2395,7 @@ mod tests {
             ),
         ];
         for (witness_type, expected_module) in cases {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let witness = builder.add_input(witness_type.clone().into());
             let value = builder.add_input(input_type.clone().into());
             let output = builder
@@ -2455,7 +2455,7 @@ mod tests {
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let swapped =
             ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
@@ -2507,7 +2507,7 @@ mod tests {
         assert!(error.contains("must have one extent in `cast`"), "{error}");
 
         // Keeping the original source and output types accepts rectangular shapes.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let value = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
@@ -2540,7 +2540,7 @@ mod tests {
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]));
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let witness = builder.add_input(witness_type.clone().into());
         let output = builder
@@ -2599,7 +2599,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension()]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let witness = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let output = builder
@@ -2743,7 +2743,7 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F64, [2, 3]);
         let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
         let laid_out = symbolic.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(exact.clone().into());
         let witness = builder.add_input(symbolic.clone().into());
         let widened = builder
@@ -2891,7 +2891,7 @@ mod tests {
         let laid_out = source.clone().with_layout(layout.clone());
         let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone());
         let copied = ArrayType::new_static(DataType::F64, [6]);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(source.clone().into());
         let value = builder
             .add_instruction(
@@ -3032,7 +3032,7 @@ mod tests {
 
         // Different specified representations are admitted before lowering materializes the requested output.
         for (input_type, output_type) in [(contiguous, strided), (sharded, replicated)] {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
@@ -3053,7 +3053,7 @@ mod tests {
             .clone()
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
@@ -3476,7 +3476,7 @@ mod tests {
             let sharded = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
             let input_type = symbolic.clone().with_sharding(replicated.clone()).unwrap();
             let output_type = symbolic.clone().with_sharding(sharded.clone()).unwrap();
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
@@ -3680,7 +3680,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
         for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
             let output = builder
@@ -3741,7 +3741,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
         for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
             let output = builder

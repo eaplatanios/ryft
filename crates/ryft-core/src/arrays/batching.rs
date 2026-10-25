@@ -393,7 +393,7 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     }
 }
 
-/// Packed array, reference, or replicated first-class dimension used by composite array batching. Arrays and references
+/// Packed array, reference, or replicated first-class dimension used by array IR batching. Arrays and references
 /// carry their mapped axis in the array or referent shape. A dimension is shared unchanged across the batch, so
 /// assigning it a mapped axis is rejected by [`Self::new`].
 #[derive(Clone, Debug, PartialEq, Parameter)]
@@ -528,7 +528,7 @@ impl<V: Value<Type = ArrayIrType>> Display for ArrayIrBatch<V> {
 
 /// Result of batching an array IR [`Region`], whose boundary explicitly threads its mapped extent.
 ///
-/// Composite regions are retraced as standalone programs and therefore cannot capture the parent program's first-class
+/// Array IR regions are retraced as standalone programs and therefore cannot capture the parent program's first-class
 /// mapped extent Single Static Assignment (SSA) value. Their boundary instead gains one additional leading dimension
 /// input and output where the input defines the identity referenced by every inserted dynamic batch dimension, and the
 /// output forwards that same atom so that enclosing higher-order operations can carry it through the sealed region. For
@@ -611,9 +611,9 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> BatchedProg
 }
 
 /// Array-specific capability that lets one homogeneous-array batching rule set serve multiple extent representations.
-/// Ordinary array batching and projected array batching inside a composite array/dimension program share everything
-/// that makes an array rule what it is (e.g., the [`ArrayBatch`] carrier, the shared elementwise alignment algorithm,
-/// and every per-operation [`BatchableOperation`] implementation). They differ in exactly two ways:
+/// Ordinary array batching and projected array batching inside an array IR program share everything that makes an
+/// array rule what it is (e.g., the [`ArrayBatch`] carrier, the shared elementwise alignment algorithm, and every
+/// per-operation [`BatchableOperation`] implementation). They differ in exactly two ways:
 ///
 ///   - **Extent Representation:** Ordinary batching knows its mapped-axis extent as one static host `usize`. Projected
 ///     batching's extent is an ordinary parent-owned first-class dimension value, so a dynamic batch extent remains a
@@ -631,7 +631,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> BatchedProg
 /// binding lets every rule rely on that without restating it. The shared rules are written once against the nominal
 /// [`ArrayBatchingPolicy<P>`] family rather than as a `P: ArrayExtentBatchingPolicy` blanket, because Rust coherence
 /// cannot use the _absence_ of a trait implementation to prove such a blanket disjoint from the genuinely mixed
-/// composite operation rules registered for other policies.
+/// array IR operation rules registered for other policies.
 ///
 /// Keeping this capability on the batching transform, rather than on [`ProjectedContext`], [`ArrayBatch`], or [`Type`],
 /// means that neither the carrier nor the type contract needs to know anything about dynamic-shape state that only
@@ -803,10 +803,10 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayExtentBatc
 
 /// [`ArrayExtentBatchingPolicy`] used while a homogeneous array rule runs inside an array IR batching transform.
 ///
-/// When composite batching reaches an array member operation, it projects the operation and its batches into the
+/// When array IR batching reaches an array member operation, it projects the operation and its batches into the
 /// zero-state [`ProjectedContext`] over [`ArrayType`] and reuses the homogeneous rule unchanged: batches remain
-/// ordinary [`ArrayBatch`]es, and so the rule cannot tell it is running inside a composite program. What does change is
-/// extent representation. The mapped-axis extent is the outer composite context's first-class dimension value rather
+/// ordinary [`ArrayBatch`]es, and so the rule cannot tell it is running inside an array IR program. What does change is
+/// extent representation. The mapped-axis extent is the outer array IR context's first-class dimension value rather
 /// than a static host `usize`, and so a dynamic batch extent remains an ordinary Single Static Assignment (SSA) value.
 ///
 /// This [`ArrayExtentBatchingPolicy`] implementation is correspondingly the only place that translates a homogeneous
@@ -953,8 +953,8 @@ where
             .normalize(output_rank)
             .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
 
-        // The broadcast is a mixed operation, so it is staged in the composite parent (i.e., two levels up, past this
-        // batching level and past the projected array view) on the lifted composite value, and the result is projected
+        // The broadcast is a mixed operation, so it is staged in the array IR parent (i.e., two levels up, past this
+        // batching level and past the projected array view) on the lifted array IR value, and the result is projected
         // back into the array member afterward.
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
         let value =
@@ -995,7 +995,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
 
         // The algorithm already decided where every input axis lands (i.e., `output_axes`) and which batch axis the
-        // result carries, so this step only stages the mixed broadcast in the composite parent.
+        // result carries, so this step only stages the mixed broadcast in the array IR parent.
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
         let value = value.dynamic_broadcast_with_output_sharding(
             &output_dimensions,
@@ -1007,10 +1007,10 @@ where
 }
 
 /// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayExtentBatchingPolicy`]. The default
-/// [`StaticArrayExtentBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use the
+/// [`StaticArrayExtentBatchingPolicy`] preserves the ordinary public array batching API. Array IR programs use the
 /// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies under this nominal
 /// policy family lets every homogeneous array operation share one generated dispatcher without making those
-/// implementations overlap genuinely mixed composite-operation rules. The wrapper delegates its batch carrier and
+/// implementations overlap genuinely mixed array IR operation rules. The wrapper delegates its batch carrier and
 /// extent representation to `P`. Array-specific alignment is supplied by `P`'s [`ArrayExtentBatchingPolicy`]
 /// implementation.
 pub struct ArrayBatchingPolicy<P = StaticArrayExtentBatchingPolicy>(PhantomData<fn() -> P>);
@@ -1302,7 +1302,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypo
 /// [`ArrayIrType::Array`] members may carry a mapped axis. [`ArrayIrType::Dimension`] members are shared shape values
 /// and therefore remain replicated. [`ArrayIrType::Reference`]s carry the mapped axis of their referents, which is
 /// fixed by the input or allocation that produced the reference and can never be moved or broadcast by a rule;
-/// references have no [`BatchingPolicyProjection`], so the reference operations own their composite batching rules
+/// references have no [`BatchingPolicyProjection`], so the reference operations own their array IR batching rules
 /// directly. The mapped axis extent is itself an ordinary parent-owned dimension value, so dynamic extents remain as
 /// Single Static Assignment (SSA) values rather than becoming transform metadata.
 ///
@@ -1424,7 +1424,7 @@ where
 }
 
 // First-class dimensions are shared shape metadata. Their member operations bind once in the parent context;
-// the composite carrier constructor rejects a mapped axis before projection.
+// the array IR carrier constructor rejects a mapped axis before projection.
 impl<C: ContextProjection<DimensionType, Type = ArrayIrType>> ReplicatedBatchingPolicyProjection<C, DimensionType>
     for ArrayIrBatchingPolicy
 {
@@ -1612,7 +1612,7 @@ where
         batch: Self::Batch,
         axis: Axis,
     ) -> Result<Self::Batch, BatchingError> {
-        // Aligns one composite array batch to `axis`, moving an existing mapped axis or dynamically broadcasting a
+        // Aligns one array IR batch to `axis`, moving an existing mapped axis or dynamically broadcasting a
         // replicated array with the context's first-class extent. A reference's batch axis is fixed by its referent,
         // so a reference batch is returned unchanged when it already carries `axis` and rejected otherwise; first-class
         // dimensions have no packed axis and are always rejected. The mapped move transposes through the value's
@@ -2185,7 +2185,7 @@ where
     ///
     /// This method is intentionally specific to [`ArrayType`]. It constructs mapped batched input types by inserting
     /// static [`Dimension`]s, rewrites array sharding metadata, and materializes output axes through [`ArrayBatch`].
-    /// Composite program families with first-class dynamic dimension extent values instead own structural recursion
+    /// Heterogeneous program families with first-class dynamic dimension extent values instead own structural recursion
     /// through [`RecursiveBatchingPolicy::batch_program`], where the [`RecursiveBatchingPolicy`] can define how extent
     /// Single Static Assignment (SSA) values cross a rewritten region boundary.
     ///
@@ -2524,10 +2524,10 @@ impl<
 where
     TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
 {
-    /// Structurally batches this composite array IR [`Program`] over the provided input axes, threading the batch
-    /// extent as a leading runtime dimension input instead of specializing on a static size.
+    /// Structurally batches this array IR [`Program`] over the provided input axes, threading the batch extent as a
+    /// leading runtime dimension input instead of specializing on a static size.
     ///
-    /// This is the composite counterpart of the homogeneous [`ArrayType`] `Program::batched` entry point: the mapped
+    /// This is the array IR counterpart of the homogeneous [`ArrayType`] `Program::batched` entry point: the mapped
     /// extent is a first-class [`DimensionType`] value supplied at invocation time, so the transformed program carries
     /// [`ArrayIrBatchingPolicy`]'s leading mapped-extent input and forwarded output, while its
     /// [`BatchedProgram::output_axes`] continue to describe only the source program's public outputs. The new batch
@@ -2833,7 +2833,7 @@ impl BatchableType for ArrayIrType {
 }
 
 /// Derives the common [`ShardingDimension`] of mapped axes from packed array types and normalized axis positions.
-/// This representation-neutral helper lets homogeneous and composite batching share the same placement join without
+/// This representation-neutral helper lets homogeneous and array IR batching share the same placement join without
 /// projecting or cloning array payloads.
 fn batch_axis_sharding<T: std::borrow::Borrow<ArrayType>, I: IntoIterator<Item = (T, Option<usize>)>>(
     inputs: I,
@@ -3054,10 +3054,10 @@ mod tests {
 
     use super::*;
 
-    /// Eager composite context shared by array, dimension, and reference batching tests.
+    /// Eager array IR context shared by array, dimension, and reference batching tests.
     type ArrayIrEagerContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Tracing composite context shared by batching tests.
+    /// Tracing array IR context shared by batching tests.
     type ArrayIrTraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     #[test]
@@ -3486,7 +3486,7 @@ mod tests {
             "a structurally batched program with a threaded extent must have a leading input and output",
         );
 
-        // The leading bookkeeping input must be a first-class dimension rather than an arbitrary composite member.
+        // The leading bookkeeping input must be a first-class dimension rather than an arbitrary array IR member.
         let mut builder = TestProgramBuilder::new();
         let array = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -3659,7 +3659,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_array_extent_batching_policy() -> Result<(), BatchingError> {
-        // The dynamic policy carries projected array members of a composite context in the same `ArrayBatch` carrier
+        // The dynamic policy carries projected array members of an array IR context in the same `ArrayBatch` carrier
         // as the static policy, so its `BatchingPolicy` surface is the same delegation over projected values.
         type Projected = ProjectedContext<ArrayIrTraceContext, ArrayType>;
         let trace = ArrayIrTraceContext::new();
@@ -3759,7 +3759,7 @@ mod tests {
         assert_eq!(moved.unbatched_type(), ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])),);
         let moved_id = moved.into_value().into_value().atom_id()?;
 
-        // A replicated batch gains the mapped axis through a dynamic broadcast staged in the composite parent, using
+        // A replicated batch gains the mapped axis through a dynamic broadcast staged in the array IR parent, using
         // the first-class extent for the new axis, and the request is normalized against the rank after insertion.
         let batch = ArrayBatch::replicated(replicated.into_projected()?);
         let broadcasted = DynamicArrayExtentBatchingPolicy::match_axis(&context, &batch, Axis::from(-1))?;
@@ -3798,7 +3798,7 @@ mod tests {
         // The algorithm has already decided the input-to-output axis mapping and the result's batch axis. The policy
         // materializes each output dimension source in first-class form (an exact constant for a static dimension, a
         // `dimension_size` read for a per-item dimension taken from another input, and the transform's own extent for
-        // the mapped axis), then stages the mixed broadcast in the composite parent.
+        // the mapped axis), then stages the mixed broadcast in the array IR parent.
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let width = DimensionVariable::new("width", DimensionBounds::new(1, Some(9)).unwrap());
@@ -4468,7 +4468,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_batching_policy_batch() {
-        // The composite policy's carrier is `ArrayIrBatch`, so `batch` derives the member kind from the value's type
+        // The array IR policy's carrier is `ArrayIrBatch`, so `batch` derives the member kind from the value's type
         // and checks the axis against it: arrays and references map an axis of the (referent) array, while a
         // first-class dimension admits only the replicated axis.
         let matrix = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
@@ -4836,7 +4836,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_batching_policy_batch_region() -> Result<(), ProgramError> {
-        // The composite replay interprets a region over `ArrayIrBatch` carriers against the parent context: constants
+        // The array IR replay interprets a region over `ArrayIrBatch` carriers against the parent context: constants
         // are lifted through the checked constructor and replicated, and each instruction runs its batching rule.
         let trace = ArrayIrTraceContext::new();
         let input = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
@@ -5448,7 +5448,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_batching_policy_bind_dispatch() -> Result<(), ProgramError> {
-        // Binding through a composite batching context dispatches each operation to its batching rule with the
+        // Binding through an array IR batching context dispatches each operation to its batching rule with the
         // `ArrayIrBatch` carriers unpacked and repackaged around it, without projecting their member kind. A
         // homogeneous array rule runs unchanged, and first-class dimensions flow through replicated.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
@@ -5593,7 +5593,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_batching_policy_bind_dispatch_replicated_dimension_operations() -> Result<(), ProgramError> {
-        // Homogeneous dimension operations have no batching rules of their own. The composite dispatcher binds each
+        // Homogeneous dimension operations have no batching rules of their own. The array IR dispatcher binds each
         // one once in the parent context under the replicated dimension policy, so a zero-input constant produces a
         // replicated dimension, and checked arithmetic keeps its single ordered assertion and its runtime failure
         // rather than running once per batch item.
@@ -5707,7 +5707,7 @@ mod tests {
 
     #[test]
     fn test_batching_tracer_value_projection() -> Result<(), ProgramError> {
-        // A composite batching tracer projects onto a member type through its per-item type: the projected value wraps
+        // An array IR batching tracer projects onto a member type through its per-item type: the projected value wraps
         // the tracer itself (there is no tracer of a projected context), and lifting simply unwraps it. A carrier of
         // another member kind fails the projection.
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
@@ -6838,7 +6838,7 @@ mod tests {
             ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 20.0, 30.0, 10.0, 20.0, 30.0],).unwrap()),
         );
 
-        // A named composite specification reaches the policy-selected context, and an explicit first-class extent
+        // A named array IR specification reaches the policy-selected context, and an explicit first-class extent
         // drives mapped output materialization when every input is replicated.
         let named_extent = BatchAxisSpecification::new(ArrayIrValue::Dimension(DimensionValue::constant(2)?), "items");
         let explicitly_broadcasted: ArrayIrValue<Array> = batch(
@@ -6938,7 +6938,7 @@ mod tests {
         );
         assert_eq!(Some(trace.builder().borrow().instructions().len()), staged_before_derivation);
 
-        // Nested public batching selects the composite policy again from the outer batching context.
+        // Nested public batching selects the array IR policy again from the outer batching context.
         let nested: ArrayIrValue<Array> = batch(
             |row| batch(|item| Ok(item), row, BatchAxis::new(0), BatchAxis::new(0), None).map_err(Into::into),
             matrix.clone(),
@@ -6998,7 +6998,7 @@ mod tests {
 
     #[test]
     fn test_program_batched_with_threaded_extent() -> Result<(), ProgramError> {
-        // Structurally batching a composite program with a threaded extent gives the result one leading dimension input
+        // Structurally batching an array IR program with a threaded extent gives the result one leading dimension input
         // of the requested extent type and forwards it as the leading output. The reported output axes exclude that
         // bookkeeping output, and every mapped boundary type carries the extent at its batch axis.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -7094,8 +7094,8 @@ mod tests {
     }
 
     #[test]
-    fn test_program_batched_with_threaded_extent_threads_composite_region_boundary() -> Result<(), ProgramError> {
-        // Composite control flow batched under a replicated predicate keeps one structural instruction whose regions
+    fn test_program_batched_with_threaded_extent_threads_array_ir_region_boundary() -> Result<(), ProgramError> {
+        // Array IR control flow batched under a replicated predicate keeps one structural instruction whose regions
         // are batched programs with the threaded extent as leading state, and the reported output axes exclude the
         // bookkeeping value. Branch alignment, per-item selection, and loop semantics are covered by the operations'
         // own tests; this test pins the boundary contract that this module threads through them.

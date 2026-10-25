@@ -320,7 +320,7 @@ impl_differentiable_operation! {
 /// their corresponding arithmetic [`Operation`]s.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Examples
 ///
@@ -1122,10 +1122,10 @@ impl_differentiable_operation! {
 /// whose input and output physical capacities cannot be represented by their runtime reshape support; equal logical
 /// element counts alone do not guarantee that every bounded shape can be compiled.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
-/// universes with array and dimension members can implement it as well.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
+/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
+/// array and dimension members can implement it as well.
 ///
 /// # Examples
 ///
@@ -1144,7 +1144,7 @@ impl_differentiable_operation! {
 /// Computed or input dimensions remain ordinary Single Static Assignment (SSA) inputs, which is what makes a
 /// runtime-derived output shape expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent
 /// is read off the input while its trailing extent is an exact lifted dimension. Extents derived by first-class
-/// dimension arithmetic work the same way: project the composite values onto [`DimensionType`] with
+/// dimension arithmetic work the same way: project the array IR values onto [`DimensionType`] with
 /// [`ValueProjection`], apply ordinary capabilities such as [`Mul`], and lift the result back.
 ///
 /// ```rust
@@ -1298,7 +1298,7 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<ArrayIrType> for Array
         output_dimensions: &[Self],
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError> {
-        // Concrete composite values resolve every explicit extent input to its runtime value, so the mixed reshape
+        // Concrete array IR values resolve every explicit extent input to its runtime value, so the mixed reshape
         // executes as the ordinary member reshape of the fully resolved output shape.
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let output_shape = Shape::new(
@@ -2572,8 +2572,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_reshape_to_sizes_composite() {
-        // Composite values reshape their array members by sizes, and first-class dimensions are rejected.
+    fn test_reshape_reshape_to_sizes_array_ir() {
+        // Array IR valuesreshape their array members by sizes, and first-class dimensions are rejected.
         let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).reshape_to_sizes(&[3, -1]),
@@ -2602,8 +2602,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_flatten_composite() {
-        // Composite values flatten their array members, and first-class dimensions are rejected.
+    fn test_reshape_flatten_array_ir() {
+        // Array IR valuesflatten their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         assert_eq!(ArrayIrValue::Array(matrix.clone()).flatten(), Ok(ArrayIrValue::Array(matrix.flatten().unwrap())));
         assert_eq!(
@@ -2641,8 +2641,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_expand_dimensions_composite() {
-        // Composite values expand the dimensions of their array members, and first-class dimensions are rejected.
+    fn test_reshape_expand_dimensions_array_ir() {
+        // Array IR valuesexpand the dimensions of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).expand_dimensions(0),
@@ -2689,8 +2689,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_squeeze_composite() {
-        // Composite values squeeze their array members, and first-class dimensions are rejected.
+    fn test_reshape_squeeze_array_ir() {
+        // Array IR valuessqueeze their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).squeeze([0]),
@@ -2727,8 +2727,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_squeeze_all_composite() {
-        // Composite values squeeze all unit axes of their array members, and first-class dimensions are rejected.
+    fn test_reshape_squeeze_all_array_ir() {
+        // Array IR valuessqueeze all unit axes of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(matrix.clone()).squeeze_all(),
@@ -3611,7 +3611,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_reshape_interpretation() {
-        // A concrete composite value resolves every explicit extent input and reshapes its array member directly.
+        // A concrete array IR value resolves every explicit extent input and reshapes its array member directly.
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let rows = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let columns = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
@@ -5360,7 +5360,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_dynamic_reshape() {
-        // A concrete composite value resolves every extent input to its runtime value and reshapes its array member
+        // A concrete array IR value resolves every extent input to its runtime value and reshapes its array member
         // with the resolved parameters.
         let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap());
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -5391,7 +5391,7 @@ mod tests {
         ];
         assert_eq!(input.dynamic_reshape(&dimensions), Ok(input.clone()));
 
-        // Both the reshaped value and every extent must be the corresponding composite member.
+        // Both the reshaped value and every extent must be the corresponding array IR member.
         assert_eq!(
             two.dynamic_reshape_with_output_sharding(&[three.clone(), two.clone()], None),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),

@@ -560,7 +560,7 @@ impl_differentiable_operation! {
 /// the axis and error contract of [`Self::sort_with_ordering`].
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -765,8 +765,8 @@ impl<
     }
 }
 
-// Composite values sort through their array views. Sorting has no receiver, which the shared projection macro cannot
-// express, and so this projection is written out. It covers composite tracers and concrete composite values alike.
+// Array IR values sort through their array views. Sorting has no receiver, which the shared projection macro cannot
+// express, and so this projection is written out. It covers array IR tracers and concrete array IR values alike.
 impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Sort<ArrayType>>> Sort<ArrayIrType> for V {
     fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
@@ -801,10 +801,10 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Sort<A
 /// and reinserted afterward, which leaves the values and indices unchanged.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
-/// Note that composite values select through their array views, so that the composition (and its index `iota`)
-/// runs in the array universe.
+/// Note that array IR values select through their array views, so that the composition (and its index `iota`) runs in
+/// the array universe.
 ///
 /// # Example
 ///
@@ -1612,13 +1612,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_composite() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_sort_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // Composite tracers stage the array sort and the array top-k composition of their members.
+        // Array IR tracers stage the array sort and the array top-k composition of their members.
         let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
-        let (_, program) = CompositeContext::trace(
-            |inputs: Vec<Tracer<CompositeContext>>| Tracer::sort(&inputs, 0, SortDirection::Ascending),
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| Tracer::sort(&inputs, 0, SortDirection::Ascending),
             vec![vector_type.clone(), vector_type],
         )
         .unwrap();
@@ -1631,7 +1631,7 @@ mod tests {
             },
         );
 
-        // Concrete composite values sort and select through their array members.
+        // Concrete array IR values sort and select through their array members.
         let keys = Array::vector(vec![3.0f32, 1.0, 2.0]).unwrap();
         let values = Array::vector(vec![1i32, 2, 3]).unwrap();
         let sorted = Array::sort(&[keys.clone(), values.clone()], 0, SortDirection::Ascending).unwrap();

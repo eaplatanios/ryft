@@ -46,7 +46,7 @@ pub(crate) fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
     Ok(values[0])
 }
 
-/// Lowers the dynamic explicit-result-extent check owned by composite concatenation.
+/// Lowers the dynamic explicit-result-extent check owned by array IR concatenation.
 pub(crate) fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
     axis: usize,
     actual: ValueRef<'b, 'c, 't>,
@@ -234,7 +234,7 @@ mod tests {
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::lowering::types::physical_bound_type;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{CompiledXlaFunction, FromPjrt, ToPjrt, XlaArray, XlaSession, compile, to_mlir_module_for_program};
 
@@ -301,7 +301,7 @@ mod tests {
             &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
         )
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
         let result_extent = builder
@@ -358,7 +358,7 @@ mod tests {
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
         )
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
         let first_size = builder.add_instruction(first_size_operation, Vec::new(), vec![first], None).unwrap()[0];
@@ -431,7 +431,7 @@ mod tests {
                     &[first_type.clone().into(), second_type.clone().into(), extent_type.into()],
                 )
                 .unwrap();
-                let mut builder = CompositeXlaProgramBuilder::new();
+                let mut builder = ArrayIrXlaProgramBuilder::new();
                 let first = builder.add_input(first_type.clone().into());
                 let second = builder.add_input(second_type.clone().into());
                 let extent = builder

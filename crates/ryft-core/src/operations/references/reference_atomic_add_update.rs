@@ -458,8 +458,8 @@ impl<
 /// permission to reorder state effects.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that staged values
-/// implement this capability for every universe with reference members (e.g., [`ArrayIrType`]), concrete composite
-/// array IR values implement it for [`ArrayIrType`], their projected reference members implement it for
+/// implement this capability for every universe with reference members (e.g., [`ArrayIrType`]), concrete array IR
+/// values implement it for [`ArrayIrType`], their projected reference members implement it for
 /// [`ReferenceType<ArrayType>`](crate::ReferenceType), and [`ReferenceView`](crate::ReferenceView)s implement it for
 /// the [`ReferenceType`](crate::ReferenceType) of their referent.
 #[capability]

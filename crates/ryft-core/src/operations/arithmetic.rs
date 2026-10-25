@@ -512,7 +512,7 @@ impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, AddOperation<Arr
 
     #[inline]
     fn provide(_request: AddOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        // The composite family adds arrays only, so the provider rejects every other member kind before constructing
+        // The array IR family adds arrays only, so the provider rejects every other member kind before constructing
         // the array member rather than leaving the mismatch to that member's input projection.
         check_count!("input", input_types, 2, ProgramError);
         for (index, input_type) in input_types.iter().enumerate() {
@@ -1643,8 +1643,8 @@ impl_rsqrt_for_primitive!(f64);
 /// floating-point host scalars.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
 pub trait ArithmeticOperations<T = <Self as Capability>::Universe>:
     Capability
     + Sign<T>
@@ -2623,30 +2623,30 @@ mod tests {
     #[test]
     fn test_add_operation_provider() {
         let array_type = ArrayType::scalar(DataType::F32);
-        let composite_type = ArrayIrType::from(array_type.clone());
+        let array_ir_type = ArrayIrType::from(array_type.clone());
 
-        // Ordinary constructors retain their unique homogeneous conversion into a composite family.
+        // Ordinary constructors retain their unique homogeneous conversion into an array IR family.
         let direct: ArrayIrOperation<Array> = AddOperation::new().into();
         assert_eq!(direct.to_string(), "add");
         assert_eq!(
-            direct.infer_output_types(&[composite_type.clone(), composite_type.clone()], &[]),
-            Ok(vec![composite_type.clone()]),
+            direct.infer_output_types(&[array_ir_type.clone(), array_ir_type.clone()], &[]),
+            Ok(vec![array_ir_type.clone()]),
         );
 
         // Generic cotangent requests select that same array member without a competing owned conversion.
         let provided =
-            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&composite_type, &composite_type])
+            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&array_ir_type, &array_ir_type])
                 .unwrap();
         assert_eq!(provided.to_string(), "add");
         let dimension_type = ArrayIrType::Dimension(DimensionValue::constant(2).unwrap().r#type().into_owned());
         assert_eq!(
-            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&composite_type, &dimension_type])
+            ArrayIrOperation::<Array>::provide(AddOperation::<ArrayIrType>::new(), &[&array_ir_type, &dimension_type])
                 .unwrap_err(),
             ProgramError::Type(TypeError::invalid("`add` input 1 must be an array but got type `dimension<2>`")),
         );
         assert_eq!(
-            provided.infer_output_types(&[composite_type.clone(), composite_type.clone()], &[]),
-            Ok(vec![composite_type]),
+            provided.infer_output_types(&[array_ir_type.clone(), array_ir_type.clone()], &[]),
+            Ok(vec![array_ir_type]),
         );
         let provided = ArrayOperation::<Array>::provide(AddOperation::new(), &[&array_type, &array_type]).unwrap();
         assert_eq!(provided.to_string(), "add");
@@ -2804,14 +2804,14 @@ mod tests {
     }
 
     #[test]
-    fn test_add_composite() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_add_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // Composite tracers stage the homogeneous addition as an array-member instruction.
+        // Array IR tracers stage the homogeneous addition as an array-member instruction.
         let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
-        let (_, program) = CompositeContext::trace(
-            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].add(&inputs[1]),
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| inputs[0].add(&inputs[1]),
             vec![array_type.clone(), array_type],
         )
         .unwrap();
@@ -2824,7 +2824,7 @@ mod tests {
             },
         );
 
-        // Concrete composite values add their array members, while first-class dimension members are rejected.
+        // Concrete array IR values add their array members, while first-class dimension members are rejected.
         let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
         assert_eq!(left.add(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
@@ -2834,10 +2834,10 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
 
-        // Batching and differentiation reach the homogeneous rules through the composite member projection.
+        // Batching and differentiation reach the homogeneous rules through the array IR member projection.
         assert_eq!(
             batch(
-                |item: BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>| item.add(&item),
+                |item: BatchingTracer<EagerArrayIrContext, ArrayIrBatchingPolicy>| item.add(&item),
                 ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
@@ -2910,12 +2910,12 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("failed to broadcast shape `[3]` to shape `[2]`"))),
         );
 
-        // Composite parameters add their array members, and first-class dimension members are rejected.
-        let composite = |values: Vec<f32>| ArrayIrValue::Array(vector(values));
-        let left = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![composite(vec![1.0]), composite(vec![2.0])]);
+        // Array IR parameters add their array members, and first-class dimension members are rejected.
+        let array_ir = |values: Vec<f32>| ArrayIrValue::Array(vector(values));
+        let left = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![array_ir(vec![1.0]), array_ir(vec![2.0])]);
         assert_eq!(
             Add::add(&left, &left).map(Parameterwise::into_inner),
-            Ok(vec![composite(vec![2.0]), composite(vec![4.0])]),
+            Ok(vec![array_ir(vec![2.0]), array_ir(vec![4.0])]),
         );
         let dimension = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![ArrayIrValue::Dimension(
             DimensionValue::constant(2).unwrap(),
@@ -3510,7 +3510,7 @@ mod tests {
 
     #[test]
     fn test_saturating_sub_differentiation_dimensions() {
-        // First-class dimensions use the same discrete rule through the composite family. No tangent slots or
+        // First-class dimensions use the same discrete rule through the array IR family. No tangent slots or
         // arithmetic are needed, and the primal result retains its inferred extent bounds.
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
@@ -3693,7 +3693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_saturating_sub_composite_projection() {
+    fn test_saturating_sub_array_ir_projection() {
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(left, right)| left.saturating_sub(&right),
             (ArrayIrType::Array(ArrayType::scalar(DataType::I8)), ArrayIrType::Array(ArrayType::scalar(DataType::I8))),

@@ -185,7 +185,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 ///
 /// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
 /// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
-/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+/// and array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait Dot<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, and returns a [`ProgramError`] if
@@ -195,7 +195,7 @@ pub trait Dot<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Size
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
     /// for the result. The requested sharding overrides the inferred output sharding and is validated by the
     /// operation's type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). Staging
-    /// values attach it to the staged operation, composite values project it onto their array members, and concrete
+    /// values attach it to the staged operation, array IR values project it onto their array members, and concrete
     /// [`Array`]s record it on their result.
     fn dot_with_output_sharding(
         &self,
@@ -413,7 +413,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedDo
 ///
 /// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
 /// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
-/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+/// and array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait RaggedDot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes a grouped generalized dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three
@@ -469,8 +469,8 @@ where
 /// implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`].
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`].
 pub trait DotOperations<T = <Self as Capability>::Universe>: Capability + Dot<Self, T> + RaggedDot<T> {}
 
 impl<T, V: Dot<V, T> + RaggedDot<T>> DotOperations<T> for V {}

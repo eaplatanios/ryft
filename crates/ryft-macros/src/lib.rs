@@ -67,8 +67,8 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
 }
 
 // TODO(eaplatanios): Review this.
-/// Validates a capability trait and optionally generates the implementations through which composite values apply it
-/// by projecting onto their members (e.g., `#[capability(projection(ArrayIrType => ArrayType))]`).
+/// Validates a capability trait and optionally generates the implementations through which heterogeneous values apply
+/// it by projecting onto their members (e.g., `#[capability(projection(ArrayIrType => ArrayType))]`).
 ///
 /// Refer to the documentation of `ryft-core`'s `Capability` trait for the canonical reference, which covers the checked
 /// conventions, the generated projection implementations, the supported function signatures, and the `crate = "path"`

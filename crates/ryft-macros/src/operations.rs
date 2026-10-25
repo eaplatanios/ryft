@@ -37,7 +37,7 @@ struct OperationParser {
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: Option<syn::Type>,
 
-    /// Explicit stored constant type for a composite operation family, when declared with `#[ryft(constant(V))]`.
+    /// Explicit stored constant type for a heterogeneous operation family, when declared with `#[ryft(constant(V))]`.
     program_constant_type: Option<syn::Type>,
 
     /// Member universes declared with `#[ryft(members(...))]`, in declaration order. Empty when the enum declares no
@@ -122,7 +122,7 @@ struct OperationEnum {
     program_constant_type: syn::Type,
 
     /// Generic value parameter whose capability bounds should be copied to a distinct runtime value type. Explicit
-    /// composite constant types have no one-to-one generic source and therefore store [`None`].
+    /// heterogeneous constant types have no one-to-one generic source and therefore store [`None`].
     program_constant_parameter: Option<syn::Ident>,
 
     /// Program-shaped generics after reducing payload-specific value parameters to the program constant space.
@@ -198,9 +198,9 @@ impl OperationParser {
     /// unknown top-level (i.e., not field or variant) `#[ryft(...)]` attributes. This function will set
     /// [`OperationParser::ryft_crate`], [`OperationParser::members`], and [`OperationParser::dispatchers`] if it is
     /// able to successfully extract them. By default it infers [`OperationParser::operation_type`] from the enum's
-    /// unique `Value<Type = T>` generic bound. Composite enums whose generic values belong to member universes instead
-    /// declare their outer operation and stored constant types together with `#[ryft(type(T), constant(V))]`, either in
-    /// one attribute or split across several.
+    /// unique `Value<Type = T>` generic bound. Heterogeneous enums whose generic values belong to member universes
+    /// instead declare their outer operation and stored constant types together with `#[ryft(type(T), constant(V))]`,
+    /// either in one attribute or split across several.
     fn extract_attributes(&mut self, input: &syn::DeriveInput) {
         let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
@@ -419,7 +419,7 @@ impl OperationParser {
         let mut payload_types = std::collections::HashSet::new();
         for variant in variants.iter().filter(|variant| {
             !variant.is_generic_extension
-                && matches!(variant.class, OperationVariantClass::CompositeNative)
+                && matches!(variant.class, OperationVariantClass::FamilyNative)
                 && is_generic_independent(&variant.payload_type, &input.generics)
         }) {
             if !payload_types.insert(variant.payload_type.to_token_stream().to_string()) {
@@ -569,7 +569,7 @@ impl OperationParser {
     }
 
     /// Extracts the semantic class and conversion policy declared for `variant`. Variants without a class marker are
-    /// composite-native and retain their payload's direct outer-family contract. A `projected` member has its complete
+    /// family-native and retain their payload's direct outer-family contract. A `projected` member has its complete
     /// instruction boundary projected into its member [`Type`](ryft_core::Type), while a `mixed` member keeps a native
     /// member payload whose parent instruction has a genuinely mixed boundary. Both classes accept the optional
     /// `structural` role, and a `mixed` marker may omit its member type entirely when the enum declares exactly one
@@ -637,7 +637,7 @@ impl OperationParser {
                 })
                 .unwrap_or_else(|error| self.errors.push(error));
         }
-        let class = class.unwrap_or(OperationVariantClass::CompositeNative);
+        let class = class.unwrap_or(OperationVariantClass::FamilyNative);
         (class, generate_from)
     }
 }
@@ -902,7 +902,7 @@ impl OperationEnum {
                 OperationVariantClass::MixedMember { .. } => quote! {
                     <#payload_type as #ryft::MemberOperation<#primary_type>>::parent_defined_type_identities(#receiver)
                 },
-                OperationVariantClass::CompositeNative | OperationVariantClass::ProjectedMember { .. } => quote! {
+                OperationVariantClass::FamilyNative | OperationVariantClass::ProjectedMember { .. } => quote! {
                     <#payload_type as #ryft::Operation>::defined_type_identities(#receiver)
                 },
             };
@@ -922,7 +922,7 @@ impl OperationEnum {
                         )
                     },
                 },
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     Self::#variant_ident(operation) => {
                         <#payload_type as #ryft::Operation>::infer_output_types(
                             #receiver,
@@ -954,7 +954,7 @@ impl OperationEnum {
                         #receiver, input_types, region_interfaces,
                     )
                 },
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     <#payload_type as #ryft::Operation>::fold(#receiver, input_types, region_interfaces)
                 },
                 OperationVariantClass::ProjectedMember { .. } => quote! {
@@ -1016,7 +1016,7 @@ impl OperationEnum {
                         #ryft::validate_projected_operation_region_interfaces(#receiver, region_interfaces)
                     },
                 },
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     Self::#variant_ident(operation) => {
                         <#payload_type as #ryft::Operation>::validate_region_interfaces(#receiver, region_interfaces)
                     },
@@ -1049,7 +1049,7 @@ impl OperationEnum {
                         },
                     }
                 }
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     Self::#variant_ident(operation) => {
                         <#payload_type as #ryft::Operation>::infer_region_input_types(
                             #receiver,
@@ -1086,7 +1086,7 @@ impl OperationEnum {
                 OperationVariantClass::ProjectedMember { .. } => quote! {
                     #ryft::prune_projected_operation_boundary(#receiver, input_types, used_outputs, regions)
                 },
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     <#payload_type as #ryft::Operation>::prune_boundary(
                         #receiver,
                         input_types,
@@ -1268,7 +1268,7 @@ impl OperationEnum {
                             interpret_in_parent(#receiver, context, driver, inputs)
                     },
                 },
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     Self::#variant_ident(operation) => {
                         <#payload_operation_type as #ryft::InterpretableOperation<__Context>>::interpret(
                             #receiver,
@@ -1323,14 +1323,14 @@ impl OperationEnum {
         });
 
         // Bare generic extension payloads and member payloads use the complete enum operation's canonical
-        // fold-or-residualize path instead of naming a payload rule in the composite context. A member payload's own
-        // partial-evaluation rule belongs to its native context and cannot consume composite partial values without a
-        // separate parent-boundary contract.
+        // fold-or-residualize path instead of naming a payload rule in the heterogeneous context. A member payload's
+        // own partial-evaluation rule belongs to its native context and cannot consume heterogeneous partial values
+        // without a separate parent-boundary contract.
         where_clause.predicates.extend(
             self.variants
                 .iter()
                 .filter(|variant| {
-                    !variant.is_generic_extension && matches!(variant.class, OperationVariantClass::CompositeNative)
+                    !variant.is_generic_extension && matches!(variant.class, OperationVariantClass::FamilyNative)
                 })
                 .map(|variant| {
                     let operation_type = &variant.program_payload_type;
@@ -1342,7 +1342,7 @@ impl OperationEnum {
         );
         let arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            if variant.is_generic_extension || !matches!(variant.class, OperationVariantClass::CompositeNative) {
+            if variant.is_generic_extension || !matches!(variant.class, OperationVariantClass::FamilyNative) {
                 quote! {
                     Self::#variant_ident(_) => {
                         let regions = driver
@@ -1396,7 +1396,7 @@ impl OperationEnum {
 
     /// Generates the [`BatchableOperation`](ryft_core::BatchableOperation) dispatcher. Inferred homogeneous array
     /// families remain generic over their array batching mode. Explicitly declared families use the canonical policy
-    /// selected by [`BatchableType`](ryft_core::BatchableType). Composite-native variants delegate directly,
+    /// selected by [`BatchableType`](ryft_core::BatchableType). Family-native variants delegate directly,
     /// computational projected members use `batch_projected_operation`, structural projected members bind their payload
     /// once through `batch_replicated_projected_operation` under the policy's
     /// [`ReplicatedBatchingPolicyProjection`](ryft_core::ReplicatedBatchingPolicyProjection), and mixed members use
@@ -1452,7 +1452,7 @@ impl OperationEnum {
         for variant in variants {
             let operation_type = &variant.program_payload_type;
             match &variant.class {
-                OperationVariantClass::CompositeNative => batching_where_clause.predicates.push(syn::parse_quote! {
+                OperationVariantClass::FamilyNative => batching_where_clause.predicates.push(syn::parse_quote! {
                     #operation_type: #ryft::BatchableOperation<
                         __ParentContext,
                         #batching_policy,
@@ -1521,7 +1521,7 @@ impl OperationEnum {
             let operation_type = &variant.program_payload_type;
             let receiver = variant.receiver();
             match &variant.class {
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     Self::#variant_ident(operation) => {
                         <#operation_type as #ryft::BatchableOperation<
                             __ParentContext,
@@ -1583,7 +1583,7 @@ impl OperationEnum {
 
     /// Generates the [`ReferenceDischargeableOperation`](ryft_core::ReferenceDischargeableOperation) dispatcher. The
     /// reference universe policy stays fully generic for every family, because a policy names the reference universe
-    /// being threaded rather than the element universe the family's values belong to. Composite-native variants and
+    /// being threaded rather than the element universe the family's values belong to. Family-native variants and
     /// bare generic extension variants delegate to their payload's own discharge rule, while member variants replay the
     /// complete enum through [`discharge_reference_free_operation`](ryft_core::discharge_reference_free_operation),
     /// which copies any attached regions across unchanged and rejects a reference instruction input or a region closure
@@ -1610,14 +1610,14 @@ impl OperationEnum {
             __ReferenceDischargePolicy: #ryft::ReferenceDischargePolicy<__ParentContext>
         });
 
-        // Composite-native and generic extension payloads name discharge rules of their own. Member payloads replay
+        // Family-native and generic extension payloads name discharge rules of their own. Member payloads replay
         // the enclosing enum instead because their operation type belongs to the projected member universe rather than
         // the parent reference universe.
         discharge_where_clause.predicates.extend(
             variants
                 .iter()
                 .filter(|variant| {
-                    variant.is_generic_extension || matches!(variant.class, OperationVariantClass::CompositeNative)
+                    variant.is_generic_extension || matches!(variant.class, OperationVariantClass::FamilyNative)
                 })
                 .map(|variant| {
                     let operation_type = &variant.program_payload_type;
@@ -1632,7 +1632,7 @@ impl OperationEnum {
         );
         let discharge_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            if !variant.is_generic_extension && !matches!(variant.class, OperationVariantClass::CompositeNative) {
+            if !variant.is_generic_extension && !matches!(variant.class, OperationVariantClass::FamilyNative) {
                 // The payload is replayed as the enclosing enum rather than on its own, so the arm binds nothing.
                 quote! {
                     Self::#variant_ident(..) => {
@@ -1749,7 +1749,7 @@ impl OperationEnum {
         for variant in variants {
             let operation_type = &variant.program_payload_type;
             match &variant.class {
-                OperationVariantClass::CompositeNative => where_clause.predicates.push(syn::parse_quote! {
+                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
                     #operation_type: #ryft::DifferentiableOperation<__DifferentiationContext>
                 }),
                 OperationVariantClass::ProjectedMember { structural: false, .. }
@@ -1810,7 +1810,7 @@ impl OperationEnum {
                     let operation_type = &variant.program_payload_type;
                     let receiver = variant.receiver();
                     match &variant.class {
-                        OperationVariantClass::CompositeNative => quote! {
+                        OperationVariantClass::FamilyNative => quote! {
                             Self::#variant_ident(operation) => {
                                 <#operation_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::#method(
                                     #receiver,
@@ -1985,7 +1985,7 @@ impl OperationEnum {
         for variant in variants {
             let operation_type = &variant.payload_type;
             match &variant.class {
-                OperationVariantClass::CompositeNative => where_clause.predicates.push(syn::parse_quote! {
+                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
                     #operation_type: #ryft::TransposableOperation<
                         #transposed_value_type,
                         #operation_self_type,
@@ -2047,7 +2047,7 @@ impl OperationEnum {
             let operation_type = &variant.payload_type;
             let receiver = variant.receiver();
             match &variant.class {
-                OperationVariantClass::CompositeNative => quote! {
+                OperationVariantClass::FamilyNative => quote! {
                     Self::#variant_ident(operation) => {
                         <#operation_type as #ryft::TransposableOperation<
                             #transposed_value_type,
@@ -2225,7 +2225,7 @@ impl OperationEnum {
     }
 
     /// Generates the canonical [`OperationProjection`] implementation for one declared projected member variant, in
-    /// either role. Composite-native and mixed variants do not define homogeneous operation-family projections.
+    /// either role. Family-native and mixed variants do not define homogeneous operation-family projections.
     fn generate_operation_projection_impl(&self, variant: &OperationVariant) -> Option<TokenStream> {
         let member_type = variant.class.projected_member_type()?;
         let ryft = &self.ryft_crate;
@@ -2247,7 +2247,7 @@ impl OperationEnum {
     /// member variants delegate to their member family in both directions, lifting constructed member operations
     /// through the enum's `From<Member>` conversion. Every other concrete variant projects into its payload when the
     /// payload type is `'static` independently of the enum's generic parameters (refer to [`is_generic_independent`]),
-    /// and such composite-native variants are also constructed from their payloads, before any projected member is
+    /// and such family-native variants are also constructed from their payloads, before any projected member is
     /// tried. Mixed member variants are never constructed, and generic extension variants neither project nor are
     /// constructed.
     fn generate_payload_projection_impl(&self) -> TokenStream {
@@ -2287,7 +2287,7 @@ impl OperationEnum {
                         ::std::option::Option::Some(#receiver as &dyn ::std::any::Any)
                     }
                 });
-                if matches!(variant.class, OperationVariantClass::CompositeNative) {
+                if matches!(variant.class, OperationVariantClass::FamilyNative) {
                     let operation =
                         if variant.is_boxed { quote!(::std::boxed::Box::new(operation)) } else { quote!(operation) };
                     native_steps.push(quote! {
@@ -2369,7 +2369,7 @@ impl OperationEnum {
         for variant in &self.variants {
             let operation_type = &variant.program_payload_type;
             match &variant.class {
-                OperationVariantClass::CompositeNative => where_clause.predicates.push(syn::parse_quote! {
+                OperationVariantClass::FamilyNative => where_clause.predicates.push(syn::parse_quote! {
                     #operation_type: #ryft::InterpretableOperation<__Context>
                 }),
                 OperationVariantClass::MixedMember { .. } => where_clause.predicates.push(syn::parse_quote! {
@@ -2432,7 +2432,7 @@ struct OperationVariant {
 /// role rides each boundary as a flag instead of splitting one boundary into two class names.
 enum OperationVariantClass {
     /// Operation whose payload already uses the enclosing operation family's type and semantic contracts.
-    CompositeNative,
+    FamilyNative,
 
     /// Homogeneous member whose inference, execution, and transform rules run in a projected context.
     ProjectedMember {
@@ -2460,7 +2460,7 @@ impl OperationVariantClass {
     /// Returns the marker name that declares this member class.
     fn name(&self) -> &'static str {
         match self {
-            Self::CompositeNative => unreachable!("composite-native variants have no class marker"),
+            Self::FamilyNative => unreachable!("family-native variants have no class marker"),
             Self::ProjectedMember { .. } => "projected",
             Self::MixedMember { .. } => "mixed",
         }
@@ -2470,19 +2470,19 @@ impl OperationVariantClass {
     /// [`MemberOperation`](ryft_core::MemberOperation) for its parent boundary.
     fn operation_type<'t>(&'t self, primary_type: &'t syn::Type) -> Option<&'t syn::Type> {
         match self {
-            Self::CompositeNative => Some(primary_type),
+            Self::FamilyNative => Some(primary_type),
             Self::MixedMember { .. } => None,
             Self::ProjectedMember { member_type, .. } => Some(member_type),
         }
     }
 
     /// Returns the projected-boundary member type this variant claims as the enclosing family's canonical
-    /// [`OperationProjection`](ryft_core::OperationProjection) target, or [`None`] for composite-native and mixed
+    /// [`OperationProjection`](ryft_core::OperationProjection) target, or [`None`] for family-native and mixed
     /// variants. A mixed variant keeps a native member type without owning that projection, so its dispatchers read it
     /// directly off [`Self::MixedMember`].
     fn projected_member_type(&self) -> Option<&syn::Type> {
         match self {
-            Self::CompositeNative | Self::MixedMember { .. } => None,
+            Self::FamilyNative | Self::MixedMember { .. } => None,
             Self::ProjectedMember { member_type, .. } => Some(member_type),
         }
     }
@@ -2490,7 +2490,7 @@ impl OperationVariantClass {
     /// Applies program-value substitutions to the declared member type.
     fn substitute_type_idents(&mut self, substitutions: &[(syn::Ident, syn::Type)]) {
         match self {
-            Self::CompositeNative => {}
+            Self::FamilyNative => {}
             Self::ProjectedMember { member_type, .. } | Self::MixedMember { member_type, .. } => {
                 *member_type = substitute_type_idents(member_type, substitutions);
             }
@@ -2504,7 +2504,7 @@ impl OperationVariant {
         if self.is_boxed { quote!(&**operation) } else { quote!(operation) }
     }
 
-    /// Returns whether this variant stores a native guard of the enclosing family: a composite-native payload, stored
+    /// Returns whether this variant stores a native guard of the enclosing family: a family-native payload, stored
     /// directly or boxed, whose type is a path whose last segment is `GuardOperation`. Detection is syntactic, by that
     /// path segment, because a procedural macro cannot resolve types. Projected and mixed members do not count, since
     /// their guards belong to the member universe rather than to the enum's primary type, and neither does a bare
@@ -2512,7 +2512,7 @@ impl OperationVariant {
     /// generated rejecting provider then conflicts with the blanket provider that the variant's `From` conversion
     /// enables (E0119), which is a compile error rather than a silent rejection.
     fn is_native_guard(&self) -> bool {
-        matches!(self.class, OperationVariantClass::CompositeNative)
+        matches!(self.class, OperationVariantClass::FamilyNative)
             && matches!(
                 &self.payload_type,
                 syn::Type::Path(type_path) if type_path.qself.is_none()
@@ -2522,7 +2522,7 @@ impl OperationVariant {
 }
 
 /// Builds the generics used by the generated [`Operation`] and [`Display`] implementations: the enum generics
-/// without defaults, plus one payload predicate per distinct contract. Composite-native variants use the enclosing
+/// without defaults, plus one payload predicate per distinct contract. Family-native variants use the enclosing
 /// family's primary type, declared projected variants use their member type, and mixed members use
 /// [`MemberOperation`](ryft_core::MemberOperation) for their parent boundary.
 fn operation_generics(
@@ -2967,7 +2967,7 @@ mod tests {
         // Explicit types may be split across attributes and may be any complete Rust type, including qualified paths
         // with generic arguments and tuple types. The outer attribute list also accepts a trailing comma.
         let generator = extract_attributes(quote! {
-            #[ryft(type(<A as Projection<ArrayType>>::Composite),)]
+            #[ryft(type(<A as Projection<ArrayType>>::Family),)]
             #[ryft(constant((ArrayIrValue<A>, Vec<u8>)))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
@@ -2977,7 +2977,7 @@ mod tests {
         assert!(generator.errors.is_empty());
         assert_eq!(
             generator.operation_type.as_ref().unwrap().to_token_stream().to_string(),
-            "< A as Projection < ArrayType > > :: Composite",
+            "< A as Projection < ArrayType > > :: Family",
         );
         assert_eq!(
             generator.program_constant_type.as_ref().unwrap().to_token_stream().to_string(),
@@ -3129,7 +3129,7 @@ mod tests {
         let variants = generator.extract_variants(&input);
         assert!(generator.errors.is_empty());
         assert_eq!(variants.len(), 6);
-        assert!(matches!(variants[0].class, OperationVariantClass::CompositeNative));
+        assert!(matches!(variants[0].class, OperationVariantClass::FamilyNative));
         // Both member boundaries default to the computational role and accept the same explicit `structural` role.
         assert!(matches!(variants[1].class, OperationVariantClass::ProjectedMember { structural: false, .. }));
         assert!(matches!(variants[2].class, OperationVariantClass::ProjectedMember { structural: true, .. }));
@@ -3246,8 +3246,8 @@ mod tests {
                  and 'skip_from' are supported here",
             ),
             (
-                quote!(#[ryft(composite_member(ArrayType))]),
-                "invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected', 'mixed', \
+                quote!(#[ryft(family_member(ArrayType))]),
+                "invalid operation variant '#[ryft(...)]' attribute: 'family_member'; only 'projected', 'mixed', \
                  and 'skip_from' are supported here",
             ),
         ];
@@ -3309,7 +3309,7 @@ mod tests {
                 OperationVariantClass::ProjectedMember { member_type, structural } => {
                     ("projected", member_type.to_token_stream().to_string(), *structural)
                 }
-                OperationVariantClass::CompositeNative => ("native", String::new(), false),
+                OperationVariantClass::FamilyNative => ("native", String::new(), false),
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -3403,7 +3403,7 @@ mod tests {
 
         let mut input: syn::DeriveInput = syn::parse_quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
-            enum CompositeOperation<A: Value<Type = ArrayType>> {
+            enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
                 Mixed(MixedOperation<ArrayIrType>),
@@ -3413,18 +3413,18 @@ mod tests {
 
         let mut parser = OperationParser::new();
         parser.extract_attributes(&input);
-        let operation = parser.normalize_input(&input).expect("failed to normalize composite operation enum");
+        let operation = parser.normalize_input(&input).expect("failed to normalize family operation enum");
 
         assert_eq!(operation.operation_type.to_token_stream().to_string(), "ArrayIrType");
         assert_eq!(operation.program_constant_type.to_token_stream().to_string(), "ArrayIrValue < A >");
         assert!(operation.program_constant_parameter.is_none());
         assert!(operation.has_separate_runtime_value_type);
-        assert_eq!(operation.program_self_type.to_token_stream().to_string(), "CompositeOperation < A >");
+        assert_eq!(operation.program_self_type.to_token_stream().to_string(), "HeterogeneousOperation < A >");
         assert!(operation.program_generics.type_params().any(|parameter| parameter.ident == "A"));
         assert_eq!(operation.variants[0].program_payload_type.to_token_stream().to_string(), "ArrayOperation < A >");
 
         let mut input: syn::DeriveInput = syn::parse_quote! {
-            #[ryft(type(CompositeType), constant(CompositeValue<V>))]
+            #[ryft(type(HeterogeneousType), constant(HeterogeneousValue<V>))]
             enum DuplicateMemberOperation<V: Value<Type = DataType>> {
                 #[ryft(projected(DataType))]
                 First(FirstOperation<V>),
@@ -3465,11 +3465,11 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_generates_composite_member_dispatchers() {
+    fn test_operation_generates_family_member_dispatchers() {
         let mut input: syn::DeriveInput = syn::parse_quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             #[ryft(dispatch(discharge, batching, differentiation, transposition))]
-            enum CompositeOperation<A: Value<Type = ArrayType>> {
+            enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
                 #[ryft(projected(DimensionType, structural))]
@@ -3485,7 +3485,7 @@ mod tests {
 
         let mut parser = OperationParser::new();
         parser.extract_attributes(&input);
-        let operation = parser.normalize_input(&input).expect("failed to normalize composite operation enum");
+        let operation = parser.normalize_input(&input).expect("failed to normalize family operation enum");
         let generated_tokens = operation.generate().to_string();
         let generated = generated_tokens.replace(' ', "");
 
@@ -3517,12 +3517,12 @@ mod tests {
         assert!(generated.contains("__BatchingPolicy:ryft::BatchingPolicyProjection<__ParentContext,ArrayType>"));
         assert!(!generated.contains("ryft::BatchingPolicyProjection<__ParentContext,DimensionType>"));
         assert!(!generated.contains("DimensionOperation:ryft::BatchableOperation"));
-        assert!(generated.contains("OperationProjection<ArrayType>forCompositeOperation<A>"));
-        assert!(generated.contains("OperationProjection<DimensionType>forCompositeOperation<A>"));
+        assert!(generated.contains("OperationProjection<ArrayType>forHeterogeneousOperation<A>"));
+        assert!(generated.contains("OperationProjection<DimensionType>forHeterogeneousOperation<A>"));
         assert!(generated.contains("jvp_in_parent(operation,context,driver,inputs)"));
         assert!(generated.contains("DifferentiationDual::new_with_zero_tangent"));
         assert!(generated.contains(
-            "MemberTransposableOperation<__TranspositionValue,CompositeOperation<A>,>>::transpose_in_parent\
+            "MemberTransposableOperation<__TranspositionValue,HeterogeneousOperation<A>,>>::transpose_in_parent\
              (operation,context,driver,inputs,outputs,accumulators)",
         ));
         assert!(generated.contains("Self::Dimension(_)=>{::std::result::Result::Ok(())}"));
@@ -3680,7 +3680,7 @@ mod tests {
     fn test_operation_generate_transposable_operation_member_dispatch() {
         let mut input: syn::DeriveInput = syn::parse_quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
-            enum CompositeOperation<A: Value<Type = ArrayType>> {
+            enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
                 Array(Box<ArrayOperation<A>>),
                 #[ryft(projected(DimensionType, structural))]
@@ -3719,7 +3719,7 @@ mod tests {
                 quote! {
                     ArrayOperation<A>: ryft::MemberTransposableOperation<
                         __TranspositionValue,
-                        CompositeOperation<A>,
+                        HeterogeneousOperation<A>,
                     >
                 }
                 .to_string()
@@ -3736,7 +3736,7 @@ mod tests {
                     Self::Array(operation) => {
                         <ArrayOperation<A> as ryft::MemberTransposableOperation<
                             __TranspositionValue,
-                            CompositeOperation<A>,
+                            HeterogeneousOperation<A>,
                         >>::transpose_in_parent(&**operation, context, driver, inputs, outputs, accumulators)
                     },
                     Self::Dimension(_) => {
@@ -3772,7 +3772,7 @@ mod tests {
         let explicit = generate(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             #[ryft(dispatch(batching, differentiation, transposition))]
-            enum CompositeOperation<A: Value<Type = ArrayType>> {
+            enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(ArrayType))]
                 Collective(ParallelAllGatherOperation),
                 #[ryft(mixed(ArrayType, structural))]
@@ -3787,7 +3787,7 @@ mod tests {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             #[ryft(members(ArrayType, structural(DimensionType)))]
             #[ryft(dispatch(batching, differentiation, transposition))]
-            enum CompositeOperation<A: Value<Type = ArrayType>> {
+            enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed)]
                 Collective(ParallelAllGatherOperation),
                 #[ryft(mixed(structural))]
@@ -3803,7 +3803,7 @@ mod tests {
         // A structural mixed payload's zero tangent is selected per output universe: one staged member zero constructor
         // per declared computational member universe, and a symbolic zero tangent for an output outside all of them.
         let generated = generate(quote! {
-            #[ryft(type(CompositeType), constant(CompositeValue<A>))]
+            #[ryft(type(HeterogeneousType), constant(HeterogeneousValue<A>))]
             #[ryft(members(ArrayType, TableType, structural(DimensionType)))]
             #[ryft(dispatch(differentiation))]
             enum MultipleMemberOperation<A: Value<Type = ArrayType>> {

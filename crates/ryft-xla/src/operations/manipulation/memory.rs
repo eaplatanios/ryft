@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_signature_placement() {
         // A host identity has no transfer instruction: only its signature can communicate physical placement.
-        // Exercise both the diagnostic homogeneous path and the compiled composite entry path.
+        // Exercise both the diagnostic homogeneous path and the compiled array IR entry path.
         for (memory, kind) in
             [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
         {

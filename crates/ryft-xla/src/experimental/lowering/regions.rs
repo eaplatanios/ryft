@@ -289,7 +289,7 @@ where
                 return Err(LoweringError::UnsupportedOp {
                     op: format!(
                         "plain-program lowering does not support attached regions for `{}`; use the production \
-                         composite XLA lowerer",
+                         array IR XLA lowerer",
                         instruction.operation().name(),
                     ),
                 });

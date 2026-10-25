@@ -963,8 +963,8 @@ where
 /// the wrapper asks `P` to create a tangent context for the enclosing context, then projects that
 /// context into the member family. If `P` shares the primal context, the projected rule shares its primal context too.
 /// To transfer a value, the wrapper lifts it into the enclosing value family, applies `P`'s transfer, then projects
-/// the result back. For example, an array-only rule inside a composite context retains partitioned known value imports
-/// even though it sees only array values. All of these calls use static dispatch through `P`.
+/// the result back. For example, an array-only rule inside a heterogeneous context retains partitioned known value
+/// imports even though it sees only array values. All of these calls use static dispatch through `P`.
 #[derive(Copy, Clone, Debug)]
 pub struct ProjectedDifferentiationPolicy<P>(PhantomData<P>);
 
@@ -1366,7 +1366,7 @@ where
 /// cannot discharge that projection equality at implementation heads whose differentiation context is itself built
 /// from `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a
 /// payload whose [`Operation::Type`] disagrees with `C::Type` cannot be differentiated in `C`: the requirement is
-/// restated by the derived dispatcher's per-payload predicates and by the composite dispatchers, and any mismatched
+/// restated by the derived dispatcher's per-payload predicates and by the family-level dispatchers, and any mismatched
 /// payload is rejected with a type-mismatch error at its use site.
 pub trait DifferentiableOperation<C: Context>: Operation {
     /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
@@ -3537,27 +3537,27 @@ impl<C: Context<Type: DifferentiableType>> TangentActivity<C> {
     }
 }
 
-/// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
-/// differentiation context. Use this function from a composite operation dispatcher when the operation is
+/// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a heterogeneous
+/// differentiation context. Use this function from a family-level operation dispatcher when the operation is
 /// [`Region`]-free and every input and output belongs to the same projectable member type `T`. It projects primal
 /// values and live tangent values into the member value family, carries structural-zero tangents as types without
 /// materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the resulting duals
-/// back into the composite value family. This named adapter always selects [`DifferentiableOperation::jvp`], including
-/// when the context is constructing a reverse derivative. Use [`jvp_for_transpose_projected_operation`] to select the
-/// reverse rule explicitly.
+/// back into the heterogeneous value family. This named adapter always selects [`DifferentiableOperation::jvp`],
+/// including when the context is constructing a reverse derivative. Use [`jvp_for_transpose_projected_operation`] to
+/// select the reverse rule explicitly.
 ///
-/// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit composite
-/// Jacobian-Vector Product (JVP) rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
-/// rejected with an exact diagnostic naming it, because projection reaches the member rule with no region access: the
-/// attached regions are programs in the composite universe, and no projected driver can present them in the member
-/// universe.
+/// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit
+/// family-level Jacobian-Vector Product (JVP) rule instead. A member operation that declares
+/// [`RegionSlot`](crate::RegionSlot)s is rejected with an exact diagnostic naming it, because projection reaches the
+/// member rule with no region access: the attached regions are programs in the heterogeneous universe, and no projected
+/// driver can present them in the member universe.
 ///
 /// # Parameters
 ///
-///   - `context`: Active composite [`Context`] through which the projected member rule stages its primal and tangent
-///     operations.
+///   - `context`: Active heterogeneous [`Context`] through which the projected member rule stages its primal and
+///     tangent operations.
 ///   - `operation`: Region-free operation expressed in the projected member operation family.
-///   - `inputs`: Composite [`DifferentiationDual`]s corresponding to the operation's inputs.
+///   - `inputs`: Heterogeneous [`DifferentiationDual`]s corresponding to the operation's inputs.
 #[inline]
 pub fn jvp_projected_operation<
     T: DifferentiableType,
@@ -3573,10 +3573,10 @@ pub fn jvp_projected_operation<
 }
 
 /// Applies a member operation's [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule through a
-/// projected composite context. It has the same projection requirements and diagnostics as [`jvp_projected_operation`],
-/// but the resulting tangent computation need only support transposition. The named adapter selects the reverse rule
-/// even when [`DifferentiationContext::rule`] is `Jvp`. It does not change the context's selection for recursive
-/// differentiation.
+/// projected heterogeneous context. It has the same projection requirements and diagnostics as
+/// [`jvp_projected_operation`], but the resulting tangent computation need only support transposition. The named
+/// adapter selects the reverse rule even when [`DifferentiationContext::rule`] is `Jvp`. It does not change the
+/// context's selection for recursive differentiation.
 ///
 /// # Errors
 ///
@@ -7248,7 +7248,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_program_linearize_disconnected_composite_symbolic_input() {
+    fn test_program_linearize_disconnected_array_ir_symbolic_input() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -8516,7 +8516,7 @@ pub(crate) mod tests {
     #[test]
     fn test_jvp_projected_operation() {
         // The third fixture member is intentionally unrelated to arrays. Its identity JVP proves that the adapter
-        // projects both halves of a live dual and lifts the resulting member values back into the composite family.
+        // projects both halves of a live dual and lifts the resulting member values back into the heterogeneous family.
         let context =
             DifferentiationContext::fused(EagerContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
         let input = DifferentiationDual::new(

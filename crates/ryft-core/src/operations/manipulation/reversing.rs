@@ -188,7 +188,7 @@ impl_differentiable_operation! {
 /// linear and self-adjoint. Batching preserves the mapped axis and reverses only the selected per-item axes.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///

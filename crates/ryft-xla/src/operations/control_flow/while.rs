@@ -1,7 +1,7 @@
 //! Lowering of [`WhileOperation`] to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 //!
-//! A while loop lowers only from the composite [`ArrayIrType`] operation family, which stores its condition and body
-//! regions; the homogeneous [`ArrayType`] payload carries no regions and is rejected. The loop state of the lowered
+//! A while loop lowers only from the [`ArrayIrType`] operation family, which stores its condition and body regions; the
+//! homogeneous [`ArrayType`] payload carries no regions and is rejected. The loop state of the lowered
 //! `stablehlo.while` is `[counter?, states..., predicate?, tokens...]`: an `i64` iteration counter when the loop has an
 //! iteration bound, the loop states, the carried predicate when the loop threads its predicate through its state, and
 //! one token per ordered effect class that either region uses. The predicate is threaded for a batched (non-scalar)
@@ -512,7 +512,7 @@ mod tests {
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, unproject_plain_program, xla_identity_branch,
     };
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
@@ -527,7 +527,7 @@ mod tests {
         // An unbounded loop with a pure scalar condition evaluates its condition in the condition region and threads
         // only its states through the loop.
         let state_type = ArrayType::scalar(DataType::Boolean);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
@@ -570,7 +570,7 @@ mod tests {
         // remain the original state elements.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let while_operation = WhileOperation::new().with_iteration_bound(3).unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
@@ -627,7 +627,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let predicate = builder
                 .add_instruction(
@@ -642,14 +642,14 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let extent = builder.add_input(extent_type.into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![extent], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -731,7 +731,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(state_type.clone().into());
             builder.add_input(state_type.clone().into());
             let predicate = builder.add_constant(XlaConstant::Boolean(true));
@@ -740,7 +740,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
@@ -754,7 +754,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let dynamic_input = builder.add_input(state_type.clone().into());
@@ -878,7 +878,7 @@ mod tests {
             Shape::new(vec![state_type.shape().dimensions()[0].clone(), Dimension::Static(3)]),
         );
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(state_type.clone().into());
             builder.add_input(state_type.clone().into());
             let predicate = builder.add_constant(XlaConstant::Boolean(true));
@@ -887,7 +887,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
@@ -901,7 +901,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let dynamic_input = builder.add_input(state_type.clone().into());
@@ -943,7 +943,7 @@ mod tests {
         // state so assertions and prints remain on their independent enclosing effect chains.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             builder
                 .add_instruction(
@@ -960,7 +960,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
@@ -1030,7 +1030,7 @@ mod tests {
         // and truncation at the bound runs it only before each permitted body execution.
         let state_type = ArrayType::scalar(DataType::F64);
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let state = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)
@@ -1040,7 +1040,7 @@ mod tests {
         }
         .unwrap();
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
@@ -1052,7 +1052,7 @@ mod tests {
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone().into());
@@ -1093,14 +1093,14 @@ mod tests {
         // masking bug (or a rejoining finished item) would leave nonzero or negative items.
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let predicate = positive(&mut builder, state);
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
@@ -1109,7 +1109,7 @@ mod tests {
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone().into());
@@ -1288,7 +1288,7 @@ mod tests {
                 ]),
             );
             let condition = {
-                let mut builder = CompositeXlaProgramBuilder::new();
+                let mut builder = ArrayIrXlaProgramBuilder::new();
                 let predicate = builder.add_input(predicate_type.clone().into());
                 builder.add_input(state_type.clone().into());
                 builder
@@ -1300,7 +1300,7 @@ mod tests {
                     .unwrap()
             };
             let body = {
-                let mut builder = CompositeXlaProgramBuilder::new();
+                let mut builder = ArrayIrXlaProgramBuilder::new();
                 let predicate = builder.add_input(predicate_type.clone().into());
                 let state = builder.add_input(state_type.clone().into());
                 builder
@@ -1311,7 +1311,7 @@ mod tests {
                     )
                     .unwrap()
             };
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let condition = builder.import_region(condition.entry_region_ref());
             let body = builder.import_region(body.entry_region_ref());
             let predicate = builder.add_input(predicate_type.clone().into());
@@ -1357,7 +1357,7 @@ mod tests {
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(extent_type.clone().into());
             let state = builder.add_input(state_type.clone().into());
             let predicate = positive(&mut builder, state);
@@ -1369,7 +1369,7 @@ mod tests {
         }
         .unwrap();
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let carried_extent = builder.add_input(extent_type.into());
             let state = builder.add_input(state_type.clone().into());
             let one = builder
@@ -1383,7 +1383,7 @@ mod tests {
             )
         }
         .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -1470,7 +1470,7 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(vector_sharding.clone()).unwrap();
         let state_types = [scalar_type.clone(), scalar_type.clone(), vector_type.clone()];
         let loop_condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![inputs[0], inputs[1]], None)
@@ -1480,7 +1480,7 @@ mod tests {
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let (index, limit, vector) = (inputs[0], inputs[1], inputs[2]);
             let one = builder
@@ -1496,7 +1496,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();

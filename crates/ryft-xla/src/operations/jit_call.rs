@@ -437,7 +437,7 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// [`BindingRegionDriver`](ryft_core::BindingRegionDriver) passed to [`Context::bind`], so repeated calls staged from
 /// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
 /// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
-/// and the executable composite array IR form to remain distinct payload types with one [`Operation`] contract each.
+/// and the executable array IR form to remain distinct payload types with one [`Operation`] contract each.
 /// The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it participates in
 /// operation equality and callee-deduplication identity and scopes reference-capture resolution during analysis.
 ///
@@ -1117,7 +1117,7 @@ where
                 .map(ArrayIrBatch::replicated)
                 .collect::<Vec<_>>());
         }
-        // The canonical composite transform threads one leading dimension through the callee. Treat it as an
+        // The canonical array IR transform threads one leading dimension through the callee. Treat it as an
         // additional explicit capture and remove only its bookkeeping output; the original capture order remains.
         let (callee, axes) = driver
             .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
@@ -1156,7 +1156,7 @@ where
         // callee region's retained transform cache: the batched program depends on live `BatchingContext` state (the
         // batch extent, the axis name, and the surrounding nesting) whose complete key surface is not yet explicit,
         // so caching it against the callee region and its input axes alone would risk exactly the unsound key reuse
-        // that cache is designed to avoid. The decided follow-up is to specify that key material when composite
+        // that cache is designed to avoid. The decided follow-up is to specify that key material when array IR
         // batching lands behind the `CompiledXlaFunction::batch` stub, which has to define it anyway: batching then
         // joins the region transform cache behind a gate measurement, through a batching-policy hook returning
         // `Option<key>` where `None` keeps a policy uncached, so soundness stays opt-in per policy. See
@@ -1682,7 +1682,7 @@ mod tests {
     };
     use crate::experimental::ops::tests::vector_type;
     use crate::experimental::ops::{
-        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::{XlaArray, to_mlir_module_for_program};
 
@@ -1821,7 +1821,7 @@ mod tests {
         // and reject this program with a false missing-capture error; the operation payload is authoritative.
         let array_type = test_vector_type(4);
         let inner = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let first_capture = builder.add_input(array_type.clone().into());
             let _second_capture = builder.add_input(array_type.clone().into());
             let second =
@@ -1835,7 +1835,7 @@ mod tests {
             )
         };
         let outer = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(array_type.clone().into());
             let callee_region = builder.intern_callee(&inner, None).unwrap();
             let output = builder
@@ -1852,7 +1852,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
         let callee_region = builder.intern_callee(&outer, None).unwrap();
         let output = builder
@@ -1871,7 +1871,7 @@ mod tests {
     /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Rc`] so callers control
     /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
     fn xla_add_self_callee(input_type: ArrayType) -> Arc<FlatXlaProgram> {
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
@@ -1881,7 +1881,7 @@ mod tests {
     /// module text. Each callee is `f(x) = x + x`; the outer function is `g(x) = sum_i callee_i(x)`.
     fn lower_two_jit_call_module(callees: Vec<Arc<FlatXlaProgram>>) -> String {
         let array_type = test_vector_type(4);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
         for callee in callees {
@@ -1986,7 +1986,7 @@ mod tests {
         let vector_type = test_vector_type(4);
         let callee = xla_add_self_callee(vector_type.clone());
         let body_program = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let first = add_xla_jit_call(&mut builder, &callee, vec![input]);
             let second = add_xla_jit_call(&mut builder, &callee, vec![input]);
@@ -2022,7 +2022,7 @@ mod tests {
     /// into the callee's canonical program text.
     fn xla_condition_callee() -> Arc<FlatXlaProgram> {
         let vector_type = test_vector_type(4);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(vector_type.clone())));
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -2048,7 +2048,7 @@ mod tests {
         let first = xla_condition_callee();
         let second = xla_condition_callee();
         let vector_type = test_vector_type(4);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let input = builder.add_input(vector_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
@@ -2152,7 +2152,7 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let branch = || {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(n.clone().into());
             let array =
                 builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
@@ -2161,7 +2161,7 @@ mod tests {
                 .unwrap()
         };
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let true_region = builder.import_region(branch().entry_region_ref());
             let false_region = builder.import_region(branch().entry_region_ref());
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -2186,7 +2186,7 @@ mod tests {
             )
         };
         assert!(callee.effects().classes().is_empty());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let dimension = builder.add_input(m.clone().into());
         let array = builder.add_input(array_type.clone().into());
@@ -2225,7 +2225,7 @@ mod tests {
         // at both call sites, and the explicit assertion after them continues their assertion chain.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let symbolic = builder.add_input(n.clone().into());
             let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
             let zero = builder
@@ -2246,7 +2246,7 @@ mod tests {
             )
         };
         assert!(callee.effects().classes().is_empty());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let symbolic = builder.add_input(n.clone().into());
         let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -2371,7 +2371,7 @@ mod tests {
         // input `y` outside of it, so the residual program needs the result of the call.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
             let squared =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -2379,7 +2379,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_program(callee);
         let x = builder.add_input(scalar_type.clone());
         let y = builder.add_input(scalar_type);
@@ -2406,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_supports_composite_region_boundaries() {
+    fn test_jit_call_supports_array_ir_region_boundaries() {
         let dimension_type =
             ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = ArrayIrType::Array(vector_type());
@@ -2432,7 +2432,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_operation_batch_homogeneous_named_axis() {
-        /// Array-only family for exercising the homogeneous JIT batching rule without composite carriers.
+        /// Array-only family for exercising the homogeneous JIT batching rule without array IR carriers.
         #[derive(Clone, Debug, Operation)]
         #[ryft(crate = "ryft_core", type(ArrayType), constant(Array), dispatch(batching))]
         enum NamedAxisCallOperation {
@@ -2511,7 +2511,7 @@ mod tests {
             RecursiveBatchingDriver,
         };
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let callee = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -2552,7 +2552,7 @@ mod tests {
             ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
 
-        let mut callee_builder = CompositeXlaProgramBuilder::new();
+        let mut callee_builder = ArrayIrXlaProgramBuilder::new();
         let dimension = callee_builder.add_input(dimension_type.clone());
         let array = callee_builder.add_input(array_type.clone());
         let callee = callee_builder
@@ -2563,7 +2563,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let dimension = builder.add_input(dimension_type.clone());
         let array = builder.add_input(array_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
@@ -2637,7 +2637,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let captured = builder.add_input(reference_type.clone());
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
@@ -2670,7 +2670,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let captured = builder.add_input(reference_type.clone());
         let reference = builder.add_input(reference_type.clone());
@@ -2727,7 +2727,7 @@ mod tests {
     fn test_jit_call_jvp_omits_inactive_reference_output_tangents() {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = CompositeXlaProgramBuilder::new();
+        let mut callee_builder = ArrayIrXlaProgramBuilder::new();
         let reference = callee_builder.add_input(reference_type.clone());
         let value = callee_builder.add_input(scalar_type.clone());
         let doubled =
@@ -2739,7 +2739,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let reference = builder.add_input(reference_type.clone());
         let value = builder.add_input(scalar_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
@@ -2774,7 +2774,7 @@ mod tests {
         // structural zero that the tangent call does not return.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
             let y = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
@@ -2787,7 +2787,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let outputs = builder
@@ -2828,7 +2828,7 @@ mod tests {
         // zero that the tangent call does not return.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             let zero =
@@ -2837,7 +2837,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(r#type);
         let outputs = builder
@@ -2878,7 +2878,7 @@ mod tests {
         // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             let zero =
@@ -2891,7 +2891,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(r#type.clone());
         let outputs = builder
@@ -2925,7 +2925,7 @@ mod tests {
         // structural zero.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
             builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
@@ -2933,7 +2933,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let output = builder
@@ -2969,7 +2969,7 @@ mod tests {
         let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
         let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let value = builder.add_input(value_type.clone());
             let size = builder.add_input(size_type.clone());
             let dimension = builder
@@ -2985,7 +2985,7 @@ mod tests {
         let operation = JitCallOperation::new(0)
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
         let output = builder.add_instruction(XlaOperation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
@@ -3006,7 +3006,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             let before = builder
@@ -3039,7 +3039,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -3139,7 +3139,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
@@ -3154,7 +3154,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -3196,7 +3196,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
@@ -3219,7 +3219,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -3271,10 +3271,10 @@ mod tests {
         let tangent_type = ArrayIrType::Array(tangent_type);
         // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
         // identity-region boundary rather than an empty driver that cannot answer that query.
-        let mut source_builder = CompositeXlaProgramBuilder::new();
+        let mut source_builder = ArrayIrXlaProgramBuilder::new();
         let input = source_builder.add_input(tangent_type.clone());
         let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut transpose_builder = CompositeXlaProgramBuilder::new();
+        let mut transpose_builder = ArrayIrXlaProgramBuilder::new();
         let input = transpose_builder.add_input(expected.clone());
         let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let driver = TestTranspositionDriver { source, transposed };
@@ -3333,13 +3333,13 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut callee_builder = CompositeXlaProgramBuilder::new();
+        let mut callee_builder = ArrayIrXlaProgramBuilder::new();
         callee_builder.add_input(dynamic_type.clone().into());
         let live = callee_builder.add_input(scalar_type.clone().into());
         let callee = callee_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let disconnected = builder.add_input(dynamic_type.into());
         let live = builder.add_input(scalar_type.into());
         let callee = builder.import_region(callee.entry_region_ref());
@@ -3382,7 +3382,7 @@ mod tests {
         let value_program_type = ArrayIrType::Array(value_type.clone());
         let predicate_program_type = ArrayIrType::Array(predicate_type.clone());
         let source = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let value = builder.add_input(value_program_type.clone());
             let predicate =
                 builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
@@ -3395,7 +3395,7 @@ mod tests {
                 .unwrap()
         };
         let transposed = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let value_cotangent = builder.add_input(value_program_type.clone());
             let _predicate_cotangent = builder.add_input(ArrayIrType::Array(predicate_type.cotangent().unwrap()));
             builder
@@ -3919,7 +3919,7 @@ mod tests {
         // scale to the policy, saving 4 KiB instead of 256 KiB and replaying only the broadcast.
         let compact_type = ArrayType::new_static(DataType::F32, [1024]);
         let expanded_type = ArrayType::new_static(DataType::F32, [64, 1024]);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let weights = builder.add_input(compact_type.clone().into());
         let scale = builder.add_instruction(SinOperation::new(), Vec::new(), vec![weights], None).unwrap()[0];
         let scale = builder
@@ -3931,7 +3931,7 @@ mod tests {
         let callee = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![expanded], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(expanded_type.clone().into());
         let weights = builder.add_input(compact_type.clone().into());
         let callee = builder.import_program(callee);
@@ -3977,7 +3977,7 @@ mod tests {
 
         // The same cut survives the rematerialization wrapper's linearization, where the original output remains a
         // known primal result and the expanded scale is needed only by the derivative with respect to the activation.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(expanded_type.clone().into());
         let weights = builder.add_input(compact_type.clone().into());
         let plain_linearization = program.linearize_with_respect_to(&[0]).unwrap();
@@ -4039,7 +4039,7 @@ mod tests {
         use ryft_core::{RematerializationPolicyFn, ResidualPolicyError};
 
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let needed = builder
@@ -4052,7 +4052,7 @@ mod tests {
         let callee = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![needed, unused], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type.clone());
         let callee = builder.import_program(callee);
@@ -4130,7 +4130,7 @@ mod tests {
 
         let policy = ResidualPolicyReference::new(NothingSavable);
         let check_boundary = |callee: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, capture_count: usize| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let inputs = callee.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
             let input_count = inputs.len();
             let callee = builder.import_program(callee);
@@ -4159,7 +4159,7 @@ mod tests {
         // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
         let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(dynamic_type.into());
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         check_boundary(
@@ -4171,7 +4171,7 @@ mod tests {
 
         // An ordered assertion must keep the same owning call and execution order.
         let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let predicate = builder.add_input(predicate_type.clone());
         builder
             .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
@@ -4184,7 +4184,7 @@ mod tests {
         );
 
         // Reference handles and retained capture constants keep their existing boundary semantics too.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         check_boundary(
             builder
@@ -4192,7 +4192,7 @@ mod tests {
                 .unwrap(),
             0,
         );
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         builder.add_input(predicate_type.clone());
         let captured = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, predicate_type.clone())));
         check_boundary(
@@ -4204,7 +4204,7 @@ mod tests {
 
         // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
         // concrete eager calls whole; using a literal in a live trace makes the retained call directly observable.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(predicate_type);
         let callee = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])

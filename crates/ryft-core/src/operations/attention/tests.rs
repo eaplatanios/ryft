@@ -358,8 +358,8 @@ fn test_dot_product_attention_interpretation() {
 }
 
 #[test]
-fn test_dot_product_attention_composite() {
-    // Concrete composite values compute attention over their array members.
+fn test_dot_product_attention_array_ir() {
+    // Concrete array IR values compute attention over their array members.
     let query =
         Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 1, 2]), &[1.0, 0.0, 0.0, 1.0]).unwrap();
     let key =

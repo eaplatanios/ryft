@@ -378,7 +378,7 @@ where
 /// Native variants forward to their payload's own rule, and the generated per-payload predicates transport that rule's
 /// value and context requirements to the enum's use site. Declared member variants instead use the enclosing enum's
 /// canonical fold-or-residualize path because member-side partial values cannot represent values belonging to other
-/// members of the composite universe. This preserves correct folding and residualization without a second projected
+/// members of the heterogeneous universe. This preserves correct folding and residualization without a second projected
 /// partial-value protocol. Refer to the documentation of [`Operation`] for the full derive contract. Partial evaluation
 /// is always generated and does not require a `dispatch(...)` selection.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {

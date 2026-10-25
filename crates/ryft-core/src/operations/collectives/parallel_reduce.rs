@@ -496,7 +496,7 @@ impl_differentiable_operation! {
 /// the input variation, because distinct groups can produce distinct results.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1262,7 +1262,7 @@ mod tests {
         assert_eq!(evaluation.program().to_string(), mesh_rendering);
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
 
-        // The composite family residualizes the operation in the same way.
+        // The array IR family residualizes the operation in the same way.
         let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let outputs = ArrayIrOperation::Array(ArrayOperation::ParallelReduce(ordinary.clone()))
             .partially_evaluate(

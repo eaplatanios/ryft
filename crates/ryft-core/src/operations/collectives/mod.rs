@@ -365,8 +365,8 @@ impl CollectiveOptions {
 /// collective capability implementations.
 ///
 /// Homogeneous [`Tracer`], [`BatchingTracer`], and [`DifferentiationTracer`] values opt in. Projected array values
-/// instead delegate through their composite value so that runtime output extents remain explicit inputs; they must
-/// not implement this trait. Concrete host arrays retain their own unbound-axis diagnostics and do not opt in either.
+/// instead delegate through their array IR value so that runtime output extents remain explicit inputs; they must not
+/// implement this trait. Concrete host arrays retain their own unbound-axis diagnostics and do not opt in either.
 pub trait ShapeChangingCollectiveValue: Value<Type = ArrayType> {}
 
 impl<C: Context> ShapeChangingCollectiveValue for Tracer<C> where Self: Value<Type = ArrayType> {}
@@ -562,18 +562,18 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> {
 
 /// [`LinearCollectiveOperation`] that resizes an array axis (e.g., [`ParallelAllGatherOperation`],
 /// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Its output shape depends on the participant
-/// count and its [`CollectiveMode`], so in the composite array/dimension family it is staged with one explicit extent
-/// input per output axis. This trait captures the hooks that differ between these collectives (i.e., their options and
-/// their composite type inference) and provides the composite interpretation and forward-mode differentiation rules,
-/// together with the batching rules of both array families, on top of them and of their
-/// [`ShapeChangingCollectiveBatching`] implementations.
+/// count and its [`CollectiveMode`], so in the array IR family it is staged with one explicit extent input per output
+/// axis. This trait captures the hooks that differ between these collectives (i.e., their options and their array IR
+/// type inference) and provides the array IR interpretation and forward-mode differentiation rules, together with the
+/// batching rules of both array families, on top of them and of their [`ShapeChangingCollectiveBatching`]
+/// implementations.
 trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     /// Returns the [`CollectiveOptions`] of this [`ShapeChangingCollectiveOperation`].
     fn collective_options(&self) -> &CollectiveOptions;
 
-    /// Infers the output type of this collective in the composite array/dimension family, whose array input is followed
-    /// by one explicit extent per output axis. Statically known extents are checked here, while dynamic extents are
-    /// checked by the runtime assertions that the collective's capability stages.
+    /// Infers the output type of this collective in the array IR family, whose array input is followed by one explicit
+    /// extent per output axis. Statically known extents are checked here, while dynamic extents are checked by the
+    /// runtime assertions that the collective's capability stages.
     ///
     /// # Errors
     ///
@@ -596,7 +596,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         &self,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // The composite collective consumes one array followed by a dimension value for each result axis.
+        // The array IR collective consumes one array followed by a dimension value for each result axis.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
         };
@@ -747,11 +747,11 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     }
 
     /// Implements [`batch_in_parent`](crate::MemberBatchableOperation::batch_in_parent) for this collective in the
-    /// composite array/dimension family, whose explicit result extents remain the only source of dynamic reshape
-    /// extents. The result extents, which describe the shape shared by every batch item, must be replicated. A `batch`
-    /// level that does not bind the collective's axis forwards it to its parent, while a level that binds the axis
-    /// consumes it through [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis) over the
-    /// array projection of its parent.
+    /// array IR family, whose explicit result extents remain the only source of dynamic reshape extents. The result
+    /// extents, which describe the shape shared by every batch item, must be replicated. A `batch` level that does not
+    /// bind the collective's axis forwards it to its parent, while a level that binds the axis consumes it through
+    /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis) over the array projection of its
+    /// parent.
     fn shape_changing_collective_batch_in_parent<
         C: ContextProjection<
                 ArrayType,
@@ -800,8 +800,8 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
         self.reject_mesh_form()?;
 
-        // Project the composite values onto their array and dimension domains, so that the homogeneous kernel
-        // can use the explicit dimension values directly for dynamic reshape extents.
+        // Project the array IR values onto their array and dimension domains, so that the homogeneous kernel can use
+        // the explicit dimension values directly for dynamic reshape extents.
         let array = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
@@ -817,7 +817,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
             logical_output_type.sharding().cloned(),
         )?;
 
-        // Embed the array result back into the composite family without changing the batch axis that the kernel chose.
+        // Embed the array result back into the array IR family without changing the batch axis that the kernel chose.
         let batch_axis = output.batch_axis();
         Ok(vec![ArrayIrBatch::new(
             <C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()),
@@ -856,7 +856,7 @@ trait ShapeChangingCollectiveBatching<C: Context<Type = ArrayType>>: ShapeChangi
 
 /// Representation boundary used only by shape-changing collective batching rules. The collective kernels determine the
 /// exchange shapes. This trait exposes the extent representation, exact division, and the alignment and reshape
-/// encodings that differ between homogeneous arrays and composite array/dimension programs.
+/// encodings that differ between homogeneous arrays and array IR programs.
 trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayExtentBatchingPolicy<C> {
     /// Extent representation consumed by the shared collective kernels.
     type ShapeExtent: Clone + Debug + Mul;
@@ -1444,7 +1444,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
     /// Returns this `batch` level re-expressed over the array projection of its parent with the dynamic extent batching
     /// policy, keeping its axis name, extent, and sharding, so that the matching-axis kernels of the shape-changing
     /// collectives, which operate on homogeneous arrays, can consume this level's mapped axis while reading their
-    /// reshape extents from the explicit dimension values of composite programs.
+    /// reshape extents from the explicit dimension values of array IR programs.
     fn array_projection(
         &self,
     ) -> BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
@@ -1466,8 +1466,8 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 /// contexts rather than values and is therefore not a member.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`].
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`].
 pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
     Capability
     + ParallelReduce<T>
@@ -1545,7 +1545,7 @@ mod tests {
         operation.batch(&context, &EmptyRegionDriver, &[input])
     }
 
-    /// Creates an eager composite batching level that binds the axis `"x"` and whose mapped extent is a first-class
+    /// Creates an eager array IR batching level that binds the axis `"x"` and whose mapped extent is a first-class
     /// dimension value.
     fn dynamic_collective_context(
         extent: DimensionValue,
@@ -1557,7 +1557,7 @@ mod tests {
             .with_axis_name("x".to_string())
     }
 
-    /// Binds `operation` at a traced composite `batch` level of extent 5 that binds the axis `"outer"`, which
+    /// Binds `operation` at a traced array IR `batch` level of extent 5 that binds the axis `"outer"`, which
     /// `operation` does not reference. The array input has physical shape `input_shape` and is mapped at
     /// `input_batch_axis`, and it is followed by one replicated extent input per entry of `output_extents`. Returns the
     /// batch axis and type of the forwarded result together with the rendering of the staged program.
@@ -2743,7 +2743,7 @@ mod tests {
 
     #[test]
     fn test_batching_context_array_projection() {
-        // The projection keeps the axis name, extent, and sharding of the composite level.
+        // The projection keeps the axis name, extent, and sharding of the array IR level.
         let axis_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::with_policy(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),

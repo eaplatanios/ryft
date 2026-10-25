@@ -76,7 +76,7 @@ impl ArrayIrType {
             .collect()
     }
 
-    /// Returns this composite member's diagnostic kind name.
+    /// Returns this array IR member's diagnostic kind name.
     fn kind_name(&self) -> &'static str {
         match self {
             Self::Array(_) => "array",

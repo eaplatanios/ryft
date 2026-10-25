@@ -91,9 +91,9 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 ///
 /// # Array Type Families
 ///
-/// For example, [`ArrayType`] accepts rank-zero Boolean predicates, while a composite [`ArrayIrType`] accepts only its
-/// rank-zero Boolean array member. A first-class dimension describes an array extent rather than Boolean data, despite
-/// its scalar runtime representation, and a reference is a mutable state handle rather than a predicate value.
+/// For example, [`ArrayType`] accepts rank-zero Boolean predicates, while [`ArrayIrType`] accepts only its rank-zero
+/// Boolean array member. A first-class dimension describes an array extent rather than Boolean data, despite its scalar
+/// runtime representation, and a reference is a mutable state handle rather than a predicate value.
 ///
 /// A manual region is a [`ShardMapOperation`](crate::ShardMapOperation) body. It runs per device on local shards, with
 /// explicit collectives for communication along the operation's selected mesh axes (its active manual mesh axes). A
@@ -197,8 +197,8 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// evaluation so inactive non-finite derivatives do not contaminate the selected derivative. The selected branch must
 /// still have a defined derivative.
 ///
-/// Composite staging with a mapped predicate also rejects branch-local type identities. Replaying both branches into
-/// one parent trace loses their separate definition scopes, and freshening those definitions alone would leave any
+/// Array IR staging with a mapped predicate also rejects branch-local type identities. Replaying both branches into one
+/// parent trace loses their separate definition scopes, and freshening those definitions alone would leave any
 /// dependent array shapes needing a runtime join. Dimension identities established by branch inputs remain supported.
 ///
 /// Each reference output must denote the same reference (i.e., the same instruction input or captured reference)
@@ -1506,7 +1506,7 @@ where
 /// implement `Clone`. Nested branch programs retain flat boundaries for positional replay.
 ///
 /// The universe parameter `T` defaults to the `Capability` universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -2373,10 +2373,10 @@ mod tests {
 
     use super::*;
 
-    /// Eager context over the composite test universe.
+    /// Eager context over the array IR test universe.
     type TestEagerContext = EagerContext<TestIrValue, TestIrOperation>;
 
-    /// Staged value of a branch traced over the composite test universe.
+    /// Staged value of a branch traced over the array IR test universe.
     type TestTracer = Tracer<TracingContext<TestIrValue, TestIrOperation>>;
 
     /// Staged value of a branch traced over the array universe.
@@ -2709,7 +2709,7 @@ mod tests {
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Builds a composite branch that forwards its `dimension_type` extent input and scales its scalar `f64` input by
+    /// Builds an array IR branch that forwards its `dimension_type` extent input and scales its scalar `f64` input by
     /// `factor`.
     fn scale_branch(
         dimension_type: DimensionType,
@@ -2730,7 +2730,7 @@ mod tests {
         builder.build(vec![extent, output], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
     }
 
-    /// Builds a composite condition over `[predicate, extent, input]`, where `input` is an `f64` vector whose dynamic
+    /// Builds an array IR condition over `[predicate, extent, input]`, where `input` is an `f64` vector whose dynamic
     /// size is `extent`. The `true` branch squares the input and the `false` branch doubles it. Returns the program
     /// together with the extent's dimension type and the input type.
     fn dynamic_extent_condition_program()
@@ -3209,7 +3209,7 @@ mod tests {
             )),
         );
 
-        // Composite universes infer the same contract over mixed dimension and array members, and reject a dimension
+        // Array IR universes infer the same contract over mixed dimension and array members, and reject a dimension
         // predicate.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
@@ -3255,13 +3255,13 @@ mod tests {
         );
         let branches = refinable_dynamic_branches();
         let interfaces = branches.each_ref().map(Program::interface);
-        let composite_branches =
+        let array_ir_branches =
             branches.map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
-        let composite_interfaces = composite_branches.each_ref().map(Program::interface);
+        let array_ir_interfaces = array_ir_branches.each_ref().map(Program::interface);
         let refined_input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [3])];
-        let refined_composite_input_types = refined_input_types.clone().map(ArrayIrType::Array);
+        let refined_array_ir_input_types = refined_input_types.clone().map(ArrayIrType::Array);
         let mismatched_input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [4])];
-        let mismatched_composite_input_types = mismatched_input_types.clone().map(ArrayIrType::Array);
+        let mismatched_array_ir_input_types = mismatched_input_types.clone().map(ArrayIrType::Array);
         let mismatch =
             TypeError::invalid("`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]");
         assert_eq!(
@@ -3284,22 +3284,22 @@ mod tests {
         );
         assert_eq!(
             TestIrOperation::Condition(ConditionOperation::new())
-                .infer_output_types(&refined_composite_input_types, &composite_interfaces),
+                .infer_output_types(&refined_array_ir_input_types, &array_ir_interfaces),
             Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]),
         );
         assert_eq!(
             TestIrOperation::Condition(ConditionOperation::new())
-                .infer_output_types(&mismatched_composite_input_types, &composite_interfaces),
+                .infer_output_types(&mismatched_array_ir_input_types, &array_ir_interfaces),
             Err(mismatch.clone()),
         );
         assert_eq!(
             KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
-                .infer_output_types(&refined_composite_input_types, &composite_interfaces),
+                .infer_output_types(&refined_array_ir_input_types, &array_ir_interfaces),
             Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]),
         );
         assert_eq!(
             KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::Condition(ConditionOperation::new()))
-                .infer_output_types(&mismatched_composite_input_types, &composite_interfaces),
+                .infer_output_types(&mismatched_array_ir_input_types, &array_ir_interfaces),
             Err(mismatch),
         );
     }
@@ -3867,9 +3867,9 @@ mod tests {
             ArrayOperation::<Array>::Condition(ConditionOperation::new()).validate_region_interfaces(&interfaces),
             expected,
         );
-        let composite_branches =
+        let array_ir_branches =
             branches.map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
-        let interfaces = composite_branches.each_ref().map(Program::interface);
+        let interfaces = array_ir_branches.each_ref().map(Program::interface);
         assert_eq!(
             TestIrOperation::Condition(ConditionOperation::new()).validate_region_interfaces(&interfaces),
             expected,
@@ -6169,8 +6169,8 @@ mod tests {
             .to_vec();
         let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
 
-        // A dimension carried through a condition is an ordinary structural value: it appears in both branch
-        // interfaces and in the composite output signature exactly like the array beside it.
+        // A dimension carried through a condition is an ordinary structural value: it appears in both branch interfaces
+        // and in the array IR output signature exactly like the array beside it.
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -6204,7 +6204,7 @@ mod tests {
             Ok(vec![dimension(&extent_type, 4), array(Array::scalar(15.0).unwrap())]),
         );
 
-        // Relocating the composite program imports both branch regions unchanged, so it renders and executes exactly
+        // Relocating the array IR program imports both branch regions unchanged, so it renders and executes exactly
         // like its source. Program splicing is owned by `programs`; no test in this module owns it.
         let mut relocated_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let relocated_inputs = vec![
@@ -9483,8 +9483,8 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_compares_refined_branch_outputs() {
-        // The composite batching rule compares refined branch outputs like the array rule does, with the batch extent
+    fn test_condition_batching_array_ir_compares_refined_branch_outputs() {
+        // The array IR batching rule compares refined branch outputs like the array rule does, with the batch extent
         // threaded through the batched branches as a first-class dimension.
         for (predicate_type, predicate_axis, expected_program) in [
             (
@@ -10330,7 +10330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_preserves_eager_reference_refinements() {
+    fn test_condition_batching_array_ir_preserves_eager_reference_refinements() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -10367,7 +10367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_rejects_mapped_shape_computation() {
+    fn test_condition_batching_array_ir_rejects_mapped_shape_computation() {
         // Computing a first-class output extent from mapped scalar data cannot produce a rectangular array.
         // The ordered scalar-to-dimension gateway makes the branch effectful, so mapped selection rejects it before
         // either branch is transformed.
@@ -10413,7 +10413,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_rejects_incompatible_branch_output_signatures() {
+    fn test_condition_batching_array_ir_rejects_incompatible_branch_output_signatures() {
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let scalar = builder.add_constant(array(Array::scalar(1.0f64).unwrap()));
         let true_branch = builder
@@ -10458,7 +10458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_keeps_dimension_outputs_replicated_under_mapped_predicates() {
+    fn test_condition_batching_array_ir_keeps_dimension_outputs_replicated_under_mapped_predicates() {
         // Under a batch-varying predicate, dimension results of the two branches stay replicated, so they must agree.
         // Dimension constants are typed exactly, so branches that return different extents have different output
         // types, and the condition rejects them by their signatures before batching selects anything.
@@ -10591,7 +10591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_rejects_staged_branch_local_type_identities() {
+    fn test_condition_batching_array_ir_rejects_staged_branch_local_type_identities() {
         // The branches are valid and agree on their result value. Flattening their definitions into the parent would
         // still duplicate one nominal identity, so rejection must precede any replay or parent-trace mutation.
         let input_type = DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap());
@@ -10649,7 +10649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_refines_outputs_of_unspecialized_branches() {
+    fn test_condition_batching_array_ir_refines_outputs_of_unspecialized_branches() {
         // Batching a condition whose refined output comes from unspecialized branches keeps its batched output refined,
         // under replicated and mapped predicates alike.
         let matrix = |values: &[f64]| {
@@ -10734,7 +10734,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_threads_reference_carries() {
+    fn test_condition_batching_array_ir_threads_reference_carries() {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
         let mut true_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -10871,7 +10871,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_rejects_branch_dependent_reference_outputs() {
+    fn test_condition_batching_array_ir_rejects_branch_dependent_reference_outputs() {
         // A replicated predicate binds one condition into the parent context. A staging parent does not interpret that
         // condition, so batching validates the reference contracts of both branches itself and rejects the condition
         // that interpretation and discharge reject.
@@ -10907,7 +10907,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_validates_reference_accesses_under_mapped_predicates() {
+    fn test_condition_batching_array_ir_validates_reference_accesses_under_mapped_predicates() {
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut branch_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let reference = branch_builder.add_input(reference_type.into());
@@ -11026,7 +11026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_forwards_refined_eager_references_under_mapped_predicates() {
+    fn test_condition_batching_array_ir_forwards_refined_eager_references_under_mapped_predicates() {
         // The branches declare `ref<f32[extent]>` and `f32[extent]` inputs, and the eager reference's `f32[3]` referent
         // refines its declared type. A batch-varying predicate only forwards the untouched reference, so it accepts
         // that refinement like eager interpretation does and selects the array outputs per item.
@@ -11102,8 +11102,8 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_aligns_manual_variation() {
-        // Composite batching gives the invariant Boolean predicate the variation of the array branch values in the same
+    fn test_condition_batching_array_ir_aligns_manual_variation() {
+        // Array IR batching gives the invariant Boolean predicate the variation of the array branch values in the same
         // way as array batching, once for both the gating and the merging selections.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying_sharding = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["x"]).unwrap();
@@ -11171,7 +11171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batching_composite_after_reference_discharge() {
+    fn test_condition_batching_array_ir_after_reference_discharge() {
         // Discharge across a condition: the mapped predicate turns the condition into a select over both discharged
         // branch states while the batched program stays pure and reference-free.
         let program = state_condition_program();
@@ -13208,9 +13208,9 @@ mod tests {
         let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
 
-        // In the composite family, the projection of `stop_gradient` materializes the severed tangent of the last
-        // instruction input as a zero shaped by its primal's runtime extent, so that tangent reaches the condition
-        // rule as a live value rather than as a structural zero.
+        // In the array IR family, the projection of `stop_gradient` materializes the severed tangent of the last
+        // instruction input as a zero shaped by its primal's runtime extent, so that tangent reaches the condition rule
+        // as a live value rather than as a structural zero.
         let severed = builder
             .add_instruction(
                 TestIrOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
@@ -13360,7 +13360,7 @@ mod tests {
             Ok(vec![Array::vector(vec![0.25f64, 1.0, 1.0]).unwrap()]),
         );
 
-        // Composite batching threads the batch extent as a dimension input and blocks the same contributions.
+        // Array IR batching threads the batch extent as a dimension input and blocks the same contributions.
         let program = square_root_or_identity_condition_program()
             .into_unprojected::<TestIrValue, TestIrOperation>()
             .unwrap();
@@ -14017,8 +14017,8 @@ mod tests {
     #[test]
     fn test_condition_transposition_materializes_one_sided_cast_zeros_from_extent_residuals() {
         // The `true` branch narrows `x: f32[n]` to `f32[2]` with a checked cast, while the `false` branch returns `y`.
-        // Over the composite universe, linearization saves one `dimension<n>` extent residual, which both branches
-        // read from `x` with `dimension_size`, for the `true` branch's tangent cast, and the disconnected `x` needs no
+        // Over the array IR universe, linearization saves one `dimension<n>` extent residual, which both branches read
+        // from `x` with `dimension_size`, for the `true` branch's tangent cast, and the disconnected `x` needs no
         // separate residual. Condition transposition materializes each one-sided zero from that shared extent residual
         // when its type needs runtime extents.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -15460,7 +15460,7 @@ mod tests {
         assert_eq!(predicate.condition(|()| Ok(()), |()| Ok(()), ()), Ok(()));
         assert_eq!(predicate.condition(Ok, Ok, Vec::<Array>::new()), Ok(Vec::<Array>::new()));
 
-        // Composite values carry arrays, dimensions, and references through the same structure.
+        // Array IR values carry arrays, dimensions, and references through the same structure.
         let predicate = TestIrValue::Array(Array::scalar(true).unwrap());
         let dimension = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let reference = TestIrValue::Reference(ArrayReference::new(Array::scalar(4.0f32).unwrap()));

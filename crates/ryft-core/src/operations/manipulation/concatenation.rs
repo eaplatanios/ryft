@@ -91,7 +91,7 @@ impl<T: Type> ConcatenateOperation<T> {
         })
     }
 
-    /// Renders this payload independently of its homogeneous or composite operation contract. This is a separate
+    /// Renders this payload independently of its homogeneous or array IR operation contract. This is a separate
     /// function rather than the body of [`Operation::render`] because the [`ArrayType`] and [`ArrayIrType`] payloads
     /// have separate [`Operation`] implementations that must render identically, and both must forward their
     /// `indentation` so that [`OperationFormatter`] can lay out continuation lines. Inherent functions take precedence
@@ -743,7 +743,7 @@ impl_differentiable_operation! {
             // The explicit result extent receives a structural zero cotangent and each array cotangent is sliced out of
             // the output cotangent at its cumulative offset along the concatenated axis. Fully static inputs delegate
             // that slicing to the homogeneous array pullback. Inputs with a dynamic extent on a _non-concatenated_ axis
-            // are sliced directly in the composite universe instead, reading each such extent off the live output
+            // are sliced directly in the array IR universe instead, reading each such extent off the live output
             // cotangent, which repeats the input's dimension identity on every preserved axis. A dynamic extent on the
             // _concatenated_ axis is the one extent this boundary does not already hold, because the per-input offsets
             // are then runtime sums, so that case requires linearization instead, which retains those input extents as
@@ -820,7 +820,7 @@ impl_differentiable_operation! {
             // output cotangent repeats each input's dimension identity there, and a repeated identity denotes one
             // runtime quantity. Reading those extents off the cotangent therefore recovers the input shape exactly
             // while keeping nothing alive that the pullback did not already hold. The homogeneous member rule cannot
-            // express this because its `SliceOperation` bounds are static payload values, so the composite slice is
+            // express this because its `SliceOperation` bounds are static payload values, so the array IR slice is
             // staged here directly.
             let MaybeZero::Value(cotangent) = &outputs[0] else {
                 unreachable!("a structural-zero output cotangent returns early above");
@@ -924,7 +924,7 @@ impl_differentiable_operation! {
 /// Represents the ability to join arrays end-to-end along one axis. [`Self::concatenate`] preserves input order and
 /// requires the same element [`DataType`](crate::DataType), rank, [`Memory`](crate::Memory) space, and dimensions other
 /// than the concatenated axis. Negative axes count from the final axis. There must be at least one input. A single
-/// input is returned unchanged without inspecting the axis, although a composite input must still be an array.
+/// input is returned unchanged without inspecting the axis, although an array IR input must still be an array.
 ///
 /// For multiple inputs, the result preserves the common memory space, clears explicit physical
 /// [`Layout`](crate::Layout) metadata, and infers [`Sharding`] independently. The concatenated axis must have static
@@ -935,7 +935,7 @@ impl_differentiable_operation! {
 /// operation.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1104,7 +1104,7 @@ where
     }
 }
 
-// A composite value concatenates through `DynamicConcatenate`, deriving the result extent as the sum of the input
+// An array IR value concatenates through `DynamicConcatenate`, deriving the result extent as the sum of the input
 // extents on `axis`. Each extent is read with `DimensionSize::dimension_size` and the extents are summed with `Add`
 // on their `DimensionType` projections, so the derivation stages dimension operations under a tracer and evaluates
 // eagerly on concrete values. Exact extents fold to a static output axis, and dynamic extents produce a fresh dimension
@@ -1167,11 +1167,10 @@ where
 /// the output unify statically with other values typed by it, and keeps its computation available to staging and
 /// differentiation.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents. Its provided functions only require views of the receiver's type (e.g.,
-/// [`AsArrayType`](crate::AsArrayType)), so that other universes with array and dimension members can implement it as
-/// well.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
+/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`](crate::AsArrayType)), so that
+/// other universes with array and dimension members can implement it as well.
 ///
 /// # Example
 ///
@@ -2075,7 +2074,7 @@ mod tests {
         );
 
         // A dynamic non-concatenated axis is shared by the output cotangent and every input, so the pullback reads it
-        // whole through a dynamic slice limit while it slices the concatenated axis at static offsets. The composite
+        // whole through a dynamic slice limit while it slices the concatenated axis at static offsets. The array IR
         // rule delegates here only for fully static inputs and otherwise stages a `dynamic_slice` whose extents it
         // reads off the live output cotangent, which is pinned by
         // `test_array_ir_concatenate_transposition_slices_a_dynamic_non_concatenated_extent`.
@@ -3521,7 +3520,7 @@ mod tests {
         // cotangent back into per-input pieces, which needs the runtime extent of the non-concatenated axis. That
         // extent is already live at the transpose boundary: concatenation preserves every non-concatenated axis, so
         // the output cotangent repeats the inputs' `columns` identity, and one `dimension_size` read of the
-        // cotangent recovers it. The composite rule therefore stages the slicing itself rather than delegating to the
+        // cotangent recovers it. The array IR rule therefore stages the slicing itself rather than delegating to the
         // homogeneous array-only rule, whose static `slice` bounds cannot express a runtime extent, and no residual
         // is retained.
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(9)).unwrap());

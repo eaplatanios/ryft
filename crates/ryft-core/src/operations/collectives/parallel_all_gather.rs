@@ -332,7 +332,7 @@ impl Operation for ParallelAllGatherOperation {
         let effective_axis_size = self.effective_axis_size()?;
 
         // Result-shape arithmetic in the homogeneous array family requires static extents. Dynamic shapes use explicit
-        // result extents in the composite array/dimension family.
+        // result extents in the array IR family.
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support dynamically shaped inputs",
@@ -685,7 +685,7 @@ where
         }
 
         // The homogeneous family has no dimension values, so the selected chunk needs static extents. A dynamically
-        // shaped input can only occur in a mixed program, whose linearization stages the composite rule instead.
+        // shaped input can only occur in a mixed program, whose linearization stages the array IR rule instead.
         let input_cotangent_type = inputs[0].r#type().cotangent()?;
         let participants_type =
             input_cotangent_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(self.axis_size))?;
@@ -906,7 +906,7 @@ where
             return self.shape_changing_collective_jvp_in_parent(context, inputs);
         }
 
-        // The composite inputs are the gathered array followed by one explicit extent per output axis. Only the array
+        // The array IR inputs are the gathered array followed by one explicit extent per output axis. Only the array
         // can carry a live tangent, because the extents are integer-valued dimensions.
         let Some((array, _)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -1059,8 +1059,8 @@ where
                             _ => output_cotangents[0].clone(),
                         };
 
-                        // The composite `dynamic_slice` consumes the sliced array followed by all start offsets and
-                        // then all slice extents, with one of each per array axis.
+                        // The array IR `dynamic_slice` consumes the sliced array followed by all start offsets and then
+                        // all slice extents, with one of each per array axis.
                         let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
                         slice_inputs.push(output_cotangent);
                         slice_inputs.extend(starts);
@@ -1105,11 +1105,11 @@ where
 /// Refer to the documentation of [`ParallelAllGatherOperation`] for the semantics and transformation rules.
 ///
 /// Over a manual mesh axis, an input that does not vary over the axis is first made varying through [`ParallelVary`],
-/// so that every device's copy is gathered. Homogeneous array values require static extents, while composite array IR
-/// values stage one explicit extent value per output axis and so also support dynamic extents.
+/// so that every device's copy is gathered. Homogeneous array values require static extents, while array IR values
+/// stage one explicit extent value per output axis and so also support dynamic extents.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1247,7 +1247,7 @@ impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGathe
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
-        // A concrete composite value performs the collective through its array member.
+        // A concrete array IR value performs the collective through its array member.
         let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_gather_with_options(
             axis_name,
@@ -1289,8 +1289,8 @@ impl<
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
-        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation. Over
-        // a manual mesh axis, an input that does not vary over the axis is first made varying, so that every device's
+        // Homogeneous values opt into direct staging, while projected values retain array IR extent delegation. Over a
+        // manual mesh axis, an input that does not vary over the axis is first made varying, so that every device's
         // copy is gathered, while reduction state over the axis is rejected first, so that it is reported as an
         // all-gather error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its
         // concatenation axis is a position in the result, whose rank is one more than the rank of the input.
@@ -1339,13 +1339,13 @@ impl<
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
-        // A composite value binds a `ParallelAllGatherOperation` through its own context, followed by one explicit
-        // extent value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that
-        // does not vary over the axis is first made varying through its array view, so that every device's copy is
-        // gathered, while reduction state over the axis is rejected first, so that it is reported as an all-gather
-        // error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its concatenation axis
-        // is a position in the result, whose rank is one more than the rank of the input. The axis is normalized
-        // before the explicit result extents are derived from the input extents.
+        // An array IR value binds a `ParallelAllGatherOperation` through its own context, followed by one explicit
+        // extent value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that does
+        // not vary over the axis is first made varying through its array view, so that every device's copy is gathered,
+        // while reduction state over the axis is rejected first, so that it is reported as an all-gather error rather
+        // than as a `parallel_vary` error. An untiled gather inserts an axis, so its concatenation axis is a position
+        // in the result, whose rank is one more than the rank of the input. The axis is normalized before the explicit
+        // result extents are derived from the input extents.
         let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let input_type = self.r#type();
@@ -1832,7 +1832,7 @@ mod tests {
             ],
         );
 
-        // The composite family applies the same transition.
+        // The array IR family applies the same transition.
         assert_eq!(
             operation.infer_array_ir_output_types(&[
                 with_sharding(4, &unrelated_pending_sum).into(),
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_type_inference_array_ir_identity_instantiation() {
-        // Staging through the composite capability derives the result extent from the input's symbolic extent.
+        // Staging through the array IR capability derives the result extent from the input's symbolic extent.
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let input_variable = DimensionVariable::new("items", bounds);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -2605,7 +2605,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_batching_array_ir() {
-        // The composite family's matching batching rule gathers the batch items exactly like the homogeneous one and
+        // The array IR family's matching batching rule gathers the batch items exactly like the homogeneous one and
         // preserves the array member kind of its result.
         assert_eq!(
             batch(
@@ -2943,7 +2943,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_differentiation_array_ir() {
-        // The composite JVP of a varying gather stages one linear call that retains the explicit result extent as its
+        // The array IR JVP of a varying gather stages one linear call that retains the explicit result extent as its
         // only residual, applies the same gather to the tangent, and transposes to the matching sum-scatter, while the
         // structurally zero extent tangent stages nothing.
         let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
@@ -3717,7 +3717,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_transposition_array_ir_rejects_dynamic_extent() {
-        // Direct transposition cannot recover a runtime-dependent result extent, so the composite family requires
+        // Direct transposition cannot recover a runtime-dependent result extent, so the array IR family requires
         // linearization, which retains that extent as a residual.
         let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
         let dimension_type = DimensionType::from(variable.clone());
@@ -3811,7 +3811,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_parallel_all_gather_tiled_preserves_unrelated_pending_sums() {
-        // The composite capability makes an invariant input varying over the gathered axis `x` without dropping a
+        // The array IR capability makes an invariant input varying over the gathered axis `x` without dropping a
         // pending sum over the independent `y` axis.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -4006,7 +4006,7 @@ mod tests {
             ));
         }
 
-        // Composite values reject participant groups with invariant output variance before anything is staged too.
+        // Array IR values reject participant groups with invariant output variance before anything is staged too.
         assert!(matches!(
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -4025,7 +4025,7 @@ mod tests {
                     output variance",
         ));
 
-        // Composite values normalize the concatenation axis before they derive the explicit result extents, and a tiled
+        // Array IR values normalize the concatenation axis before they derive the explicit result extents, and a tiled
         // gather concatenates along an existing axis, so its axis must be smaller than the rank of the input.
         assert!(matches!(
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
@@ -4048,7 +4048,7 @@ mod tests {
     fn test_parallel_all_gather_parallel_all_gather_with_options_negative_axes() {
         // Negative concatenation axes count from the end of the result. An untiled gather inserts an axis, so its
         // result has one more axis than the input and `-1` appends a new trailing axis, while a tiled gather
-        // concatenates along an existing axis. Homogeneous and composite values normalize the axis alike.
+        // concatenates along an existing axis. Homogeneous and array IR values normalize the axis alike.
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
         let homogeneous = |concatenation_axis: i32, options: CollectiveOptions| {
@@ -4066,7 +4066,7 @@ mod tests {
             )
             .map(|(_, program)| program.to_string())
         };
-        let composite = |concatenation_axis: i32, options: CollectiveOptions| {
+        let array_ir = |concatenation_axis: i32, options: CollectiveOptions| {
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 move |input| {
                     input.parallel_all_gather_with_options(
@@ -4086,14 +4086,14 @@ mod tests {
         assert_eq!(homogeneous(-1, untiled()).unwrap(), homogeneous(2, untiled()).unwrap());
         assert_eq!(homogeneous(-3, untiled()).unwrap(), homogeneous(0, untiled()).unwrap());
         assert_eq!(homogeneous(-1, tiled()).unwrap(), homogeneous(1, tiled()).unwrap());
-        assert_eq!(composite(-1, untiled()).unwrap(), composite(2, untiled()).unwrap());
-        assert_eq!(composite(-2, tiled()).unwrap(), composite(0, tiled()).unwrap());
+        assert_eq!(array_ir(-1, untiled()).unwrap(), array_ir(2, untiled()).unwrap());
+        assert_eq!(array_ir(-2, tiled()).unwrap(), array_ir(0, tiled()).unwrap());
         assert_eq!(
             homogeneous(-4, untiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
         );
         assert_eq!(
-            composite(-3, tiled()),
+            array_ir(-3, tiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
         );
     }
@@ -4116,8 +4116,8 @@ mod tests {
             Err(BatchingError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
         );
 
-        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
-        // binder, so every axis name is unbound for them.
+        // Concrete arrays, and concrete array IR values through their array members, are never inside an axis binder,
+        // so every axis name is unbound for them.
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).unwrap().parallel_all_gather("x", 0),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
@@ -4130,7 +4130,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_parallel_all_gather_with_options_projected_value() {
-        // A projected array view of a composite value stages the all-gather through its composite value, so that the
+        // A projected array view of an array IR value stages the all-gather through its array IR value, so that the
         // output extent is staged as an explicit extent value.
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| {

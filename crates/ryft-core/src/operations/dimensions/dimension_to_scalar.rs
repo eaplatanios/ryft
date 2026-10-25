@@ -99,7 +99,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         // Batching converts one replicated first-class dimension into one replicated scalar array. Mapped dimension
-        // inputs are rejected by the composite batch carrier before conversion.
+        // inputs are rejected by the array IR batch carrier before conversion.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         input.validate_replicated_dimension()?;
@@ -117,14 +117,14 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 
 /// Capability to convert first-class [`DimensionValue`]s into ordinary rank-zero signed 64-bit [`Array`]s.
 ///
-/// This is the explicit boundary from a first-class dimension to numerical data. Composite program values produce an
+/// This is the explicit boundary from a first-class dimension to numerical data. Array IR program values produce an
 /// array member in their parent carrier, while concrete dimension backends can select a concrete array representation
 /// through `Output`. The returned scalar cannot define an array extent and converting it back into a first-class
 /// dimension requires a separate checked gateway.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that first-class dimension
-/// values (including the projected dimension members of composite values) implement this capability for
-/// [`DimensionType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values (including the projected dimension members of array IR values) implement this capability for
+/// [`DimensionType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///

@@ -511,7 +511,7 @@ impl ElementType for ArrayType {
 /// which returns the input once validated, whereas concrete values execute their backend's conversion directly.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Examples
 ///
@@ -869,7 +869,7 @@ impl_differentiable_operation! {
 /// [`DataType::F64`] elements.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1045,9 +1045,9 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 ///     output cotangent back to its input's cotangent type, with witnesses that carry the required input identities.
 ///     A tangent cast is witnessed only for the identities that one of its sides does not carry, by a value whose type
 ///     carries each such identity, read from the primal input or output with [`CastType::IdentityWitnessOperation`]
-///     (e.g., a `dimension<n>` scalar in the composite [`ArrayIrType`] family), or by that whole primal value in
-///     families without such an operation. Forward-mode programs that interleave primal and tangent computations
-///     also make it depend on the primal output, so that it stays behind the primal check.
+///     (e.g., a `dimension<n>` scalar in the [`ArrayIrType`] family), or by that whole primal value in families without
+///     such an operation. Forward-mode programs that interleave primal and tangent computations also make it depend on
+///     the primal output, so that it stays behind the primal check.
 ///
 /// Batching lifts the declared types by the mapped axis and binds the cast over the packed values. A proven one-input
 /// identity keeps its carrier unchanged. A first-class dimension input must be replicated, because a lifted
@@ -1228,7 +1228,7 @@ impl<T: Type> CastOperation<T> {
     ///     output tangent type carries but the tangent does not (e.g., `n` when widening `f32[2]` to `f32[n]`), read
     ///     from `output`, which the tangent cast itself requires. Each witness is the value of the identity's
     ///     [`CastType::IdentityWitnessOperation`] bound in the primal context (e.g., a `dimension<n>` scalar in the
-    ///     composite [`ArrayIrType`] family). Families without such an operation retain the whole value instead.
+    ///     [`ArrayIrType`] family). Families without such an operation retain the whole value instead.
     ///   - When `needs_ordering` holds, a data dependency on `output` so that the tangent stays behind the primal check
     ///     and its witness producers in a fused forward-mode program. A witness read from `output` already provides
     ///     it. Otherwise, `output` itself is a witness, unless a whole `primal` is retained, which is then re-cast at
@@ -1813,7 +1813,7 @@ impl CastType for ArrayType {
         let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
         let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
 
-        // The composite contract preserves the requested output's member kind.
+        // The array IR contract preserves the requested output's member kind.
         let project = |output| match output {
             ArrayIrType::Array(output) => output,
             _ => unreachable!(),
@@ -1843,7 +1843,7 @@ impl CastType for DimensionType {
         let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<_>>();
         let (output, interpreted) = ArrayIrType::infer_cast_output_type(&operation, &input_types)?;
 
-        // The composite contract preserves the requested output's member kind.
+        // The array IR contract preserves the requested output's member kind.
         let project = |output| match output {
             ArrayIrType::Dimension(output) => output,
             _ => unreachable!(),
@@ -2240,7 +2240,7 @@ impl CastType for ArrayIrType {
 /// types relate the output's identities to other values. An [`ArrayIrValue`] delegates array casts to its array member,
 /// including when that member is a tracer; its concrete dimension witnesses have exact types and introduce no shared
 /// identities. Host dimension results reject array witnesses that their member context cannot resolve as constants; use
-/// a composite context to retain staged dependencies or observe backend completion. [`cast`](Self::cast) checks the
+/// an array IR context to retain staged dependencies or observe backend completion. [`cast`](Self::cast) checks the
 /// relationship in staged and compiled programs too, whereas [`cast_unchecked`](Self::cast_unchecked) assumes it there.
 ///
 /// Placement over explicit mesh axes may change under the rules of [`Reshard`](crate::Reshard), whereas placement
@@ -2248,7 +2248,7 @@ impl CastType for ArrayIrType {
 /// bounds when changing physical allocation bounds, and constrains placement only when the explicit placement changes.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -2418,7 +2418,7 @@ fn cast_array_ir_value<A: Value<Type = ArrayType, Domain: Context> + Cast<ArrayT
             return Err(ProgramError::Concretization {
                 message: format!(
                     "host dimension `{CAST_OPERATION_NAME}` cannot retain an array witness producer; \
-                     bind the cast through a composite context",
+                     bind the cast through an array IR context",
                 ),
             });
         }
@@ -4611,7 +4611,7 @@ mod tests {
             );
         }
 
-        // The composite universe applies the same rule to its array members.
+        // The array IR universe applies the same rule to its array members.
         assert_eq!(
             CastOperation::<ArrayIrType>::checked(rank_mismatch.into(), vec![plain.clone().into()])
                 .unwrap()
@@ -4680,7 +4680,7 @@ mod tests {
             );
         }
 
-        // The composite universe applies the same rules to its array members.
+        // The array IR universe applies the same rules to its array members.
         assert_eq!(
             CastOperation::<ArrayIrType>::checked(varying.clone().into(), vec![plain.clone().into()])
                 .unwrap()
@@ -6316,8 +6316,8 @@ mod tests {
                 let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{4}]]] %0
                 in (%1)"};
             assert_eq!(source.to_string(), expected_source);
-            let composite_declared: ArrayIrType = declared.clone().into();
-            let (_, composite) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            let array_ir_declared: ArrayIrType = declared.clone().into();
+            let (_, array_ir) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
                 |value| {
                     if checked {
                         value.cast(plain.clone().into(), &[])
@@ -6325,10 +6325,10 @@ mod tests {
                         value.cast_unchecked(plain.clone().into(), &[])
                     }
                 },
-                composite_declared,
+                array_ir_declared,
             )
             .unwrap();
-            assert_eq!(composite.to_string(), expected_source);
+            assert_eq!(array_ir.to_string(), expected_source);
             // Rank-changing packing clears layout. The complete original cast remains valid, while the packed
             // declaration and input agree on the new representation, including empty and singleton batches.
             for extent in [0, 1, 3] {
@@ -6351,7 +6351,7 @@ mod tests {
                 );
                 let value = Array::matrix(extent, 2, vec![1f32; extent * 2]).unwrap();
                 assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value.clone()]));
-                let (program, axes) = composite
+                let (program, axes) = array_ir
                     .to_flat_program()
                     .batched_with_threaded_extent(
                         DimensionType::from(Dimension::Static(extent)),
@@ -6804,7 +6804,7 @@ mod tests {
 
     #[test]
     fn test_cast_differentiation_identity_witnesses() {
-        // In the composite family, a tangent cast is witnessed by the first-class dimension of each identity that one
+        // In the array IR family, a tangent cast is witnessed by the first-class dimension of each identity that one
         // of its sides does not carry, read with `dimension_size` from the primal source (narrowing) or the checked
         // primal output (widening), so linearization retains `dimension<n>` scalars rather than `f32[n]` arrays. The
         // fused narrowing tangent also depends on the checked output, whereas a witness read from the widened output
@@ -6965,7 +6965,7 @@ mod tests {
     fn test_cast_differentiation_refined_representation() {
         // Layout and sharding change directly, with one tangent conversion and no erased intermediate. The static
         // input type proves the relationship, so the JVP normalizes the checked primal cast as well, and split
-        // linearization needs no primal residual for ordering. The composite universe stages the same programs.
+        // linearization needs no primal residual for ordering. The array IR universe stages the same programs.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
@@ -7027,14 +7027,14 @@ mod tests {
                 let linearization = program.linearize().unwrap();
                 assert_eq!(linearization.residual_count(), 0);
                 assert_eq!(linearization.tangent().to_string(), expected_tangent);
-                let composite = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
-                let composite_jvp = composite.jvp().unwrap();
-                assert_eq!(composite_jvp.to_string(), expected);
+                let array_ir = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+                let array_ir_jvp = array_ir.jvp().unwrap();
+                assert_eq!(array_ir_jvp.to_string(), expected);
                 assert_eq!(
-                    composite_jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
+                    array_ir_jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
                     Ok(expected_values.into_iter().map(ArrayIrValue::Array).collect()),
                 );
-                assert_eq!(composite.linearize().unwrap().tangent().to_string(), expected_tangent);
+                assert_eq!(array_ir.linearize().unwrap().tangent().to_string(), expected_tangent);
             }
         }
     }
@@ -7145,11 +7145,11 @@ mod tests {
             Array::from_elements(output, &[3f32, 4f32]).unwrap(),
         ];
         assert_eq!(program.jvp().unwrap().interpret(inputs.clone()), Ok(expected_values.clone()));
-        let composite = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
-        let composite_jvp = composite.jvp().unwrap();
-        assert_eq!(composite_jvp.to_string(), expected);
+        let array_ir = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+        let array_ir_jvp = array_ir.jvp().unwrap();
+        assert_eq!(array_ir_jvp.to_string(), expected);
         assert_eq!(
-            composite_jvp.interpret(inputs.into_iter().map(ArrayIrValue::Array).collect()),
+            array_ir_jvp.interpret(inputs.into_iter().map(ArrayIrValue::Array).collect()),
             Ok(expected_values.into_iter().map(ArrayIrValue::Array).collect()),
         );
     }
@@ -7448,12 +7448,12 @@ mod tests {
                 let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
                 assert_eq!(pullback.to_string(), expected);
                 assert_eq!(pullback.interpret(vec![cotangent.clone()]), Ok(vec![expected_cotangent.clone()]));
-                let composite = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
-                let composite_pullback =
-                    composite.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
-                assert_eq!(composite_pullback.to_string(), expected);
+                let array_ir = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
+                let array_ir_pullback =
+                    array_ir.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+                assert_eq!(array_ir_pullback.to_string(), expected);
                 assert_eq!(
-                    composite_pullback.interpret(vec![ArrayIrValue::Array(cotangent.clone())]),
+                    array_ir_pullback.interpret(vec![ArrayIrValue::Array(cotangent.clone())]),
                     Ok(vec![ArrayIrValue::Array(expected_cotangent.clone())]),
                 );
             }
@@ -8243,7 +8243,7 @@ mod tests {
             Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
         );
 
-        // The composite universe rejects casts across member kinds and references.
+        // The array IR universe rejects casts across member kinds and references.
         assert_eq!(
             ArrayIrType::infer_cast_output_type(
                 &CastOperation::checked(ArrayIrType::Dimension(dimension), vec![array.clone().into()]).unwrap(),
@@ -8263,7 +8263,7 @@ mod tests {
 
     #[test]
     fn test_cast_type_identity_witness_operation() {
-        // The composite universe reads an array identity from the first axis that carries it as a first-class
+        // The array IR universe reads an array identity from the first axis that carries it as a first-class
         // dimension, whose type carries the same identity.
         let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let m = DimensionVariable::new("m", DimensionBounds::positive(Some(8)).unwrap());
@@ -8450,39 +8450,39 @@ mod tests {
         let exact = |extent: usize| ArrayType::new_static(DataType::F32, [extent]);
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
 
-        // Composite array members behave like arrays, including representation changes, and reference witnesses are
-        // rejected.
-        let composite = |extent: usize| ArrayIrValue::<Array>::Array(vector(extent));
+        // Array members of array IR values behave like arrays, including representation changes, and reference
+        // witnesses are rejected.
+        let array_ir = |extent: usize| ArrayIrValue::<Array>::Array(vector(extent));
         assert_eq!(
-            composite(2).cast(symbolic.clone().into(), &[]),
+            array_ir(2).cast(symbolic.clone().into(), &[]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cast` output identity `n` is not carried by a declared input",
             ))),
         );
         assert_eq!(
-            composite(3).cast_unchecked(exact(2).into(), &[]),
+            array_ir(3).cast_unchecked(exact(2).into(), &[]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
             ))),
         );
         let laid_out = exact(2).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let expected = Ok(ArrayIrValue::Array(Array::from_elements(laid_out.clone(), &[1f32, 1f32]).unwrap()));
-        assert_eq!(composite(2).cast(laid_out.clone().into(), &[]), expected);
-        assert_eq!(composite(2).cast_unchecked(laid_out.into(), &[]), expected);
+        assert_eq!(array_ir(2).cast(laid_out.clone().into(), &[]), expected);
+        assert_eq!(array_ir(2).cast_unchecked(laid_out.into(), &[]), expected);
         let reference = ArrayIrValue::Reference(ArrayReference::new(vector(2)));
         let expected = Err(ProgramError::Type(TypeError::invalid(format!(
             "`cast` does not support reference type `{}`",
             reference.r#type(),
         ))));
-        assert_eq!(composite(2).cast(exact(2).into(), std::slice::from_ref(&reference)), expected);
-        assert_eq!(composite(2).cast_unchecked(exact(2).into(), &[reference]), expected);
+        assert_eq!(array_ir(2).cast(exact(2).into(), std::slice::from_ref(&reference)), expected);
+        assert_eq!(array_ir(2).cast_unchecked(exact(2).into(), &[reference]), expected);
 
         // A first-class dimension type defines its identity, which the output type of a cast may not, so only exact
         // dimension types are valid outputs for dimension values, and concrete witnesses carry no identities.
         let dimension = |extent: usize| ArrayIrValue::<Array>::Dimension(DimensionValue::constant(extent).unwrap());
         let exact_dimension = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(2)));
         assert_eq!(dimension(2).cast(exact_dimension.clone(), &[]), Ok(dimension(2)));
-        assert_eq!(dimension(2).cast(exact_dimension.clone(), &[composite(2)]), Ok(dimension(2)));
+        assert_eq!(dimension(2).cast(exact_dimension.clone(), &[array_ir(2)]), Ok(dimension(2)));
         assert_eq!(
             dimension(3).cast(exact_dimension, &[]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -8499,7 +8499,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_cast_wrapped_tracers() {
-        // A composite value whose array member is a tracer delegates array casts to that member's context, so symbolic
+        // An array IR value whose array member is a tracer delegates array casts to that member's context, so symbolic
         // relationships are staged and checked at runtime rather than inspected eagerly, whereas a host dimension cast
         // cannot retain a staged array witness.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -8508,7 +8508,7 @@ mod tests {
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
         let unretained = ProgramError::Concretization {
             message: "host dimension `cast` cannot retain an array witness producer; \
-                      bind the cast through a composite context"
+                      bind the cast through an array IR context"
                 .to_owned(),
         };
         let context = TracingContext::<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>>::new();

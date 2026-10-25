@@ -233,7 +233,7 @@ impl_differentiable_elementwise_operation! {
 impl<A: Value<Type = ArrayType>> From<PrintOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: PrintOperation<ArrayIrType>) -> Self {
-        // Composite tracers print by lifting the type-generic print into the homogeneous array member, preserving
+        // Array IR tracers print by lifting the type-generic print into the homogeneous array member, preserving
         // its label and effect class, so that the member's effect declaration and transform rules apply through the
         // projection.
         Self::Array(ArrayOperation::Print(
@@ -248,7 +248,7 @@ impl<A: Value<Type = ArrayType>> From<PrintOperation<ArrayIrType>> for ArrayIrOp
 /// relative to other ordered print instructions.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability]
 pub trait Print<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value unchanged while printing it to standard error with `label`, and a [`ProgramError`] if the
@@ -282,7 +282,7 @@ impl Print for Array {
 impl<A: Value<Type = ArrayType> + Print<ArrayType>> Print<ArrayIrType> for ArrayIrValue<A> {
     #[inline]
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
-        // A concrete composite value prints its array member. It uses `ValueDirectDispatch`, so the generic
+        // A concrete array IR value prints its array member. It uses `ValueDirectDispatch`, so the generic
         // implementation below never applies to it.
         let input = <Self as ValueProjection<ArrayType>>::into_projected(self)?;
         Ok(Self::Array(input.print_with_effect_class(label, effect_class)?))
@@ -505,11 +505,11 @@ mod tests {
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
 
-        // Composite values stage the print through their array member. Composite batching also stages the batch extent
-        // as a first-class dimension constant, which nothing here consumes.
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let (_, program) = CompositeContext::trace(
-            |input: Tracer<CompositeContext>| {
+        // Array IR values stage the print through their array member. Array IR batching also stages the batch extent as
+        // a first-class dimension constant, which nothing here consumes.
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| {
                 Ok(batch(
                     |item| item.print_with_effect_class("x", EffectClass::UnorderedIo),
                     input,
@@ -537,17 +537,17 @@ mod tests {
         // Batching a `shard_map` batches its body under a staging parent, so a per-device print in the body prints
         // the local value of the whole batch and the batched program keeps the `DeviceOrderedIo` effect. The batch
         // axis is placed on the free mesh axis `y`, which a body with this effect allows.
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let (_, program) = CompositeContext::trace(
-            |input: Tracer<CompositeContext>| {
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| {
                 let output = shard_map(
-                    |local: ShardMapTracer<CompositeContext>| {
+                    |local: ShardMapTracer<ArrayIrContext>| {
                         local.print_with_effect_class("body", EffectClass::DeviceOrderedIo).unwrap()
                     },
                     ValueProjection::<ArrayType>::into_projected(input)?,
@@ -736,13 +736,13 @@ mod tests {
     }
 
     #[test]
-    fn test_print_composite() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_print_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // Composite tracers stage the print as an array-member instruction that keeps its label and effect class,
+        // Array IR tracers stage the print as an array-member instruction that keeps its label and effect class,
         // so the staged program declares the selected effect.
-        let (_, program) = CompositeContext::trace(
-            |input: Tracer<CompositeContext>| input.print_with_effect_class("x", EffectClass::UnorderedIo),
+        let (_, program) = ArrayIrContext::trace(
+            |input: Tracer<ArrayIrContext>| input.print_with_effect_class("x", EffectClass::UnorderedIo),
             ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
         )
         .unwrap();
@@ -756,7 +756,7 @@ mod tests {
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
 
-        // A concrete composite value prints its array member immediately and returns itself unchanged.
+        // A concrete array IR value prints its array member immediately and returns itself unchanged.
         let value = ArrayIrValue::Array(Array::scalar(2.0f64).unwrap());
         assert_eq!(value.clone().print("x"), Ok(value));
     }

@@ -335,11 +335,11 @@ impl_differentiable_operation! {
 /// the operation in their own context while direct eager arrays execute its checked semantics without binding it again.
 /// Backend authors can implement this trait on [`ValueDirectDispatch`] for their own value types. Implementations must
 /// validate targets through the operation's type inference contract and preserve the input's elements, shape, data
-/// type, and domain. Composite implementations project the array member and lift the result back, so dimensions and
+/// type, and domain. Array IR implementations project the array member and lift the result back, so dimensions and
 /// references retain their existing projection diagnostics.
 ///
 /// `T` is the value's type descriptor, and `V` is its representation. Including `T` keeps dispatch over homogeneous
-/// arrays and composite array IR values disjoint.
+/// arrays and array IR values disjoint.
 pub trait ReshardDispatch<T: Type, V: Value<Type = T>> {
     /// Applies the primitive sharding operation to `input` and returns its value.
     fn reshard(input: &V, sharding: &Sharding) -> Result<V, ProgramError>;
@@ -409,10 +409,10 @@ impl<
 /// The leaf parameter `P` defaults to `Self`: a value is a one-leaf structure accepting one `Sharding`, while nested
 /// tuples, vectors, maps, and custom structures accept the corresponding `Self::To<Sharding>`. Parameter paths must
 /// agree, and the receiver's structure and static fields are preserved without requiring the receiver to be `Clone`.
-/// Homogeneous and composite array values share this API through their primitive [`ReshardDispatch`] implementations.
+/// Homogeneous and array IR values share this API through their primitive [`ReshardDispatch`] implementations.
 ///
 /// The universe parameter `T` defaults to the leaf's [`Capability`] universe, so that homogeneous array leaves use
-/// [`ArrayType`] and composite array IR leaves use [`ArrayIrType`]. A structure uses the same universe as its leaves.
+/// [`ArrayType`] and array IR leaves use [`ArrayIrType`]. A structure uses the same universe as its leaves.
 /// Implementations tie `T` to that universe, which selects their primitive dispatch family; specifying a different
 /// universe does not grant the capability. The universe is distinct from `P`, which identifies the structural leaves.
 pub trait Reshard<P: Parameter + Capability = Self, T = <P as Capability>::Universe>: Sized {
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reshard_structured_composite_tracing() {
+    fn test_reshard_structured_array_ir_tracing() {
         // Every leaf of a structured value is resharded to its own target, which replaces the leaf's tracked sharding.
         let mesh = mesh();
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1181,7 +1181,7 @@ mod tests {
         assert_eq!(apply_leaf(&input, &target), input.reshard(&target));
         assert_eq!(apply_domain::<EagerContext<Array, ArrayOperation<Array>>>(&input, &target), input.reshard(&target),);
 
-        // Composite array members dispatch through the same leaf capability.
+        // Array members of array IR values dispatch through the same leaf capability.
         let inputs = vec![ArrayIrValue::Array(input)];
         let expected = vec![inputs[0].reshard(&target).unwrap()];
         assert_eq!(inputs.reshard(&vec![target]).unwrap(), expected);

@@ -76,7 +76,7 @@ impl From<ShardingError> for TypeError {
 }
 
 /// Read-only access to the optional [`Sharding`] of a type family. Arrays expose their placement, references expose
-/// their referent's placement, and scalar data types and first-class dimensions carry no sharding. Composite types
+/// their referent's placement, and scalar data types and first-class dimensions carry no sharding. Array IR types
 /// follow the corresponding member's contract. Operations separately validate which members they accept and which
 /// placement or variation transitions they permit.
 pub trait ShardableType: Type {

@@ -506,7 +506,7 @@ impl<
         axis: Axis,
     ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
         // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability, whose staged operation
-        // lifts back through the composite operation family.
+        // lifts back through the array IR operation family.
         let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
         Ok(ValueProjection::from_projected(sum_mapped_array_cotangents(cotangent, axis)?))
     }
@@ -514,7 +514,7 @@ impl<
 
 /// Sums the per-item cotangents of the array-typed `cotangent` packed along `axis`, removing that axis. This is the
 /// representation-independent core of [`CotangentBatchingPolicy::sum_mapped_cotangents`] for both array policies (the
-/// homogeneous policy applies it to the replayed cotangent directly, while the composite policy applies it to the
+/// homogeneous policy applies it to the replayed cotangent directly, while the array IR policy applies it to the
 /// cotangent's projected array member).
 fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
     cotangent: V,
@@ -1295,8 +1295,8 @@ mod tests {
     fn test_array_ir_batching_sum_mapped_cotangents() {
         type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // The composite policy projects the replayed cotangent to its array member, reduce-sums along the (here
-        // negative and normalized) mapped axis, and lifts the sum back into the composite family.
+        // The array IR policy projects the replayed cotangent to its array member, reduce-sums along the (here
+        // negative and normalized) mapped axis, and lifts the sum back into the array IR family.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let cotangent_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));

@@ -85,7 +85,7 @@ mod tests {
     use ryft_core::{AddOperation, ArrayIrType, ArrayType, MulOperation, Placeholder, ProgramError};
 
     use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::{LoweringError, to_mlir_module_for_program};
 
     #[test]
@@ -97,7 +97,7 @@ mod tests {
         // here by the multiplies on the tangent and cotangent sides) reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let printed = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("primal"), Vec::new(), vec![input], None)
@@ -109,7 +109,7 @@ mod tests {
                 .unwrap()
         };
         let jvp = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let tangent = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -124,7 +124,7 @@ mod tests {
                 .unwrap()
         };
         let forward = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
@@ -136,7 +136,7 @@ mod tests {
                 .unwrap()
         };
         let backward = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let input_cotangent =
@@ -160,7 +160,7 @@ mod tests {
                 vec![&jvp, &forward, &backward],
             ),
         ] {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let mut regions = vec![builder.import_region(primal.entry_region_ref())];
             regions.extend(rules.into_iter().map(|rule| builder.import_region(rule.entry_region_ref())));
             let input = builder.add_input(vector_type.clone().into());
@@ -201,14 +201,14 @@ mod tests {
         let vector_type = test_vector_type(4);
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::<XlaConstant, XlaOperation>::new("doubled"));
         let primal = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let input = builder.add_input(vector_type.clone().into());
         let output = builder
@@ -237,7 +237,7 @@ mod tests {
         );
 
         // An unresolved reverse-mode carrier has no forward program to lower.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(vector_type.clone().into());
         let carrier = CustomFunctionTransposeOperation::new(
             rules.reference(),
@@ -268,7 +268,7 @@ mod tests {
         // before lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let output =
@@ -286,7 +286,7 @@ mod tests {
             vec![ArrayIrType::Array(vector_type.clone())],
             vec![ArrayIrType::Array(vector_type.clone())],
         );
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let backward_region = builder.import_region(backward.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone().into());
         let residual = builder.add_input(vector_type.clone().into());

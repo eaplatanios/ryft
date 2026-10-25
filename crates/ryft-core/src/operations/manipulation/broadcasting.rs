@@ -330,7 +330,7 @@ impl<O: Operation<Type = ArrayType> + From<BroadcastOperation>> OperationProvide
 /// allowing mixed-operation transform rules to use this capability once their input extents have been resolved.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Examples
 ///
@@ -1171,10 +1171,10 @@ impl_differentiable_operation! {
 /// [`DynamicBroadcast`] fills the same role for [`DynamicBroadcastOperation`] that [`std::ops::Add`] and
 /// [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
-/// universes with array and dimension members can implement it as well.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
+/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
+/// array and dimension members can implement it as well.
 ///
 /// # Examples
 ///
@@ -2798,8 +2798,8 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_broadcast_to_composite() {
-        // Composite values broadcast their array members, and first-class dimensions are rejected.
+    fn test_broadcast_broadcast_to_array_ir() {
+        // Array IR valuesbroadcast their array members, and first-class dimensions are rejected.
         let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(vector.clone()).broadcast_to([3, 2]),
@@ -2851,8 +2851,8 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_broadcast_leading_composite() {
-        // Composite values prepend axes to their array members, and first-class dimensions are rejected.
+    fn test_broadcast_broadcast_leading_array_ir() {
+        // Array IR valuesprepend axes to their array members, and first-class dimensions are rejected.
         let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(
             ArrayIrValue::Array(vector.clone()).broadcast_leading([3]),
@@ -2893,8 +2893,8 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_broadcast_arrays_composite() {
-        // Composite values broadcast their array members to a common shape, and first-class dimensions are rejected.
+    fn test_broadcast_broadcast_arrays_array_ir() {
+        // Array IR valuesbroadcast their array members to a common shape, and first-class dimensions are rejected.
         let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let scalar = Array::scalar(5.0f32).unwrap();
         assert_eq!(

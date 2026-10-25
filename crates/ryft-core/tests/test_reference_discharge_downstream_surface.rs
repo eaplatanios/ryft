@@ -2400,10 +2400,10 @@ fn test_downstream_reference_universe_vjp_with_a_local_allocation() {
 }
 
 #[test]
-fn test_downstream_reference_operation_providers_support_value_only_composite_families() {
+fn test_downstream_reference_operation_providers_support_value_only_array_ir_families() {
     use ryft_core::{ConcatenateOperation, PadOperation, SliceOperation, UpdateSliceOperation};
 
-    // A downstream family can use the core composite type without supporting reference operations. Owning the
+    // A downstream family can use the core array IR type without supporting reference operations. Owning the
     // providers on the operation family lets it opt into ordinary gradients without an orphan-rule conflict.
     /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
     #[derive(Clone, Debug, ryft_macros::Operation)]
@@ -2445,7 +2445,7 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         }
     }
 
-    /// A downstream composite family containing only constants and ordinary array operations.
+    /// A downstream array IR family containing only constants and ordinary array operations.
     #[derive(Clone, Debug, ryft_macros::Operation)]
     #[ryft(
         crate = "ryft_core",
@@ -2609,7 +2609,7 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
 
 #[test]
 fn test_downstream_reference_universe_value_and_gradient() {
-    // The composite parameter is one leaf regardless of its member variant. A reference input therefore reconstructs
+    // A heterogeneous parameter is one leaf regardless of its member variant. A reference input therefore reconstructs
     // as an ordinary register cotangent, beside the ordinary input's cotangent, while primal mutation remains visible.
     let reference = Reference::new(RegisterValue::Register(1)).unwrap();
     assert_eq!(

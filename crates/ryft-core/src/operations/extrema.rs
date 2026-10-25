@@ -539,7 +539,7 @@ impl_differentiable_operation! {
 /// arrays compute immediately while context-carrying values apply [`ClampOperation`] through their context.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait Clamp<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Clamps this value elementwise to the inclusive `[lower, upper]` interval (i.e., computes
@@ -631,8 +631,8 @@ impl_clamp_for_primitive!(f64);
 /// for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
 pub trait ExtremaOperations<T = <Self as Capability>::Universe>: Capability + Min<T> + Max<T> + Clamp<T> {}
 
 impl<T, V: Min<T> + Max<T> + Clamp<T>> ExtremaOperations<T> for V {}

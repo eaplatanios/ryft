@@ -3758,7 +3758,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let composite: Program<
+        let array_ir: Program<
             ArrayIrValue<Array>,
             ArrayIrOperation<Array>,
             (ArrayIrValue<Array>, ArrayIrValue<Array>),
@@ -3766,18 +3766,18 @@ mod tests {
         > = source.into_unprojected().unwrap();
 
         assert_eq!(
-            composite.input_types(),
+            array_ir.input_types(),
             vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)), ArrayIrType::Array(array_type.clone()),],
         );
-        assert_eq!(composite.output_types(), vec![ArrayIrType::Array(array_type)]);
-        assert_eq!(composite.input_structure(), &(Placeholder, Placeholder));
-        assert_eq!(composite.output_structure(), &Placeholder);
-        assert_eq!(composite.effects(), source_effects);
-        assert_eq!(composite.type_identity_signature(), &source_signature);
-        assert_eq!(composite.regions().len(), source_region_count);
-        assert_eq!(composite.entry(), source_entry);
+        assert_eq!(array_ir.output_types(), vec![ArrayIrType::Array(array_type)]);
+        assert_eq!(array_ir.input_structure(), &(Placeholder, Placeholder));
+        assert_eq!(array_ir.output_structure(), &Placeholder);
+        assert_eq!(array_ir.effects(), source_effects);
+        assert_eq!(array_ir.type_identity_signature(), &source_signature);
+        assert_eq!(array_ir.regions().len(), source_region_count);
+        assert_eq!(array_ir.entry(), source_entry);
         for ((atom_count, input_ids, output_ids, instructions), region) in
-            source_structure.iter().zip(composite.regions().iter())
+            source_structure.iter().zip(array_ir.regions().iter())
         {
             assert_eq!(region.atoms().len(), *atom_count);
             assert_eq!(region.input_ids(), input_ids);
@@ -3790,7 +3790,7 @@ mod tests {
             }
         }
 
-        let entry = composite.entry_region();
+        let entry = array_ir.entry_region();
         assert_eq!(entry.instructions().len(), 1);
         let branch_region = entry.instructions()[0].regions()[0];
         assert_eq!(entry.instructions()[0].regions(), &[branch_region, branch_region]);
@@ -3799,7 +3799,7 @@ mod tests {
             &entry.atoms()[constant.index()],
             Atom::Constant(ArrayIrValue::Array(value)) if value == &Array::scalar(2.0_f64).unwrap(),
         ));
-        let branch = composite.region(branch_region).unwrap();
+        let branch = array_ir.region(branch_region).unwrap();
         assert!(matches!(branch.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Neg(_))));
         let scan_instruction = branch
             .instructions()
@@ -3813,7 +3813,7 @@ mod tests {
         assert_eq!(scan.length(), &Dimension::Static(2));
         assert!(scan.reverse());
         assert_eq!(scan.unroll(), 2);
-        let scan_body = composite.region(scan_instruction.regions()[0]).unwrap();
+        let scan_body = array_ir.region(scan_instruction.regions()[0]).unwrap();
         let while_instruction = scan_body
             .instructions()
             .iter()

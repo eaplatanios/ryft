@@ -19,7 +19,7 @@
 //!
 //! Every built-in policy recognizes the producers of a residual by their payload operations (i.e.,
 //! [`ResidualProducer::payload`](crate::ResidualProducer::payload)) rather than by their operation family, so the same
-//! policy works for every family, including composite and backend families that hold array operations through projected
+//! policy works for every family, including array IR and backend families that hold array operations through projected
 //! members. A residual that several producers may produce (e.g., the corresponding outputs of the two branches of a
 //! `condition` operation) matches a policy when any of its producers does.
 //!

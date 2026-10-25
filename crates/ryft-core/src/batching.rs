@@ -69,10 +69,11 @@
 //!
 //! Implement [`BatchableOperation`] for each operation payload that may appear under batching. Use the shared
 //! elementwise path only for genuinely elementwise semantics; write a dedicated rule whenever dimensions, mapped axes,
-//! nested regions, named axes, or sharding require operation-specific handling. Composite member operations can reuse
-//! homogeneous rules through [`batch_projected_operation`] only when they are region-free and projectable. Member
-//! operations over shared bookkeeping values whose outer policy implements [`ReplicatedBatchingPolicyProjection`]
-//! need no rules at all as [`batch_replicated_projected_operation`] binds them once in the parent context.
+//! nested regions, named axes, or sharding require operation-specific handling. Member operations of heterogeneous
+//! families can reuse homogeneous rules through [`batch_projected_operation`] only when they are region-free and
+//! projectable. Member operations over shared bookkeeping values whose outer policy implements
+//! [`ReplicatedBatchingPolicyProjection`] need no rules at all as [`batch_replicated_projected_operation`] binds them
+//! once in the parent context.
 //!
 //! A new value universe supplies a [`BatchingPolicy`] and, for the public entry point, a
 //! [`BatchingEntrypointPolicy`]. Add [`RecursiveBatchingPolicy`] when its region programs support structural batching
@@ -450,7 +451,7 @@ impl<V: Value, O: Operation<Type = V::Type>> BoundaryPreservingBatchedProgram<V,
     /// boundary:
     ///
     ///   - It drops the leading `widening_output_count` outputs, which carry transform bookkeeping (e.g., the
-    ///     composite policy's forwarded mapped extent) rather than source-region results.
+    ///     array IR policy's forwarded mapped extent) rather than source-region results.
     ///   - It reconciles each remaining output with the batch axis its consumer requires: an output that is mapped
     ///     while its required axis is replicated is collapsed along its mapped axis by `collapse_fn`. Every other
     ///     combination passes through unchanged.
@@ -595,20 +596,20 @@ pub trait BatchableType: Type {
 ///     type and the parent-owned packed value that stores the whole batch. How that split is represented is specific
 ///     to each value kind: an ordinary array gains a mapped axis in its packed shape (i.e.,
 ///     [`ArrayBatch`](crate::ArrayBatch)), while a first-class dimension is shared shape metadata.
-///     A composite carrier therefore keeps dimension members replicated and rejects mapped dimension members.
-///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while a
-///     composite universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
+///     An array IR carrier therefore keeps dimension members replicated and rejects mapped dimension members.
+///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while an
+///     array IR universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
 ///     remains a Single Static Assignment (SSA) value flowing through instruction inputs rather than being treated as
 ///     static transform metadata.
 ///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Programs over homogeneous arrays preserve
-///     source region's boundary exactly and produce [`BoundaryPreservingBatchedProgram`]s, while a composite universe
+///     source region's boundary exactly and produce [`BoundaryPreservingBatchedProgram`]s, while an array IR universe
 ///     may thread bookkeeping values such as its first-class mapped extent through standalone nested programs.
 ///     Every selected carrier implements [`BatchedProgram`], while [`Self::boundary_inputs`] and
 ///     [`Self::adapt_batched_program`] let consumers complete or shed policy-specific widening.
 ///
 /// The policy is deliberately limited to carrier selection, construction, access, type derivation,
 /// and invariant enforcement. Array-specific alignment and broadcasting are represented as functions on
-/// [`ArrayBatch`](crate::ArrayBatch) (a composite policy may project an array member into that carrier to reuse
+/// [`ArrayBatch`](crate::ArrayBatch) (an array IR policy may project an array member into that carrier to reuse
 /// an existing array rule). Batching nested [`Region`](crate::Region) support is provided separately by the
 /// [`RecursiveBatchingPolicy`] trait, allowing a batching carrier to support region-free operations without
 /// also supporting recursive transformation of nested programs.
@@ -759,18 +760,18 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError>;
 }
 
-/// Selects the [`BatchingPolicy`] used when an outer policy `Self` projects one member type `T` from composite
+/// Selects the [`BatchingPolicy`] used when an outer policy `Self` projects one member type `T` from heterogeneous
 /// [`Context`] `C`. A [`BatchingPolicy`] determines one context's batch carrier, mapped-extent representation, and
-/// structurally batched program boundary. It cannot by itself determine how each member type of a composite context
-/// should represent those concepts. For example, an array member needs an [`ArrayBatch`](crate::ArrayBatch) carrier
-/// that may hold a mapped axis. Every projected policy must nevertheless preserve the outer policy's exact
+/// structurally batched program boundary. It cannot by itself determine how each member type of a heterogeneous
+/// context should represent those concepts. For example, an array member needs an [`ArrayBatch`](crate::ArrayBatch)
+/// carrier that may hold a mapped axis. Every projected policy must nevertheless preserve the outer policy's exact
 /// mapped-extent representation. This type-indexed relation records that choice independently for every supported
 /// `(C, T)` pair. A member whose values are shared by every batch item, such as a first-class dimension, needs no
 /// member policy and implements [`ReplicatedBatchingPolicyProjection`] instead.
 ///
 /// Note that this trait carries no runtime state. Implementing it only establishes the associated
 /// [`Projected`](Self::Projected) policy used by [`batch_projected_operation`]. Unsupported member projections simply
-/// omit an implementation, while composite backends with several independently batchable member kinds can select a
+/// omit an implementation, while heterogeneous backends with several independently batchable member kinds can select a
 /// different policy for each kind.
 pub trait BatchingPolicyProjection<C: Context, T: Type>: BatchingPolicy<C>
 where
@@ -781,12 +782,12 @@ where
     type Projected: BatchingPolicy<ProjectedContext<C, T>, Extent = Self::Extent>;
 }
 
-/// Projection of an outer [`BatchingPolicy`] `Self` onto member type `T` of composite [`Context`] `C` for members whose
-/// values are shared by every batch item (i.e., replicated), which lets [`batch_replicated_projected_operation`] batch
-/// a region-free member operation by binding it once in the parent context instead of applying a member batching rule.
-/// This is the batching contract of shared bookkeeping values such as first-class dimensions: every batch item observes
-/// the same value, so evaluating the operation once yields the result for every batch item. A value that differs per
-/// batch item (e.g., one extent per batch item) cannot cross this replicated projection.
+/// Projection of an outer [`BatchingPolicy`] `Self` onto member type `T` of heterogeneous [`Context`] `C` for members
+/// whose values are shared by every batch item (i.e., replicated), which lets [`batch_replicated_projected_operation`]
+/// batch a region-free member operation by binding it once in the parent context instead of applying a member batching
+/// rule. This is the batching contract of shared bookkeeping values such as first-class dimensions: every batch item
+/// observes the same value, so evaluating the operation once yields the result for every batch item. A value that
+/// differs per batch item (e.g., one extent per batch item) cannot cross this replicated projection.
 ///
 /// Unlike [`BatchingPolicyProjection`], this projection selects no member [`BatchingPolicy`]: a replicated member
 /// value needs no batch axis, extent, or structurally batched program of its own, so the member side of the boundary
@@ -1901,25 +1902,25 @@ pub fn batch<
     context.batch(function, input, input_batch_axes, output_batch_axes, batch_axis)
 }
 
-/// Applies a member [`Operation`]'s batching rule through a projected view of a composite [`BatchingContext`]. Use
-/// this function from a composite operation dispatcher when the operation is [`Region`](crate::Region)-free and every
-/// input and result belongs to the same projectable member type `T`. It converts the packed input values to the
+/// Applies a member [`Operation`]'s batching rule through a projected view of a heterogeneous [`BatchingContext`]. Use
+/// this function from a family-level operation dispatcher when the operation is [`Region`](crate::Region)-free and
+/// every input and result belongs to the same projectable member type `T`. It converts the packed input values to the
 /// member value family, preserves the outer batch axes and mapped extent, runs the member's existing batching rule,
-/// and converts the results back to the composite value family. [`BatchingPolicyProjection`] selects the member policy
-/// that represents the same extent for the specific projected type `T`. This keeps homogeneous member rules independent
-/// of the enclosing composite type.
+/// and converts the results back to the heterogeneous value family. [`BatchingPolicyProjection`] selects the member
+/// policy that represents the same extent for the specific projected type `T`. This keeps homogeneous member rules
+/// independent of the enclosing heterogeneous type.
 ///
-/// Operations with mixed member types or attached regions require an explicit composite batching rule instead. A
+/// Operations with mixed member types or attached regions require an explicit family-level batching rule instead. A
 /// member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an exact diagnostic naming it,
 /// because projection reaches the member rule with no region access: the attached regions are programs in the
-/// _composite_ universe, and no projected driver can present them in the member universe.
+/// _heterogeneous_ universe, and no projected driver can present them in the member universe.
 ///
 /// # Parameters
 ///
-///   - `context`: Active composite [`BatchingContext`] whose mapped extent, axis metadata, and parent context are
+///   - `context`: Active heterogeneous [`BatchingContext`] whose mapped extent, axis metadata, and parent context are
 ///     preserved while the member rule runs.
 ///   - `operation`: Region-free operation expressed in the projected member operation family.
-///   - `inputs`: Packed composite batches corresponding to the operation's inputs.
+///   - `inputs`: Packed heterogeneous batches corresponding to the operation's inputs.
 pub fn batch_projected_operation<
     T: Type,
     O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,
@@ -1934,7 +1935,7 @@ pub fn batch_projected_operation<
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
                 "projected operation `{}` carries regions and cannot be batched through its member family; batch it \
-                 through a composite carrier for that operation instead",
+                 through a family-level carrier for that operation instead",
                 operation.name(),
             ),
         });
@@ -1960,7 +1961,7 @@ pub fn batch_projected_operation<
 
 /// Batches a region-free member [`Operation`] over replicated member values by binding the operation once in the parent
 /// context through a [`ProjectedContext`] instead of applying a member batching rule. Use this function from a
-/// composite operation dispatcher for a projected member whose values are shared bookkeeping (e.g., first-class
+/// family-level operation dispatcher for a projected member whose values are shared bookkeeping (e.g., first-class
 /// dimensions) and whose outer policy implements [`ReplicatedBatchingPolicyProjection`] for it, so that its operation
 /// family needs no [`BatchableOperation`] implementation of its own. `#[derive(Operation)]` uses it for every
 /// `#[ryft(projected(T, structural))]` variant. Values that are the same for every batch item yield results that are
@@ -1969,7 +1970,7 @@ pub fn batch_projected_operation<
 /// The steps run in the following order, and each failure stops the remaining steps:
 ///
 ///   1. An operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected before any input is projected,
-///      because the attached regions are programs in the composite universe that this function cannot rebind.
+///      because the attached regions are programs in the heterogeneous universe that this function cannot rebind.
 ///   2. Every input carrier is converted into its member value through
 ///      [`ReplicatedBatchingPolicyProjection::project_replicated_batch`], which rejects mapped carriers.
 ///   3. Every input carrier must be replicated. A correct [`ReplicatedBatchingPolicyProjection`] already guarantees
@@ -1977,14 +1978,14 @@ pub fn batch_projected_operation<
 ///   4. The complete operation payload is bound once in [`ProjectedContext`] over the parent context, with no regions.
 ///      Binding through the real parent keeps eager execution, staging, enclosing transforms, placement, manual
 ///      variation, and operation effects on their established execution paths, regardless of the batch size.
-///   5. Every result is embedded back into the composite value family and wrapped with [`BatchingPolicy::replicated`],
-///      preserving output count and order.
+///   5. Every result is embedded back into the heterogeneous value family and wrapped with
+///      [`BatchingPolicy::replicated`], preserving output count and order.
 ///
 /// # Parameters
 ///
-///   - `context`: Active composite [`BatchingContext`] whose parent context binds the operation.
+///   - `context`: Active heterogeneous [`BatchingContext`] whose parent context binds the operation.
 ///   - `operation`: Region-free operation expressed in the projected member operation family.
-///   - `inputs`: Packed composite batches corresponding to the operation's inputs.
+///   - `inputs`: Packed heterogeneous batches corresponding to the operation's inputs.
 ///
 /// # Errors
 ///
@@ -2006,7 +2007,7 @@ pub fn batch_replicated_projected_operation<
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
                 "projected operation `{}` carries regions and cannot be batched through its member family; \
-                 batch it through a composite carrier for that operation instead",
+                 batch it through a family-level carrier for that operation instead",
                 operation.name(),
             ),
         });
@@ -2055,7 +2056,7 @@ mod tests {
 
     use super::*;
 
-    /// Batch carrier shared by the composite and projected-member batching fixtures.
+    /// Batch carrier shared by the heterogeneous and projected-member batching fixtures.
     #[derive(Clone, Debug, PartialEq)]
     struct ProjectedBatch<V: Value> {
         /// Packed value.
@@ -2782,7 +2783,7 @@ mod tests {
     fn test_batch_projected_operation() {
         // The third fixture member is intentionally unrelated to arrays. Successfully applying its identity batching
         // rule proves that the adapter depends only on the projection and policy contracts, while preserving the
-        // composite policy's packed value and replicated-axis representation.
+        // heterogeneous policy's packed value and replicated-axis representation.
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
         let input = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
             ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
@@ -2801,7 +2802,7 @@ mod tests {
     fn test_batch_replicated_projected_operation() {
         // The first fixture member is unrelated to arrays and has no member batching rule, so a successful application
         // proves that the operation is bound once through the parent context and that its results are rebuilt as
-        // replicated composite carriers.
+        // replicated heterogeneous carriers.
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
         let left = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
             ProjectedProgramValue::First(ProjectedMemberValue::<0>(3)),

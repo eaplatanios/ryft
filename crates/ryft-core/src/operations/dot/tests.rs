@@ -1784,13 +1784,13 @@ fn test_ragged_dot_transpose_rejects_contracting_and_batch_modes() {
 }
 
 #[test]
-fn test_dot_composite() {
-    type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+fn test_dot_array_ir() {
+    type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    // Composite tracers stage the homogeneous dot product as an array-member instruction.
+    // Array IR tracers stage the homogeneous dot product as an array-member instruction.
     let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
-    let (_, program) = CompositeContext::trace(
-        |inputs: Vec<Tracer<CompositeContext>>| inputs[0].dot(&inputs[1], &DotDimensionNumbers::inner_product()),
+    let (_, program) = ArrayIrContext::trace(
+        |inputs: Vec<Tracer<ArrayIrContext>>| inputs[0].dot(&inputs[1], &DotDimensionNumbers::inner_product()),
         vec![vector_type.clone(), vector_type],
     )
     .unwrap();
@@ -1805,8 +1805,8 @@ fn test_dot_composite() {
         },
     );
 
-    // Concrete composite values contract their array members, and differentiation reaches the homogeneous rule
-    // through the composite member projection.
+    // Concrete array IR values contract their array members, and differentiation reaches the homogeneous rule through
+    // the array IR member projection.
     let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
     let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
     assert_eq!(

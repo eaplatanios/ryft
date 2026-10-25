@@ -1350,7 +1350,7 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// Zero sources for structural input cotangents, one slot per primal input leaf, aligned with
     /// [`primal_input_types`](Self::primal_input_types). A slot holds its primal input leaf only when a zero of the
     /// leaf's cotangent type cannot be constructed from the type alone, because the type references runtime quantities
-    /// that only a value defines (e.g., the extent of a symbolic array dimension, which a composite family reads
+    /// that only a value defines (e.g., the extent of a symbolic array dimension, which an array IR family reads
     /// through a first-class dimension and a homogeneous family takes from an exact-type exemplar), as decided by
     /// [`ResidualZeroProvider::requires_zero_source`]. Every other slot is [`None`] because such zeros come from their
     /// types, and reference-typed leaves are always [`None`]. The slots exist solely so that a consumer can materialize
@@ -2313,11 +2313,11 @@ where
 ///
 /// Passing raw gradient references to every rule would also expose storage, but would require references even when the
 /// caller only wants a value. Handles keep that choice in the context and expose reference access only when a buffer is
-/// available in the rule's value family. They do not make an enclosing composite family's reference representable in a
-/// homogeneous array family: projected rules use value contributions when they cannot represent the buffer, and direct
-/// indexed updates require a reference-capable implementation. Additive gradient storage for non-reference inputs also
-/// remains distinct from reference-state adjoints, whose transpose rules may need to read, replace, or clear state
-/// through the context's separate reference operations.
+/// available in the rule's value family. They do not make an enclosing heterogeneous family's reference representable
+/// in a homogeneous array family: projected rules use value contributions when they cannot represent the buffer, and
+/// direct indexed updates require a reference-capable implementation. Additive gradient storage for non-reference
+/// inputs also remains distinct from reference-state adjoints, whose transpose rules may need to read, replace, or
+/// clear state through the context's separate reference operations.
 ///
 /// # Deriving Transposable Operation Enums
 ///
@@ -4093,27 +4093,28 @@ where
     Ok(((output, auxiliary), gradient))
 }
 
-/// Applies a member operation's transpose rule through a projected view of a composite [`TracingContext`]. Use this
-/// function from a composite operation dispatcher when the linear operation is [`Region`]-free and every input and
-/// output belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage through a
+/// Applies a member operation's transpose rule through a projected view of a heterogeneous [`TracingContext`]. Use
+/// this function from a family-level operation dispatcher when the linear operation is [`Region`]-free and every input
+/// and output belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage through a
 /// member-typed [`TracingContext`], this function records the rule in a short-lived member program, converts that
-/// program to the composite type, and splices it into the active trace. Known primal inputs and live output cotangents
-/// become splice inputs in encounter order; structural zeros remain types and do not materialize values. The member
-/// rule receives the enclosing handles' cotangent mask but accumulates values locally, because its type family may not
-/// represent reference buffers. Each resulting contribution is lifted and submitted to the corresponding enclosing
-/// handle. Composite rules that can update reference views directly should bypass this dense fallback.
+/// program to the heterogeneous type, and splices it into the active trace. Known primal inputs and live output
+/// cotangents become splice inputs in encounter order; structural zeros remain types and do not materialize values.
+/// The member rule receives the enclosing handles' cotangent mask but accumulates values locally, because its type
+/// family may not represent reference buffers. Each resulting contribution is lifted and submitted to the corresponding
+/// enclosing handle. Family-level rules that can update reference views directly should bypass this dense fallback.
 ///
-/// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit composite
-/// transpose rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an
-/// exact diagnostic naming it, because projection reaches the member rule with no region access: the attached regions
-/// are programs in the _composite_ universe, and no projected driver can present them in the member universe.
+/// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit
+/// family-level transpose rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
+/// rejected with an exact diagnostic naming it, because projection reaches the member rule with no region access: the
+/// attached regions are programs in the _heterogeneous_ universe, and no projected driver can present them in the
+/// member universe.
 ///
 /// # Parameters
 ///
-///   - `context`: Active composite [`TranspositionContext`] into which the projected transpose program is spliced.
+///   - `context`: Active heterogeneous [`TranspositionContext`] into which the projected transpose program is spliced.
 ///   - `operation`: Region-free linear operation expressed in the projected member operation family.
 ///   - `inputs`: Per-input primal knowledge, preserving whether each primal is known or is a linear unknown.
-///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
+///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
 ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by `context`.
 pub fn transpose_projected_operation<
     T: DifferentiableType,
@@ -4139,7 +4140,7 @@ where
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "projected operation `{}` carries regions and cannot be transposed through its member family; \
-                 transpose it through a composite carrier for that operation instead",
+                 transpose it through a family-level carrier for that operation instead",
                 operation.name(),
             ),
         }
@@ -4150,15 +4151,15 @@ where
     accumulators.iter().try_for_each(|accumulator| context.cotangent_storage(accumulator).map(|_| ()))?;
 
     // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back to
-    // the composite type before it is attached to `context`, so primitive transpose rules never need composite types.
-    // The trace is detached from any region, so the member rule cannot reach reference accumulators, which is what this
-    // helper's region-free, reference-free contract requires.
+    // the heterogeneous type before it is attached to `context`, so primitive transpose rules never need heterogeneous
+    // types. The trace is detached from any region, so the member rule cannot reach reference accumulators, which is
+    // what this helper's region-free, reference-free contract requires.
     let mut rule_context = TranspositionContext::<<V as ValueProjection<T>>::Projected, P>::new(TracingContext::new());
 
     // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only their
-    // projected types. Known primals become leading member-program inputs and their composite atoms become the leading
-    // splice inputs, preserving the transposition rule's input order. Validate builder ownership before taking atom
-    // IDs: the same index in another trace names an unrelated value.
+    // projected types. Known primals become leading member-program inputs and their heterogeneous atoms become the
+    // leading splice inputs, preserving the transposition rule's input order. Validate builder ownership before taking
+    // atom IDs: the same index in another trace names an unrelated value.
     let mut splice_inputs = Vec::new();
     let rule_inputs = inputs
         .iter()
@@ -4175,7 +4176,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     // Live output cotangents follow known primals in both boundaries. Structural zeros remain type-only and therefore
-    // consume neither a member-program input nor a composite splice input.
+    // consume neither a member-program input nor a heterogeneous splice input.
     let rule_outputs = outputs
         .iter()
         .map(|output| -> Result<_, DifferentiationError> {
@@ -4210,8 +4211,8 @@ where
         .map(|(index, value, provenance)| Ok(((index, provenance.clone()), value.atom_id()?)))
         .collect::<Result<_, DifferentiationError>>()?;
 
-    // Convert the complete member program into the composite universe, then splice it with the source atoms collected
-    // in precisely the same order as the temporary member-program inputs.
+    // Convert the complete member program into the heterogeneous universe, then splice it with the source atoms
+    // collected in precisely the same order as the temporary member-program inputs.
     let rule_program = rule_context
         .builder()
         .borrow()
@@ -4236,8 +4237,8 @@ where
 /// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
 /// instruction consumes its `T`-typed member inputs together with inputs belonging to other members of the parent
 /// type universe (e.g., the first-class dimensions that supply a dynamic result shape), in any arrangement. Use this
-/// function from a composite operation dispatcher for a [`Region`]-free payload that keeps its native member operation
-/// type while its instruction crosses member kinds.
+/// function from a family-level operation dispatcher for a [`Region`]-free payload that keeps its native member
+/// operation type while its instruction crosses member kinds.
 ///
 /// Each instruction input is classified individually rather than by position. An input whose type projects into `T`
 /// is a _data_ input and every other input is a parent-universe shape input. The data inputs, in input order, are
@@ -4255,11 +4256,11 @@ where
 ///
 /// # Parameters
 ///
-///   - `context`: Active composite [`TranspositionContext`] the delegated member rule is spliced into.
+///   - `context`: Active heterogeneous [`TranspositionContext`] the delegated member rule is spliced into.
 ///   - `operation`: Region-free linear member operation whose instruction has a mixed parent boundary. Its homogeneous
 ///     rule sees exactly the data inputs, in the order they appear in the mixed instruction.
 ///   - `inputs`: Per-input primal knowledge in the mixed instruction's input order.
-///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
+///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
 ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by `context`.
 pub fn transpose_mixed_operation<
     T: DifferentiableType,
@@ -4888,12 +4889,12 @@ pub(crate) mod tests {
     type ReferenceTestProgram =
         Program<ReferenceTestValue, ReferenceTestOperation, Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>;
 
-    /// Wraps a scalar `f32` array into the composite value used by the reference transposition tests.
+    /// Wraps a scalar `f32` array into the array IR value used by the reference transposition tests.
     fn reference_test_scalar(value: f32) -> ReferenceTestValue {
         ArrayIrValue::Array(Array::scalar(value).unwrap())
     }
 
-    /// Stages `left · right` into a composite reference test program builder and returns the product.
+    /// Stages `left · right` into an array IR reference test program builder and returns the product.
     fn reference_test_mul(
         builder: &mut ProgramBuilder<ReferenceTestValue, ReferenceTestOperation>,
         left: AtomId,
@@ -4903,7 +4904,7 @@ pub(crate) mod tests {
         builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0]
     }
 
-    /// Squares a value in the composite reference test family, preserving the active transform context.
+    /// Squares a value in the array IR reference test family, preserving the active transform context.
     fn reference_test_square<V: Value<Type = ArrayIrType>>(value: V) -> Result<V, ProgramError>
     where
         V::Domain: Context<Value = V, Operation: From<ArrayOperation<Array>>>,
@@ -5989,7 +5990,7 @@ pub(crate) mod tests {
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
-        // The composite universe reads the runtime extent from `x` as a first-class dimension.
+        // The array IR universe reads the runtime extent from `x` as a first-class dimension.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let x = context.input(vector_type.clone().into());
         let y = context.input(scalar_type.clone().into());
@@ -10092,7 +10093,7 @@ pub(crate) mod tests {
     #[test]
     fn test_transpose_projected_operation() {
         // The third fixture member is intentionally unrelated to arrays. Its identity transpose proves that the
-        // adapter records the member rule, converts its program, and splices the live cotangent into the composite
+        // adapter records the member rule, converts its program, and splices the live cotangent into the heterogeneous
         // trace without changing its SSA identity or type.
         let mut context =
             TranspositionContext::new(TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
@@ -10225,7 +10226,7 @@ pub(crate) mod tests {
             }
         }
 
-        /// Composite carrier that preserves additions staged inside the member rule.
+        /// Array IR carrier that preserves additions staged inside the member rule.
         #[derive(Clone, Debug)]
         struct ScopedProgramOperation(ScopedMemberOperation);
 
@@ -10409,7 +10410,7 @@ pub(crate) mod tests {
             }
         }
 
-        /// Composite carrier whose canonical third-member projection is [`InterleavedMemberOperation`].
+        /// Heterogeneous carrier whose canonical third-member projection is [`InterleavedMemberOperation`].
         #[derive(Clone, Debug)]
         struct InterleavedProgramOperation(InterleavedMemberOperation);
 

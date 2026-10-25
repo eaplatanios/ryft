@@ -68,8 +68,8 @@ pub const PARALLEL_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_all_to_all";
 /// axis is rejected; sums over unrelated manual axes are preserved. An ordinary exchange carries no mesh and preserves
 /// the input's mesh variation and pending sums, even when its input carries a manual mesh axis with the same name,
 /// because a `batch` level whose axis name shadows that mesh axis may bind it instead. Type inference in the
-/// homogeneous array family requires static extents; the composite array/dimension family uses explicit result
-/// extents, with runtime assertions for dynamic split divisibility and untiled split size.
+/// homogeneous array family requires static extents; the array IR family uses explicit result extents, with runtime
+/// assertions for dynamic split divisibility and untiled split size.
 ///
 /// A matching `batch` level consumes the named axis of an ordinary exchange with a local reshape/transpose block
 /// exchange. Batch item `i` receives every item's chunk `i`, in sender order. A replicated input is broadcast before
@@ -238,8 +238,8 @@ impl Operation for ParallelAllToAllOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         let input_type = self.validate_input(input_types, region_interfaces)?;
 
-        // Result shape arithmetic in the homogeneous array family requires static extents.
-        // Dynamic shapes use explicit result extents in the composite array/dimension family.
+        // Result shape arithmetic in the homogeneous array family requires static extents. Dynamic shapes use explicit
+        // result extents in the array IR family.
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` does not support dynamically shaped inputs",
@@ -855,7 +855,7 @@ where
 /// dynamic split extents.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1046,7 +1046,7 @@ impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        // A concrete composite value performs the collective through its array member.
+        // A concrete array IR value performs the collective through its array member.
         let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_to_all_with_options(
             axis_name,
@@ -1077,9 +1077,9 @@ where
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        // Composite values stage the array followed by one result extent per axis. Only a manual mesh binder records
-        // its mesh on the operation and introduces variation; a named batch that shadows the same mesh-axis name
-        // performs its own local exchange.
+        // Array IR values stage the array followed by one result extent per axis. Only a manual mesh binder records its
+        // mesh on the operation and introduces variation; a named batch that shadows the same mesh-axis name performs
+        // its own local exchange.
         let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
@@ -1210,7 +1210,7 @@ impl<
         concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
+        // Homogeneous values opt into direct staging, while projected values retain array IR extent delegation.
         let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
@@ -1673,7 +1673,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_type_inference_array_ir_dynamic() {
-        // A tiled exchange of a dynamically shaped composite input takes its result extents from the explicit dimension
+        // A tiled exchange of a dynamically shaped array IR input takes its result extents from the explicit dimension
         // inputs, while coincident axes preserve the input type, including its dynamic extent.
         let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
         let split_result = DimensionVariable::new("split", DimensionBounds::new(1, Some(9)).unwrap());
@@ -1915,7 +1915,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_interpretation_array_ir() {
-        // Composite values apply the same degenerate rules to their array input after validating the explicit result
+        // Array IR values apply the same degenerate rules to their array input after validating the explicit result
         // extents against the observed input.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
@@ -2262,7 +2262,7 @@ mod tests {
             },
         );
 
-        // The composite family's explicit result extents use the same local batching rule.
+        // The array IR family's explicit result extents use the same local batching rule.
         let (output_type, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -2639,7 +2639,7 @@ mod tests {
             },
         );
 
-        // The composite capability stages result extents with structural-zero tangents and uses the same binder.
+        // The array IR capability stages result extents with structural-zero tangents and uses the same binder.
         let (output_type, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -2733,8 +2733,8 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_differentiation_array_ir_linearization() {
-        // A composite exchange linearizes into a linear call that retains its explicit result extent as a residual,
-        // and whose transpose applies the adjoint exchange to the output cotangent.
+        // An array IR exchange linearizes into a linear call that retains its explicit result extent as a residual, and
+        // whose transpose applies the adjoint exchange to the output cotangent.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
         let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
@@ -2846,7 +2846,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_differentiation_array_ir_dynamic_extent() {
-        // A composite untiled exchange retains its dynamic input extent so the pullback restores the original axes.
+        // An array IR untiled exchange retains its dynamic input extent so the pullback restores the original axes.
         let variable = DimensionVariable::new("length", DimensionBounds::new(1, Some(9)).unwrap());
         let dimension_type = DimensionType::from(variable.clone());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3100,7 +3100,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_infer_parent_region_input_types() {
-        // The exchange has no regions, so it requests no region input types from its composite parent.
+        // The exchange has no regions, so it requests no region input types from its array IR parent.
         assert_eq!(
             ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
                 .infer_parent_region_input_types(&[ArrayType::new_static(DataType::F32, [4, 3]).into()], &[]),
@@ -3111,7 +3111,7 @@ mod tests {
     #[test]
     fn test_parallel_all_to_all_rename_parent_type_identities() {
         // The exchange records no type identities of its own, because its result extents are explicit inputs of its
-        // composite parent, so renaming the identities of that parent leaves it unchanged.
+        // array IR parent, so renaming the identities of that parent leaves it unchanged.
         let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
         let mut renaming = TypeIdentityRenaming::new();
         renaming
@@ -3140,8 +3140,8 @@ mod tests {
             Ok(Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0]).unwrap()),
         );
 
-        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
-        // binder, so every axis name is unbound for them.
+        // Concrete arrays, and concrete array IR values through their array members, are never inside an axis binder,
+        // so every axis name is unbound for them.
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).unwrap().parallel_all_to_all("x", 0, 0),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
@@ -3279,8 +3279,8 @@ mod tests {
     #[test]
     fn test_parallel_all_to_all_parallel_all_to_all_with_options_negative_axes() {
         // Negative split and concatenation axes count from the end. An exchange preserves the rank, so both axes are
-        // normalized against the rank of the input in both modes. Homogeneous and composite values normalize the axes
-        // alike, and composite values do so before they stage any result extent.
+        // normalized against the rank of the input in both modes. Homogeneous and array IR values normalize the axes
+        // alike, and array IR values do so before they stage any result extent.
         let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
         let homogeneous =
             |input_type: ArrayType, split_axis: i32, concatenation_axis: i32, options: CollectiveOptions| {
@@ -3291,15 +3291,14 @@ mod tests {
                 )
                 .map(|(_, program)| program.to_string())
             };
-        let composite =
-            |input_type: ArrayType, split_axis: i32, concatenation_axis: i32, options: CollectiveOptions| {
-                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                    move |input| input.parallel_all_to_all_with_options("x", split_axis, concatenation_axis, options),
-                    ArrayIrType::Array(input_type),
-                    named_axes(),
-                )
-                .map(|(_, program)| program.to_string())
-            };
+        let array_ir = |input_type: ArrayType, split_axis: i32, concatenation_axis: i32, options: CollectiveOptions| {
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                move |input| input.parallel_all_to_all_with_options("x", split_axis, concatenation_axis, options),
+                ArrayIrType::Array(input_type),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
         let untiled_type = || ArrayType::new_static(DataType::F32, [3, 4, 2]);
         let tiled_type = || ArrayType::new_static(DataType::F32, [4, 6]);
         let untiled = CollectiveOptions::default;
@@ -3313,23 +3312,23 @@ mod tests {
             homogeneous(tiled_type(), 0, 1, tiled()).unwrap(),
         );
         assert_eq!(
-            composite(untiled_type(), -1, -3, untiled()).unwrap(),
-            composite(untiled_type(), 2, 0, untiled()).unwrap(),
+            array_ir(untiled_type(), -1, -3, untiled()).unwrap(),
+            array_ir(untiled_type(), 2, 0, untiled()).unwrap(),
         );
-        assert_eq!(composite(tiled_type(), -2, -1, tiled()).unwrap(), composite(tiled_type(), 0, 1, tiled()).unwrap());
+        assert_eq!(array_ir(tiled_type(), -2, -1, tiled()).unwrap(), array_ir(tiled_type(), 0, 1, tiled()).unwrap());
         assert_eq!(
             homogeneous(untiled_type(), -4, 0, untiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
         );
         assert_eq!(
-            composite(tiled_type(), 0, -3, tiled()),
+            array_ir(tiled_type(), 0, -3, tiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
         );
     }
 
     #[test]
     fn test_parallel_all_to_all_parallel_all_to_all_with_options_preserves_unrelated_pending_sums() {
-        // The composite capability makes an invariant input varying over the exchanged axis `x` without dropping a
+        // The array IR capability makes an invariant input varying over the exchanged axis `x` without dropping a
         // pending sum over the independent `y` axis, but rejects a pending sum over `x` itself.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -3593,7 +3592,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_parallel_all_to_all_with_options_projected_value() {
-        // A projected array view of a composite value stages the exchange through its composite value, so that the
+        // A projected array view of an array IR value stages the exchange through its array IR value, so that the
         // result extents are staged as explicit extent values.
         let (output_type, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(

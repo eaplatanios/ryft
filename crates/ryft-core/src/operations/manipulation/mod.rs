@@ -119,8 +119,8 @@ pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, Transp
 /// type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and composite array IR
-/// values implement it for [`ArrayIrType`](crate::ArrayIrType).
+/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and array IR values
+/// implement it for [`ArrayIrType`](crate::ArrayIrType).
 pub trait ManipulationOperations<T = <Self as Capability>::Universe>:
     Capability
     + Transpose<T>
@@ -167,7 +167,7 @@ impl<
 /// [`DynamicSliceWithDimensions`]). It is implemented automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that composite array IR values implement this bundle for [`ArrayIrType`](crate::ArrayIrType).
+/// so that array IR values implement this bundle for [`ArrayIrType`](crate::ArrayIrType).
 pub trait DynamicManipulationOperations<T = <Self as Capability>::Universe>:
     Capability
     + DynamicReshape<T>

@@ -95,7 +95,7 @@ pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTyp
 
 /// Type-family storage policy for values that must cross an iteration boundary as stacked residuals.
 ///
-/// Array residuals store themselves directly. A composite backend can instead assign a checked array-backed storage
+/// Array residuals store themselves directly. An array IR backend can instead assign a checked array-backed storage
 /// type to metadata values such as first-class dimensions, keeping the temporal representation explicit in SSA.
 pub(crate) trait TemporalResidualType: Type {
     /// Returns the per-iteration array-backed storage type for this residual.
@@ -145,9 +145,8 @@ impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O 
     }
 }
 
-// Composite array IR residuals store arrays directly and first-class dimensions as scalar arrays. A reference never
-// defines temporal storage because the transforms thread references through loops as carries and never save them as
-// residuals.
+// Array IR residuals store arrays directly and first-class dimensions as scalar arrays. A reference never defines
+// temporal storage because the transforms thread references through loops as carries and never save them as residuals.
 impl TemporalResidualType for ArrayIrType {
     #[inline]
     fn temporal_storage_type(&self) -> Result<Self, TypeError> {
@@ -589,16 +588,16 @@ mod tests {
 
     use super::{SCAN_OPERATION_NAME, validate_reference_carry_axis};
 
-    /// Composite array value, which admits references and first-class dimensions.
+    /// Array IR value, which admits references and first-class dimensions.
     pub(super) type TestIrValue = ArrayIrValue<Array>;
 
-    /// Operation family of the composite array programs under test.
+    /// Operation family of the array IR programs under test.
     pub(super) type TestIrOperation = ArrayIrOperation<Array>;
 
-    /// Captured composite value of the reference discharge fixtures.
+    /// Captured array IR value of the reference discharge fixtures.
     pub(super) type DischargeCapture = CaptureReference<ArrayIrType>;
 
-    /// Operation family of the captured composite programs in the reference discharge fixtures.
+    /// Operation family of the captured array IR programs in the reference discharge fixtures.
     pub(super) type DischargeCaptureOperation = ArrayIrOperation<CaptureReference<ArrayType>>;
 
     /// [`RegionLiveness`] of an operation with a single attached region, whose live inputs `used_inputs` derives from

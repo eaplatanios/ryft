@@ -155,7 +155,7 @@ pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 /// the same function of the same state. Batching a mapped state (e.g., one state per batch item derived with
 /// [`Random::split_rng_key`]) stages one carry-free [`ScanOperation`] over the per-item states, so each batch item
 /// draws exactly the bits that its own state produces unbatched and the staged program size is independent of the
-/// batch size. The composite form threads its output extents through that scan as invariant carries, which requires
+/// batch size. The array IR form threads its output extents through that scan as invariant carries, which requires
 /// them to be replicated.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RngBitGeneratorOperation<T: Type> {
@@ -259,7 +259,7 @@ impl<T: Type> RngBitGeneratorOperation<T> {
             .map_err(|error| TypeError::invalid(error.to_string()))
     }
 
-    /// Renders this payload independently of its homogeneous or composite input contract. This is a separate function
+    /// Renders this payload independently of its homogeneous or array IR input contract. This is a separate function
     /// rather than the body of [`Operation::render`] because the [`ArrayType`] and [`ArrayIrType`] payloads have
     /// separate [`Operation`] implementations that must render identically, and both must forward their `indentation`
     /// so that [`OperationFormatter`] can lay out continuation lines. Inherent functions take precedence over trait
@@ -558,10 +558,10 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// and so their derivative is a structural zero.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
-/// Note that composite values also generate random bits through their array views, which stages the static array
-/// generator; the native composite generator with dynamic output dimensions is [`DynamicRngBitGenerator`].
+/// Note that array IR values also generate random bits through their array views, which stages the static array
+/// generator; the native array IR generator with dynamic output dimensions is [`DynamicRngBitGenerator`].
 ///
 /// # Example
 ///
@@ -691,9 +691,8 @@ impl<
 /// [`ArrayIrValue`]s generate exactly the bits that [`RngBitGenerator`] generates for the resolved static shape, while
 /// context-carrying values bind an [`RngBitGeneratorOperation<ArrayIrType>`].
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
-/// extents.
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents.
 ///
 /// # Example
 ///
@@ -846,9 +845,9 @@ pub enum CategoricalSamplingMode {
 /// function.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
-/// Note that composite values sample through their array views, so that the whole composition runs in the array
+/// Note that array IR values sample through their array views, so that the whole composition runs in the array
 /// universe.
 ///
 /// # Example
@@ -1576,7 +1575,7 @@ mod tests {
             }],
         );
 
-        // The composite type universe applies the same rule.
+        // The array IR type universe applies the same rule.
         assert_eq!(
             RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, output_type)
                 .infer_output_types(&[varying_state_type.clone().into()], &[]),
@@ -1586,7 +1585,7 @@ mod tests {
 
     #[test]
     fn test_rng_bit_generator_type_inference_dynamic() {
-        // The composite contract takes one extent input per dynamic output axis, in axis order, and each extent must
+        // The array IR contract takes one extent input per dynamic output axis, in axis order, and each extent must
         // define the dimension variable of its axis.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(4)).unwrap());
@@ -1796,7 +1795,7 @@ mod tests {
             Ok(vec![ArrayIrValue::Array(expected_state), ArrayIrValue::Array(expected_bits)]),
         );
 
-        // Context-carrying mixed values stage one composite bit-generation instruction.
+        // Context-carrying mixed values stage one array IR bit-generation instruction.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let state = context.input(RandomAlgorithm::ThreeFry.state_type().into());
         let rows_value = context.input(DimensionType::from(rows).into());
@@ -1965,7 +1964,7 @@ mod tests {
     fn test_rng_bit_generator_batching_dynamic() -> Result<(), ProgramError> {
         type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // A mapped state over a dynamic batch extent stages one composite scan whose replicated output extents are
+        // A mapped state over a dynamic batch extent stages one array IR scan whose replicated output extents are
         // invariant carries and whose dynamic length is a trailing runtime input.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7))?);
@@ -2009,7 +2008,7 @@ mod tests {
             panic!("mapped random bit generation should stage exactly one scan instruction");
         };
         let ArrayIrOperation::Scan(scan_operation) = scan.operation() else {
-            panic!("mapped random bit generation should stage the direct composite scan carrier");
+            panic!("mapped random bit generation should stage the direct array IR scan carrier");
         };
         assert_eq!(scan_operation.carry_count(), 2);
         assert_eq!(scan_operation.length(), &Dimension::Dynamic(batch));
@@ -2048,7 +2047,7 @@ mod tests {
         );
         assert_eq!(nested.input_types()[0], ArrayIrType::Dimension(DimensionType::from(outer)));
 
-        // A replicated state stages the composite operation once and replicates both outputs.
+        // A replicated state stages the array IR operation once and replicates both outputs.
         let trace = Context::new();
         let batch_extent = trace.input(DimensionType::new("batch", DimensionBounds::new(1, Some(9))?).into());
         let state = trace.input(RandomAlgorithm::ThreeFry.state_type().into());
@@ -2176,25 +2175,25 @@ mod tests {
     }
 
     #[test]
-    fn test_random_composite() {
-        // Concrete composite values generate bits and sample through their array members.
+    fn test_random_array_ir() {
+        // Concrete array IR values generate bits and sample through their array members.
         let state = threefry_state(42, 7);
-        let composite = ArrayIrValue::Array(state.clone());
+        let array_ir = ArrayIrValue::Array(state.clone());
         let output_type = ArrayType::new_static(DataType::U32, [2]);
         let (next_state, bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
         assert_eq!(
-            composite.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
+            array_ir.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
             Ok((ArrayIrValue::Array(next_state), ArrayIrValue::Array(bits))),
         );
         let (next_state, keys) = state.split_rng_key(2).unwrap();
         assert_eq!(
-            composite.split_rng_key(2),
+            array_ir.split_rng_key(2),
             Ok((ArrayIrValue::Array(next_state), keys.into_iter().map(ArrayIrValue::Array).collect())),
         );
         let sample_type = ArrayType::new_static(DataType::F32, [3]);
         let (next_state, samples) = state.random_uniform(&sample_type).unwrap();
         assert_eq!(
-            composite.random_uniform(&sample_type),
+            array_ir.random_uniform(&sample_type),
             Ok((ArrayIrValue::Array(next_state), ArrayIrValue::Array(samples))),
         );
     }

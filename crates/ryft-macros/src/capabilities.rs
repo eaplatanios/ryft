@@ -1,5 +1,5 @@
 //! Expansion of the `#[capability]` attribute, which validates the conventions of capability traits and generates the
-//! implementations through which composite values apply a capability by projecting onto their members.
+//! implementations through which heterogeneous values apply a capability by projecting onto their members.
 
 // TODO(eaplatanios): Review this module.
 
@@ -13,12 +13,12 @@ use syn::{
     Token, TraitItem, TraitItemFn, Type, TypeParamBound, WherePredicate, parenthesized,
 };
 
-/// Projection requested by a `projection(Composite => Member)` attribute argument.
+/// Projection requested by a `projection(Family => Member)` attribute argument.
 struct Projection {
-    /// Universe of the composite values that apply the capability by projecting onto their members.
-    composite: Type,
+    /// Universe of the heterogeneous values that apply the capability by projecting onto their members.
+    family: Type,
 
-    /// Universe of the member values onto which composite values project.
+    /// Universe of the member values onto which heterogeneous values project.
     member: Type,
 }
 
@@ -45,15 +45,15 @@ impl Parse for Arguments {
                 if keyword != "projection" {
                     return Err(syn::Error::new_spanned(
                         keyword,
-                        "expected `projection(Composite => Member)` or `crate = \"path\"`",
+                        "expected `projection(Family => Member)` or `crate = \"path\"`",
                     ));
                 }
                 let content;
                 parenthesized!(content in input);
-                let composite = content.parse()?;
+                let family = content.parse()?;
                 content.parse::<Token![=>]>()?;
                 let member = content.parse()?;
-                projections.push(Projection { composite, member });
+                projections.push(Projection { family, member });
             }
             if !input.is_empty() {
                 input.parse::<Token![,]>()?;
@@ -65,7 +65,7 @@ impl Parse for Arguments {
 
 // TODO(eaplatanios): Review this.
 /// Expands one `#[capability]` attribute: validates the annotated capability trait and appends one projection
-/// implementation per `projection(Composite => Member)` argument.
+/// implementation per `projection(Family => Member)` argument.
 pub(crate) fn expand(attributes: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let arguments: Arguments = syn::parse2(attributes)?;
     let item: ItemTrait = syn::parse2(item)?;
@@ -171,7 +171,7 @@ fn mentions_self(r#type: &Type) -> bool {
     finder.found
 }
 
-/// Generates the implementation of the capability for every value of `projection.composite` whose
+/// Generates the implementation of the capability for every value of `projection.family` whose
 /// [`ValueProjection`] onto `projection.member` yields a value that implements the capability itself.
 fn projection_implementation(
     item: &ItemTrait,
@@ -179,17 +179,17 @@ fn projection_implementation(
     projection: &Projection,
     core: &Path,
 ) -> syn::Result<TokenStream> {
-    let Projection { composite, member } = projection;
+    let Projection { family, member } = projection;
     let projected = quote!(<__V as #core::ValueProjection<#member>>::Projected);
 
     // Type parameters other than the universe must default to `Self` (e.g., the right input of `Dot`), so that they
-    // resolve to the composite value in the implemented trait and to its projection in the delegated one.
+    // resolve to the heterogeneous value in the implemented trait and to its projection in the delegated one.
     let mut self_parameters = Vec::new();
     let mut implemented_arguments = Vec::new();
     let mut projected_arguments = Vec::new();
     for (index, parameter) in item.generics.params.iter().enumerate() {
         if index == universe {
-            implemented_arguments.push(quote!(#composite));
+            implemented_arguments.push(quote!(#family));
             projected_arguments.push(quote!(#member));
             continue;
         }
@@ -224,7 +224,7 @@ fn projection_implementation(
     Ok(quote! {
         impl<__V> #trait_name<#(#implemented_arguments),*> for __V
         where
-            __V: #core::Value<Type = #composite> + #core::ValueProjection<#member>,
+            __V: #core::Value<Type = #family> + #core::ValueProjection<#member>,
             #projected: #trait_name<#(#projected_arguments),*>,
         {
             #(#functions)*
@@ -372,8 +372,8 @@ fn result_value_type(r#type: &Type) -> Option<&Type> {
 }
 
 /// Lifts the projected value `expression` of type `type` (with `Self` read as the projected member) back into the
-/// composite universe: `Self` is lifted through [`ValueProjection::from_projected`], `Vec<Self>` element by element,
-/// tuples component by component, and types that do not mention `Self` are passed through unchanged.
+/// heterogeneous universe: `Self` is lifted through [`ValueProjection::from_projected`], `Vec<Self>` element by
+/// element, tuples component by component, and types that do not mention `Self` are passed through unchanged.
 fn lift(r#type: &Type, expression: TokenStream, member: &Type, core: &Path) -> syn::Result<TokenStream> {
     let from_projected = quote!(<Self as #core::ValueProjection<#member>>::from_projected);
     if is_self(r#type) {
@@ -508,7 +508,7 @@ mod tests {
                     pub trait Double<T = <Self as Capability>::Universe>: Capability {}
                 ),
             ),
-            "expected `projection(Composite => Member)` or `crate = \"path\"`",
+            "expected `projection(Family => Member)` or `crate = \"path\"`",
         );
     }
 

@@ -2798,7 +2798,7 @@ mod tests {
     ///
     /// `CustomCallBatching::Sequential` also executes through the *eager* XLA path, whose batching parent is a
     /// [`ProjectedContext`]: the projection lifts the `scan` that applies the kernel once per batch item, together with
-    /// its body region, into the composite family.
+    /// its body region, into the array IR family.
     #[test]
     fn test_eager_custom_call_batching_executes_registered_ffi_handler() {
         use ryft_core::{CustomCall, CustomCallBatching, CustomCallOperation, CustomCallUnrolling};
@@ -2895,7 +2895,7 @@ mod tests {
     }
 
     /// A function built from a custom call with `CustomFunction::from_custom_call` executes the registered FFI
-    /// handler as its primal, through the projection of the composite XLA domain onto arrays, and differentiates
+    /// handler as its primal, through the projection of the array IR XLA domain onto arrays, and differentiates
     /// through its user-provided rules.
     #[test]
     fn test_eager_custom_call_differentiates_through_from_custom_call() {
@@ -2929,7 +2929,7 @@ mod tests {
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
     }
 
-    /// A custom function with a custom batching rule, written against the projection of the composite XLA domain onto
+    /// A custom function with a custom batching rule, written against the projection of the array IR XLA domain onto
     /// arrays, executes through that projection, which lifts the regions of the calls that it binds. Its unbatched
     /// derivative differentiates the primal, while batching it (before or after differentiating it) applies the rule
     /// (here deliberately `2 · sin(x)` instead of `sin(x)`).

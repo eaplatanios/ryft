@@ -306,8 +306,8 @@ impl Operation for ParallelSumScatterOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         let input_type = self.validate_input(input_types, region_interfaces)?;
 
-        // Result-shape arithmetic in the homogeneous array family requires static extents.
-        // Dynamic shapes use explicit result extents in the composite array/dimension family.
+        // Result-shape arithmetic in the homogeneous array family requires static extents. Dynamic shapes use explicit
+        // result extents in the array IR family.
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
@@ -769,7 +769,7 @@ where
 /// as explicit extent values, and a runtime assertion checks every extent that is not statically known.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -890,7 +890,7 @@ impl<
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
+        // Homogeneous values opt into direct staging, while projected values retain array IR extent delegation.
         let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
@@ -918,7 +918,7 @@ impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScat
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        // A concrete composite value performs the collective through its array member.
+        // A concrete array IR value performs the collective through its array member.
         let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_sum_scatter_with_options(
             axis_name,
@@ -947,7 +947,7 @@ impl<
         scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        // A composite value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit
+        // An array IR value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit
         // extent value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a
         // manual mesh axis, an input that neither varies over the axis nor is unreduced over it is first made varying
         // through its array view, exactly as JAX's `psum_scatter` does, so that every device's copy is counted.
@@ -1066,11 +1066,10 @@ mod tests {
         .unwrap()
     }
 
-    /// Checks that transposing a tiled sum-scatter over the two-participant manual mesh axis `"x"` of an `f32[8]`
-    /// input with the provided `sharding` stages the `expected` program in both the homogeneous array family and
-    /// the composite array/dimension family, so that both representations restore the same complete input cotangent
-    /// reduction state. The composite family must additionally give the explicit output extent a structural-zero
-    /// cotangent.
+    /// Checks that transposing a tiled sum-scatter over the two-participant manual mesh axis `"x"` of an `f32[8]` input
+    /// with the provided `sharding` stages the `expected` program in both the homogeneous array family and the array IR
+    /// family, so that both representations restore the same complete input cotangent reduction state. The array IR
+    /// family must additionally give the explicit output extent a structural-zero cotangent.
     fn check_parallel_sum_scatter_transposition_reduction_state(sharding: Sharding, expected: &str) {
         let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled())
             .with_mesh(sharding.mesh().clone());
@@ -1362,7 +1361,7 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_type_inference_array_ir() {
-        // The composite family follows each array input with one explicit extent per output axis, checks every extent
+        // The array IR family follows each array input with one explicit extent per output axis, checks every extent
         // that is statically known, and keeps dynamic extents.
         assert_eq!(
             ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default())
@@ -1853,7 +1852,7 @@ mod tests {
         assert_eq!(output_type, expected_type);
         assert_eq!(program.to_string(), expected);
 
-        // The composite family's explicit output extents use the same local batching rule.
+        // The array IR family's explicit output extents use the same local batching rule.
         let (output_type, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -1923,7 +1922,7 @@ mod tests {
         assert_eq!(output_type, expected_type);
         assert_eq!(program.to_string(), expected);
 
-        // The composite family's explicit output extents use the same local batching rule.
+        // The array IR family's explicit output extents use the same local batching rule.
         let (output_type, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -1961,7 +1960,7 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_differentiation_array_ir_dynamic_extent() {
-        // The composite family linearizes a sum-scatter with an explicit extent into a linear call whose pullback, over
+        // The array IR family linearizes a sum-scatter with an explicit extent into a linear call whose pullback, over
         // a single participant, returns the output cotangent unchanged.
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dimension_type = DimensionType::from(variable.clone());
@@ -2216,7 +2215,7 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_transposition_array_ir_extent() {
-        // The composite family transposes the array input through the same all-gather and gives the explicit extent a
+        // The array IR family transposes the array input through the same all-gather and gives the explicit extent a
         // structural-zero cotangent.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::new_static(DataType::F32, [3]).into());
@@ -2555,7 +2554,7 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_parallel_sum_scatter_with_options_negative_axes() {
-        // Negative scatter axes count from the end of the input in both modes. Homogeneous and composite values
+        // Negative scatter axes count from the end of the input in both modes. Homogeneous and array IR values
         // normalize the axis alike.
         let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
         let homogeneous = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
@@ -2566,7 +2565,7 @@ mod tests {
             )
             .map(|(_, program)| program.to_string())
         };
-        let composite = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
+        let array_ir = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
                 ArrayIrType::Array(input_type),
@@ -2583,14 +2582,14 @@ mod tests {
             homogeneous(untiled_type(), 1, untiled()).unwrap(),
         );
         assert_eq!(homogeneous(tiled_type(), -1, tiled()).unwrap(), homogeneous(tiled_type(), 1, tiled()).unwrap());
-        assert_eq!(composite(untiled_type(), -1, untiled()).unwrap(), composite(untiled_type(), 1, untiled()).unwrap());
-        assert_eq!(composite(tiled_type(), -1, tiled()).unwrap(), composite(tiled_type(), 1, tiled()).unwrap());
+        assert_eq!(array_ir(untiled_type(), -1, untiled()).unwrap(), array_ir(untiled_type(), 1, untiled()).unwrap());
+        assert_eq!(array_ir(tiled_type(), -1, tiled()).unwrap(), array_ir(tiled_type(), 1, tiled()).unwrap());
         assert_eq!(
             homogeneous(untiled_type(), -3, untiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
         );
         assert_eq!(
-            composite(tiled_type(), 2, tiled()),
+            array_ir(tiled_type(), 2, tiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
         );
     }
@@ -2612,8 +2611,8 @@ mod tests {
             Err::<ArrayIrValue<Array>, _>(BatchingError::Axis(AxisError::UnboundAxisName { name: "y".to_string() })),
         );
 
-        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
-        // binder, so every axis name is unbound for them.
+        // Concrete arrays, and concrete array IR values through their array members, are never inside an axis binder,
+        // so every axis name is unbound for them.
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).unwrap().parallel_sum_scatter_with_options(
                 "x",
@@ -2740,7 +2739,7 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_parallel_sum_scatter_with_options_array_ir_manual_mesh() {
-        // The composite family supplies the mesh in the same way and stages the output extent explicitly. A varying
+        // The array IR family supplies the mesh in the same way and stages the output extent explicitly. A varying
         // input already represents one contribution per participant.
         let mesh = manual_mesh();
         let sharding = Sharding::replicated(mesh.clone(), 1);
@@ -3028,7 +3027,7 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_parallel_sum_scatter_with_options_projected_value() {
-        // A projected array view of a composite value stages the sum-scatter through its composite value, so that the
+        // A projected array view of an array IR value stages the sum-scatter through its array IR value, so that the
         // output extent is staged as an explicit extent value.
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| {

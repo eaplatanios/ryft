@@ -2125,7 +2125,7 @@ mod tests {
         }
     }
 
-    /// Minimal composite compilation domain used to prove the retained-JIT contract over dimension inputs: it
+    /// Minimal array IR compilation domain used to prove the retained-JIT contract over dimension inputs: it
     /// stages through the ordinary tracing path, "lowers" and "compiles" to the lifted flat program itself, counts
     /// backend compilations, and executes calls by eager interpretation of the compiled program.
     #[derive(Clone)]

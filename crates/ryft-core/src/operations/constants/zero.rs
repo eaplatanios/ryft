@@ -32,7 +32,7 @@ pub const ZERO_OPERATION_NAME: &str = "zero";
 /// the right type and shape filled with zeros.
 ///
 /// This operation also serves as an [`OperationProvider`] request: it carries the requested output type while the
-/// provider receives no input types. Composite operation families select the appropriate member operation from this
+/// provider receives no input types. Heterogeneous operation families select the appropriate member operation from this
 /// type; homogeneous families use their ordinary `From<ZeroOperation<T>>` conversion.
 /// This constructs zeros whose shape is fully described by their type. Differentiation's separate
 /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol handles zeros that require runtime extents from
@@ -411,10 +411,10 @@ mod tests {
         let operation = ZeroOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
-        // Nullary construction rejects output types with ungrounded identity _references_ (a dynamic array axis),
-        // which must instead be constructed through the mixed dimension-input contract owned by the composite
-        // operation family. Definition-position identities remain constructible: a dimension value's type defines
-        // its own variable, so nullary construction leaves no dangling reference.
+        // Nullary construction rejects output types with ungrounded identity _references_ (a dynamic array axis), which
+        // must instead be constructed through the mixed dimension-input contract owned by the array IR operation
+        // family. Definition-position identities remain constructible: a dimension value's type defines its own
+        // variable, so nullary construction leaves no dangling reference.
         let rows = crate::arrays::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
@@ -548,7 +548,7 @@ mod tests {
                                values exist only in array programs over `ArrayIrOperation`",
         ));
 
-        // Composite eager zero materialization delegates array members and rejects first-class dimensions and
+        // Eager array IR zero materialization delegates array members and rejects first-class dimensions and
         // references. A reference names an allocation with persistent identity and cannot be conjured from its type.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(context.zero(&ArrayIrType::Array(output_type.clone())), Ok(ArrayIrValue::Array(expected)));
@@ -787,19 +787,19 @@ mod tests {
             ArrayOperation::<Array>::provide(ZeroOperation::new(static_type.clone()), &[&static_type]).unwrap_err(),
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
         );
-        let composite_type = ArrayIrType::Array(static_type.clone());
+        let array_ir_type = ArrayIrType::Array(static_type.clone());
         assert_eq!(
-            ArrayIrOperation::<Array>::provide(ZeroOperation::new(composite_type.clone()), &[&composite_type])
+            ArrayIrOperation::<Array>::provide(ZeroOperation::new(array_ir_type.clone()), &[&array_ir_type])
                 .unwrap_err(),
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
         );
 
-        // The composite provider projects a valid input-free array zero into the homogeneous member family.
+        // The array IR provider projects a valid input-free array zero into the homogeneous member family.
         let ArrayIrOperation::<Array>::Array(ArrayOperation::Zero(operation)) =
             ArrayIrOperation::<Array>::provide(ZeroOperation::new(ArrayIrType::Array(static_type.clone())), &[])
                 .unwrap()
         else {
-            panic!("expected a composite homogeneous zero operation");
+            panic!("expected an array IR homogeneous zero operation");
         };
         assert_eq!(operation.r#type(), &static_type);
 

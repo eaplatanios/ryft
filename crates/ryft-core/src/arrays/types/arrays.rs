@@ -707,7 +707,7 @@ impl From<ReferenceType<NoReferent>> for ArrayType {
 /// to [`DimensionRefinements`] for the distinction between declared and actual identity scopes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayTypeRefinements {
-    /// [`DimensionRefinements`] shared by array axes and, in the composite universe, dimension and reference members.
+    /// [`DimensionRefinements`] shared by array axes and, in the array IR universe, dimension and reference members.
     dimensions: DimensionRefinements,
 }
 
@@ -879,7 +879,7 @@ impl From<DimensionRefinements> for ArrayTypeRefinements {
 
 /// [`Type`] universe whose types may describe arrays. Universe-parameterized array capabilities use this view in their
 /// provided functions to read the [`ArrayType`] of a value in either universe, so that those functions are available
-/// for homogeneous array values and for composite array IR values alike.
+/// for homogeneous array values and for array IR values alike.
 pub trait AsArrayType: Type {
     /// Returns the [`ArrayType`] that this type describes, or a [`TypeError`] if it does not describe an array
     /// (e.g., a first-class dimension or a reference in the array IR universe).

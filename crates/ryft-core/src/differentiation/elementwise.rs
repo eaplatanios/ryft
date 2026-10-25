@@ -639,7 +639,7 @@ mod tests {
                                type f64[] has a different shape",
         ));
 
-        // An implicitly broadcasting result with a runtime extent is served by the composite arm instead. The narrow
+        // An implicitly broadcasting result with a runtime extent is served by the array IR arm instead. The narrow
         // input is replicated explicitly against first-class extents read off the input that owns the runtime
         // axis, because the metadata-only broadcast's payload output type is one that program replay never refines.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

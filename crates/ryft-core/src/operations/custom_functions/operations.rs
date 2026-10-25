@@ -134,7 +134,7 @@ enum CustomFunctionRules<T, S> {
 /// ordinary input whose derivative merely happens to be zero. This is the same input split that
 /// [`LinearCallOperation`](crate::LinearCallOperation) draws with its residual count. Batching is a canonical producer
 /// of such inputs: a batching policy that threads batching state through a structurally batched region's boundary
-/// (e.g., a composite universe's first-class mapped extent) reintroduces that state as additional leading
+/// (e.g., the array IR universe's first-class mapped extent) reintroduces that state as additional leading
 /// non-differentiated inputs of the batched call.
 ///
 /// # Rule Selection
@@ -2931,7 +2931,7 @@ mod tests {
     type ArrayIrCustomFunctionTranspose =
         CustomFunctionTransposeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Eager composite context whose values may be arrays or references.
+    /// Eager array IR context whose values may be arrays or references.
     type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Builds a reference-free program representing the identity function over `r#type`.
@@ -3379,7 +3379,7 @@ mod tests {
         assert_eq!(reference.read(), Ok(expected_state));
     }
 
-    /// Tracer of the composite universe used by the plumbing-reference tests.
+    /// Tracer of the array IR universe used by the plumbing-reference tests.
     type ArrayIrTracer = DomainTracer<EagerArrayIrContext>;
 
     /// Error message of the forward-mode rejection of calls that have only reverse-mode rules.
@@ -3535,7 +3535,7 @@ mod tests {
     /// Tracer over which the rules of an [`IrDefinition`] are written.
     type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Multiplies two array IR tracers, whose composite values have no operator sugar.
+    /// Multiplies two array IR tracers, whose values have no operator sugar.
     fn ir_multiply(left: &IrTracer, right: &IrTracer) -> Result<IrTracer, ProgramError> {
         let operation = ArrayIrOperation::from(ArrayOperation::<Array>::Mul(MulOperation::new()));
         Ok(left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?.remove(0))
@@ -3654,8 +3654,8 @@ mod tests {
 
     /// Reference-capable operation family for the carrier tests that need caller-owned cotangent buffers or reference
     /// effects, which [`TestArrayOperation`] lacks. It hosts the reverse-mode carrier, which tests construct directly
-    /// as reverse-mode linearization would stage it, together with the ordinary composite operations that backward
-    /// rules emit, a region-carrying computation, and the production condition and linear call. It supports direct
+    /// as reverse-mode linearization would stage it, together with the ordinary array IR operations that backward rules
+    /// emit, a region-carrying computation, and the production condition and linear call. It supports direct
     /// transposition rather than differentiation.
     #[derive(Clone, Debug)]
     enum ReferenceTestOperation {
@@ -9657,7 +9657,7 @@ mod tests {
 
     #[test]
     fn test_custom_function_transpose_transposition_retained_rules_after_un_projection() {
-        /// Array-member carrier payload retaining a definition declared in the composite family.
+        /// Array-member carrier payload retaining a definition declared in the array IR family.
         #[derive(Clone, Debug)]
         struct MemberCarrier {
             /// Definition whose backward rule the converted carrier applies.
@@ -9706,7 +9706,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // This canonical conversion changes the stored value and type families as well as the operation payload. It
-        // carries an already composite-typed definition; it does not make a Rust closure family-polymorphic.
+        // carries a definition already typed over array IR values; it does not make a Rust closure family-polymorphic.
         let converted = member.into_unprojected::<ArrayIrValue<Array>, ReferenceTestOperation>().unwrap();
         let ReferenceTestOperation::CustomFunctionTranspose(operation) = converted.instructions()[0].operation() else {
             unreachable!()

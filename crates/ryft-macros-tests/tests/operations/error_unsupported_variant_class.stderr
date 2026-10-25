@@ -1,8 +1,8 @@
-error: invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected', 'mixed', and 'skip_from' are supported here
+error: invalid operation variant '#[ryft(...)]' attribute: 'family_member'; only 'projected', 'mixed', and 'skip_from' are supported here
   --> tests/operations/error_unsupported_variant_class.rs:13:12
    |
-13 |     #[ryft(composite_member(ArrayType))]
-   |            ^^^^^^^^^^^^^^^^
+13 |     #[ryft(family_member(ArrayType))]
+   |            ^^^^^^^^^^^^^
 
 error: invalid projected operation variant role 'replicated'; only 'structural' is supported here
   --> tests/operations/error_unsupported_variant_class.rs:16:33

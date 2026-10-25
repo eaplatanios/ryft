@@ -2899,7 +2899,7 @@ mod tests {
     #[test]
     fn test_rematerialize_differentiation_dynamic_batching_combined_policy() {
         // Mapping only x in f(x, w) = x sin(w) introduces a dynamic broadcast of the replicated scale. Its dimension
-        // input does not project into ArrayType, so a lifted composite policy must use its children's native policies.
+        // input does not project into ArrayType, so a lifted combined policy must use its children's native policies.
         let function =
             rematerialize(|inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * inputs[1].sin()?.tag("scale")?]))
                 .with_policy(SaveFromBothPolicies::new(DotsSavable, SaveOnlyTheseNames::new(["scale"])));

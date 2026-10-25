@@ -100,9 +100,9 @@ impl<T: Type> TagOperation<T> {
 impl<T: 'static + Type> TagOperation<T> {
     /// Returns the key of the [`TagOperation`] that `operation` holds, or [`None`] when it holds none. `operation` may
     /// belong to any family over the type universe `T`, and the tag is recognized either as a `TagOperation<T>` or, in
-    /// composite families such as [`ArrayIrOperation`] that hold array operations through their projected array member,
-    /// as a `TagOperation<ArrayType>`. This is how key-based consumers such as rematerialization policies recognize
-    /// tags without naming the family that holds them.
+    /// heterogeneous families such as [`ArrayIrOperation`] that hold array operations through their projected array
+    /// member, as a `TagOperation<ArrayType>`. This is how key-based consumers such as rematerialization policies
+    /// recognize tags without naming the family that holds them.
     pub fn key_of<O: OperationPayloadProjection + ?Sized>(operation: &O) -> Option<&str> {
         let tag = operation.project_payload(TypeId::of::<Self>()).and_then(|tag| tag.downcast_ref::<Self>());
         tag.map(Self::key).or_else(|| {
@@ -185,7 +185,7 @@ impl_differentiable_elementwise_operation! {
 impl<A: Value<Type = ArrayType>> From<TagOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: TagOperation<ArrayIrType>) -> Self {
-        // Composite programs tag array members with the corresponding array tag, so that consumers
+        // Array IR programs tag array members with the corresponding array tag, so that consumers
         // such as rematerialization find the key on array instructions in both universes.
         Self::Array(ArrayOperation::Tag(TagOperation::new(operation.key())))
     }
@@ -198,7 +198,7 @@ impl<A: Value<Type = ArrayType>> From<TagOperation<ArrayIrType>> for ArrayIrOper
 /// residuals, which rematerialization policies classify by key through the producing [`TagOperation`].
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 #[capability]
 pub trait Tag<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value unchanged while tagging it with `key`, and a [`ProgramError`] if the value's context fails
@@ -218,7 +218,7 @@ impl Tag for Array {
 impl<A: Value<Type = ArrayType> + Tag<ArrayType>> Tag<ArrayIrType> for ArrayIrValue<A> {
     #[inline]
     fn tag(self, key: &str) -> Result<Self, ProgramError> {
-        // A concrete composite value tags its array member, which carries itself through unchanged
+        // A concrete array IR value tags its array member, which carries itself through unchanged
         // like any concrete array.
         let input = ValueProjection::<ArrayType>::into_projected(self)?;
         Ok(Self::Array(input.tag(key)?))
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(operation.to_string(), "tag [key=residual]");
 
         // Keys are recognized in any family over the operation's universe, including through the projected array member
-        // of a composite family.
+        // of an array IR family.
         let tag = ArrayOperation::<Array>::from(operation.clone());
         assert_eq!(TagOperation::<ArrayType>::key_of(&tag), Some("residual"));
         assert_eq!(TagOperation::<ArrayIrType>::key_of(&ArrayIrOperation::<Array>::from(tag)), Some("residual"));
@@ -422,13 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_composite() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_tag_array_ir() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        // Composite tracers tag their array members with the array tag, and concrete composite values carry
-        // themselves through unchanged.
-        let (_, program) = CompositeContext::trace(
-            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].clone().tag("residual"),
+        // Array IR tracers tag their array members with the array tag, and concrete array IR values carry themselves
+        // through unchanged.
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| inputs[0].clone().tag("residual"),
             vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))],
         )
         .unwrap();

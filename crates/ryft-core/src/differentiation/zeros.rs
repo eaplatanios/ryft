@@ -34,8 +34,8 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// The protocol has three steps, executed by the differentiation machinery rather than by implementors:
 ///
 ///   1. **Declare:** A consumer that needs a concrete zero calls [`Self::zero_residual_types`] with the zero's type
-///      to learn its residual signature (e.g., one first-class dimension per distinct dynamic identity for a composite
-///      array type, and nothing for a static type).
+///      to learn its residual signature (e.g., one first-class dimension per distinct dynamic identity for an array IR
+///      type, and nothing for a static type).
 ///   2. **Capture:** While an extent source is in scope, [`Self::capture_zero_residuals`] stages reads into a program
 ///      builder and [`Self::capture_zero_residual_values`] obtains the corresponding values in a context. Forward
 ///      linearization retains these values only for concrete output tangents and reference allocation shapes.
@@ -48,7 +48,7 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///
 /// [`Self::materialize_zero_from_residual_sources`] performs these steps together from values already available to
 /// the consumer. A pullback supplies its retained primal leaf; region transposition may instead supply live sibling
-/// cotangents, known inputs, or first-class dimensions. Composite families can gather each required extent from a
+/// cotangents, known inputs, or first-class dimensions. Array IR families can gather each required extent from a
 /// different source, including for cotangent representations whose complete type differs from the primal type.
 ///
 /// # Who Implements It
@@ -59,8 +59,8 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// on the first source with exactly the requested type, so [`Self::requires_zero_source`] reports symbolic types even
 /// though they declare no residuals. Unexpected residuals are rejected rather than silently ignored. Eligible
 /// [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket implementation that captures runtime
-/// dimensions and assembles zeros with explicit extent inputs. This includes both the core composite family and its
-/// XLA backend counterpart; neither needs its own residual-protocol implementation.
+/// dimensions and assembles zeros with explicit extent inputs. This includes both the core array IR family and its XLA
+/// backend counterpart; neither needs its own residual-protocol implementation.
 ///
 /// Other type universes opt in explicitly. An input-free family can use an empty implementation when it already
 /// implements `OperationProvider<T, ZeroOperation<T>>`; a family requiring residuals overrides declaration, capture,
@@ -74,9 +74,8 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> {
     /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
     /// [`Self::capture_zero_residuals`] captures them and [`Self::zero_operation_with_residuals`] consumes them.
-    /// Input-free operation families use the empty default. The array-dimension composite family returns one
-    /// dimension type per _distinct_ dynamic identity of `r#type`, in first-occurrence order, so repeated axes share
-    /// one residual.
+    /// Input-free operation families use the empty default. The array IR family returns one dimension type per
+    /// _distinct_ dynamic identity of `r#type`, in first-occurrence order, so repeated axes share one residual.
     #[inline]
     fn zero_residual_types(_type: &T) -> Vec<T> {
         Vec::new()
@@ -255,7 +254,7 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
 /// declared order. A disagreement is a malformed provider implementation and is reported as a
 /// [`ProgramError::MalformedProgram`] before the residuals can construct a zero with incorrect runtime dimensions.
 ///
-/// For example, suppose `r#type` is `zero[n, n, m]` and `source` is the corresponding primal array. A composite array
+/// For example, suppose `r#type` is `zero[n, n, m]` and `source` is the corresponding primal array. An array IR
 /// provider declares one dimension residual per distinct dynamic identity, `[dimension(n), dimension(m)]`, and captures
 /// the runtime extents `[n, m]` from the first source axis carrying each identity. This helper validates those two
 /// captured values. Later, [`ResidualZeroProvider::zero_operation_with_residuals`] expands them into the per-axis

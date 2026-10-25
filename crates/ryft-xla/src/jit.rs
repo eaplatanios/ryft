@@ -101,7 +101,7 @@ use crate::{
     AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, XlaArray, XlaDomain, XlaOptions, XlaValue,
 };
 
-/// Composite tracer retained by the experimental stateful XLA program.
+/// Array IR tracer retained by the experimental stateful XLA program.
 ///
 /// # Stability
 ///
@@ -111,7 +111,7 @@ pub type XlaStatefulCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c
 /// Tracer leaf exposed by the public array-only XLA compilation facade.
 pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaStatefulCompileTracer<'c>>;
 
-/// Internal reparameterization of one public array parameter tree into the production composite type family.
+/// Internal reparameterization of one public array parameter tree into the production array IR type family.
 type XlaProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
 
 /// Internal value tree corresponding to one public array parameter tree.
@@ -133,7 +133,7 @@ type XlaStatefulTraceOutput<'c, P> = <P as Parameterized<ArrayIrType>>::To<XlaSt
 /// Fallible traced output of one heterogeneous stateful XLA closure.
 type XlaStatefulTraceResult<'c, P> = Result<XlaStatefulTraceOutput<'c, P>, XlaDomainError>;
 
-/// Projects one internal composite tracer tree to the public array-only tracer tree.
+/// Projects one internal array IR tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
     values: XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>,
 ) -> Result<P::To<XlaCompileTracer<'c>>, XlaDomainError>
@@ -153,7 +153,7 @@ where
         .map_err(Into::into)
 }
 
-/// Lifts one public array-only tracer tree back into the internal composite tracer tree.
+/// Lifts one public array-only tracer tree back into the internal array IR tracer tree.
 fn lift_tracers<'c, P>(
     values: P::To<XlaCompileTracer<'c>>,
 ) -> Result<XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>, XlaDomainError>
@@ -170,7 +170,7 @@ where
         .map_err(Into::into)
 }
 
-/// Lifts one public runtime array tree into the production composite value family.
+/// Lifts one public runtime array tree into the production array IR value family.
 fn lift_arrays<'c, P>(
     values: P::To<XlaArray<'c>>,
 ) -> Result<XlaProgramParameterValues<P, XlaStatefulValue<'c>>, XlaDomainError>
@@ -187,7 +187,7 @@ where
         .map_err(Into::into)
 }
 
-/// Projects one production composite output tree back to public runtime arrays.
+/// Projects one production array IR output tree back to public runtime arrays.
 fn project_arrays<'c, P>(
     values: XlaProgramParameterValues<P, XlaStatefulValue<'c>>,
 ) -> Result<P::To<XlaArray<'c>>, XlaDomainError>
@@ -223,7 +223,7 @@ pub struct JittedXlaFunction<
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
-    /// Composite-domain dispatcher hidden behind the public array projection boundary.
+    /// Array IR domain dispatcher hidden behind the public array projection boundary.
     function:
         CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
 }
@@ -262,7 +262,7 @@ where
         + ParameterizedFamily<XlaStatefulValue<'c>>
         + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
 {
-    /// Calls this dispatcher with public array inputs and projects its composite runtime outputs back to arrays.
+    /// Calls this dispatcher with public array inputs and projects its array IR runtime outputs back to arrays.
     pub fn call(
         &self,
         static_parameters: Static,
@@ -632,7 +632,7 @@ where
     In::Family: ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<XlaConstant>,
 {
-    /// Backend-neutral compiled function retaining the composite runtime boundary.
+    /// Backend-neutral compiled function retaining the array IR runtime boundary.
     function: CompiledFunction<XlaDomain<'c>, In, Out>,
 }
 
@@ -832,7 +832,7 @@ where
         Out::To::<ProjectedValue<ArrayType, V>>::from_parameters(output_structure, outputs).map_err(ProgramError::from)
     }
 
-    /// Consumes this facade and returns its composite staged artifact for crate-internal verification.
+    /// Consumes this facade and returns its array IR staged artifact for crate-internal verification.
     #[cfg(test)]
     pub(crate) fn into_inner(
         self,
@@ -1360,9 +1360,9 @@ where
     /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
     /// takes `(primals, tangents)` and returns `(primal_out, tangent_out)`.
     ///
-    /// The implementation stages a composite `jit_call` operation and lets its ordinary JVP rule build the tangent
+    /// The implementation stages an array IR `jit_call` operation and lets its ordinary JVP rule build the tangent
     /// call boundary. Public array tracers are projected only at this facade boundary; the transform itself runs over
-    /// the production composite program.
+    /// the production array IR program.
     ///
     /// The derived function is retained on this wrapper (shared across its clones): repeated calls with an
     /// interchangeable `domain` return the retained compiled function without repeating source reconstruction,
@@ -1471,18 +1471,18 @@ where
     /// every output leaf is materialized with the batched axis at position 0. The batched
     /// leading axis is replicated for now.
     ///
-    /// Composite compiled-function batching is not implemented. This method returns a precise unsupported-operation
+    /// Array IR compiled-function batching is not implemented. This method returns a precise unsupported-operation
     /// diagnostic instead of reinterpreting projected batching values.
     ///
     /// Homogeneous static-extent array regions already retain structurally batched programs through
-    /// `ryft_core::programs::transforms::Transform`. Composite XLA batching must additionally define how its live
+    /// `ryft_core::programs::transforms::Transform`. Array IR XLA batching must additionally define how its live
     /// first-class extent crosses the transformed boundary: only the extent's static type/identity contract belongs in
     /// the transform key, while the current extent value remains an explicit runtime operand. The axis name, mapped
-    /// sharding, normalized input axes, and output policy likewise complete that composite marker's structural key.
+    /// sharding, normalized input axes, and output policy likewise complete that array IR marker's structural key.
     ///
     /// # Limitation
     ///
-    /// Even once composite batching is available, a [`ShardMapOperation`](ryft_core::ShardMapOperation) batches mapped
+    /// Even once array IR batching is available, a [`ShardMapOperation`](ryft_core::ShardMapOperation) batches mapped
     /// inputs only for a static batch extent, because its batching rule turns the batch axis into a dimension of its
     /// static boundary types, so a runtime extent operand makes its mapped batching fail with
     /// [`ShardMapError::DynamicBatchExtentNotSupported`](ryft_core::ShardMapError::DynamicBatchExtentNotSupported).
@@ -1499,7 +1499,7 @@ where
     {
         let _ = (self, domain, axis_size);
         Err(ProgramError::UnsupportedOperation {
-            message: "compiled XLA batching does not support composite region boundaries".to_string(),
+            message: "compiled XLA batching does not support array IR region boundaries".to_string(),
         }
         .into())
     }
@@ -2959,10 +2959,10 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_value_and_gradient_with_captures_on_the_xla_domain() {
+    fn test_array_ir_value_and_gradient_with_captures_on_the_xla_domain() {
         use ryft_core::Add;
 
-        // Composite tracers dispatch `add` and `dot` through the array-IR capability universe without projecting to
+        // Array IR tracers dispatch `add` and `dot` through the array-IR capability universe without projecting to
         // arrays first, and the captured gradient of `f(x; c) = (x + c) · c` is `c`.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -6422,8 +6422,8 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_method_rejects_composite_region_boundaries() {
-        // Compiled-function batching reports its unsupported composite-region boundary directly.
+    fn test_batch_method_rejects_array_ir_region_boundaries() {
+        // Compiled-function batching reports its unsupported array IR region boundary directly.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -6438,10 +6438,10 @@ mod tests {
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), scalar_input_type, &engine, mesh.clone()).unwrap();
         let error = match inner.batch(&engine, 4) {
-            Ok(_) => panic!("compiled batching should reject unsupported composite region boundaries"),
+            Ok(_) => panic!("compiled batching should reject unsupported array IR region boundaries"),
             Err(error) => error,
         };
-        assert_eq!(error.to_string(), "compiled XLA batching does not support composite region boundaries");
+        assert_eq!(error.to_string(), "compiled XLA batching does not support array IR region boundaries");
     }
 
     #[test]

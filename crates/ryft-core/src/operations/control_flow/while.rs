@@ -128,7 +128,7 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
 /// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the
-/// shared implementation supports homogeneous array and composite array IR loops.
+/// shared implementation supports homogeneous array and array IR loops.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WhileOperation<T: Type> {
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
@@ -893,7 +893,7 @@ where
 //      *becomes* batched. Each pass instantiates the body outputs at the current state axes (mirroring JAX's
 //      `instantiate=carry_bat`), so the converged body is already aligned to the loop-invariant state layout, and
 //      widened parent inputs gain their batch axis through the driver. First-class dimension state stays replicated,
-//      because composite batching admits no mapped dimension values, and reference state keeps the batch axis that its
+//      because array IR batching admits no mapped dimension values, and reference state keeps the batch axis that its
 //      referent fixes.
 //   2. The condition is batched at the stabilized axes. When its predicate output stays *replicated*, one
 //      [`WhileOperation`] over the batched condition and body is bound into the parent directly, preserving any
@@ -1172,7 +1172,7 @@ where
 /// that the body forwards unchanged is the identity. [`WhileOperation::validate_application`] checks that invariance
 /// structurally (the body must return the carry's own input), so every path accepts the same loops, and
 /// [`ArrayIrValue`]'s [`mask_select`](WhilePredicate::mask_select) then returns such equal dimension carries unchanged.
-/// Structural composite batching relies on this relaxation to thread its loop-invariant mapped extent through
+/// Structural array IR batching relies on this relaxation to thread its loop-invariant mapped extent through
 /// batch-varying loops.
 ///
 /// The loop-carried state rule is otherwise identical for every type family: the condition and body consume the same
@@ -1654,10 +1654,10 @@ fn rotated_discharge_regions<V: Value, O: Operation<Type = V::Type>>(
 /// Array-backed storage semantics used by bounded `while` differentiation.
 ///
 /// A bounded loop stores each per-iteration residual in an ordinary leading-axis array stack. Homogeneous array
-/// programs use their residual type directly. Array IR programs additionally map first-class dimension
-/// residuals to checked scalar-array storage and restore them at the tangent-body boundary. Keeping this contract at
-/// the type-family boundary lets both operation families share the bounded-loop algorithm without making the generic
-/// control-flow rule inspect composite variants.
+/// programs use their residual type directly. Array IR programs additionally map first-class dimension residuals to
+/// checked scalar-array storage and restore them at the tangent-body boundary. Keeping this contract at the type-family
+/// boundary lets both operation families share the bounded-loop algorithm without making the generic control-flow rule
+/// inspect array IR variants.
 pub(crate) trait WhileResidualStackType:
     DifferentiableType + TemporalResidualType + WhileType + AsArrayType + From<ArrayType>
 {
@@ -2921,9 +2921,9 @@ impl WhilePredicate for Array {
     }
 }
 
-// Composite predicates delegate to their array payload. Under a batched predicate, equal dimension and reference
-// carries pass through unchanged; the eager `while` interpreter selects distinct reference carries wholesale under a
-// scalar predicate and rejects a batched predicate over them, since effectful state has no per-item value to mask.
+// Array IR predicates delegate to their array payload. Under a batched predicate, equal dimension and reference carries
+// pass through unchanged; the eager `while` interpreter selects distinct reference carries wholesale under a scalar
+// predicate and rejects a batched predicate over them, since effectful state has no per-item value to mask.
 impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValue<A> {
     fn any_true(&self) -> Result<bool, ProgramError> {
         match self {
@@ -3700,13 +3700,13 @@ mod tests {
             .unwrap()
     }
 
-    /// Composite array IR region program over the reference [`Array`] backend.
-    type CompositeRegionProgram =
+    /// Array IR region program over the reference [`Array`] backend.
+    type ArrayIrRegionProgram =
         Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>;
 
-    /// Builds the composite per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar `f64` array state
+    /// Builds the array IR per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar `f64` array state
     /// element, returning its condition and body programs in `while` region order.
-    fn composite_countdown_while_regions() -> Vec<CompositeRegionProgram> {
+    fn array_ir_countdown_while_regions() -> Vec<ArrayIrRegionProgram> {
         let scalar_f64 = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let mut condition_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
@@ -3763,7 +3763,7 @@ mod tests {
         vec![condition, body]
     }
 
-    /// Builds the composite loop `while (x < 8) { (extent, x) = (extent, x + x) }` over a forwarded first-class
+    /// Builds the array IR loop `while (x < 8) { (extent, x) = (extent, x + x) }` over a forwarded first-class
     /// dimension of type `extent_type` and one scalar `f64` array state element, returning its condition and body
     /// programs in `while` region order.
     fn doubling_while_regions(
@@ -4066,7 +4066,7 @@ mod tests {
             )),
         );
 
-        // Composite operation families validate the same contract through their derived and kernel dispatch.
+        // Array IR operation families validate the same contract through their derived and kernel dispatch.
         let regions = regions.map(|region| region.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
         let interfaces = regions.each_ref().map(Program::interface);
         assert_eq!(TestIrOperation::While(WhileOperation::new()).validate_region_interfaces(&interfaces), expected);
@@ -4232,8 +4232,8 @@ mod tests {
     }
 
     #[test]
-    fn test_while_type_inference_composite_state() {
-        // A loop over composite state, a first-class dimension carry and an array sized by it, infers its state types
+    fn test_while_type_inference_array_ir_state() {
+        // A loop over array IR state, a first-class dimension carry and an array sized by it, infers its state types
         // under a scalar predicate.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
@@ -7349,7 +7349,7 @@ mod tests {
 
     #[test]
     fn test_while_partial_evaluation_folds_loop_invariant_known_array_state() {
-        // Composite loops fold loop-invariant known array state exactly as homogeneous loops do, while a known
+        // Array IR loops fold loop-invariant known array state exactly as homogeneous loops do, while a known
         // first-class dimension keeps flowing through the loop because its state input already defines its identity.
         // Body `[extent, counter, accumulator, factor] -> [extent, counter - 1, accumulator + factor * factor, factor]`
         // over a known extent and a known `factor`.
@@ -8907,15 +8907,15 @@ mod tests {
     }
 
     #[test]
-    fn test_while_batching_reuses_naturally_aligned_batch_varying_composite_programs() {
-        // The composite rule batches the condition with natural output axes to detect per-item termination and
-        // rebuilds both regions only when that widening changes the invariant boundary: with every array carry already
-        // mapped at axis 0 and a predicate that naturally landed on axis 0, the rebuilds would replay the exact same
-        // programs, so the discovery body and condition are kept and batching the per-item countdown loop performs one
-        // structural pass per region.
+    fn test_while_batching_reuses_naturally_aligned_batch_varying_array_ir_programs() {
+        // The array IR rule batches the condition with natural output axes to detect per-item termination and rebuilds
+        // both regions only when that widening changes the invariant boundary: with every array carry already mapped at
+        // axis 0 and a predicate that naturally landed on axis 0, the rebuilds would replay the exact same programs, so
+        // the discovery body and condition are kept and batching the per-item countdown loop performs one structural
+        // pass per region.
         type EagerParent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let countdown_regions = composite_countdown_while_regions();
+        let countdown_regions = array_ir_countdown_while_regions();
 
         // Batching batch items [3, 1, 2] under an eager parent performs exactly one structural pass per region (the
         // fixed-point discovery body and the natural condition) and interprets the loop with its masked per-item
@@ -8975,8 +8975,8 @@ mod tests {
     }
 
     #[test]
-    fn test_while_batching_stages_batched_predicate_composite_loops_under_tracing() {
-        // Composite batching of a batch-varying `while` loop stages under tracing. The rule threads the loop-invariant
+    fn test_while_batching_stages_batched_predicate_array_ir_loops_under_tracing() {
+        // Array IR batching of a batch-varying `while` loop stages under tracing. The rule threads the loop-invariant
         // mapped extent as leading loop state next to the batched `bool[batch]` predicate, which the type contract
         // accepts because the body passes that dimension carry through unchanged, and interpreting the staged loop
         // exercises the masked eager path over that carry.
@@ -8993,7 +8993,7 @@ mod tests {
         let outputs = context
             .bind(
                 ArrayIrOperation::While(WhileOperation::new()),
-                composite_countdown_while_regions(),
+                array_ir_countdown_while_regions(),
                 &[BatchingTracer::new(context.clone(), ArrayIrBatch::new(state, BatchAxis::new(0)).unwrap())],
             )
             .unwrap();
@@ -9014,7 +9014,7 @@ mod tests {
             )
             .unwrap();
         let [r#while] = program.entry_region().instructions() else {
-            panic!("composite while batching should stage exactly one instruction");
+            panic!("array IR while batching should stage exactly one instruction");
         };
         assert_eq!(r#while.inputs(), &[input_ids[0], input_ids[1]]);
         assert_eq!(
@@ -9117,8 +9117,8 @@ mod tests {
     }
 
     #[test]
-    fn test_while_batching_preserves_a_replicated_predicate_prefix_of_composite_state() {
-        // Composite batching with a threaded extent preserves a replicated predicate prefix exactly as array batching
+    fn test_while_batching_preserves_a_replicated_predicate_prefix_of_array_ir_state() {
+        // Array IR batching with a threaded extent preserves a replicated predicate prefix exactly as array batching
         // does: the mapped axis lands after the `[true, false]` prefix, so the first state item doubles twice for every
         // batch item and the second never does.
         let state_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2]));
@@ -12127,8 +12127,8 @@ mod tests {
     }
 
     #[test]
-    fn test_while_differentiation_pulls_back_composite_loops_with_batched_predicates() {
-        // Reverse mode runs through a bounded composite loop with a batched predicate:
+    fn test_while_differentiation_pulls_back_array_ir_loops_with_batched_predicates() {
+        // Reverse mode runs through a bounded array IR loop with a batched predicate:
         // `while (x < [2, 4, 8], iteration_bound = 4) { x = x + x }` from `[1, 1, 1]` doubles item `i` exactly `i + 1`
         // times before its own predicate turns false, so the primal is `[2, 4, 8]` and the pullback scales a unit
         // cotangent by the matching per-item factors `[2, 4, 8]`.
@@ -13499,7 +13499,7 @@ mod tests {
             )),
         );
 
-        // A composite predicate must be a Boolean array member, so a first-class dimension or a reference predicate is
+        // An array IR predicate must be a Boolean array member, so a first-class dimension or a reference predicate is
         // rejected, and the prefix requirement applies to the array state members only.
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(3)));
         let state_types = vec![dimension_type.clone(), ArrayType::new_static(DataType::F32, [2]).into()];
@@ -13537,7 +13537,7 @@ mod tests {
     #[test]
     fn test_while_type_is_loop_invariant_state() {
         // Only a first-class dimension has no per-item value to mask. Array state is maskable, and reference state is
-        // rejected under a batched predicate by its own rule (refer to `test_while_type_inference_composite_state`).
+        // rejected under a batched predicate by its own rule (refer to `test_while_type_inference_array_ir_state`).
         let scalar_type = ArrayType::scalar(DataType::F32);
         assert!(!ArrayType::is_loop_invariant_state(&scalar_type));
         assert!(!ArrayIrType::is_loop_invariant_state(&scalar_type.clone().into()));
@@ -13564,7 +13564,7 @@ mod tests {
             }),
         );
 
-        // Composite predicates delegate to their array payload and reject dimension and reference predicates.
+        // Array IR predicates delegate to their array payload and reject dimension and reference predicates.
         assert_eq!(ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap()).any_true(), Ok(true));
         assert_eq!(
             ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap()).any_true(),
@@ -13656,7 +13656,7 @@ mod tests {
         assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
         assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
 
-        // Composite array carries delegate to the array payload.
+        // Array members of array IR carries delegate to the array payload.
         let scalar_true = ArrayIrValue::Array(Array::scalar(true).unwrap());
         let scalar_false = ArrayIrValue::Array(Array::scalar(false).unwrap());
         let batched = ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap());

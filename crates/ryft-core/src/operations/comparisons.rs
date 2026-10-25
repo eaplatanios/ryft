@@ -428,9 +428,9 @@ impl<O: Operation<Type = ArrayType> + From<CompareOperation<ArrayType>>>
     }
 }
 
-// Composite operation families select the comparison by member kind. Array pairs compare through the homogeneous array
+// Array IR operation families select the comparison by member kind. Array pairs compare through the homogeneous array
 // member, which owns promotion, broadcasting, and manual-axis variation, while first-class dimension pairs keep the
-// native composite comparison, whose transform rules prove dimension predicates. Mixed pairs have no comparison.
+// native array IR comparison, whose transform rules prove dimension predicates. Mixed pairs have no comparison.
 impl<
     O: Operation<Type = ArrayIrType>
         + From<CompareOperation<ArrayIrType>>
@@ -470,7 +470,7 @@ impl<
 /// an array output when the input type, such as [`DimensionValue`], cannot represent Boolean data.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -614,8 +614,8 @@ where
     DimensionValue: Compare<A>,
 {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
-        // A concrete composite value compares array pairs through its array members and first-class dimension pairs
-        // through their extents, matching the member-kind selection of the composite operation provider above.
+        // A concrete array IR value compares array pairs through its array members and first-class dimension pairs
+        // through their extents, matching the member-kind selection of the array IR operation provider above.
         match (self, other) {
             (Self::Array(left), Self::Array(right)) => Ok(Self::Array(left.compare(right, direction)?)),
             (Self::Dimension(left), Self::Dimension(right)) => {
@@ -669,7 +669,7 @@ impl<
 }
 
 // Any context-carrying value compares by binding the comparison that its operation family provides for the aligned
-// input types, so that composite families can select a member operation (see the composite provider above).
+// input types, so that heterogeneous families can select a member operation (see the array IR provider above).
 impl<
     T: Type,
     V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain = C> + ManualVariationAlignment<T>,
@@ -1529,12 +1529,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_for_composite_tracer() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    fn test_compare_for_array_ir_tracer() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         // Array pairs stage the homogeneous comparison as an array-member instruction, whose interpretation and
         // batching reuse the array rules.
-        let (_, program) = CompositeContext::trace(
+        let (_, program) = ArrayIrContext::trace(
             |(left, right): (_, _)| left.less_than(&right),
             (
                 ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
@@ -1572,11 +1572,11 @@ mod tests {
             Ok(ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap())),
         );
 
-        // Dimension pairs keep the native composite comparison, and mixed pairs are rejected while staging.
+        // Dimension pairs keep the native array IR comparison, and mixed pairs are rejected while staging.
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
-        let (_, program) = CompositeContext::trace(
+        let (_, program) = ArrayIrContext::trace(
             |(left, right): (_, _)| left.less_than(&right),
             (ArrayIrType::from(left_type.clone()), ArrayIrType::from(right_type)),
         )
@@ -1591,7 +1591,7 @@ mod tests {
         );
         assert!(matches!(program.instructions()[0].operation(), ArrayIrOperation::Compare(_)));
         assert_eq!(
-            CompositeContext::trace(
+            ArrayIrContext::trace(
                 |(left, right): (_, _)| left.less_than(&right),
                 (ArrayIrType::Array(ArrayType::scalar(DataType::F32)), ArrayIrType::from(left_type)),
             )

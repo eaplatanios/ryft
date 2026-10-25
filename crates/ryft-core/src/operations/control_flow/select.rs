@@ -405,8 +405,8 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
     #[inline]
     fn from(_: SelectOperation<ArrayIrType>) -> Self {
         // A `select` reads its complete output shape, including every runtime extent, from its inputs, and so the
-        // homogeneous array member already expresses the dynamic case and the composite family needs no mixed encoding
-        // for it. This conversion lets composite-typed values stage `select` through the shared `Select` blanket
+        // homogeneous array member already expresses the dynamic case and the array IR family needs no mixed encoding
+        // for it. This conversion lets array IR values stage `select` through the shared `Select` blanket
         // implementation. Projecting the member rejects first-class dimension and reference inputs.
         Self::Array(ArrayOperation::Select(SelectOperation::new()))
     }
@@ -427,7 +427,7 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// batching semantics.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///

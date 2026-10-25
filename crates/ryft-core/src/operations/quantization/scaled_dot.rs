@@ -312,7 +312,7 @@ crate::impl_non_transposable_operation!(ScaledDotOperation);
 ///
 /// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
 /// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
-/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+/// and array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes `(self * lhs_scale) · (rhs * rhs_scale)` using a generalized dot contraction. Each absent scale is
@@ -660,8 +660,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scaled_dot_composite() {
-        // Concrete composite values contract their array members, including their optional scales.
+    fn test_scaled_dot_array_ir() {
+        // Concrete array IR values contract their array members, including their optional scales.
         let lhs = Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let rhs = Array::matrix(2, 2, vec![5.0f32, 6.0, 7.0, 8.0]).unwrap();
         let expected = lhs.scaled_dot(&rhs, None, None, None, Some(DataType::F32)).unwrap();

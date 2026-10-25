@@ -304,7 +304,7 @@ mod tests {
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{
-        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder,
+        FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder,
     };
     use crate::operations::sharding::shard_map::to_mlir_module;
     use crate::tests::{execution_client, values_to_bytes};
@@ -327,7 +327,7 @@ mod tests {
     /// physical capacity at six elements, so only a runtime extent of six passes the element-count assertion.
     fn static_input_dynamic_output_reshape_program() -> FlatXlaProgram {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7)).unwrap());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [6]).into());
         let extent = builder.add_input(DimensionType::from(rows).into());
         let output = builder
@@ -345,7 +345,7 @@ mod tests {
         for static_output in [false, true] {
             let input_type = ArrayType::new(DataType::I64, Shape::new(vec![dynamic_dimension("input", Some(5))]));
             let size_type = ArrayType::scalar(DataType::I64);
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let size = builder.add_input(size_type.clone().into());
             let dimension_type = if static_output {
@@ -481,7 +481,7 @@ mod tests {
     fn test_lower_reshape_physical_capacities() {
         let input_type = ArrayType::new_static(DataType::F32, [4]);
         let dimension_type = DimensionType::new("columns", DimensionBounds::new(0, Some(4)).unwrap());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let rows = builder
             .add_instruction(

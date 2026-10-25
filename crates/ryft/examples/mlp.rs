@@ -1,17 +1,15 @@
 //! Trains a small multi-layer perceptron with reverse-mode automatic differentiation.
 //!
 //! The model, its loss, and its training loop are written once over [`ArrayOperations`], which both homogeneous array
-//! values and composite array IR values implement. The default runner uses the transparent `ryft-core` reference
-//! array backend, and the `core-ir` runner trains the same model over composite array IR values with reference array
-//! members:
+//! values and array IR values implement. The default runner uses the transparent `ryft-core` reference array backend,
+//! and the `core-ir` runner trains the same model over array IR values with reference array members:
 //!
 //! ```sh
 //! cargo run -p ryft --no-default-features --example mlp
 //! cargo run -p ryft --no-default-features --example mlp -- core-ir
 //! ```
 //!
-//! Enabling `xla` adds XLA runners over XLA arrays (`xla`) and over composite array IR values with XLA array members
-//! (`xla-ir`):
+//! Enabling `xla` adds XLA runners over XLA arrays (`xla`) and over array IR values with XLA array members (`xla-ir`):
 //!
 //! ```sh
 //! cargo run -p ryft --features xla --example mlp -- xla
@@ -28,7 +26,7 @@
 //! Replace `cuda-13` with `cuda-12` to use the CUDA 12 plugin. All runners optimize the same two-layer MLP and XOR
 //! dataset. The differentiated closure takes only the model as its active argument; the dataset and loss scale are
 //! supplied separately as nondifferentiated runtime captures. The `parity` argument runs every available runner and
-//! checks that each composite runner matches its homogeneous counterpart at every step:
+//! checks that each array IR runner matches its homogeneous counterpart at every step:
 //!
 //! ```sh
 //! cargo run -p ryft --features xla --example mlp -- parity
@@ -143,7 +141,7 @@ struct Training {
 
 /// Trains an MLP in `context` using a backend adapter only for host value materialization, and checks that every loss
 /// and prediction is finite and that the final loss is below `1e-3` and below 10% of the initial loss. The context is
-/// explicit because composite values whose array members need session state (e.g., XLA arrays) cannot recover a
+/// explicit because array IR values whose array members need session state (e.g., XLA arrays) cannot recover a
 /// session-backed execution domain from every leaf (e.g., from a first-class dimension), and so free transforms do not
 /// serve them.
 fn train<A, C, ReadValues>(
@@ -191,35 +189,33 @@ where
     Ok(Training { losses, predictions })
 }
 
-/// Checks that a composite runner matches its homogeneous counterpart at every step and on every prediction, using
+/// Checks that an array IR runner matches its homogeneous counterpart at every step and on every prediction, using
 /// `|a - b| <= atol + rtol * max(|a|, |b|)` with `atol = 1e-6` and `rtol = 1e-5` for losses and `atol = 1e-4` and
 /// `rtol = 1e-4` for predictions.
 fn check_parity(
-    composite_backend: &str,
-    composite: &Training,
+    array_ir_backend: &str,
+    array_ir: &Training,
     homogeneous_backend: &str,
     homogeneous: &Training,
 ) -> ExampleResult<()> {
     let pairs = [
-        ("loss", &composite.losses, &homogeneous.losses, 1e-6, 1e-5),
-        ("prediction", &composite.predictions, &homogeneous.predictions, 1e-4, 1e-4),
+        ("loss", &array_ir.losses, &homogeneous.losses, 1e-6, 1e-5),
+        ("prediction", &array_ir.predictions, &homogeneous.predictions, 1e-4, 1e-4),
     ];
-    for (kind, composite_values, homogeneous_values, absolute_tolerance, relative_tolerance) in pairs {
-        if composite_values.len() != homogeneous_values.len() {
-            return Err(
-                format!("`{composite_backend}` and `{homogeneous_backend}` have different {kind} counts").into()
-            );
+    for (kind, array_ir_values, homogeneous_values, absolute_tolerance, relative_tolerance) in pairs {
+        if array_ir_values.len() != homogeneous_values.len() {
+            return Err(format!("`{array_ir_backend}` and `{homogeneous_backend}` have different {kind} counts").into());
         }
-        for (index, (&left, &right)) in composite_values.iter().zip(homogeneous_values).enumerate() {
+        for (index, (&left, &right)) in array_ir_values.iter().zip(homogeneous_values).enumerate() {
             if (left - right).abs() > absolute_tolerance + relative_tolerance * left.abs().max(right.abs()) {
                 return Err(format!(
-                    "{kind} {index} of `{composite_backend}` ({left}) differs from `{homogeneous_backend}` ({right})"
+                    "{kind} {index} of `{array_ir_backend}` ({left}) differs from `{homogeneous_backend}` ({right})"
                 )
                 .into());
             }
         }
     }
-    println!("`{composite_backend}` matches `{homogeneous_backend}`");
+    println!("`{array_ir_backend}` matches `{homogeneous_backend}`");
     Ok(())
 }
 
@@ -242,7 +238,7 @@ fn target_values() -> Vec<f32> {
 }
 
 /// Runs MLP training with the `ryft-core` reference CPU array backend in `context`, over arrays lifted into the value
-/// family `A` by `lift` (e.g., composite array IR values) and read back to the host by `read_values`.
+/// family `A` by `lift` (e.g., array IR values) and read back to the host by `read_values`.
 fn run_core<A, C, ReadValues>(
     backend: &str,
     context: &C,
@@ -277,7 +273,7 @@ fn run_core_arrays() -> ExampleResult<Training> {
     run_core("core", &EagerContext::<Array, ArrayOperation<Array>>::new(), |array| array, |array| Ok(array.to_f64s()))
 }
 
-/// Runs MLP training with the `ryft-core` reference CPU array backend over composite array IR values.
+/// Runs MLP training with the `ryft-core` reference CPU array backend over array IR values.
 fn run_core_ir() -> ExampleResult<Training> {
     let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
     run_core("core-ir", &context, ArrayIrValue::Array, |value| match value {
@@ -388,9 +384,9 @@ mod xla_backend {
         Ok((load_cpu_plugin()?, ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
     }
 
-    /// Runs MLP training through XLA on the selected PJRT platform, over XLA arrays or, if `composite` is set, over
-    /// composite array IR values with XLA array members.
-    pub(super) fn run(composite: bool) -> ExampleResult<Training> {
+    /// Runs MLP training through XLA on the selected PJRT platform, over XLA arrays or, if `array_ir` is set, over
+    /// array IR values with XLA array members.
+    pub(super) fn run(array_ir: bool) -> ExampleResult<Training> {
         let (plugin, client_options) = load_xla_plugin()?;
         let client = plugin.client(client_options)?;
         println!("XLA platform: {}", client.platform_name()?);
@@ -419,7 +415,7 @@ mod xla_backend {
         let targets = array(&domain, &mesh, &[4, 1], &target_values())?;
         let learning_rate = array(&domain, &mesh, &[], &[0.1])?;
         let mean_scale = array(&domain, &mesh, &[], &[0.25])?;
-        if !composite {
+        if !array_ir {
             return super::train(
                 "xla",
                 &ProjectedContext::new(domain.clone()),
@@ -432,7 +428,7 @@ mod xla_backend {
             );
         }
 
-        // Composite values over XLA arrays train in the session-backed composite domain itself.
+        // Array IR values over XLA arrays train in the session-backed array IR domain itself.
         super::train(
             "xla-ir",
             &domain,

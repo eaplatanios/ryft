@@ -244,15 +244,15 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 
 /// Reads the runtime extent of one array axis.
 ///
-/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation
-/// is selected by `Output` (e.g., a materialized array backend can return its host extent, while a composite program
-/// value returns a dimension value that can be passed explicitly to shape-carrying operations and combined with other
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
+/// selected by `Output` (e.g., a materialized array backend can return its host extent, while an array IR program value
+/// returns a dimension value that can be passed explicitly to shape-carrying operations and combined with other
 /// dimension operations). A program output is not an integer array; convert it to ordinary scalar data explicitly when
 /// a numerical computation needs the extent as data.
 ///
-/// In a composite trace, the capability works both on the outer array member and on a
-/// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
-/// an array operation output to feed shape computation without exposing an adapter conversion in user code.
+/// In an array IR trace, the capability works both on the outer array member and on a [`ProjectedValue<ArrayType, V>`].
+/// The projected form stages into and returns the parent array IR carrier, allowing an array operation output to feed
+/// shape computation without exposing an adapter conversion in user code.
 ///
 /// Negative axes index from the final array axis. The representation of the output depends on whether the type
 /// already pins the extent. A dynamic selected axis stages a [`DimensionSizeOperation`] read that preserves the
@@ -264,8 +264,8 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// During batching, each item shares the array axis extent, so the resulting dimension remains replicated.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
-/// composite array IR values implement it for [`ArrayIrType`].
+/// values (including the projected array members of array IR values) implement this capability for [`ArrayType`] and
+/// array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -356,8 +356,8 @@ impl<
 > DimensionSize<V, ArrayType> for ProjectedValue<ArrayType, V>
 {
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
-        // The projected view stages into and returns the parent composite carrier,
-        // folding static axes exactly like the composite implementation above.
+        // The projected view stages into and returns the parent array IR carrier, folding static axes exactly like the
+        // array IR implementation above.
         let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
         if let Dimension::Static(extent) = operation.input_dimension() {
             return self.value().domain().dimension_constant(*extent);

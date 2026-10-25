@@ -111,7 +111,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     ///     and concrete values of downstream backend crates that execute eagerly (e.g., the XLA backend's arrays)
     ///     bind every capability into their backend's domain, which executes it op by op. Such backend values must
     ///     carry the state that their domain requires in every member and in every projected representation (e.g.,
-    ///     the XLA backend's composite values carry their session in their array, dimension, and reference members),
+    ///     the XLA backend's array IR values carry their session in their array, dimension, and reference members),
     ///     because [`ValueProjection::from_projected`] is infallible and receives no state.
     ///   - **Direct Implementations (i.e., [`ValueDirectDispatch`]):** Concrete values that implement
     ///     capabilities directly (e.g., [`Array`](crate::Array), [`ArrayIrValue`](crate::ArrayIrValue), and
@@ -311,14 +311,14 @@ impl<V: Value<Type = ArrayIrType> + Concretizable<bool>> Concretizable<bool> for
     }
 }
 
-/// Provides checked access to one member kind of a composite [`Value`]. Some program families store several kinds of
-/// values in one [`Value`] type so that all of them can flow through the same [`Program`](crate::Program). For example,
-/// [`ArrayIrValue`](crate::ArrayIrValue) may be a backend array, a first-class runtime dimension, or an array
+/// Provides checked access to one member kind of a heterogeneous [`Value`]. Some program families store several kinds
+/// of values in one [`Value`] type so that all of them can flow through the same [`Program`](crate::Program). For
+/// example, [`ArrayIrValue`](crate::ArrayIrValue) may be a backend array, a first-class runtime dimension, or an array
 /// reference, mirroring the three member types of [`ArrayIrType`]. Most operations and transform rules, however,
 /// are written against exactly one member kind (e.g., array-only rules consume values with `Value<Type = ArrayType>`),
-/// and `ValueProjection<T>` is what lets them accept a composite value. [`Self::projected`] returns a read-only view
-/// of the value as its `T`-typed member, [`Self::into_projected`] consumes the value and returns an owned member
-/// representation, and [`Self::from_projected`] embeds a member representation back into the composite value type.
+/// and `ValueProjection<T>` is what lets them accept a heterogeneous value. [`Self::projected`] returns a read-only
+/// view of the value as its `T`-typed member, [`Self::into_projected`] consumes the value and returns an owned member
+/// representation, and [`Self::from_projected`] embeds a member representation back into the heterogeneous value type.
 /// Both projection methods fail with a [`TypeError`] when the value holds a different member kind than the requested
 /// one. The associated representations depend on how a value relates to its member:
 ///
@@ -340,7 +340,7 @@ pub trait ValueProjection<T: Type>: Value {
         Self: 'v,
         T: 'v;
 
-    /// Embeds an owned `T`-typed member representation back into this composite [`Value`] type.
+    /// Embeds an owned `T`-typed member representation back into this heterogeneous [`Value`] type.
     fn from_projected(value: Self::Projected) -> Self;
 
     /// Returns a read-only view of this [`Value`] as its `T`-typed member, without cloning any member payload.
@@ -354,20 +354,20 @@ pub trait ValueProjection<T: Type>: Value {
     fn into_projected(self) -> Result<Self::Projected, TypeError>;
 }
 
-/// Extension trait applying [`ValueProjection`] to a whole [`Parameterized`] tree at a boundary, rather than value by
-/// value. Code that receives a tree of composite values (e.g., a model, a batch of inputs, a tuple of intermediates)
-/// projects it once with [`project_parameters`](Self::project_parameters), computes with ordinary member capabilities,
-/// and lifts the result back with [`lift_parameters`](Self::lift_parameters). Both directions preserve the tree's
-/// structure exactly, and projection fails with the member-kind [`TypeError`] as soon as any leaf holds a different
-/// member kind.
+/// Extension trait applying [`ValueProjection`] to a whole [`Parameterized`] tree at a boundary, rather than
+/// value by value. Code that receives a tree of heterogeneous values (e.g., a model, a batch of inputs, a tuple of
+/// intermediates) projects it once with [`project_parameters`](Self::project_parameters), computes with ordinary member
+/// capabilities, and lifts the result back with [`lift_parameters`](Self::lift_parameters). Both directions preserve
+/// the tree's structure exactly, and projection fails with the member-kind [`TypeError`] as soon as any leaf holds a
+/// different member kind.
 ///
 /// This trait is blanket-implemented for every [`Parameterized`] tree and has no items of its own to implement. Its
-/// parameter `P` is the tree's leaf type, which plays a different role in each direction: it is the composite [`Value`]
-/// being projected for [`project_parameters`](Self::project_parameters), and the member representation being lifted for
-/// [`lift_parameters`](Self::lift_parameters). Each method's `where` clause carries the remaining requirements, so
-/// whether a particular direction is available for a particular tree is decided per method at the call site. The
-/// member [`Type`] is a method-level parameter, which keeps each call site down to a single turbofish: the projected
-/// member type for one direction and the composite value type for the other.
+/// parameter `P` is the tree's leaf type, which plays a different role in each direction: it is the heterogeneous
+/// [`Value`] being projected for [`project_parameters`](Self::project_parameters), and the member representation being
+/// lifted for [`lift_parameters`](Self::lift_parameters). Each method's `where` clause carries the remaining
+/// requirements, so whether a particular direction is available for a particular tree is decided per method at the call
+/// site. The member [`Type`] is a method-level parameter, which keeps each call site down to a single turbofish: the
+/// projected member type for one direction and the heterogeneous value type for the other.
 ///
 /// # Examples
 ///
@@ -384,7 +384,7 @@ pub trait ValueProjection<T: Type>: Value {
 /// # }
 /// ```
 pub trait ParameterProjection<P: Parameter>: Parameterized<P> {
-    /// Projects every composite value [`Parameter`] of this [`Parameterized`] instance onto its `T`-typed member,
+    /// Projects every heterogeneous value [`Parameter`] of this [`Parameterized`] instance onto its `T`-typed member,
     /// preserving the [`Parameterized`] structure. This corresponds to [`ValueProjection::into_projected`] applied to
     /// every parameter, and it fails with that method's member-kind [`TypeError`] as soon as any parameter holds a
     /// different member kind.
@@ -399,11 +399,11 @@ pub trait ParameterProjection<P: Parameter>: Parameterized<P> {
         Ok(Self::To::<P::Projected>::from_parameters(structure, parameters)?)
     }
 
-    /// Lifts every member representation [`Parameter`] of this [`Parameterized`] instance back into the
-    /// composite value type `V`, preserving the [`Parameterized`] structure. This function is the inverse
-    /// of [`project_parameters`](Self::project_parameters) and is infallible per parameter, since
+    /// Lifts every member representation [`Parameter`] of this [`Parameterized`] instance back into the heterogeneous
+    /// value type `V`, preserving the [`Parameterized`] structure. This function is the inverse of
+    /// [`project_parameters`](Self::project_parameters) and is infallible per parameter, since
     /// [`ValueProjection::from_projected`] always accepts a member representation. The member [`Type`] is recovered
-    /// from the parameters themselves (i.e., `P::Type`), so only the composite value type has to be named.
+    /// from the parameters themselves (i.e., `P::Type`), so only the heterogeneous value type has to be named.
     fn lift_parameters<V: ValueProjection<P::Type, Projected = P>>(self) -> Result<Self::To<V>, ProgramError>
     where
         P: Typed,
@@ -417,19 +417,19 @@ pub trait ParameterProjection<P: Parameter>: Parameterized<P> {
 
 impl<P: Parameter, Values: Parameterized<P>> ParameterProjection<P> for Values {}
 
-/// A [`Value`] whose reported [`Type`] has been narrowed to one member kind of its composite type, as returned by
+/// A [`Value`] whose reported [`Type`] has been narrowed to one member kind of its heterogeneous type, as returned by
 /// [`ValueProjection::projected`] and [`ValueProjection::into_projected`]. This wrapper exists for values that refer
 /// to a program rather than containing a member payload, such as a [`Tracer`] naming a Single Static Assignment (SSA)
 /// [`Atom`](crate::Atom) or a [`PartialTracer`] carrying known/unknown state. Such a value cannot be split into its
 /// member the way an enum of payloads can, so projecting it keeps the value intact (i.e., preserving the program
 /// identity it carries) and pairs it with the member type it was validated against. [`Typed`] consequently reports
-/// that member type rather than the value's original composite type. The wrapped value is owned for
+/// that member type rather than the value's original heterogeneous type. The wrapped value is owned for
 /// [`ValueProjection::Projected`] and borrowed (i.e., `ProjectedValue<T, &V>`) for [`ValueProjection::ProjectedRef`],
 /// so one type covers both the owned and the read-only projection.
 ///
 /// The projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch.
 /// [`ProjectedContext`] provides that behavior through this type's blanket [`Value`] implementation whenever the
-/// surrounding composite domains expose the corresponding [`OperationProjection`].
+/// surrounding heterogeneous domains expose the corresponding [`OperationProjection`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ProjectedValue<T: Type, V> {
     /// Original value, kept intact so the program identity it carries is preserved.
@@ -532,7 +532,7 @@ pub trait LiteralIdentity {
 /// Renames a value's type-identity metadata by _rejection_ meaning that identity renamings and renamings that leave
 /// the value's [`Type`] unchanged clone the value, while identity-changing renamings fail because the value has no
 /// value-specific reconstruction. This one helper backs the [`Value::rename_type_identities`] default implementation
-/// and composite member arms that deliberately keep the same semantics (e.g., eager references, whose shared
+/// and array IR member arms that deliberately keep the same semantics (e.g., eager references, whose shared
 /// state must not be renamed through one alias), so the rejection policy and diagnostic have exactly one home.
 pub(crate) fn rename_type_identities_by_rejection<V: Typed + Clone>(
     value: &V,
@@ -622,9 +622,9 @@ mod tests {
 
     #[test]
     fn test_parameter_projection() {
-        // A handwritten composite boundary projects its whole parameter tree once, computes with ordinary array
+        // A handwritten array IR boundary projects its whole parameter tree once, computes with ordinary array
         // capabilities, and lifts the result back. The following example uses the Multi-Layer Perceptron (MLP) shape
-        // where a model tree of weights and biases enters as composite values, and the layer arithmetic is homogeneous
+        // where a model tree of weights and biases enters as array IR values, and the layer arithmetic is homogeneous
         // array math.
         let model = (
             ArrayIrValue::<Array>::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),

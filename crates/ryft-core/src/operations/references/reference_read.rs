@@ -433,8 +433,8 @@ impl<
         Tracer<TracingContext<V, Self>>: ReferenceAddUpdate<Transform>,
         TracingContext<V, Self>: StagingContext<Type = ArrayIrType, Constant = V, Operation = Self>,
     {
-        // Composite array IR families sum the cotangent of a read whose view varies over manual axes beyond its root
-        // over those axes before accumulating it (refer to the documentation of `ReferenceReadTransposition`).
+        // Array IR families sum the cotangent of a read whose view varies over manual axes beyond its root over those
+        // axes before accumulating it (refer to the documentation of `ReferenceReadTransposition`).
 
         // The axes that the cotangent (and thus the value read) varies over and the root does not are the axes along
         // which the read implicitly varied the root. Without such axes, the indexed accumulation is the exact adjoint.
@@ -497,8 +497,8 @@ impl<
 
 /// Capability to read an immutable snapshot from a reference value.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`], their projected reference members implement it for
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`], their projected reference members implement it for
 /// [`ReferenceType<ArrayType>`](crate::ReferenceType), and [`ReferenceView`](crate::ReferenceView)s implement it for
 /// the [`ReferenceType`](crate::ReferenceType) of their referent.
 #[capability]

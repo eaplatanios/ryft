@@ -47,7 +47,7 @@ enum BackendOperation<V: Value<Type = DataType>> {
 ```
 
 Optional dispatchers can be generated with
-`#[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]`, as described above. Composite
+`#[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]`, as described above. Heterogeneous
 operation families whose stored constants belong to a member universe declare their operation and constant types
 explicitly, together with their member universes:
 
@@ -59,7 +59,7 @@ explicitly, together with their member universes:
     members(ArrayType, structural(DimensionType)),
     dispatch(identity, batching, differentiation, transposition),
 )]
-enum CompositeOperation<A: Value<Type = ArrayType>> {
+enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
     #[ryft(projected(ArrayType))]
     Array(ArrayOperation<A>),
 

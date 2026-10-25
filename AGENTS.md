@@ -94,7 +94,7 @@ Use the relevant skill for focused maintenance and reviews as well as new implem
 workflows; the shared references and scoped instructions still apply.
 
 - [`add-or-review-core-operation`](.agents/skills/add-or-review-core-operation/SKILL.md): core operations, value
-  capabilities/providers, transform rules or replay, reference validation, composite values, and backend integration,
+  capabilities/providers, transform rules or replay, reference validation, array IR values, and backend integration,
   including work outside `operations/`. Also consult its core input terminology when editing programs or instructions.
 - [`add-mlir-dialect`](.agents/skills/add-mlir-dialect/SKILL.md): MLIR dialect wrappers, registration, passes, and
   custom dialect C API shims; owns dialect layout, typed APIs, documentation, coverage, and native shim conventions.

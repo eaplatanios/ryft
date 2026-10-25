@@ -2726,7 +2726,7 @@ pub type ShardMapTracer<C> = ProjectedValue<ArrayType, DomainTracer<C>>;
 /// [`DomainTracingContext`] of `C` that the body is traced in. It is the [`Domain`](Value::Domain) of the body's
 /// [`ShardMapTracer`]s, so values that it creates through its capabilities are [`ShardMapTracer`]s as well (e.g.,
 /// `context.axis_index("x")` returns the coordinate of the executing device along the manual axis `x`, and
-/// [`Context::lift`] stages an array constant), and [`ProjectedContext::parent`] returns the underlying composite
+/// [`Context::lift`] stages an array constant), and [`ProjectedContext::parent`] returns the underlying array IR
 /// tracing context.
 pub type ShardMapContext<C> = ProjectedContext<DomainTracingContext<C>, ArrayType>;
 
@@ -2741,7 +2741,7 @@ pub type ShardMapContext<C> = ProjectedContext<DomainTracingContext<C>, ArrayTyp
 /// # Parameters
 ///
 ///   - `function`: Body closure traced over the local shards of `inputs`.
-///   - `inputs`: Structured global input values, whose leaves are array projections of composite values.
+///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
 ///   - `in_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
 ///   - `out_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
@@ -2789,7 +2789,7 @@ where
 /// # Parameters
 ///
 ///   - `function`: Body closure traced over the local shards of `inputs`.
-///   - `inputs`: Structured global input values, whose leaves are array projections of composite values.
+///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
 ///   - `in_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
 ///   - `out_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
@@ -2862,7 +2862,7 @@ where
 /// `manual_axes` mirrors, and the function that [`shard_map`] and [`shard_map_with_options`] delegate to with the
 /// context of their first input.
 ///
-/// The leaves of `inputs` are array projections of composite values (i.e., values of type [`ArrayIrType`]) of the
+/// The leaves of `inputs` are array projections of array IR values (i.e., values of type [`ArrayIrType`]) of the
 /// [`Context`] `C`, in which the operation is bound. Every input must belong to `context`; binding validates this where
 /// the context tracks value ownership (e.g., a staging context rejects tracers of another trace). `function` is traced
 /// once, in a fresh [`DomainTracingContext`] of `C`, and receives the [`ShardMapContext`] of that trace together with
@@ -2929,7 +2929,7 @@ where
 ///   - `context`: Context in which the operation is bound, which every leaf of `inputs` must belong to, and whose
 ///     named axes the body inherits as explained above.
 ///   - `function`: Body closure traced over the body context and the local shards of `inputs`.
-///   - `inputs`: Structured global input values, whose leaves are array projections of composite values.
+///   - `inputs`: Structured global input values, whose leaves are array projections of array IR values.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
 ///   - `in_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
 ///   - `out_shardings`: Shardings of the global outputs (i.e., JAX's `out_specs`), with the same structure as the
@@ -5195,21 +5195,21 @@ mod tests {
     type TestOperation = ArrayIrOperation<Array>;
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
-    /// Tracing context over the composite test family, whose tracers are the values that `shard_map` is invoked on.
+    /// Tracing context over the array IR test family, whose tracers are the values that `shard_map` is invoked on.
     type TestContext = TracingContext<TestValue, TestOperation>;
 
     /// Array projection of a [`TestContext`] tracer. It is both the input leaf of `shard_map` invocations in a
     /// [`TestContext`] trace and the local value of bodies traced for [`TestContext`] or for the eager test domain.
     type TestTracer = ShardMapTracer<TestContext>;
 
-    /// Eager context over the composite test family, which descriptor-only tracing names as the domain of its bodies.
+    /// Eager context over the array IR test family, which descriptor-only tracing names as the domain of its bodies.
     type TestEagerContext = EagerContext<TestValue, TestOperation>;
 
     // The transform tests below stage complete programs rather than using the `check_operation_*` macros, because those
     // macros cover regionless operations over homogeneous `Array` values, whose transformed results they compare with
-    // eager interpretation, while `shard_map` attaches a body region over the composite family (whose interpretation
-    // the `emulation` module tests). For the same reason, the derivatives are not compared with `check_gradient!`; the
-    // XLA backend tests execute differentiated shard maps on devices instead.
+    // eager interpretation, while `shard_map` attaches a body region over the array IR family (whose interpretation the
+    // `emulation` module tests). For the same reason, the derivatives are not compared with `check_gradient!`; the XLA
+    // backend tests execute differentiated shard maps on devices instead.
 
     /// Test-only driver that returns a predetermined transpose for its one attached source region.
     struct TestTranspositionDriver {
@@ -7153,22 +7153,21 @@ mod tests {
     #[test]
     fn test_shard_map_type_inference() {
         let array_type = f32_scalar_type();
-        let composite_array_type = ArrayIrType::Array(array_type.clone());
+        let array_ir_array_type = ArrayIrType::Array(array_type.clone());
         let operation =
             ShardMapOperation::from_boundary(single_input_test_shard_map(), vec![array_type.clone()], vec![array_type]);
         let array_body = RegionInterface::new(
-            vec![composite_array_type.clone()],
-            vec![composite_array_type.clone()],
+            vec![array_ir_array_type.clone()],
+            vec![array_ir_array_type.clone()],
             EffectClasses::NONE,
         );
 
         assert_eq!(
-            operation
-                .infer_output_types(std::slice::from_ref(&composite_array_type), std::slice::from_ref(&array_body)),
-            Ok(vec![composite_array_type.clone()]),
+            operation.infer_output_types(std::slice::from_ref(&array_ir_array_type), std::slice::from_ref(&array_body)),
+            Ok(vec![array_ir_array_type.clone()]),
         );
         assert_eq!(
-            operation.infer_output_types(std::slice::from_ref(&composite_array_type), &[]),
+            operation.infer_output_types(std::slice::from_ref(&array_ir_array_type), &[]),
             Err(TypeError::invalid("expected 1 region but got 0")),
         );
 
@@ -7188,19 +7187,19 @@ mod tests {
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         let dimension_input_body =
-            RegionInterface::new(vec![dimension_type.clone()], vec![composite_array_type.clone()], EffectClasses::NONE);
+            RegionInterface::new(vec![dimension_type.clone()], vec![array_ir_array_type.clone()], EffectClasses::NONE);
         assert_eq!(
             operation.infer_output_types(
-                std::slice::from_ref(&composite_array_type),
+                std::slice::from_ref(&array_ir_array_type),
                 std::slice::from_ref(&dimension_input_body),
             ),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         let dimension_output_body =
-            RegionInterface::new(vec![composite_array_type.clone()], vec![dimension_type], EffectClasses::NONE);
+            RegionInterface::new(vec![array_ir_array_type.clone()], vec![dimension_type], EffectClasses::NONE);
         assert_eq!(
             operation.infer_output_types(
-                std::slice::from_ref(&composite_array_type),
+                std::slice::from_ref(&array_ir_array_type),
                 std::slice::from_ref(&dimension_output_body),
             ),
             Err(TypeError::invalid("expected array type but got dimension type")),
@@ -14992,7 +14991,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_transposition() {
-        // Reverse mode through a `shard_map` reaches the transposition rule through the composite operation family's
+        // Reverse mode through a `shard_map` reaches the transposition rule through the array IR operation family's
         // derived transposition dispatcher, which stages a transposed `shard_map` instead of reporting the operation as
         // non-transposable, so the manual region survives reverse mode.
 
@@ -17516,9 +17515,9 @@ mod tests {
     #[test]
     fn test_trace_shard_map_rejects_captures_registered_in_its_body() {
         // The body is traced in a fresh trace whose capture table is discarded, so registering a capture rejects the
-        // body regardless of whether the returned reference is staged (refer to
-        // `TracingContext::trace_with_named_axes` for the silent-aliasing rationale). The composite test family does
-        // not embed capture references, so this test traces over a constant family that does.
+        // body regardless of whether the returned reference is staged (refer to `TracingContext::trace_with_named_axes`
+        // for the silent-aliasing rationale). The array IR test family does not embed capture references, so this test
+        // traces over a constant family that does.
         type CapturingDomain = TracingContext<CaptureReference<ArrayIrType>, TestOperation>;
         let mesh = manual_mesh();
         let sharded = sharded_along_x();

@@ -167,8 +167,8 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// scalar is rejected because array shapes must be shared by every batch item.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
-/// composite array IR values implement it for [`ArrayIrType`].
+/// values (including the projected array members of array IR values) implement this capability for [`ArrayType`] and
+/// array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///

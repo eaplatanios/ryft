@@ -303,7 +303,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 /// capabilities and turns a variation transition into a runtime error instead of a compile error.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -477,12 +477,12 @@ impl<
 /// An axis whose name a `batch` level binds does not take part, because that level shadows the manual mesh axis. A
 /// trace that does not bind the name at all, such as the fresh trace in which [`Region`](crate::Region) transposition
 /// stages its rules, still aligns over it, using the mesh of an input that varies over the axis (refer to
-/// [`ParallelVary::parallel_vary_on_mesh`]). Scalar data-type and dimension values have no manual variation
-/// and pass through unchanged, and a composite [`ArrayIrType`] value aligns only its array members.
+/// [`ParallelVary::parallel_vary_on_mesh`]). Scalar data-type and dimension values have no manual variation and pass
+/// through unchanged, and an [`ArrayIrType`] value aligns only its array members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that data-type scalar
-/// values, homogeneous array values, first-class dimension values, and composite array IR values implement this
-/// capability for [`DataType`], [`ArrayType`], [`DimensionType`], and [`ArrayIrType`], respectively.
+/// values, homogeneous array values, first-class dimension values, and array IR values implement this capability for
+/// [`DataType`], [`ArrayType`], [`DimensionType`], and [`ArrayIrType`], respectively.
 #[capability]
 pub trait ManualVariationAlignment<T = <Self as Capability>::Universe>: Capability + Clone {
     /// Returns `inputs` with their manual variation aligned, in the same order.
@@ -861,7 +861,7 @@ mod tests {
         let (invariant, varying) = scalar_types();
         let operation = ArrayIrOperation::<Array>::from(ParallelVaryOperation::new("m".to_string()));
 
-        // Through the composite `ArrayIrOperation`, an eager known side residualizes the transition.
+        // Through `ArrayIrOperation`, an eager known side residualizes the transition.
         let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let input = PartialEvaluationValue::known(ArrayIrValue::Array(
             Array::from_elements(invariant.clone(), &[2.0f32]).unwrap(),
@@ -1375,8 +1375,8 @@ mod tests {
 
     #[test]
     fn test_manual_variation_alignment_align_manual_variation_array_ir() {
-        // Array members of a composite `ArrayIrType` value align like plain array values, including the placement of
-        // an unsharded member on the axis's mesh. A dimension member passes through at its position, while the array
+        // Array members of an `ArrayIrType` value align like plain array values, including the placement of an
+        // unsharded member on the axis's mesh. A dimension member passes through at its position, while the array
         // members around it are aligned.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying = ArrayType::scalar(DataType::F32)
@@ -1460,8 +1460,8 @@ mod tests {
 
     #[test]
     fn test_manual_variation_alignment_align_manual_variation_to_array_ir() {
-        // Array members of a composite `ArrayIrType` value align to the target like plain array values, including the
-        // placement of an unsharded member on the axis's mesh, while a dimension member passes through at its position.
+        // Array members of an `ArrayIrType` value align to the target like plain array values, including the placement
+        // of an unsharded member on the axis's mesh, while a dimension member passes through at its position.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let target = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
         let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();

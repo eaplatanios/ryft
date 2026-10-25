@@ -190,10 +190,10 @@ pub use trigonometric::{
 /// A universe is a type-level marker only, and it does not need to be a [`Type`](crate::Type). Capabilities only use
 /// it to tell implementations apart, and so host types need no artificial [`Type`](crate::Type) to belong to one. The
 /// universe parameter lets one capability have separate implementations for different universes (e.g., a homogeneous
-/// array implementation and a composite array IR implementation that projects onto it), which coherence could not
-/// otherwise tell apart, because it cannot use associated types to prove two implementations disjoint. Capabilities
-/// require [`Capability`] without pinning its universe to their parameter, because pinning it overflows the trait
-/// solver. An implementor must therefore only implement capabilities for its own universe.
+/// array implementation and an array IR implementation that projects onto it), which coherence could not otherwise tell
+/// apart, because it cannot use associated types to prove two implementations disjoint. Capabilities require
+/// [`Capability`] without pinning its universe to their parameter, because pinning it overflows the trait solver. An
+/// implementor must therefore only implement capabilities for its own universe.
 ///
 /// In generic code, prefer stating capability bounds with their default universe (e.g., `V: Add + Broadcast`) or a
 /// bundle such as [`ArrayOperations`](crate::ArrayOperations), and avoid mixing them with explicitly named universes
@@ -215,25 +215,25 @@ pub use trigonometric::{
 /// Capability traits are declared with the [`capability`](macro@ryft_macros::capability) attribute, which checks their
 /// conventions at compile time (i.e., exactly one type parameter defaults to `<Self as Capability>::Universe`, that
 /// parameter is unbounded because host types are their own universes, and [`Capability`] is a direct super-trait).
-/// Its `projection(Composite => Member)` argument additionally implements the capability for every value of the
-/// `Composite` universe whose [`ValueProjection`](crate::ValueProjection) onto `Member` implements it. The
-/// generated functions project the receiver and every `&Self`, `&[Self]`, and `Option<&Self>` input, apply the member
-/// implementation, and lift `Self` outputs (also inside `Vec`s and tuples) back, while passing other inputs and outputs
-/// through unchanged. Projecting a member of another kind fails with the projection's error (e.g., a [`TypeError`] for
-/// a first-class dimension). This is how composite array IR values (i.e., [`ArrayIrValue`](crate::ArrayIrValue) and the
-/// tracers over [`ArrayIrType`](crate::ArrayIrType)) implement most array capabilities, through
-/// `#[capability(projection(ArrayIrType => ArrayType))]`, so that their staged programs contain
-/// the same array instructions as homogeneous programs.
+/// Its `projection(Family => Member)` argument additionally implements the capability for every value of the `Family`
+/// universe whose [`ValueProjection`](crate::ValueProjection) onto `Member` implements it. The generated functions
+/// project the receiver and every `&Self`, `&[Self]`, and `Option<&Self>` input, apply the member implementation, and
+/// lift `Self` outputs (also inside `Vec`s and tuples) back, while passing other inputs and outputs through unchanged.
+/// Projecting a member of another kind fails with the projection's error (e.g., a [`TypeError`] for a first-class
+/// dimension). This is how array IR values (i.e., [`ArrayIrValue`](crate::ArrayIrValue) and the tracers over
+/// [`ArrayIrType`](crate::ArrayIrType)) implement most array capabilities, through
+/// `#[capability(projection(ArrayIrType => ArrayType))]`, so that their staged programs contain the same array
+/// instructions as homogeneous programs.
 ///
 /// The projection covers the required functions of a capability, and provided functions keep their default bodies.
 /// A default must therefore be correct for every implementor, typically by composing required functions. A function
 /// whose behavior depends on the implementor (e.g., one whose configuration staging values record in the staged
-/// operation while concrete values only validate it) must be required instead, so that composite values project it too.
-/// Type parameters that precede the universe must default to `Self` (e.g., a right input declared as `Rhs = Self`), and
-/// they resolve to the composite value in the implemented capability and to its projection in the delegated one. The
-/// generated code refers to the `ryft` crate, and a `crate = "path"` argument overrides that path (e.g., for crates
-/// that depend on `ryft-core` directly). Capabilities whose composite implementations are irregular (e.g., [`Sort`] or
-/// [`Gather`]) keep handwritten implementations and use the bare attribute.
+/// operation while concrete values only validate it) must be required instead, so that heterogeneous values project it
+/// too. Type parameters that precede the universe must default to `Self` (e.g., a right input declared as
+/// `Rhs = Self`), and they resolve to the heterogeneous value in the implemented capability and to its projection in
+/// the delegated one. The generated code refers to the `ryft` crate, and a `crate = "path"` argument overrides that
+/// path (e.g., for crates that depend on `ryft-core` directly). Capabilities whose array IR implementations are
+/// irregular (e.g., [`Sort`] or [`Gather`]) keep handwritten implementations and use the bare attribute.
 ///
 /// ```rust
 /// # extern crate ryft_core as ryft;
@@ -576,12 +576,12 @@ mod tests {
             }
         }
 
-        // Composite tracers stage the homogeneous array instructions of every generated function.
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        // Array IR tracers stage the homogeneous array instructions of every generated function.
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
-        let (_, program) = CompositeContext::trace(
-            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].scale(&inputs[1], 2)?.double()?.combine(&inputs[1]),
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| inputs[0].scale(&inputs[1], 2)?.double()?.combine(&inputs[1]),
             vec![array_type.clone(), array_type],
         )
         .unwrap();
@@ -597,7 +597,7 @@ mod tests {
             },
         );
 
-        // Concrete composite values apply the capabilities to their array members, and the provided
+        // Concrete array IR values apply the capabilities to their array members, and the provided
         // function composes them, while first-class dimension members are rejected by the projection.
         let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());

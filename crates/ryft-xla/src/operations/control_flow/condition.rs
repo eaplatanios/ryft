@@ -1,7 +1,7 @@
 //! Lowering of [`ConditionOperation`] to [StableHLO `if`](https://openxla.org/stablehlo/spec#if).
 //!
-//! A condition lowers only from the composite [`ArrayIrType`] operation family, which stores its two branch regions;
-//! the homogeneous [`ArrayType`] payload carries no regions and is rejected. The predicate selects between two
+//! A condition lowers only from the [`ArrayIrType`] operation family, which stores its two branch regions; the
+//! homogeneous [`ArrayType`] payload carries no regions and is rejected. The predicate selects between two
 //! `stablehlo.if` regions that take no arguments and capture the lowered branch inputs implicitly. Each branch input is
 //! converted from its actual type to the shared declared type of its branch input, and an entry guard checks the input
 //! relationships that the actual input types leave unproven before either branch runs. Every ordered effect class that
@@ -167,7 +167,7 @@ mod tests {
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
         unproject_plain_program, xla_identity_branch, xla_neg_branch,
     };
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as ArrayIrXlaProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
@@ -182,7 +182,7 @@ mod tests {
     fn test_condition_lowering() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
         let predicate = builder.add_input(predicate_type.clone().into());
@@ -240,7 +240,7 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let branch = || {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let dimension = builder.add_input(m.clone().into());
             let array = builder.add_input(array_type.clone().into());
             let declared: Vec<ArrayIrType> = vec![
@@ -254,7 +254,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(branch().entry_region_ref());
         let false_region = builder.import_region(branch().entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -324,7 +324,7 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let inner_branch = || {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             builder.add_input(n.clone().into());
             let array =
                 builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
@@ -333,7 +333,7 @@ mod tests {
                 .unwrap()
         };
         let outer_branch = || {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let true_region = builder.import_region(inner_branch().entry_region_ref());
             let false_region = builder.import_region(inner_branch().entry_region_ref());
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -352,7 +352,7 @@ mod tests {
                 .unwrap()
         };
         assert!(outer_branch().effects().classes().is_empty());
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(outer_branch().entry_region_ref());
         let false_region = builder.import_region(outer_branch().entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -447,7 +447,7 @@ mod tests {
         // simplification), not ryft's.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
         let input = builder.add_input(input_type.clone().into());
@@ -496,7 +496,7 @@ mod tests {
         let output_type = dynamic_vector_type.clone();
 
         let branch = |negate: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let branch_extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
@@ -521,7 +521,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -597,7 +597,7 @@ mod tests {
         // returns its print custom call's token, and the pure branch returns the entry token unchanged.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F64);
-        let mut true_builder = CompositeXlaProgramBuilder::new();
+        let mut true_builder = ArrayIrXlaProgramBuilder::new();
         let true_input = true_builder.add_input(input_type.clone().into());
         let printed = true_builder
             .add_instruction(PrintOperation::<ArrayType>::new("taken"), Vec::new(), vec![true_input], None)
@@ -607,7 +607,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![negated], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
         let predicate = builder.add_input(predicate_type.clone().into());
@@ -658,7 +658,7 @@ mod tests {
         // branches return the union's two tokens while forwarding the untouched entry token for the unused class.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let true_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let predicate = builder
                 .add_instruction(
@@ -684,7 +684,7 @@ mod tests {
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("false"), Vec::new(), vec![input], None)
@@ -693,7 +693,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -751,7 +751,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let branch = |label| {
-            let mut backward = CompositeXlaProgramBuilder::new();
+            let mut backward = ArrayIrXlaProgramBuilder::new();
             let seed = backward.add_input(scalar_type.clone().into());
             backward
                 .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![seed], None)
@@ -761,7 +761,7 @@ mod tests {
             let backward = backward
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let backward = builder.import_region(backward.entry_region_ref());
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
@@ -780,7 +780,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_branch = builder.import_region(branch("true backward").entry_region_ref());
         let false_branch = builder.import_region(branch("false backward").entry_region_ref());
         let predicate = builder.add_input(predicate_type.clone().into());
@@ -896,14 +896,14 @@ mod tests {
         // An empty data-flow boundary must retain the selected branch's effects and sequence later effects after it.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |label| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             builder
                 .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![input], None)
                 .unwrap();
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_branch = builder.import_region(branch("true").entry_region_ref());
         let false_branch = builder.import_region(branch("false").entry_region_ref());
         let predicate_type = ArrayType::scalar(DataType::Boolean);
@@ -1004,7 +1004,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let branch_input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let branch = |add: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let first = builder.add_input(branch_input_type.clone().into());
             let second = builder.add_input(branch_input_type.clone().into());
             let output = if add {
@@ -1018,7 +1018,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_branch = builder.import_region(branch(true).entry_region_ref());
         let false_branch = builder.import_region(branch(false).entry_region_ref());
         let predicate = builder.add_constant(XlaConstant::Boolean(true));
@@ -1057,13 +1057,13 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let client = execution_client();
         ensure_assertion_handler_registered(&client).unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         builder.add_input(extent_type.clone().into());
         let input = builder.add_input(dynamic_type.clone().into());
         let true_branch = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         builder.add_input(extent_type.clone().into());
         builder.add_input(dynamic_type.into());
         let output = builder
@@ -1076,7 +1076,7 @@ mod tests {
             // The broad first-class dimension and static array share an extent relationship that structural
             // specialization cannot replace. Direct construction retains both declared branch programs, whose declared
             // outputs (`f64[extent]` and `f64[3]`) agree only after input refinement.
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let regions = vec![
                 builder.import_region(true_branch.entry_region_ref()),
                 builder.import_region(false_branch.entry_region_ref()),
@@ -1127,7 +1127,7 @@ mod tests {
         let block = context.block_with_no_arguments();
         let branch = unproject_plain_program(xla_identity_branch(ArrayType::scalar(DataType::F32)));
 
-        // The plain array family cannot carry branch regions, so conditions lower only from the composite family.
+        // The plain array family cannot carry branch regions, so conditions lower only from the array IR family.
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone(); 2]);
         let expected_message = concat!(
             "higher-order operation `condition` must be stored directly ",
@@ -1138,7 +1138,7 @@ mod tests {
             Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message })) if message == expected_message,
         ));
 
-        // A composite condition needs exactly one region per branch.
+        // An array IR condition needs exactly one region per branch.
         let mut lowerer = XlaLowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
@@ -1163,7 +1163,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let empty_type = ArrayType::new_static(DataType::F64, [0]);
         let branch = |negate: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let (scalar, empty) = if negate {
@@ -1189,7 +1189,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1292,7 +1292,7 @@ mod tests {
         let extent_type = DimensionType::new("extent", DimensionBounds::non_negative(Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |negate: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
@@ -1311,7 +1311,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1409,14 +1409,14 @@ mod tests {
         // The assertion must not run when the `true` branch is selected.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let true_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let selector = builder.add_input(scalar_type.clone().into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![selector], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let selector = builder.add_input(scalar_type.clone().into());
             let predicate = positive(&mut builder, selector);
             builder
@@ -1432,7 +1432,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![selector], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.into());
@@ -1509,7 +1509,7 @@ mod tests {
         // through the condition, so that the prints appear once per iteration and in iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let print_branch = |label| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let index = builder.add_input(scalar_type.clone().into());
             let index = builder
                 .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![index], None)
@@ -1519,7 +1519,7 @@ mod tests {
                 .unwrap()
         };
         let loop_condition = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let index = builder.add_input(scalar_type.clone().into());
             let limit = builder.add_input(scalar_type.clone().into());
             let predicate = builder
@@ -1530,7 +1530,7 @@ mod tests {
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let first_region = builder.import_region(print_branch("first").entry_region_ref());
             let later_region = builder.import_region(print_branch("later").entry_region_ref());
             let index = builder.add_input(scalar_type.clone().into());
@@ -1558,7 +1558,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let index = builder.add_input(scalar_type.clone().into());
@@ -1655,7 +1655,7 @@ mod tests {
         // order.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |label, add: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
             let item = builder
@@ -1671,7 +1671,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let true_region = builder.import_region(branch("positive", true).entry_region_ref());
             let false_region = builder.import_region(branch("nonpositive", false).entry_region_ref());
             builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -1694,7 +1694,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -1799,7 +1799,7 @@ mod tests {
         // The condition negates its input when the selector is positive and doubles it otherwise.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |negate: bool| {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = if negate {
                 builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0]
@@ -1810,7 +1810,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(branch(true).entry_region_ref());
         let false_region = builder.import_region(branch(false).entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -1928,7 +1928,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![n.dimension().clone()]));
         let true_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let sum = builder
                 .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![input], None)
@@ -1944,14 +1944,14 @@ mod tests {
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut builder = ArrayIrXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -2031,7 +2031,7 @@ mod tests {
         );
 
         // The primal and the pullback run in one program, which keeps the boolean predicate residual inside it.
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let selector = builder.add_input(scalar_type.into());
         let input = builder.add_input(vector_type.clone().into());
         let cotangent = builder.add_input(vector_type.into());
@@ -2134,7 +2134,7 @@ mod tests {
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let selector_type = ArrayType::scalar(DataType::F32).with_sharding(selector_sharding.clone()).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(vector_sharding.clone()).unwrap();
-        let mut builder = CompositeXlaProgramBuilder::new();
+        let mut builder = ArrayIrXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(vector_type.clone())));
         let selector = builder.add_input(selector_type.clone().into());

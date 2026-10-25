@@ -572,7 +572,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let data_type = output_type.data_type();
     let narrow = !data_type.is_complex() && !matches!(data_type, DataType::F32 | DataType::F64);
     let (left, right) = if narrow {
-        // Evaluate the entire composite in one working type, then round only its final output.
+        // Evaluate the entire composition in one working type, then round only its final output.
         let working_type = lower_tensor_type(&output_type.clone().with_data_type(DataType::F32), context, location)?;
         let left = block
             .append_operation(stable_hlo::convert(left, working_type, location)?)?

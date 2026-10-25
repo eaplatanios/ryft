@@ -277,8 +277,8 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType,
 
 /// Capability to consume a reference, returning its final value and invalidating its complete alias family.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
-/// values implement this capability for [`ArrayIrType`] and their projected reference members implement it for
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
+/// implement this capability for [`ArrayIrType`] and their projected reference members implement it for
 /// [`ReferenceType<ArrayType>`](crate::ReferenceType).
 #[capability]
 pub trait ReferenceFreeze<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
@@ -757,8 +757,8 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_provider() {
-        // Composite array families select the canonical consuming operation for an array referent, keeping alias
-        // invalidation in the reference machinery.
+        // Array IR families select the canonical consuming operation for an array referent, keeping alias invalidation
+        // in the reference machinery.
         assert!(matches!(
             TestIrOperation::provide(
                 ReferenceFreezeOperation::new(),

@@ -24,9 +24,9 @@ use crate::tracing::{Tracer, TracingContext};
 /// Those batching rules own every universe-independent part of the transformation, structurally batching the attached
 /// regions, aligning their boundaries, threading policy-owned bookkeeping values, and rebuilding the call. The
 /// representation of `ūᵢ` is the one step they cannot determine generically. An ordinary array policy reduces the
-/// cotangent directly along its mapped axis, while a composite policy may first need to project the cotangent to its
-/// differentiable member, perform that member's reduction, and lift the result back. This capability supplies exactly
-/// that representation-dependent step and lets each generic [`BatchableOperation`](crate::BatchableOperation)
+/// cotangent directly along its mapped axis, while a heterogeneous policy may first need to project the cotangent to
+/// its differentiable member, perform that member's reduction, and lift the result back. This capability supplies
+/// exactly that representation-dependent step and lets each generic [`BatchableOperation`](crate::BatchableOperation)
 /// implementation retain its complete algorithm.
 ///
 /// Implement this trait for a [`BatchingPolicy`] only when its program universe supports batching operations with

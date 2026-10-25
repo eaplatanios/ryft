@@ -126,8 +126,8 @@ pub const PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_ragged_all
 ///
 /// Batching over an unrelated mapped axis currently requires a static mapped extent and statically shaped data inputs.
 /// Offset rebasing stages `N` and `M` as scalar constants, and the shared reshape interface cannot yet recover dynamic
-/// trailing extents from both homogeneous and composite carriers. Participant groups are supported in this case,
-/// because the merged metadata keep the block of every receiver contiguous for any group size.
+/// trailing extents from both homogeneous and array IR carriers. Participant groups are supported in this case, because
+/// the merged metadata keep the block of every receiver contiguous for any group size.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelRaggedAllToAllOperation {
     /// Axis name referenced by this collective.
@@ -1444,8 +1444,8 @@ impl_differentiable_operation! {
 }
 
 impl MemberOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
-    // This direct composite carrier has an array-only boundary, but it cannot be a second projected `ArrayType`
-    // member in `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous
+    // This direct array IR carrier has an array-only boundary, but it cannot be a second projected `ArrayType` member
+    // in `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous
     // operation.
 
     #[inline]
@@ -1540,7 +1540,7 @@ impl<
 /// [`ManualVariationAlignment`]), because each device computes its result from all six inputs.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -1771,7 +1771,7 @@ mod tests {
 
     use super::*;
 
-    /// Composite trace shared by the dynamic mapped-extent batching, composite differentiation, and capability tests.
+    /// Array IR trace shared by the dynamic mapped-extent batching, array IR differentiation, and capability tests.
     type ArrayIrTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Executes a degenerate single-participant ragged exchange of the `operand` `[1, 2, 3]` into the `output` seed
@@ -2499,7 +2499,7 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_type_inference_array_ir() {
-        // The composite carrier projects its inputs onto the homogeneous array contract and wraps the inferred type.
+        // The array IR carrier projects its inputs onto the homogeneous array contract and wraps the inferred type.
         let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2);
         let metadata = || ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2]));
         let input_types = [
@@ -2531,8 +2531,8 @@ mod tests {
             )),
         );
 
-        // The exchange has no regions, so it requests no region input types from its composite parent, whose inputs
-        // must still project to arrays.
+        // The exchange has no regions, so it requests no region input types from its array IR parent, whose inputs must
+        // still project to arrays.
         assert_eq!(operation.infer_parent_region_input_types(&input_types, &[]), Ok(Vec::new()));
         let mut invalid_input_types = input_types.to_vec();
         invalid_input_types[0] = ArrayIrType::Dimension(DimensionType::from(DimensionVariable::new(
@@ -2547,8 +2547,8 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_type_inference_array_ir_identity_renaming() {
-        // The exchange records no type identities of its own, so renaming the identities of its composite parent
-        // leaves it unchanged.
+        // The exchange records no type identities of its own, so renaming the identities of its array IR parent leaves
+        // it unchanged.
         let operation =
             ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]]).unwrap();
         let mut renaming = TypeIdentityRenaming::new();
@@ -2719,7 +2719,7 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_interpretation_array_ir() {
-        // A composite value interprets the exchange through its array member.
+        // An array IR value interprets the exchange through its array member.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
             context.bind(
@@ -3714,7 +3714,7 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_batching_array_ir() {
-        // Composite values reach the eager exchange of a matching named `batch` level through their array members.
+        // Array IR values reach the eager exchange of a matching named `batch` level through their array members.
         let operand = vec![1i32, 2, 2, 3, 4, 0];
         let output_seed = vec![0i32; 8];
         let output: ArrayIrValue<Array> = batch(
@@ -3845,7 +3845,7 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_differentiation_array_ir() {
-        // A composite exchange differentiates through the rule of its array member, which applies the same exchange,
+        // An array IR exchange differentiates through the rule of its array member, which applies the same exchange,
         // with the same primal metadata, to the live tangents of both data inputs.
         let context = ArrayIrTracingContext::new();
         let operand = context.input(ArrayType::new_static(DataType::F32, [3]).into());
@@ -4695,8 +4695,8 @@ mod tests {
             },
         );
 
-        // A composite value exchanges through its array view, which converts the exchange back into its direct
-        // composite carrier. Inputs without a sharding are placed on the axis's mesh before they are made varying.
+        // An array IR value exchanges through its array view, which converts the exchange back into its direct array IR
+        // carrier. Inputs without a sharding are placed on the axis's mesh before they are made varying.
         let (output_type, program) = ArrayIrTracingContext::trace_with_named_axes(
             |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
@@ -4778,8 +4778,8 @@ mod tests {
             ))),
         );
 
-        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
-        // binder, so every axis name is unbound for them.
+        // Concrete arrays, and concrete array IR values through their array members, are never inside an axis binder,
+        // so every axis name is unbound for them.
         let data = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let metadata = Array::vector(vec![0i32]).unwrap();
         assert_eq!(
@@ -4874,7 +4874,7 @@ mod tests {
             },
         );
 
-        // A composite value exchanges through its array view, which places and varies its inputs like an ungrouped
+        // An array IR value exchanges through its array view, which places and varies its inputs like an ungrouped
         // exchange and records the groups.
         let (output_type, program) =
             ArrayIrTracingContext::trace_with_named_axes(grouped_exchange, unplaced_input_types, axes.clone()).unwrap();
@@ -4953,8 +4953,8 @@ mod tests {
             ))),
         );
 
-        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
-        // binder, so every axis name is unbound for them.
+        // Concrete arrays, and concrete array IR values through their array members, are never inside an axis binder,
+        // so every axis name is unbound for them.
         let data = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let metadata = Array::vector(vec![0i32]).unwrap();
         assert_eq!(
