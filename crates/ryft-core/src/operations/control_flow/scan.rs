@@ -1580,7 +1580,6 @@ impl<
         // on both boundaries, its accesses replay inside the body, and it publishes no successor. A preserved
         // allocation reached only through an inherited capture gains the same kind of reference-typed carry so
         // that the rebuilt body can bind that capture without turning it into state.
-
         let name = self.name();
         let carry_count = self.carry_count();
         let source_body = driver.region(0)?;
@@ -1838,8 +1837,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -1854,7 +1851,6 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
         // placed as the declared stacked-axis placement requires, to retain placement metadata, and later writes
         // reconcile manual variation through `ScanInterpretationDomain::write_iteration`. Empty stacks use inferred
         // output types. The `shard_map` emulator runs this same rule over its per-device values.
-
         let body = driver.region(0)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = self.validate_application(&input_types, body)?;
@@ -1900,6 +1896,8 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
         Ok(carries)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     T: ScanType + TemporalResidualType,
