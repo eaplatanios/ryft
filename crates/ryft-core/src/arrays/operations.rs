@@ -18,32 +18,31 @@ use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
     AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
     ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations,
-    ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations,
-    ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomCall,
-    CustomCallOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
-    DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
-    DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DotProductAttention,
-    DotProductAttentionBackwardOperation, DotProductAttentionOperation, DynamicBroadcastOperation,
-    DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations,
-    ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation,
-    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
-    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
-    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
-    ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
-    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDot, ScaledDotOperation,
-    ScanOperation, ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation,
-    SinOperation, SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
-    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation,
-    ZeroOperation,
+    CompositeCallOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation,
+    ConstantOperation, ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation,
+    Cumulative, CumulativeOperation, CustomCall, CustomCallOperation, DimensionAddOperation, DimensionDivOperation,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
+    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
+    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
+    DivOperation, DotOperation, DotOperations, DotProductAttention, DotProductAttentionBackwardOperation,
+    DotProductAttentionOperation, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
+    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation,
+    ExpOperation, ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, GuardOperation,
+    ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation,
+    LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation,
+    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
+    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
+    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation,
+    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
+    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, SaturatingSub,
+    SaturatingSubOperation, ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation,
+    ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
+    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
+    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
+    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -151,8 +150,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Guard(GuardOperation<ArrayType>),
     Cast(CastOperation<ArrayType>),
     CustomCall(CustomCallOperation),
-    CustomFunction(CustomFunctionOperation<V, ArrayOperation<V>>),
-    CustomFunctionTranspose(CustomFunctionTransposeOperation<V, ArrayOperation<V>>),
+    Composite(CompositeCallOperation<V, ArrayOperation<V>>),
+    CompositeTranspose(CompositeTransposeOperation<V, ArrayOperation<V>>),
 }
 
 /// Value-level capability bundle that groups every operation Ryft supports on arrays, so that generic array code can
@@ -453,26 +452,25 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
 
-    /// Custom function call with an array IR primal region and attached rules or retained rules registered in this
-    /// family. Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are
-    /// rejected.
-    CustomFunction(CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
+    /// Composite call with an array IR primal region and attached rules or retained rules registered in this family.
+    /// Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are rejected.
+    Composite(CompositeCallOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Reverse-mode carrier of [`CustomFunction`](Self::CustomFunction), replaced by the call's backward rule during
+    /// Reverse-mode carrier of [`Composite`](Self::Composite), replaced by the call's backward rule during
     /// transposition.
-    CustomFunctionTranspose(CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
+    CompositeTranspose(CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Custom function call promoted from [`ArrayOperation`] with retained member-registered rules. [`LiftedCustomRules`]
+    /// Composite call promoted from [`ArrayOperation`] with retained member-registered rules. [`LiftedCustomRules`]
     /// specializes and converts those rules into this family. Calls with attached rules instead use
-    /// [`CustomFunction`](Self::CustomFunction).
-    LiftedCustomFunction(
-        CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
+    /// [`Composite`](Self::Composite).
+    LiftedComposite(
+        CompositeCallOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
 
-    /// Reverse-mode carrier of [`LiftedCustomFunction`](Self::LiftedCustomFunction), whose backward rule is specialized
-    /// by its member definition and converted into this family.
-    LiftedCustomFunctionTranspose(
-        CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
+    /// Reverse-mode carrier of [`LiftedComposite`](Self::LiftedComposite), whose backward rule is specialized by its
+    /// member definition and converted into this family.
+    LiftedCompositeTranspose(
+        CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
 }
 
@@ -494,9 +492,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// Variants without a value-level capability are necessarily absent. These are the context-side constructors
 /// [`DynamicZero`](crate::operations::constants::DynamicZero),
 /// [`DynamicOne`](crate::operations::constants::DynamicOne), and
-/// [`DynamicIota`](crate::operations::constants::DynamicIota), and the variants that function-level APIs and
-/// transforms stage on behalf of values, namely control flow, rematerialization, linear calls, custom functions, and
-/// shard maps.
+/// [`DynamicIota`](crate::operations::constants::DynamicIota), and the variants that function-level APIs and transforms
+/// stage on behalf of values, namely control flow, rematerialization, linear calls, composites, and shard maps.
 ///
 /// Array capabilities apply directly to array IR values, and checked arithmetic over first-class dimensions uses
 /// their member projection:
@@ -573,16 +570,16 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                     .with_unroll(operation.unroll())
                     .unwrap(),
             ),
-            // Custom function calls and carriers with attached rules store no source, so they follow their regions
-            // into the native variants. Those with retained rules keep their member definition, which specializes their
-            // rules for this family on demand.
-            ArrayOperation::CustomFunction(operation) => match operation.into_attached_family() {
-                Ok(operation) => Self::CustomFunction(operation),
-                Err(operation) => Self::LiftedCustomFunction(operation.into_family(LiftedCustomRules::Member)),
+            // Composite calls and carriers with attached rules store no source, so they follow their regions into the
+            // native variants. Those with retained rules keep their member definition, which specializes their rules
+            // for this family on demand.
+            ArrayOperation::Composite(operation) => match operation.into_attached_family() {
+                Ok(operation) => Self::Composite(operation),
+                Err(operation) => Self::LiftedComposite(operation.into_family(LiftedCustomRules::Member)),
             },
-            ArrayOperation::CustomFunctionTranspose(operation) => match operation.into_attached_family() {
-                Ok(operation) => Self::CustomFunctionTranspose(operation),
-                Err(operation) => Self::LiftedCustomFunctionTranspose(operation.into_family(LiftedCustomRules::Member)),
+            ArrayOperation::CompositeTranspose(operation) => match operation.into_attached_family() {
+                Ok(operation) => Self::CompositeTranspose(operation),
+                Err(operation) => Self::LiftedCompositeTranspose(operation.into_family(LiftedCustomRules::Member)),
             },
             // A linear call stores no types, so it reaches the carrier that owns the extent-threaded region rule
             // unchanged.
@@ -950,13 +947,12 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, ConcatenateOperation,
-        ConditionOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation,
-        CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
-        DynamicReshapeOperation, MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation,
-        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, ShardMap, SinOperation, WhileOperation,
-        ZeroOperation,
+        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeCallOperation,
+        CompositeJvpRule, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, CustomRuleDefinition,
+        CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
+        MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation, ReductionKind,
+        RematerializationOptimizationBarrier, ScanOperation, ShardMap, SinOperation, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
@@ -2430,9 +2426,9 @@ mod tests {
             .unwrap()[0]
     }
 
-    /// Builds the `["primal", "jvp"]` regions of an array IR `custom_function` call with a JVP rule, implementing
-    /// `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving
-    /// custom-function boundary stays detectable in a transformed program's numbers.
+    /// Builds the `["primal", "jvp"]` regions of an array IR `composite` call with a JVP rule, implementing
+    /// `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving composite
+    /// boundary stays detectable in a transformed program's numbers.
     fn array_ir_custom_jvp_regions() -> Vec<TestProgram> {
         vec![
             array_ir_scalar_program(1, |builder, inputs| vec![array_ir_scaled(builder, inputs[0], 2.0)]),
@@ -2442,8 +2438,8 @@ mod tests {
         ]
     }
 
-    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `custom_function` call with reverse-mode
-    /// rules, implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule
+    /// Builds the `["primal", "forward", "backward"]` regions of an array IR `composite` call with reverse-mode rules,
+    /// implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule
     /// `backward(r, ȳ) = 3 * ȳ`.
     fn array_ir_custom_vjp_regions() -> Vec<TestProgram> {
         vec![
@@ -2480,17 +2476,16 @@ mod tests {
     #[test]
     fn test_array_ir_lift_promotes_every_region_carrying_array_payload() {
         // Every region-carrying array payload has an array IR carrier, so none of them reaches the region-free
-        // projected `Array` variant. Custom-function calls carry their rule layout and non-differentiated input split,
-        // and rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
-        for jvp_rule in [CustomFunctionJvpRule::Absent, CustomFunctionJvpRule::Explicit, CustomFunctionJvpRule::Primal]
-        {
+        // projected `Array` variant. Composite calls carry their rule layout and non-differentiated input split, and
+        // rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
+        for jvp_rule in [CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Primal] {
             for has_vjp_rule in [false, true] {
-                let operation = CustomFunctionOperation::from_rule_regions(jvp_rule, has_vjp_rule)
+                let operation = CompositeCallOperation::from_rule_regions(jvp_rule, has_vjp_rule)
                     .with_non_differentiated_count(2)
                     .unwrap();
                 assert!(matches!(
-                    TestOperation::from(ArrayOperation::CustomFunction(operation)),
-                    ArrayIrOperation::CustomFunction(operation)
+                    TestOperation::from(ArrayOperation::Composite(operation)),
+                    ArrayIrOperation::Composite(operation)
                         if operation.jvp_rule() == jvp_rule
                             && operation.has_vjp_rule() == has_vjp_rule
                             && operation.non_differentiated_count() == 2,
@@ -2518,19 +2513,15 @@ mod tests {
         // A carrier with an attached backward rule maps its stored tangent types into the array IR type universe and
         // follows its region into the native carrier variant.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let promoted = TestOperation::from(ArrayOperation::CustomFunctionTranspose(
-            CustomFunctionTransposeOperation::from_backward_region(
-                1,
-                vec![scalar_type.clone()],
-                vec![scalar_type.clone()],
-            ),
+        let promoted = TestOperation::from(ArrayOperation::CompositeTranspose(
+            CompositeTransposeOperation::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type.clone()]),
         ));
-        let ArrayIrOperation::CustomFunctionTranspose(promoted) = promoted else {
-            panic!("expected a promoted array IR custom function carrier");
+        let ArrayIrOperation::CompositeTranspose(promoted) = promoted else {
+            panic!("expected a promoted array IR composite carrier");
         };
         assert_eq!(
             promoted,
-            CustomFunctionTransposeOperation::from_backward_region(
+            CompositeTransposeOperation::from_backward_region(
                 1,
                 vec![ArrayIrType::Array(scalar_type.clone())],
                 vec![ArrayIrType::Array(scalar_type)],
@@ -2539,14 +2530,11 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_of_a_custom_function_jvp_rule_payload() {
+    fn test_array_ir_batching_of_a_composite_jvp_rule_payload() {
         // The array IR carrier batches both regions structurally and threads the first-class mapped extent into
         // them as one additional leading non-differentiated input of the batched call.
         let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                CustomFunctionJvpRule::Explicit,
-                false,
-            )),
+            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
             array_ir_custom_jvp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2554,7 +2542,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_function [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2580,14 +2568,11 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_of_a_custom_function_vjp_rule_payload() {
+    fn test_array_ir_batching_of_a_composite_vjp_rule_payload() {
         // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
         // with the differentiated inputs only.
         let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                CustomFunctionJvpRule::Absent,
-                true,
-            )),
+            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
             array_ir_custom_vjp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2595,7 +2580,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_function [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2625,16 +2610,13 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_of_a_custom_function_payload() {
+    fn test_array_ir_batching_of_a_composite_payload() {
         // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
         // keeping every rule attached in region order.
         let mut regions = array_ir_custom_jvp_regions();
         regions.extend(array_ir_custom_vjp_regions().into_iter().skip(1));
         let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                CustomFunctionJvpRule::Explicit,
-                true,
-            )),
+            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, true)),
             regions,
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2642,7 +2624,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_function [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = composite [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2712,7 +2694,7 @@ mod tests {
     #[test]
     fn test_array_ir_batching_of_a_linear_call_payload() {
         // The executable linear call threads the mapped extent as one more leading residual, which is the precedent
-        // the custom-function carriers follow with their non-differentiated input split.
+        // the composite carriers follow with their non-differentiated input split.
         let array_type = ArrayType::scalar(DataType::F64);
         let identity_program = || -> TestProgram {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -2744,7 +2726,7 @@ mod tests {
         assert_eq!(output, linear);
     }
 
-    /// Builds an array IR program holding one `custom_function` call with a JVP rule over a scalar input.
+    /// Builds an array IR program holding one `composite` call with a JVP rule over a scalar input.
     fn array_ir_custom_jvp_program() -> TestProgram {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let regions = array_ir_custom_jvp_regions()
@@ -2754,10 +2736,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output = builder
             .add_instruction(
-                ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                    CustomFunctionJvpRule::Explicit,
-                    false,
-                )),
+                ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 regions,
                 vec![input],
                 None,
@@ -2797,8 +2776,8 @@ mod tests {
                     let context = input.context().clone();
                     Ok(context
                         .bind(
-                            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                                CustomFunctionJvpRule::Explicit,
+                            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                                CompositeJvpRule::Explicit,
                                 false,
                             )),
                             array_ir_custom_jvp_regions(),
@@ -2819,7 +2798,7 @@ mod tests {
         assert_eq!(
             array_ir_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "operation `custom_function` is not transposable".to_string(),
+                message: "operation `composite` is not transposable".to_string(),
             }),
         );
     }
@@ -3562,13 +3541,13 @@ mod tests {
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::CustomFunction(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::Composite(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Rematerialize(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::ShardMap(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::CustomFunctionTranspose(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::LiftedCustomFunction(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::LiftedCustomFunctionTranspose(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::CompositeTranspose(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::LiftedComposite(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::LiftedCompositeTranspose(_) => MemberKindSignature::RegionForwarding,
         }
     }
 
@@ -3732,17 +3711,14 @@ mod tests {
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
             (
-                ArrayIrOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                    CustomFunctionJvpRule::Explicit,
+                ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(
+                    CompositeJvpRule::Explicit,
                     false,
                 )),
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                    CustomFunctionJvpRule::Absent,
-                    true,
-                )),
+                ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
                 MemberKindSignature::RegionForwarding,
             ),
             (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
@@ -3766,11 +3742,11 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(array_ir_rules.reference())),
+                ArrayIrOperation::Composite(CompositeCallOperation::new(array_ir_rules.reference())),
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::new(
+                ArrayIrOperation::CompositeTranspose(CompositeTransposeOperation::new(
                     array_ir_rules.reference(),
                     0,
                     Vec::new(),
@@ -3779,13 +3755,13 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::from(ArrayOperation::CustomFunction(CustomFunctionOperation::new(
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeCallOperation::new(
                     member_rules.reference(),
                 ))),
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::from(ArrayOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::new(
+                ArrayIrOperation::from(ArrayOperation::CompositeTranspose(CompositeTransposeOperation::new(
                     member_rules.reference(),
                     0,
                     Vec::new(),

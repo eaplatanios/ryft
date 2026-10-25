@@ -6,8 +6,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayType, AsArrayType, Dimension, DimensionType,
-    DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType, Dimension,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -370,7 +370,7 @@ pub trait Reshape<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn reshape_to_sizes(&self, output_sizes: &[isize]) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let input_count = self.r#type().as_array_type()?.shape().element_count()?.ok_or_else(|| {
             TypeError::invalid(format!(
@@ -429,7 +429,7 @@ pub trait Reshape<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -450,7 +450,7 @@ pub trait Reshape<T = <Self as Capability>::Universe>: Capability + Sized {
     ///   - `axis`: Position of the inserted axis, normalized against the result rank.
     fn expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -473,7 +473,7 @@ pub trait Reshape<T = <Self as Capability>::Universe>: Capability + Sized {
     ///   - `axes`: Input axes to remove; each must have the statically known size one.
     fn squeeze<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -501,7 +501,7 @@ pub trait Reshape<T = <Self as Capability>::Universe>: Capability + Sized {
     /// becomes scalar; a shape with no singleton axes is unchanged.
     fn squeeze_all(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let axes = self
             .r#type()
@@ -1124,8 +1124,8 @@ impl_differentiable_operation! {
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
 /// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
-/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
-/// array and dimension members can implement it as well.
+/// provided functions only require views of the receiver's type (e.g., [`ArrayMemberType`]), so that other universes
+/// with array and dimension members can implement it as well.
 ///
 /// # Examples
 ///
@@ -1207,7 +1207,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///     exact extents rather than capacity bounds. Inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>,
     {
         // Validate the requested shape before staging any dimension constant, so that an invalid element count
         // leaves no dead dimension literals behind in a trace.
@@ -1227,7 +1227,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant>
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>
             + DimensionSize
             + ValueProjection<DimensionType, Projected: Mul>,
     {
@@ -1267,7 +1267,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
     fn dynamic_expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;

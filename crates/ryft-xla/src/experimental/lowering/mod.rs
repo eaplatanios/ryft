@@ -705,7 +705,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
             ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
-            Print, Assert, Guard, Cast, CustomCall, CustomFunction, CustomFunctionTranspose,
+            Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
         )
     }
 }
@@ -775,12 +775,12 @@ impl LowerableOperation for XlaOperation {
             Condition,
             While,
             Scan,
-            CustomFunction,
-            CustomFunctionTranspose,
+            Composite,
+            CompositeTranspose,
             LinearCall,
             Rematerialize,
-            LiftedCustomFunction,
-            LiftedCustomFunctionTranspose,
+            LiftedComposite,
+            LiftedCompositeTranspose,
             JitCall,
             ShardMap => boxed,
         )

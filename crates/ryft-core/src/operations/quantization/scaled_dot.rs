@@ -1,6 +1,6 @@
 use ryft_macros::capability;
 
-use crate::arrays::AsArrayType;
+use crate::arrays::ArrayMemberType;
 use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
 use crate::operations::Capability;
 use crate::programs::ValueDomainDispatch;
@@ -345,7 +345,7 @@ pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
         preferred_element_type: Option<DataType>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         for value in [self, rhs, lhs_scale, rhs_scale] {
             if value.r#type().as_array_type()?.rank() != 3 {

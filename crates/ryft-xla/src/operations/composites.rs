@@ -1,13 +1,13 @@
 use ryft_core::{
-    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomFunctionOperation,
-    CustomFunctionTransposeOperation, Operation, Parameter, ProgramError, RematerializationOptimizationBarrier, Typed,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeCallOperation, CompositeTransposeOperation,
+    Operation, Parameter, ProgramError, RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
-impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CustomFunctionOperation<V, RegionOperation, S>
+impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeCallOperation<V, RegionOperation, S>
 where
     Self: Operation,
 {
@@ -20,20 +20,20 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let [primal, ..] = lowerer.regions.as_slice() else {
             return Err(LoweringError::UnsupportedOp {
-                op: format!("{CUSTOM_FUNCTION_OPERATION_NAME} expected a primal region but got no regions"),
+                op: format!("{COMPOSITE_OPERATION_NAME} expected a primal region but got no regions"),
             });
         };
         if lowerer.regions.len() != self.region_slots().len() {
             return Err(LoweringError::UnsupportedOp {
                 op: format!(
                     "{} expected {} attached regions but got {}",
-                    CUSTOM_FUNCTION_OPERATION_NAME,
+                    COMPOSITE_OPERATION_NAME,
                     self.region_slots().len(),
                     lowerer.regions.len(),
                 ),
             });
         }
-        // Custom function regions are traced through fresh-root contexts whose local capture tables are discarded, so
+        // Composite call regions are traced through fresh-root contexts whose local capture tables are discarded, so
         // they can never legally reference the enclosing function's captures (the trace boundary rejects bodies that
         // register captures). Lowering the primal region with an empty capture namespace turns any capture-referencing
         // constant that still sneaks in into a loud `MissingCapturedConstant` error instead of silently aliasing
@@ -56,8 +56,7 @@ where
     }
 }
 
-impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation
-    for CustomFunctionTransposeOperation<V, RegionOperation, S>
+impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeTransposeOperation<V, RegionOperation, S>
 where
     Self: Operation,
 {
@@ -70,7 +69,7 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "a `{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` has no forward program and cannot be lowered to \
+                "a `{COMPOSITE_TRANSPOSE_OPERATION_NAME}` has no forward program and cannot be lowered to \
                  StableHLO; transpose it before lowering",
             ),
         }
@@ -89,12 +88,12 @@ mod tests {
     use crate::{LoweringError, to_mlir_module_for_program};
 
     #[test]
-    fn test_custom_function_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{CustomFunctionJvpRule, CustomFunctionOperation, PrintOperation};
+    fn test_composite_lowering_inlines_only_the_primal_program() {
+        use ryft_core::{CompositeCallOperation, CompositeJvpRule, PrintOperation};
 
-        // A retained `custom_function` call lowers only its primal program and threads its effects onto the
-        // enclosing ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked
-        // here by the multiplies on the tangent and cotangent sides) reaches the emitted module.
+        // A retained `composite` call lowers only its primal program and threads its effects onto the enclosing
+        // ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked here by the
+        // multiplies on the tangent and cotangent sides) reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
             let mut builder = ArrayIrXlaProgramBuilder::new();
@@ -150,13 +149,10 @@ mod tests {
                 .unwrap()
         };
         for (operation, rules) in [
-            (CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Explicit, false), vec![&jvp]),
+            (CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false), vec![&jvp]),
+            (CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true), vec![&forward, &backward]),
             (
-                CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Absent, true),
-                vec![&forward, &backward],
-            ),
-            (
-                CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Explicit, true),
+                CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, true),
                 vec![&jvp, &forward, &backward],
             ),
         ] {
@@ -164,9 +160,8 @@ mod tests {
             let mut regions = vec![builder.import_region(primal.entry_region_ref())];
             regions.extend(rules.into_iter().map(|rule| builder.import_region(rule.entry_region_ref())));
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder
-                .add_instruction(XlaOperation::CustomFunction(operation), regions, vec![input], None)
-                .unwrap()[0];
+            let output =
+                builder.add_instruction(XlaOperation::Composite(operation), regions, vec![input], None).unwrap()[0];
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
@@ -194,7 +189,7 @@ mod tests {
     #[test]
     fn test_custom_rule_lowering_inlines_only_the_primal_program() {
         use ryft_core::{
-            CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition, CustomRuleRegistration,
+            CompositeCallOperation, CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration,
         };
 
         // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
@@ -213,7 +208,7 @@ mod tests {
         let input = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::CustomFunction(CustomFunctionOperation::new(rules.reference())),
+                XlaOperation::Composite(CompositeCallOperation::new(rules.reference())),
                 vec![primal_region],
                 vec![input],
                 None,
@@ -239,14 +234,14 @@ mod tests {
         // An unresolved reverse-mode carrier has no forward program to lower.
         let mut builder = ArrayIrXlaProgramBuilder::new();
         let input = builder.add_input(vector_type.clone().into());
-        let carrier = CustomFunctionTransposeOperation::new(
+        let carrier = CompositeTransposeOperation::new(
             rules.reference(),
             0,
             vec![vector_type.clone().into()],
             vec![vector_type.clone().into()],
         );
         let output = builder
-            .add_instruction(XlaOperation::CustomFunctionTranspose(carrier), Vec::new(), vec![input], None)
+            .add_instruction(XlaOperation::CompositeTranspose(carrier), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -255,17 +250,17 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None)
                 .unwrap_err()
                 .to_string(),
-            "a `custom_function_transpose` has no forward program and cannot be lowered to StableHLO; transpose it \
+            "a `composite_transpose` has no forward program and cannot be lowered to StableHLO; transpose it \
              before lowering",
         );
     }
 
     #[test]
-    fn test_custom_function_transpose_lowering_is_rejected() {
-        use ryft_core::CustomFunctionTransposeOperation;
+    fn test_composite_transpose_lowering_is_rejected() {
+        use ryft_core::CompositeTransposeOperation;
 
-        // A custom function carrier with an attached backward rule is reverse-mode-only and must be transposed away
-        // before lowering, so lowering it is rejected.
+        // A composite transpose with an attached backward rule is reverse-mode-only and must be transposed away before
+        // lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
             let mut builder = ArrayIrXlaProgramBuilder::new();
@@ -281,7 +276,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = CustomFunctionTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+        let operation = CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
             1,
             vec![ArrayIrType::Array(vector_type.clone())],
             vec![ArrayIrType::Array(vector_type.clone())],
@@ -292,7 +287,7 @@ mod tests {
         let residual = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::CustomFunctionTranspose(operation),
+                XlaOperation::CompositeTranspose(operation),
                 vec![backward_region],
                 vec![tangent, residual],
                 None,
@@ -311,7 +306,7 @@ mod tests {
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
             Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "a `custom_function_transpose` has no forward program and cannot be lowered to \
+                if message == "a `composite_transpose` has no forward program and cannot be lowered to \
                                StableHLO; transpose it before lowering",
         ));
     }

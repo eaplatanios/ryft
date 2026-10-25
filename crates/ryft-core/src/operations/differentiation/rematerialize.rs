@@ -772,12 +772,12 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
+    use crate::operations::composites::functions::composite;
     use crate::operations::constants::one_like::OneLike;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
-    use crate::operations::custom_functions::functions::custom_function;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::dot::{Dot, DotDimensionNumbers, DotOperation};
@@ -2348,11 +2348,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_differentiation_custom_function_body() {
-        // The body calls a custom function whose JVP rule doubles the derivative of `sin` and whose VJP rule triples
-        // it. Forward mode through the call uses the JVP rule, while reverse mode uses the VJP rule, because the
-        // driver selects the rule with which the body is differentiated.
-        let sine = custom_function(|x: TestTracer| Ok(x.sin()?))
+    fn test_rematerialize_differentiation_composite_body() {
+        // The body calls a composite whose JVP rule doubles the derivative of `sin` and whose VJP rule triples it.
+        // Forward mode through the call uses the JVP rule, while reverse mode uses the VJP rule, because the driver
+        // selects the rule with which the body is differentiated.
+        let sine = composite(|x: TestTracer| Ok(x.sin()?))
             .with_jvp(|x, tangent| {
                 let tangent = x.cos()? * tangent;
                 Ok((x.sin()?, tangent.clone() + tangent))
@@ -2376,7 +2376,7 @@ mod tests {
     #[test]
     fn test_rematerialize_differentiation_call_body() {
         // A call with derivatives derived from its primal keeps the same values and derivatives inside a checkpoint.
-        let sine = custom_function(|x: TestTracer| Ok(x.sin()?)).with_jvp_from_primal();
+        let sine = composite(|x: TestTracer| Ok(x.sin()?)).with_jvp_from_primal();
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<TestTracer>| Ok(vec![sine.call(inputs[0].clone())?]),
             vec![ArrayType::scalar(DataType::F64)],
@@ -2386,7 +2386,7 @@ mod tests {
             body.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = custom_function [name=\"custom_function\"] %0 [
+                let %1:f64[] = composite [name=\"composite\"] %0 [
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
@@ -2404,7 +2404,7 @@ mod tests {
     fn test_rematerialize_differentiation_call_body_offload() {
         // Differentiating only x makes g(w) an all-known call. Its returned scale still follows the enclosing
         // checkpoint's storage decision, even though the callee itself needs no partial-evaluation split.
-        let scale = custom_function(|weight: TestTracer| Ok(weight.sin()?.tag("scale")?)).with_jvp_from_primal();
+        let scale = composite(|weight: TestTracer| Ok(weight.sin()?.tag("scale")?)).with_jvp_from_primal();
         let scalar_type = ArrayType::scalar(DataType::F64);
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?]),
@@ -2415,7 +2415,7 @@ mod tests {
             body.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = custom_function [name=\"custom_function\"] %1 [
+                let %2:f64[] = composite [name=\"composite\"] %1 [
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
@@ -2436,7 +2436,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = custom_function [name=\"custom_function\"] %1 [
+                let %2:f64[] = composite [name=\"composite\"] %1 [
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0

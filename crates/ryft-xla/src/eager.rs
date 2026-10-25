@@ -2853,12 +2853,12 @@ mod tests {
         }
     }
 
-    /// A custom call wrapped in a custom function with reverse-mode rules differentiates through the user-provided
-    /// rules while the primal executes the registered FFI handler, which is the documented pairing for differentiable
-    /// foreign kernels (the bare operation rejects differentiation).
+    /// A custom call wrapped in a composite with reverse-mode rules differentiates through the user-provided rules
+    /// while the primal executes the registered FFI handler, which is the documented pairing for differentiable foreign
+    /// kernels (the bare operation rejects differentiation).
     #[test]
-    fn test_eager_custom_call_differentiates_through_custom_function() {
-        use ryft_core::{CustomCall, CustomCallOperation, DomainTracer, custom_function};
+    fn test_eager_custom_call_differentiates_through_composite() {
+        use ryft_core::{CustomCall, CustomCallOperation, DomainTracer, composite};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2877,7 +2877,7 @@ mod tests {
             let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type.clone()]);
             Ok(CustomCall::custom_call(&operation, std::slice::from_ref(x))?.remove(0))
         };
-        let function = custom_function({
+        let function = composite({
             let add_one = add_one.clone();
             move |x: DomainTracer<ArrayXlaDomain<'_>>| add_one(&x)
         })
@@ -2894,12 +2894,12 @@ mod tests {
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
     }
 
-    /// A function built from a custom call with `CustomFunction::from_custom_call` executes the registered FFI
-    /// handler as its primal, through the projection of the array IR XLA domain onto arrays, and differentiates
-    /// through its user-provided rules.
+    /// A function built from a custom call with `Composite::from_custom_call` executes the registered FFI handler as
+    /// its primal, through the projection of the array IR XLA domain onto arrays, and differentiates through its
+    /// user-provided rules.
     #[test]
     fn test_eager_custom_call_differentiates_through_from_custom_call() {
-        use ryft_core::{CustomCall, CustomCallOperation, CustomFunction, DomainTracer};
+        use ryft_core::{Composite, CustomCall, CustomCallOperation, DomainTracer};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2917,7 +2917,7 @@ mod tests {
         // The forward rule calls the kernel again, and d(x + 1)/dx is the identity, so the backward rule passes the
         // cotangent through.
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type]);
-        let function = CustomFunction::from_custom_call(operation.clone()).with_vjp(
+        let function = Composite::from_custom_call(operation.clone()).with_vjp(
             move |inputs: Vec<Tracer<'_>>| Ok((CustomCall::custom_call(&operation, &inputs)?, ())),
             |(), cotangents| Ok(cotangents),
         );
@@ -2929,13 +2929,13 @@ mod tests {
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
     }
 
-    /// A custom function with a custom batching rule, written against the projection of the array IR XLA domain onto
-    /// arrays, executes through that projection, which lifts the regions of the calls that it binds. Its unbatched
-    /// derivative differentiates the primal, while batching it (before or after differentiating it) applies the rule
-    /// (here deliberately `2 · sin(x)` instead of `sin(x)`).
+    /// A composite with a custom batching rule, written against the projection of the array IR XLA domain onto arrays,
+    /// executes through that projection, which lifts the regions of the calls that it binds. Its unbatched derivative
+    /// differentiates the primal, while batching it (before or after differentiating it) applies the rule (here
+    /// deliberately `2 · sin(x)` instead of `sin(x)`).
     #[test]
-    fn test_eager_custom_function_with_batching_rule() {
-        use ryft_core::{BatchingLevelExtent, DomainTracer, custom_function};
+    fn test_eager_composite_with_batching_rule() {
+        use ryft_core::{BatchingLevelExtent, DomainTracer, composite};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2948,7 +2948,7 @@ mod tests {
         let tangent = f32_vector(&domain, &mesh, &[1.0, 1.0, 1.0]);
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
-        let function = custom_function(|x: Tracer<'_>| Ok(x.sin()?)).with_batching(
+        let function = composite(|x: Tracer<'_>| Ok(x.sin()?)).with_batching(
             |_: BatchingLevelExtent<Tracer<'_>>, x: Tracer<'_>, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)),
         );
         let close = |actual: &XlaArray<'_>, expected: &[f32]| {
@@ -2975,13 +2975,13 @@ mod tests {
         assert!(close(&value, &doubled(&sine)) && close(&derivative, &doubled(&cosine)));
     }
 
-    /// A custom function whose batching rule depends on its input batch axes (`2xy` when both inputs are mapped and
-    /// `3xy` otherwise) and is configured as axis-dependent batches its derivative in eager XLA with the exact per-item
+    /// A composite whose batching rule depends on its input batch axes (`2xy` when both inputs are mapped and `3xy`
+    /// otherwise) and is configured as axis-dependent batches its derivative in eager XLA with the exact per-item
     /// tangents `3(ẋy + xẏ)` when `y` is replicated but its tangent is mapped, which requires taking a diagonal on
     /// device.
     #[test]
-    fn test_eager_custom_function_with_axis_dependent_batching_rule() {
-        use ryft_core::{BatchingLevelExtent, DomainTracer, custom_function};
+    fn test_eager_composite_with_axis_dependent_batching_rule() {
+        use ryft_core::{BatchingLevelExtent, DomainTracer, composite};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2991,7 +2991,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
-        let function = custom_function(|(x, y): (Tracer<'_>, Tracer<'_>)| Ok(x * y)).with_axis_dependent_batching(
+        let function = composite(|(x, y): (Tracer<'_>, Tracer<'_>)| Ok(x * y)).with_axis_dependent_batching(
             |_: BatchingLevelExtent<Tracer<'_>>,
              (x, y): (Tracer<'_>, Tracer<'_>),
              (x_axis, y_axis): (BatchAxis, BatchAxis)| {

@@ -7,9 +7,9 @@ use ryft_macros::capability;
 use crate::arrays::types::dimensions::{DimensionComparison, DimensionRefinementFact};
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, AsArrayType, AsDimensionType,
-    Dimension, DimensionRefinements, DimensionType, DimensionValue, Layout, LinearResiduals, MeshAxisType, Shape,
-    Sharding, ShardingDimension, StridedLayout, TiledLayout,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType, ArrayTypeRefinements, Dimension,
+    DimensionMemberType, DimensionRefinements, DimensionType, DimensionValue, Layout, LinearResiduals, MeshAxisType,
+    Shape, Sharding, ShardingDimension, StridedLayout, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
@@ -373,7 +373,7 @@ pub trait Broadcast<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn broadcast_to<S: Into<Shape>>(&self, output_shape: S) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         self.broadcast_to_with_output_sharding(output_shape, None)
     }
@@ -393,7 +393,7 @@ pub trait Broadcast<T = <Self as Capability>::Universe>: Capability + Sized {
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -436,7 +436,7 @@ pub trait Broadcast<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn broadcast_leading<S: Into<Vec<usize>>>(&self, leading_shape: S) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         self.broadcast_leading_with_output_sharding(leading_shape, None)
     }
@@ -455,7 +455,7 @@ pub trait Broadcast<T = <Self as Capability>::Universe>: Capability + Sized {
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let mut dimensions = leading_shape.into().into_iter().map(Dimension::Static).collect::<Vec<_>>();
         dimensions.extend_from_slice(self.r#type().as_array_type()?.shape().dimensions());
@@ -488,7 +488,7 @@ pub trait Broadcast<T = <Self as Capability>::Universe>: Capability + Sized {
     ///     [`DynamicBroadcast::dynamic_broadcast_arrays`] when replication needs runtime dimension values.
     fn broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -1173,8 +1173,8 @@ impl_differentiable_operation! {
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
 /// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
-/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
-/// array and dimension members can implement it as well.
+/// provided functions only require views of the receiver's type (e.g., [`ArrayMemberType`]), so that other universes
+/// with array and dimension members can implement it as well.
 ///
 /// # Examples
 ///
@@ -1271,7 +1271,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         self.dynamic_broadcast_to_with_output_sharding(output_dimensions, None)
     }
@@ -1290,7 +1290,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let r#type = self.r#type();
         let input_type = r#type.as_array_type()?;
@@ -1317,7 +1317,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant> + DimensionSize,
     {
         self.dynamic_broadcast_leading_with_output_sharding(leading_dimensions, None)
     }
@@ -1336,7 +1336,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant> + DimensionSize,
     {
         let r#type = self.r#type();
         let input_type = r#type.as_array_type()?;
@@ -1388,7 +1388,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>,
     {
         let output_dimensions = output_sizes
             .iter()
@@ -1409,7 +1409,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant> + DimensionSize,
     {
         let context = self.domain();
         let leading_dimensions = leading_sizes
@@ -1449,7 +1449,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///     identities; distinct unknown dimensions are not assumed to have equal runtime values.
     fn dynamic_broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize,
     {
         let Some(first) = inputs.first() else {
             return Ok(Vec::new());

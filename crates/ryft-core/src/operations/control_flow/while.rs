@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, AsArrayType, DataType, MAX_DIMENSION_EXTENT,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType, DataType, MAX_DIMENSION_EXTENT,
     ShardableType, Sharding,
 };
 use crate::batching::{
@@ -954,7 +954,7 @@ fn batch_while<T, C, P, D>(
     inputs: &[P::Batch],
 ) -> Result<Vec<P::Batch>, BatchingError>
 where
-    T: WhileType + AsArrayType,
+    T: WhileType + ArrayMemberType,
     C: Context<Type = T, Operation: From<WhileOperation<T>>>,
     P: BatchingPolicy<C>,
     D: BatchingDriver<C, P>,
@@ -1659,12 +1659,12 @@ fn rotated_discharge_regions<V: Value, O: Operation<Type = V::Type>>(
 /// boundary lets both operation families share the bounded-loop algorithm without making the generic control-flow rule
 /// inspect array IR variants.
 pub(crate) trait WhileResidualStackType:
-    DifferentiableType + TemporalResidualType + WhileType + AsArrayType + From<ArrayType>
+    DifferentiableType + TemporalResidualType + WhileType + ArrayMemberType + From<ArrayType>
 {
 }
 
-impl<T: DifferentiableType + TemporalResidualType + WhileType + AsArrayType + From<ArrayType>> WhileResidualStackType
-    for T
+impl<T: DifferentiableType + TemporalResidualType + WhileType + ArrayMemberType + From<ArrayType>>
+    WhileResidualStackType for T
 {
 }
 
@@ -3035,6 +3035,7 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
+    use crate::operations::composites::operations::CompositeTransposeOperation;
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
     use crate::operations::constants::iota::Iota;
@@ -3046,7 +3047,6 @@ mod tests {
         CountingBatchingDriver, DischargeCapture, DischargeCaptureOperation, TestIrOperation, TestIrValue,
         TestRegionLiveness, array, dimension,
     };
-    use crate::operations::custom_functions::operations::CustomFunctionTransposeOperation;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::logical::{AndOperation, OrOperation};
@@ -8071,7 +8071,7 @@ mod tests {
         let backward = body_builder.import_program(backward);
         body_builder
             .add_instruction(
-                TestIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::from_backward_region(
+                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
                     1,
                     Vec::new(),
                     Vec::new(),
@@ -8137,7 +8137,7 @@ mod tests {
                     },
                     body={
                         lambda %0:f64[], %1:f64[], %2:ref<f64[]> .
-                        let () = custom_function_transpose [leading_input_count=1] %2 [
+                        let () = composite_transpose [leading_input_count=1] %2 [
                             backward={
                                 lambda %0:ref<f64[]> .
                                 let %1:f64[] = const 1.0

@@ -880,16 +880,24 @@ impl From<DimensionRefinements> for ArrayTypeRefinements {
 /// [`Type`] universe whose types may describe arrays. Universe-parameterized array capabilities use this view in their
 /// provided functions to read the [`ArrayType`] of a value in either universe, so that those functions are available
 /// for homogeneous array values and for array IR values alike.
-pub trait AsArrayType: Type {
+pub trait ArrayMemberType: Type {
     /// Returns the [`ArrayType`] that this type describes, or a [`TypeError`] if it does not describe an array
     /// (e.g., a first-class dimension or a reference in the array IR universe).
     fn as_array_type(&self) -> Result<&ArrayType, TypeError>;
 }
 
-impl AsArrayType for ArrayType {
+impl ArrayMemberType for ArrayType {
     #[inline]
     fn as_array_type(&self) -> Result<&ArrayType, TypeError> {
         Ok(self)
+    }
+}
+
+impl ArrayMemberType for NoReferent {
+    #[inline]
+    fn as_array_type(&self) -> Result<&ArrayType, TypeError> {
+        // Reference-aware array code can request this view, but a referent-free universe never supplies a referent.
+        match *self {}
     }
 }
 
@@ -1517,6 +1525,16 @@ mod tests {
     fn test_array_type_as_referent() {
         assert_eq!(ArrayType::scalar(F32).as_referent(), None);
         assert_eq!(ArrayType::new_static(F64, [3]).as_referent(), None);
+    }
+
+    #[test]
+    fn test_array_type_as_array_type() {
+        let r#type = ArrayType::new_static(F32, [3]);
+        assert_eq!(r#type.as_array_type(), Ok(&r#type));
+
+        // Generic reference-aware code can use the same bound for a universe with no references.
+        fn assert_array_projection<T: ReferenceMemberType<Referent: ArrayMemberType>>() {}
+        assert_array_projection::<ArrayType>();
     }
 
     #[test]

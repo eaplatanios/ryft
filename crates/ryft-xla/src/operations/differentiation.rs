@@ -72,10 +72,10 @@ impl LowerableOperation for RematerializeOperation<ArrayIrType> {
                 ),
             });
         };
-        // Rematerialized bodies are traced through fresh-root contexts and lower with an empty capture namespace;
-        // refer to the `CustomFunctionOperation` lowering for the rationale. A differentiated call recomputes values
-        // that the original computation also computes, so a barrier on its selected inputs keeps XLA from merging the
-        // two computations or from scheduling the recomputation before those inputs are available.
+        // Rematerialized bodies are traced through fresh-root contexts and lower with an empty capture namespace; refer
+        // to the `CompositeCallOperation` lowering for the rationale. A differentiated call recomputes values that the
+        // original computation also computes, so a barrier on its selected inputs keeps XLA from merging the two
+        // computations or from scheduling the recomputation before those inputs are available.
         let optimization_barrier = match self.differentiated() {
             true => self.optimization_barrier(),
             false => &RematerializationOptimizationBarrier::None,

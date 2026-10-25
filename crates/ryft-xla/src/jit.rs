@@ -3054,9 +3054,7 @@ mod tests {
 
     #[test]
     fn test_stateful_compiled_function_commits_accumulating_custom_backward_buffers() {
-        use ryft_core::{
-            ArraySliceAxis, CotangentAccumulator, MaybeZero, Slice, TranspositionContext, custom_function,
-        };
+        use ryft_core::{ArraySliceAxis, CotangentAccumulator, MaybeZero, Slice, TranspositionContext, composite};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3072,7 +3070,7 @@ mod tests {
         let element = |x: &Tracer<'_>| -> Result<Tracer<'_>, ProgramError> {
             Ok(ValueProjection::<ArrayType>::into_projected(x.clone())?.slice(&[1], &[2usize], &[1])?.into_value())
         };
-        let function = custom_function(move |x: Tracer<'_>| element(&x)).with_accumulating_vjp(
+        let function = composite(move |x: Tracer<'_>| element(&x)).with_accumulating_vjp(
             move |x: Tracer<'_>| Ok((element(&x)?, ())),
             |context: &mut TranspositionContext<XlaConstant, XlaOperation>,
              (): (),

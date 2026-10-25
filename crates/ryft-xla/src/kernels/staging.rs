@@ -11,11 +11,11 @@ use ryft_core::kernels::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
-    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, ConstantOperation, Context,
-    CotangentAccumulator, CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
-    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Domain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OperationProvider, OutputRegionProvenance,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeCallOperation, CompositeJvpRule,
+    ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Domain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver,
+    MaybeZero, Operation, OperationBoundaryPruning, OperationProvider, OutputRegionProvenance,
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
@@ -621,7 +621,7 @@ where
 }
 
 /// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
-/// active tangents and returns primal results followed by their tangents, as checked by a [`CustomFunctionOperation`]
+/// active tangents and returns primal results followed by their tangents, as checked by a [`CompositeCallOperation`]
 /// with a JVP rule region. The supplied rule owns derivative semantics; the mutable kernel body is never implicitly
 /// differentiated.
 pub fn stage_kernel_with_jvp<C, Extension>(
@@ -635,7 +635,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(CustomFunctionJvpRule::Explicit, false),
+        CompositeCallOperation::<XlaConstant, XlaOperation>::from_rule_regions(CompositeJvpRule::Explicit, false),
         vec![kernel_primal(definition)?, jvp.clone()],
         inputs,
     )
@@ -643,7 +643,7 @@ where
 
 /// Stages a native kernel primal with explicit canonical forward and backward VJP regions. The forward region returns
 /// primal outputs and residuals; the backward region receives residuals and output cotangents and returns input
-/// cotangents. A [`CustomFunctionOperation`] with reverse-mode rules validates these boundaries and retains its
+/// cotangents. A [`CompositeCallOperation`] with reverse-mode rules validates these boundaries and retains its
 /// reverse-mode-only contract.
 /// A forward rule may itself stage a kernel when its primal must execute natively during differentiation.
 pub fn stage_kernel_with_vjp<C, Extension>(
@@ -658,7 +658,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(CustomFunctionJvpRule::Absent, true),
+        CompositeCallOperation::<XlaConstant, XlaOperation>::from_rule_regions(CompositeJvpRule::Absent, true),
         vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
         inputs,
     )
@@ -680,9 +680,9 @@ where
     C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
     Extension: KernelExtension + Into<XlaKernelExtension>,
     S: CustomRuleSource<XlaConstant, XlaOperation>,
-    XlaOperation: From<CustomFunctionOperation<XlaConstant, XlaOperation, S>>,
+    XlaOperation: From<CompositeCallOperation<XlaConstant, XlaOperation, S>>,
 {
-    context.bind(CustomFunctionOperation::new(rules), vec![kernel_primal(definition)?], inputs)
+    context.bind(CompositeCallOperation::new(rules), vec![kernel_primal(definition)?], inputs)
 }
 
 /// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the
@@ -734,7 +734,7 @@ where
     stage_kernel_with_jvp(context, definition, &jvp, inputs)
 }
 
-/// Builds the ordinary functional primal region shared by canonical custom function carriers.
+/// Builds the ordinary functional primal region shared by canonical composite carriers.
 fn kernel_primal<Extension: KernelExtension + Into<XlaKernelExtension>>(
     definition: &KernelDefinition<Extension>,
 ) -> Result<FlatXlaProgram, ProgramError> {
@@ -1699,7 +1699,7 @@ pub(crate) mod tests {
             vec![scalar],
         )
         .unwrap();
-        assert_eq!(program.instructions()[0].operation().name(), "custom_function");
+        assert_eq!(program.instructions()[0].operation().name(), "composite");
         assert_eq!(program.instructions()[0].regions().len(), 2);
         assert_eq!(execute_derivative(&program.jvp().unwrap(), &[3.0, 4.0]), vec![3.0, 8.0]);
     }
@@ -1749,14 +1749,14 @@ pub(crate) mod tests {
         .unwrap();
         // Both calls render the same, because rendering does not show where a call's rules come from, so only the
         // operation variants distinguish the definition registered in this family from the lifted member definition.
-        assert!(matches!(native_program.instructions()[0].operation(), XlaOperation::CustomFunction(_)));
-        assert!(matches!(member_program.instructions()[0].operation(), XlaOperation::LiftedCustomFunction(_)));
+        assert!(matches!(native_program.instructions()[0].operation(), XlaOperation::Composite(_)));
+        assert!(matches!(member_program.instructions()[0].operation(), XlaOperation::LiftedComposite(_)));
         for program in [native_program, member_program] {
             assert_eq!(
                 program.to_string(),
                 indoc! {"
                     lambda %0:f32[] .
-                    let %1:f32[] = custom_function [name=\"double\"] %0 [
+                    let %1:f32[] = composite [name=\"double\"] %0 [
                         primal={
                             lambda %0:f32[] .
                             let %1:f32[] = kernel_call [
@@ -1824,7 +1824,7 @@ pub(crate) mod tests {
             vec![scalar],
         )
         .unwrap();
-        assert_eq!(program.instructions()[0].operation().name(), "custom_function");
+        assert_eq!(program.instructions()[0].operation().name(), "composite");
         assert_eq!(program.instructions()[0].regions().len(), 3);
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let input = context.input(program.input_types()[0].clone());

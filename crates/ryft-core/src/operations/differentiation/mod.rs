@@ -13,8 +13,8 @@
 //! Outside of differentiation, all of these operations are transparent. That is, interpretation and backend lowering
 //! execute the forward map of a linear call when it has one and pass the inputs of a gradient barrier through
 //! unchanged, while under differentiation a gradient barrier produces zero tangents. Functions with custom derivative
-//! rules live in the [`custom_functions`](crate::operations::custom_functions) module, and the differentiation
-//! transforms themselves live in the [`differentiation`](crate::differentiation) module.
+//! rules live in the [`composites`](crate::operations::composites) module, and the differentiation transforms
+//! themselves live in the [`differentiation`](crate::differentiation) module.
 //!
 //! # Examples
 //!

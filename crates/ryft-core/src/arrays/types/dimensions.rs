@@ -1821,13 +1821,13 @@ impl TryFrom<&Shape> for StaticShape {
 /// [`Type`] universe whose types may describe first-class dimensions. Universe-parameterized dimension-valued
 /// capabilities use this view in their provided functions to read the [`DimensionType`] of a value in any universe
 /// that has first-class dimensions, so that those functions do not depend on one particular universe.
-pub trait AsDimensionType: Type {
+pub trait DimensionMemberType: Type {
     /// Returns the [`DimensionType`] that this type describes, or a [`TypeError`] if it does not describe a first-class
     /// dimension (e.g., an array or a reference in the array IR universe).
     fn as_dimension_type(&self) -> Result<&DimensionType, TypeError>;
 }
 
-impl AsDimensionType for DimensionType {
+impl DimensionMemberType for DimensionType {
     #[inline]
     fn as_dimension_type(&self) -> Result<&DimensionType, TypeError> {
         Ok(self)

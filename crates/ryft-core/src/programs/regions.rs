@@ -1186,8 +1186,8 @@ pub enum RegionRole {
     Rule,
 
     /// The [`Region`] represents a dormant transformation rule that a later transform of the owning operation executes
-    /// (e.g., the attached rule of a [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation),
-    /// which transposition replays). Like a [`Rule`](Self::Rule) region, it does not execute during ordinary
+    /// (e.g., the attached rule of a [`CompositeTransposeOperation`](crate::CompositeTransposeOperation), which
+    /// transposition replays). Like a [`Rule`](Self::Rule) region, it does not execute during ordinary
     /// interpretation, so its [`EffectClasses`] do not belong to the owning computation. Unlike a [`Rule`](Self::Rule)
     /// region though, a region with effects or deferred work makes the owning operation carry
     /// [deferred work](crate::Effects#deferred-work), so that transforms retain the operation (e.g., dead code

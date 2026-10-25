@@ -15,11 +15,11 @@ pub mod attention;
 pub mod collectives;
 pub mod comparisons;
 pub mod complex;
+pub mod composites;
 pub mod constants;
 pub mod control_flow;
 pub mod cumulative;
 pub mod custom_call;
-pub mod custom_functions;
 pub mod debugging;
 pub mod differentiation;
 pub mod dimensions;
@@ -68,6 +68,15 @@ pub use complex::{
     ConjugateOperation, IMAGINARY_OPERATION_NAME, Imaginary, ImaginaryOperation, REAL_OPERATION_NAME, Real,
     RealOperation,
 };
+pub use composites::{
+    BatchingRuleConsistencyError, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite,
+    CompositeBatching, CompositeCallOperation, CompositeJvp, CompositeJvpRule, CompositeTransposeOperation,
+    CompositeVjp, CustomCallPrimal, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration,
+    CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer, DefaultBatching, DefaultJvp, DefaultVjp, JvpFromPrimal,
+    LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration, WithAccumulatingVjp,
+    WithAxisDependentBatching, WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp,
+    check_batching_rule_consistency, composite,
+};
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
     DynamicIota, DynamicOne, DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME,
@@ -82,15 +91,6 @@ pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, Cumu
 pub use custom_call::{
     CUSTOM_CALL_OPERATION_NAME, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
     CustomCallInputOutputAlias, CustomCallOperation, CustomCallUnrolling,
-};
-pub use custom_functions::{
-    BatchingRuleConsistencyError, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
-    CustomCallPrimal, CustomFunction, CustomFunctionBatching, CustomFunctionJvp, CustomFunctionJvpRule,
-    CustomFunctionOperation, CustomFunctionTransposeOperation, CustomFunctionVjp, CustomRuleDefinition,
-    CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer,
-    DefaultBatching, DefaultJvp, DefaultVjp, JvpFromPrimal, LiftedCustomRules, UnavailableCustomRules,
-    WeakCustomRuleRegistration, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
-    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, check_batching_rule_consistency, custom_function,
 };
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
@@ -203,12 +203,13 @@ pub use trigonometric::{
 /// `Typed<Type = T>` alongside a universe-parameterized capability bound at `T`, because the resulting
 /// equality makes bounds on `V::Type` unusable.
 ///
-/// Provided functions that inspect the type of their receiver therefore do not pin the universe
-/// of their capability. Instead, they bound a view of that type, such as [`AsArrayType`](crate::AsArrayType) or
-/// [`AsDimensionType`](crate::AsDimensionType) (e.g., `Self: Typed<Type: AsArrayType>`), so that every universe whose
-/// types offer that view inherits them. Implementations name their universe explicitly (e.g., `Add<ArrayType>`), and a
-/// blanket implementation over values of several universes introduces that universe as its own type parameter (e.g.,
-/// the staging implementation of [`ReferenceAddUpdate`], which serves every universe that has reference members).
+/// Provided functions that inspect the type of their receiver therefore do not pin the universe of their
+/// capability. Instead, they bound a view of that type, such as [`ArrayMemberType`](crate::ArrayMemberType) or
+/// [`DimensionMemberType`](crate::DimensionMemberType) (e.g., `Self: Typed<Type: ArrayMemberType>`), so that every
+/// universe whose types offer that view inherits them. Implementations name their universe explicitly (e.g.,
+/// `Add<ArrayType>`), and a blanket implementation over values of several universes introduces that universe as its own
+/// type parameter (e.g., the staging implementation of [`ReferenceAddUpdate`], which serves every universe that has
+/// reference members).
 ///
 /// # The `capability` Attribute
 ///

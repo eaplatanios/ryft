@@ -1406,9 +1406,9 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     /// forward-mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
     /// [`Self::jvp`], whose tangent computation must support execution as a pushforward. This rule's tangent
     /// computation need only support transposition (e.g., it may retain a custom backward program in a
-    /// [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation), which cannot be executed as a
-    /// pushforward). Callers constructing an executable JVP must therefore use [`Self::jvp`] with a forward-selected
-    /// context and driver.
+    /// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation), which cannot be executed as a pushforward).
+    /// Callers constructing an executable JVP must therefore use [`Self::jvp`] with a forward-selected context and
+    /// driver.
     ///
     /// The default delegates to [`Self::jvp`], deriving reverse mode from the same derivative rule as forward mode.
     /// Override this function when reverse mode needs a custom backward program or different primal computations and
@@ -3788,7 +3788,7 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::{impl_guardless_operation, impl_non_transposable_operation};
     use crate::operations::{
-        AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, LinearCallOperation, Mul,
+        AddOperation, CompositeTransposeOperation, ConditionOperation, CosOperation, LinearCallOperation, Mul,
         MulOperation, NegOperation, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient,
@@ -3940,7 +3940,7 @@ pub(crate) mod tests {
                 Type = ArrayType,
                 Operation: From<MulOperation<ArrayType>>
                                + From<AddOperation<ArrayType>>
-                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
+                               + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
             >,
     > DifferentiableOperation<C> for CustomCubeOperation
     {
@@ -3988,7 +3988,7 @@ pub(crate) mod tests {
                 vec![Placeholder; 2],
                 vec![Placeholder],
             )?;
-            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
                 1,
                 vec![input.r#type().into_owned()],
                 vec![input.r#type().into_owned()],
@@ -4065,7 +4065,7 @@ pub(crate) mod tests {
                 Type = ArrayType,
                 Operation: From<MulOperation<ArrayType>>
                                + From<AddOperation<ArrayType>>
-                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
+                               + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
             >,
     > DifferentiableOperation<C> for CustomWeightedCubeOperation
     {
@@ -4137,7 +4137,7 @@ pub(crate) mod tests {
                 vec![Placeholder; 3],
                 vec![Placeholder; 2],
             )?;
-            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
                 2,
                 vec![value_type.clone(); 2],
                 vec![value_type.clone()],
@@ -4220,8 +4220,7 @@ pub(crate) mod tests {
     impl<
         C: Context<
                 Type = ArrayType,
-                Operation: From<AddOperation<ArrayType>>
-                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
+                Operation: From<AddOperation<ArrayType>> + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
             >,
     > DifferentiableOperation<C> for RuleMarkerOperation
     {
@@ -4252,7 +4251,7 @@ pub(crate) mod tests {
                 vec![Placeholder],
                 vec![Placeholder],
             )?;
-            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
                 0,
                 vec![value_type.clone()],
                 vec![value_type],
@@ -4322,8 +4321,7 @@ pub(crate) mod tests {
     impl<
         C: Context<
                 Type = ArrayType,
-                Operation: From<RuleMarkerOperation>
-                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
+                Operation: From<RuleMarkerOperation> + From<CompositeTransposeOperation<C::Constant, C::Operation>>,
             >,
     > DifferentiableOperation<C> for NestedRuleOperation
     {
@@ -4351,7 +4349,7 @@ pub(crate) mod tests {
                 vec![Placeholder],
                 vec![Placeholder],
             )?;
-            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+            let carrier = CompositeTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
                 0,
                 vec![value_type.clone()],
                 vec![value_type],
@@ -5141,7 +5139,7 @@ pub(crate) mod tests {
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %0 %0
                     %3:f64[] = mul %2 %0
-                    %4:f64[] = custom_function_transpose [leading_input_count=1] %0 %1 [
+                    %4:f64[] = composite_transpose [leading_input_count=1] %0 %1 [
                         backward={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = mul %0 %0
@@ -5222,7 +5220,7 @@ pub(crate) mod tests {
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = mul %0 %0
                             %3:f64[] = mul %2 %0
-                            %4:f64[] = custom_function_transpose [leading_input_count=1] %0 %1 [
+                            %4:f64[] = composite_transpose [leading_input_count=1] %0 %1 [
                                 backward={
                                     lambda %0:f64[], %1:f64[] .
                                     let %2:f64[] = mul %0 %0

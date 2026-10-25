@@ -154,11 +154,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, ArrayType, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
-        ComparisonDirection, ConditionOperation, CustomFunctionTransposeOperation, DataType, Dimension,
-        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
-        GuardOperation, MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder,
-        PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape,
-        Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation, ZeroOperation,
+        ComparisonDirection, CompositeTransposeOperation, ConditionOperation, DataType, Dimension, DimensionBounds,
+        DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, GuardOperation,
+        MeshAxisType, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder, PrintOperation,
+        ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape, Sharding,
+        ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation, ZeroOperation,
     };
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -766,7 +766,7 @@ mod tests {
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CustomFunctionTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
+                    CompositeTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
                         0,
                         vec![scalar_type.clone().into()],
                         vec![scalar_type.clone().into()],

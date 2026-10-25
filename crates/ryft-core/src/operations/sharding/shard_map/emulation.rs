@@ -35,10 +35,10 @@
 //!     interpretation does on every device. Their inputs must have the same type on every device (including the
 //!     runtime length of a `scan`, whose type is its extent), and the devices must agree on every `while` and
 //!     `condition` predicate. Either way, a `scan` slice whose manual variation differs from that of its stack widens
-//!     both to the join of their variation, as eager interpretation does. `custom_function`,
-//!     `linear_call`, and `rematerialize` replay their primal region, and a nested `shard_map` extends the device set
-//!     by its own active manual axes. Devices that disagree cannot run such regions in lockstep, and every other region
-//!     operation that needs lockstep execution is rejected, both with [`ProgramError::UnsupportedOperation`].
+//!     both to the join of their variation, as eager interpretation does. `composite`, `linear_call`, and
+//!     `rematerialize` replay their primal region, and a nested `shard_map` extends the device set by its own active
+//!     manual axes. Devices that disagree cannot run such regions in lockstep, and every other region operation that
+//!     needs lockstep execution is rejected, both with [`ProgramError::UnsupportedOperation`].
 //!
 //! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region
 //! operation in lockstep requires knowing how its regions are sequenced (e.g., how many times and with which inputs),
@@ -66,11 +66,11 @@ use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAl
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
+use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
 use crate::operations::control_flow::scan::{ScanInterpretationDomain, ScanOperation};
 use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate};
-use crate::operations::custom_functions::operations::CUSTOM_FUNCTION_OPERATION_NAME;
 use crate::operations::differentiation::linear_call::LINEAR_CALL_OPERATION_NAME;
 use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_NAME;
 use crate::operations::reductions::{Reduce, ReductionKind};
@@ -420,7 +420,7 @@ where
         // The eager rules of these operations replay their primal region (i.e., region zero) over all of their inputs.
         if matches!(
             operation.name(),
-            CUSTOM_FUNCTION_OPERATION_NAME | LINEAR_CALL_OPERATION_NAME | REMATERIALIZE_OPERATION_NAME,
+            COMPOSITE_OPERATION_NAME | LINEAR_CALL_OPERATION_NAME | REMATERIALIZE_OPERATION_NAME,
         ) {
             return self.run_region(regions[0], inputs.to_vec());
         }
@@ -1364,10 +1364,10 @@ mod tests {
     use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatter;
     use crate::operations::collectives::parallel_vary::ParallelVary;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::custom_functions::operations::{
-        CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation,
+    use crate::operations::composites::operations::{
+        CompositeCallOperation, CompositeJvpRule, CompositeTransposeOperation,
     };
+    use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::differentiation::rematerialize::RematerializeOperation;
@@ -2371,10 +2371,9 @@ mod tests {
 
     #[test]
     fn test_shard_map_interpretation_replays_single_region_wrappers() {
-        // A `custom_function`, a `linear_call`, and a `rematerialize` call whose primal (i.e., first) regions reduce
-        // over the manual axis replay those regions in lockstep on both devices, as their eager rules replay them on
-        // one device. Each one replaces the values `1` and `2` of the two devices by their sum, which doubles every
-        // time.
+        // A `composite`, a `linear_call`, and a `rematerialize` call whose primal (i.e., first) regions reduce over the
+        // manual axis replay those regions in lockstep on both devices, as their eager rules replay them on one device.
+        // Each one replaces the values `1` and `2` of the two devices by their sum, which doubles every time.
         let mesh = manual_mesh();
         let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
         let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
@@ -2386,11 +2385,9 @@ mod tests {
         let identity = build_program(vec![local_type.clone()], |_, inputs| inputs.to_vec());
         let body = build_program(vec![local_type.clone()], |builder, inputs| {
             let primal = builder.import_program(reduce());
-            let custom_function = CustomFunctionOperation::<TestValue, TestOperation>::from_rule_regions(
-                CustomFunctionJvpRule::Primal,
-                false,
-            );
-            let value = builder.add_instruction(custom_function, vec![primal], inputs.to_vec(), None).unwrap()[0];
+            let composite =
+                CompositeCallOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Primal, false);
+            let value = builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap()[0];
             let regions = vec![builder.import_program(reduce()), builder.import_program(identity)];
             let linear_call = LinearCallOperation::<ArrayIrType>::new(0);
             let value = builder.add_instruction(linear_call, regions, vec![value], None).unwrap()[0];
@@ -2410,7 +2407,7 @@ mod tests {
     fn test_shard_map_interpretation_rejects_other_region_operations() {
         // A region operation whose regions reduce over the manual axis needs lockstep execution, which the emulator
         // provides only for the region operations whose region sequencing it knows. Here, the backward rule region of a
-        // `custom_function_transpose` carrier reduces over the manual axis.
+        // `composite_transpose` carrier reduces over the manual axis.
         let mesh = manual_mesh();
         let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
         let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
@@ -2419,7 +2416,7 @@ mod tests {
             build_program(vec![local_type.clone()], |builder, inputs| vec![add_sum_over_x(builder, &mesh, inputs[0])]);
         let body = build_program(vec![local_type.clone()], |builder, inputs| {
             let backward = builder.import_program(backward);
-            let carrier = CustomFunctionTransposeOperation::<TestValue, TestOperation>::from_backward_region(
+            let carrier = CompositeTransposeOperation::<TestValue, TestOperation>::from_backward_region(
                 0,
                 vec![local_type.clone()],
                 vec![local_type.clone()],
@@ -2430,7 +2427,7 @@ mod tests {
         assert_eq!(
             program.interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`shard_map` interpretation cannot run `custom_function_transpose` in lockstep across \
+                message: "`shard_map` interpretation cannot run `composite_transpose` in lockstep across \
                           devices, which its attached regions require because they use collectives over the manual \
                           axes"
                     .to_string(),

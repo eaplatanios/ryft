@@ -24,6 +24,9 @@ pub(crate) mod collectives;
 pub(crate) mod comparisons;
 /// StableHLO lowering of complex-number operations.
 pub(crate) mod complex;
+/// StableHLO lowering of Ryft composites: composite calls inline only their primal program, and composite transposes
+/// are rejected because transposition must replace them before lowering.
+pub(crate) mod composites;
 /// StableHLO lowering of constant and constructor operations (e.g., `zero`, `one`, `iota`, and literal constants).
 ///
 /// Eager evaluation and staging allow unbounded dimensions, but executable zero, one, iota, and like constructors need
@@ -37,8 +40,6 @@ pub(crate) mod control_flow;
 pub(crate) mod cumulative;
 /// StableHLO lowering of custom calls.
 pub(crate) mod custom_call;
-/// StableHLO lowering of custom functions.
-pub(crate) mod custom_functions;
 /// Host-callback debugging support: the StableHLO lowering of `print` to the `ryft.print` XLA FFI custom call, its
 /// handler, and its capturable print sink.
 pub mod debugging;

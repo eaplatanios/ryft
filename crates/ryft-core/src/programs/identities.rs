@@ -19,7 +19,7 @@ pub enum TypeIdentityKind {
 /// Assignment (SSA) atom identity in that types retain it before any value-producing instruction exists, while
 /// [`Region`](crate::Region) closure determines where the identity becomes available in the program graph. Identities
 /// own their metadata (i.e., they are `'static`), so that transform state that records them (e.g., the type-erased
-/// boundary layouts of custom function calls) can be stored and renamed without borrowing.
+/// boundary layouts of composite calls) can be stored and renamed without borrowing.
 pub trait TypeIdentity: 'static + Clone + Debug + Display + PartialEq + Eq {
     /// Returns a fresh [`TypeIdentity`] with the same user-facing metadata as `self`. [`Program`](crate::Program)
     /// relocation uses this function to rename [`TypeIdentity`]s defined inside an imported graph while preserving

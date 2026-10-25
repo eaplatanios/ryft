@@ -39,11 +39,11 @@ use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaDoma
 /// programs into shared private `func.func`s at lowering time.
 ///
 /// Eligible programs (see [`supports_structural_dedup`]) are keyed by their canonical rendering plus their complete
-/// flat input/output signature: type inference is deterministic and attached regions (control-flow bodies,
-/// custom-function programs, and nested `jit_call` callees) render contextually inside their instructions, so two
-/// programs that render identically with equal boundary types compute the same function and may share one emitted
-/// function — even when they are distinct staged programs produced by separate transform passes (for example the
-/// per-block primal and pullback programs of `grad(jit(f))` over repeated blocks).
+/// flat input/output signature: type inference is deterministic and attached regions (control-flow bodies, composite
+/// programs, and nested `jit_call` callees) render contextually inside their instructions, so two programs that render
+/// identically with equal boundary types compute the same function and may share one emitted function — even when they
+/// are distinct staged programs produced by separate transform passes (for example the per-block primal and pullback
+/// programs of `grad(jit(f))` over repeated blocks).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct JitCallProgramKey {
     /// Canonical [`Program`](ryft_core::Program) rendering (operation names, all bracketed attributes, and attached
@@ -167,9 +167,9 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
 }
 
 /// Counts `jit_call` callee occurrences in `program`, covering nested computations at every depth: attached regions
-/// (control-flow bodies, custom-function programs, and callee bodies) all live in the program's one canonical
-/// region arena, so the walk descends region edges without materializing nested programs. Shard-map body regions are
-/// intentionally skipped: their `jit_call`s lower with shard-local types and always inline.
+/// (control-flow bodies, composite programs, and callee bodies) all live in the program's one canonical region arena,
+/// so the walk descends region edges without materializing nested programs. Shard-map body regions are intentionally
+/// skipped: their `jit_call`s lower with shard-local types and always inline.
 ///
 /// `counts` accumulates the occurrence count and a representative materialized program per identity, `order` records
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root

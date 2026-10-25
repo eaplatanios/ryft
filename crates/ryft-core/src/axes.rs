@@ -315,8 +315,8 @@ pub trait NamedAxes: Context {
     /// Returns the named axes in scope at this context, innermost first, with each name once (i.e., without the
     /// bindings that nearer binders shadow), so that [`Self::named_axis`] resolves a name to the binding that this
     /// function returns for it. Functions that trace user code in a fresh trace instead of in the context that they
-    /// are called in (e.g., [`CustomFunction::call`](crate::CustomFunction::call) for its primal and rules) seed that
-    /// trace with these bindings, so that the code resolves the same names as it would in the calling context.
+    /// are called in (e.g., [`Composite::call`](crate::Composite::call) for its primal and rules) seed that trace
+    /// with these bindings, so that the code resolves the same names as it would in the calling context.
     fn named_axes(&self) -> Vec<(String, NamedAxis)>;
 }
 

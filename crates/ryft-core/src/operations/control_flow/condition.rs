@@ -2340,6 +2340,7 @@ mod tests {
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
+    use crate::operations::composites::operations::CompositeTransposeOperation;
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -2348,7 +2349,6 @@ mod tests {
         dimension, resolve_captures,
     };
     use crate::operations::control_flow::r#while::WhileOperation;
-    use crate::operations::custom_functions::operations::CustomFunctionTransposeOperation;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::DimensionAddOperation;
@@ -8403,7 +8403,7 @@ mod tests {
         let backward_region = true_builder.import_program(backward);
         true_builder
             .add_instruction(
-                TestIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::from_backward_region(
+                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
                     1,
                     Vec::new(),
                     Vec::new(),
@@ -8473,7 +8473,7 @@ mod tests {
                 let () = condition %1 %0 [
                     true={
                         lambda %0:ref<f64[]> .
-                        let () = custom_function_transpose [leading_input_count=1] %0 [
+                        let () = composite_transpose [leading_input_count=1] %0 [
                             backward={
                                 lambda %0:ref<f64[]> .
                                 let %1:f64[] = const 1.0
@@ -14442,7 +14442,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let tangent = builder.add_input(scalar.clone());
             let backward = builder.import_program(backward);
-            let carrier = CustomFunctionTransposeOperation::<Array, ArrayOperation<Array>>::from_backward_region(
+            let carrier = CompositeTransposeOperation::<Array, ArrayOperation<Array>>::from_backward_region(
                 0,
                 vec![scalar.clone()],
                 vec![scalar.clone()],

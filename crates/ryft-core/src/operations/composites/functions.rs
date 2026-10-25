@@ -1,7 +1,7 @@
-//! The [`CustomFunction`] builder, which pairs a primal closure with structured rule closures, together with the
-//! type-state markers of its configurations (e.g., [`WithJvp`] and [`WithVjp`]) and the adapters that register the
-//! structured closures as the flat, family-level rules of [`CustomRuleDefinition`]s. Each call of a function stages a
-//! [`CustomFunctionOperation`] with retained rules.
+//! The [`Composite`] builder, which pairs a primal closure with structured rule closures, together with the type-state
+//! markers of its configurations (e.g., [`WithJvp`] and [`WithVjp`]) and the adapters that register the structured
+//! closures as the flat, family-level rules of [`CustomRuleDefinition`]s. Each call of a composite stages a
+//! [`CompositeCallOperation`] with retained rules.
 
 // TODO(eaplatanios): Review this module.
 
@@ -27,14 +27,14 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::custom_call::{CustomCall, CustomCallOperation};
-use crate::operations::custom_functions::operations::{
-    CUSTOM_FUNCTION_OPERATION_NAME, CustomFunctionOperation, validate_non_differentiated_count,
+use crate::operations::composites::operations::{
+    COMPOSITE_OPERATION_NAME, CompositeCallOperation, validate_non_differentiated_count,
 };
-use crate::operations::custom_functions::rules::{
+use crate::operations::composites::rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer,
     derive_bijective_identity_renaming,
 };
+use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -49,7 +49,7 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 pub enum BatchingRuleConsistencyError {
     /// Broadcasting a replicated input changes a batched output, so the batching rule behind the function depends on
     /// its input batch axes beyond computing the batched function (refer to
-    /// [`CustomFunction::with_axis_dependent_batching`]).
+    /// [`Composite::with_axis_dependent_batching`]).
     #[error("broadcasting the replicated input leaf {input} changes the batched output leaf {output}")]
     Inconsistent {
         /// Index of the replicated input leaf whose broadcast changes the batched outputs.
@@ -64,24 +64,24 @@ pub enum BatchingRuleConsistencyError {
     Batching(#[from] BatchingError),
 }
 
-/// Forward-mode configuration of a [`CustomFunction`] without a configured forward-mode rule. A function without
+/// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
-/// with reverse-mode rules rejects forward mode (refer to [`custom_function`] for the rule selection).
+/// with reverse-mode rules rejects forward mode (refer to [`composite`] for the rule selection).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultJvp;
 
-/// Forward-mode configuration of a [`CustomFunction`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
+/// Forward-mode configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
 /// implementing `(x, ẋ) ↦ (y, ẏ)`.
 pub struct WithJvp<Jvp>(Arc<Jvp>);
 
-/// Forward-mode configuration of a [`CustomFunction`] whose forward-mode rule is derived from its primal (refer to
-/// [`CustomFunction::with_jvp_from_primal`]).
+/// Forward-mode configuration of a [`Composite`] whose forward-mode rule is derived from its primal (refer to
+/// [`Composite::with_jvp_from_primal`]).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct JvpFromPrimal;
 
-/// Forward-mode configuration of a [`CustomFunction`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
+/// Forward-mode configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
 /// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` with [`MaybeZero`] leaves, of which the structurally zero ones are
-/// [`MaybeZero::Zero`]s (refer to [`CustomFunction::with_symbolic_zero_jvp`]).
+/// [`MaybeZero::Zero`]s (refer to [`Composite::with_symbolic_zero_jvp`]).
 pub struct WithSymbolicZeroJvp<Tracer, Jvp> {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
     jvp: Arc<Jvp>,
@@ -90,13 +90,13 @@ pub struct WithSymbolicZeroJvp<Tracer, Jvp> {
     marker: PhantomData<fn() -> Tracer>,
 }
 
-/// Reverse-mode configuration of a [`CustomFunction`] without reverse-mode rules. Reverse mode then transposes the
+/// Reverse-mode configuration of a [`Composite`] without reverse-mode rules. Reverse mode then transposes the
 /// forward-mode rule, which is derived from the primal when none is configured.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultVjp;
 
-/// Reverse-mode configuration of a [`CustomFunction`] with user-supplied forward and backward (i.e., Vector-Jacobian
-/// Product or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`.
+/// Reverse-mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
+/// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`.
 pub struct WithVjp<Residual, Forward, Backward> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Arc<Forward>,
@@ -108,10 +108,10 @@ pub struct WithVjp<Residual, Forward, Backward> {
     marker: PhantomData<fn() -> Residual>,
 }
 
-/// Reverse-mode configuration of a [`CustomFunction`] with user-supplied forward and backward (i.e., Vector-Jacobian
-/// Product or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` with
+/// Reverse-mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
+/// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` with
 /// [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
-/// [`CustomFunction::with_symbolic_zero_vjp`]).
+/// [`Composite::with_symbolic_zero_vjp`]).
 pub struct WithSymbolicZeroVjp<Residual, Tracer, Forward, Backward> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Arc<Forward>,
@@ -124,9 +124,9 @@ pub struct WithSymbolicZeroVjp<Residual, Tracer, Forward, Backward> {
     marker: PhantomData<fn() -> (Residual, Tracer)>,
 }
 
-/// Reverse-mode configuration of a [`CustomFunction`] with a user-supplied forward rule closure implementing
-/// `x ↦ (y, r)` and an accumulating backward rule closure, which submits the input cotangents to their accumulators
-/// (refer to [`CustomFunction::with_accumulating_vjp`]).
+/// Reverse-mode configuration of a [`Composite`] with a user-supplied forward rule closure implementing `x ↦ (y, r)`
+/// and an accumulating backward rule closure, which submits the input cotangents to their accumulators (refer to
+/// [`Composite::with_accumulating_vjp`]).
 pub struct WithAccumulatingVjp<Residual, Tracer, Transposition, Forward, Backward> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Arc<Forward>,
@@ -140,12 +140,12 @@ pub struct WithAccumulatingVjp<Residual, Tracer, Transposition, Forward, Backwar
     marker: PhantomData<fn() -> (Residual, Tracer, Transposition)>,
 }
 
-/// Forward-mode configuration of a [`CustomFunction`] (i.e., [`DefaultJvp`], [`WithJvp`], [`WithSymbolicZeroJvp`], or
-/// [`JvpFromPrimal`]), which
-/// installs its forward-mode rule in the retained definition that a call registers for the operation family `(V, O)`.
-/// Its user-supplied rule is adapted to the flat interface of retained rules by tracing it, with the complete
-/// structured interface of the call, at the types of each specialization and replaying the traced program.
-pub trait CustomFunctionJvp<V: Value, O: Operation<Type = V::Type>, Input, Output>
+/// Forward-mode configuration of a [`Composite`] (i.e., [`DefaultJvp`], [`WithJvp`], [`WithSymbolicZeroJvp`], or
+/// [`JvpFromPrimal`]), which installs its forward-mode rule in the retained definition that a call registers for the
+/// operation family `(V, O)`. Its user-supplied rule is adapted to the flat interface of retained rules by tracing it,
+/// with the complete structured interface of the call, at the types of each specialization and replaying the traced
+/// program.
+pub trait CompositeJvp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -170,7 +170,7 @@ where
     ) -> CustomRuleDefinition<V, O>;
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CustomFunctionJvp<V, O, Input, Output> for DefaultJvp
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CompositeJvp<V, O, Input, Output> for DefaultJvp
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -189,7 +189,7 @@ where
     }
 }
 
-impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>, Input, Output> CustomFunctionJvp<V, O, Input, Output>
+impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>, Input, Output> CompositeJvp<V, O, Input, Output>
     for JvpFromPrimal
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -209,7 +209,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Jvp> CustomFunctionJvp<V, O, Input, Output> for WithJvp<Jvp>
+impl<V, O, Input, Output, Jvp> CompositeJvp<V, O, Input, Output> for WithJvp<Jvp>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -253,8 +253,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Jvp> CustomFunctionJvp<V, O, Input, Output>
-    for WithSymbolicZeroJvp<CustomRuleTracer<V, O>, Jvp>
+impl<V, O, Input, Output, Jvp> CompositeJvp<V, O, Input, Output> for WithSymbolicZeroJvp<CustomRuleTracer<V, O>, Jvp>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -303,21 +302,20 @@ where
     }
 }
 
-/// Reverse-mode configuration of a [`CustomFunction`] (i.e., [`DefaultVjp`], [`WithVjp`], [`WithSymbolicZeroVjp`], or
+/// Reverse-mode configuration of a [`Composite`] (i.e., [`DefaultVjp`], [`WithVjp`], [`WithSymbolicZeroVjp`], or
 /// [`WithAccumulatingVjp`]), which installs its reverse-mode rules in the retained definition that a call registers for
 /// the operation family `(V, O)`. Its user-supplied rules are adapted to the flat interface of retained rules as for
-/// [`CustomFunctionJvp`]. The backward rule receives the residuals with the structure that the forward rule returned
-/// for the same specialization. Different specializations of one call structure may return differently structured
-/// residuals, as long as residuals whose flat types are equal up to a renaming of their type identities (e.g., their
-/// dimension variables) always have the same structure; the forward rule is rejected otherwise.
-pub trait CustomFunctionVjp<V: Value, O: Operation<Type = V::Type>, Input, Output>
+/// [`CompositeJvp`]. The backward rule receives the residuals with the structure that the forward rule returned for the
+/// same specialization. Different specializations of one call structure may return differently structured residuals, as
+/// long as residuals whose flat types are equal up to a renaming of their type identities (e.g., their dimension
+/// variables) always have the same structure; the forward rule is rejected otherwise.
+pub trait CompositeVjp<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
     Output: Parameterized<CustomRuleTracer<V, O>>,
 {
-    /// Returns `definition` with these reverse-mode rules (refer to [`CustomFunctionJvp::configure`] for the
-    /// parameters).
+    /// Returns `definition` with these reverse-mode rules (refer to [`CompositeJvp::configure`] for the parameters).
     fn configure(
         &self,
         definition: CustomRuleDefinition<V, O>,
@@ -328,7 +326,7 @@ where
     ) -> CustomRuleDefinition<V, O>;
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CustomFunctionVjp<V, O, Input, Output> for DefaultVjp
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CompositeVjp<V, O, Input, Output> for DefaultVjp
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -347,7 +345,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
+impl<V, O, Input, Output, Residual, Forward, Backward> CompositeVjp<V, O, Input, Output>
     for WithVjp<Residual, Forward, Backward>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -391,7 +389,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> CustomRuleDefinition<V, O> {
-        let residual_structures = CustomFunctionResidualStructures::<V::Type, Residual::ParameterStructure>::default();
+        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, Forward>(
             self.forward.clone(),
             name,
@@ -434,7 +432,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
+impl<V, O, Input, Output, Residual, Forward, Backward> CompositeVjp<V, O, Input, Output>
     for WithSymbolicZeroVjp<Residual, CustomRuleTracer<V, O>, Forward, Backward>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -482,7 +480,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> CustomRuleDefinition<V, O> {
-        let residual_structures = CustomFunctionResidualStructures::<V::Type, Residual::ParameterStructure>::default();
+        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, Forward>(
             self.forward.clone(),
             name,
@@ -527,7 +525,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
+impl<V, O, Input, Output, Residual, Forward, Backward> CompositeVjp<V, O, Input, Output>
     for WithAccumulatingVjp<Residual, CustomRuleTracer<V, O>, TranspositionContext<V, O>, Forward, Backward>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -580,7 +578,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> CustomRuleDefinition<V, O> {
-        let residual_structures = CustomFunctionResidualStructures::<V::Type, Residual::ParameterStructure>::default();
+        let residual_structures = CompositeResidualStructures::<V::Type, Residual::ParameterStructure>::default();
         let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, Forward>(
             self.forward.clone(),
             name,
@@ -633,13 +631,13 @@ where
     }
 }
 
-/// Batching configuration of a [`CustomFunction`] without a custom batching rule. Batching a call structurally
-/// batches its primal region.
+/// Batching configuration of a [`Composite`] without a custom batching rule. Batching a call structurally batches its
+/// primal region.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DefaultBatching;
 
-/// Batching configuration of a [`CustomFunction`] with a user-supplied custom batching rule closure implementing
-/// `(extent, x, x_axes) ↦ (y, y_axes)` (refer to [`CustomFunction::with_batching`]).
+/// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
+/// `(extent, x, x_axes) ↦ (y, y_axes)` (refer to [`Composite::with_batching`]).
 pub struct WithBatching<Tracer, Rule> {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
     rule: Arc<Rule>,
@@ -648,9 +646,9 @@ pub struct WithBatching<Tracer, Rule> {
     marker: PhantomData<fn() -> Tracer>,
 }
 
-/// Batching configuration of a [`CustomFunction`] with a user-supplied custom batching rule closure implementing
+/// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
 /// `(extent, x, x_axes) ↦ (y, y_axes)` whose result may depend on its input batch axes (refer to
-/// [`CustomFunction::with_axis_dependent_batching`]).
+/// [`Composite::with_axis_dependent_batching`]).
 pub struct WithAxisDependentBatching<Tracer, Rule> {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
     rule: Arc<Rule>,
@@ -659,10 +657,10 @@ pub struct WithAxisDependentBatching<Tracer, Rule> {
     marker: PhantomData<fn() -> Tracer>,
 }
 
-/// Batching configuration of a [`CustomFunction`] (i.e., [`DefaultBatching`], [`WithBatching`], or
+/// Batching configuration of a [`Composite`] (i.e., [`DefaultBatching`], [`WithBatching`], or
 /// [`WithAxisDependentBatching`]), which installs its custom batching rule, if any, in the retained definition that a
 /// call registers for the operation family `(V, O)`.
-pub trait CustomFunctionBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
+pub trait CompositeBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -685,8 +683,7 @@ where
     ) -> CustomRuleDefinition<V, O>;
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CustomFunctionBatching<V, O, Input, Output>
-    for DefaultBatching
+impl<V: Value, O: Operation<Type = V::Type>, Input, Output> CompositeBatching<V, O, Input, Output> for DefaultBatching
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -704,8 +701,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Rule> CustomFunctionBatching<V, O, Input, Output>
-    for WithBatching<CustomRuleTracer<V, O>, Rule>
+impl<V, O, Input, Output, Rule> CompositeBatching<V, O, Input, Output> for WithBatching<CustomRuleTracer<V, O>, Rule>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -748,7 +744,7 @@ where
     }
 }
 
-impl<V, O, Input, Output, Rule> CustomFunctionBatching<V, O, Input, Output>
+impl<V, O, Input, Output, Rule> CompositeBatching<V, O, Input, Output>
     for WithAxisDependentBatching<CustomRuleTracer<V, O>, Rule>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -796,10 +792,10 @@ where
     }
 }
 
-/// Adapts the structured custom batching rule closure `rule` of a [`CustomFunction`] to the flat interface of retained
-/// batching rules: each invocation passes the closure the level's extent, the call's own batched inputs with the
-/// call's input structure, and their batch axes, and validates that its outputs and their batch axes have the call's
-/// output structure.
+/// Adapts the structured custom batching rule closure `rule` of a [`Composite`] to the flat interface of retained
+/// batching rules: each invocation passes the closure the level's extent, the call's own batched inputs with the call's
+/// input structure, and their batch axes, and validates that its outputs and their batch axes have the call's output
+/// structure.
 ///
 /// # Parameters
 ///
@@ -888,30 +884,30 @@ where
     }
 }
 
-/// Residual structures that the forward rule of one [`CustomFunction`] registration returned, from which its
-/// backward rule learns the structure of the residuals that it receives as flat leading inputs. The backward rule of
-/// each specialization is traced after the forward rule of that specialization, but specializations of one call
-/// structure may return differently structured residuals (e.g., collections whose lengths depend on the input shapes),
-/// so the structures are recorded by the flat residual types that the forward rule returned, and only two structures
-/// with equivalent flat residual types are ambiguous.
+/// Residual structures that the forward rule of one [`Composite`] registration returned, from which its backward rule
+/// learns the structure of the residuals that it receives as flat leading inputs. The backward rule of each
+/// specialization is traced after the forward rule of that specialization, but specializations of one call structure
+/// may return differently structured residuals (e.g., collections whose lengths depend on the input shapes), so the
+/// structures are recorded by the flat residual types that the forward rule returned, and only two structures with
+/// equivalent flat residual types are ambiguous.
 ///
 /// Flat residual types are compared up to a bijective renaming of their type identities, because the backward rule
 /// observes the residuals of a replay of the traced forward rule. Replaying a program that computes type identities
 /// (e.g., a dimension `n * n`) mints fresh identities, so the residual types that the backward rule observes differ
 /// from the recorded ones by exactly such a renaming.
-struct CustomFunctionResidualStructures<T, Structure> {
+struct CompositeResidualStructures<T, Structure> {
     /// Recorded flat residual types, each with the structure of the residuals that had them.
     structures: Arc<Mutex<Vec<(Vec<T>, Structure)>>>,
 }
 
-impl<T: Type, Structure: Clone + Debug + PartialEq> CustomFunctionResidualStructures<T, Structure> {
+impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<T, Structure> {
     /// Records that a forward rule returned residuals of the provided flat types with the provided structure.
     ///
     /// # Errors
     ///
     /// Returns a [`ParameterError`] when residuals of equivalent flat types were recorded with a different structure.
     fn record(&self, residual_types: Vec<T>, structure: Structure) -> Result<(), ParameterError> {
-        let mut structures = self.structures.lock().expect("custom function residual mutex is poisoned");
+        let mut structures = self.structures.lock().expect("composite residual mutex is poisoned");
         let recorded = structures
             .iter()
             .find(|(types, _)| derive_bijective_identity_renaming(types, &residual_types).is_some());
@@ -938,7 +934,7 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CustomFunctionResidualStruct
     fn get(&self, name: &str, residual_types: &[T]) -> Result<Structure, ProgramError> {
         self.structures
             .lock()
-            .expect("custom function residual mutex is poisoned")
+            .expect("composite residual mutex is poisoned")
             .iter()
             .find(|(types, _)| derive_bijective_identity_renaming(types, residual_types).is_some())
             .map(|(_, structure)| structure.clone())
@@ -950,21 +946,21 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CustomFunctionResidualStruct
     }
 }
 
-impl<T, Structure> Clone for CustomFunctionResidualStructures<T, Structure> {
+impl<T, Structure> Clone for CompositeResidualStructures<T, Structure> {
     fn clone(&self) -> Self {
         Self { structures: self.structures.clone() }
     }
 }
 
-impl<T, Structure> Default for CustomFunctionResidualStructures<T, Structure> {
+impl<T, Structure> Default for CompositeResidualStructures<T, Structure> {
     fn default() -> Self {
         Self { structures: Arc::new(Mutex::new(Vec::new())) }
     }
 }
 
-/// Adapts the structured reverse-mode forward closure `forward` of a [`CustomFunction`] to the flat interface of
-/// retained forward rules: each invocation traces the closure at the types of its primal inputs, records the structure
-/// of its residuals in `residual_structures`, and replays the traced program on the primal inputs.
+/// Adapts the structured reverse-mode forward closure `forward` of a [`Composite`] to the flat interface of retained
+/// forward rules: each invocation traces the closure at the types of its primal inputs, records the structure of its
+/// residuals in `residual_structures`, and replays the traced program on the primal inputs.
 ///
 /// # Parameters
 ///
@@ -980,7 +976,7 @@ fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     name: &Cow<'static, str>,
     input_structure: &Input::ParameterStructure,
     output_structure: &Output::ParameterStructure,
-    residual_structures: &CustomFunctionResidualStructures<V::Type, Residual::ParameterStructure>,
+    residual_structures: &CompositeResidualStructures<V::Type, Residual::ParameterStructure>,
     named_axes: &[(String, NamedAxis)],
 ) -> impl 'static
 + Fn(&[CustomRuleTracer<V, O>]) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
@@ -1253,8 +1249,8 @@ where
 /// `[outputs..., output_tangents...]`. Both halves of the closure's result must have the primal output structure
 /// `output_structure`, because flattened signatures cannot distinguish differently nested collections with identical
 /// leaf types, and the tangent placeholders of the leading `non_differentiated_count` inputs must be unused (refer to
-/// [`without_non_differentiated_tangent_inputs`]). The retained JVP rules of [`CustomFunction`] functions are traced
-/// with this function on their first derivative request.
+/// [`without_non_differentiated_tangent_inputs`]). The retained JVP rules of [`Composite`]s are traced with this
+/// function on their first derivative request.
 ///
 /// # Parameters
 ///
@@ -1380,7 +1376,7 @@ where
 
 /// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
 /// rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
-/// non-differentiated input has no tangent slot in the [`CustomFunctionOperation`] contract, so its tangent input is a
+/// non-differentiated input has no tangent slot in the [`CompositeCallOperation`] contract, so its tangent input is a
 /// placeholder that the rule must ignore. The traced program has inputs `[inputs..., input_tangents...]`, and the
 /// placeholders are the tangents at positions `input_count..input_count + non_differentiated_count`, which are
 /// projected away so that the remaining boundary is exactly `[inputs..., differentiated_input_tangents...]`.
@@ -1427,18 +1423,18 @@ fn without_non_differentiated_tangent_inputs<V: Value, O: Operation<Type = V::Ty
     Ok(pruned)
 }
 
-/// Retained definitions that one [`CustomFunction`] function registered, one per operation family, call structure
-/// (i.e., input and output parameter structure), and visible named axes. The registration handles live as long as the
-/// function, so every call staged by the function shares the specialization caches of its structure and named axes
-/// until the function is dropped.
+/// Retained definitions that one [`Composite`] registered, one per operation family, call structure (i.e., input and
+/// output parameter structure), and visible named axes. The registration handles live as long as the composite, so
+/// every call staged by the composite shares the specialization caches of its structure and named axes until the
+/// composite is dropped.
 #[derive(Default)]
-struct CustomFunctionRegistrations {
-    /// Registrations, each a [`CustomFunctionRegistration`] of some family and structure types.
+struct CompositeRegistrations {
+    /// Registrations, each a [`CompositeRegistration`] of some family and structure types.
     entries: Mutex<Vec<Box<dyn Any + Send>>>,
 }
 
-/// Retained definition that a [`CustomFunction`] function registered for one operation family and call structure.
-struct CustomFunctionRegistration<V: Typed + Parameter, O, InputStructure, OutputStructure> {
+/// Retained definition that a [`Composite`] registered for one operation family and call structure.
+struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStructure> {
     /// Structure of the calls' inputs.
     input_structure: InputStructure,
 
@@ -1452,7 +1448,7 @@ struct CustomFunctionRegistration<V: Typed + Parameter, O, InputStructure, Outpu
     registration: CustomRuleRegistration<V, O>,
 }
 
-impl CustomFunctionRegistrations {
+impl CompositeRegistrations {
     /// Returns a reference to the definition registered for the family `(V, O)`, the provided call structure, and the
     /// provided named axes, registering the definition returned by `register_fn` if there is none yet.
     fn get_or_register<V, O, InputStructure, OutputStructure, F>(
@@ -1470,10 +1466,10 @@ impl CustomFunctionRegistrations {
         CustomRuleRegistration<V, O>: Send,
         F: FnOnce() -> CustomRuleDefinition<V, O>,
     {
-        let mut entries = self.entries.lock().expect("custom function registration mutex is poisoned");
+        let mut entries = self.entries.lock().expect("composite registration mutex is poisoned");
         let existing = entries.iter().find_map(|entry| {
             entry
-                .downcast_ref::<CustomFunctionRegistration<V, O, InputStructure, OutputStructure>>()
+                .downcast_ref::<CompositeRegistration<V, O, InputStructure, OutputStructure>>()
                 .filter(|entry| {
                     &entry.input_structure == input_structure
                         && &entry.output_structure == output_structure
@@ -1484,7 +1480,7 @@ impl CustomFunctionRegistrations {
         existing.unwrap_or_else(|| {
             let registration = CustomRuleRegistration::new(register_fn());
             let reference = registration.reference();
-            entries.push(Box::new(CustomFunctionRegistration {
+            entries.push(Box::new(CompositeRegistration {
                 input_structure: input_structure.clone(),
                 output_structure: output_structure.clone(),
                 named_axes: named_axes.to_vec(),
@@ -1495,10 +1491,10 @@ impl CustomFunctionRegistrations {
     }
 }
 
-/// Function with custom derivative or batching rules, built by [`custom_function`]. It stores a primal closure together
-/// with an optional forward-mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
+/// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
+/// an optional forward-mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
 /// reverse-mode rules (refer to [`Self::with_vjp`]), and an optional batching rule (refer to [`Self::with_batching`]),
-/// and each [`call`](Self::call) stages one [`CustomFunctionOperation`] with retained rules over the traced primal.
+/// and each [`call`](Self::call) stages one [`CompositeCallOperation`] with retained rules over the traced primal.
 ///
 /// The rules are retained callbacks rather than traced programs: a call traces only its primal, and each rule is traced
 /// on the first derivative request of each specialization (e.g., each distinct input signature or batching level) and
@@ -1515,9 +1511,9 @@ impl CustomFunctionRegistrations {
 ///
 /// The forward-mode configuration is part of the type (i.e., `Jvp` is [`DefaultJvp`], [`WithJvp`], or
 /// [`JvpFromPrimal`]), so an explicit forward-mode rule and a forward-mode rule derived from the primal cannot both be
-/// configured, whatever the order of the configuration calls. Refer to the documentation of the [`custom_function`]
-/// function for the rule selection of every configuration.
-pub struct CustomFunction<Input, Output, Primal, Jvp = DefaultJvp, Vjp = DefaultVjp, Batching = DefaultBatching> {
+/// configured, whatever the order of the configuration calls. Refer to the documentation of the [`composite`] function
+/// for the rule selection of every configuration.
+pub struct Composite<Input, Output, Primal, Jvp = DefaultJvp, Vjp = DefaultVjp, Batching = DefaultBatching> {
     /// Closure computing the primal output value from the primal input value.
     primal: Primal,
 
@@ -1537,26 +1533,26 @@ pub struct CustomFunction<Input, Output, Primal, Jvp = DefaultJvp, Vjp = Default
     name: Cow<'static, str>,
 
     /// Definitions registered by the calls of this function.
-    registrations: CustomFunctionRegistrations,
+    registrations: CompositeRegistrations,
 
-    /// Phantom marker pinning the input and output tracer types named by the closure signatures. The [`Context`]
-    /// whose universe the rules are traced into is recovered from the values passed to [`CustomFunction::call`], and
-    /// so the function stores neither a context value nor a context type witness.
+    /// Phantom marker pinning the input and output tracer types named by the closure signatures. The [`Context`] whose
+    /// universe the rules are traced into is recovered from the values passed to [`Composite::call`], and so the
+    /// function stores neither a context value nor a context type witness.
     marker: PhantomData<fn() -> (Input, Output)>,
 }
 
-/// Primal closure of a [`CustomFunction`] built by [`CustomFunction::from_custom_call`], which calls one foreign
-/// kernel on a vector of input values.
+/// Primal closure of a [`Composite`] built by [`Composite::from_custom_call`], which calls one foreign kernel on a
+/// vector of input values.
 pub type CustomCallPrimal<V> = Box<dyn Fn(Vec<V>) -> Result<Vec<V>, ProgramError> + Send + Sync>;
 
-impl<V: CustomCall> CustomFunction<Vec<V>, Vec<V>, CustomCallPrimal<V>> {
-    /// Creates a [`CustomFunction`], without any custom rule, whose primal calls the foreign kernel described by
-    /// `operation` (i.e., it stages a [`CustomCallOperation`] whose outputs have the operation's declared output
-    /// types). Foreign kernels are opaque, so a custom call rejects differentiation, and this constructor is how a
-    /// differentiable foreign kernel is defined: its configuration functions add the derivative rules (e.g.,
-    /// [`Self::with_vjp`]), which may themselves call foreign kernels. Without derivative rules, differentiating the
-    /// function differentiates its primal, which reaches the custom call and reports its error. This is the analogue of
-    /// wrapping JAX's [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html) with
+impl<V: CustomCall> Composite<Vec<V>, Vec<V>, CustomCallPrimal<V>> {
+    /// Creates a [`Composite`], without any custom rule, whose primal calls the foreign kernel described by `operation`
+    /// (i.e., it stages a [`CustomCallOperation`] whose outputs have the operation's declared output types). Foreign
+    /// kernels are opaque, so a custom call rejects differentiation, and this constructor is how a differentiable
+    /// foreign kernel is defined: its configuration functions add the derivative rules (e.g., [`Self::with_vjp`]),
+    /// which may themselves call foreign kernels. Without derivative rules, differentiating the function differentiates
+    /// its primal, which reaches the custom call and reports its error. This is the analogue of wrapping JAX's
+    /// [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html) with
     /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) or
     /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
     ///
@@ -1568,14 +1564,14 @@ impl<V: CustomCall> CustomFunction<Vec<V>, Vec<V>, CustomCallPrimal<V>> {
     pub fn from_custom_call(operation: CustomCallOperation) -> Self {
         let name = operation.target_name().to_owned();
         let primal: CustomCallPrimal<V> = Box::new(move |inputs| CustomCall::custom_call(&operation, &inputs));
-        custom_function(primal).with_name(name)
+        composite(primal).with_name(name)
     }
 }
 
-impl<Input, Output, Primal, Jvp, Vjp, Batching> CustomFunction<Input, Output, Primal, Jvp, Vjp, Batching> {
+impl<Input, Output, Primal, Jvp, Vjp, Batching> Composite<Input, Output, Primal, Jvp, Vjp, Batching> {
     /// Returns this function with the leading `non_differentiated_count` flattened input leaves treated as
-    /// non-differentiated _plumbing_ inputs. Refer to the documentation of the [`custom_function`] function for the
-    /// semantics of non-differentiated inputs. Calls staged before this reconfiguration keep their original rules.
+    /// non-differentiated _plumbing_ inputs. Refer to the documentation of the [`composite`] function for the semantics
+    /// of non-differentiated inputs. Calls staged before this reconfiguration keep their original rules.
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
         let Self { primal, jvp, vjp, batching, name, .. } = self;
@@ -1593,7 +1589,7 @@ impl<Input, Output, Primal, Jvp, Vjp, Batching> CustomFunction<Input, Output, Pr
     /// Returns this function with the provided configurations and without registered definitions, because the
     /// definitions registered by earlier calls were configured with the previous configurations. The calls staged
     /// earlier keep their definitions, but since this drops the registrations that own their specialization caches,
-    /// their derivative requests trace their rules again on every request (refer to [`CustomFunction`]).
+    /// their derivative requests trace their rules again on every request (refer to [`Composite`]).
     fn with_configuration<NewJvp, NewVjp, NewBatching>(
         primal: Primal,
         jvp: NewJvp,
@@ -1601,21 +1597,21 @@ impl<Input, Output, Primal, Jvp, Vjp, Batching> CustomFunction<Input, Output, Pr
         batching: NewBatching,
         non_differentiated_count: usize,
         name: Cow<'static, str>,
-    ) -> CustomFunction<Input, Output, Primal, NewJvp, NewVjp, NewBatching> {
-        CustomFunction {
+    ) -> Composite<Input, Output, Primal, NewJvp, NewVjp, NewBatching> {
+        Composite {
             primal,
             jvp,
             vjp,
             batching,
             non_differentiated_count,
             name,
-            registrations: CustomFunctionRegistrations::default(),
+            registrations: CompositeRegistrations::default(),
             marker: PhantomData,
         }
     }
 }
 
-impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal, DefaultJvp, Vjp, Batching> {
+impl<Input, Output, Primal, Vjp, Batching> Composite<Input, Output, Primal, DefaultJvp, Vjp, Batching> {
     /// Returns this function with the provided Jacobian-Vector Product (JVP) rule, which governs forward-mode
     /// differentiation and, unless reverse-mode rules are configured as well, reverse-mode differentiation. This is the
     /// analogue of JAX's [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
@@ -1632,8 +1628,8 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     /// the same parameter structures as their corresponding primal values, and Ryft validates these structural and type
     /// relationships when it traces the rule. The rule keeps receiving a full `ẋ` value when the function has
     /// non-differentiated inputs, so that its signature mirrors the primal signature, but the tangent leaves of those
-    /// inputs are placeholders that it must not use, because the staged [`CustomFunctionOperation`] has no tangent
-    /// slot for them. A rule that consumes or returns such a placeholder is rejected when it is first traced.
+    /// inputs are placeholders that it must not use, because the staged [`CompositeCallOperation`] has no tangent slot
+    /// for them. A rule that consumes or returns such a placeholder is rejected when it is first traced.
     ///
     /// # When to Use
     ///
@@ -1669,7 +1665,7 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     pub fn with_jvp<Jvp: 'static + Fn(Input, Input) -> Result<(Output, Output), ProgramError> + Send + Sync>(
         self,
         jvp: Jvp,
-    ) -> CustomFunction<Input, Output, Primal, WithJvp<Jvp>, Vjp, Batching> {
+    ) -> Composite<Input, Output, Primal, WithJvp<Jvp>, Vjp, Batching> {
         let Self { primal, vjp, batching, non_differentiated_count, name, .. } = self;
         Self::with_configuration(primal, WithJvp(Arc::new(jvp)), vjp, batching, non_differentiated_count, name)
     }
@@ -1680,7 +1676,7 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     /// primal, so this configuration is needed only to pair reverse-mode rules with the derived forward-mode rule,
     /// which would otherwise make forward mode reject the calls.
     #[inline]
-    pub fn with_jvp_from_primal(self) -> CustomFunction<Input, Output, Primal, JvpFromPrimal, Vjp, Batching> {
+    pub fn with_jvp_from_primal(self) -> Composite<Input, Output, Primal, JvpFromPrimal, Vjp, Batching> {
         let Self { primal, vjp, batching, non_differentiated_count, name, .. } = self;
         Self::with_configuration(primal, JvpFromPrimal, vjp, batching, non_differentiated_count, name)
     }
@@ -1697,7 +1693,7 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     pub fn with_symbolic_zero_jvp<Tracer, Jvp>(
         self,
         jvp: Jvp,
-    ) -> CustomFunction<Input, Output, Primal, WithSymbolicZeroJvp<Tracer, Jvp>, Vjp, Batching>
+    ) -> Composite<Input, Output, Primal, WithSymbolicZeroJvp<Tracer, Jvp>, Vjp, Batching>
     where
         Tracer: Typed + Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -1709,7 +1705,7 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     }
 }
 
-impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal, Jvp, DefaultVjp, Batching> {
+impl<Input, Output, Primal, Jvp, Batching> Composite<Input, Output, Primal, Jvp, DefaultVjp, Batching> {
     /// Returns this function with the provided reverse-mode forward and backward (i.e., Vector-Jacobian Product or VJP)
     /// rules, which govern reverse-mode differentiation and take precedence over any forward-mode rule for it. This is
     /// the analogue of JAX's [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
@@ -1764,7 +1760,7 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
     ///
     /// Non-differentiated inputs reach the primal and `forward` at their usual positions and receive no cotangent:
     /// `backward` keeps returning a full `x̄` value so that its signature mirrors the primal signature, but the leaves
-    /// that it returns at non-differentiated positions are ignored, because the staged [`CustomFunctionOperation`]
+    /// that it returns at non-differentiated positions are ignored, because the staged [`CompositeCallOperation`]
     /// produces no cotangents for them. A non-differentiated value that `backward` needs must be forwarded to it as a
     /// residual in `r`.
     ///
@@ -1780,10 +1776,10 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
     ///
     /// Reverse mode traces `forward` when it linearizes a call and `backward` when it transposes the resulting carrier.
     /// It replays the forward program for the primal outputs and residuals and stages a
-    /// [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation) carrier whose transpose replays
-    /// the backward program, so reverse mode uses exactly the user-supplied gradient, and the original call is never
-    /// transposed. A call batched before it is differentiated batches both rule programs traced at the unbatched types
-    /// and sums the cotangents that the batched backward program produces for replicated inputs over the batch axis.
+    /// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) carrier whose transpose replays the backward
+    /// program, so reverse mode uses exactly the user-supplied gradient, and the original call is never transposed. A
+    /// call batched before it is differentiated batches both rule programs traced at the unbatched types and sums the
+    /// cotangents that the batched backward program produces for replicated inputs over the batch axis.
     ///
     /// Higher-order differentiation differentiates the backward program's ordinary operations, because the pullback
     /// replays that program inline. Both forward and reverse mode apply to a pullback, with respect to the primal
@@ -1801,7 +1797,7 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
         self,
         forward: Forward,
         backward: Backward,
-    ) -> CustomFunction<Input, Output, Primal, Jvp, WithVjp<Residual, Forward, Backward>, Batching>
+    ) -> Composite<Input, Output, Primal, Jvp, WithVjp<Residual, Forward, Backward>, Batching>
     where
         Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
         Backward: 'static + Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync,
@@ -1822,7 +1818,7 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
         self,
         forward: Forward,
         backward: Backward,
-    ) -> CustomFunction<Input, Output, Primal, Jvp, WithSymbolicZeroVjp<Residual, Tracer, Forward, Backward>, Batching>
+    ) -> Composite<Input, Output, Primal, Jvp, WithSymbolicZeroVjp<Residual, Tracer, Forward, Backward>, Batching>
     where
         Tracer: Typed + Parameter,
         Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -1853,7 +1849,7 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
         self,
         forward: Forward,
         backward: Backward,
-    ) -> CustomFunction<
+    ) -> Composite<
         Input,
         Output,
         Primal,
@@ -1882,7 +1878,7 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
     }
 }
 
-impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp, Vjp, DefaultBatching> {
+impl<Input, Output, Primal, Jvp, Vjp> Composite<Input, Output, Primal, Jvp, Vjp, DefaultBatching> {
     /// Returns this function with the provided custom batching rule `(extent, x, x_axes) ↦ (y, y_axes)`, which batches
     /// its calls instead of structurally batching its primal (i.e., the analogue of JAX's
     /// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html)). The rule
@@ -1900,8 +1896,8 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     ///
     /// # Derivatives
     ///
-    /// How derivatives interact with the rule depends on the forward-mode rule (refer to [`custom_function`] for the
-    /// rule selection):
+    /// How derivatives interact with the rule depends on the forward-mode rule (refer to [`composite`] for the rule
+    /// selection):
     ///
     ///   - **Derived from the primal** (i.e., without derivative rules, or with [`Self::with_jvp_from_primal`]): the
     ///     rule stays on the path of forward-mode derivatives in either order of the two transforms, which is the
@@ -1935,7 +1931,7 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     pub fn with_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> CustomFunction<Input, Output, Primal, Jvp, Vjp, WithBatching<Tracer, Rule>>
+    ) -> Composite<Input, Output, Primal, Jvp, Vjp, WithBatching<Tracer, Rule>>
     where
         Tracer: Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -1974,7 +1970,7 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     pub fn with_axis_dependent_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> CustomFunction<Input, Output, Primal, Jvp, Vjp, WithAxisDependentBatching<Tracer, Rule>>
+    ) -> Composite<Input, Output, Primal, Jvp, Vjp, WithAxisDependentBatching<Tracer, Rule>>
     where
         Tracer: Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -1995,11 +1991,11 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
 }
 
 impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp, Batching>
-    CustomFunction<Input, Output, Primal, Jvp, Vjp, Batching>
+    Composite<Input, Output, Primal, Jvp, Vjp, Batching>
 {
     /// Stages one call of this function on the provided `input` value and returns its output value. Refer to the
-    /// documentation of the [`custom_function`] function for the tracing semantics and for how the transforms treat
-    /// the staged call.
+    /// documentation of the [`composite`] function for the tracing semantics and for how the transforms treat the
+    /// staged call.
     ///
     /// The [`Context`] `C` whose universe the rules are traced into is the [`Domain`](Value::Domain)
     /// of the values in `input`, which is exactly the context the call is staged into. It is therefore never named at
@@ -2014,8 +2010,8 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number of
-    /// input leaves, when tracing the primal closure fails, or when the staged [`CustomFunctionOperation`] rejects
-    /// the call (e.g., because the call violates the reference contract). The rules are validated when they are first
+    /// input leaves, when tracing the primal closure fails, or when the staged [`CompositeCallOperation`] rejects the
+    /// call (e.g., because the call violates the reference contract). The rules are validated when they are first
     /// traced, so their errors are reported by the derivative requests that trace them.
     pub fn call<
         V: Value<Type = C::Type, Domain = C>,
@@ -2029,13 +2025,13 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         C::Constant: 'static,
-        C::Operation: 'static + From<CustomFunctionOperation<C::Constant, C::Operation>>,
+        C::Operation: 'static + From<CompositeCallOperation<C::Constant, C::Operation>>,
         <C::Type as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
         CustomRuleRegistration<C::Constant, C::Operation>: Send,
-        Jvp: CustomFunctionJvp<C::Constant, C::Operation, Input, Output>,
-        Vjp: CustomFunctionVjp<C::Constant, C::Operation, Input, Output>,
-        Batching: CustomFunctionBatching<C::Constant, C::Operation, Input, Output>,
+        Jvp: CompositeJvp<C::Constant, C::Operation, Input, Output>,
+        Vjp: CompositeVjp<C::Constant, C::Operation, Input, Output>,
+        Batching: CompositeBatching<C::Constant, C::Operation, Input, Output>,
         Input: Parameterized<DomainTracer<C>, ParameterStructure: 'static + PartialEq + Send>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
         Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
@@ -2098,36 +2094,36 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         // context, or a differentiation context), so the batching or differentiation rule of the bound operation fires
         // and the function composes with those transforms.
         let operation =
-            CustomFunctionOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
+            CompositeCallOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
         let outputs = first.domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
 
-/// Creates a [`CustomFunction`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any
-/// custom rule. It is the one entry point for custom rules of every transform, and its configuration functions add
-/// them, where each configuration is the analogue of one JAX entry point: [`CustomFunction::with_jvp`] of
-/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`CustomFunction::with_vjp`] of
+/// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any custom
+/// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them, where
+/// each configuration is the analogue of one JAX entry point: [`Composite::with_jvp`] of
+/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`] of
 /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html), and
-/// [`CustomFunction::with_batching`] of
+/// [`Composite::with_batching`] of
 /// [`jax.custom_batching.custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html),
 /// and they combine in one registration:
 ///
-///   - [`CustomFunction::with_jvp`] adds a Jacobian-Vector Product (JVP) rule `(x, ẋ) ↦ (y, ẏ)`, and
-///     [`CustomFunction::with_symbolic_zero_jvp`] adds one that receives structural-zero tangents,
-///   - [`CustomFunction::with_jvp_from_primal`] derives the forward-mode rule from the primal instead,
-///   - [`CustomFunction::with_vjp`] adds reverse-mode forward and backward rules `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`,
-///     [`CustomFunction::with_symbolic_zero_vjp`] adds ones whose backward rule receives structural-zero seeds, and
-///     [`CustomFunction::with_accumulating_vjp`] adds ones whose backward rule submits its cotangents to their
-///     destinations (e.g., caller-provided buffers) instead of returning them, and
-///   - [`CustomFunction::with_batching`] adds a custom batching rule, which batches calls instead of structurally
-///     batching their primal.
+///   - [`Composite::with_jvp`] adds a Jacobian-Vector Product (JVP) rule `(x, ẋ) ↦ (y, ẏ)`, and
+///     [`Composite::with_symbolic_zero_jvp`] adds one that receives structural-zero tangents,
+///   - [`Composite::with_jvp_from_primal`] derives the forward-mode rule from the primal instead,
+///   - [`Composite::with_vjp`] adds reverse-mode forward and backward rules `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`,
+///     [`Composite::with_symbolic_zero_vjp`] adds ones whose backward rule receives structural-zero seeds, and
+///     [`Composite::with_accumulating_vjp`] adds ones whose backward rule submits its cotangents to their destinations
+///     (e.g., caller-provided buffers) instead of returning them, and
+///   - [`Composite::with_batching`] adds a custom batching rule, which batches calls instead of structurally batching
+///     their primal.
 ///
-/// [`CustomFunction::from_custom_call`] creates a function whose primal calls a foreign kernel. Every transform
-/// without a configured rule treats the primal as it treats any other function, so a function without derivative
-/// rules (e.g., one with only a batching rule, which is JAX's bare `custom_vmap`) differentiates its primal. The one
-/// exception is a function with only reverse-mode rules, which rejects forward mode (as JAX's `custom_vjp` does),
-/// because a derived pushforward would contradict its custom pullback. Each derivative mode selects exactly one rule:
+/// [`Composite::from_custom_call`] creates a function whose primal calls a foreign kernel. Every transform without a
+/// configured rule treats the primal as it treats any other function, so a function without derivative rules (e.g., one
+/// with only a batching rule, which is JAX's bare `custom_vmap`) differentiates its primal. The one exception is a
+/// function with only reverse-mode rules, which rejects forward mode (as JAX's `custom_vjp` does), because a derived
+/// pushforward would contradict its custom pullback. Each derivative mode selects exactly one rule:
 ///
 /// | Configuration                          | Forward mode   | Reverse mode                          | Batching      |
 /// |----------------------------------------|----------------|---------------------------------------|---------------|
@@ -2151,13 +2147,13 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
 /// ```rust
 /// # use ryft_core::{
 /// #     Array, ArrayOperation, BatchAxis, BatchingLevelExtent, Cos, DomainTracer, EagerContext, ProgramError, Sin,
-/// #     batch, custom_function, differentiate_at,
+/// #     batch, composite, differentiate_at,
 /// # };
 /// # fn main() -> Result<(), ProgramError> {
 /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 ///
 /// // `sin` with a JVP rule for forward mode and reverse-mode rules that save `cos(x)` as their residual.
-/// let sine = custom_function(|x: Tracer| Ok(x.sin()?))
+/// let sine = composite(|x: Tracer| Ok(x.sin()?))
 ///     .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
 ///     .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
 /// let (_, tangent) = differentiate_at(Array::scalar(0.5f64)?).jvp(Array::scalar(1.0f64)?, |x| sine.call(x))?;
@@ -2167,7 +2163,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
 ///
 /// // A custom batching rule receives the batched input and its batch axis, and it declares the batch axis of the
 /// // output (i.e., the output is mapped exactly when the input is).
-/// let square = custom_function(|x: Tracer| Ok(x.clone() * x))
+/// let square = composite(|x: Tracer| Ok(x.clone() * x))
 ///     .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.clone() * x, axis)));
 /// let squares: Array = batch(
 ///     |x| square.call(x),
@@ -2193,14 +2189,14 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
 ///
 /// # Non-Differentiated Inputs
 ///
-/// [`CustomFunction::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
+/// [`Composite::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
 /// parameterizes the call without being differentiated. These leaves remain dynamic inputs. Unlike JAX's
 /// `nondiff_argnums`, this is a prefix of flattened leaves, not a set of static argument positions. Plumbing leaves
 /// reach every closure at their usual positions, and the rules keep signatures that mirror the primal signature: the
 /// tangent leaves that a JVP rule receives for them are placeholders that it must not use, and the cotangent leaves
-/// that a backward rule returns for them are ignored (refer to [`CustomFunction::with_jvp`] and
-/// [`CustomFunction::with_vjp`]). Differentiating a call with a non-zero tangent for a numeric plumbing input is
-/// rejected because the rules cannot propagate that tangent.
+/// that a backward rule returns for them are ignored (refer to [`Composite::with_jvp`] and [`Composite::with_vjp`]).
+/// Differentiating a call with a non-zero tangent for a numeric plumbing input is rejected because the rules cannot
+/// propagate that tangent.
 ///
 /// # References
 ///
@@ -2215,15 +2211,15 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
 ///
 /// # Tracing Semantics
 ///
-/// Nothing is traced at construction time. Each [`CustomFunction::call`] recovers the tracing [`Context`] from the
-/// values that it is called with, traces only the primal closure at their types, and stages one
-/// [`CustomFunctionOperation`] that retains the rules into the context through which those values flow. The rules are
-/// traced lazily, at the types of each specialization (e.g., each distinct input signature): forward mode traces the
-/// JVP rule, reverse mode traces the forward rule when it stages its reverse-mode carrier and the backward rule when
-/// that carrier is transposed, and batching traces the batching rule. Tracing a rule also validates its signature, so
-/// a malformed rule is reported by the request that first needs it rather than by the call. The traced programs are
-/// cached with the function, and a program that is never differentiated never traces its derivative rules (refer to
-/// [`CustomFunction`] for the ownership of that cache).
+/// Nothing is traced at construction time. Each [`Composite::call`] recovers the tracing [`Context`] from the values
+/// that it is called with, traces only the primal closure at their types, and stages one [`CompositeCallOperation`]
+/// that retains the rules into the context through which those values flow. The rules are traced lazily, at the types
+/// of each specialization (e.g., each distinct input signature): forward mode traces the JVP rule, reverse mode traces
+/// the forward rule when it stages its reverse-mode carrier and the backward rule when that carrier is transposed, and
+/// batching traces the batching rule. Tracing a rule also validates its signature, so a malformed rule is reported by
+/// the request that first needs it rather than by the call. The traced programs are cached with the function, and a
+/// program that is never differentiated never traces its derivative rules (refer to [`Composite`] for the ownership of
+/// that cache).
 ///
 /// # Transform Semantics
 ///
@@ -2236,33 +2232,33 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
 ///     primal program, and records the batching level, and a later derivative request batches the derivative rule
 ///     programs traced at the unbatched types, aligned to the batch axes of the batched call's outputs, so that the
 ///     custom derivative survives batching applied _before_ differentiation, while a batching rule survives batching
-///     applied _after_ forward-mode differentiation (refer to [`CustomFunction::with_batching`]), and
-///   - _differentiation_ replays the selected derivative rule programs instead of differentiating the primal (refer
-///     to [`CustomFunction::with_jvp`] and [`CustomFunction::with_vjp`] for the semantics of each mode, including
-///     higher-order differentiation).
+///     applied _after_ forward-mode differentiation (refer to [`Composite::with_batching`]), and
+///   - _differentiation_ replays the selected derivative rule programs instead of differentiating the primal (refer to
+///     [`Composite::with_jvp`] and [`Composite::with_vjp`] for the semantics of each mode, including higher-order
+///     differentiation).
 ///
 /// # Parameters
 ///
 ///   - `primal`: Closure implementing `f(x) = y`.
 #[inline]
-pub fn custom_function<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>>(
+pub fn composite<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>>(
     primal: Primal,
-) -> CustomFunction<Input, Output, Primal> {
-    CustomFunction {
+) -> Composite<Input, Output, Primal> {
+    Composite {
         primal,
         jvp: DefaultJvp,
         vjp: DefaultVjp,
         batching: DefaultBatching,
         non_differentiated_count: 0,
-        name: Cow::Borrowed(CUSTOM_FUNCTION_OPERATION_NAME),
-        registrations: CustomFunctionRegistrations::default(),
+        name: Cow::Borrowed(COMPOSITE_OPERATION_NAME),
+        registrations: CompositeRegistrations::default(),
         marker: PhantomData,
     }
 }
 
 /// Checks on sample values whether the batching rule behind `function` depends on its input batch axes beyond computing
-/// the batched function, which is what decides between [`CustomFunction::with_batching`] and
-/// [`CustomFunction::with_axis_dependent_batching`] (the former is exact only for rules that do not). The function is
+/// the batched function, which is what decides between [`Composite::with_batching`] and
+/// [`Composite::with_axis_dependent_batching`] (the former is exact only for rules that do not). The function is
 /// batched once at `input_batch_axes`, and then once for each replicated input leaf with that leaf broadcast along the
 /// batch instead. Every batched output is mapped at axis `0`, and the outputs of each broadcast batch are compared with
 /// those of the first batch by `equivalent` (e.g., exact equality, or equality within a numerical tolerance for a rule
@@ -2271,11 +2267,11 @@ pub fn custom_function<Input, Output, Primal: Fn(Input) -> Result<Output, Progra
 ///
 /// Passing the check on samples does not prove that the rule is independent of its axes, but failing it proves that it
 /// is not, in which case the function's derivatives batched with a replicated primal whose tangent is mapped require
-/// [`CustomFunction::with_axis_dependent_batching`] to be the per-item derivatives of its batched primal.
+/// [`Composite::with_axis_dependent_batching`] to be the per-item derivatives of its batched primal.
 ///
 /// # Parameters
 ///
-///   - `function`: Function to batch, which typically calls a [`CustomFunction`] with a custom batching rule.
+///   - `function`: Function to batch, which typically calls a [`Composite`] with a custom batching rule.
 ///   - `input`: Sample input of `function`, with every mapped leaf packed along its batch axis.
 ///   - `input_batch_axes`: Batch axis of each input leaf, with the structure of `input`.
 ///   - `batch_axis`: Batch axis specification passed to every [`batch`] call. It must supply the batch extent when
@@ -2376,9 +2372,9 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
+    use crate::operations::composites::rules::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
-    use crate::operations::custom_functions::rules::CustomRuleSource;
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
@@ -2406,12 +2402,12 @@ mod tests {
     type ArrayIrTracer = DomainTracer<EagerArrayIrContext>;
 
     #[test]
-    fn test_custom_function_from_custom_call() {
+    fn test_composite_from_custom_call() {
         // The primal calls the foreign kernel `my_sin`, which the reference backend cannot execute, while the rules
         // are ordinary programs, so both differentiation modes execute without calling the kernel.
         type Tracer = DomainTracer<ArrayContext>;
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let function = CustomFunction::from_custom_call(CustomCallOperation::new("my_sin", vec![scalar_type.clone()]))
+        let function = Composite::from_custom_call(CustomCallOperation::new("my_sin", vec![scalar_type.clone()]))
             .with_jvp(|inputs: Vec<Tracer>, tangents: Vec<Tracer>| {
                 Ok((vec![inputs[0].sin()?], vec![inputs[0].cos()? * tangents[0].clone()]))
             })
@@ -2424,7 +2420,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = custom_function [name=\"my_sin\"] %0 [
+                let %1:f64[] = composite [name=\"my_sin\"] %0 [
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = custom_call [target=my_sin] %0
@@ -2454,7 +2450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_from_custom_call_batching() {
+    fn test_composite_from_custom_call_batching() {
         // Batching a function built from a foreign kernel defers to the kernel's own strategy unless the function has a
         // custom batching rule, which takes precedence and here calls a batched kernel instead.
         type Tracer = DomainTracer<ArrayContext>;
@@ -2467,7 +2463,7 @@ mod tests {
         };
 
         // The kernel rejects batching by default.
-        let function = CustomFunction::from_custom_call(operation.clone()).with_jvp(jvp);
+        let function = Composite::from_custom_call(operation.clone()).with_jvp(jvp);
         let (_, program) = ArrayContext::trace(|inputs| function.call(inputs), vec![scalar_type.clone()]).unwrap();
         assert!(matches!(
             program.into_flat_program().batched(3, ShardingDimension::Replicated, &axes, natural.clone()),
@@ -2478,9 +2474,8 @@ mod tests {
         ));
 
         // Its broadcasting strategy applies when the function has no batching rule.
-        let function =
-            CustomFunction::from_custom_call(operation.clone().with_batching(CustomCallBatching::BroadcastAll))
-                .with_jvp(jvp);
+        let function = Composite::from_custom_call(operation.clone().with_batching(CustomCallBatching::BroadcastAll))
+            .with_jvp(jvp);
         let (_, program) = ArrayContext::trace(|inputs| function.call(inputs), vec![scalar_type.clone()]).unwrap();
         let batched = program
             .into_flat_program()
@@ -2490,7 +2485,7 @@ mod tests {
             batched.into_parts().0.to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = custom_function [name=\"my_sin\", batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])]] %0 [
+                let %1:f64[3] = composite [name=\"my_sin\", batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])]] %0 [
                     primal={
                         lambda %0:f64[3] .
                         let %1:f64[3] = custom_call [target=my_sin, batching=broadcast_all] %0
@@ -2504,7 +2499,7 @@ mod tests {
 
         // A batching rule takes precedence over the kernel's strategy, including under nested batching, and the batched
         // call keeps its JVP rule.
-        let function = CustomFunction::from_custom_call(operation).with_jvp(jvp).with_batching(
+        let function = Composite::from_custom_call(operation).with_jvp(jvp).with_batching(
             |_: BatchingLevelExtent<Tracer>, inputs: Vec<Tracer>, axes: Vec<BatchAxis>| {
                 let operation = CustomCallOperation::new("my_batched_sin", vec![inputs[0].r#type().into_owned()]);
                 Ok((CustomCall::custom_call(&operation, &inputs)?, axes))
@@ -2521,7 +2516,7 @@ mod tests {
             nested.to_string(),
             indoc! {"
                 lambda %0:f64[2, 3] .
-                let %1:f64[2, 3] = custom_function [
+                let %1:f64[2, 3] = composite [
                     name=\"my_sin\",
                     batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0]), (extent=2, input_axes=[axis 0], output_axes=[axis 0])],
                 ] %0 [
@@ -2549,14 +2544,14 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_from_custom_call_without_rules() {
+    fn test_composite_from_custom_call_without_rules() {
         // Without derivative rules, differentiation differentiates the primal, which reaches the opaque custom call and
         // reports its own diagnostic in both modes.
         type Tracer = DomainTracer<ArrayContext>;
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let function: CustomFunction<Vec<Tracer>, Vec<Tracer>, CustomCallPrimal<Tracer>> =
-            CustomFunction::from_custom_call(CustomCallOperation::new("my_sin", vec![scalar_type]));
-        let rejection = "custom call `my_sin` has no differentiation rule; call it through a `custom_function` with \
+        let function: Composite<Vec<Tracer>, Vec<Tracer>, CustomCallPrimal<Tracer>> =
+            Composite::from_custom_call(CustomCallOperation::new("my_sin", vec![scalar_type]));
+        let rejection = "custom call `my_sin` has no differentiation rule; call it through a `composite` with \
                          derivative rules to provide one";
         assert!(matches!(
             differentiate_at(vec![Array::scalar(2.0).unwrap()])
@@ -2571,17 +2566,17 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_name() {
+    fn test_composite_with_name() {
         // Without a name, calls are labeled by the operation name. Renaming a function that was already called must not
         // reuse the definition registered by that call, which carries the previous name. A function without derivative
         // rules rejects both differentiation modes and names itself in the diagnostic.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?));
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?));
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = custom_function [name=\"custom_function\"] %0 [
+                let %1:f64[] = composite [name=\"composite\"] %0 [
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
@@ -2598,7 +2593,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = custom_function [name=\"sine\"] %0 [
+                let %1:f64[] = composite [name=\"sine\"] %0 [
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
@@ -2615,17 +2610,17 @@ mod tests {
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot apply forward-mode differentiation to a `custom_function` call of `sine` that \
+                if message == "cannot apply forward-mode differentiation to a `composite` call of `sine` that \
                                has only reverse-mode rules; it supports only reverse-mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
         ));
     }
 
     #[test]
-    fn test_custom_function_with_jvp() {
+    fn test_composite_with_jvp() {
         // An explicit JVP rule governs forward mode and, by transposition, reverse mode. The rule doubles the true
         // derivative (expressed through addition to avoid constant lifting), which proves that the rule is in control.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp(|x, tangent| {
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp(|x, tangent| {
             let tangent = x.cos()? * tangent;
             Ok((x.sin()?, tangent.clone() + tangent))
         });
@@ -2640,11 +2635,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_zero_space_inputs() {
+    fn test_composite_with_jvp_zero_space_inputs() {
         // The tangent of an integer input belongs to a zero differential space, so it is always a structural zero,
         // which the specialization materializes for a rule that receives materialized tangents.
         type Tracer = DomainTracer<ArrayContext>;
-        let function = custom_function(|(x, _): (Tracer, Tracer)| Ok(x.sin()?)).with_jvp(
+        let function = composite(|(x, _): (Tracer, Tracer)| Ok(x.sin()?)).with_jvp(
             |(x, _): (Tracer, Tracer), (tangent, count_tangent): (Tracer, Tracer)| {
                 assert_eq!(count_tangent.r#type().into_owned(), ArrayType::scalar(DataType::Zero));
                 Ok((x.sin()?, x.cos()? * tangent))
@@ -2660,14 +2655,14 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_non_differentiated_inputs() {
+    fn test_composite_with_jvp_non_differentiated_inputs() {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
 
         // The leading counter is plumbing: it reaches both closures at its usual position, and the rule closure keeps
         // receiving a full tangent value whose counter leaf is a placeholder that it leaves unused.
         let function =
-            custom_function(|(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
+            composite(|(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
                 counter.add_update(&x)?;
                 Ok(x)
             })
@@ -2703,7 +2698,7 @@ mod tests {
         // A rule that uses the placeholder tangent of a plumbing input is rejected when it is first traced (i.e., by
         // the first derivative request), because the staged rule has no tangent slot for it.
         let function =
-            custom_function(|(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
+            composite(|(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
                 counter.add_update(&x)?;
                 Ok(x)
             })
@@ -2721,7 +2716,7 @@ mod tests {
                 program.into_flat_program().jvp_with_respect_to(&[1]).map(|_| ()).map_err(ProgramError::from)
             }),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` rule uses the tangent of leading non-differentiated input 0, which has no tangent \
+                "`composite` rule uses the tangent of leading non-differentiated input 0, which has no tangent \
                  slot because non-differentiated inputs parameterize the rule without being differentiated"
                     .to_string(),
             ))),
@@ -2729,7 +2724,7 @@ mod tests {
 
         // Returning the placeholder is also a use, even when no instruction consumes it.
         let function =
-            custom_function(|(parameter, _): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(parameter))
+            composite(|(parameter, _): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(parameter))
                 .with_jvp(|(parameter, _), (placeholder, _)| Ok((parameter, placeholder)))
                 .with_non_differentiated_count(1);
         assert_eq!(
@@ -2741,7 +2736,7 @@ mod tests {
                 program.into_flat_program().jvp_with_respect_to(&[1]).map(|_| ()).map_err(ProgramError::from)
             }),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` rule uses the tangent of leading non-differentiated input 0, which has no tangent \
+                "`composite` rule uses the tangent of leading non-differentiated input 0, which has no tangent \
                  slot because non-differentiated inputs parameterize the rule without being differentiated"
                     .to_string(),
             ))),
@@ -2749,7 +2744,7 @@ mod tests {
 
         // Without the declaration, the reference is an active input, which the staged operation rejects.
         let function =
-            custom_function(|(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
+            composite(|(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
                 counter.add_update(&x)?;
                 Ok(x)
             })
@@ -2758,30 +2753,30 @@ mod tests {
             EagerArrayIrContext::trace(|(counter, x)| function.call((counter, x)), (reference_type, scalar_type))
                 .map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` accepts reference inputs only in its leading non-differentiated segment; move \
+                "`composite` accepts reference inputs only in its leading non-differentiated segment; move \
                  input 0 of type `ref<f32[]>` before the differentiated inputs"
                     .to_string(),
             ))),
         );
 
         // The non-differentiated count cannot exceed the number of input leaves.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
             .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
             .with_non_differentiated_count(2);
         assert_eq!(
             ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` non-differentiated input count 2 exceeds input count 1".to_string(),
+                "`composite` non-differentiated input count 2 exceeds input count 1".to_string(),
             ))),
         );
     }
 
     #[test]
-    fn test_custom_function_with_jvp_call() {
+    fn test_composite_with_jvp_call() {
         // The wrapper traces the closures at the call site, specialized to the input types. The custom rule
         // `jvp(x, ẋ) = (sin(x), cos(x) * ẋ + cos(x) * ẋ)` doubles the mathematical derivative (expressed through
         // addition to avoid constant lifting), which proves that the rule is in control.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp(|x, tangent| {
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp(|x, tangent| {
             let tangent = x.cos()? * tangent;
             Ok((x.sin()?, tangent.clone() + tangent))
         });
@@ -2800,11 +2795,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_structured_outputs() {
+    fn test_composite_with_jvp_structured_outputs() {
         // Distinct tuple leaves make flattening and reconstruction order observable.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok((x.sin()?, vec![x.cos()?, x]))).with_jvp(
-            |x, tangent| Ok(((x.sin()?, vec![x.cos()?, x]), (tangent.clone(), vec![tangent.clone(), tangent]))),
-        );
+        let function =
+            composite(|x: DomainTracer<ArrayContext>| Ok((x.sin()?, vec![x.cos()?, x]))).with_jvp(|x, tangent| {
+                Ok(((x.sin()?, vec![x.cos()?, x]), (tangent.clone(), vec![tangent.clone(), tangent])))
+            });
         let (_, program) = ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(
             program.interpret(Array::scalar(2.0).unwrap()),
@@ -2816,26 +2812,25 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_tracing_errors() {
+    fn test_composite_with_jvp_tracing_errors() {
         // Empty collections cannot identify the context in which the call should execute.
-        let function = custom_function(|inputs: Vec<DomainTracer<ArrayContext>>| Ok(inputs))
+        let function = composite(|inputs: Vec<DomainTracer<ArrayContext>>| Ok(inputs))
             .with_jvp(|inputs, tangents| Ok((inputs, tangents)));
         assert_eq!(
             ArrayContext::trace(|inputs| function.call(inputs), Vec::<ArrayType>::new()).map(|_| ()),
-            Err(ProgramError::Type(TypeError::invalid("`custom_function` requires at least one input".to_string()))),
+            Err(ProgramError::Type(TypeError::invalid("`composite` requires at least one input".to_string()))),
         );
 
         // Both closures propagate their original error without replacing it with a signature error.
-        let function =
-            custom_function(|_: DomainTracer<ArrayContext>| -> Result<DomainTracer<ArrayContext>, ProgramError> {
-                Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() })
-            })
-            .with_jvp(|input, tangent| Ok((input, tangent)));
+        let function = composite(|_: DomainTracer<ArrayContext>| -> Result<DomainTracer<ArrayContext>, ProgramError> {
+            Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() })
+        })
+        .with_jvp(|input, tangent| Ok((input, tangent)));
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() }),
         );
-        let function = custom_function(|input: DomainTracer<ArrayContext>| Ok(input))
+        let function = composite(|input: DomainTracer<ArrayContext>| Ok(input))
             .with_jvp(|_, _| Err(ProgramError::InvalidArgument { message: "jvp tracing failed".to_string() }));
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64))
@@ -2845,33 +2840,32 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_rule_signature_mismatch() {
+    fn test_composite_with_jvp_rule_signature_mismatch() {
         // Fixed tuple structures are checked statically, but array shapes and collection lengths require runtime
         // validation. This rule produces a scalar tangent for a vector output, which fails signature validation when
         // the rule is first traced (i.e., by the first derivative request) rather than when the function is called.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
             .with_jvp(|x, tangent| Ok((x.sin()?, tangent.dot(&tangent, &DotDimensionNumbers::inner_product())?)));
         let (_, program) =
             ArrayContext::trace(|x| function.call(x), ArrayType::new_static(DataType::F64, [2])).unwrap();
         assert_eq!(
             program.into_flat_program().jvp().map(|_| ()).map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` `custom_function` JVP rule output type signature mismatch: expected [f64[2], \
+                "`composite` `composite` JVP rule output type signature mismatch: expected [f64[2], \
                  f64[2]] but got [f64[2], f64[]]"
                     .to_string(),
             ))),
         );
 
         // Equal flattened leaf types cannot distinguish different nested vector lengths.
-        let function = custom_function(|input: DomainTracer<ArrayContext>| {
-            Ok(vec![vec![input.clone(), input.clone()], vec![input]])
-        })
-        .with_jvp(|input, tangent| {
-            Ok((
-                vec![vec![input.clone()], vec![input.clone(), input]],
-                vec![vec![tangent.clone()], vec![tangent.clone(), tangent]],
-            ))
-        });
+        let function =
+            composite(|input: DomainTracer<ArrayContext>| Ok(vec![vec![input.clone(), input.clone()], vec![input]]))
+                .with_jvp(|input, tangent| {
+                    Ok((
+                        vec![vec![input.clone()], vec![input.clone(), input]],
+                        vec![vec![tangent.clone()], vec![tangent.clone(), tangent]],
+                    ))
+                });
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64))
                 .and_then(|(_, program)| program.into_flat_program().jvp().map(|_| ()).map_err(ProgramError::from)),
@@ -2882,15 +2876,14 @@ mod tests {
         );
 
         // The primal half may agree while the tangent half has the wrong structure.
-        let function = custom_function(|input: DomainTracer<ArrayContext>| {
-            Ok(vec![vec![input.clone(), input.clone()], vec![input]])
-        })
-        .with_jvp(|input, tangent| {
-            Ok((
-                vec![vec![input.clone(), input.clone()], vec![input]],
-                vec![vec![tangent.clone()], vec![tangent.clone(), tangent]],
-            ))
-        });
+        let function =
+            composite(|input: DomainTracer<ArrayContext>| Ok(vec![vec![input.clone(), input.clone()], vec![input]]))
+                .with_jvp(|input, tangent| {
+                    Ok((
+                        vec![vec![input.clone(), input.clone()], vec![input]],
+                        vec![vec![tangent.clone()], vec![tangent.clone(), tangent]],
+                    ))
+                });
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64))
                 .and_then(|(_, program)| program.into_flat_program().jvp().map(|_| ()).map_err(ProgramError::from)),
@@ -2902,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_computed_dimension_outputs() {
+    fn test_composite_with_jvp_computed_dimension_outputs() {
         // The primal broadcasts `x` to the computed extent `n · n`, and the JVP rule recomputes that extent in its own
         // trace, which mints a fresh identity for it. The rule outputs therefore agree with the primal outputs only up
         // to a renaming of that identity, which is applied to the rule program.
@@ -2912,7 +2905,7 @@ mod tests {
             Ok((extent.clone(), x.dynamic_broadcast(&[extent], &[])?))
         };
         let function = |shares_extent: bool| {
-            custom_function(move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| broadcast(&dimension, x))
+            composite(move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| broadcast(&dimension, x))
                 .with_non_differentiated_count(1)
                 .with_jvp(
                     move |(dimension, x): (ArrayIrTracer, ArrayIrTracer),
@@ -2968,7 +2961,7 @@ mod tests {
         assert_eq!(
             jvp(false).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` `custom_function` JVP rule output type signature mismatch: expected \
+                "`composite` `composite` JVP rule output type signature mismatch: expected \
                  [dimension<n * n ∈ [4, 17)>, f64[n * n], zero[], f64[n * n]] but got [dimension<n * n ∈ [4, 17)>, \
                  f64[n * n], zero[], f64[n * n]] with different type identities"
                     .to_string(),
@@ -2977,18 +2970,18 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_zero_space_boundaries() {
+    fn test_composite_with_jvp_zero_space_boundaries() {
         // Token primals and zero-space tangents carry no payload, so the wrapper must pass them through the traced
         // rule unchanged instead of demanding a dense tangent space.
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let function = custom_function(|token: DomainTracer<ArrayContext>| Ok(token))
-            .with_jvp(|token, tangent| Ok((token, tangent)));
+        let function =
+            composite(|token: DomainTracer<ArrayContext>| Ok(token)).with_jvp(|token, tangent| Ok((token, tangent)));
         assert_eq!(differentiate_at(token.clone()).jvp(zero.clone(), |token| function.call(token)), Ok((token, zero)));
     }
 
     #[test]
-    fn test_custom_function_with_jvp_tangent_casts() {
+    fn test_composite_with_jvp_tangent_casts() {
         // The rule narrows `x: f64[n]` to `f64[2]` with a checked cast and converts the tangent to match. Reverse mode
         // transposes the replayed rule, so the cotangent must widen back to `f64[n]`. An unchecked tangent conversion
         // that names the primal input as its witness keeps `n` available to that transpose (as the derived rule does),
@@ -3000,7 +2993,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [2]);
         let program = |checked: bool| {
             let (primal_type, rule_type) = (static_type.clone(), static_type.clone());
-            let function = custom_function(move |x: Tracer| x.cast(primal_type.clone(), &[])?.sin()).with_jvp(
+            let function = composite(move |x: Tracer| x.cast(primal_type.clone(), &[])?.sin()).with_jvp(
                 move |x: Tracer, tangent: Tracer| {
                     let y = x.cast(rule_type.clone(), &[])?;
                     let tangent = match checked {
@@ -3129,7 +3122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_and_vjp() {
+    fn test_composite_with_jvp_and_vjp() {
         // With both rule kinds, forward mode uses the JVP rule (which doubles the derivative) and reverse mode uses the
         // reverse-mode rules (which triple it), whatever the order of the configuration calls.
         let doubled_jvp = |x: DomainTracer<ArrayContext>, tangent: DomainTracer<ArrayContext>| {
@@ -3142,8 +3135,8 @@ mod tests {
             Ok(gradient.clone() + gradient.clone() + gradient)
         };
         let primal = |x: DomainTracer<ArrayContext>| Ok(x.sin()?);
-        let jvp_first = custom_function(primal).with_jvp(doubled_jvp).with_vjp(forward, tripled_backward);
-        let vjp_first = custom_function(primal).with_vjp(forward, tripled_backward).with_jvp(doubled_jvp);
+        let jvp_first = composite(primal).with_jvp(doubled_jvp).with_vjp(forward, tripled_backward);
+        let vjp_first = composite(primal).with_vjp(forward, tripled_backward).with_jvp(doubled_jvp);
         for (jvp, gradient) in [
             (
                 differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| jvp_first.call(x)),
@@ -3160,10 +3153,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_jvp_from_primal() {
+    fn test_composite_with_jvp_from_primal() {
         // Deriving the forward-mode rule from the primal yields the true derivative in both modes, unless reverse-mode
         // rules are configured as well, in which case they govern reverse mode (and triple the derivative here).
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp_from_primal();
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp_from_primal();
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Ok((Array::scalar(2.0f64.sin()).unwrap(), Array::scalar(2.0f64.cos()).unwrap())),
@@ -3190,12 +3183,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_symbolic_zero_jvp() {
+    fn test_composite_with_symbolic_zero_jvp() {
         // The product rule receives the structural zero of an input that is not being differentiated as a
         // `MaybeZero::Zero` leaf and skips its term, and each activity pattern is a separate specialization.
         type Tracer = DomainTracer<ArrayContext>;
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_symbolic_zero_jvp({
+        let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_symbolic_zero_jvp({
             let observed = observed.clone();
             move |(x, y): (Tracer, Tracer), tangents: (MaybeZero<Tracer>, MaybeZero<Tracer>)| {
                 observed.lock().unwrap().push((tangents.0.is_zero(), tangents.1.is_zero()));
@@ -3224,10 +3217,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp() {
+    fn test_composite_with_vjp() {
         // Reverse-mode rules govern reverse mode, while forward mode rejects the call because no forward-mode rule was
         // configured.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
             |cosine, cotangent| {
                 let gradient = cosine * cotangent;
@@ -3241,17 +3234,17 @@ mod tests {
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot apply forward-mode differentiation to a `custom_function` call that has only \
+                if message == "cannot apply forward-mode differentiation to a `composite` call that has only \
                                reverse-mode rules; it supports only reverse-mode differentiation (e.g., `vjp`, \
                                `value_and_gradient`, or `jacobian_reverse`)",
         ));
     }
 
     #[test]
-    fn test_custom_function_with_vjp_specialized_residual_structures() {
+    fn test_composite_with_vjp_specialized_residual_structures() {
         // Specializations of one call structure may return differently structured residuals: here, one residual per
         // input dimension, so the scalar and vector specializations save zero and two residuals, respectively.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
             |x| {
                 let cosine = x.cos()?;
                 Ok((x.sin()?, (cosine.clone(), vec![cosine; x.r#type().rank()])))
@@ -3273,7 +3266,7 @@ mod tests {
 
         // Residual structures are recorded by their flat residual types, so two specializations whose residuals have
         // identical flat types but different structures are ambiguous. Here, the residual type is always `f64[]`.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
             |x| {
                 let total = x.cos()?.reduce(&(0..x.r#type().rank()).collect::<Vec<_>>(), ReductionKind::Sum)?;
                 let residuals = if x.r#type().rank() == 0 { vec![vec![total]] } else { vec![vec![], vec![total]] };
@@ -3298,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_dimension_residuals() {
+    fn test_composite_with_vjp_dimension_residuals() {
         // The forward rule saves the dimension `n · n` of its input's extent `n`. Replaying the traced forward rule
         // mints a fresh identity for that dimension, so the backward rule must find the residual structure by type
         // equivalence up to identity renaming.
@@ -3306,7 +3299,7 @@ mod tests {
             let extent = ValueProjection::<DimensionType>::into_projected(x.dimension_size(0)?)?;
             Ok((x, (extent.clone() * extent).into_value()))
         };
-        let function = custom_function(|x: ArrayIrTracer| Ok(x))
+        let function = composite(|x: ArrayIrTracer| Ok(x))
             .with_vjp(saved_extent, |_: ArrayIrTracer, cotangent: ArrayIrTracer| Ok(cotangent));
         let input = ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0]).unwrap());
         let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64, 4.0]).unwrap());
@@ -3315,7 +3308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_computed_dimension_outputs() {
+    fn test_composite_with_vjp_computed_dimension_outputs() {
         // The primal broadcasts `x` to the computed extent `n · n`, and the forward rule recomputes that extent in its
         // own trace, which mints a fresh identity for it. The rule outputs therefore agree with the primal outputs
         // only up to a renaming of that identity, which is applied to the rule program, including its residuals.
@@ -3324,7 +3317,7 @@ mod tests {
             let extent = (dimension.clone() * dimension).into_value();
             Ok((extent.clone(), x.dynamic_broadcast(&[extent], &[])?))
         };
-        let function = custom_function(move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| broadcast(&dimension, x))
+        let function = composite(move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| broadcast(&dimension, x))
             .with_vjp(
                 move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| {
                     let (extent, output) = broadcast(&dimension, x)?;
@@ -3359,7 +3352,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:dimension<n ∈ [2, 5)>, %2:dimension<n * n ∈ [4, 17)>, %3:dimension<n * n ∈ [4, 17)> .
-                let %4:zero[], %5:f64[n * n] = custom_function_transpose [name=\"custom_function\", leading_input_count=4, seed_extent_count=1] %1 %1 %2 %3 %0
+                let %4:zero[], %5:f64[n * n] = composite_transpose [name=\"composite\", leading_input_count=4, seed_extent_count=1] %1 %1 %2 %3 %0
                 in (%5)
             "}
             .trim_end(),
@@ -3377,12 +3370,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_non_differentiated_inputs() {
+    fn test_composite_with_vjp_non_differentiated_inputs() {
         // The stash-gradients pattern: the leading `stash` reference is plumbing, the forward rule forwards it as a
         // residual by identity rather than saving a snapshot, and the backward rule writes the incoming cotangent into
         // it before returning `x̄ = cos(x) · ȳ`. The cotangent value that it returns is input-shaped, so its leading
         // plumbing leaf is ignored.
-        let function = custom_function(|(_, x): (ArrayIrTracer, ArrayIrTracer)| {
+        let function = composite(|(_, x): (ArrayIrTracer, ArrayIrTracer)| {
             Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
         })
         .with_vjp(
@@ -3432,23 +3425,23 @@ mod tests {
         assert_eq!(stash.read(), Ok(Array::scalar(3.0f32).unwrap()));
 
         // The non-differentiated count cannot exceed the number of input leaves.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
             .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |residual, cotangent| Ok(residual * cotangent))
             .with_non_differentiated_count(2);
         assert_eq!(
             ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` non-differentiated input count 2 exceeds input count 1".to_string(),
+                "`composite` non-differentiated input count 2 exceeds input count 1".to_string(),
             ))),
         );
     }
 
     #[test]
-    fn test_custom_function_with_vjp_call() {
+    fn test_composite_with_vjp_call() {
         // The wrapper traces the closures at the call site, specialized to the input types. The custom
         // rule `backward(residual, cotangent) = 3 * residual * cotangent` triples the true gradient (expressed through
         // addition to avoid constant lifting), which proves that the rule is in control.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
                 let product = residual * cotangent;
@@ -3464,28 +3457,27 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_tracing_errors() {
+    fn test_composite_with_vjp_tracing_errors() {
         // An empty collection provides no value from which the call can recover its execution context.
-        let function = custom_function(|inputs: Vec<DomainTracer<ArrayContext>>| Ok(inputs))
+        let function = composite(|inputs: Vec<DomainTracer<ArrayContext>>| Ok(inputs))
             .with_vjp(|inputs| Ok((inputs, ())), |(), cotangents| Ok(cotangents));
         assert_eq!(
             ArrayContext::trace(|inputs| function.call(inputs), Vec::<ArrayType>::new()).map(|_| ()),
-            Err(ProgramError::Type(TypeError::invalid("`custom_function` requires at least one input".to_string()))),
+            Err(ProgramError::Type(TypeError::invalid("`composite` requires at least one input".to_string()))),
         );
 
         // Each closure's original error must propagate rather than becoming a rule-interface diagnostic. The primal
         // closure is traced when the function is called, while the forward and backward closures are traced by the
         // first reverse-mode derivative request.
-        let function =
-            custom_function(|_: DomainTracer<ArrayContext>| -> Result<DomainTracer<ArrayContext>, ProgramError> {
-                Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() })
-            })
-            .with_vjp(|input| Ok((input, ())), |(), cotangent| Ok(cotangent));
+        let function = composite(|_: DomainTracer<ArrayContext>| -> Result<DomainTracer<ArrayContext>, ProgramError> {
+            Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() })
+        })
+        .with_vjp(|input| Ok((input, ())), |(), cotangent| Ok(cotangent));
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() }),
         );
-        let function = custom_function(|input: DomainTracer<ArrayContext>| Ok(input)).with_vjp(
+        let function = composite(|input: DomainTracer<ArrayContext>| Ok(input)).with_vjp(
             |_| -> Result<(DomainTracer<ArrayContext>, ()), ProgramError> {
                 Err(ProgramError::InvalidArgument { message: "forward tracing failed".to_string() })
             },
@@ -3499,7 +3491,7 @@ mod tests {
                 .map_err(ProgramError::from),
             Err(ProgramError::InvalidArgument { message: "forward tracing failed".to_string() }),
         );
-        let function = custom_function(|input: DomainTracer<ArrayContext>| Ok(input)).with_vjp(
+        let function = composite(|input: DomainTracer<ArrayContext>| Ok(input)).with_vjp(
             |input| Ok((input, ())),
             |(), _| Err(ProgramError::InvalidArgument { message: "backward tracing failed".to_string() }),
         );
@@ -3514,10 +3506,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_rule_signature_mismatch() {
+    fn test_composite_with_vjp_rule_signature_mismatch() {
         // The closure signatures fix the parameter families, but array shapes still require validation after tracing,
         // which happens when the first reverse-mode derivative request specializes the rules.
-        let function = custom_function(|input: DomainTracer<ArrayContext>| Ok(input))
+        let function = composite(|input: DomainTracer<ArrayContext>| Ok(input))
             .with_vjp(|input| Ok((input.reduce(&[0], ReductionKind::Sum)?, ())), |(), cotangent| Ok(cotangent));
         assert_eq!(
             differentiate_at(Array::vector(vec![1.0f64, 2.0]).unwrap())
@@ -3526,14 +3518,14 @@ mod tests {
                 .map(|_| ())
                 .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` `custom_function` forward rule output type signature mismatch: expected [f64[2]] \
+                "`composite` `composite` forward rule output type signature mismatch: expected [f64[2]] \
                  but got [f64[]]"
                     .to_string(),
             ))),
         );
 
         // A valid forward interface must not hide a backward rule that produces the wrong input-cotangent shape.
-        let function = custom_function(|input: DomainTracer<ArrayContext>| Ok(input))
+        let function = composite(|input: DomainTracer<ArrayContext>| Ok(input))
             .with_vjp(|input| Ok((input, ())), |(), cotangent| Ok(cotangent.reduce(&[0], ReductionKind::Sum)?));
         assert_eq!(
             differentiate_at(Array::vector(vec![1.0f64, 2.0]).unwrap())
@@ -3542,20 +3534,19 @@ mod tests {
                 .map(|_| ())
                 .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` `custom_function` backward rule output type signature mismatch: expected [f64[2]] \
+                "`composite` `composite` backward rule output type signature mismatch: expected [f64[2]] \
                  but got [f64[]]"
                     .to_string(),
             ))),
         );
 
         // The forward result must preserve nested collection lengths, not just the flattened types.
-        let function = custom_function(|input: DomainTracer<ArrayContext>| {
-            Ok(vec![vec![input.clone(), input.clone()], vec![input]])
-        })
-        .with_vjp(
-            |input| Ok((vec![vec![input.clone()], vec![input.clone(), input]], ())),
-            |(), cotangents| Ok(cotangents[0][0].clone()),
-        );
+        let function =
+            composite(|input: DomainTracer<ArrayContext>| Ok(vec![vec![input.clone(), input.clone()], vec![input]]))
+                .with_vjp(
+                    |input| Ok((vec![vec![input.clone()], vec![input.clone(), input]], ())),
+                    |(), cotangents| Ok(cotangents[0][0].clone()),
+                );
         assert_eq!(
             differentiate_at(Array::scalar(1.0).unwrap())
                 .vjp(|input| function.call(input))
@@ -3569,7 +3560,7 @@ mod tests {
 
         // Check the full backward structure even when the first flattened leaf is non-differentiated. Reverse mode
         // linearizes with respect to the two differentiated leaves only and then transposes both tangent inputs.
-        let function = custom_function(|input: Vec<Vec<DomainTracer<ArrayContext>>>| Ok(input[1][0].clone()))
+        let function = composite(|input: Vec<Vec<DomainTracer<ArrayContext>>>| Ok(input[1][0].clone()))
             .with_vjp(
                 |input| Ok((input[1][0].clone(), ())),
                 |(), cotangent| Ok(vec![vec![cotangent.clone()], vec![cotangent.clone(), cotangent]]),
@@ -3596,19 +3587,19 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_reference_contract() {
+    fn test_composite_with_vjp_reference_contract() {
         let input_types = (
             ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
             ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
         );
 
         // A reference input that is not declared as plumbing is an active input, which the staged operation rejects.
-        let function = custom_function(|(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x))
+        let function = composite(|(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x))
             .with_vjp(|(stash, x)| Ok((x, stash)), |stash, cotangent| Ok((stash, cotangent)));
         assert_eq!(
             EagerArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` accepts reference inputs only in its leading non-differentiated segment; move \
+                "`composite` accepts reference inputs only in its leading non-differentiated segment; move \
                  input 0 of type `ref<f32[]>` before the differentiated inputs"
                     .to_string(),
             ))),
@@ -3620,7 +3611,7 @@ mod tests {
             ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0f32).unwrap())),
             ArrayIrValue::Array(Array::scalar(0.5f32).unwrap()),
         );
-        let function = custom_function(|(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x))
+        let function = composite(|(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x))
             .with_vjp(|(_, x)| Ok((x.clone(), x.reference_new()?)), |allocated, cotangent| Ok((allocated, cotangent)))
             .with_non_differentiated_count(1);
         assert_eq!(
@@ -3630,7 +3621,7 @@ mod tests {
                 .map(|_| ())
                 .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` forward rule returns residual 0 of reference type `ref<f32[]>` that is not a \
+                "`composite` forward rule returns residual 0 of reference type `ref<f32[]>` that is not a \
                  leading non-differentiated input forwarded by identity"
                     .to_string(),
             ))),
@@ -3638,7 +3629,7 @@ mod tests {
 
         // Every reference-typed residual is held to that rule, not only the first one: forwarding the plumbing
         // reference and then returning an allocated reference beside it is rejected at the allocated residual.
-        let function = custom_function(|(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x))
+        let function = composite(|(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x))
             .with_vjp(
                 |(stash, x)| Ok((x.clone(), (stash, x.reference_new()?))),
                 |(stash, _allocated), cotangent| Ok((stash, cotangent)),
@@ -3651,26 +3642,26 @@ mod tests {
                 .map(|_| ())
                 .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` forward rule returns residual 1 of reference type `ref<f32[]>` that is not a \
+                "`composite` forward rule returns residual 1 of reference type `ref<f32[]>` that is not a \
                  leading non-differentiated input forwarded by identity"
                     .to_string(),
             ))),
         );
 
         // No rule may return a reference as a primal output, not even a plumbing input forwarded by identity.
-        let function = custom_function(|(stash, _): (ArrayIrTracer, ArrayIrTracer)| Ok(stash))
+        let function = composite(|(stash, _): (ArrayIrTracer, ArrayIrTracer)| Ok(stash))
             .with_vjp(|(stash, _)| Ok((stash, ())), |(), cotangent| Ok((cotangent.clone(), cotangent.read()?)))
             .with_non_differentiated_count(1);
         assert_eq!(
             EagerArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` cannot return a reference, but output 0 has type `ref<f32[]>`".to_string(),
+                "`composite` cannot return a reference, but output 0 has type `ref<f32[]>`".to_string(),
             ))),
         );
 
         // Two same-typed inputs do not permit forwarding the first one twice. Type multiplicity alone cannot detect
         // this alias, so the specialized forward rule checks which input each residual forwards.
-        let function = custom_function(|(_, _, input): (ArrayIrTracer, ArrayIrTracer, ArrayIrTracer)| Ok(input))
+        let function = composite(|(_, _, input): (ArrayIrTracer, ArrayIrTracer, ArrayIrTracer)| Ok(input))
             .with_vjp(
                 |(first, _, input)| Ok((input, (first.clone(), first))),
                 |(first, second), cotangent| Ok((first, second, cotangent)),
@@ -3687,18 +3678,18 @@ mod tests {
             .map(|_| ())
             .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`custom_function` forward rule returns residual 1 of reference type `ref<f32[]>` from an input \
+                "`composite` forward rule returns residual 1 of reference type `ref<f32[]>` from an input \
                  already forwarded by an earlier residual",
             ))),
         );
     }
 
     #[test]
-    fn test_custom_function_with_vjp_pullback() {
+    fn test_composite_with_vjp_pullback() {
         // Extracting the stored pullback must preserve the custom backward rule and its residual inputs. The forward
         // rule saves `cos(x)`, and the backward rule returns `2 * residual * cotangent`, so a unit cotangent at
         // `x = 0.7` produces `2 * cos(0.7)` rather than the mathematical derivative.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok((residual.clone() + residual) * cotangent),
         );
@@ -3711,7 +3702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_cotangent_casts() {
+    fn test_composite_with_vjp_cotangent_casts() {
         // The forward rule narrows `x: f64[n]` to `f64[2]` with a checked cast and saves `x` with the derivative, and
         // the backward rule widens the cotangent back to `f64[n]` with a checked cast that names `x` as its witness.
         // The staged pullback keeps both checks, the first one before the backward rule, in both orders of batching and
@@ -3721,7 +3712,7 @@ mod tests {
         let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let static_type = ArrayType::new_static(DataType::F64, [2]);
         let forward_type = static_type.clone();
-        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin()).with_vjp(
+        let function = composite(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin()).with_vjp(
             move |x: Tracer| {
                 let y = x.cast(forward_type.clone(), &[])?;
                 Ok((y.sin()?, (x, y.cos()?)))
@@ -3833,12 +3824,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_multiple_outputs() {
+    fn test_composite_with_vjp_multiple_outputs() {
         // A two-output custom VJP exercises the output/residual split of the forward region: its leading values are the
         // primal outputs and the rest are residuals, and the backward region consumes one cotangent per output. The
         // custom rule scales the contribution of the first output by 2 and that of the second by 3, so
         // seeding one output cotangent at a time isolates each term of the custom backward rule.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?))).with_vjp(
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?))).with_vjp(
             |x| Ok(((x.sin()?, x.cos()?), (x.cos()?, x.sin()?))),
             |(cosine, sine), (first, second)| {
                 let from_first = cosine * first;
@@ -3861,12 +3852,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_structured_signatures() {
+    fn test_composite_with_vjp_structured_signatures() {
         // Tuple inputs and tuple residuals exercise the `Parameterized` calling convention, and the captured `repeats`
         // count plays the role of static configuration that is visible to the rule closures without being
         // differentiated or stored as a residual.
         let repeats = 3usize;
-        let function = custom_function(|(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y))
+        let function = composite(|(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y))
             .with_vjp(
                 |(x, y)| Ok((x.clone() * y.clone(), (x, y))),
                 move |(x, y), cotangent| {
@@ -3890,11 +3881,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_empty_residuals() {
+    fn test_composite_with_vjp_empty_residuals() {
         // A forward rule that saves nothing (i.e., `Residuals = ()`) exercises the zero-residual carrier path: the
         // backward rule depends only on the output cotangent, so the custom rule
         // `backward(cotangent) = 2 * cotangent` makes the gradient the constant `2` instead of `cos(x)`.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?))
             .with_vjp(|x| Ok((x.sin()?, ())), |(), cotangent| Ok(cotangent.clone() + cotangent));
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| function.call(x).unwrap()),
@@ -3903,10 +3894,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_batching_replicated_inputs() {
+    fn test_composite_with_vjp_batching_replicated_inputs() {
         // Mapping only the first input verifies that the replicated input remains shared at the call boundary while
         // operations inside its regions broadcast it only where per-item multiplication requires alignment.
-        let function = custom_function(|(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y))
+        let function = composite(|(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y))
             .with_vjp(
                 |(x, y)| Ok((x.clone() * y.clone(), (x, y))),
                 |(x, y), cotangent| Ok((y * cotangent.clone(), x * cotangent)),
@@ -3923,12 +3914,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_zero_space_boundaries() {
+    fn test_composite_with_vjp_zero_space_boundaries() {
         // Token primals, residuals, and zero-space cotangents carry no payload, so the wrapper must pass them through
         // the traced forward and backward rules unchanged instead of demanding a dense cotangent space.
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let function = custom_function(|token: DomainTracer<ArrayContext>| Ok(token))
+        let function = composite(|token: DomainTracer<ArrayContext>| Ok(token))
             .with_vjp(|token| Ok((token.clone(), token)), |_residual, cotangent| Ok(cotangent));
         let (value, pullback) = differentiate_at(token.clone()).vjp(|token| function.call(token)).unwrap();
         assert_eq!(value, token);
@@ -3936,11 +3927,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_vjp_effectful_backward_destinations() {
+    fn test_composite_with_vjp_effectful_backward_destinations() {
         // This is one custom backward closure with an observable reference effect and an intentionally nonlinear
         // seed formula. Destination specialization must preserve the closure's execution and additive semantics.
         let stash = ArrayReference::new(Array::scalar(-1.0f32).unwrap());
-        let function = custom_function(|(_, value): (ArrayIrTracer, ArrayIrTracer)| Ok(value))
+        let function = composite(|(_, value): (ArrayIrTracer, ArrayIrTracer)| Ok(value))
             .with_vjp(
                 |(stash, value)| Ok((value, stash)),
                 |stash: ArrayIrTracer, seed: ArrayIrTracer| {
@@ -4010,12 +4001,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_symbolic_zero_vjp() {
+    fn test_composite_with_symbolic_zero_vjp() {
         // The backward rule of `x ↦ (sin(x), cos(x))` receives the structural-zero seed of the unused second output as
         // a `MaybeZero::Zero` leaf and skips its term.
         type Tracer = DomainTracer<ArrayContext>;
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let function = custom_function(|x: Tracer| Ok((x.sin()?, x.cos()?))).with_symbolic_zero_vjp(
+        let function = composite(|x: Tracer| Ok((x.sin()?, x.cos()?))).with_symbolic_zero_vjp(
             |x| Ok(((x.sin()?, x.cos()?), (x.cos()?, x.sin()?))),
             {
                 let observed = observed.clone();
@@ -4045,7 +4036,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_symbolic_zero_vjp_dimension_residuals() {
+    fn test_composite_with_symbolic_zero_vjp_dimension_residuals() {
         // The forward rule saves the dimension `n · n` of its input's extent `n`. Replaying the traced forward rule
         // mints a fresh identity for that dimension, so the backward rule must find the residual structure by type
         // equivalence up to identity renaming.
@@ -4053,7 +4044,7 @@ mod tests {
             let extent = ValueProjection::<DimensionType>::into_projected(x.dimension_size(0)?)?;
             Ok((x, (extent.clone() * extent).into_value()))
         };
-        let function = custom_function(|x: ArrayIrTracer| Ok(x)).with_symbolic_zero_vjp(
+        let function = composite(|x: ArrayIrTracer| Ok(x)).with_symbolic_zero_vjp(
             saved_extent,
             |_: ArrayIrTracer, seed: MaybeZero<ArrayIrTracer>| match seed {
                 MaybeZero::Value(seed) => Ok(seed),
@@ -4069,7 +4060,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_accumulating_vjp() {
+    fn test_composite_with_accumulating_vjp() {
         // `(x, y) ↦ x[1] + y[1]` over `f64[4]` inputs. One accumulating backward rule serves every destination: it adds
         // the seed to only the affected entry of a caller buffer (without a full-sized temporary) and pads it into a
         // full cotangent for a returned destination. It is specialized once per pattern of destination kinds.
@@ -4082,7 +4073,7 @@ mod tests {
             Ok(left.context().bind(operation, Vec::new(), &[left.clone(), right])?.remove(0))
         };
         let invocations = Arc::new(AtomicUsize::new(0));
-        let function = custom_function(move |(x, y): (ArrayIrTracer, ArrayIrTracer)| add(element(&x)?, element(&y)?))
+        let function = composite(move |(x, y): (ArrayIrTracer, ArrayIrTracer)| add(element(&x)?, element(&y)?))
             .with_accumulating_vjp(
                 move |(x, y): (ArrayIrTracer, ArrayIrTracer)| Ok((add(element(&x)?, element(&y)?)?, ())),
                 {
@@ -4172,7 +4163,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_accumulating_vjp_dimension_residuals() {
+    fn test_composite_with_accumulating_vjp_dimension_residuals() {
         // The forward rule saves the dimension `n · n` of its input's extent `n`. Replaying the traced forward rule
         // mints a fresh identity for that dimension, so the backward rule must find the residual structure by type
         // equivalence up to identity renaming.
@@ -4181,7 +4172,7 @@ mod tests {
             Ok((x, (extent.clone() * extent).into_value()))
         };
         type Transposition = TranspositionContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let function = custom_function(|x: ArrayIrTracer| Ok(x)).with_accumulating_vjp(
+        let function = composite(|x: ArrayIrTracer| Ok(x)).with_accumulating_vjp(
             saved_extent,
             |context: &mut Transposition,
              _: ArrayIrTracer,
@@ -4195,13 +4186,13 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching() {
+    fn test_composite_with_batching() {
         // The rule of `(x, y) ↦ x · y` computes `y · x`, which shows that it takes precedence over structurally
         // batching the primal, and declares that the output follows the mapped input. It is traced once per batching
         // level and input signature, which the extents that it records show.
         type Tracer = DomainTracer<ArrayContext>;
         let extents = Arc::new(Mutex::new(Vec::new()));
-        let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y))
+        let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y))
             .with_jvp(|(x, y): (Tracer, Tracer), (dx, dy): (Tracer, Tracer)| {
                 let tangent = dx * y.clone() + x.clone() * dy;
                 Ok((x * y, tangent.clone() + tangent))
@@ -4247,8 +4238,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[] .
-                let %2:f64[3] = custom_function [
-                    name=\"custom_function\",
+                let %2:f64[3] = composite [
+                    name=\"composite\",
                     batching=[(extent=3, input_axes=[axis 0, replicated], output_axes=[axis 0])],
                 ] %0 %1 [
                     primal={
@@ -4306,7 +4297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_named_axes() {
+    fn test_composite_named_axes() {
         // The primal and the rules are traced in fresh traces that are seeded with the named axes visible where the
         // function is called, so a function called under `batch` resolves the batch axis `items` in its primal
         // (`x ↦ x · i` at batch item `i`), its JVP rule (`(x, ẋ) ↦ (x · i, ẋ · i)`), its VJP rules (which save `i`
@@ -4321,7 +4312,7 @@ mod tests {
         let items = || BatchAxisSpecification::named("items");
 
         // Outside of `batch`, nothing binds `items`.
-        let function = custom_function(scaled);
+        let function = composite(scaled);
         assert_eq!(
             ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "items".to_string() })),
@@ -4339,8 +4330,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = custom_function [
-                    name=\"custom_function\",
+                let %1:f64[3] = composite [
+                    name=\"composite\",
                     batching=[(extent=3, axis_name=\"items\", input_axes=[axis 0], output_axes=[axis 0])],
                 ] %0 [
                     primal={
@@ -4356,7 +4347,7 @@ mod tests {
             .trim_end(),
         );
 
-        let function = custom_function(scaled)
+        let function = composite(scaled)
             .with_jvp(move |x: Tracer, tangent: Tracer| Ok((scaled(x.clone())?, tangent * index(&x)?)));
         assert_eq!(
             differentiate_at(inputs.clone()).jvp(ones.clone(), |x| {
@@ -4365,7 +4356,7 @@ mod tests {
             Ok((Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap(), Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap())),
         );
 
-        let function = custom_function(scaled).with_vjp(
+        let function = composite(scaled).with_vjp(
             move |x: Tracer| Ok((scaled(x.clone())?, index(&x)?)),
             |index: Tracer, cotangent: Tracer| Ok(cotangent * index),
         );
@@ -4377,7 +4368,7 @@ mod tests {
             Ok(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
         );
 
-        let function = custom_function(|x: Tracer| x.parallel_reduce(ReductionKind::Sum, "items"));
+        let function = composite(|x: Tracer| x.parallel_reduce(ReductionKind::Sum, "items"));
         assert_eq!(
             batch(|x| function.call(x), inputs, BatchAxis::new(0), BatchAxis::new(0), items()),
             Ok(Array::vector(vec![6.0f64; 3]).unwrap()),
@@ -4385,7 +4376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_references() {
+    fn test_composite_with_batching_references() {
         // The primal `(counter, x) ↦ x` adds `x` into its plumbing counter. Structurally batching it with a replicated
         // counter and a mapped `x` is rejected, because a replicated reference cannot receive a batched value, while
         // the batching rule adds the sum of the batch into the counter instead.
@@ -4405,7 +4396,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
         };
-        let function = custom_function(primal).with_non_differentiated_count(1);
+        let function = composite(primal).with_non_differentiated_count(1);
         let (_, program) = EagerArrayIrContext::trace(|inputs| function.call(inputs), input_types.clone()).unwrap();
         assert!(matches!(
             batched(program.into_flat_program()),
@@ -4414,7 +4405,7 @@ mod tests {
                                the reference as a batched input instead",
         ));
 
-        let function = custom_function(primal).with_non_differentiated_count(1).with_batching(
+        let function = composite(primal).with_non_differentiated_count(1).with_batching(
             |_: BatchingLevelExtent<ArrayIrTracer>,
              (counter, x): (ArrayIrTracer, ArrayIrTracer),
              (_, x_axis): (BatchAxis, BatchAxis)| {
@@ -4429,8 +4420,8 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<3>, %1:ref<f32[]>, %2:f32[3] .
-                let %3:f32[3] = custom_function [
-                    name=\"custom_function\",
+                let %3:f32[3] = composite [
+                    name=\"composite\",
                     non_differentiated_count=2,
                     batching=[(extent=dimension<3>, input_axes=[replicated, axis 0], output_axes=[axis 0])],
                 ] %0 %1 %2 [
@@ -4461,7 +4452,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_casts() {
+    fn test_composite_with_batching_casts() {
         // The primal narrows `x: f64[n]` to `f64[2]` with a checked cast before `sin`, while the batching rule applies
         // `sin` first and then narrows the batched value with a checked cast of its own, so that its program is
         // recognizable. The rule's check survives batching, differentiation of the batched call (which differentiates
@@ -4471,7 +4462,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let static_type = ArrayType::new_static(DataType::F64, [2]);
-        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin()).with_batching(
+        let function = composite(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin()).with_batching(
             |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| {
                 let mut dimensions = x.r#type().shape().dimensions().to_vec();
                 *dimensions.last_mut().unwrap() = Dimension::Static(2);
@@ -4508,8 +4499,8 @@ mod tests {
             batched_program.to_string(),
             indoc! {"
                 lambda %0:f64[3, n] .
-                let %1:f64[3, 2] = custom_function [
-                    name=\"custom_function\",
+                let %1:f64[3, 2] = composite [
+                    name=\"composite\",
                     batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])],
                 ] %0 [
                     primal={
@@ -4552,7 +4543,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[n], %1:f64[n] .
-                let %2:f64[2], %3:f64[2] = custom_function [name=\"jvp(custom_function)\"] %0 %1 [
+                let %2:f64[2], %3:f64[2] = composite [name=\"jvp(composite)\"] %0 %1 [
                     primal={
                         lambda %0:f64[n], %1:f64[n] .
                         let %2:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
@@ -4573,8 +4564,8 @@ mod tests {
             batched_jvp.to_string(),
             indoc! {"
                 lambda %0:f64[3, n], %1:f64[3, n] .
-                let %2:f64[3, 2], %3:f64[3, 2] = custom_function [
-                    name=\"jvp(custom_function)\",
+                let %2:f64[3, 2], %3:f64[3, 2] = composite [
+                    name=\"jvp(composite)\",
                     batching=[(extent=3, input_axes=[axis 0, axis 0], output_axes=[axis 0, axis 0])],
                 ] %0 %1 [
                     primal={
@@ -4597,10 +4588,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiation() {
+    fn test_composite_with_batching_differentiation() {
         // A function with only a batching rule (i.e., bare `custom_vmap`) differentiates its primal in both modes.
         type Tracer = DomainTracer<ArrayContext>;
-        let function = custom_function(|x: Tracer| Ok(x.sin()?))
+        let function = composite(|x: Tracer| Ok(x.sin()?))
             .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()?, axis)));
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
@@ -4615,7 +4606,7 @@ mod tests {
     /// Returns `sin` with a custom batching rule that computes `2 · sin(x)` instead (expressed through addition to
     /// avoid constant lifting), which makes visible whether a batched computation and each of its derivatives go
     /// through the rule. The rule maps its output exactly when its input is mapped.
-    fn doubled_sine_when_batched() -> CustomFunction<
+    fn doubled_sine_when_batched() -> Composite<
         DomainTracer<ArrayContext>,
         DomainTracer<ArrayContext>,
         impl Fn(DomainTracer<ArrayContext>) -> Result<DomainTracer<ArrayContext>, ProgramError>,
@@ -4634,14 +4625,14 @@ mod tests {
         >,
     > {
         type Tracer = DomainTracer<ArrayContext>;
-        custom_function(|x: Tracer| Ok(x.sin()?))
+        composite(|x: Tracer| Ok(x.sin()?))
             .with_name("sine")
             .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)))
     }
 
     /// Returns `x · y` with a custom batching rule that computes `2 · x · y` instead (refer to
     /// [`doubled_sine_when_batched`]), whose output is mapped along the first mapped input axis.
-    fn doubled_product_when_batched() -> CustomFunction<
+    fn doubled_product_when_batched() -> Composite<
         (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>),
         DomainTracer<ArrayContext>,
         impl Fn(
@@ -4662,7 +4653,7 @@ mod tests {
         >,
     > {
         type Tracer = DomainTracer<ArrayContext>;
-        custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_name("product").with_batching(
+        composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_name("product").with_batching(
             |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
                 let product = x * y;
                 Ok((product.clone() + product, if x_axis.is_replicated() { y_axis } else { x_axis }))
@@ -4679,7 +4670,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_batch_then_differentiate() {
+    fn test_composite_with_batching_batch_then_differentiate() {
         // Batching the call applies its batching rule, so differentiating the batched call differentiates the rule's
         // program in both modes (i.e., `d(2 · sin(x)) = 2 · cos(x) · ẋ`).
         let function = doubled_sine_when_batched();
@@ -4726,7 +4717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch() {
+    fn test_composite_with_batching_differentiate_then_batch() {
         // Differentiating an unbatched call stages a derived call whose primal region is the derivative of the call's
         // primal region, and batching it applies the derivative of the batching rule, whatever the order in which the
         // two transforms are applied.
@@ -4737,7 +4728,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[], %3:f64[] = custom_function [name=\"jvp(sine)\"] %0 %1 [
+                let %2:f64[], %3:f64[] = composite [name=\"jvp(sine)\"] %0 %1 [
                     primal={
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = sin %0
@@ -4767,7 +4758,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[3] .
-                let %2:f64[3], %3:f64[3] = custom_function [
+                let %2:f64[3], %3:f64[3] = composite [
                     name=\"jvp(sine)\",
                     batching=[(extent=3, input_axes=[axis 0, axis 0], output_axes=[axis 0, axis 0])],
                 ] %0 %1 [
@@ -4813,7 +4804,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_jacobian_forward() {
+    fn test_composite_with_batching_differentiate_then_batch_jacobian_forward() {
         // Linearization computes the outputs with the call itself and stages a pushforward call on its tangent side, so
         // the forward-mode Jacobian (which batches that pushforward over its tangents) applies the rule's derivative.
         let function = doubled_sine_when_batched();
@@ -4826,7 +4817,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = custom_function [name=\"sine\"] %0 [
+                let %1:f64[3] = composite [name=\"sine\"] %0 [
                     primal={
                         lambda %0:f64[3] .
                         let %1:f64[3] = sin %0
@@ -4841,7 +4832,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[3] .
-                let %2:f64[3] = custom_function [name=\"pushforward(sine)\"] %1 %0 [
+                let %2:f64[3] = composite [name=\"pushforward(sine)\"] %1 %0 [
                     primal={
                         lambda %0:f64[3], %1:f64[3] .
                         let %2:f64[3] = cos %0
@@ -4896,7 +4887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_mixed_axes() {
+    fn test_composite_with_batching_differentiate_then_batch_mixed_axes() {
         // Every combination of mapped and replicated primals and tangents batches through the rule's derivative. The
         // first two broadcast the replicated side of a pair with one mapped side, and the last two batch the derivative
         // of the rule applied to replicated inputs structurally, because no input is mapped on both sides.
@@ -4948,12 +4939,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_flag_sensitive_rule() {
+    fn test_composite_with_batching_differentiate_then_batch_flag_sensitive_rule() {
         // The rule computes `2xy` when both inputs are mapped and `3xy` otherwise. The primal outputs of a batched
         // derivative always come from the rule applied at the primal inputs' batch axes, so they are those of the
         // batched call in both cases below.
         type Tracer = DomainTracer<ArrayContext>;
-        let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
+        let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
             |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
                 let product = x * y;
                 let scale = if x_axis.is_replicated() || y_axis.is_replicated() { 3.0 } else { 2.0 };
@@ -4976,11 +4967,11 @@ mod tests {
         let mapped = BatchAxis::new(0);
         let replicated = BatchAxis::replicated();
 
-        // For a mapped `x` and a replicated `y` whose tangent is mapped, the batched call returns `3xy`. The rule cannot
-        // perturb the shared `y` differently for each batch item, so the tangent comes from the rule applied with `y`
-        // broadcast, which is `2(ẋy + xẏ)`. JAX instead returns the outer product of the two batches, whose diagonal
-        // is `3(ẋy + xẏ)` (i.e., `[18, 24, 39]` here). The two coincide for rules that do not depend on their input
-        // axes (e.g., in `test_custom_function_with_batching_differentiate_then_batch_mixed_axes`).
+        // For a mapped `x` and a replicated `y` whose tangent is mapped, the batched call returns `3xy`. The rule
+        // cannot perturb the shared `y` differently for each batch item, so the tangent comes from the rule applied
+        // with `y` broadcast, which is `2(ẋy + xẏ)`. JAX instead returns the outer product of the two batches, whose
+        // diagonal is `3(ẋy + xẏ)` (i.e., `[18, 24, 39]` here). The two coincide for rules that do not depend on their
+        // input axes (e.g., in `test_composite_with_batching_differentiate_then_batch_mixed_axes`).
         let x = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
         let y = Array::scalar(4.0f64).unwrap();
         let primal = Array::vector(vec![12.0f64, 24.0, 36.0]).unwrap();
@@ -5023,7 +5014,7 @@ mod tests {
         // An axis-dependent configuration of the same rule applies it once, at the primal axes, in the first case too,
         // and recovers the per-item tangents of the replicated `y` from the outer product of its batch of tangents with
         // the rule's batch, so they are exactly the per-item derivatives `3(ẋy + xẏ)` of the batched primal `3xy`.
-        let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_axis_dependent_batching(
+        let function = composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_axis_dependent_batching(
             |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
                 let product = x * y;
                 let scale = if x_axis.is_replicated() || y_axis.is_replicated() { 3.0 } else { 2.0 };
@@ -5078,7 +5069,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_non_differentiated_inputs() {
+    fn test_composite_with_batching_differentiate_then_batch_non_differentiated_inputs() {
         // A derived call receives no tangents for non-differentiated inputs, which keep their batch axes when the rule
         // is applied.
         let function = doubled_product_when_batched().with_non_differentiated_count(1);
@@ -5090,7 +5081,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[] .
-                let %3:f64[], %4:f64[] = custom_function [name=\"jvp(product)\", non_differentiated_count=1] %0 %1 %2 [
+                let %3:f64[], %4:f64[] = composite [name=\"jvp(product)\", non_differentiated_count=1] %0 %1 %2 [
                     primal={
                         lambda %0:f64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %0 %1
@@ -5123,11 +5114,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_zero_space_inputs() {
+    fn test_composite_with_batching_differentiate_then_batch_zero_space_inputs() {
         // Zero-space inputs (e.g., integers) have no tangents, so a derived call receives none for them, while the rule
         // still receives them with their batch axes.
         type Tracer = DomainTracer<ArrayContext>;
-        let function = custom_function(|(x, _): (Tracer, Tracer)| Ok(x.sin()?)).with_name("sine").with_batching(
+        let function = composite(|(x, _): (Tracer, Tracer)| Ok(x.sin()?)).with_name("sine").with_batching(
             |_: BatchingLevelExtent<Tracer>, (x, _): (Tracer, Tracer), (axis, _): (BatchAxis, BatchAxis)| {
                 Ok((x.sin()? + x.sin()?, axis))
             },
@@ -5142,7 +5133,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:i32[], %2:f64[] .
-                let %3:f64[], %4:f64[] = custom_function [name=\"jvp(sine)\"] %0 %1 %2 [
+                let %3:f64[], %4:f64[] = composite [name=\"jvp(sine)\"] %0 %1 %2 [
                     primal={
                         lambda %0:f64[], %1:i32[], %2:f64[] .
                         let %3:f64[] = sin %0
@@ -5178,23 +5169,19 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_non_batchable_primal() {
+    fn test_composite_with_batching_differentiate_then_batch_non_batchable_primal() {
         // The primal's derivative calls a foreign kernel, which cannot be batched (nor executed by the reference
         // backend), so batching a derivative succeeds only through the derivative of the batching rule, in both modes.
         type Tracer = DomainTracer<ArrayContext>;
-        let kernel = CustomFunction::from_custom_call(CustomCallOperation::new(
-            "my_sin",
-            vec![ArrayType::scalar(DataType::F64)],
-        ))
-        .with_jvp(|inputs: Vec<Tracer>, tangents: Vec<Tracer>| {
-            let kernel = CustomCallOperation::new("my_sin", vec![ArrayType::scalar(DataType::F64)]);
-            Ok((CustomCall::custom_call(&kernel, &inputs)?, vec![inputs[0].cos()? * tangents[0].clone()]))
-        });
-        let function = custom_function(move |x: Tracer| Ok(kernel.call(vec![x])?.remove(0)))
-            .with_name("sine")
-            .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| {
-                Ok((x.sin()? + x.sin()?, axis))
-            });
+        let kernel =
+            Composite::from_custom_call(CustomCallOperation::new("my_sin", vec![ArrayType::scalar(DataType::F64)]))
+                .with_jvp(|inputs: Vec<Tracer>, tangents: Vec<Tracer>| {
+                    let kernel = CustomCallOperation::new("my_sin", vec![ArrayType::scalar(DataType::F64)]);
+                    Ok((CustomCall::custom_call(&kernel, &inputs)?, vec![inputs[0].cos()? * tangents[0].clone()]))
+                });
+        let function = composite(move |x: Tracer| Ok(kernel.call(vec![x])?.remove(0))).with_name("sine").with_batching(
+            |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)),
+        );
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         let jvp = program.into_flat_program().jvp().unwrap();
         let x = [0.5, 1.0, 1.5];
@@ -5225,11 +5212,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_projection() {
+    fn test_composite_with_batching_differentiate_then_batch_projection() {
         // Projections of array IR contexts lift the regions of the member operations that they bind, so a function
         // written against a projection stages its derived call in the array IR family.
         type Tracer = DomainTracer<ProjectedContext<EagerArrayIrContext, ArrayType>>;
-        let function = custom_function(|x: Tracer| Ok(x.sin()?)).with_batching(
+        let function = composite(|x: Tracer| Ok(x.sin()?)).with_batching(
             |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)),
         );
         let (_, program) = EagerArrayIrContext::trace(
@@ -5245,7 +5232,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[], %2:f64[] = custom_function [name=\"jvp(custom_function)\"] %0 %0 [
+                let %1:f64[], %2:f64[] = composite [name=\"jvp(composite)\"] %0 %0 [
                     primal={
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = sin %0
@@ -5261,7 +5248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_output_axes() {
+    fn test_composite_with_batching_differentiate_then_batch_output_axes() {
         // The derived batching rule keeps the batch axes that the rule declares, including nonzero ones, and moves a
         // tangent that is mapped along another axis than its primal to its primal's axis.
         let function = doubled_sine_when_batched();
@@ -5291,12 +5278,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_dynamic_extent() {
+    fn test_composite_with_batching_differentiate_then_batch_dynamic_extent() {
         // A first-class batch extent reaches the derived batching rule as the level's boundary input, which the source
         // rule and the batched derivative both consume.
         type Tracer = DomainTracer<EagerArrayIrContext>;
         let sine = |x: Tracer| ValueProjection::<ArrayType>::into_projected(x)?.sin();
-        let function = custom_function(move |x: Tracer| Ok(sine(x)?.into_value())).with_name("sine").with_batching(
+        let function = composite(move |x: Tracer| Ok(sine(x)?.into_value())).with_name("sine").with_batching(
             move |_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| {
                 Ok(((sine(x.clone())? + sine(x)?).into_value(), axis))
             },
@@ -5333,7 +5320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_shared_derivation() {
+    fn test_composite_with_batching_differentiate_then_batch_shared_derivation() {
         // Calls whose primal regions differ share one derived definition, while each keeps its own primal region.
         let function = doubled_sine_when_batched();
         let (_, program) = ArrayContext::trace(
@@ -5346,7 +5333,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2], %2:f64[], %3:f64[2] .
-                let %4:f64[], %5:f64[] = custom_function [name=\"jvp(sine)\"] %0 %2 [
+                let %4:f64[], %5:f64[] = composite [name=\"jvp(sine)\"] %0 %2 [
                     primal={
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = sin %0
@@ -5355,7 +5342,7 @@ mod tests {
                         in (%2, %4)
                     },
                 ]
-                    %6:f64[2], %7:f64[2] = custom_function [name=\"jvp(sine)\"] %1 %3 [
+                    %6:f64[2], %7:f64[2] = composite [name=\"jvp(sine)\"] %1 %3 [
                         primal={
                             lambda %0:f64[2], %1:f64[2] .
                             let %2:f64[2] = sin %0
@@ -5375,7 +5362,7 @@ mod tests {
             .instructions()
             .iter()
             .map(|instruction| match instruction.operation() {
-                ArrayOperation::CustomFunction(operation) => operation.rules().unwrap().clone(),
+                ArrayOperation::Composite(operation) => operation.rules().unwrap().clone(),
                 operation => panic!("unexpected operation `{operation}`"),
             })
             .collect::<Vec<_>>();
@@ -5413,7 +5400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_effectful_primal() {
+    fn test_composite_with_batching_differentiate_then_batch_effectful_primal() {
         // A pushforward that recomputed this primal would repeat its reference update and read the updated counter, so
         // linearization inlines the derivative of an effectful primal instead: the effect runs once, when the known
         // side runs, and every pushforward sees the coefficient that the known side observed.
@@ -5424,7 +5411,7 @@ mod tests {
             let scale = ValueProjection::<ArrayType>::into_projected(counter.read()?)?;
             Ok::<_, ProgramError>((scale * ValueProjection::<ArrayType>::into_projected(x)?).into_value())
         };
-        let function = custom_function(scaled_by_incremented_counter).with_non_differentiated_count(1).with_batching(
+        let function = composite(scaled_by_incremented_counter).with_non_differentiated_count(1).with_batching(
             move |_: BatchingLevelExtent<Tracer>, inputs: (Tracer, Tracer), (_, axis): (BatchAxis, BatchAxis)| {
                 Ok((scaled_by_incremented_counter(inputs)?, axis))
             },
@@ -5475,7 +5462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_higher_order() {
+    fn test_composite_with_batching_differentiate_then_batch_higher_order() {
         // A derived call is differentiated like its source, so higher-order derivatives keep the rule on their batching
         // path. Nested batching applies the derived rule at every level, where the source rule batches the source
         // function at the batched types (i.e., the rule is not composed with itself), as for the source call.
@@ -5486,7 +5473,7 @@ mod tests {
             second_order.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                let %4:f64[], %5:f64[], %6:f64[], %7:f64[] = custom_function [name=\"jvp(jvp(sine))\"] %0 %1 %2 %3 [
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[] = composite [name=\"jvp(jvp(sine))\"] %0 %1 %2 %3 [
                     primal={
                         lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = sin %0
@@ -5568,7 +5555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_batching_differentiate_then_batch_reverse_mode() {
+    fn test_composite_with_batching_differentiate_then_batch_reverse_mode() {
         // Reverse mode inlines the derivative of the primal, since derived calls are not transposable, and a function
         // with reverse-mode rules keeps using them.
         let function = doubled_sine_when_batched();
@@ -5593,7 +5580,7 @@ mod tests {
         );
 
         type Tracer = DomainTracer<ArrayContext>;
-        let function = custom_function(|x: Tracer| Ok(x.sin()?))
+        let function = composite(|x: Tracer| Ok(x.sin()?))
             .with_jvp_from_primal()
             .with_vjp(
                 |x| Ok((x.sin()?, x.cos()?)),
@@ -5619,7 +5606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_axis_dependent_batching() {
+    fn test_composite_with_axis_dependent_batching() {
         // The rule of `(x, y, z) ↦ (xy, yz)` computes the batched products for every batch axis pattern, so it does not
         // depend on its axes, and the axis-dependent configuration must give exactly the per-item derivatives that the
         // plain configuration gives. With `x` mapped and `y` and `z` replicated, the mapped tangent `ẏ` (and, in the
@@ -5635,10 +5622,10 @@ mod tests {
         };
         let scalar_type = ArrayType::scalar(DataType::F64);
         let input_types = (scalar_type.clone(), scalar_type.clone(), scalar_type);
-        let axis_dependent = custom_function(primal).with_axis_dependent_batching(rule);
+        let axis_dependent = composite(primal).with_axis_dependent_batching(rule);
         let (_, program) = ArrayContext::trace(|inputs| axis_dependent.call(inputs), input_types.clone()).unwrap();
         let program = program.into_flat_program();
-        let plain = custom_function(primal).with_batching(rule);
+        let plain = composite(primal).with_batching(rule);
         let (_, plain_program) = ArrayContext::trace(|inputs| plain.call(inputs), input_types).unwrap();
         let plain_program = plain_program.into_flat_program();
         let batched = |program: &FlatProgram<ArrayContext>, axes: &[BatchAxis], inputs: Vec<Array>| {
@@ -5672,8 +5659,8 @@ mod tests {
         assert_eq!(batched_jvp.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[] .
-                let %6:f64[3], %7:f64[], %8:f64[3], %9:f64[3] = custom_function [
-                    name=\"jvp(custom_function)\",
+                let %6:f64[3], %7:f64[], %8:f64[3], %9:f64[3] = composite [
+                    name=\"jvp(composite)\",
                     batching=[(extent=3, input_axes=[axis 0, replicated, replicated, axis 0, axis 0, replicated], output_axes=[axis 0, replicated, axis 0, axis 0])],
                 ] %0 %1 %2 %3 %4 %5 [
                     primal={
@@ -5724,7 +5711,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
-                let %6:f64[], %7:f64[] = custom_function [name=\"pushforward(custom_function)\"] %3 %4 %5 %0 %1 %2 [
+                let %6:f64[], %7:f64[] = composite [name=\"pushforward(composite)\"] %3 %4 %5 %0 %1 %2 [
                     primal={
                         lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
                         let %6:f64[] = mul %1 %3
@@ -5760,7 +5747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_axis_dependent_batching_dynamic_extent() {
+    fn test_composite_with_axis_dependent_batching_dynamic_extent() {
         // The rule of `y ↦ 3y` maps its output itself: it computes `3y` broadcast along the batch when `y` is replicated
         // and `2y` otherwise. With a replicated `y` whose tangent is mapped along a first-class extent, the plain
         // configuration applies the rule with `y` broadcast, which gives `2ẏ`, while the axis-dependent configuration
@@ -5810,13 +5797,13 @@ mod tests {
             ])
         };
 
-        let function = custom_function(primal).with_batching(rule);
+        let function = composite(primal).with_batching(rule);
         let (_, program) = EagerArrayIrContext::trace(|y| function.call(y), scalar_type.clone()).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
         assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
         assert_eq!(batched.interpret(inputs.clone()), outputs(vec![2.0, 4.0, 6.0]));
 
-        let function = custom_function(primal).with_axis_dependent_batching(rule);
+        let function = composite(primal).with_axis_dependent_batching(rule);
         let (_, program) = EagerArrayIrContext::trace(|y| function.call(y), scalar_type).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
         assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
@@ -5824,8 +5811,8 @@ mod tests {
         assert_eq!(batched.to_string(),
             indoc! {"
                 lambda %0:dimension<n ∈ [1, 8)>, %1:f64[], %2:f64[n] .
-                let %3:f64[n], %4:f64[n] = custom_function [
-                    name=\"jvp(custom_function)\",
+                let %3:f64[n], %4:f64[n] = composite [
+                    name=\"jvp(composite)\",
                     non_differentiated_count=1,
                     batching=[(extent=dimension<n ∈ [1, 8)>, input_axes=[replicated, axis 0], output_axes=[axis 0, axis 0])],
                 ] %0 %1 %2 [
@@ -5853,7 +5840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_with_axis_dependent_batching_nested_levels() {
+    fn test_composite_with_axis_dependent_batching_nested_levels() {
         // A derived call batched at an earlier level reaches the exact path with that level's batch axes on its inputs.
         // The rule of `(x, y) ↦ xy` does not depend on its axes, so the per-item derivative `ẋy + xẏ` (with `y` mapped
         // only at the inner level) is also what the plain configuration computes.
@@ -5892,14 +5879,14 @@ mod tests {
         ];
         let inputs = vec![x, y, x_tangent, y_tangent];
 
-        let function = custom_function(primal).with_batching(rule);
+        let function = composite(primal).with_batching(rule);
         let (_, program) =
             ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type.clone())).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
         assert_eq!(output_axes, vec![mapped; 2]);
         assert_eq!(batched.interpret(inputs.clone()), Ok(expected.clone()));
 
-        let function = custom_function(primal).with_axis_dependent_batching(rule);
+        let function = composite(primal).with_axis_dependent_batching(rule);
         let (_, program) =
             ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
@@ -5913,7 +5900,7 @@ mod tests {
         // replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
         type Tracer = DomainTracer<ArrayContext>;
         let scaled_product = |inconsistent: bool| {
-            custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
+            composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
                 move |_: BatchingLevelExtent<Tracer>,
                       (x, y): (Tracer, Tracer),
                       (x_axis, y_axis): (BatchAxis, BatchAxis)| {
@@ -5957,11 +5944,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_call() {
+    fn test_composite_call() {
         // Nothing but the primal is traced when the function is called. Calls that share a call structure share one
         // registered definition, whose rule is traced once per specialization and cached while the function lives.
         let traces = Arc::new(AtomicUsize::new(0));
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp({
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?)).with_jvp({
             let traces = traces.clone();
             move |x, tangent| {
                 traces.fetch_add(1, Ordering::SeqCst);
@@ -5978,7 +5965,7 @@ mod tests {
             .instructions()
             .iter()
             .map(|instruction| match instruction.operation() {
-                ArrayOperation::CustomFunction(operation) => operation.rules().unwrap().id(),
+                ArrayOperation::Composite(operation) => operation.rules().unwrap().id(),
                 operation => panic!("unexpected operation `{operation}`"),
             })
             .collect::<Vec<_>>();
@@ -6003,10 +5990,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_call_structures() {
+    fn test_composite_call_structures() {
         // Each call structure registers its own definition, because the rules are adapted to the structured closures.
         let function =
-            custom_function(|xs: Vec<DomainTracer<ArrayContext>>| Ok(xs)).with_jvp(|xs, tangents| Ok((xs, tangents)));
+            composite(|xs: Vec<DomainTracer<ArrayContext>>| Ok(xs)).with_jvp(|xs, tangents| Ok((xs, tangents)));
         let (_, program) = ArrayContext::trace(
             |x: DomainTracer<ArrayContext>| {
                 let single = function.call(vec![x.clone()])?;
@@ -6024,7 +6011,7 @@ mod tests {
             .instructions()
             .iter()
             .map(|instruction| match instruction.operation() {
-                ArrayOperation::CustomFunction(operation) => operation.rules().unwrap().id(),
+                ArrayOperation::Composite(operation) => operation.rules().unwrap().id(),
                 operation => panic!("unexpected operation `{operation}`"),
             })
             .collect::<Vec<_>>();
@@ -6041,10 +6028,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function() {
+    fn test_composite() {
         // A function without custom rules differentiates its primal in both modes and to higher orders, and it batches
         // its primal structurally.
-        let function = custom_function(|x: DomainTracer<ArrayContext>| Ok(x.sin()?));
+        let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?));
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Ok((Array::scalar(2.0f64.sin()).unwrap(), Array::scalar(2.0f64.cos()).unwrap())),
@@ -6071,7 +6058,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_checked_casts() {
+    fn test_composite_checked_casts() {
         // A checked cast in the primal of a function without derivative rules keeps its runtime check in every
         // transform. The derived forward-mode rule converts the tangent behind the primal check and retains the source
         // `f64[n]` for the extent that the converted tangent no longer carries, so that reverse mode can transpose the
@@ -6080,14 +6067,14 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let static_type = ArrayType::new_static(DataType::F64, [2]);
-        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin());
+        let function = composite(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin());
         let (_, program) = ArrayContext::trace(|x| function.call(x), symbolic_type).unwrap();
         let program = program.into_flat_program();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[n] .
-                let %1:f64[2] = custom_function [name=\"custom_function\"] %0 [
+                let %1:f64[2] = composite [name=\"composite\"] %0 [
                     primal={
                         lambda %0:f64[n] .
                         let %1:f64[2] = cast [type=f64[2], inputs=[f64[n]], checked=true] %0
@@ -6190,14 +6177,14 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_checked_casts_batching() {
+    fn test_composite_checked_casts_batching() {
         // Batching lifts the declared cast types by the batch axis and keeps the check, and both orders of batching and
         // differentiation stage the same checked primal conversion and unchecked tangent conversion.
         type Tracer = DomainTracer<ArrayContext>;
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let symbolic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let static_type = ArrayType::new_static(DataType::F64, [2]);
-        let function = custom_function(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin());
+        let function = composite(move |x: Tracer| x.cast(static_type.clone(), &[])?.sin());
         let (_, program) = ArrayContext::trace(|x| function.call(x), symbolic_type).unwrap();
         let program = program.into_flat_program();
         let batched = |program: &FlatProgram<ArrayContext>, input_count: usize| {
@@ -6228,8 +6215,8 @@ mod tests {
             batched_program.to_string(),
             indoc! {"
                 lambda %0:f64[3, n] .
-                let %1:f64[3, 2] = custom_function [
-                    name=\"custom_function\",
+                let %1:f64[3, 2] = composite [
+                    name=\"composite\",
                     batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])],
                 ] %0 [
                     primal={

@@ -6,7 +6,7 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, AsArrayType,
+    ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
     DataType, Dimension, DimensionType, DimensionValue, LinearResiduals, MeshAxisType, Shape, Sharding,
     ShardingDimension, StaticShape,
 };
@@ -641,7 +641,7 @@ pub trait Slice<T = <Self as Capability>::Universe>: Capability + Sized {
         stride: usize,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -666,7 +666,7 @@ pub trait Slice<T = <Self as Capability>::Universe>: Capability + Sized {
     ///   - `keep_axis`: Whether the selected axis remains in the result shape.
     fn index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType> + Reshape<T>,
+        Self: Typed<Type: ArrayMemberType> + Reshape<T>,
     {
         let axis = axis.into().normalize(self.r#type().as_array_type()?.rank())?;
         let limit = index.checked_add(1).ok_or_else(|| TypeError::invalid("`index_axis` index overflows `usize`"))?;
@@ -2803,8 +2803,8 @@ where
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
 /// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
-/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
-/// array and dimension members can implement it as well.
+/// provided functions only require views of the receiver's type (e.g., [`ArrayMemberType`]), so that other universes
+/// with array and dimension members can implement it as well.
 ///
 /// # Example
 ///
@@ -2941,7 +2941,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
         stride: usize,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant + DynamicIota<Self>>
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
@@ -3033,7 +3033,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
     ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
     fn dynamic_index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, Domain: DimensionConstant + DynamicIota<Self>>
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DynamicReshape
             + DimensionSize

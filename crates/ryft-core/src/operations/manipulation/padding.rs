@@ -7,9 +7,9 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, AsArrayType,
-    AsDimensionType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
-    materialize_array_tangent,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType,
+    DataType, Dimension, DimensionMemberType, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
+    Shape, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1641,8 +1641,8 @@ where
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
 /// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
-/// provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other universes with
-/// array and dimension members can implement it as well.
+/// provided functions only require views of the receiver's type (e.g., [`ArrayMemberType`]), so that other universes
+/// with array and dimension members can implement it as well.
 ///
 /// # Example
 ///
@@ -1723,7 +1723,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
         extent: &Self,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant + DynamicIota<Self>>
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant + DynamicIota<Self>>
             + DimensionSize
             + Assert
             + DimensionToScalar

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
-    AsArrayType, Shape, Sharding,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayMemberType,
+    ArrayType, Shape, Sharding,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -385,7 +385,7 @@ pub trait Transpose<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn transpose_reversed(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         self.transpose((0..self.r#type().as_array_type()?.rank()).rev().collect::<Vec<_>>())
     }
@@ -405,7 +405,7 @@ pub trait Transpose<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn matrix_transpose(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let rank = self.r#type().as_array_type()?.rank();
         if rank < 2 {
@@ -445,7 +445,7 @@ pub trait Transpose<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn move_axis<S: Into<Axes>, D: Into<Axes>>(&self, source: S, destination: D) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let rank = self.r#type().as_array_type()?.rank();
         let source = source.into();
@@ -490,7 +490,7 @@ pub trait Transpose<T = <Self as Capability>::Universe>: Capability + Sized {
     #[inline]
     fn swap_axes<I: Into<Axis>, J: Into<Axis>>(&self, i: I, j: J) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType>,
+        Self: Typed<Type: ArrayMemberType>,
     {
         let rank = self.r#type().as_array_type()?.rank();
         let i = i.into();

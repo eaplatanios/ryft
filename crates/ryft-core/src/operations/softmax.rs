@@ -67,12 +67,12 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
+use crate::operations::composites::functions::{Composite, WithJvp, composite};
+use crate::operations::composites::operations::CompositeCallOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
-use crate::operations::custom_functions::functions::{CustomFunction, WithJvp, custom_function};
-use crate::operations::custom_functions::operations::CustomFunctionOperation;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::exponential::{Exp, ExpM1, Ln1p};
 use crate::operations::logical::{And, Or};
@@ -417,10 +417,11 @@ pub struct SoftmaxCrossEntropyWithTargetLogits<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    /// Retained custom function whose leading target input is non-differentiated plumbing.
-    function: CustomFunction<
+    /// Retained composite whose leading target input is non-differentiated plumbing.
+    composite: Composite<
         (DomainTracer<D>, DomainTracer<D>),
         DomainTracer<D>,
+        // TODO(eaplatanios): Can we make these a bit more ergonomic? Is this about the `Composite` design?
         Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>,
         WithJvp<
             Box<
@@ -441,7 +442,7 @@ impl<
     D: Domain<
             Type = ArrayType,
             Constant: 'static + Send + Sync,
-            Operation: 'static + Send + Sync + From<CustomFunctionOperation<D::Constant, D::Operation>>,
+            Operation: 'static + Send + Sync + From<CompositeCallOperation<D::Constant, D::Operation>>,
         >,
 > SoftmaxCrossEntropyWithTargetLogits<D>
 where
@@ -452,7 +453,7 @@ where
     /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
     /// reducing the class axes. Both inputs must have the same real floating-point element type and static shape.
     /// Target derivatives are explicitly stopped, so differentiation over both inputs returns a zero target gradient.
-    /// Manual variation is aligned before the custom function boundary, so its transpose sums replicated inputs'
+    /// Manual variation is aligned before the composite boundary, so its transpose sums replicated inputs'
     /// contributions once.
     ///
     /// The inputs' domain supplies the call context, so this function can be reused with eager and transformed values
@@ -478,7 +479,7 @@ where
         let mut inputs = V::align_manual_variation(&[target_logits, logits])?;
         let logits = inputs.pop().unwrap();
         let target_logits = inputs.pop().unwrap();
-        self.function.call((target_logits, logits))
+        self.composite.call((target_logits, logits))
     }
 }
 
@@ -642,7 +643,7 @@ where
         Ok((loss, output_tangent))
     });
     SoftmaxCrossEntropyWithTargetLogits {
-        function: custom_function(primal)
+        composite: composite(primal)
             .with_jvp(jvp)
             .with_non_differentiated_count(1)
             .with_name("softmax_cross_entropy_with_target_logits"),
@@ -2679,8 +2680,8 @@ indoc! {"
 
     #[test]
     fn test_softmax_cross_entropy_with_target_logits_staging() {
-        // The call stops the teacher's gradient and stages one retained custom function whose primal composes the
-        // teacher's softmax with the student's log-softmax.
+        // The call stops the teacher's gradient and stages one retained composite whose primal composes the teacher's
+        // softmax with the student's log-softmax.
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         let (_, program) = ArrayContext::trace(
             |(student, teacher)| function.call(student, teacher),
@@ -2692,7 +2693,7 @@ indoc! {"
             indoc! {"
             lambda %0:f32[2], %1:f32[2] .
             let %2:f32[2] = stop_gradient %1
-                %3:f32[] = custom_function [name=\"softmax_cross_entropy_with_target_logits\", non_differentiated_count=1] %2 %0 [
+                %3:f32[] = composite [name=\"softmax_cross_entropy_with_target_logits\", non_differentiated_count=1] %2 %0 [
                     primal={
                         lambda %0:f32[2], %1:f32[2] .
                         let %2:i64[] = argmax [axis=0, index_data_type=i64] %0
@@ -2779,7 +2780,7 @@ indoc! {"
             lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
             let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = stop_gradient %1
                 %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %2
-                %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = custom_function [name=\"softmax_cross_entropy_with_target_logits\", non_differentiated_count=1] %3 %0 [
+                %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = composite [name=\"softmax_cross_entropy_with_target_logits\", non_differentiated_count=1] %3 %0 [
                     primal={
                         lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                         let %2:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %0
@@ -3171,7 +3172,7 @@ indoc! {"
             unknown.program().to_string(),
             indoc! {"
             lambda %0:f64[2], %1:f64[2] .
-            let %2:f64[] = custom_function [name=\"softmax_cross_entropy_with_target_logits\", non_differentiated_count=1] %1 %0 [
+            let %2:f64[] = composite [name=\"softmax_cross_entropy_with_target_logits\", non_differentiated_count=1] %1 %0 [
                 primal={
                     lambda %0:f64[2], %1:f64[2] .
                     let %2:i64[2] = iota [type=i64[2], dimension=0]

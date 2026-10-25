@@ -15,7 +15,7 @@
 //! Homogeneous array calls require static output shapes. Mixed [`ArrayIrType`] calls additionally accept trailing
 //! first-class dimension inputs that ground dynamic output axes without entering the kernel ABI. Undeclared output
 //! shardings inherit the manual-axis variation of the inputs. Differentiation requires wrapping the call in a
-//! [`custom_function`](crate::custom_function) with derivative rules, while partial evaluation uses the ordinary
+//! [`composite`](crate::composite) with derivative rules, while partial evaluation uses the ordinary
 //! fold-or-residualize behavior of the executing context. Refer to [`CustomCallOperation`] for the complete calling
 //! convention and to the [StableHLO specification](https://openxla.org/stablehlo/spec#custom_call) for the operation
 //! that the XLA backend lowers it to.
@@ -46,9 +46,9 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
+use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
-use crate::operations::custom_functions::operations::CUSTOM_FUNCTION_OPERATION_NAME;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
@@ -566,9 +566,9 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 ///
 ///   - **Differentiation:** Forward-mode differentiation binds the call unchanged and returns structural zero tangents
 ///     when every input tangent is a structural zero (including when the call has no inputs). Any other derivative
-///     reports an error directing users to call the kernel through a [`custom_function`](crate::custom_function) with
-///     derivative rules (refer to [`CustomFunction::from_custom_call`](crate::CustomFunction::from_custom_call)). The
-///     call is not linear, so it never transposes.
+///     reports an error directing users to call the kernel through a [`composite`](crate::composite) with derivative
+///     rules (refer to [`Composite::from_custom_call`](crate::Composite::from_custom_call)). The call is not linear,
+///     so it never transposes.
 ///   - **Batching:** A call whose inputs are all replicated is bound unchanged, because a region-free foreign kernel
 ///     cannot observe the transform's named axis. A mapped input is governed by the [`CustomCallBatching`] behavior
 ///     selected with [`with_batching`](Self::with_batching): the default [`Rejected`](CustomCallBatching::Rejected)
@@ -576,9 +576,9 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 ///     batch item through a `scan` with an explicit [`CustomCallUnrolling`] policy, and
 ///     [`BroadcastAll`](CustomCallBatching::BroadcastAll), [`ExpandDimensions`](CustomCallBatching::ExpandDimensions),
 ///     and [`Vectorized`](CustomCallBatching::Vectorized) hand the kernel batch-prefixed buffers in a single call.
-///     A [`custom_function`](crate::custom_function) without its own batching rule batches its primal region
-///     structurally, so a mapped input reaches this same operation and meets this same contract. Single-call strategies
-///     shift declared input and output layouts so that the new batch axis is the most major one.
+///     A [`composite`](crate::composite) without its own batching rule batches its primal region structurally, so a
+///     mapped input reaches this same operation and meets this same contract. Single-call strategies shift declared
+///     input and output layouts so that the new batch axis is the most major one.
 ///   - **Partial Evaluation:** Known calls execute or stage through the parent context when it supports them, and pure
 ///     calls remain residual when an eager parent cannot execute them. Residual calls retain their declared effects
 ///     through dead-code elimination.
@@ -1330,7 +1330,7 @@ impl<
         // computed on its own. The shortcut must never be generalized to region-carrying operations, because a region
         // can contain a named-axis operation whose value differs per batch item even when every input of the enclosing
         // instruction is replicated. For example, mapping a region that returns the named-axis index still produces
-        // `[0, 1, 2]` at extent `3` even with replicated inputs. Custom-function wrappers therefore always batch their
+        // `[0, 1, 2]` at extent `3` even with replicated inputs. Composite wrappers therefore always batch their
         // regions structurally.
         //
         // A mapped input is instead governed by the call's own `CustomCallBatching` behavior. `Rejected` reports
@@ -1434,14 +1434,14 @@ impl_differentiable_operation! {
         C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>,
     {
         |operation, context, _driver, inputs| {
-            // Foreign kernels require explicit custom-function derivative rules to propagate live tangents.
+            // Foreign kernels require explicit composite derivative rules to propagate live tangents.
             if inputs.iter().any(|input| !input.tangent().is_zero()) {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
                         "custom call `{}` has no differentiation rule; call it through a `{}` \
                          with derivative rules to provide one",
                         operation.target_name,
-                        CUSTOM_FUNCTION_OPERATION_NAME,
+                        COMPOSITE_OPERATION_NAME,
                     ),
                 }
                 .into());
@@ -1741,14 +1741,14 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>> Membe
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Trailing output extents are integer dimensions with structural-zero tangents. Any live array tangent
-        // still requires explicit custom-function derivative rules for the foreign kernel.
+        // Trailing output extents are integer dimensions with structural-zero tangents. Any live array tangent still
+        // requires explicit composite derivative rules for the foreign kernel.
         if inputs.iter().any(|input| !input.tangent().is_zero()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "custom call `{}` has no differentiation rule; call it through a `{}` with \
                      derivative rules to provide one",
-                    self.target_name, CUSTOM_FUNCTION_OPERATION_NAME,
+                    self.target_name, COMPOSITE_OPERATION_NAME,
                 ),
             }
             .into());
@@ -5080,7 +5080,7 @@ mod tests {
             program.jvp(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
-                               `custom_function` with derivative rules to provide one",
+                               `composite` with derivative rules to provide one",
         ));
 
         // Invoked directly, the rule rejects a live tangent before staging the primal call.
@@ -5095,7 +5095,7 @@ mod tests {
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
-                               `custom_function` with derivative rules to provide one",
+                               `composite` with derivative rules to provide one",
         ));
         assert!(context.builder().borrow().instructions().is_empty());
     }
@@ -5186,7 +5186,7 @@ mod tests {
             program.jvp(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
-                               `custom_function` with derivative rules to provide one",
+                               `composite` with derivative rules to provide one",
         ));
 
         // A zero-input mixed call replays unchanged with structural-zero output tangents.
@@ -5242,7 +5242,7 @@ mod tests {
             program.jvp(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "custom call `ryft.test.dynamic` has no differentiation rule; call it through a \
-                               `custom_function` with derivative rules to provide one",
+                               `composite` with derivative rules to provide one",
         ));
 
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

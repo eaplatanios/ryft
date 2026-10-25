@@ -22,10 +22,11 @@ different role; inspect their existing contract instead of mechanically giving t
   marker that need not be a `Type`, and host types are their own universe), with any other parameters (e.g.,
   `Transform`, `Binding`, or `Output`) before the universe, and every capability bundle has the same universe parameter
   with a blanket implementation.
-- Never pin a capability's receiver to one universe through a super-trait such as `Value<Type = ArrayIrType>`: provided
-  functions bound a type view instead (e.g., `Self: Value<Type: AsArrayType + AsDimensionType>`), implementations name
-  their universe explicitly (e.g., `DynamicPad<ArrayIrType>`), and a blanket implementation that serves several
-  universes introduces the universe as its own type parameter (e.g., `impl<U, V: Value<Type = U>> X<U> for V`).
+- Never pin a capability's receiver to one universe through a super-trait such as `Value<Type = ArrayIrType>`:
+  provided functions bound a type view instead (e.g., `Self: Value<Type: ArrayMemberType + DimensionMemberType>`).
+  Implementations name their universe explicitly (e.g., `DynamicPad<ArrayIrType>`), and a blanket implementation that
+  serves several universes introduces the universe as its own type parameter
+  (e.g., `impl<U, V: Value<Type = U>> X<U> for V`).
 - Capability traits carry the `#[capability]` attribute that checks those conventions, and declare exactly one array IR
   strategy: a projection through `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into
   the array IR family plus an eager `ArrayIrValue` delegation (S2), an existing family-native path (S3), or member-kind

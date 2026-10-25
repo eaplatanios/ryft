@@ -2221,8 +2221,8 @@ mod tests {
     };
     use crate::differentiation::{MemoryTransferStorage, NothingSavable};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, CosOperation, CustomFunctionJvpRule,
-        CustomFunctionOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation,
+        AddOperation, CompareOperation, ComparisonDirection, CompositeCallOperation, CompositeJvpRule,
+        ConditionOperation, CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation,
         LinearCallOperation, MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation,
         ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, RematerializeOperation, ScanOperation,
         SinOperation, TagOperation, TransferToMemoryOperation, WhileOperation,
@@ -4802,8 +4802,8 @@ mod tests {
             let body = branch.import_program(body.clone());
             let mut outputs = Vec::new();
             for (input, output_index) in inputs.into_iter().zip(selected_outputs) {
-                let call = TestOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                    CustomFunctionJvpRule::Primal,
+                let call = TestOperation::Composite(CompositeCallOperation::from_rule_regions(
+                    CompositeJvpRule::Primal,
                     false,
                 ));
                 outputs.push(branch.add_instruction(call, vec![body], vec![input], None).unwrap()[output_index]);

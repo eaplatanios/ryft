@@ -14,12 +14,10 @@ use crate::operations::attention::{
     DotProductAttentionOperation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
+use crate::operations::composites::functions::{Composite, CompositeVjp, DefaultJvp, WithVjp, composite};
+use crate::operations::composites::operations::CompositeCallOperation;
+use crate::operations::composites::rules::CustomRuleRegistration;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::custom_functions::functions::{
-    CustomFunction, CustomFunctionVjp, DefaultJvp, WithVjp, custom_function,
-};
-use crate::operations::custom_functions::operations::CustomFunctionOperation;
-use crate::operations::custom_functions::rules::CustomRuleRegistration;
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
@@ -147,16 +145,16 @@ type AttentionBackward<D> = Box<
 >;
 
 /// Differentiable scaled dot-product attention training function, built by [`differentiable_dot_product_attention`].
-/// It is a [`CustomFunction`] with reverse-mode rules whose input variation transitions precede its custom function
-/// boundary, which lets the transitions' transposes accumulate invariant-input contributions exactly once. Its forward
-/// and backward rules are retained: an ordinary call traces only the attention primal, and the rules are traced on the
+/// It is a [`Composite`] with reverse-mode rules whose input variation transitions precede its composite boundary,
+/// which lets the transitions' transposes accumulate invariant-input contributions exactly once. Its forward and
+/// backward rules are retained: an ordinary call traces only the attention primal, and the rules are traced on the
 /// first reverse-mode request of each specialization and cached for as long as the function lives.
 pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    /// Custom function that stages the attention training call.
-    function: CustomFunction<
+    /// Composite that stages the attention training call.
+    function: Composite<
         AttentionInputs<DomainTracer<D>>,
         DomainTracer<D>,
         AttentionPrimal<D>,
@@ -175,13 +173,13 @@ where
     pub fn call<C, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
         C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation> + NamedAxes,
-        C::Operation: From<CustomFunctionOperation<C::Constant, C::Operation>>,
+        C::Operation: From<CompositeCallOperation<C::Constant, C::Operation>>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
         <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
         CustomRuleRegistration<C::Constant, C::Operation>: Send,
         WithVjp<AttentionResiduals<DomainTracer<D>>, AttentionForward<D>, AttentionBackward<D>>:
-            CustomFunctionVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
+            CompositeVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
     {
         let signature = inputs.signature();
         let inputs = inputs.into_values();
@@ -259,7 +257,7 @@ where
             Ok(cotangents)
         });
     DifferentiableDotProductAttention {
-        function: custom_function(primal).with_vjp(forward, backward).with_name(DOT_PRODUCT_ATTENTION_OPERATION_NAME),
+        function: composite(primal).with_vjp(forward, backward).with_name(DOT_PRODUCT_ATTENTION_OPERATION_NAME),
     }
 }
 
@@ -322,7 +320,7 @@ mod tests {
         assert_eq!(output, varying);
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "parallel_vary", "custom_function"],
+            vec!["parallel_vary", "parallel_vary", "composite"],
         );
     }
 
@@ -346,7 +344,7 @@ mod tests {
                 program.to_string(),
                 indoc! {"
                     lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
-                    let %3:f32[1, 1, 1, 1] = custom_function [name=\"dot_product_attention\"] %0 %1 %2 [
+                    let %3:f32[1, 1, 1, 1] = composite [name=\"dot_product_attention\"] %0 %1 %2 [
                         primal={
                             lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
                             let %3:f32[1, 1, 1, 1] = dot_product_attention [

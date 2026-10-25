@@ -1324,7 +1324,7 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// output is the caller's reference input itself. Two reference inputs that denote the same allocation are rejected
 /// with [`ShardMapError::RepeatedReferenceInputAllocation`], as in reference discharge. The emulation deliberately
 /// supports only the lockstep region operations whose semantics it knows (i.e., `while`, `condition`, `scan`,
-/// `custom_function`, `linear_call`, `rematerialize`, and nested `shard_map`s) and rejects, with
+/// `composite`, `linear_call`, `rematerialize`, and nested `shard_map`s) and rejects, with
 /// [`ProgramError::UnsupportedOperation`], every other region operation whose regions use collectives over the
 /// emulated axes, as well as a `while`, `condition`, or `scan` around such collectives whose devices diverge on a
 /// predicate or on the type of an input (e.g., on the runtime length of a `scan`, which is its trip count). These are
@@ -2550,11 +2550,11 @@ where
 // of the body over `[inputs..., active(input_tangents)...]` (refer to `fused_shard_map_jvp`). Its outputs are the
 // outputs followed by the live output tangents, so an eager context runs one manual computation per `shard_map` and
 // materializes no residual edges, and a fused program that is later partitioned (e.g., by the `while`, `scan`,
-// `condition`, rematerialization, or custom-function rules) is split by the partial-evaluation rule of this operation
-// into a known map (computing the outputs and the residuals) and a residual map (computing the output tangents). That
-// split must keep every output known, so a body that the partial-evaluation rule keeps whole keeps the two-map form
-// even in a fused context: a body with references (refer to `body_has_references`) and a body with a dynamically shaped
-// value anywhere in its region closure, which could be a residual that cannot cross the static boundary (refer to
+// `condition`, rematerialization, or composite rules) is split by the partial-evaluation rule of this operation into a
+// known map (computing the outputs and the residuals) and a residual map (computing the output tangents). That split
+// must keep every output known, so a body that the partial-evaluation rule keeps whole keeps the two-map form even in a
+// fused context: a body with references (refer to `body_has_references`) and a body with a dynamically shaped value
+// anywhere in its region closure, which could be a residual that cannot cross the static boundary (refer to
 // `body_has_dynamically_shaped_values`). So does a body none of whose output tangents is live, for which the two-map
 // form binds no tangent map at all.
 impl<C> DifferentiableOperation<C> for ShardMapOperation
@@ -4236,7 +4236,7 @@ where
 
     // The boundary keeps every primal output followed by the live tangent slots, retaining all inputs to match the
     // input shardings below. Simplification also removes dead work inside nested regions (e.g., unused tangent
-    // allocations passed only to custom functions), while preserving observable effects and deferred work.
+    // allocations passed only to composites), while preserving observable effects and deferred work.
     let output_indices = live_outputs
         .iter()
         .enumerate()
@@ -5167,12 +5167,12 @@ mod tests {
     use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
+    use crate::operations::composites::functions::composite;
+    use crate::operations::composites::operations::CompositeTransposeOperation;
     use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
-    use crate::operations::custom_functions::functions::custom_function;
-    use crate::operations::custom_functions::operations::CustomFunctionTransposeOperation;
     use crate::operations::debugging::{Print, PrintOperation};
     use crate::operations::differentiation::stop_gradient::StopGradient;
     use crate::operations::exponential::Exp;
@@ -6064,7 +6064,7 @@ mod tests {
         elements
     }
 
-    /// Returns `sin(x)` for the plumbing reference and input `(_, x)` of the custom functions of the tests below.
+    /// Returns `sin(x)` for the plumbing reference and input `(_, x)` of the composites of the tests below.
     fn custom_sine((_, x): (Tracer<TestContext>, Tracer<TestContext>)) -> Result<Tracer<TestContext>, ProgramError> {
         Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
     }
@@ -10088,7 +10088,7 @@ mod tests {
     #[test]
     fn test_shard_map_partial_evaluation_retains_deferred_work_of_bodies_with_only_forwarded_outputs() {
         // A body whose outputs all forward known inputs is kept exactly when its remaining work is retained when
-        // unused. Deferred work has no effect class but must survive: here, a reverse-mode carrier of a custom function
+        // unused. Deferred work has no effect class but must survive: here, a reverse-mode carrier of a composite
         // applied to the unknown input `x`, whose backward rule prints its cotangent, stays in a `shard_map` without
         // outputs.
         let replicated = Sharding::replicated(manual_mesh(), 0);
@@ -10109,13 +10109,13 @@ mod tests {
             let a = builder.add_input(scalar.clone().into());
             let x = builder.add_input(scalar.clone().into());
             let backward = builder.import_program(backward);
-            let carrier = CustomFunctionTransposeOperation::from_backward_region(
+            let carrier = CompositeTransposeOperation::from_backward_region(
                 0,
                 vec![scalar.clone().into()],
                 vec![scalar.clone().into()],
             );
             builder
-                .add_instruction(TestOperation::CustomFunctionTranspose(carrier), vec![backward], vec![x], None)
+                .add_instruction(TestOperation::CompositeTranspose(carrier), vec![backward], vec![x], None)
                 .unwrap();
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![a], vec![Placeholder; 2], vec![Placeholder])
@@ -10151,7 +10151,7 @@ mod tests {
                 ] %1 %0 [
                     body={{
                         lambda %0:{scalar}, %1:{scalar} .
-                        let %2:{scalar} = custom_function_transpose [leading_input_count=0] %1 [
+                        let %2:{scalar} = composite_transpose [leading_input_count=0] %1 [
                             backward={{
                                 lambda %0:{scalar} .
                                 let %1:{scalar} = print [label=cotangent, effect_class=device_ordered_io] %0
@@ -13368,14 +13368,14 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_differentiation_of_custom_functions_over_body_allocated_references() {
-        // A body may allocate a reference and pass it to a `custom_function` as a leading non-differentiated (plumbing)
+    fn test_shard_map_differentiation_of_composites_over_body_allocated_references() {
+        // A body may allocate a reference and pass it to a `composite` as a leading non-differentiated (plumbing)
         // input. The explicit JVP rule replays inline, so the reference is not a residual. The body accesses no
         // reference, so forward mode binds one fused map, whose dead work (here, the allocations of the reference and
         // its tangent) is removed before binding, and in reverse mode, only `cos(x)` crosses from the primal map to the
         // tangent map.
         type BodyTracer = Tracer<TestContext>;
-        let function = custom_function(|(_, x): (BodyTracer, BodyTracer)| {
+        let function = composite(|(_, x): (BodyTracer, BodyTracer)| {
             Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
         })
         .with_non_differentiated_count(1)
@@ -13457,14 +13457,14 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_linearization_snapshots_body_allocated_references_of_derived_custom_function_calls() {
-        // A `custom_function` with a batching rule linearizes through a derived `pushforward` call, which takes the
+    fn test_shard_map_linearization_snapshots_body_allocated_references_of_derived_composite_calls() {
+        // A `composite` with a batching rule linearizes through a derived `pushforward` call, which takes the
         // body-allocated plumbing reference `r` as a residual. The primal map snapshots the final state of `r` into a
         // residual edge tiled along `x`, and the tangent map allocates its own `r` from that edge. Forward mode binds
         // one fused map, whose derived `jvp` call takes the primal `r` directly (the dead allocation of the tangent of
         // `r` is removed before binding). Both match the same function outside `shard_map` on the reference backend.
         type BodyTracer = Tracer<TestContext>;
-        let function = custom_function(custom_sine).with_non_differentiated_count(1).with_batching(
+        let function = composite(custom_sine).with_non_differentiated_count(1).with_batching(
             |_: BatchingLevelExtent<BodyTracer>,
              (r, x): (BodyTracer, BodyTracer),
              (_, axis): (BatchAxis, BatchAxis)| { Ok((custom_sine((r, x))?, axis)) },
@@ -13475,9 +13475,9 @@ mod tests {
         let sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
         let global = "f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}]}]";
         let local = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
-        let primal = "custom_function [name=\"custom_function\", non_differentiated_count=1]";
-        let pushforward = "custom_function [name=\"pushforward(custom_function)\", non_differentiated_count=1]";
-        let jvp = "custom_function [name=\"jvp(custom_function)\", non_differentiated_count=1]";
+        let primal = "composite [name=\"composite\", non_differentiated_count=1]";
+        let pushforward = "composite [name=\"pushforward(composite)\", non_differentiated_count=1]";
+        let jvp = "composite [name=\"jvp(composite)\", non_differentiated_count=1]";
         assert_eq!(
             program.jvp().unwrap().to_string(),
             formatdoc! {"
@@ -13599,8 +13599,8 @@ mod tests {
             let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
             Ok((r, (cosine * cotangent).into_value()))
         };
-        let reverse = custom_function(custom_sine).with_non_differentiated_count(1).with_vjp(forward, backward);
-        let combined = custom_function(custom_sine)
+        let reverse = composite(custom_sine).with_non_differentiated_count(1).with_vjp(forward, backward);
+        let combined = composite(custom_sine)
             .with_non_differentiated_count(1)
             .with_jvp(|(_, x): (BodyTracer, BodyTracer), (_, tangent): (BodyTracer, BodyTracer)| {
                 let x = ValueProjection::<ArrayType>::into_projected(x)?;
@@ -13678,7 +13678,7 @@ mod tests {
         // because the primal body reads it after its last instruction. The gradient is therefore `cos(x) * x * x` in
         // both cases.
         type BodyTracer = Tracer<TestContext>;
-        let function = custom_function(custom_sine).with_non_differentiated_count(1).with_vjp(
+        let function = composite(custom_sine).with_non_differentiated_count(1).with_vjp(
             |(r, x): (BodyTracer, BodyTracer)| {
                 let x = ValueProjection::<ArrayType>::into_projected(x)?;
                 Ok((x.sin()?.into_value(), (r, x.cos()?.into_value())))
@@ -13773,7 +13773,7 @@ mod tests {
         // that a later application would observe the doubled state. The body also reshapes its `f32[1]` shard to the
         // varying scalar `x`, whose snapshot edge is promoted to `f32[1]` so that it can be tiled along `x`.
         type BodyTracer = Tracer<TestContext>;
-        let function = custom_function(custom_sine).with_non_differentiated_count(1).with_vjp(
+        let function = composite(custom_sine).with_non_differentiated_count(1).with_vjp(
             |(r, x): (BodyTracer, BodyTracer)| {
                 let x = ValueProjection::<ArrayType>::into_projected(x)?;
                 Ok((x.sin()?.into_value(), (r, x.cos()?.into_value())))
@@ -16364,12 +16364,12 @@ mod tests {
 
     #[test]
     fn test_shard_map_transposition_keeps_effects_of_bodies_without_output_cotangents() {
-        // A body whose backward work prints (here, a reverse-mode carrier of a custom function applied to `x`, whose
-        // backward rule prints its cotangent) must be transposed even when every value output cotangent is a structural
-        // zero, as here, where the outer program uses no output of the map. The body is projected onto no outputs,
-        // which keeps the carrier because it carries deferred work, so the transposed map still runs the print on a
-        // zero seed. The backward rule returns that zero seed as the cotangent of `x`, which is therefore a structural
-        // zero, and the transposed map without outputs is staged for its effect alone.
+        // A body whose backward work prints (here, a reverse-mode carrier of a composite applied to `x`, whose backward
+        // rule prints its cotangent) must be transposed even when every value output cotangent is a structural zero, as
+        // here, where the outer program uses no output of the map. The body is projected onto no outputs, which keeps
+        // the carrier because it carries deferred work, so the transposed map still runs the print on a zero seed. The
+        // backward rule returns that zero seed as the cotangent of `x`, which is therefore a structural zero, and the
+        // transposed map without outputs is staged for its effect alone.
         let replicated = Sharding::replicated(manual_mesh(), 0);
         let scalar = f32_scalar_type().with_sharding(replicated.clone()).unwrap();
         let backward = {
@@ -16385,13 +16385,13 @@ mod tests {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let x = builder.add_input(scalar.clone().into());
             let backward = builder.import_program(backward);
-            let carrier = CustomFunctionTransposeOperation::from_backward_region(
+            let carrier = CompositeTransposeOperation::from_backward_region(
                 0,
                 vec![scalar.clone().into()],
                 vec![scalar.clone().into()],
             );
             builder
-                .add_instruction(TestOperation::CustomFunctionTranspose(carrier), vec![backward], vec![x], None)
+                .add_instruction(TestOperation::CompositeTranspose(carrier), vec![backward], vec![x], None)
                 .unwrap();
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![x], vec![Placeholder], vec![Placeholder])

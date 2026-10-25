@@ -5793,8 +5793,8 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::StopGradient(_)
         | ArrayOperation::Tag(_)
         | ArrayOperation::Rematerialize(_)
-        | ArrayOperation::CustomFunction(_)
-        | ArrayOperation::CustomFunctionTranspose(_)
+        | ArrayOperation::Composite(_)
+        | ArrayOperation::CompositeTranspose(_)
         | ArrayOperation::LinearCall(_) => Propagated,
     }
 }
@@ -5849,12 +5849,12 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::Condition(_)
         | XlaOperation::While(_)
         | XlaOperation::Scan(_)
-        | XlaOperation::CustomFunction(_)
+        | XlaOperation::Composite(_)
         | XlaOperation::LinearCall(_)
         | XlaOperation::Rematerialize(_)
-        | XlaOperation::CustomFunctionTranspose(_)
-        | XlaOperation::LiftedCustomFunction(_)
-        | XlaOperation::LiftedCustomFunctionTranspose(_)
+        | XlaOperation::CompositeTranspose(_)
+        | XlaOperation::LiftedComposite(_)
+        | XlaOperation::LiftedCompositeTranspose(_)
         | XlaOperation::JitCall(_) => Propagated,
     }
 }
@@ -6943,16 +6943,15 @@ mod tests {
         Assert, AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation,
         BatchingContext, CalleeRegionDriver, CaptureReference, Cast, CastOperation, CollectiveOptions,
         CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
-        CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
-        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
-        CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation,
-        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
-        DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy,
-        DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
-        DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        CompiledFunctionDispatcher, CompositeCallOperation, CompositeJvpRule, ConcatenateOperation, ConditionOperation,
+        ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
+        CustomCallOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+        DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+        DimensionToScalarOperation, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation,
+        DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
+        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
+        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
+        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
         OneOperation, ParallelAllGatherOperation, ParallelAllGatherOutputVariance, ParallelAllToAllOperation,
         ParallelPermuteOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation, Program,
         ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind,
@@ -14203,15 +14202,12 @@ mod tests {
         };
         assert_eq!(
             domain.bind(
-                XlaOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                    CustomFunctionJvpRule::Explicit,
-                    false,
-                )),
+                XlaOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 vec![primal.clone(), rule],
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_function` carries reference state that XLA eager execution cannot lower; \
+                message: "`composite` carries reference state that XLA eager execution cannot lower; \
                           discharge references before lowering"
                     .to_string(),
             }),
@@ -14237,15 +14233,12 @@ mod tests {
         };
         assert_eq!(
             domain.bind(
-                XlaOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
-                    CustomFunctionJvpRule::Explicit,
-                    false,
-                )),
+                XlaOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 vec![primal, pure_reference_rule],
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_function` carries reference state that XLA eager execution cannot lower; \
+                message: "`composite` carries reference state that XLA eager execution cannot lower; \
                           discharge references before lowering"
                     .to_string(),
             }),
@@ -14632,7 +14625,7 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_executes_gradients_through_body_allocated_reference_residuals_of_shard_maps() {
-        use ryft_core::{Cos, Differentiate, ParallelReduce, Reduce, Sin, custom_function};
+        use ryft_core::{Cos, Differentiate, ParallelReduce, Reduce, Sin, composite};
 
         // The body allocates `r = reference_new(x)`, calls a custom `sin` whose reverse-mode rule saves `r` as a
         // residual and whose backward rule scales the cotangent by the state that it reads from `r`, and then writes
@@ -14656,7 +14649,7 @@ mod tests {
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
         type BodyTracer = XlaTracer<'static>;
-        let function = custom_function(|(_, x): (BodyTracer, BodyTracer)| {
+        let function = composite(|(_, x): (BodyTracer, BodyTracer)| {
             Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
         })
         .with_non_differentiated_count(1)

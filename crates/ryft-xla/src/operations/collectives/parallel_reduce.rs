@@ -153,10 +153,10 @@ impl LowerableOperation for ParallelReduceOperation {
         _input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        // This plain dispatch serves nested programs (control-flow bodies, inlined custom-function primals,
-        // and rematerialized bodies), which can sit inside a shard_map manual region: the threaded
-        // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual
-        // regions (a batched axis would have been consumed into a `Reduce` at trace time).
+        // This plain dispatch serves nested programs (control-flow bodies, inlined composite primals, and
+        // rematerialized bodies), which can sit inside a shard_map manual region: the threaded
+        // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual regions (a
+        // batched axis would have been consumed into a `Reduce` at trace time).
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();

@@ -518,7 +518,7 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
 // compiled functions) then exceed the default recursion limit (E0275). The bounds deliberately name only leaves rather
 // than `Program<V, O, Vec<V>, Vec<V>>: Send + Sync`. A program bound would re-enter the region cycle through a
 // where-clause, which the trait solver fails to close when `V` and `O` are still inference variables (e.g., while
-// checking closures that capture custom functions), whereas leaf bounds terminate immediately.
+// checking closures that capture composites), whereas leaf bounds terminate immediately.
 unsafe impl<V, O> Send for RegionTransformCache<V, O>
 where
     V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,

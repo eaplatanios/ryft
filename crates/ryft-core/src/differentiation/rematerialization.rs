@@ -595,8 +595,8 @@ pub fn saved_residuals<
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    // The program is linearized with the `jvp_for_transpose` rules that reverse mode differentiation uses,
-    // which can save different values than the `jvp` rules (e.g., for custom functions with distinct rules).
+    // The program is linearized with the `jvp_for_transpose` rules that reverse mode differentiation uses, which can
+    // save different values than the `jvp` rules (e.g., for composites with distinct rules).
     let (_, program) = TracingContext::<V, O>::trace(function, input_types)?;
     let program = program.into_flat_program();
     let input_indices = (0..program.input_ids().len()).collect::<Vec<_>>();
@@ -1373,7 +1373,7 @@ mod tests {
     use crate::differentiation::differentiate_at;
     use crate::operations::{
         AxisIndex, ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp, MulOperation,
-        ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, custom_function,
+        ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, composite,
     };
     use crate::partial::ResidualProducer;
     use crate::programs::{Program, ReferenceType};
@@ -2001,8 +2001,8 @@ mod tests {
             ]),
         );
 
-        // Reverse-mode rules decide what is saved: a custom function with only a reverse-mode rule saves its residual.
-        let sine = custom_function(|x: TestTracer| Ok(x.sin()?))
+        // Reverse-mode rules decide what is saved: a composite with only a reverse-mode rule saves its residual.
+        let sine = composite(|x: TestTracer| Ok(x.sin()?))
             .with_vjp(|x: TestTracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
         let function = rematerialize(move |x: TestTracer| sine.call(x)).with_policy(EverythingSavable);
         assert_eq!(

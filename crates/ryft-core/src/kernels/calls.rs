@@ -23,8 +23,8 @@ use crate::kernels::validation::{
 };
 use crate::operations::attention::AttentionConfiguration;
 use crate::operations::{
-    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomCallArrayAttribute,
-    CustomCallAttribute, CustomCallOperation, DimensionFromScalar, DimensionFromScalarOperation, PadOperation,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute,
+    CustomCallOperation, DimensionFromScalar, DimensionFromScalarOperation, PadOperation,
 };
 use crate::parameters::Placeholder;
 use crate::programs::{
@@ -1064,9 +1064,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         );
     }
 
-    /// Returns the error that rejects the kernel semantic descriptor encoding of the custom function operation named
-    /// `name` with retained rules, whose identity is local to the process.
-    fn retained_custom_function_encoding_error(name: &str) -> TypeError {
+    /// Returns the error that rejects the kernel semantic descriptor encoding of the composite operation named `name`
+    /// with retained rules, whose identity is local to the process.
+    fn retained_composite_encoding_error(name: &str) -> TypeError {
         TypeError::invalid(format!(
             "`{name}` operations with retained rules have no kernel semantic descriptor encoding, because the identity \
              of their rules is local to the process",
@@ -1091,17 +1091,15 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 ArrayOperation::DotProductAttentionBackward(operation) => {
                     Self::attention_semantic_fields(key, operation.configuration())
                 }
-                ArrayOperation::CustomFunction(operation) if operation.rules().is_some() => {
-                    return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
+                ArrayOperation::Composite(operation) if operation.rules().is_some() => {
+                    return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
                 }
-                ArrayOperation::CustomFunctionTranspose(operation) if operation.rules().is_some() => {
-                    return Err(Self::retained_custom_function_encoding_error(
-                        CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
-                    ));
+                ArrayOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
+                    return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
                 }
-                ArrayOperation::CustomFunctionTranspose(_) => {
+                ArrayOperation::CompositeTranspose(_) => {
                     return Err(TypeError::invalid(format!(
-                        "`{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
+                        "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
                          encoding",
                     )));
                 }
@@ -1194,25 +1192,25 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Guard(_)
                 | ArrayOperation::Cast(_)
                 | ArrayOperation::Print(_)
-                | ArrayOperation::CustomFunction(_)
+                | ArrayOperation::Composite(_)
                 | ArrayOperation::LinearCall(_) => {}
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-            ArrayIrOperation::CustomFunction(operation) if operation.rules().is_some() => {
-                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
+            ArrayIrOperation::Composite(operation) if operation.rules().is_some() => {
+                return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
             }
-            ArrayIrOperation::LiftedCustomFunction(_) => {
-                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
+            ArrayIrOperation::LiftedComposite(_) => {
+                return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
             }
-            ArrayIrOperation::CustomFunctionTranspose(operation) if operation.rules().is_some() => {
-                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME));
+            ArrayIrOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
+                return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
             }
-            ArrayIrOperation::LiftedCustomFunctionTranspose(_) => {
-                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME));
+            ArrayIrOperation::LiftedCompositeTranspose(_) => {
+                return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
             }
-            ArrayIrOperation::CustomFunctionTranspose(_) => {
+            ArrayIrOperation::CompositeTranspose(_) => {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
+                    "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
                      encoding",
                 )));
             }
@@ -1244,7 +1242,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::Condition(_)
             | ArrayIrOperation::While(_)
             | ArrayIrOperation::Scan(_)
-            | ArrayIrOperation::CustomFunction(_)
+            | ArrayIrOperation::Composite(_)
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Guard(_)
@@ -1272,7 +1270,7 @@ mod tests {
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
     use crate::operations::{
-        ConditionOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation,
+        CompositeCallOperation, CompositeJvpRule, CompositeTransposeOperation, ConditionOperation,
         CustomRuleDefinition, CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation,
         ZeroOperation,
@@ -2518,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_definition_semantic_key_custom_functions() {
+    fn test_kernel_definition_semantic_key_composites() {
         // Builds a kernel whose body applies `operation` to one scalar constant, with `region_count` attached regions
         // that are each the scalar identity.
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
@@ -2544,8 +2542,8 @@ mod tests {
         };
 
         // A call with attached rules is encoded structurally, because its rules are regions of the body.
-        let attached = CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Absent, false);
-        assert!(definition(ArrayIrOperation::CustomFunction(attached), 1).semantic_key().is_ok());
+        let attached = CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, false);
+        assert!(definition(ArrayIrOperation::Composite(attached), 1).semantic_key().is_ok());
 
         // Calls and carriers with retained rules have no encoding, whether their rules are registered in this family or
         // lifted from the array member family, because the identity of their rules is local to the process.
@@ -2559,45 +2557,39 @@ mod tests {
             CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("retained"),
         );
         assert_eq!(
-            definition(ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(rules.reference())), 1)
-                .semantic_key(),
-            retained("custom_function"),
+            definition(ArrayIrOperation::Composite(CompositeCallOperation::new(rules.reference())), 1).semantic_key(),
+            retained("composite"),
         );
         let member_rules =
             CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member"));
         assert_eq!(
             definition(
-                ArrayIrOperation::from(ArrayOperation::CustomFunction(CustomFunctionOperation::new(
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeCallOperation::new(
                     member_rules.reference(),
                 ))),
                 1,
             )
             .semantic_key(),
-            retained("custom_function"),
+            retained("composite"),
         );
-        let carrier = CustomFunctionTransposeOperation::new(
+        let carrier = CompositeTransposeOperation::new(
             rules.reference(),
             0,
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
         );
         assert_eq!(
-            definition(ArrayIrOperation::CustomFunctionTranspose(carrier), 0).semantic_key(),
-            retained("custom_function_transpose"),
+            definition(ArrayIrOperation::CompositeTranspose(carrier), 0).semantic_key(),
+            retained("composite_transpose"),
         );
 
         // A carrier with an attached backward rule is an unresolved reverse-mode obligation, so it has no encoding
         // either.
-        let carrier = CustomFunctionTransposeOperation::from_backward_region(
-            0,
-            vec![scalar_type.clone()],
-            vec![scalar_type.clone()],
-        );
+        let carrier =
+            CompositeTransposeOperation::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type.clone()]);
         assert_eq!(
-            definition(ArrayIrOperation::CustomFunctionTranspose(carrier), 1).semantic_key(),
-            Err(TypeError::invalid(
-                "`custom_function_transpose` operations have no kernel semantic descriptor encoding",
-            )),
+            definition(ArrayIrOperation::CompositeTranspose(carrier), 1).semantic_key(),
+            Err(TypeError::invalid("`composite_transpose` operations have no kernel semantic descriptor encoding",)),
         );
     }
 

@@ -30,7 +30,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   call site instead of extracting a helper that adds indirection without meaningful reuse.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical abstraction
-  and keep one source of truth.
+  and keep one source of truth. For type-member classification, check `ArrayMemberType`, `DimensionMemberType`,
+  `ReferenceMemberType`, and conversion into `ArrayIrType` before adding an operation-specific enum or projection hook.
+  Do not add an always-error projection implementation for a family merely to satisfy a generic operation bound.
 - Prefer putting short and simple type bounds directly in generic type declarations typically including the primary
   identifying bound for each parameter (e.g., `T: Type`, `V: Value<Type = T>`, `O: Operation<T>`, etc.). Move long or
   structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`, into

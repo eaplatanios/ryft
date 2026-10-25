@@ -75,11 +75,11 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 /// operation itself has no array- or dimension-specific semantics.
 ///
 /// This operation derives its complete interface from its attached `forward` and `transpose` [`Region`](crate::Region)s
-/// and can be interpreted, lowered, batched, transposed, and differentiated again. A linear map that supplies only
-/// a reverse rule (e.g., the backward rule of a custom derivative) has no executable forward program, so it is
-/// represented by a [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation) instead, whose
-/// transposition applies that rule inline rather than swapping regions. Keeping such maps out of this operation
-/// means that every consumer of a linear call can rely on its forward region.
+/// and can be interpreted, lowered, batched, transposed, and differentiated again. A linear map that supplies only a
+/// reverse rule (e.g., the backward rule of a custom derivative) has no executable forward program, so it is
+/// represented by a [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) instead, whose transposition
+/// applies that rule inline rather than swapping regions. Keeping such maps out of this operation means that every
+/// consumer of a linear call can rely on its forward region.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct LinearCallOperation<T: DifferentiableType> {
     /// Number of leading residual inputs.

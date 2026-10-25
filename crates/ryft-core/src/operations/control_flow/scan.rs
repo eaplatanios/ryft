@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AsArrayType, AsDimensionType, DataType, Dimension,
+    ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension, DimensionMemberType,
     DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
@@ -100,12 +100,14 @@ use crate::tracing::{Tracer, TracingContext};
 /// These rules are independent of the execution domain, so inference, transforms, and lowering can validate scans
 /// without requiring any runtime value representation or iteration capabilities.
 ///
-/// The shared [`AsArrayType`], [`AsDimensionType`], and [`ReferenceMemberType`] projections distinguish arrays,
-/// references to arrays, and first-class dimensions. The scan contract is stated once over those views, and each family
-/// only restricts it: [`ArrayType`] stacks per-iteration arrays along a static leading axis and requires a static
-/// length and fully static bodies, while [`ArrayIrType`] additionally permits references and first-class dimensions in
-/// carry positions and a dynamic length supplied by a trailing dimension input. Every family requires the body's first
-/// input to be a scalar [`I64`](DataType::I64) slice index.
+/// The shared [`ArrayMemberType`] and [`ReferenceMemberType`] projections distinguish arrays from references to arrays.
+/// Runtime length types are inspected through their canonical [`ArrayIrType`] representation, so homogeneous array
+/// families need no first-class dimension projection. Conversion into that representation must preserve the member
+/// kind and metadata exposed by the projections. The scan contract is stated once over those views, and each
+/// family only restricts it: [`ArrayType`] stacks per-iteration arrays along a static leading axis and requires a
+/// static length and fully static bodies, while [`ArrayIrType`] additionally permits references and first-class
+/// dimensions in carry positions and a dynamic length supplied by a trailing dimension input. Every family requires the
+/// body's first input to be a scalar [`I64`](DataType::I64) slice index.
 ///
 /// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the body
 /// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
@@ -118,9 +120,9 @@ use crate::tracing::{Tracer, TracingContext};
 pub trait ScanType:
     Type<Identity = DimensionVariable>
     + From<ArrayType>
-    + AsArrayType
-    + AsDimensionType
-    + ReferenceMemberType<Referent: AsArrayType>
+    + Into<ArrayIrType>
+    + ArrayMemberType
+    + ReferenceMemberType<Referent: ArrayMemberType>
 {
     /// Returns the type of the trailing runtime length input of a scan whose trip count is the dynamic `length` (i.e.,
     /// the first-class `dimension<length>`).
@@ -377,7 +379,7 @@ pub trait ScanType:
         // while one that carries the length's own identity establishes nothing beyond the declared bounds. Only the
         // carries preserve the identities of reference inputs.
         let nominal_runtime_length = length.variable().is_some_and(|variable| {
-            matches!(input_types.last().map(Self::as_dimension_type), Some(Ok(r#type))
+            matches!(input_types.last().cloned().map(Into::into), Some(ArrayIrType::Dimension(r#type))
                 if r#type.variable() == Some(variable))
         });
         let fact_count = expected_input_types.len() - usize::from(nominal_runtime_length);
@@ -1160,12 +1162,12 @@ impl<T: ScanType> Operation for ScanOperation<T> {
                  {trailing_count}",
             )));
         }
-        let runtime_length = input_types.get(carry_count + stacked_count);
+        let runtime_length: Option<ArrayIrType> = input_types.get(carry_count + stacked_count).cloned().map(Into::into);
         let keeps_dead_stack = |r#type: &T| {
-            let Some(runtime_length) = runtime_length else {
+            let Some(runtime_length) = &runtime_length else {
                 return false;
             };
-            let Ok(runtime_length) = runtime_length.as_dimension_type() else {
+            let ArrayIrType::Dimension(runtime_length) = runtime_length else {
                 return true;
             };
             let stack = match r#type.referent() {
@@ -2402,7 +2404,8 @@ fn validate_scan_runtime_length_type<T: ScanType>(
     let Some(variable) = length.variable() else {
         return Ok(None);
     };
-    let runtime_length_type = input_types.last().unwrap().as_dimension_type()?;
+    let runtime_length_type: ArrayIrType = input_types.last().unwrap().clone().into();
+    let runtime_length_type = runtime_length_type.as_dimension_type()?;
     if runtime_length_type.variable() == Some(variable) {
         return Ok(None);
     }
@@ -2444,7 +2447,8 @@ fn validate_scan_runtime_length<T: ScanType>(
     if length.variable().is_none() {
         return Ok(None);
     }
-    let runtime_length_type = input_types.last().unwrap().as_dimension_type()?;
+    let runtime_length_type: ArrayIrType = input_types.last().unwrap().clone().into();
+    let runtime_length_type = runtime_length_type.as_dimension_type()?;
     let extent = validate_scan_runtime_length_type(length, input_types)?;
     for (index, r#type) in input_types[carry_count..input_types.len() - 1].iter().enumerate() {
         let Some(referent) = r#type.referent() else {
@@ -3670,13 +3674,13 @@ mod tests {
     use crate::operations::arithmetic::{Add, AddOperation, DivOperation, MulOperation, NegOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
+    use crate::operations::composites::operations::CompositeTransposeOperation;
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::tests::{
         CountingBatchingDriver, DischargeCapture, DischargeCaptureOperation, TestIrOperation, TestIrValue,
         TestRegionLiveness, array, dimension, resolve_captures,
     };
-    use crate::operations::custom_functions::operations::CustomFunctionTransposeOperation;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
@@ -20261,7 +20265,7 @@ mod tests {
         let backward_region = body_builder.import_program(backward);
         body_builder
             .add_instruction(
-                TestIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::from_backward_region(
+                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
                     1,
                     Vec::new(),
                     Vec::new(),
@@ -20339,7 +20343,7 @@ mod tests {
         let backward_region = body_builder.import_program(backward);
         body_builder
             .add_instruction(
-                TestIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::from_backward_region(
+                TestIrOperation::CompositeTranspose(CompositeTransposeOperation::from_backward_region(
                     1,
                     Vec::new(),
                     Vec::new(),

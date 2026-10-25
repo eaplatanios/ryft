@@ -2178,10 +2178,10 @@ where
     /// Structurally batches this borrowed homogeneous-array [`Region`] so that the resulting program operates over
     /// inputs batched along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations
     /// use this function to batch captured programs _without_ concretizing any batch-item values, so that batched
-    /// control-flow and custom-function structure can be staged back into the enclosing trace. This function replays
-    /// the region through an [`ArrayBatchingPolicy`] [`BatchingContext`] over a fresh [`TracingContext`], lifts every
-    /// instruction through its [`BatchableOperation`] rule, and extracts the resulting staged program together
-    /// with the requested [`ProgramBatchingOutputAxesPolicy`].
+    /// control-flow and composite structure can be staged back into the enclosing trace. This function replays the
+    /// region through an [`ArrayBatchingPolicy`] [`BatchingContext`] over a fresh [`TracingContext`], lifts every
+    /// instruction through its [`BatchableOperation`] rule, and extracts the resulting staged program together with the
+    /// requested [`ProgramBatchingOutputAxesPolicy`].
     ///
     /// This method is intentionally specific to [`ArrayType`]. It constructs mapped batched input types by inserting
     /// static [`Dimension`]s, rewrites array sharding metadata, and materializes output axes through [`ArrayBatch`].

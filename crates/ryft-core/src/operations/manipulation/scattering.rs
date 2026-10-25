@@ -5,8 +5,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
-    ArrayIrType, ArrayType, AsArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding, ShardingDimension,
-    materialize_array_tangent,
+    ArrayIrType, ArrayMemberType, ArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding,
+    ShardingDimension, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1563,7 +1563,7 @@ pub trait Scatter<T = <Self as Capability>::Universe>: Capability + Sized {
         mode: ScatterMode,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType> + Reshape<T>,
+        Self: Typed<Type: ArrayMemberType> + Reshape<T>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;

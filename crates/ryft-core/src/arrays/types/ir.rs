@@ -5,9 +5,9 @@ use ryft_macros::Parameter;
 
 use crate::arrays::sharding::ShardableType;
 use crate::arrays::sharding::shardings::Sharding;
-use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements, AsArrayType};
+use crate::arrays::types::arrays::{ArrayMemberType, ArrayType, ArrayTypeRefinements};
 use crate::arrays::types::dimensions::{
-    AsDimensionType, Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionType,
+    Dimension, DimensionComparison, DimensionMemberType, DimensionRefinementFact, DimensionRefinements, DimensionType,
     DimensionTypeRefinements, DimensionVariable,
 };
 use crate::parameters::Parameter;
@@ -284,14 +284,14 @@ impl ShardableType for ArrayIrType {
     }
 }
 
-impl AsArrayType for ArrayIrType {
+impl ArrayMemberType for ArrayIrType {
     #[inline]
     fn as_array_type(&self) -> Result<&ArrayType, TypeError> {
         self.try_into()
     }
 }
 
-impl AsDimensionType for ArrayIrType {
+impl DimensionMemberType for ArrayIrType {
     #[inline]
     fn as_dimension_type(&self) -> Result<&DimensionType, TypeError> {
         self.try_into()
@@ -874,6 +874,8 @@ mod tests {
         let array = ArrayType::new(F32, Shape::scalar());
         let stored = ArrayIrType::from(array.clone());
         assert_eq!(<&ArrayType>::try_from(&stored), Ok(&array));
+        assert_eq!(stored.as_array_type(), <&ArrayType>::try_from(&stored));
+        assert_eq!(stored.as_dimension_type(), <&DimensionType>::try_from(&stored));
         assert!(!stored.is_reference());
         assert_eq!(stored.referent(), None);
         assert_eq!(
@@ -889,6 +891,8 @@ mod tests {
         let dimension = DimensionType::new("extent", DimensionBounds::positive(Some(9)).unwrap());
         let stored = ArrayIrType::from(dimension.clone());
         assert_eq!(<&DimensionType>::try_from(&stored), Ok(&dimension));
+        assert_eq!(stored.as_array_type(), <&ArrayType>::try_from(&stored));
+        assert_eq!(stored.as_dimension_type(), <&DimensionType>::try_from(&stored));
         assert!(!stored.is_reference());
         assert_eq!(stored.referent(), None);
         assert_eq!(
@@ -904,6 +908,8 @@ mod tests {
         let reference = ReferenceType::new(array.clone());
         let stored = ArrayIrType::from(reference.clone());
         assert_eq!(<&ReferenceType<ArrayType>>::try_from(&stored), Ok(&reference));
+        assert_eq!(stored.as_array_type(), <&ArrayType>::try_from(&stored));
+        assert_eq!(stored.as_dimension_type(), <&DimensionType>::try_from(&stored));
         assert!(!stored.is_scalar());
         assert!(!stored.is_complex());
         assert!(stored.is_reference());

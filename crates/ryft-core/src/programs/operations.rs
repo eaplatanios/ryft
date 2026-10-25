@@ -821,8 +821,8 @@ pub trait Operation: Clone {
     /// The default keeps every instruction whole, which is always correct. Operations whose attached regions forward
     /// inputs and outputs positionally override it: a `condition` drops the inputs that neither branch uses, and a
     /// `scan` drops unused stacked inputs and outputs together with the carries that nothing depends on. Operations
-    /// whose attached regions have coupled boundaries (e.g., the rule regions of a custom function, which mirror its
-    /// primal region) keep the default.
+    /// whose attached regions have coupled boundaries (e.g., the rule regions of a composite, which mirror its primal
+    /// region) keep the default.
     ///
     /// # Parameters
     ///
@@ -1238,7 +1238,7 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
 ///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
 ///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
-///     such as `CustomFunctionOperation<V, ArrayOperation<V>>` are not exposed.
+///     such as `CompositeCallOperation<V, ArrayOperation<V>>` are not exposed.
 ///   - [`from_payload`](Self::from_payload) tries the family's own (family-native) variants first, in declaration
 ///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
 ///     over a member family that holds the same payload type. Mixed member variants are never constructed, because

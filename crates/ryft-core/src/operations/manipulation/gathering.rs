@@ -7,8 +7,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
-    ArrayIrType, ArrayIrValue, ArrayType, AsArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, Shape,
-    Sharding, ShardingDimension,
+    ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals,
+    Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1264,7 +1264,7 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array, T = <Self as Capabilit
         mode: GatherMode<Stored>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type: AsArrayType> + Reshape<T>,
+        Self: Typed<Type: ArrayMemberType> + Reshape<T>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
