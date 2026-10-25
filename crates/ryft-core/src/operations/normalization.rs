@@ -85,8 +85,6 @@ use crate::operations::reductions::{ArgMax, Reduce};
 use crate::programs::{ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Capability that provides support for stable softmax normalization and cross-entropy along one or more class axes.
 /// `axes` accepts one axis or a list of axes, and negative axes count from the end. Several class axes are normalized
 /// jointly, as if they were flattened into one class axis in increasing axis order, which is also the order in which
@@ -126,7 +124,9 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 /// ```
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Normalizes the exponentials along `axes`, preserving small derivatives at saturated probabilities.
+    /// Returns class probabilities `qᵢ = exp(xᵢ) / ∑ⱼ exp(xⱼ)` for logits `x = self`. The indices range over the
+    /// classes along `axes`; all other axes are processed independently. The output has the logits' shape and element
+    /// type, and small derivatives survive even when a probability rounds to one.
     ///
     /// # Errors
     ///
@@ -134,9 +134,10 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     /// axes, inputs with unreduced or reduced mesh axes, or an operation binding failure.
     fn softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError>;
 
-    /// Normalizes the exponentials of the classes that `mask` selects along `axes`, as [`Self::softmax`] does over
-    /// those classes alone. Unselected classes have probability zero, as does every class of a row without a selected
-    /// class.
+    /// Returns probabilities `qᵢ = exp(xᵢ) / ∑ⱼ∈M exp(xⱼ)` for logits `x = self` and selected classes `i ∈ M`.
+    /// Here `M = {j | maskⱼ}` contains the classes selected by the Boolean `mask` along `axes`; other axes are
+    /// processed independently. Unselected classes have probability zero; an empty `M` gives zero for the whole row.
+    /// The mask must have the logits' shape, and the output keeps the logits' shape and element type.
     ///
     /// # Errors
     ///
@@ -144,31 +145,34 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     /// array with the logits' shape.
     fn masked_softmax<A: Into<Axes>>(&self, mask: &Self, axes: A) -> Result<Self, ProgramError>;
 
-    /// Computes log-probabilities along `axes`, retaining the small negative log-probability of a dominant class.
-    /// The output has the input shape and element type.
+    /// Returns log-probabilities `ℓᵢ = xᵢ − ln(∑ⱼ exp(xⱼ))` for logits `x = self`. The indices range over the
+    /// classes along `axes`; all other axes are processed independently. The output has the logits' shape and element
+    /// type. Computing directly in log space retains small negative log-probabilities that would be lost by taking
+    /// the logarithm of a rounded [`Self::softmax`] result.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] under the same conditions as [`Self::softmax`].
     fn log_softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError>;
 
-    /// Computes the log-probabilities of the classes that `mask` selects along `axes`, as [`Self::log_softmax`] does
-    /// over those classes alone. Unselected classes have log-probability negative infinity, as does every class of a
-    /// row without a selected class.
+    /// Returns log-probabilities `ℓᵢ = xᵢ − ln(∑ⱼ∈M exp(xⱼ))` for logits `x = self` and selected classes `i ∈ M`.
+    /// Here `M = {j | maskⱼ}` contains the classes selected by the Boolean `mask` along `axes`; other axes are
+    /// processed independently. Unselected classes have log-probability `−∞`; an empty `M` gives `−∞` for the whole
+    /// row. The mask must have the logits' shape, and the output keeps the logits' shape and element type.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] under the same conditions as [`Self::masked_softmax`].
     fn masked_log_softmax<A: Into<Axes>>(&self, mask: &Self, axes: A) -> Result<Self, ProgramError>;
 
-    /// Computes `-sum(probability_targets * log_softmax(self), axes)`, dropping the class axes. Targets must have
-    /// the logits' shape and real floating-point elements; callers supply nonnegative probabilities summing to one.
-    /// Both inputs are differentiable. The convention `0 * log(0) = 0` applies to excluded classes; the derivative
-    /// with respect to that zero target is also defined as zero. Targets are converted to the logits' working type,
-    /// and the result has the logits' element type. Targets and logits may vary over different manual mesh axes; they
-    /// are aligned before they are combined. When the target distribution is supplied as logits, use
-    /// [`softmax_cross_entropy_with_target_logits`] to preserve the prediction gradient when the distributions nearly
-    /// coincide.
+    /// Returns cross-entropy `L = −∑ᵢ pᵢ ℓᵢ`, where `p = probability_targets` and `ℓ` contains the log-probabilities
+    /// of `self` from [`Self::log_softmax`]. The sum ranges over the classes along `axes`, producing one loss for each
+    /// combination of remaining indices. The output drops the class axes and keeps the logits' element type. Targets
+    /// must have the logits' shape and real floating-point elements; callers supply `pᵢ ≥ 0` with `∑ᵢ pᵢ = 1`. Targets
+    /// are converted to the logits' working type, and both inputs are differentiable. For an excluded class,
+    /// `0 · (−∞) = 0`, with zero derivative for that zero target. Inputs with different manual variation are aligned
+    /// before computing the loss. For targets supplied as logits, use [`softmax_cross_entropy_with_target_logits`] to
+    /// retain accurate prediction gradients when the distributions nearly coincide.
     ///
     /// # Errors
     ///
@@ -176,9 +180,11 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     /// or element types.
     fn softmax_cross_entropy<A: Into<Axes>>(&self, probability_targets: &Self, axes: A) -> Result<Self, ProgramError>;
 
-    /// Computes [`Self::softmax_cross_entropy`] over the classes that `mask` selects: the log-probabilities are those
-    /// of [`Self::masked_log_softmax`], and unselected classes contribute nothing to the sum whatever their target. A
-    /// row without any selected class has zero loss.
+    /// Returns masked cross-entropy `L = −∑ᵢ∈M pᵢ ℓᵢ`, where `p = probability_targets` and `ℓ` contains the
+    /// log-probabilities of `self` from [`Self::masked_log_softmax`]. The set `M = {i | maskᵢ}` contains the classes
+    /// selected by the Boolean `mask` along `axes`; all other axes identify independent losses. Unselected classes
+    /// contribute nothing; targets are not renormalized after masking, and an empty `M` gives zero loss. Target
+    /// requirements, output shape and element type, and differentiation follow [`Self::softmax_cross_entropy`].
     ///
     /// # Errors
     ///
@@ -191,11 +197,12 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
         axes: A,
     ) -> Result<Self, ProgramError>;
 
-    /// Computes one cross-entropy loss per integer class label, dropping the class axes. `labels` has the logits'
-    /// shape with `axes` removed and integer elements, and each label indexes the classes flattened in increasing
-    /// axis order. Labels outside `[0, class_count)` produce NaN. The result has the logits' element type; labels
-    /// have structural-zero derivatives. Labels and logits may vary over different manual mesh axes; they are aligned
-    /// before the lookup.
+    /// Returns the negative log-probability of each labeled class: `L = −ℓ[y]`, where `y` is a class index from
+    /// `labels` and `ℓ` contains the log-probabilities of `self` from [`Self::log_softmax`] along `axes`. The output
+    /// drops the class axes and keeps the logits' element type. Labels have integer elements and the output shape;
+    /// each label indexes the classes flattened along `axes` in increasing axis order. Labels have structural-zero
+    /// derivatives; values outside `[0, class_count)` produce NaN. Inputs with different manual variation are
+    /// aligned before looking up the labels.
     ///
     /// # Errors
     ///
@@ -207,9 +214,13 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
         axes: A,
     ) -> Result<Self, ProgramError>;
 
-    /// Computes [`Self::softmax_cross_entropy_with_integer_labels`] over the classes that `mask` selects: the loss
-    /// is the negative [`Self::masked_log_softmax`] of the labeled class, so a label that names an unselected class
-    /// yields an infinite loss, while a row without any selected class has zero loss whatever its label.
+    /// Returns the negative masked log-probability of each labeled class: `L = −ℓ[y]`, where `y` is a class index from
+    /// `labels` and `ℓ` contains the log-probabilities of `self` from [`Self::masked_log_softmax`]. Normalization uses
+    /// the classes selected by the Boolean `mask` along `axes`; other axes identify independent losses. A valid label
+    /// naming an unselected class gives infinite loss; a row with no selected class gives zero loss regardless of its
+    /// label. Labels have integer elements and index the classes flattened along `axes` in increasing axis order.
+    /// Label shape, output shape and element type, and differentiation follow
+    /// [`Self::softmax_cross_entropy_with_integer_labels`].
     ///
     /// # Errors
     ///
@@ -222,6 +233,8 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
         axes: A,
     ) -> Result<Self, ProgramError>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
