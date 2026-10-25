@@ -66,7 +66,7 @@ use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAl
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
-use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
 use crate::operations::control_flow::scan::{ScanInterpretationDomain, ScanOperation};
@@ -1371,9 +1371,7 @@ mod tests {
     use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatter;
     use crate::operations::collectives::parallel_vary::ParallelVary;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::operations::{
-        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation,
-    };
+    use crate::operations::composites::{CompositeJvpRule, CompositeOperation, CompositeTransposeOperation};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::differentiation::linear_call::LinearCallOperation;

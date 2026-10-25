@@ -66,7 +66,7 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
-use crate::operations::composites::functions::{CompositeCallContext, JvpComposite, composite};
+use crate::operations::composites::{CompositeCallContext, JvpComposite, composite};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::constants::zero_like::ZeroLike;

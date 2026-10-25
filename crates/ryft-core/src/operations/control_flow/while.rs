@@ -3012,7 +3012,7 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::operations::CompositeTransposeOperation;
+    use crate::operations::composites::CompositeTransposeOperation;
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
     use crate::operations::constants::iota::Iota;

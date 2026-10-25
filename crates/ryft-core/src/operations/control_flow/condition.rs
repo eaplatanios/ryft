@@ -2340,7 +2340,7 @@ mod tests {
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::operations::CompositeTransposeOperation;
+    use crate::operations::composites::CompositeTransposeOperation;
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::scan::ScanOperation;

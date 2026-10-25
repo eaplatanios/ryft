@@ -5167,8 +5167,7 @@ mod tests {
     use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::functions::composite;
-    use crate::operations::composites::operations::CompositeTransposeOperation;
+    use crate::operations::composites::{CompositeTransposeOperation, composite};
     use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;

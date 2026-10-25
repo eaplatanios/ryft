@@ -772,7 +772,7 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::functions::composite;
+    use crate::operations::composites::composite;
     use crate::operations::constants::one_like::OneLike;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;

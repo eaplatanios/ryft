@@ -12,7 +12,7 @@ use crate::operations::attention::{
     DotProductAttentionOperation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::composites::functions::{
+use crate::operations::composites::{
     Composite, CompositeCallContext, CompositeVjp, DefaultJvp, SymbolicZeroVjp, composite,
 };
 use crate::parameters::{Parameter, Parameterized};

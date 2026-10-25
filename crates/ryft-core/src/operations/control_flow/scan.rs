@@ -2529,6 +2529,413 @@ where
     }
 }
 
+/// Selection of the iteration count for a structured scan.
+#[derive(Clone, Debug)]
+enum ScanIterationCount<V> {
+    /// Infer a static count from the stacked inputs.
+    Inferred,
+    /// Use the provided static count.
+    Static(usize),
+    /// Consume a first-class dimension value as the count.
+    Value(V),
+}
+
+/// Configuration of [`Scan::scan`] and [`scan`]. The carry count is derived from the structured initial state.
+///
+/// By default, the iteration count is inferred from a stacked input with a statically known leading extent. A scan
+/// without stacked values needs an explicit count. Dynamic counts use [`Self::with_iteration_count_value`], including
+/// dimension values whose types happen to pin one extent: the value remains an input so its validation is preserved.
+#[derive(Clone, Debug)]
+pub struct ScanOptions<V: Value> {
+    /// Source of the declared iteration count.
+    iteration_count: ScanIterationCount<V>,
+
+    /// Whether to visit the input slices in reverse order.
+    reverse: bool,
+
+    /// Number of body copies per lowered loop iteration.
+    unroll: usize,
+
+    /// Placements of the leading axes of stacked output leaves.
+    stacked_axis_shardings: Vec<ShardingDimension>,
+}
+
+impl<V: Value> Default for ScanOptions<V> {
+    fn default() -> Self {
+        Self {
+            iteration_count: ScanIterationCount::Inferred,
+            reverse: false,
+            unroll: 1,
+            stacked_axis_shardings: Vec::new(),
+        }
+    }
+}
+
+impl<V: Value> ScanOptions<V> {
+    /// Creates options that infer the count and visit slices in forward order without unrolling.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets an explicit static iteration count, replacing any earlier count selection.
+    #[inline]
+    pub fn with_iteration_count(mut self, iteration_count: usize) -> Self {
+        self.iteration_count = ScanIterationCount::Static(iteration_count);
+        self
+    }
+
+    /// Sets a first-class dimension value that supplies the iteration count, replacing any earlier count selection.
+    /// Its type and relationships to the stacked inputs are validated by [`Scan::scan`].
+    #[inline]
+    pub fn with_iteration_count_value(mut self, iteration_count: V) -> Self {
+        self.iteration_count = ScanIterationCount::Value(iteration_count);
+        self
+    }
+
+    /// Sets whether slices are visited in reverse order (refer to [`ScanOperation::with_reverse`]).
+    #[inline]
+    pub fn with_reverse(mut self, reverse: bool) -> Self {
+        self.reverse = reverse;
+        self
+    }
+
+    /// Sets the lowering unroll factor, which must be at least one (refer to [`ScanOperation::with_unroll`]).
+    pub fn with_unroll(mut self, unroll: usize) -> Result<Self, ProgramError> {
+        // Reuse the operation's validation rather than define another unroll contract for the frontend.
+        self.unroll = ScanOperation::<V::Type>::new(0, 0).with_unroll(unroll)?.unroll();
+        Ok(self)
+    }
+
+    /// Sets the scan-axis placements of the stacked output leaves, in parameter order (refer to
+    /// [`ScanOperation::with_stacked_axis_shardings`]).
+    #[inline]
+    pub fn with_stacked_axis_shardings(mut self, shardings: Vec<ShardingDimension>) -> Self {
+        self.stacked_axis_shardings = shardings;
+        self
+    }
+
+    /// Returns the explicit static count, or `None` when the count is inferred or supplied by a value.
+    #[inline]
+    pub fn iteration_count(&self) -> Option<usize> {
+        match self.iteration_count {
+            ScanIterationCount::Static(count) => Some(count),
+            _ => None,
+        }
+    }
+
+    /// Returns the explicit count value, or `None` when the count is inferred or static.
+    #[inline]
+    pub fn iteration_count_value(&self) -> Option<&V> {
+        match &self.iteration_count {
+            ScanIterationCount::Value(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns whether input slices are visited in reverse order.
+    #[inline]
+    pub fn reverse(&self) -> bool {
+        self.reverse
+    }
+
+    /// Returns the lowering unroll factor.
+    #[inline]
+    pub fn unroll(&self) -> usize {
+        self.unroll
+    }
+
+    /// Returns the requested stacked-output axis placements, before the primitive removes trailing replicated entries.
+    #[inline]
+    pub fn stacked_axis_shardings(&self) -> &[ShardingDimension] {
+        &self.stacked_axis_shardings
+    }
+
+    /// Resolves the count and constructs the primitive payload without discarding an explicit count value.
+    fn operation(&self, carry_count: usize, input_types: &[V::Type]) -> Result<ScanOperation<V::Type>, ProgramError>
+    where
+        V::Type: ScanType,
+    {
+        let leading_dimensions = input_types
+            .iter()
+            .map(|r#type| {
+                let array = match r#type.referent() {
+                    Some(referent) => referent.as_array_type()?,
+                    None => r#type.as_array_type()?,
+                };
+                if array.rank() == 0 {
+                    return Err(TypeError::invalid("`scan` stacked inputs must have a leading scan axis"));
+                }
+                Ok(array.dimension(0))
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let iteration_count = match &self.iteration_count {
+            ScanIterationCount::Inferred => {
+                let extent = leading_dimensions.iter().find_map(Dimension::value).ok_or_else(|| {
+                    ProgramError::InvalidArgument {
+                        message: "`scan` cannot infer a static iteration count; provide an explicit count or a \
+                                  first-class dimension value"
+                            .to_string(),
+                    }
+                })?;
+                Dimension::Static(extent)
+            }
+            ScanIterationCount::Static(extent) => Dimension::Static(*extent),
+            ScanIterationCount::Value(value) => {
+                let representation: ArrayIrType = value.r#type().into_owned().into();
+                let count = representation.as_dimension_type()?;
+                // A singleton value can refine a wider stack identity. Keep that declaration so the primitive checks
+                // their relationship, while retaining the supplied value and its ordered validation as an input.
+                let stack_dimension = count.extent().and_then(|_| {
+                    leading_dimensions.iter().find(|candidate| {
+                        candidate.variable().is_some()
+                            && leading_dimensions.iter().all(|actual| candidate.is_refined_by(actual))
+                            && DimensionType::from((*candidate).clone()).is_refined_by(count)
+                    })
+                });
+                stack_dimension.cloned().unwrap_or_else(|| Dimension::Dynamic(count.to_variable()))
+            }
+        };
+        Ok(ScanOperation::new(carry_count, iteration_count)
+            .with_reverse(self.reverse)
+            .with_unroll(self.unroll)?
+            .with_stacked_axis_shardings(self.stacked_axis_shardings.clone()))
+    }
+}
+
+/// Context constructor for a structured [`ScanOperation`]. The explicit context also supports scans with no input
+/// values, for which the global [`scan`] function cannot recover an execution domain.
+///
+/// The body receives the intrinsic scalar `i64` index, the carried state, and the slices of stacked array inputs.
+/// Reference stacks enter whole, so the index can be used to construct views explicitly. It returns the next carried
+/// state and the output slices. Carries, inputs, and outputs may be [`Parameterized`] structures with static fields;
+/// the carry's structure, static fields, and leaf types must remain valid loop state.
+///
+/// The body is traced, not called once per runtime iteration. It may be retraced while carry manual variation reaches
+/// a fixed point, so it must describe the same computation on every call. Entry variation is applied before the loop,
+/// including when the iteration count is zero, and its transpose preserves the corresponding reductions.
+/// Nonconstant values used by the body must be passed through its inputs; constants may be closed over.
+pub trait Scan: Context {
+    /// Traces `body` and binds one scan in this context, returning its final carry and structured stacked outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `body`: Traced function `(index, carry, input_slice) -> (next_carry, output_slice)`.
+    ///   - `carry`: Initial loop-carried state.
+    ///   - `inputs`: Stacked array inputs or whole reference stacks.
+    ///   - `options`: Count selection, visit order, unroll factor, and stacked-output placements.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors for invalid counts, signatures, carry structure/static-field changes, reference identities,
+    /// incompatible metadata, or nonconvergent manual variation, and errors from tracing, alignment, or binding.
+    fn scan<
+        Carry: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        Input: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        Output: Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<Self::Value>>,
+        F: FnMut(
+            Tracer<NestedTracingContext<Self>>,
+            Carry::To<Tracer<NestedTracingContext<Self>>>,
+            Input::To<Tracer<NestedTracingContext<Self>>>,
+        ) -> Result<(Carry::To<Tracer<NestedTracingContext<Self>>>, Output), ProgramError>,
+    >(
+        &self,
+        body: F,
+        carry: Carry,
+        inputs: Input,
+        options: ScanOptions<Self::Value>,
+    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>
+    where
+        Carry::ParameterStructure: PartialEq;
+}
+
+impl<C: Context<Type: ScanType>> Scan for C
+where
+    C::Operation: From<ScanOperation<C::Type>>,
+    Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
+{
+    fn scan<
+        Carry: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        Input: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        Output: Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<Self::Value>>,
+        F: FnMut(
+            Tracer<NestedTracingContext<Self>>,
+            Carry::To<Tracer<NestedTracingContext<Self>>>,
+            Input::To<Tracer<NestedTracingContext<Self>>>,
+        ) -> Result<(Carry::To<Tracer<NestedTracingContext<Self>>>, Output), ProgramError>,
+    >(
+        &self,
+        mut body: F,
+        carry: Carry,
+        inputs: Input,
+        options: ScanOptions<Self::Value>,
+    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>
+    where
+        Carry::ParameterStructure: PartialEq,
+    {
+        let carry_structure = carry.parameter_structure();
+        let input_structure = inputs.parameter_structure();
+        let carry_values = carry.into_parameters().collect::<Vec<_>>();
+        let carry_count = carry_values.len();
+        let mut operation_inputs = carry_values.clone();
+        operation_inputs.extend(inputs.into_parameters());
+        let mut input_types = operation_inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let operation = options.operation(carry_count, &input_types[carry_count..])?;
+        if let ScanIterationCount::Value(value) = options.iteration_count {
+            input_types.push(value.r#type().into_owned());
+            operation_inputs.push(value);
+        }
+        let mut body_input_types = C::Type::infer_scan_body_input_types(
+            &input_types,
+            1 + input_types.len() - usize::from(operation.iteration_count.variable().is_some()),
+            carry_count,
+            &operation.iteration_count,
+        )?;
+        // Validate the input-side family contract before calling the body. Matching carry-only outputs stand in for
+        // its yet-untraced outputs; the complete application is validated below using the final body.
+        C::Type::validate_scan_body_type_signature(
+            &body_input_types,
+            &body_input_types[1..1 + carry_count],
+            carry_count,
+            &operation.iteration_count,
+        )?;
+        let initial_carry_types = input_types[..carry_count].to_vec();
+        let mut remaining_widenings = None;
+        let (body_program, output_structure) = loop {
+            let mut next_input_types = Vec::new();
+            let mut output_structure = None;
+            let (_, program) = NestedTracingContext::trace(
+                self.clone(),
+                |values| {
+                    let mut values = values.into_iter();
+                    let index = values.next().unwrap();
+                    let state_values = values.by_ref().take(carry_count).collect::<Vec<_>>();
+                    let state = Carry::To::<Tracer<NestedTracingContext<Self>>>::from_parameters(
+                        carry_structure.clone(),
+                        state_values.clone(),
+                    )?;
+                    let inputs = Input::To::<Tracer<NestedTracingContext<Self>>>::from_parameters(
+                        input_structure.clone(),
+                        values,
+                    )?;
+                    let (next_carry, output) = body(index, state, inputs)?;
+                    if next_carry.parameter_structure() != carry_structure {
+                        return Err(ProgramError::InvalidArgument {
+                            message: "`scan` body must preserve the carry parameter structure and static fields"
+                                .to_string(),
+                        });
+                    }
+                    let mut next_carries = Vec::with_capacity(carry_count);
+                    for (incoming, returned) in state_values.into_iter().zip(next_carry.into_parameters()) {
+                        let mut pair = Tracer::align_manual_variation(&[incoming, returned])?;
+                        next_input_types.push(pair.remove(0).r#type().into_owned());
+                        next_carries.push(pair.pop().unwrap());
+                    }
+                    output_structure = Some(output.parameter_structure());
+                    next_carries.extend(output.into_parameters());
+                    Ok(next_carries)
+                },
+                body_input_types.clone(),
+            )?;
+            let capacity = remaining_widenings.get_or_insert_with(|| {
+                let axes = body_input_types
+                    .iter()
+                    .chain(program.output_types().iter())
+                    .filter_map(|r#type| r#type.as_array_type().ok().and_then(ArrayType::sharding))
+                    .map(|sharding| sharding.mesh().axes().len())
+                    .max()
+                    .unwrap_or(0);
+                carry_count.saturating_mul(axes.max(1))
+            });
+            if next_input_types == body_input_types[1..1 + carry_count] {
+                break (program, output_structure.unwrap());
+            }
+            if *capacity == 0 {
+                return Err(ProgramError::InvalidArgument {
+                    message: "`scan` carry manual variation did not reach a fixed point".to_string(),
+                });
+            }
+            *capacity -= 1;
+            body_input_types[1..1 + carry_count].clone_from_slice(&next_input_types);
+        };
+        input_types[..carry_count].clone_from_slice(&body_input_types[1..1 + carry_count]);
+        operation.validate_application(&input_types, body_program.entry_region_ref())?;
+
+        // Replay entry alignment through this explicit context, not through the values' possibly different domains.
+        // This emits the actual transitions only after convergence and leaves transpose reductions outside the scan.
+        if initial_carry_types != body_input_types[1..1 + carry_count] {
+            let (_, alignment) = NestedTracingContext::trace(
+                self.clone(),
+                |values| {
+                    values
+                        .into_iter()
+                        .zip(&body_input_types[1..1 + carry_count])
+                        .map(|(value, r#type)| match r#type.as_array_type().ok().and_then(ArrayType::sharding) {
+                            Some(sharding) => Ok(Tracer::align_manual_variation_to(&[value], sharding)?.remove(0)),
+                            None => Ok(value),
+                        })
+                        .collect::<Result<Vec<_>, ProgramError>>()
+                },
+                initial_carry_types,
+            )?;
+            let aligned = alignment.interpret_in_context(self, carry_values)?;
+            operation_inputs[..carry_count].clone_from_slice(&aligned);
+        }
+        let output_count = body_program.output_ids().len();
+        let mut outputs = self.bind(operation, vec![body_program], &operation_inputs)?;
+        check_count!("output", outputs, output_count, ProgramError);
+        let stacked_outputs = outputs.split_off(carry_count);
+        Ok((
+            Carry::from_parameters(carry_structure, outputs)?,
+            Output::To::<Self::Value>::from_parameters(output_structure, stacked_outputs)?,
+        ))
+    }
+}
+
+/// Runs [`Scan::scan`] in the execution domain recovered from the first carry or stacked-input leaf, or from an
+/// explicit iteration-count value. Structured carries and inputs may be empty individually; when all three sources
+/// contain no values, use the context constructor instead.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::InvalidArgument`] when no input value supplies a domain, and the errors of [`Scan::scan`].
+#[inline]
+pub fn scan<
+    V: Value<Domain: Scan>,
+    Carry: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
+    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<NestedTracingContext<V::Domain>>>>,
+    Output: Parameterized<Tracer<NestedTracingContext<V::Domain>>, Family: ParameterizedFamily<V>>,
+    F: FnMut(
+        Tracer<NestedTracingContext<V::Domain>>,
+        Carry::To<Tracer<NestedTracingContext<V::Domain>>>,
+        Input::To<Tracer<NestedTracingContext<V::Domain>>>,
+    ) -> Result<(Carry::To<Tracer<NestedTracingContext<V::Domain>>>, Output), ProgramError>,
+>(
+    body: F,
+    carry: Carry,
+    inputs: Input,
+    options: ScanOptions<V>,
+) -> Result<(Carry, Output::To<V>), ProgramError>
+where
+    Carry::ParameterStructure: PartialEq,
+{
+    let context = carry
+        .parameters()
+        .next()
+        .or_else(|| inputs.parameters().next())
+        .or_else(|| match &options.iteration_count {
+            ScanIterationCount::Value(value) => Some(value),
+            _ => None,
+        })
+        .map(Value::domain)
+        .ok_or_else(|| ProgramError::InvalidArgument {
+            message: "`scan` requires an input value to recover its context from; use `Scan::scan` with an explicit \
+                      context when there are no input values"
+                .to_string(),
+        })?;
+    context.scan(body, carry, inputs, options)
+}
+
 /// Returns the per-iteration slice type of a stacked scan value of type `stacked_type` whose scan axis is `axis`,
 /// together with the scan dimension. A placement over [`Auto`](MeshAxisType::Auto) mesh axes on the scan axis is only a
 /// hint for the compiler, so the slice drops it: each iteration reads a single position of that axis, and the compiler
@@ -3789,7 +4196,7 @@ mod tests {
     use crate::operations::arithmetic::{Add, AddOperation, DivOperation, MulOperation, NegOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
-    use crate::operations::composites::operations::CompositeTransposeOperation;
+    use crate::operations::composites::CompositeTransposeOperation;
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::tests::{
@@ -22284,6 +22691,378 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [2]).into(),
                 ArrayType::new_static(DataType::F64, [3, 2]).into(),
             ]),
+        );
+    }
+
+    #[test]
+    fn test_scan_options() {
+        let options = ScanOptions::<Array>::new();
+        assert_eq!(options.iteration_count(), None);
+        assert_eq!(options.iteration_count_value(), None);
+        assert!(!options.reverse());
+        assert_eq!(options.unroll(), 1);
+        assert_eq!(options.stacked_axis_shardings(), &[]);
+        let options = options
+            .with_iteration_count(3)
+            .with_reverse(true)
+            .with_unroll(2)
+            .unwrap()
+            .with_stacked_axis_shardings(vec![ShardingDimension::Replicated]);
+        assert_eq!(options.iteration_count(), Some(3));
+        assert!(options.reverse());
+        assert_eq!(options.unroll(), 2);
+        assert_eq!(options.stacked_axis_shardings(), &[ShardingDimension::Replicated]);
+        assert_eq!(
+            ScanOptions::<Array>::new().with_unroll(0).err(),
+            Some(ProgramError::Type(TypeError::invalid("`scan` unroll factor must be at least 1"))),
+        );
+        let count = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let options = ScanOptions::new().with_iteration_count(2).with_iteration_count_value(count.clone());
+        assert_eq!(options.iteration_count(), None);
+        assert_eq!(options.iteration_count_value(), Some(&count));
+    }
+
+    #[test]
+    fn test_scan_frontend() {
+        // The body sees the physical slice index in either visit order, and structured output leaves stack separately.
+        let inputs = Array::vector(vec![1f32, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            scan(
+                |index, carry, value| {
+                    let next = carry.add(&value)?;
+                    Ok((next.clone(), (next, index)))
+                },
+                Array::scalar(0f32).unwrap(),
+                inputs.clone(),
+                ScanOptions::new(),
+            ),
+            Ok((
+                Array::scalar(6f32).unwrap(),
+                (Array::vector(vec![1f32, 3.0, 6.0]).unwrap(), Array::vector(vec![0i64, 1, 2]).unwrap()),
+            )),
+        );
+        assert_eq!(
+            scan(
+                |index, carry, value| {
+                    let next = carry.add(&value)?;
+                    Ok((next.clone(), (next, index)))
+                },
+                Array::scalar(0f32).unwrap(),
+                inputs,
+                ScanOptions::new().with_reverse(true).with_unroll(2).unwrap(),
+            ),
+            Ok((
+                Array::scalar(6f32).unwrap(),
+                (Array::vector(vec![6f32, 5.0, 3.0]).unwrap(), Array::vector(vec![0i64, 1, 2]).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_context_empty_inputs() {
+        // The explicit constructor supplies the execution domain when there are no leaves; the global entry errors.
+        let context = TestEagerContext::new();
+        assert_eq!(
+            context.scan(|index, (), ()| Ok(((), index)), (), (), ScanOptions::new().with_iteration_count(3)),
+            Ok(((), Array::vector(vec![0i64, 1, 2]).unwrap())),
+        );
+        assert_eq!(
+            context.scan(|index, (), ()| Ok(((), index)), (), (), ScanOptions::new().with_iteration_count(0)),
+            Ok(((), Array::vector(Vec::<i64>::new()).unwrap())),
+        );
+        assert_eq!(
+            scan(|index, (), ()| Ok(((), index)), (), (), ScanOptions::<Array>::new().with_iteration_count(3)),
+            Err(ProgramError::InvalidArgument {
+                message:
+                    "`scan` requires an input value to recover its context from; use `Scan::scan` with an explicit \
+                          context when there are no input values"
+                        .to_string(),
+            }),
+        );
+        // A count value is itself a domain-bearing input, including a singleton zero count.
+        assert_eq!(
+            scan(
+                |index, (), ()| Ok(((), index)),
+                (),
+                (),
+                ScanOptions::new()
+                    .with_iteration_count_value(TestIrValue::Dimension(DimensionValue::constant(0).unwrap())),
+            ),
+            Ok(((), array(Array::vector(Vec::<i64>::new()).unwrap()))),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_staging() {
+        let (_, program) = TracingContext::<Array, TestOperation>::trace(
+            |(carry, inputs)| {
+                scan(
+                    |_, carry, value| {
+                        let next = carry.add(&value)?;
+                        Ok((next.clone(), next))
+                    },
+                    carry,
+                    inputs,
+                    ScanOptions::new(),
+                )
+            },
+            (ArrayType::scalar(DataType::F32), ArrayType::new_static(DataType::F32, [3])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[], %1:f32[3] .
+            let %2:f32[], %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
+                body={
+                    lambda %0:i64[], %1:f32[], %2:f32[] .
+                    let %3:f32[] = add %1 %2
+                    in (%3, %3)
+                },
+            ]
+            in (%2, %3)"}
+        );
+        assert_eq!(
+            program.interpret((Array::scalar(0f32).unwrap(), Array::vector(vec![1f32, 2.0, 3.0]).unwrap())),
+            Ok((Array::scalar(6f32).unwrap(), Array::vector(vec![1f32, 3.0, 6.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_structure() {
+        /// A state whose static tag must survive tracing, without requiring Clone on runtime structures.
+        #[derive(ryft_macros::Parameterized)]
+        struct State<P: crate::parameters::Parameter> {
+            /// Runtime state leaf.
+            value: P,
+
+            /// Static state tag.
+            tag: &'static str,
+        }
+        impl Clone for State<Placeholder> {
+            fn clone(&self) -> Self {
+                Self { value: self.value, tag: self.tag }
+            }
+        }
+        impl PartialEq for State<Placeholder> {
+            fn eq(&self, other: &Self) -> bool {
+                self.tag == other.tag
+            }
+        }
+        let (carry, output) = scan(
+            |_, carry, input| {
+                let next = carry.value.add(&input.value)?;
+                Ok((State { value: next.clone(), tag: carry.tag }, State { value: next, tag: input.tag }))
+            },
+            State { value: Array::scalar(0f32).unwrap(), tag: "state" },
+            State { value: Array::vector(vec![1f32, 2.0]).unwrap(), tag: "output" },
+            ScanOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(carry.value, Array::scalar(3f32).unwrap());
+        assert_eq!(carry.tag, "state");
+        assert_eq!(output.value, Array::vector(vec![1f32, 3.0]).unwrap());
+        assert_eq!(output.tag, "output");
+        let result = scan(
+            |_, carry, input| Ok((State { value: carry.value, tag: "changed" }, input)),
+            State { value: Array::scalar(0f32).unwrap(), tag: "state" },
+            Array::vector(vec![1f32, 2.0]).unwrap(),
+            ScanOptions::new(),
+        );
+        assert!(matches!(result, Err(ProgramError::InvalidArgument { message })
+            if message == "`scan` body must preserve the carry parameter structure and static fields"));
+    }
+
+    #[test]
+    fn test_scan_frontend_validation() {
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            scan(
+                |_, carry, input| {
+                    called.set(true);
+                    Ok((carry, input))
+                },
+                Array::scalar(0f32).unwrap(),
+                Array::vector(vec![1f32, 2.0, 3.0]).unwrap(),
+                ScanOptions::new().with_iteration_count(2),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`scan` stacked input 1 must have leading dimension `2` but has type `f32[3]`",
+            ))),
+        );
+        assert!(!called.get());
+        assert_eq!(
+            scan(
+                |_, _, input| Ok((input.clone(), input)),
+                Array::scalar(0f32).unwrap(),
+                Array::matrix(3, 2, vec![1f32; 6]).unwrap(),
+                ScanOptions::new(),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`scan` body carry type signature mismatch: expected [f32[]] but got [f32[2]]",
+            ))),
+        );
+        assert_eq!(
+            scan(|_, carry, ()| Ok((carry.clone(), carry)), Array::scalar(0f32).unwrap(), (), ScanOptions::new()),
+            Err(ProgramError::InvalidArgument {
+                message: "`scan` cannot infer a static iteration count; provide an explicit count or a first-class \
+                          dimension value"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_dynamic_count() {
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let count_type = DimensionType::from(length.clone());
+        let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
+            |(carry, inputs, count)| {
+                scan(
+                    |_, carry, value| {
+                        let next = carry.add(&value)?;
+                        Ok((next.clone(), next))
+                    },
+                    carry,
+                    inputs,
+                    ScanOptions::new().with_iteration_count_value(count),
+                )
+            },
+            (
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![length.into()]))),
+                ArrayIrType::Dimension(count_type.clone()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [0, 8)> .
+            let %3:f32[], %4:f32[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
+                body={
+                    lambda %0:i64[], %1:f32[], %2:f32[] .
+                    let %3:f32[] = add %1 %2
+                    in (%3, %3)
+                },
+            ]
+            in (%3, %4)"}
+        );
+        let inputs = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
+        assert_eq!(
+            program.interpret((array(Array::scalar(0f32).unwrap()), inputs.clone(), dimension(&count_type, 3))),
+            Ok((array(Array::scalar(6f32).unwrap()), array(Array::vector(vec![1f32, 3.0, 6.0]).unwrap()))),
+        );
+        assert_eq!(
+            program.interpret((array(Array::scalar(0f32).unwrap()), inputs, dimension(&count_type, 2))),
+            Err(input_dimension_mismatch("length", 3, 2)),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_singleton_count_keeps_validation() {
+        // A scalar-to-dimension assertion remains an input dependency, even though its declared extent is fixed at 3.
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let count_type = DimensionType::new("count", DimensionBounds::new(3, Some(4)).unwrap());
+        let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
+            |(inputs, scalar)| {
+                let count = scalar
+                    .context()
+                    .bind(DimensionFromScalarOperation::new(count_type.clone()), Vec::new(), &[scalar.clone()])?
+                    .remove(0);
+                scan(|_, (), input| Ok(((), input)), (), inputs, ScanOptions::new().with_iteration_count_value(count))
+            },
+            (
+                ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![length.into()]))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[length], %1:i64[] .
+            let %2:dimension<3> = dimension_from_scalar [bounds=[3, 4)] %1
+                %3:f32[3] = scan [carry_count=0, iteration_count=length, reverse=false] %0 %2 [
+                body={
+                    lambda %0:i64[], %1:f32[] .
+                    in (%1)
+                },
+            ]
+            in (%3)"}
+        );
+        let inputs = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
+        assert_eq!(program.interpret((inputs.clone(), array(Array::scalar(3i64).unwrap()))), Ok(((), inputs.clone())));
+        assert_eq!(
+            program.interpret((inputs, array(Array::scalar(2i64).unwrap()))),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::BindingOutOfBounds {
+                variable: "count".to_string(),
+                value: 2,
+                bounds: DimensionBounds::new(3, Some(4)).unwrap(),
+            }))),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_references() {
+        let root = ArrayReference::new(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
+        let root_type = root.r#type().into_owned();
+        assert_eq!(
+            scan(
+                |index, (), input| {
+                    assert_eq!(input.r#type().as_ref(), &ArrayIrType::Reference(root_type.clone()));
+                    Ok(((), index))
+                },
+                (),
+                TestIrValue::Reference(root),
+                ScanOptions::new(),
+            ),
+            Ok(((), array(Array::vector(vec![0i64, 1, 2]).unwrap()))),
+        );
+        let first = TestIrValue::Reference(ArrayReference::new(Array::scalar(1f32).unwrap()));
+        let second = TestIrValue::Reference(ArrayReference::new(Array::scalar(2f32).unwrap()));
+        assert_eq!(
+            scan(
+                |_, (first, second), ()| Ok(((second, first), ())),
+                (first, second),
+                (),
+                ScanOptions::new().with_iteration_count(0)
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`scan` body does not return carry 0 as the reference it entered with, so the loop state has no fixed point",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_keeps_effects_with_no_outputs() {
+        let (_, program) = TracingContext::<Array, TestOperation>::trace(
+            |anchor| {
+                anchor.context().scan(
+                    |index, (), ()| {
+                        index.context().bind(PrintOperation::new("step"), Vec::new(), &[index.clone()])?;
+                        Ok(((), ()))
+                    },
+                    (),
+                    (),
+                    ScanOptions::new().with_iteration_count(2),
+                )
+            },
+            ArrayType::scalar(DataType::I64),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:i64[] .
+            let () = scan [carry_count=0, iteration_count=2, reverse=false] [
+                body={
+                    lambda %0:i64[] .
+                    let %1:i64[] = print [label=step] %0
+                    in ()
+                },
+            ]
+            in ()"}
         );
     }
 

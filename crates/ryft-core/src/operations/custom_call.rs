@@ -46,7 +46,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
-use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
+use crate::operations::composites::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
