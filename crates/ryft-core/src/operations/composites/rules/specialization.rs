@@ -38,6 +38,9 @@ use crate::programs::{
 use crate::specialization::SpecializationCacheError;
 use crate::tracing::TracingContext;
 
+#[cfg(doc)]
+use crate::batching::DiagonalBatchingPolicy;
+
 /// Derivation of a definition from a source definition, which is stored in the derived definition in place of a
 /// batching rule (refer to [`CustomRuleSpecializer::derived`]).
 pub(super) struct CustomRuleDerivation<V: Typed + Parameter, O> {

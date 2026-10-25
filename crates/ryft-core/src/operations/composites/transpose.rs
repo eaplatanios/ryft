@@ -41,6 +41,9 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
+#[cfg(doc)]
+use crate::operations::composites::call::CompositeOperation;
+
 /// Canonical operation name for [`CompositeTransposeOperation`].
 pub const COMPOSITE_TRANSPOSE_OPERATION_NAME: &str = "composite_transpose";
 

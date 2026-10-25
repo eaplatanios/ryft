@@ -28,6 +28,9 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracingContext, TracingContext};
 
+#[cfg(doc)]
+use crate::operations::composites::builder::{Composite, composite};
+
 /// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
 /// with reverse-mode rules rejects forward mode (refer to [`composite`] for the rule selection).

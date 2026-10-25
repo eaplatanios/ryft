@@ -31,6 +31,18 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
+#[cfg(doc)]
+use crate::batching::DiagonalBatchingPolicy;
+
+#[cfg(doc)]
+use crate::differentiation::TranspositionContext;
+
+#[cfg(doc)]
+use crate::operations::control_flow::scan::{ScanOperation, ScanType};
+
+#[cfg(doc)]
+use crate::programs::Program;
+
 /// Error returned by [`check_batching_rule_consistency`].
 #[derive(Error, Clone, Debug, PartialEq)]
 pub enum BatchingRuleConsistencyError {

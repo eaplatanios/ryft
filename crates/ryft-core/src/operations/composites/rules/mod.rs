@@ -29,6 +29,9 @@ use crate::parameters::Parameter;
 use crate::programs::{Program, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed};
 use crate::tracing::{Tracer, TracingContext};
 
+#[cfg(doc)]
+use crate::operations::composites::transpose::CompositeTransposeOperation;
+
 mod definition;
 mod registration;
 mod specialization;
@@ -497,7 +500,6 @@ pub type CustomRuleProgram<V, O> = Arc<CustomRuleSpecialization<V, O>>;
 
 #[cfg(test)]
 mod tests {
-
     use crate::arrays::{Array, ArrayOperation, ArrayType, ShardingDimension};
 
     use super::*;

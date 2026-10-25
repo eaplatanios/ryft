@@ -45,6 +45,18 @@ use crate::programs::{
 use crate::specialization::{ReentrantSpecializationError, SpecializationCacheError};
 use crate::tracing::TracingContext;
 
+#[cfg(doc)]
+use crate::differentiation::TransposedProgramCotangent;
+
+#[cfg(doc)]
+use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
+
+#[cfg(doc)]
+use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
+
+#[cfg(doc)]
+use crate::operations::composites::transpose::CompositeTransposeOperation;
+
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
 static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);
 

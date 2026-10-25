@@ -23022,11 +23022,11 @@ mod tests {
         assert_eq!(program.interpret((inputs.clone(), array(Array::scalar(3i64).unwrap()))), Ok(((), inputs.clone())));
         assert_eq!(
             program.interpret((inputs, array(Array::scalar(2i64).unwrap()))),
-            Err(ProgramError::Type(TypeError::custom(DimensionError::BindingOutOfBounds {
-                variable: "count".to_string(),
+            Err(ProgramError::custom(DimensionError::BindingOutOfBounds {
+                variable: "3".to_string(),
                 value: 2,
                 bounds: DimensionBounds::new(3, Some(4)).unwrap(),
-            }))),
+            })),
         );
     }
 
