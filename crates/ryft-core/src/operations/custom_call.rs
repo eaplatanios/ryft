@@ -1304,41 +1304,13 @@ impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> Partial
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how a
-// batch axis threads through it. A call whose inputs are *all replicated* is nevertheless bound unchanged through the
-// parent context and reports replicated outputs, matching JAX, which only invokes a batching rule once some input is
-// actually mapped.
-//
-// That all-replicated shortcut is sound *for this operation specifically* because a custom call is region-free by
-// construction: [`Operation::infer_output_types`] rejects every attached region, so the kernel is a leaf that observes
-// only its instruction inputs. A foreign kernel therefore cannot observe the transform's named axis, and running it
-// unchanged over replicated inputs computes exactly what each batch item would have computed on its own. The shortcut
-// must never be generalized to region-carrying operations, because a region can contain a named-axis operation whose
-// value differs per batch item even when every input of the enclosing instruction is replicated.
-// For example, mapping a region that returns the named-axis index still produces `[0, 1, 2]` at extent 3 even with
-// replicated inputs. Custom-function wrappers therefore always batch their regions structurally.
-//
-// A mapped input is instead governed by the call's own [`CustomCallBatching`] behavior:
-// [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that input and
-// its mapped axis, [`Sequential`](CustomCallBatching::Sequential) stages one [`ScanOperation`] whose body performs a
-// single unbatched call (mapped inputs realigned to batch axis `0` and sliced per iteration, replicated inputs threaded
-// as invariant carries), [`CustomCallUnrolling::Full`] sets its unroll factor to the static batch extent, and
-// [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every input to batch axis `0` and rebinds one call whose
-// declared outputs gain the same leading batch dimension. The other
-// single-call modes differ only in whether replicated inputs gain a singleton axis or remain unchanged. All mapped
-// behaviors keep the staged program's size independent of the batch extent: unrolling expands the scan during backend
-// compilation. They compose with nested batching, because the rewritten instruction is bound through the parent context
-// and carries the same behavior selection.
-//
-// Sequential batching requires a statically known mapped extent here: the scan trip count is a host `usize` in this
-// universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip count is a first-class
-// dimension input (and which full unrolling rejects, because a dynamic trip count cannot be fully unrolled).
-impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for CustomCallOperation
-where
-    C::Operation: From<CustomCallOperation> + From<BroadcastOperation> + From<ScanOperation<C::Type>>,
+impl<
+    C: Context<
+            Type = ArrayType,
+            Operation: From<CustomCallOperation> + From<BroadcastOperation> + From<ScanOperation<C::Type>>,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for CustomCallOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -1346,6 +1318,35 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // A foreign kernel is opaque, so Ryft cannot derive how a batch axis threads through it. A call whose inputs
+        // are _all replicated_ is nevertheless bound unchanged through the parent context and reports replicated
+        // outputs, matching JAX, which only invokes a batching rule once some input is actually mapped.
+        //
+        // That all-replicated shortcut is sound _for this operation specifically_ because a custom call is region-free
+        // by construction (i.e., `Operation::infer_output_types` rejects every attached region, so the kernel is a leaf
+        // that observes only its instruction inputs). A foreign kernel therefore cannot observe the transform's named
+        // axis, and running it unchanged over replicated inputs computes exactly what each batch item would have
+        // computed on its own. The shortcut must never be generalized to region-carrying operations, because a region
+        // can contain a named-axis operation whose value differs per batch item even when every input of the enclosing
+        // instruction is replicated. For example, mapping a region that returns the named-axis index still produces
+        // `[0, 1, 2]` at extent `3` even with replicated inputs. Custom-function wrappers therefore always batch their
+        // regions structurally.
+        //
+        // A mapped input is instead governed by the call's own `CustomCallBatching` behavior. `Rejected` reports
+        // a `BatchingError::UnsupportedOperation` naming that input and its mapped axis, `Sequential` stages a
+        // `ScanOperation` whose body performs a single unbatched call (mapped inputs realigned to batch axis `0` and
+        // sliced per iteration, replicated inputs threaded as invariant carries), `CustomCallUnrolling::Full` sets its
+        // unroll factor to the static batch extent, and `BroadcastAll` aligns every input to batch axis `0` and rebinds
+        // one call whose declared outputs gain the same leading batch dimension. The other single-call modes differ
+        // only in whether replicated inputs gain a singleton axis or remain unchanged. All mapped behaviors keep the
+        // staged program's size independent of the batch extent: unrolling expands the scan during backend compilation.
+        // They compose with nested batching, because the rewritten instruction is bound through the parent context and
+        // carries the same behavior selection.
+        //
+        // Sequential batching requires a statically known mapped extent here: the scan trip count is a host `usize`
+        // in this universe. The mixed `ArrayIrType` rule below owns the dynamic-extent case, where the trip count is a
+        // first-class dimension input (and which full unrolling rejects, because a dynamic trip count cannot be fully
+        // unrolled).
         let Some((index, mapped)) = inputs.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
         else {
             let values = inputs.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
@@ -1356,10 +1357,11 @@ where
         match self.batching {
             CustomCallBatching::Rejected => Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "custom call `{}` has no batching rule for input {index} mapped at batch {}; invoke a \
+                    "custom call `{}` has no batching rule for input {} mapped at batch {}; invoke a \
                      kernel that understands the batch axis, or select an explicit batching behavior with \
                      `CustomCallOperation::with_batching`",
                     self.target_name,
+                    index,
                     mapped.batch_axis(),
                 ),
             }),
@@ -1423,6 +1425,8 @@ where
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl_differentiable_operation! {
     CustomCallOperation,
