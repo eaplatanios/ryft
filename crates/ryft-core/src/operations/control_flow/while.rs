@@ -26,7 +26,7 @@ use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME
 use crate::operations::constants::one::OneOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::condition::ConditionOperation;
-use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type};
+use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{
     TemporalResidualOperation, TemporalResidualType, canonicalize_carry_axes, passed_through_carries,
@@ -1888,7 +1888,8 @@ where
     let predicate_type = condition.output_types()[0].as_array_type()?.clone();
     let counter_type = C::Type::from(bounded_while_scalar_type(DataType::I64, &predicate_type)?);
     let boolean_scalar_type = C::Type::from(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
-    let mask_stack_type = C::Type::from(stacked_scan_type(boolean_scalar_type.as_array_type()?, bound));
+    let mask_stack_type =
+        C::Type::from(boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap());
     let (extended_condition, augmented_body, stack_types) =
         build_bounded_while_programs(condition, &stacked_primal_program, stacked_residual_types.as_slice(), bound)?;
     let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -2399,7 +2400,8 @@ where
     let predicate_type = condition.output_types()[0].as_array_type()?.clone();
     let counter_type = V::Type::from(bounded_while_scalar_type(DataType::I64, &predicate_type)?);
     let boolean_scalar_type = V::Type::from(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
-    let mask_stack_type = V::Type::from(stacked_scan_type(boolean_scalar_type.as_array_type()?, bound));
+    let mask_stack_type =
+        V::Type::from(boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap());
     let storage_types = residual_types
         .iter()
         .map(TemporalResidualType::temporal_storage_type)
@@ -2435,7 +2437,7 @@ where
         .map(|storage_type| {
             storage_type
                 .as_array_type()
-                .map(|storage_type| V::Type::from(stacked_scan_type(storage_type, bound)))
+                .map(|storage_type| V::Type::from(storage_type.with_inserted_dimension(0, bound.into()).unwrap()))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2499,7 +2501,7 @@ where
                     residual_output.clone()
                 };
                 let storage_array_type = storage_type.as_array_type()?;
-                let batch_item_type = stacked_scan_type(storage_array_type, 1);
+                let batch_item_type = storage_array_type.with_inserted_dimension(0, 1.into()).unwrap();
                 let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
                 let mut expanded = context.bind(
                     O::residual_stack_broadcast(batch_item_type, output_axes),
@@ -2546,7 +2548,7 @@ where
             }
             let true_scalar = context.bind(O::residual_stack_one(boolean_scalar_type.clone()), Vec::new(), &[])?;
             check_count!("output", true_scalar, 1, ProgramError);
-            let true_item_type = stacked_scan_type(boolean_scalar_type.as_array_type()?, 1);
+            let true_item_type = boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, 1.into()).unwrap();
             let mut true_item = context.bind(
                 O::residual_stack_broadcast(true_item_type, Vec::new()),
                 Vec::new(),
