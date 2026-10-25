@@ -963,6 +963,19 @@ impl<T: Type> ScanOperation<T> {
         &self.iteration_count
     }
 
+    /// Returns `true` when iterations of this [`ScanOperation`] visit the stacked slices in reverse order.
+    #[inline]
+    pub fn reverse(&self) -> bool {
+        self.reverse
+    }
+
+    /// Returns the _lowering-only_ unrolling factor of this [`ScanOperation`] (i.e., the number of body copies emitted
+    /// per lowered loop iteration; `1` when no unrolling was requested via [`with_unroll`](Self::with_unroll)).
+    #[inline]
+    pub fn unroll(&self) -> usize {
+        self.unroll
+    }
+
     /// Returns the placements of the leading scan axes of the stacked outputs of this [`ScanOperation`], in output
     /// order and without trailing replicated entries (refer to [`Self::with_stacked_axis_shardings`]); the stacked
     /// outputs beyond the list are replicated.
@@ -971,36 +984,8 @@ impl<T: Type> ScanOperation<T> {
         &self.stacked_axis_shardings
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the placement of the leading scan axis of the stacked output at `index` (counting stacked outputs
-    /// only) of this [`ScanOperation`].
-    #[inline]
-    fn stacked_axis_sharding(&self, index: usize) -> &ShardingDimension {
-        self.stacked_axis_shardings.get(index).unwrap_or(&ShardingDimension::Replicated)
-    }
-
-    /// Returns `true` when iterations of this [`ScanOperation`] visit the stacked slices in reverse order.
-    #[inline]
-    pub fn reverse(&self) -> bool {
-        self.reverse
-    }
-
-    /// Returns the lowering-only unroll factor of this [`ScanOperation`] (the number of body copies emitted per lowered
-    /// loop iteration; `1` when no unrolling was requested via [`with_unroll`](Self::with_unroll)).
-    #[inline]
-    pub fn unroll(&self) -> usize {
-        self.unroll
-    }
-
-    /// Returns this [`ScanOperation`] with `additional_carry_count` extra carries appended after its existing carries,
-    /// preserving its iteration count, direction, and unroll factor. Reference discharge uses this to widen a scan with
-    /// discharged reference state carries.
-    fn with_added_carries(&self, additional_carry_count: usize) -> Self {
-        Self { carry_count: self.carry_count + additional_carry_count, ..self.clone() }
-    }
-
-    /// Validates the instruction and body positions used by the producer-source and execution-demand contracts.
+    /// Validates that this [`ScanOperation`] has one body whose input/output counts match the operation boundary,
+    /// accounting for the body index and optional iteration count input.
     fn validate_data_flow_boundary(&self, boundary: RegionDataFlowBoundary<'_>) -> Result<(), ProgramError> {
         let iteration_count_input_count = usize::from(self.iteration_count.variable().is_some());
         if boundary.regions.len() != 1
@@ -1011,9 +996,9 @@ impl<T: Type> ScanOperation<T> {
             })
         {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` region data flow requires an index followed by {} carries and stacked inputs, \
+                "`{}` region data flow requires an index followed by {} carries and stacked inputs, \
                  matching body outputs and instruction inputs",
-                self.carry_count,
+                SCAN_OPERATION_NAME, self.carry_count,
             )));
         }
         Ok(())
@@ -1032,8 +1017,10 @@ impl<T: Type> ScanOperation<T> {
         let carry_count = self.carry_count;
         if used_outputs.len() < carry_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` has {} outputs but carries {carry_count} values",
+                "`{}` has {} outputs but carries {} values",
+                SCAN_OPERATION_NAME,
                 used_outputs.len(),
+                carry_count,
             )));
         }
         let (used_carries, used_stacked_outputs) = used_outputs.split_at(carry_count);
@@ -1052,6 +1039,8 @@ impl<T: Type> ScanOperation<T> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: ScanType> ScanOperation<T> {
     /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e., the
@@ -1325,7 +1314,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             .iter()
             .enumerate()
             .filter(|(_, used)| **used)
-            .map(|(index, _)| self.stacked_axis_sharding(index).clone())
+            .map(|(index, _)| self.stacked_axis_shardings.get(index).cloned().unwrap_or(ShardingDimension::Replicated))
             .collect();
         Ok(Some(OperationBoundaryPruning {
             operation: Self {
@@ -1680,7 +1669,7 @@ impl<
             program = program.with_boundary(&input_order, &output_order)?;
         }
         let outputs = context.parent().bind(
-            self.with_added_carries(entering.len() + carried_inputs.len()),
+            Self { carry_count: self.carry_count + (entering.len() + carried_inputs.len()), ..self.clone() },
             vec![program],
             discharged_inputs.as_slice(),
         )?;
@@ -1755,7 +1744,7 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
                     output_index,
                     accumulator.take(),
                     iteration_count,
-                    self.stacked_axis_sharding(index),
+                    self.stacked_axis_shardings.get(index).unwrap_or(&ShardingDimension::Replicated),
                     iteration,
                     output,
                 )?);
@@ -3053,7 +3042,12 @@ fn reconstruct_partitioned_scan<
         .enumerate()
         .skip(carry_count)
         .filter(|(_, output)| matches!(output, PartialEvaluationOutput::Known(_)))
-        .map(|(index, _)| scan.stacked_axis_sharding(index - carry_count).clone())
+        .map(|(index, _)| {
+            scan.stacked_axis_shardings
+                .get(index - carry_count)
+                .cloned()
+                .unwrap_or(ShardingDimension::Replicated)
+        })
         .collect();
     let known_scan = ScanOperation {
         carry_count: known_carry_count,
@@ -3300,7 +3294,12 @@ fn reconstruct_partitioned_scan<
             .enumerate()
             .skip(carry_count)
             .filter(|(_, output)| matches!(output, PartialEvaluationOutput::Unknown(_)))
-            .map(|(index, _)| scan.stacked_axis_sharding(index - carry_count).clone())
+            .map(|(index, _)| {
+                scan.stacked_axis_shardings
+                    .get(index - carry_count)
+                    .cloned()
+                    .unwrap_or(ShardingDimension::Replicated)
+            })
             .collect();
         let unknown_scan = ScanOperation {
             carry_count: unknown_carry_count,
@@ -3549,7 +3548,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
         let stacked_output_count = output_live.len() - carry_count;
         let stacked_axis_shardings = (0..stacked_output_count)
             .chain((0..stacked_output_count).filter(|&index| output_live[carry_count + index]))
-            .map(|index| scan.stacked_axis_sharding(index).clone())
+            .map(|index| scan.stacked_axis_shardings.get(index).cloned().unwrap_or(ShardingDimension::Replicated))
             .collect();
         let operation = ScanOperation {
             carry_count: carry_count + live_carry_count,
@@ -4605,19 +4604,6 @@ mod tests {
                  `f32[3][sharding={mesh<['n'=2:manual]>, [{}]}]` on `{'m'}` (unknown mesh axis name: `m`)",
             )),
         );
-    }
-
-    #[test]
-    fn test_scan_with_added_carries() {
-        // Widening appends the requested carries and preserves every other field, including the visit order and the
-        // lowering-only unroll factor.
-        let operation = TestScanOperation::new(1, 3).with_reverse(true).with_unroll(3).unwrap();
-        let widened = operation.with_added_carries(2);
-        assert_eq!(widened.carry_count(), 3);
-        assert_eq!(widened.iteration_count(), &Dimension::Static(3));
-        assert!(widened.reverse());
-        assert_eq!(widened.unroll(), 3);
-        assert_eq!(operation.with_added_carries(0), operation);
     }
 
     #[test]
