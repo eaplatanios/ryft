@@ -873,6 +873,33 @@ impl CustomCallOperation {
         Ok((array_input_count, refinements, output_types))
     }
 
+    /// Returns the declared output types with undeclared shardings inheriting the inputs' manual variation.
+    fn infer_array_output_types(&self, input_types: &[&ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        // Opaque code cannot be assumed to produce the same result on every device, so an output whose declared type
+        // says nothing about placement inherits the manual variation of the inputs, placed replicated on their mesh.
+        // A declared sharding is the author's statement and is kept as is.
+        let Some(input_sharding) = input_types.iter().find_map(|input_type| input_type.sharding()) else {
+            return Ok(self.output_types.clone());
+        };
+        let varying_manual_axes = input_types
+            .iter()
+            .filter_map(|input_type| input_type.sharding())
+            .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
+            .collect::<BTreeSet<_>>();
+        self.output_types
+            .iter()
+            .map(|output_type| {
+                if output_type.sharding().is_some() || varying_manual_axes.is_empty() {
+                    return Ok(output_type.clone());
+                }
+                let sharding = Sharding::replicated(input_sharding.mesh().clone(), output_type.rank())
+                    .with_varying_manual_axes(varying_manual_axes.clone())
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
+            })
+            .collect()
+    }
+
     /// Batches this call through a scan over `arrays`, whose mapped axes have already been aligned to axis `0`.
     /// Replicated arrays and trailing output `extents` are invariant carries. The body restores the call's original
     /// input order, then returns those carries unchanged followed by the per-item results. `length_input` supplies
@@ -960,7 +987,23 @@ impl CustomCallOperation {
         // Stacked results carry the batch axis's placement, like every other batched value.
         let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
             .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
-        if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
+
+        // Full unrolling uses the static trip count as its factor. An empty scan still needs a positive factor.
+        if let CustomCallBatching::Sequential { unroll } = self.batching {
+            let unroll = match unroll {
+                CustomCallUnrolling::Disabled => 1,
+                CustomCallUnrolling::Factor(unroll) => unroll,
+                CustomCallUnrolling::Full => batch_dimension
+                    .value()
+                    .ok_or_else(|| BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "custom call `{}` batching `{}` requires a statically known batch extent \
+                             but the mapped axis has dynamic extent `{}`",
+                            self.target_name, self.batching, batch_dimension,
+                        ),
+                    })?
+                    .max(1),
+            };
             scan = scan.with_unroll(unroll)?;
         }
 
@@ -1054,45 +1097,6 @@ impl CustomCallOperation {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Returns the [`ScanOperation`] unroll factor that the selected sequential [`CustomCallBatching`] behavior requests
-    /// for a mapped axis of extent `batch_dimension`, or [`None`] to keep one kernel call per loop trip.
-    /// [`CustomCallUnrolling::Full`] uses the static batch extent itself, which unrolls the scan completely (refer to
-    /// [`ScanOperation::with_unroll`]), and so it rejects dynamic extents. The single-call and rejecting behaviors stage
-    /// no scan and request no unrolling.
-    fn sequential_unroll(&self, batch_dimension: &Dimension) -> Result<Option<usize>, BatchingError> {
-        match self.batching {
-            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled } => Ok(None),
-            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Factor(unroll) } => Ok(Some(unroll)),
-            CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Full } => match batch_dimension.value() {
-                Some(extent) => Ok(Some(extent.max(1))),
-                None => Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "custom call `{}` batching `{}` requires a statically known batch extent but the mapped axis \
-                         has dynamic extent `{batch_dimension}`",
-                        self.target_name, self.batching,
-                    ),
-                }),
-            },
-            CustomCallBatching::Rejected
-            | CustomCallBatching::BroadcastAll
-            | CustomCallBatching::ExpandDimensions
-            | CustomCallBatching::Vectorized => Ok(None),
-        }
-    }
-
-    /// Returns the [`BatchingError`] reported when input `index` carries the mapped `batch_axis` and this call has no
-    /// way to thread that axis through its opaque kernel.
-    fn mapped_input_error(&self, index: usize, batch_axis: BatchAxis) -> BatchingError {
-        BatchingError::UnsupportedOperation {
-            message: format!(
-                "custom call `{}` has no batching rule for input {index} mapped at batch {batch_axis}; invoke a \
-                 kernel that understands the batch axis, or select an explicit batching behavior with \
-                 `CustomCallOperation::with_batching`",
-                self.target_name,
-            ),
-        }
-    }
-
     /// Returns the forward-mode differentiation of this call in either universe. Foreign kernels have no derivable
     /// derivative, so users must call them through a [`custom_function`](crate::custom_function) with derivative rules
     /// to propagate live tangents (which is also how JAX handles `ffi_call` differentiation). When every input tangent
@@ -1122,34 +1126,6 @@ impl CustomCallOperation {
             .bind(self.clone(), Vec::new(), primals.as_slice())?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
-            .collect()
-    }
-
-    /// Returns the declared output types with undeclared shardings inheriting the inputs' manual variation.
-    /// Both universes use this rule; dynamic dimensions remain unchanged.
-    fn infer_array_output_types(&self, input_types: &[&ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        // Opaque code cannot be assumed to produce the same result on every device, so an output whose declared type
-        // says nothing about placement inherits the manual variation of the inputs, placed replicated on their mesh.
-        // A declared sharding is the author's statement and is kept as is.
-        let Some(input_sharding) = input_types.iter().find_map(|input_type| input_type.sharding()) else {
-            return Ok(self.output_types.clone());
-        };
-        let varying_manual_axes = input_types
-            .iter()
-            .filter_map(|input_type| input_type.sharding())
-            .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
-            .collect::<BTreeSet<_>>();
-        self.output_types
-            .iter()
-            .map(|output_type| {
-                if output_type.sharding().is_some() || varying_manual_axes.is_empty() {
-                    return Ok(output_type.clone());
-                }
-                let sharding = Sharding::replicated(input_sharding.mesh().clone(), output_type.rank())
-                    .with_varying_manual_axes(varying_manual_axes.clone())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
-            })
             .collect()
     }
 
@@ -1399,7 +1375,15 @@ where
         };
 
         match self.batching {
-            CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
+            CustomCallBatching::Rejected => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no batching rule for input {index} mapped at batch {}; invoke a \
+                     kernel that understands the batch axis, or select an explicit batching behavior with \
+                     `CustomCallOperation::with_batching`",
+                    self.target_name,
+                    mapped.batch_axis(),
+                ),
+            }),
             CustomCallBatching::Sequential { .. } => {
                 let aligned = inputs
                     .iter()
@@ -1643,7 +1627,15 @@ where
         };
 
         match self.batching {
-            CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
+            CustomCallBatching::Rejected => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no batching rule for input {index} mapped at batch {}; invoke a \
+                     kernel that understands the batch axis, or select an explicit batching behavior with \
+                     `CustomCallOperation::with_batching`",
+                    self.target_name,
+                    mapped.batch_axis(),
+                ),
+            }),
             CustomCallBatching::Sequential { .. } => {
                 let aligned = arrays
                     .iter()
