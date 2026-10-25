@@ -8,13 +8,14 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::programs::transforms::{Transform, TransformArtifact};
 use ryft_core::{
-    Accuracy, Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, CastOperation, CastType,
-    CompiledCallOperation, Context, DataType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, DimensionBounds, DimensionFromScalarOperation, DimensionType,
-    DimensionVariable, EagerContext, Linearization, LogicalMesh, ManualVariationAlignment, NoIdentity, Operation,
-    ParallelVary, Parameter, PartitionedProgram, Placeholder, Program, ProgramBuilder, ProgramError, Region,
-    RegionDriver, RegionInterface, RegionRef, RegionSlot, Sin, SinOperation, TangentActivity, Type, TypeError, Typed,
-    Value, ValueDirectDispatch,
+    Accuracy, Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BindingRegionDriver,
+    CastOperation, CastType, CompiledCallOperation, Context, DataType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, DimensionBounds,
+    DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext,
+    InterpretableOperation, InterpretationDriver, Linearization, LogicalMesh, ManualVariationAlignment, NoIdentity,
+    Operation, ParallelVary, Parameter, PartitionedProgram, Placeholder, Program, ProgramBuilder, ProgramError, Region,
+    RegionDriver, RegionInterface, RegionRef, RegionSlot, ScanInterpretationDomain, ScanOperation, ShardingDimension,
+    Sin, SinOperation, TangentActivity, Type, TypeError, Typed, Value, ValueDirectDispatch,
 };
 
 /// External transform arguments selecting one independently retained identity artifact.
@@ -459,4 +460,116 @@ fn test_compiled_call_operation_compiled_call_with_type_signature() {
         Err(ProgramError::Type(TypeError::Invalid { message, .. }))
             if message == "operation `external_call` output defines identity rows more than once in this region",
     ));
+}
+
+#[test]
+fn test_external_scan_interpretation_domain() {
+    type BackendValue = ArrayIrValue<Array>;
+    type BackendOperation = ArrayIrOperation<Array>;
+    type HostContext = EagerContext<BackendValue, BackendOperation>;
+
+    /// Downstream passive domain and body driver, with no `Context` implementation.
+    struct Backend<'o> {
+        /// Body supplied to the scan application.
+        body: RegionRef<'o, BackendValue, BackendOperation>,
+    }
+
+    impl Domain for Backend<'_> {
+        type Type = ArrayIrType;
+        type Value = BackendValue;
+        type Constant = BackendValue;
+        type Operation = BackendOperation;
+    }
+
+    impl ScanInterpretationDomain for Backend<'_> {
+        fn iteration_count(iteration_count: &Self::Value) -> Result<usize, ProgramError> {
+            HostContext::iteration_count(iteration_count)
+        }
+
+        fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError> {
+            HostContext::new().iteration_index(iteration)
+        }
+
+        fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError> {
+            HostContext::read_iteration(stack, iteration)
+        }
+
+        fn write_iteration(
+            &self,
+            output: usize,
+            accumulator: Option<Self::Value>,
+            length: usize,
+            placement: &ShardingDimension,
+            iteration: usize,
+            value: Self::Value,
+        ) -> Result<Self::Value, ProgramError> {
+            HostContext::new().write_iteration(output, accumulator, length, placement, iteration, value)
+        }
+
+        fn empty_stack(
+            &self,
+            output_type: &Self::Type,
+            body_input_types: &[Self::Type],
+            inputs: &[Self::Value],
+        ) -> Result<Self::Value, ProgramError> {
+            HostContext::new().empty_stack(output_type, body_input_types, inputs)
+        }
+    }
+
+    impl RegionDriver<BackendValue, BackendOperation> for Backend<'_> {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, BackendValue, BackendOperation>>
+        where
+            BackendValue: 'r,
+            BackendOperation: 'r,
+        {
+            std::iter::once(self.body)
+        }
+    }
+
+    impl<'o> InterpretationDriver<Backend<'o>> for Backend<'o> {
+        fn interpret_region(
+            &self,
+            _context: &Backend<'o>,
+            index: usize,
+            inputs: Vec<BackendValue>,
+        ) -> Result<Vec<BackendValue>, ProgramError> {
+            self.region(index)?.to_program().interpret(inputs)
+        }
+
+        fn bind<R: BindingRegionDriver<BackendValue, BackendOperation>>(
+            &self,
+            _context: &Backend<'o>,
+            operation: BackendOperation,
+            regions: R,
+            inputs: &[BackendValue],
+        ) -> Result<Vec<BackendValue>, ProgramError> {
+            HostContext::new().bind(operation, regions, inputs)
+        }
+    }
+
+    let mut builder = ProgramBuilder::<BackendValue, BackendOperation>::new();
+    let _index = builder.add_input(ArrayType::scalar(DataType::I64).into());
+    let slice = builder.add_input(ArrayType::scalar(DataType::I64).into());
+    let body = builder
+        .build::<Vec<BackendValue>, Vec<BackendValue>>(vec![slice], vec![Placeholder, Placeholder], vec![Placeholder])
+        .unwrap();
+    assert_eq!(
+        body.to_string(),
+        indoc! {"
+            lambda %0:i64[], %1:i64[] .
+            in (%1)"},
+    );
+    let backend = Backend { body: body.entry_region_ref() };
+    let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
+    let operation = ScanOperation::<ArrayIrType>::new(0, Dimension::Dynamic(length)).with_reverse(true);
+
+    // Every logical slice is restored to its own position even though visits run in reverse order.
+    let stack = BackendValue::Array(Array::vector(vec![2i64, 3, 5]).unwrap());
+    let length = BackendValue::Dimension(DimensionValue::constant(3).unwrap());
+    assert_eq!(operation.interpret(&backend, &backend, &[stack.clone(), length]), Ok(vec![stack]));
+
+    // Zero trips use the external domain's empty-stack construction instead of calling the body.
+    let empty = BackendValue::Array(Array::vector(Vec::<i64>::new()).unwrap());
+    let length = BackendValue::Dimension(DimensionValue::constant(0).unwrap());
+    assert_eq!(operation.interpret(&backend, &backend, &[empty.clone(), length]), Ok(vec![empty]));
 }

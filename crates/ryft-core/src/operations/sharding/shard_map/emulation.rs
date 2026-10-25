@@ -33,7 +33,7 @@
 //!     `while`, `condition`, and `scan` run their eager rules over values that hold the value of every device, whose
 //!     regions the emulator replays in lockstep, so that they validate, iterate, and select exactly as eager
 //!     interpretation does on every device. Their inputs must have the same type on every device (including the
-//!     runtime length of a `scan`, whose type is its extent), and the devices must agree on every `while` and
+//!     iteration count of a `scan`, whose type is its extent), and the devices must agree on every `while` and
 //!     `condition` predicate. Either way, a `scan` slice whose manual variation differs from that of its stack widens
 //!     both to the join of their variation, as eager interpretation does. `composite`, `linear_call`, and
 //!     `rematerialize` replay their primal region, and a nested `shard_map` extends the device set by its own active
@@ -882,11 +882,11 @@ type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
 // Every device applies the eager array IR iteration functions to its own values, so a slice whose manual variation
 // differs from that of its stack widens both to the join of their variation exactly as when the scan binds per device.
-// The devices agree on a dynamic trip count, because they agree on the type of the runtime length (refer to
+// The devices agree on a dynamic trip count, because they agree on the type of the iteration count (refer to
 // `lockstep_values`), which is its extent.
 impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDomain<O> {
-    fn runtime_length(runtime_length: &LockstepValue<O>) -> Result<usize, ProgramError> {
-        DeviceContext::runtime_length(&runtime_length.0[0])
+    fn iteration_count(iteration_count: &LockstepValue<O>) -> Result<usize, ProgramError> {
+        DeviceContext::iteration_count(&iteration_count.0[0])
     }
 
     fn iteration_index(&self, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
@@ -944,8 +944,8 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
 
 /// Returns the per-device `inputs` of the region operation named `operation_name` that runs in lockstep as
 /// [`LockstepValue`]s, after validating that the input of every device has the type of the input of device zero.
-/// Devices whose inputs differ in type (e.g., in the extent of the runtime length of a `scan`, which is its trip count)
-/// would take different paths through the operation, whose regions communicate across them.
+/// Devices whose inputs differ in type (e.g., in the extent of the iteration count of a `scan`, which is its trip
+/// count) would take different paths through the operation, whose regions communicate across them.
 fn lockstep_values<O>(operation_name: &str, inputs: &[DeviceValues]) -> Result<Vec<LockstepValue<O>>, ProgramError> {
     inputs
         .iter()

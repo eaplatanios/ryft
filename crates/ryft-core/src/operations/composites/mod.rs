@@ -12,8 +12,10 @@
 //!     [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html)), forward and backward
 //!     rules that govern reverse-mode differentiation ([`Composite::with_vjp`], the analogue of JAX's
 //!     [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html)), or both, as well as a
-//!     batching rule ([`Composite::with_batching`], the analogue of JAX's [`jax.custom_batching.custom_vmap`][vmap]).
-//!     [`Composite::from_custom_call`] creates a composite whose primal calls a foreign kernel.
+//!     batching rule ([`Composite::with_batching`], the analogue of JAX's [`jax.custom_batching.custom_vmap`][vmap]) or
+//!     sequential batching ([`Composite::with_sequential_batching`], the analogue of JAX's
+//!     [`jax.custom_batching.sequential_vmap`][sequential_vmap]). [`Composite::from_custom_call`] creates a composite
+//!     whose primal calls a foreign kernel.
 //!   - **Operations:** each call of a composite stages a [`CompositeOperation`], which carries the primal program
 //!     as an attached region and retains the rules as callbacks that are traced on the first request of each
 //!     specialization. Callers whose rules are already programs (e.g., kernel staging with explicit rule programs)
@@ -25,6 +27,7 @@
 //!     behind the retained rules, which trace and cache the rule programs of each specialization.
 //!
 //! [vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html
+//! [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
 //!
 //! Outside of the transforms that their rules govern, composites are transparent: interpretation and backend lowering
 //! replay the primal program. Refer to the documentation of [`composite`] for the calling convention and for how the
@@ -60,8 +63,8 @@ pub mod rules;
 pub use functions::{
     AccumulatingVjp, AxisDependentBatching, BatchedComposite, BatchingRuleConsistencyError, Composite,
     CompositeBatching, CompositeCallContext, CompositeJvp, CompositeVjp, CustomBatching, DefaultBatching, DefaultJvp,
-    DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, SymbolicZeroJvp, SymbolicZeroVjp, VjpComposite,
-    check_batching_rule_consistency, composite,
+    DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, SequentialBatching, SymbolicZeroJvp,
+    SymbolicZeroVjp, VjpComposite, check_batching_rule_consistency, composite,
 };
 pub use operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeJvpRule, CompositeOperation,

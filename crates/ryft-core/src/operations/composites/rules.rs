@@ -32,7 +32,7 @@ use std::thread::ThreadId;
 
 use lru::LruCache;
 
-use crate::arrays::ShardingDimension;
+use crate::arrays::{ArrayType, DataType, ShardingDimension};
 use crate::axes::{Axis, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
@@ -41,13 +41,15 @@ use crate::batching::{
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
-    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
+    TranspositionContext,
 };
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, CompositeTransposeOperation, describe_composite, describe_composite_transpose,
 };
+use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -112,14 +114,15 @@ where
 
 /// Retained custom Jacobian-Vector Product (JVP) rule `(p, x, ẋ) ↦ (y, ẏ)` that receives the structural zeros of its
 /// input tangents as [`MaybeZero::Zero`] leaves instead of materialized zeros, so that it can skip the work that they
-/// would otherwise require. It is otherwise identical to [`CustomJvpRule`].
+/// would otherwise require, and that returns its output tangents as [`MaybeZero`]s, so that it can declare an output
+/// tangent to be a structural zero without computing it. It is otherwise identical to [`CustomJvpRule`].
 trait CustomSymbolicZeroJvpRule<V, O>: Send + Sync {
     /// Applies this rule to the provided primal inputs and differentiated input tangents.
     fn apply(
         &self,
         primals: &[CustomRuleTracer<V, O>],
         tangents: &[MaybeZero<CustomRuleTracer<V, O>>],
-    ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
+    ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
@@ -132,7 +135,7 @@ where
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
-        ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
+        ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
         + Send
         + Sync,
 {
@@ -141,7 +144,7 @@ where
         &self,
         primals: &[CustomRuleTracer<V, O>],
         tangents: &[MaybeZero<CustomRuleTracer<V, O>>],
-    ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError> {
+    ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError> {
         self(primals, tangents)
     }
 }
@@ -215,14 +218,16 @@ where
 
 /// Retained custom Vector-Jacobian Product (VJP) backward rule `(p, r, ȳ) ↦ x̄` that receives its structural-zero
 /// output cotangent seeds as [`MaybeZero::Zero`] leaves instead of materialized zeros, so that it can skip the work
-/// that they would otherwise require. It is otherwise identical to [`CustomVjpBackwardRule`].
+/// that they would otherwise require, and that returns its input cotangents as [`MaybeZero`]s, so that it can declare
+/// an input cotangent to be a structural zero without computing it. It is otherwise identical to
+/// [`CustomVjpBackwardRule`].
 pub(super) trait CustomSymbolicZeroVjpBackwardRule<V, O>: Send + Sync {
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
         leading_inputs: &[CustomRuleTracer<V, O>],
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
-    ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
+    ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
@@ -235,7 +240,7 @@ where
     F: Fn(
             &[CustomRuleTracer<V, O>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
-        ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
+        ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
         + Send
         + Sync,
 {
@@ -244,7 +249,7 @@ where
         &self,
         leading_inputs: &[CustomRuleTracer<V, O>],
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
-    ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError> {
         self(leading_inputs, seeds)
     }
 }
@@ -436,13 +441,16 @@ pub(super) enum CustomVjpBackward<V, O> {
 }
 
 /// Transposition of a backward-rule specialization source program with respect to the provided inputs and destination
-/// kinds. [`CustomRuleDefinition::with_vjp`] captures it where the operation family's transposition bounds are known,
-/// because requiring them on the carrier's own transposition rule would form a cycle with the family's payload bounds.
+/// kinds, which returns the transposed program together with the representation of each selected input's cotangent
+/// (refer to [`TransposedProgram`](crate::TransposedProgram)), so that the cotangents that a backward rule declares to
+/// be structural zeros stay structural zeros instead of being materialized. [`CustomRuleDefinition::with_vjp`] captures
+/// it where the operation family's transposition bounds are known, because requiring them on the carrier's own
+/// transposition rule would form a cycle with the family's payload bounds.
 type CustomRuleTransposer<V, O> = dyn Fn(
         &Program<V, O, Vec<V>, Vec<V>>,
         &[usize],
         &[CotangentDestinationKind],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
     + Send
     + Sync;
 
@@ -495,6 +503,16 @@ type CustomRuleDifferentiator<V, O> = dyn Fn(
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     + Send
     + Sync;
+
+/// Construction of the scan with which a call batched sequentially loops over its batch items (refer to
+/// [`CustomRuleDefinition::with_sequential_batching`]). It receives the extent of the batch axis (i.e., the scan's trip
+/// count), the number of carries (i.e., of the call's replicated inputs), the placement of the batch axis, and the
+/// number of stacked outputs (i.e., of the call's outputs), and it returns the scan operation together with the type
+/// of the slice index that the scan body receives first. [`CustomRuleDefinition::with_sequential_batching`] captures
+/// it where the family's scan bounds are known, because requiring them on the operations' own rules would restrict
+/// every family that contains the operations to scannable types.
+type CustomRuleSequentialScan<V, O> =
+    dyn Fn(usize, usize, &ShardingDimension, usize) -> Result<(O, <V as Typed>::Type), ProgramError> + Send + Sync;
 
 /// One batching level applied to a [`CompositeOperation`](crate::CompositeOperation) or
 /// [`CompositeTransposeOperation`] after it was staged. Batching such an operation batches no derivative rule. Instead,
@@ -621,6 +639,14 @@ pub struct CustomRuleSpecializationKey<T> {
     /// calls with the same inputs but different primal outputs must never share a specialization.
     pub(super) output_types: Vec<T>,
 
+    /// Whether each output of the rule is an output of the call, or [`None`] when the call returns every output of the
+    /// rule (refer to [`CompositeOperation`](crate::CompositeOperation)'s boundary pruning). When present, it has one
+    /// entry per output of the rule, and [`Self::output_types`] lists the types of the kept outputs only, against which
+    /// the specialization is validated. A forward-mode specialization then returns only the kept outputs and their
+    /// tangents, while a reverse-mode forward specialization keeps returning every output of the rule, because the
+    /// backward rule receives a seed for each of them.
+    pub(super) kept_outputs: Option<Vec<bool>>,
+
     /// Number of leading inputs that parameterize the rule without being differentiated, excluding boundary inputs.
     pub(super) non_differentiated_count: usize,
 
@@ -643,6 +669,36 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
     fn split_outermost_level(&self) -> Option<(Self, &CustomRuleBatchingLevel<T>)> {
         let (outermost, inner) = self.levels.split_last()?;
         Some((Self { levels: inner.to_vec(), ..self.clone() }, outermost))
+    }
+
+    /// Returns the number of outputs of the rule, which exceeds the number of outputs of the call when the call keeps
+    /// only some of them (refer to [`Self::kept_outputs`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the kept outputs do not match the number of output types.
+    pub(super) fn rule_output_count(&self) -> Result<usize, ProgramError> {
+        let Some(kept_outputs) = &self.kept_outputs else {
+            return Ok(self.output_types.len());
+        };
+        let kept_output_count = kept_outputs.iter().filter(|kept| **kept).count();
+        if kept_output_count != self.output_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "custom rule specialization key keeps {kept_output_count} rule outputs but has {} output types",
+                self.output_types.len(),
+            )));
+        }
+        Ok(kept_outputs.len())
+    }
+
+    /// Returns the positions of the outputs of the call among the `rule_output_count` outputs of the rule.
+    pub(super) fn kept_output_indices(&self, rule_output_count: usize) -> Vec<usize> {
+        (0..rule_output_count).filter(|&index| self.is_output_kept(index)).collect()
+    }
+
+    /// Returns whether the output of the rule at `index` is an output of the call.
+    fn is_output_kept(&self, index: usize) -> bool {
+        self.kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index])
     }
 }
 
@@ -781,6 +837,19 @@ pub struct CustomRuleSpecialization<V: Typed + Parameter, O> {
 
     /// Batch axes of the specialized program's outputs.
     pub(super) output_axes: Vec<BatchAxis>,
+
+    /// Representation of the cotangent of each differentiated input of a backward-rule specialization, in input order,
+    /// of which only the [`TransposedProgramCotangent::Output`]s consume an output of the program, and which is empty
+    /// for every other specialization. A structural-zero cotangent (e.g., one that the backward rule declares with
+    /// [`MaybeZero::Zero`]) is [`TransposedProgramCotangent::Zero`] and contributes nothing to its destination.
+    pub(super) cotangents: Vec<TransposedProgramCotangent>,
+}
+
+impl<V: Typed + Parameter, O> CustomRuleSpecialization<V, O> {
+    /// Creates a new [`CustomRuleSpecialization`] of a rule other than a backward rule, which has no cotangents.
+    pub(super) fn new(program: Program<V, O, Vec<V>, Vec<V>>, output_axes: Vec<BatchAxis>) -> Self {
+        Self { program, output_axes, cotangents: Vec::new() }
+    }
 }
 
 /// Shared [`CustomRuleSpecialization`], as retained by the specialization caches of a [`CustomRuleDefinition`].
@@ -901,6 +970,10 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// instead of [`Self::batching_rule`] (refer to [`CustomRuleDerivation`]).
     derivation: Option<CustomRuleDerivation<V, O>>,
 
+    /// Optional construction of the scan with which calls are batched sequentially when there is no custom batching
+    /// rule (refer to [`Self::with_sequential_batching`]).
+    sequential_scan: Option<Arc<CustomRuleSequentialScan<V, O>>>,
+
     /// Optional reference discharge of traced rule programs, without which discharged calls can be differentiated
     /// only when their rule programs contain no reference state.
     discharger: Option<Arc<CustomRuleDischarger<V, O>>>,
@@ -933,6 +1006,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             differentiator: None,
             axis_dependence: None,
             derivation: None,
+            sequential_scan: None,
             discharger: None,
             uncached_in_flight: Mutex::new(HashSet::new()),
             derived_definitions: Mutex::new(HashMap::new()),
@@ -973,8 +1047,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns this [`CustomRuleDefinition`] with the provided forward-mode rule, replacing any previously configured
     /// forward-mode rule. The rule is used as the rule of [`Self::with_jvp`], except that it receives each structurally
     /// zero input tangent as a [`MaybeZero::Zero`] rather than as a materialized zero, which lets it skip the work that
-    /// the zero would otherwise require. Each pattern of structurally zero input tangents is a separate specialization
-    /// of the rule.
+    /// the zero would otherwise require, and that it returns each output tangent as a [`MaybeZero`], so that it can
+    /// declare an output tangent to be a structural zero (e.g., that of an output that does not depend on the
+    /// differentiated inputs). Each pattern of structurally zero input tangents is a separate specialization of the
+    /// rule. A structural-zero output tangent is materialized at the boundary of the specialization program, from the
+    /// primal outputs and inputs, as a zero-producing operation, which forward-mode differentiation recognizes as a
+    /// structural zero again when it replays the program.
     pub fn with_symbolic_zero_jvp<R>(mut self, rule: R) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -984,7 +1062,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Fn(
                 &[CustomRuleTracer<V, O>],
                 &[MaybeZero<CustomRuleTracer<V, O>>],
-            ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
+            )
+                -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>
             + Send
             + Sync,
     {
@@ -1029,15 +1108,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::Pure(Arc::new(backward)));
-        self.transposer = Some(Arc::new(|program, input_indices, destination_kinds| {
-            program.transpose_with_respect_to(input_indices, destination_kinds)
-        }));
+        self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
         self
     }
 
     /// Returns this [`CustomRuleDefinition`] with the provided reverse-mode forward rule `(p, x) ↦ (y, r)` and pure
     /// backward rule `(p, r, ȳ) ↦ x̄`. The rules are used as the rules of [`Self::with_vjp`], except that the backward
-    /// rule receives each structural-zero seed as a [`MaybeZero::Zero`] rather than as a materialized zero.
+    /// rule receives each structural-zero seed as a [`MaybeZero::Zero`] rather than as a materialized zero, and that
+    /// it returns each input cotangent as a [`MaybeZero`], so that it can declare an input cotangent to be a structural
+    /// zero (e.g., that of an input that it treats as a parameter). Transposition contributes nothing to the
+    /// destination of a structural-zero cotangent, so the cotangent stays a structural zero through the transposed
+    /// program (refer to [`TransposedProgramCotangent::Zero`]) unless its consumer materializes it.
     pub fn with_symbolic_zero_vjp<F, B>(mut self, forward: F, backward: B) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1053,15 +1134,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             + Fn(
                 &[CustomRuleTracer<V, O>],
                 &[MaybeZero<CustomRuleTracer<V, O>>],
-            ) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
+            ) -> Result<Vec<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>
             + Send
             + Sync,
     {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::PureWithSymbolicZeros(Arc::new(backward)));
-        self.transposer = Some(Arc::new(|program, input_indices, destination_kinds| {
-            program.transpose_with_respect_to(input_indices, destination_kinds)
-        }));
+        self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
         self
     }
 
@@ -1096,9 +1175,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::Accumulating(Arc::new(backward)));
-        self.transposer = Some(Arc::new(|program, input_indices, destination_kinds| {
-            program.transpose_with_respect_to(input_indices, destination_kinds)
-        }));
+        self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
         self
     }
 
@@ -1247,6 +1324,32 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         let mut definition = self.with_batching_rule(rule);
         definition.axis_dependence = Some(Arc::new(PolicyAxisDependence(PhantomData)));
         definition
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with sequential batching, which batches each call by looping over its
+    /// batch items with a [`ScanOperation`] whose body applies the unbatched call to one item, instead of structurally
+    /// batching its primal region (i.e., the analogue of JAX's [`sequential_vmap`][sequential_vmap]). The mapped inputs
+    /// are moved to axis 0 and become the scan's stacked inputs, the replicated inputs become invariant carries, and
+    /// every output is mapped at axis 0. Batching therefore replaces the call with the scan, rather than preserving the
+    /// call around a batched primal region, and the derivatives of the batched call are those of the scan: its body
+    /// differentiates the unbatched call with its own rules, one batch item at a time. A forward-mode rule derived from
+    /// the primal stays sequential when its derivative is batched after it is taken, because differentiating an
+    /// unbatched call stages a derived call that is itself batched sequentially (refer to
+    /// [`CustomRuleSpecializer::derived`]). A custom batching rule (refer to [`Self::with_batching_rule`]) takes
+    /// precedence over sequential batching, and the batch extent must be static.
+    ///
+    /// [sequential_vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
+    pub fn with_sequential_batching(mut self) -> Self
+    where
+        V: 'static + Value<Type: ScanType>,
+        O: 'static + Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
+    {
+        self.sequential_scan = Some(Arc::new(|length, carry_count, axis_sharding, stacked_output_count| {
+            let scan = ScanOperation::<V::Type>::new(carry_count, length)
+                .with_stacked_axis_shardings(vec![axis_sharding.clone(); stacked_output_count]);
+            Ok((O::from(scan), V::Type::from(ArrayType::scalar(DataType::I64))))
+        }));
+        self
     }
 
     /// Returns this [`CustomRuleDefinition`] with support for differentiating calls whose reference state was
@@ -1696,6 +1799,10 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// which takes precedence over structurally batching the primal region of its calls.
     fn has_batching_rule(&self) -> bool;
 
+    /// Returns whether the source batches its calls sequentially (refer to
+    /// [`CustomRuleDefinition::with_sequential_batching`]) when it has no custom batching rule.
+    fn has_sequential_batching(&self) -> bool;
+
     /// Returns the definition whose rules the source applies directly, or [`None`] when the source obtains its
     /// specializations elsewhere (e.g., from a member definition).
     fn native_definition(&self) -> Option<&CustomRuleDefinition<V, O>>;
@@ -1767,14 +1874,28 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>;
 
+    /// Returns the scan operation with which a call of this source loops over `length` batch items when it is batched
+    /// sequentially (refer to [`CustomRuleDefinition::with_sequential_batching`]), carrying `carry_count` replicated
+    /// inputs and stacking `stacked_output_count` outputs along a batch axis placed by `axis_sharding`, together with
+    /// the type of the slice index that the scan body receives first.
+    fn sequential_batching_scan(
+        &self,
+        length: usize,
+        carry_count: usize,
+        axis_sharding: &ShardingDimension,
+        stacked_output_count: usize,
+    ) -> Result<(O, V::Type), DifferentiationError>;
+
     /// Returns the rules of the definition derived from this source for `key`, with which forward-mode differentiation
     /// stages the derived call of a call whose forward-mode rule is derived from its primal and whose source has a
-    /// custom batching rule. This keeps that rule on the path of forward-mode derivatives that are batched after they
-    /// are taken (i.e., the analogue of JAX's `custom_vmap_jvp`): the derived call's primal region is the derivative
-    /// of the call's primal region (i.e., its Jacobian-Vector Product (JVP), or the tangent half of it), and the
-    /// derived definition holds no program. It derives its forward-mode rule from each call's primal region, so that
-    /// higher orders recurse through each call's own region, and its batching rule applies the JVP of the source's
-    /// batching rule. Calls whose primal regions differ therefore share one derived definition.
+    /// custom batching rule or batches its calls sequentially. This keeps that rule, or the sequential batching, on the
+    /// path of forward-mode derivatives that are batched after they are taken (i.e., the analogue of JAX's
+    /// `custom_vmap_jvp`): the derived call's primal region is the derivative of the call's primal region (i.e., its
+    /// Jacobian-Vector Product (JVP), or the tangent half of it), and the derived definition holds no program. It
+    /// derives its forward-mode rule from each call's primal region, so that higher orders recurse through each call's
+    /// own region, and its batching rule applies the JVP of the source's batching rule, while the derived definition of
+    /// a source that batches its calls sequentially batches its own calls sequentially (i.e., it loops over the
+    /// derivative one batch item at a time). Calls whose primal regions differ therefore share one derived definition.
     ///
     /// The derived batching rule always computes the derived call's primal outputs with the source rule applied at the
     /// batch axes of the primal inputs, which is exactly how batching the source call computes them, so a rule whose
@@ -1838,6 +1959,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
     #[inline]
     fn has_batching_rule(&self) -> bool {
         self.definition.batching_rule.is_some() || self.definition.derivation.is_some()
+    }
+
+    #[inline]
+    fn has_sequential_batching(&self) -> bool {
+        self.definition.sequential_scan.is_some()
     }
 
     #[inline]
@@ -1911,7 +2037,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 }
                 // The rule's two result partitions are validated separately before they are flattened, because
                 // the flattened types alone cannot tell a missing output from a misplaced tangent.
-                let output_count = key.output_types.len();
+                let output_count = key.rule_output_count()?;
                 let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (primals, active_tangents) = values.split_at(key.input_types.len());
@@ -1937,7 +2063,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                                         )
                                     })
                                     .collect::<Result<Vec<_>, _>>()?;
-                                rule.apply(primals, &tangents)?
+                                let (outputs, output_tangents) = rule.apply(primals, &tangents)?;
+                                (outputs, output_tangents.into_iter().map(MaybeZero::Value).collect::<Vec<_>>())
                             }
                             CustomRuleJvpRule::SymbolicZeros(rule) => rule.apply(primals, &tangents)?,
                         };
@@ -1951,20 +2078,50 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                             ))
                             .into());
                         }
+
+                        // A structural-zero output tangent is materialized here, at the boundary of the program, from
+                        // its own output and the primal inputs (which name every runtime extent of its type), rather
+                        // than inside the rule. The zero-producing operation that this stages lets the replay of the
+                        // program recover the structural zero (refer to `replay_custom_jvp_rule`).
+                        let output_tangents = output_tangents
+                            .into_iter()
+                            .zip(&outputs)
+                            .map(|(tangent, output)| {
+                                O::materialize_zero_from_residual_sources(
+                                    output.context(),
+                                    tangent,
+                                    std::iter::once(output).chain(primals),
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
                         outputs.extend(output_tangents);
                         Ok(outputs)
                     },
                     rule_input_types,
                     self.definition.named_axes.clone(),
                 )?;
+                // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
+                // whose computation is all that remains of the program.
+                let program = match key.kept_outputs {
+                    None => program,
+                    Some(_) => {
+                        let kept_output_indices = key.kept_output_indices(output_count);
+                        let selected = kept_output_indices
+                            .iter()
+                            .copied()
+                            .chain(kept_output_indices.iter().map(|index| output_count + index))
+                            .collect::<Vec<_>>();
+                        program.with_outputs(&selected)?
+                    }
+                };
                 let mut expected_output_types = key.output_types.clone();
                 for r#type in &key.output_types {
                     expected_output_types.push(r#type.tangent()?);
                 }
                 let program =
-                    conform_rule_output_types(self.definition.name(), "JVP", program, &expected_output_types)?;
+                    conform_rule_output_types(self.definition.name(), "JVP", program, &expected_output_types, None)?;
                 let program = self.definition.discharge_if(key.discharged, program)?;
-                return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new() }));
+                return Ok(Arc::new(CustomRuleSpecialization::new(program, Vec::new())));
             };
 
             // Each active tangent follows the batch axis of its primal, and each output tangent follows its output.
@@ -1990,6 +2147,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 &input_axes,
                 &output_axes,
                 CustomRuleBatchedOutputs::Values,
+                Vec::new(),
             )
         })
     }
@@ -2008,7 +2166,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // [`Self::jvp_specialization`], except that residuals keep the batch axes that batching naturally produces,
         // which the specialization records.
         //
-        // The traced rule is validated against the unbatched output types of `key`.
+        // The traced rule is validated against the unbatched output types of `key`. A call that keeps only some of
+        // the rule's outputs still receives every output of the rule, because the backward rule receives a seed for
+        // each of them, but only the kept outputs are validated against the call's output types.
         let Some(forward) = &self.definition.forward else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("{} has no reverse-mode forward rule", describe_composite(self.definition.name())),
@@ -2016,7 +2176,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             .into());
         };
         // The inner specialization is requested only when the outer one is not cached.
-        let output_count = key.output_types.len();
+        let output_count = key.rule_output_count()?;
         self.specialize(CustomRuleSpecializationRequest::Forward(key.clone()), || {
             let inner = match key.split_outermost_level() {
                 Some((inner_key, level)) => Some((self.forward_specialization(inner_key)?, level.clone())),
@@ -2043,7 +2203,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     key.input_types.clone(),
                     self.definition.named_axes.clone(),
                 )?;
-                let program = conform_rule_output_types(self.definition.name(), "forward", program, &key.output_types)?;
+                let kept_output_indices = key.kept_output_indices(output_count);
+                let program = conform_rule_output_types(
+                    self.definition.name(),
+                    "forward",
+                    program,
+                    &key.output_types,
+                    key.kept_outputs.as_ref().map(|_| kept_output_indices.as_slice()),
+                )?;
                 // Reference residuals preserve handles, not snapshots, so each one must forward a distinct leading
                 // non-differentiated input by identity, which the backward rule then receives as plumbing.
                 let leading_inputs = &program.input_ids()[..key.non_differentiated_count];
@@ -2072,14 +2239,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     }
                 }
                 let program = self.definition.discharge_if(key.discharged, program)?;
-                return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new() }));
+                return Ok(Arc::new(CustomRuleSpecialization::new(program, Vec::new())));
             };
+            // The outputs that the call does not keep, like the residuals, keep their natural batch axes.
             let residual_count = inner.program.output_types().len() - output_count;
-            let output_axes = level
-                .output_axes
-                .iter()
-                .copied()
-                .map(Some)
+            let mut kept_output_axes = level.output_axes.iter().copied();
+            let output_axes = (0..output_count)
+                .map(|index| key.is_output_kept(index).then(|| kept_output_axes.next()).flatten())
                 .chain(std::iter::repeat_n(None, residual_count))
                 .collect::<Vec<_>>();
             self.definition.batched_specialization(
@@ -2088,6 +2254,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 &level.input_axes,
                 &output_axes,
                 CustomRuleBatchedOutputs::Values,
+                Vec::new(),
             )
         })
     }
@@ -2148,14 +2315,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     vec![Placeholder; live_output_count],
                 )?;
                 let linear_inputs = (leading_input_count..input_count).collect::<Vec<_>>();
-                let program = transposer(&source, &linear_inputs, &key.destination_kinds)?;
+                let (program, cotangents) = transposer(&source, &linear_inputs, &key.destination_kinds)?;
                 let program = self.definition.discharge_if(key.discharged, program)?;
-                return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new() }));
+                return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new(), cotangents }));
             };
 
             // The inner program consumes its inner boundary inputs, then the live seeds, then the caller buffers, then
             // the remaining leading inputs. Each seed follows its output, each caller buffer follows its input, and
-            // each leading input keeps its recorded axis. Each returned cotangent is aligned to its input.
+            // each leading input keeps its recorded axis. Each returned cotangent is aligned to its input, while
+            // structural-zero cotangents have no output and stay structural zeros at every level.
             let inner_boundary_input_count = boundary_input_count(&key.levels[..key.levels.len() - 1]);
             let (leading_axes, tangent_axes) =
                 level.input_axes.split_at(inner_boundary_input_count + leading_input_count);
@@ -2176,8 +2344,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             input_axes.extend_from_slice(&leading_axes[inner_boundary_input_count..]);
             let output_axes = tangent_axes
                 .iter()
-                .zip(&key.destination_kinds)
-                .filter_map(|(axis, kind)| (*kind == CotangentDestinationKind::Return).then_some(Some(*axis)))
+                .zip(&inner.cotangents)
+                .filter_map(|(axis, cotangent)| {
+                    (*cotangent == TransposedProgramCotangent::Output).then_some(Some(*axis))
+                })
                 .collect::<Vec<_>>();
             self.definition.batched_specialization(
                 &level,
@@ -2185,6 +2355,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 &input_axes,
                 &output_axes,
                 CustomRuleBatchedOutputs::Cotangents,
+                inner.cotangents.clone(),
             )
         })
     }
@@ -2209,10 +2380,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 .into());
             };
             return self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
-                let CustomRuleSpecialization { program, output_axes } =
+                let CustomRuleSpecialization { program, output_axes, .. } =
                     derivation.batching_rule_specialization(self.definition.name(), &key)?;
                 let program = self.definition.discharge_if(key.discharged, program)?;
-                Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
+                Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
             });
         };
         self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
@@ -2239,17 +2410,38 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 self.definition.named_axes.clone(),
             )?;
             let program = self.definition.discharge_if(key.discharged, program)?;
-            Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
+            Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
         })
+    }
+
+    fn sequential_batching_scan(
+        &self,
+        length: usize,
+        carry_count: usize,
+        axis_sharding: &ShardingDimension,
+        stacked_output_count: usize,
+    ) -> Result<(O, V::Type), DifferentiationError> {
+        let Some(sequential_scan) = &self.definition.sequential_scan else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} does not batch its calls sequentially",
+                    describe_composite(self.definition.name())
+                ),
+            }
+            .into());
+        };
+        Ok(sequential_scan(length, carry_count, axis_sharding, stacked_output_count)?)
     }
 
     fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError> {
         // A derived definition copies the capabilities that its calls need from the source definition and holds no
-        // program, so calls whose primal regions differ share it (refer to `CustomRuleSpecializer::derived`).
-        if !self.has_batching_rule() {
+        // program, so calls whose primal regions differ share it (refer to `CustomRuleSpecializer::derived`). A source
+        // that batches its calls sequentially, without a custom batching rule, derives a definition that batches its
+        // calls sequentially as well, which needs no derivation.
+        if !self.has_batching_rule() && !self.has_sequential_batching() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{} has no custom batching rule from which to derive rules",
+                    "{} has neither a custom batching rule nor sequential batching from which to derive rules",
                     describe_composite(self.definition.name()),
                 ),
             }
@@ -2260,6 +2452,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 CustomRuleDerivationKind::Jvp => "jvp",
                 CustomRuleDerivationKind::Pushforward => "pushforward",
             };
+            let derivation = self.has_batching_rule().then(|| CustomRuleDerivation { source: self.clone(), key });
             CustomRuleDefinition {
                 name: Cow::Owned(format!("{prefix}({})", self.definition.name())),
                 named_axes: self.definition.named_axes.clone(),
@@ -2267,7 +2460,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 batcher: self.definition.batcher.clone(),
                 differentiator: self.definition.differentiator.clone(),
                 axis_dependence: self.definition.axis_dependence.clone(),
-                derivation: Some(CustomRuleDerivation { source: self.clone(), key }),
+                derivation,
+                sequential_scan: self.definition.sequential_scan.clone(),
                 discharger: self.definition.discharger.clone(),
                 ..CustomRuleDefinition::new("")
             }
@@ -2331,6 +2525,9 @@ pub struct UnavailableCustomRules {
 
     /// Whether the original definition has a custom batching rule.
     has_batching_rule: bool,
+
+    /// Whether the original definition batches its calls sequentially.
+    has_sequential_batching: bool,
 }
 
 impl UnavailableCustomRules {
@@ -2344,6 +2541,7 @@ impl UnavailableCustomRules {
             has_vjp: rules.has_vjp(),
             batched_output_axes: rules.batched_output_axes().map(<[BatchAxis]>::to_vec),
             has_batching_rule: rules.has_batching_rule(),
+            has_sequential_batching: rules.has_sequential_batching(),
         }
     }
 
@@ -2556,6 +2754,13 @@ where
         }
     }
 
+    fn has_sequential_batching(&self) -> bool {
+        match self {
+            Self::Member(rules) => rules.has_sequential_batching(),
+            Self::Unavailable(rules) => rules.has_sequential_batching,
+        }
+    }
+
     #[inline]
     fn native_definition(&self) -> Option<&CustomRuleDefinition<Vc, Oc>> {
         None
@@ -2591,6 +2796,7 @@ where
         let member_key = CustomRuleSpecializationKey {
             input_types: self.project_types(&key.input_types)?,
             output_types: self.project_types(&key.output_types)?,
+            kept_outputs: key.kept_outputs.clone(),
             non_differentiated_count: key.non_differentiated_count,
             tangent_activity: key.tangent_activity.clone(),
             levels: self.project_levels(&key.levels)?,
@@ -2601,6 +2807,7 @@ where
             Ok(Arc::new(CustomRuleSpecialization {
                 program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
                 output_axes: specialization.output_axes.clone(),
+                cotangents: specialization.cotangents.clone(),
             }))
         })
     }
@@ -2617,6 +2824,7 @@ where
         let member_key = CustomRuleSpecializationKey {
             input_types: self.project_types(&key.input_types)?,
             output_types: self.project_types(&key.output_types)?,
+            kept_outputs: key.kept_outputs.clone(),
             non_differentiated_count: key.non_differentiated_count,
             tangent_activity: key.tangent_activity.clone(),
             levels: self.project_levels(&key.levels)?,
@@ -2627,6 +2835,7 @@ where
             Ok(Arc::new(CustomRuleSpecialization {
                 program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
                 output_axes: specialization.output_axes.clone(),
+                cotangents: specialization.cotangents.clone(),
             }))
         })
     }
@@ -2675,6 +2884,7 @@ where
             Ok(Arc::new(CustomRuleSpecialization {
                 program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
                 output_axes: specialization.output_axes.clone(),
+                cotangents: specialization.cotangents.clone(),
             }))
         })
     }
@@ -2721,8 +2931,23 @@ where
             Ok(Arc::new(CustomRuleSpecialization {
                 program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
                 output_axes: specialization.output_axes.clone(),
+                cotangents: specialization.cotangents.clone(),
             }))
         })
+    }
+
+    fn sequential_batching_scan(
+        &self,
+        length: usize,
+        carry_count: usize,
+        axis_sharding: &ShardingDimension,
+        stacked_output_count: usize,
+    ) -> Result<(Oc, Vc::Type), DifferentiationError> {
+        // The member definition constructs the scan in its own family, which contains the scan operation and the type
+        // of its slice index of this family.
+        let (scan, index_type) =
+            self.member()?.sequential_batching_scan(length, carry_count, axis_sharding, stacked_output_count)?;
+        Ok((Oc::from(scan), Vc::Type::from(index_type)))
     }
 
     fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError> {
@@ -2846,7 +3071,7 @@ where
                 program_types,
                 self.source.definition.named_axes.clone(),
             )?;
-            return Ok(CustomRuleSpecialization { program, output_axes });
+            return Ok(CustomRuleSpecialization::new(program, output_axes));
         }
 
         // Rule mode: align each primal and tangent pair with a mapped side to one axis, preferring the primal's axis.
@@ -2940,7 +3165,7 @@ where
             program_types,
             self.source.definition.named_axes.clone(),
         )?;
-        Ok(CustomRuleSpecialization { program, output_axes })
+        Ok(CustomRuleSpecialization::new(program, output_axes))
     }
 
     /// Returns the batched program of a derived call for `key` when its source batching rule depends on its input batch
@@ -3195,7 +3420,7 @@ where
             key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
             self.source.definition.named_axes.clone(),
         )?;
-        Ok(CustomRuleSpecialization { program, output_axes: all_output_axes })
+        Ok(CustomRuleSpecialization::new(program, all_output_axes))
     }
 
     /// Returns the Jacobian-Vector Product (JVP) program of the source rule's batched `program` with respect to
@@ -3308,7 +3533,8 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Batches `program` at the provided level with the retained batcher, rejecting the request when this definition
-    /// has no batching support.
+    /// has no batching support. The batched specialization has the provided `cotangents`, which are those of the
+    /// specialization that `program` belongs to (i.e., empty unless it is a backward-rule specialization).
     fn batched_specialization(
         &self,
         level: &CustomRuleBatchingLevel<V::Type>,
@@ -3316,6 +3542,7 @@ where
         input_axes: &[BatchAxis],
         output_axes: &[Option<BatchAxis>],
         outputs: CustomRuleBatchedOutputs,
+        cotangents: Vec<TransposedProgramCotangent>,
     ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
         let Some(batcher) = &self.batcher else {
             return Err(ProgramError::UnsupportedOperation {
@@ -3329,8 +3556,28 @@ where
         };
         let (program, output_axes) =
             batcher(&level.level, program, input_axes, output_axes, outputs).map_err(ProgramError::from)?;
-        Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
+        Ok(Arc::new(CustomRuleSpecialization { program, output_axes, cotangents }))
     }
+}
+
+/// Transposes the source program of an unbatched backward-rule specialization with respect to the inputs at
+/// `input_indices`, whose cotangents have the provided destination kinds, and returns the transposed program together
+/// with the representation of each selected input's cotangent. Structural-zero cotangents (e.g., those that a backward
+/// rule declares with [`MaybeZero::Zero`]) are not materialized, so they consume no output of the transposed program
+/// and reach the carrier as [`TransposedProgramCotangent::Zero`]s, which contribute nothing to their destinations.
+fn transpose_backward_source_program<V, O>(
+    program: &Program<V, O, Vec<V>, Vec<V>>,
+    input_indices: &[usize],
+    destination_kinds: &[CotangentDestinationKind],
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<TransposedProgramCotangent>), DifferentiationError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    V: Value<Type: DifferentiableType + ReferenceMemberType>,
+    O: CustomVjpOperation<V>,
+{
+    let transposed = program.entry_region_ref().transpose(input_indices, &[], destination_kinds)?;
+    let cotangents = transposed.cotangents().to_vec();
+    Ok((Arc::unwrap_or_clone(transposed.into_program()), cotangents))
 }
 
 /// Returns the number of boundary inputs that the provided batching levels together prepended to an operation's inputs.
@@ -3353,7 +3600,8 @@ pub(super) fn validate_rule_output_types<T: Type>(
 }
 
 /// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the
-/// `expected` types as its leading outputs, and returns it with its type identities renamed onto those of `expected`.
+/// `expected` types as its leading outputs (or as its outputs at the `selected` positions, when provided), and returns
+/// it with its type identities renamed onto those of `expected`.
 /// The trace establishes fresh identities for the extents that the rule computes (e.g., a recomputed `n · n` extent of
 /// the primal outputs), so its outputs can agree with `expected` only up to a renaming of those identities. The
 /// renaming is derived across the complete boundary, so that the identities of the program inputs map to themselves,
@@ -3364,13 +3612,19 @@ fn conform_rule_output_types<V: Value, O: Operation<Type = V::Type>>(
     rule: &str,
     program: Program<V, O, Vec<V>, Vec<V>>,
     expected: &[V::Type],
+    selected: Option<&[usize]>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     let input_types = program.input_types();
     let output_types = program.output_types();
-    let actual = output_types.get(..expected.len()).unwrap_or(&output_types);
+    let selected_types = selected
+        .map(|selected| selected.iter().filter_map(|&index| output_types.get(index).cloned()).collect::<Vec<_>>());
+    let actual = match &selected_types {
+        Some(selected_types) => selected_types.as_slice(),
+        None => output_types.get(..expected.len()).unwrap_or(&output_types),
+    };
     let boundary = |outputs: &[V::Type]| input_types.iter().chain(outputs).cloned().collect::<Vec<_>>();
     let Some(renaming) = derive_bijective_identity_renaming(&boundary(actual), &boundary(expected)) else {
         // Signatures that render equally differ only in their identities (e.g., when the rule computes two extents
@@ -3463,6 +3717,7 @@ mod tests {
         let key = |input_type: ArrayIrType, levels| CustomRuleSpecializationKey {
             input_types: vec![input_type.clone()],
             output_types: vec![input_type],
+            kept_outputs: None,
             non_differentiated_count: 0,
             tangent_activity: vec![true],
             levels,
@@ -3558,6 +3813,7 @@ mod tests {
         let key = CustomRuleSpecializationKey {
             input_types: vec![scalar_type.clone()],
             output_types: vec![scalar_type],
+            kept_outputs: None,
             non_differentiated_count: 0,
             tangent_activity: vec![true],
             levels: Vec::new(),
@@ -3612,6 +3868,7 @@ mod tests {
         let key = CustomRuleSpecializationKey {
             input_types: vec![item_type.clone()],
             output_types: vec![item_type],
+            kept_outputs: None,
             non_differentiated_count: 0,
             tangent_activity: vec![true],
             levels: vec![level],
@@ -3779,6 +4036,7 @@ mod tests {
                 let key = CustomRuleSpecializationKey {
                     input_types: vec![r#type.clone()],
                     output_types: vec![r#type],
+                    kept_outputs: None,
                     non_differentiated_count: 0,
                     tangent_activity: vec![true],
                     levels: Vec::new(),
@@ -3822,6 +4080,7 @@ mod tests {
             let key = CustomRuleSpecializationKey {
                 input_types: vec![r#type.clone()],
                 output_types: vec![r#type],
+                kept_outputs: None,
                 non_differentiated_count: 0,
                 tangent_activity: vec![true],
                 levels: Vec::new(),
@@ -3860,6 +4119,7 @@ mod tests {
         let key = CustomRuleSpecializationKey {
             input_types: vec![scalar_type.clone()],
             output_types: vec![scalar_type],
+            kept_outputs: None,
             non_differentiated_count: 0,
             tangent_activity: vec![true],
             levels: vec![CustomRuleBatchingLevel {
@@ -4005,7 +4265,7 @@ mod tests {
                 .derived(key(CustomRuleDerivationKind::Jvp))
                 .unwrap_err()
                 .to_string(),
-            "`composite` `sine` has no custom batching rule from which to derive rules",
+            "`composite` `sine` has neither a custom batching rule nor sequential batching from which to derive rules",
         );
     }
 

@@ -13,11 +13,10 @@ use crate::operations::attention::{
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::composites::functions::{
-    CompositeCallContext, CompositeVjp, ExplicitVjp, VjpComposite, composite,
+    Composite, CompositeCallContext, CompositeVjp, DefaultJvp, SymbolicZeroVjp, composite,
 };
-use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::parameters::Parameter;
-use crate::programs::{OperationProvider, ProgramError, Typed, Value};
+use crate::parameters::{Parameter, Parameterized};
+use crate::programs::{MaybeZero, ProgramError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext};
 
 /// Residuals retained by the attention reverse rule.
@@ -78,22 +77,37 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-/// Stages the attention backward boundary over one canonical input structure.
+/// Returns the structural-zero cotangent of `value`.
+fn zero_cotangent<D: Domain<Type = ArrayType>>(
+    value: &DomainTracer<D>,
+) -> Result<MaybeZero<DomainTracer<D>>, ProgramError>
+where
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+{
+    Ok(MaybeZero::Zero(value.r#type().cotangent()?))
+}
+
+/// Stages the attention backward boundary over one canonical input structure. The kernel returns the cotangents of the
+/// query, key, and value, and of a bias whose cotangent space is not zero-dimensional, so the cotangents of the other
+/// inputs (i.e., of the masks and sequence lengths, and of a bias with a zero-dimensional cotangent space) are
+/// structural zeros, which contribute nothing to their inputs' cotangents.
 fn bind_attention_backward<D: Domain<Type = ArrayType>>(
     inputs: AttentionInputs<DomainTracer<D>>,
     output: DomainTracer<D>,
     statistic: DomainTracer<D>,
     output_cotangent: DomainTracer<D>,
     configuration: AttentionConfiguration,
-) -> Result<AttentionInputs<DomainTracer<D>>, ProgramError>
+) -> Result<AttentionInputs<MaybeZero<DomainTracer<D>>>, ProgramError>
 where
-    D::Operation: From<DotProductAttentionBackwardOperation>
-        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
+    D::Operation: From<DotProductAttentionBackwardOperation>,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     let signature = inputs.signature();
     let context = inputs.query.domain();
     let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
+    let mask = inputs.mask.as_ref().map(zero_cotangent::<D>).transpose()?;
+    let query_sequence_lengths = inputs.query_sequence_lengths.as_ref().map(zero_cotangent::<D>).transpose()?;
+    let key_value_sequence_lengths = inputs.key_value_sequence_lengths.as_ref().map(zero_cotangent::<D>).transpose()?;
     let mut backward_inputs = inputs.into_values();
     backward_inputs.extend([output, statistic, output_cotangent]);
     let mut outputs = context.bind(
@@ -105,17 +119,17 @@ where
     check_count!("output", outputs, 3 + usize::from(has_live_bias_cotangent), ProgramError);
     let bias = match bias_cotangent_type {
         None => None,
-        Some(_) if has_live_bias_cotangent => Some(outputs.remove(3)),
-        Some(r#type) => Some(context.zero(&r#type)?),
+        Some(_) if has_live_bias_cotangent => Some(MaybeZero::Value(outputs.remove(3))),
+        Some(r#type) => Some(MaybeZero::Zero(r#type)),
     };
     Ok(AttentionInputs {
-        query: outputs.remove(0),
-        key: outputs.remove(0),
-        value: outputs.remove(0),
+        query: MaybeZero::Value(outputs.remove(0)),
+        key: MaybeZero::Value(outputs.remove(0)),
+        value: MaybeZero::Value(outputs.remove(0)),
         bias,
-        mask: None,
-        query_sequence_lengths: None,
-        key_value_sequence_lengths: None,
+        mask,
+        query_sequence_lengths,
+        key_value_sequence_lengths,
     })
 }
 
@@ -129,7 +143,17 @@ where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     /// Composite that stages the attention training call.
-    function: VjpComposite<AttentionInputs<DomainTracer<D>>, DomainTracer<D>, AttentionResiduals<DomainTracer<D>>>,
+    function: Composite<
+        AttentionInputs<DomainTracer<D>>,
+        DomainTracer<D>,
+        DefaultJvp,
+        SymbolicZeroVjp<
+            DomainTracer<D>,
+            AttentionInputs<DomainTracer<D>>,
+            DomainTracer<D>,
+            AttentionResiduals<DomainTracer<D>>,
+        >,
+    >,
 }
 
 impl<D: Domain<Type = ArrayType>> DifferentiableDotProductAttention<D>
@@ -143,8 +167,12 @@ where
     where
         C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
-        ExplicitVjp<AttentionInputs<DomainTracer<D>>, DomainTracer<D>, AttentionResiduals<DomainTracer<D>>>:
-            CompositeVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
+        SymbolicZeroVjp<
+            DomainTracer<D>,
+            AttentionInputs<DomainTracer<D>>,
+            DomainTracer<D>,
+            AttentionResiduals<DomainTracer<D>>,
+        >: CompositeVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
     {
         let signature = inputs.signature();
         let inputs = inputs.into_values();
@@ -163,10 +191,12 @@ where
 /// guarantees do not apply to those kernels. Dropout requires an explicit fused configuration. Inference through
 /// [`DotProductAttention`] retains automatic fusion.
 ///
-/// Optional Boolean masks and integer sequence lengths remain ordinary structural leaves of `inputs`; their cotangents
-/// are produced by Ryft's existing zero-space machinery, while a present floating-point bias receives the cotangent
-/// returned by the backward program. This one structured entry point replaces separate query/key/value, bias, and
-/// sequence-length tuple families.
+/// Optional Boolean masks and integer sequence lengths remain ordinary structural leaves of `inputs`; the backward rule
+/// returns structural zeros for their cotangents (refer to [`Composite::with_symbolic_zero_vjp`]), which Ryft's
+/// existing zero-space machinery materializes only where a consumer needs a value, while a present floating-point bias
+/// receives the cotangent returned by the backward program. A structurally zero output cotangent (e.g., when the output
+/// is unused) skips the backward kernel altogether. This one structured entry point replaces separate query/key/value,
+/// bias, and sequence-length tuple families.
 ///
 /// The returned function retains its rules (refer to [`DifferentiableDotProductAttention`]), so it should be created
 /// once and called many times, which shares the traced rule specializations across its calls. To embed the resulting
@@ -183,9 +213,7 @@ pub fn differentiable_dot_product_attention<D>(
 where
     D: Domain<Type = ArrayType>,
     D::Constant: 'static,
-    D::Operation: 'static
-        + From<DotProductAttentionBackwardOperation>
-        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
+    D::Operation: 'static + From<DotProductAttentionBackwardOperation>,
     DomainTracer<D>: DotProductAttention,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
@@ -204,25 +232,23 @@ where
         Ok((output.clone(), AttentionResiduals { inputs, output, statistic }))
     };
     let backward = move |residuals: AttentionResiduals<DomainTracer<D>>,
-                         output_cotangent: DomainTracer<D>|
+                         output_cotangent: MaybeZero<DomainTracer<D>>|
           -> Result<_, ProgramError> {
-        let structural_inputs = residuals.inputs.clone();
-        let mut cotangents = bind_attention_backward::<D>(
-            residuals.inputs,
-            residuals.output,
-            residuals.statistic,
-            output_cotangent,
-            configuration.with_residual(true),
-        )?;
-        let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent()?);
-        cotangents.mask = structural_inputs.mask.as_ref().map(zero).transpose()?;
-        cotangents.query_sequence_lengths = structural_inputs.query_sequence_lengths.as_ref().map(zero).transpose()?;
-        cotangents.key_value_sequence_lengths =
-            structural_inputs.key_value_sequence_lengths.as_ref().map(zero).transpose()?;
-        Ok(cotangents)
+        match output_cotangent {
+            MaybeZero::Value(output_cotangent) => bind_attention_backward::<D>(
+                residuals.inputs,
+                residuals.output,
+                residuals.statistic,
+                output_cotangent,
+                configuration.with_residual(true),
+            ),
+            MaybeZero::Zero(_) => residuals.inputs.try_map_parameters(|input| zero_cotangent::<D>(&input)),
+        }
     };
     DifferentiableDotProductAttention {
-        function: composite(primal).with_vjp(forward, backward).with_name(DOT_PRODUCT_ATTENTION_OPERATION_NAME),
+        function: composite(primal)
+            .with_symbolic_zero_vjp(forward, backward)
+            .with_name(DOT_PRODUCT_ATTENTION_OPERATION_NAME),
     }
 }
 

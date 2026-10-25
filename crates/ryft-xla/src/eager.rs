@@ -952,6 +952,38 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_masked_softmax_cross_entropy_differentiation_probability_targets() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let logits = f32_vector(&domain, &mesh, &[1.0, f32::NAN, 3.0]);
+        let targets = f32_vector(&domain, &mesh, &[0.2, 0.5, 0.3]);
+        let mask = boolean_vector(&domain, &mesh, &[true, false, true]);
+        let (loss, gradient) = differentiate_at(targets.clone())
+            .with_captures((logits.clone(), mask))
+            .value_and_gradient(|targets, (logits, mask)| logits.masked_softmax_cross_entropy(&targets, &mask, 0))
+            .unwrap();
+        let correction = (-2.0f64).exp().ln_1p();
+        let expected_loss = (0.2 * (2.0 + correction) + 0.3 * correction) as f32;
+        assert_eq!(loss.r#type().as_ref(), &replicated_type(&mesh, DataType::F32, &[]));
+        assert!((read_f32s(&loss)[0] - expected_loss).abs() < 1e-6);
+        assert_eq!(gradient.r#type().as_ref(), &replicated_type(&mesh, DataType::F32, &[3]));
+        let gradient = read_f32s(&gradient);
+        assert!((gradient[0] - (2.0 + correction) as f32).abs() < 1e-6);
+        assert_eq!(gradient[1], 0.0);
+        assert!((gradient[2] - correction as f32).abs() < 1e-6);
+
+        // An empty mask makes the loss independent of every probability target, including beside NaN logits.
+        let mask = boolean_vector(&domain, &mesh, &[false, false, false]);
+        let (loss, gradient) = differentiate_at(targets)
+            .with_captures((logits, mask))
+            .value_and_gradient(|targets, (logits, mask)| logits.masked_softmax_cross_entropy(&targets, &mask, 0))
+            .unwrap();
+        assert_eq!(read_f32s(&loss), vec![0.0]);
+        assert_eq!(read_f32s(&gradient), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn test_eager_softmax_cross_entropy_with_integer_labels() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();

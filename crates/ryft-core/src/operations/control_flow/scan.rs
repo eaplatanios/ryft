@@ -10,7 +10,7 @@
 //! projections, including that every stacked leading axis has the trip count as its extent. Conflicting static extents
 //! are type errors, while the scan boundary checks at runtime the relationships between its inputs that their types
 //! leave unproven (e.g., two carries that the body declares as `f32[n]` but that are supplied as `f32[n]` and `f32[3]`,
-//! or an `f32[3]` stack next to a runtime length of type `dimension<length>`). A rule that removes or splits the
+//! or an `f32[3]` stack next to an iteration count of type `dimension<length>`). A rule that removes or splits the
 //! boundary first stages an entry guard that performs the same checks. Every transformation rule validates this
 //! complete contract before it executes, rewrites, or stages the body (reference discharge over the allocations that it
 //! threads), so whether an application is accepted depends neither on the transformation nor on the trip count. The
@@ -25,7 +25,7 @@
 //!     indexes itself, and a zero-trip scan over empty state is replaced by an entry guard over its boundary.
 //!   - **Boundary Pruning:** The kept carries are the fixed point of the carries that the used outputs need, while
 //!     stacked inputs and outputs are pruned independently, except that a dead stack whose leading extent the input
-//!     types do not prove equal to the runtime length is kept, so that the boundary still checks it.
+//!     types do not prove equal to the iteration count is kept, so that the boundary still checks it.
 //!   - **Partial Evaluation:** A fixed point over carry knownness splits the scan into a known scan, which stacks the
 //!     per-iteration residuals that the unknown side consumes, and a residual scan, while loop-invariant residuals are
 //!     computed once before the loop.
@@ -97,9 +97,9 @@ use crate::tracing::{Tracer, TracingContext};
 ///
 /// These rules are independent of the execution domain, so inference, transforms, and lowering can validate scans
 /// without requiring any runtime value representation or iteration capabilities. The shared [`ArrayMemberType`] and
-/// [`ReferenceMemberType`] projections distinguish arrays from references to arrays. Runtime length types are inspected
-/// through their canonical [`ArrayIrType`] representation, so homogeneous arra families need no first-class dimension
-/// projection. Conversion into that representation must preserve the member kind and metadata exposed by the
+/// [`ReferenceMemberType`] projections distinguish arrays from references to arrays. Iteration count types are
+/// inspected through their canonical [`ArrayIrType`] representation, so homogeneous array families need no first-class
+/// dimension projection. Conversion into that representation must preserve the member kind and metadata exposed by the
 /// projections. The scan contract is stated once over those views, and each family only restricts it: [`ArrayType`]
 /// stacks per-iteration arrays along a static leading axis and requires a static length and fully static bodies, while
 /// [`ArrayIrType`] additionally permits references and first-class dimensions in carry positions and a dynamic length
@@ -112,7 +112,7 @@ use crate::tracing::{Tracer, TracingContext};
 /// [`DimensionVariable`]s as its type identities. A dynamic length and every stacked leading axis must have equal
 /// extents: static extents must agree, and the scan boundary checks at runtime the relationships that the input types
 /// leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type that carries
-/// no identity that such a check could relate to the runtime length, so its leading extent must be provably equal to
+/// no identity that such a check could relate to the iteration count, so its leading extent must be provably equal to
 /// the trip count.
 pub trait ScanType:
     Type<Identity = DimensionVariable>
@@ -121,13 +121,13 @@ pub trait ScanType:
     + From<ArrayType>
     + Into<ArrayIrType>
 {
-    /// Returns the type of the trailing runtime length input of a scan whose trip count is the dynamic `length`
-    /// (i.e., the first-class `dimension<length>`).
+    /// Returns the type of the trailing first-class dimension input that supplies the iteration count for a dynamic
+    /// `length` (i.e., `dimension<length>`).
     ///
     /// # Errors
     ///
     /// Returns an error when this family admits no dynamic scan length.
-    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError>;
+    fn iteration_count_type(length: &Dimension) -> Result<Self, TypeError>;
 
     /// Validates the restrictions that this family places on the members of a declared iteration body beyond the shared
     /// index and carry contract (e.g., homogeneous array bodies must be fully static).
@@ -169,7 +169,7 @@ pub trait ScanType:
         }
 
         if length.variable().is_some() {
-            Self::runtime_length_type(length)?;
+            Self::iteration_count_type(length)?;
         }
 
         if body_input_types.first() != Some(&Self::from(ArrayType::scalar(DataType::I64))) {
@@ -191,7 +191,7 @@ pub trait ScanType:
     }
 
     /// Validates the operation inputs against the declared iteration inputs, including the type and identity of a
-    /// trailing runtime length. This checks ordinary type refinement independently of how the runtime length relates
+    /// trailing iteration count. This checks ordinary type refinement independently of how the iteration count relates
     /// to the stacked axes, which [`Self::infer_scan_output_types`] additionally validates. Callers must first validate
     /// the body signature. Reference inputs refine their declared referents; their allocation identity is validated
     /// separately from these type relationships.
@@ -201,11 +201,11 @@ pub trait ScanType:
     ///   - `body_input_types`: Validated body inputs, including the intrinsic index.
     ///   - `carry_count`: Number of leading carried inputs.
     ///   - `length`: Declared trip count.
-    ///   - `input_types`: Actual operation input types, including a trailing runtime length for dynamic scans.
+    ///   - `input_types`: Actual operation input types, including a trailing iteration count for dynamic scans.
     ///
     /// # Errors
     ///
-    /// Returns an error for mismatched input counts, ordinary types, or runtime length types.
+    /// Returns an error for mismatched input counts, ordinary types, or iteration count types.
     fn validate_scan_input_type_signature(
         body_input_types: &[Self],
         carry_count: usize,
@@ -250,7 +250,7 @@ pub trait ScanType:
                 validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?;
             }
         }
-        validate_scan_runtime_length_type(length, input_types)?;
+        validate_scan_iteration_count_type(length, input_types)?;
         Ok(())
     }
 
@@ -259,7 +259,7 @@ pub trait ScanType:
     ///
     /// # Parameters
     ///
-    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the runtime length input
+    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the iteration count input
     ///     when `length` is dynamic.
     ///   - `body_input_count`: Number of inputs of the attached body, including its intrinsic index input.
     ///   - `carry_count`: Number of loop-carried state leaves.
@@ -327,7 +327,7 @@ pub trait ScanType:
             body_input_types.push(body_input_type);
         }
 
-        validate_scan_runtime_length(length, input_types, carry_count)?;
+        validate_scan_iteration_count(length, input_types, carry_count)?;
         Ok(body_input_types)
     }
 
@@ -354,7 +354,7 @@ pub trait ScanType:
     ///   - `length`: Declared scan length.
     ///   - `stacked_axis_shardings`: Placements of the leading scan axes of the stacked outputs (refer to
     ///     [`ScanOperation::with_stacked_axis_shardings`]).
-    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the runtime length input when
+    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the iteration count input when
     ///     `length` is dynamic.
     fn infer_scan_output_types(
         body_input_types: &[Self],
@@ -368,10 +368,10 @@ pub trait ScanType:
         Self::validate_scan_input_type_signature(body_input_types, carry_count, length, input_types)?;
         let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, length)?;
 
-        // A runtime length input that only refines the declared bounds fixes the trip count to one exact extent, so the
-        // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
-        // them symbolic would type a concretely sized result as an independent runtime extent.
-        let effective_length = match validate_scan_runtime_length(length, input_types, carry_count)? {
+        // An iteration count input that only refines the declared bounds fixes the trip count to one exact extent, so
+        // the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length.
+        // Leaving them symbolic would type a concretely sized result as an independent runtime extent.
+        let effective_length = match validate_scan_iteration_count(length, input_types, carry_count)? {
             Some(extent) => Dimension::Static(extent),
             None => length.clone(),
         };
@@ -386,16 +386,16 @@ pub trait ScanType:
         // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
         // separate step from the trip-count refinement above: the stacked outputs' leading axis describes the trip
         // count that is fixed before the first iteration, so it stays refined even when a first-class dimension carry
-        // shares the length's identity and keeps every carry that refers to it symbolic. A runtime length of another
+        // shares the length's identity and keeps every carry that refers to it symbolic. An iteration count of another
         // type (e.g., the exact type of an eager dimension value) is a member of the facts like every other input, so
         // that no carry declared with the length's identity establishes an extent that disagrees with the trip count,
         // while one that carries the length's own identity establishes nothing beyond the declared bounds. Only the
         // carries preserve the identities of reference inputs.
-        let nominal_runtime_length = length.variable().is_some_and(|variable| {
+        let nominal_iteration_count = length.variable().is_some_and(|variable| {
             matches!(input_types.last().cloned().map(Into::into), Some(ArrayIrType::Dimension(r#type))
                 if r#type.variable() == Some(variable))
         });
-        let fact_count = expected_input_types.len() - usize::from(nominal_runtime_length);
+        let fact_count = expected_input_types.len() - usize::from(nominal_iteration_count);
         refine_output_types(
             &expected_input_types[..fact_count],
             &input_types[..fact_count],
@@ -407,7 +407,7 @@ pub trait ScanType:
 
 impl ScanType for ArrayType {
     #[inline]
-    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
+    fn iteration_count_type(length: &Dimension) -> Result<Self, TypeError> {
         Err(TypeError::invalid(format!(
             "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use an array IR \
              `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
@@ -437,7 +437,7 @@ impl ScanType for ArrayType {
 
 impl ScanType for ArrayIrType {
     #[inline]
-    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
+    fn iteration_count_type(length: &Dimension) -> Result<Self, TypeError> {
         Ok(Self::Dimension(DimensionType::from(length.clone())))
     }
 
@@ -463,14 +463,14 @@ impl ScanType for ArrayIrType {
 /// provide their own implementation, including array IR backends with references and runtime dimensions. A domain
 /// covered by the blanket implementation cannot also provide an overlapping implementation of its own.
 pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
-    /// Returns the trip count that the trailing runtime length input of a dynamic-length scan, `runtime_length`,
-    /// supplies, agreeing with the extent and bounds represented by that value.
+    /// Returns the number of iterations represented by the trailing first-class dimension value, `iteration_count`,
+    /// of a dynamic-length scan. The result must agree with the extent and bounds represented by that value.
     ///
     /// # Errors
     ///
     /// Returns an error when the value cannot supply a valid trip count. Static-only families never call this function
     /// through a validated scan and may reject the request.
-    fn runtime_length(runtime_length: &Self::Value) -> Result<usize, ProgramError>;
+    fn iteration_count(iteration_count: &Self::Value) -> Result<usize, ProgramError>;
 
     /// Returns the value of the intrinsic index input of iteration `iteration`, as a scalar [`I64`](DataType::I64)
     /// array in this domain.
@@ -518,9 +518,10 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     ) -> Result<Self::Value, ProgramError>;
 
     /// Returns the empty stacked output of type `output_type` of a scan that runs no iteration, whose body declares
-    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the trailing
-    /// runtime length). The body types include the intrinsic index input. Resolve any dynamic slice dimensions that
-    /// the value representation requires from these type/value bindings; the leading stack extent is zero.
+    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the
+    /// trailing iteration count). The body types include the intrinsic index input. Resolve any dynamic slice
+    /// dimensions that the value representation requires from these type/value bindings; the leading stack extent is
+    /// zero.
     ///
     /// # Errors
     ///
@@ -536,9 +537,9 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
 impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C::Value> + Fill<i64, C::Value>>
     ScanInterpretationDomain for C
 {
-    fn runtime_length(_runtime_length: &Self::Value) -> Result<usize, ProgramError> {
-        // Validation rejects a homogeneous scan with a dynamic length before any runtime length is read.
-        Err(ProgramError::MalformedProgram(format!("homogeneous `{SCAN_OPERATION_NAME}` has no runtime length input")))
+    fn iteration_count(_iteration_count: &Self::Value) -> Result<usize, ProgramError> {
+        // Validation rejects a homogeneous scan with a dynamic length before any iteration count is read.
+        Err(ProgramError::MalformedProgram(format!("homogeneous `{SCAN_OPERATION_NAME}` has no iteration count input")))
     }
 
     fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError> {
@@ -639,8 +640,8 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
 // variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its stacks the
 // same way whether or not its body uses collectives over the emulated manual axes.
 impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext<ArrayIrValue<Array>, O> {
-    fn runtime_length(runtime_length: &ArrayIrValue<Array>) -> Result<usize, ProgramError> {
-        Ok(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(runtime_length)?.extent())
+    fn iteration_count(iteration_count: &ArrayIrValue<Array>) -> Result<usize, ProgramError> {
+        Ok(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(iteration_count)?.extent())
     }
 
     fn iteration_index(&self, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
@@ -763,12 +764,12 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 ///
 /// The explicit [`length`](Self::length) also supports scans with no stacked inputs. Homogeneous [`ArrayType`] scans
 /// require a static length. [`ArrayIrType`] scans may use a dynamic dimension identity and consume its matching
-/// first-class dimension value as a trailing runtime input. Every stacked leading axis must then have the runtime
-/// length as its extent, which the scan boundary checks at runtime when the input types leave it unproven (e.g., for an
-/// `f32[3]` stack next to a runtime length of type `dimension<length>`). A runtime length of an unrelated identity is
-/// admitted only when its bounds fix one exact extent, which then is the trip count. Reference stacks have static types
-/// that carry no identity that a runtime check could relate to the runtime length, so their leading extents must be
-/// provably equal to the trip count.
+/// first-class dimension value as a trailing runtime input. Every stacked leading axis must then have the iteration
+/// count as its extent, which the scan boundary checks at runtime when the input types leave it unproven (e.g., for an
+/// `f32[3]` stack next to an iteration count of type `dimension<length>`). An iteration count of an unrelated identity
+/// is admitted only when its bounds fix one exact extent, which then is the trip count. Reference stacks have static
+/// types that carry no identity that a runtime check could relate to the iteration count, so their leading extents must
+/// be provably equal to the trip count.
 ///
 /// An array IR body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index
 /// transform to each access, with the body's index input as the first transform binding. Reference operations and their
@@ -929,12 +930,12 @@ impl<T: Type> ScanOperation<T> {
 
     /// Validates the instruction and body positions used by the producer-source and execution-demand contracts.
     fn validate_data_flow_boundary(&self, boundary: RegionDataFlowBoundary<'_>) -> Result<(), ProgramError> {
-        let runtime_length_count = usize::from(self.length.variable().is_some());
+        let iteration_count_input_count = usize::from(self.length.variable().is_some());
         if boundary.regions.len() != 1
             || boundary.output_count < self.carry_count
             || boundary.regions[0].output_count != boundary.output_count
             || boundary.regions[0].input_count.checked_sub(1).is_none_or(|count| {
-                count < self.carry_count || count.checked_add(runtime_length_count) != Some(boundary.input_count)
+                count < self.carry_count || count.checked_add(iteration_count_input_count) != Some(boundary.input_count)
             })
         {
             return Err(ProgramError::MalformedProgram(format!(
@@ -983,11 +984,11 @@ impl<T: Type> ScanOperation<T> {
 impl<T: ScanType> ScanOperation<T> {
     /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e., the
     /// intrinsic iteration index followed by the carries and the slices or reference stacks of the stacked inputs),
-    /// followed by the `dimension<length>` type of the trailing runtime length input when the length is dynamic.
+    /// followed by the `dimension<length>` type of the trailing iteration count input when the length is dynamic.
     /// Carries keep their types, a reference stack keeps its type, and a stacked array gains the leading scan axis
     /// while keeping only the memory placement of its slice: scan input validation compares the slices of the actual
-    /// stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g., one
-    /// whose scan axis is sharded over an `Auto` mesh axis). The runtime length shares its identity with every carry or
+    /// stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g., one whose
+    /// scan axis is sharded over an `Auto` mesh axis). The iteration count shares its identity with every carry or
     /// stack that the body declares with the length's identity, so these types relate the trip count to those inputs.
     /// Backends that check the entry of a scan whose body they inline (e.g., with a [`GuardOperation`]) and transform
     /// rules that remove or split the scan boundary relate the actual inputs to these types.
@@ -1026,16 +1027,16 @@ impl<T: ScanType> ScanOperation<T> {
     }
 
     /// Validates the application of this scan to inputs of the types `input_types` (i.e., the carries and the stacked
-    /// inputs, followed by the runtime length input when the length is dynamic) with the iteration `body`, and returns
+    /// inputs, followed by the iteration count input when the length is dynamic) with the iteration `body`, and returns
     /// its output types. Every rule validates this complete contract before it executes, rewrites, discharges, or
     /// stages the body, so that whether an application is accepted does not depend on the transform that reaches it.
     /// The contract consists of the boundary that [`Operation::infer_output_types`] validates and of the reference
     /// contract that only the body reveals: the body must return every reference carry as its own body input (refer to
     /// [`validate_reference_carry_roots`]), however the inputs of the application alias.
     ///
-    /// The boundary relates every stacked leading extent to the runtime length (refer to [`ScanType`]). Conflicting
+    /// The boundary relates every stacked leading extent to the iteration count (refer to [`ScanType`]). Conflicting
     /// static extents are rejected here, while a relationship that the input types leave unproven (e.g., an exact
-    /// runtime length of type `dimension<3>` next to a stack of type `f32[length]`) is checked at runtime by the scan
+    /// iteration count of type `dimension<3>` next to a stack of type `f32[length]`) is checked at runtime by the scan
     /// boundary, or by the entry guard that a rule which removes or splits that boundary stages first.
     ///
     /// # Parameters
@@ -1104,8 +1105,8 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             &self.length,
         )?;
         // A body specialized to the actual input types no longer declares the length's identity where its inputs do
-        // not prove it, which would drop the relationship between those inputs and the trailing runtime length (e.g.,
-        // a carry declared as `f32[length]` but supplied as `f32[3]`). The runtime length is not a body input, so the
+        // not prove it, which would drop the relationship between those inputs and the trailing iteration count (e.g.,
+        // a carry declared as `f32[length]` but supplied as `f32[3]`). The iteration count is not a body input, so the
         // specialized body could not retain that relationship, and the declared body is kept instead. The declared
         // identities are local to this comparison, so that a specialization which only renames identities (e.g., a
         // body declared over `f32[extent]` slices supplied with `f32[other]` slices) is still requested.
@@ -1185,11 +1186,11 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         // Carries are kept by their fixed point, while stacked inputs and outputs are pruned independently, and the
-        // index input and the runtime length input that trails the stacked inputs of a scan with a dynamic length are
-        // always kept. The scan boundary relates the leading axis of every stacked input to that runtime length, which
+        // index input and the iteration count input that trails the stacked inputs of a scan with a dynamic length are
+        // always kept. The scan boundary relates the leading axis of every stacked input to that iteration count, which
         // is not a body input, so region liveness cannot see that relationship. A dead stacked input of a scan with a
         // dynamic length is therefore kept unless the actual input types prove that relationship, which holds when the
-        // leading dimension of the stack (of its referent, for a reference stack) and the runtime length provably have
+        // leading dimension of the stack (of its referent, for a reference stack) and the iteration count provably have
         // equal extents (i.e., they share a symbolic identity, as an `f32[length]` stack next to a `dimension<length>`,
         // or both fix the same extent, as an `f32[3]` stack next to a `dimension<3>`). Otherwise the boundary checks
         // the relationship at runtime (e.g., an `f32[3]` stack next to a `dimension<length>`), and pruning must not
@@ -1209,19 +1210,20 @@ impl<T: ScanType> Operation for ScanOperation<T> {
                  {stacked_count} stacked inputs",
             ))
         })?;
-        let runtime_length_count = usize::from(self.length.variable().is_some());
-        if trailing_count != runtime_length_count {
+        let iteration_count_input_count = usize::from(self.length.variable().is_some());
+        if trailing_count != iteration_count_input_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{SCAN_OPERATION_NAME}` expects {runtime_length_count} trailing runtime length inputs but has \
+                "`{SCAN_OPERATION_NAME}` expects {iteration_count_input_count} trailing iteration count inputs but has \
                  {trailing_count}",
             )));
         }
-        let runtime_length: Option<ArrayIrType> = input_types.get(carry_count + stacked_count).cloned().map(Into::into);
+        let iteration_count: Option<ArrayIrType> =
+            input_types.get(carry_count + stacked_count).cloned().map(Into::into);
         let keeps_dead_stack = |r#type: &T| {
-            let Some(runtime_length) = &runtime_length else {
+            let Some(iteration_count) = &iteration_count else {
                 return false;
             };
-            let ArrayIrType::Dimension(runtime_length) = runtime_length else {
+            let ArrayIrType::Dimension(iteration_count) = iteration_count else {
                 return true;
             };
             let stack = match r#type.referent() {
@@ -1231,7 +1233,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             let Ok(stack) = stack else {
                 return true;
             };
-            stack.rank() == 0 || !stack.dimension(0).has_equal_extents(runtime_length.dimension())
+            stack.rank() == 0 || !stack.dimension(0).has_equal_extents(iteration_count.dimension())
         };
         let kept_stacks = used_body_inputs[1 + carry_count..]
             .iter()
@@ -1421,7 +1423,7 @@ impl<
             }
         }
         let summary = context.region_summary(self, 0, source_body, &body_allocations)?;
-        let length = match validate_scan_runtime_length(&self.length, &input_types, carry_count)? {
+        let length = match validate_scan_iteration_count(&self.length, &input_types, carry_count)? {
             Some(extent) => Dimension::Static(extent),
             None => self.length.clone(),
         };
@@ -1648,8 +1650,8 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
         let (inputs, length) = match self.length.value() {
             Some(length) => (inputs, length),
             None => {
-                let (runtime_length, inputs) = inputs.split_last().unwrap();
-                (inputs, C::runtime_length(runtime_length)?)
+                let (iteration_count, inputs) = inputs.split_last().unwrap();
+                (inputs, C::iteration_count(iteration_count)?)
             }
         };
         let (carries, stacks) = inputs.split_at(self.carry_count);
@@ -1710,10 +1712,11 @@ impl<
         // evaluation against known values specializes the residual body. Computed loop-invariant work is hoisted only
         // when the declared length guarantees an iteration, so a split never runs body work that no iteration performs.
         // Before splitting or residualizing the scan, the rule guards its complete boundary (refer to
-        // `PartialEvaluationContext::guard_inputs`), whose declared types also relate the runtime length to the leading
-        // axes of the stacked inputs, so that neither the rebuilt scans nor forwarded outputs rely on a relationship
-        // that the input types leave unproven. Non-reference carries that the body passes through unchanged are then
-        // forwarded from their guarded inputs, and a scan where nothing folds residualizes unchanged.
+        // `PartialEvaluationContext::guard_inputs`), whose declared types also relate the iteration count to the
+        // leading axes of the stacked inputs, so that neither the rebuilt scans nor forwarded outputs rely on a
+        // relationship that the input types leave unproven. Non-reference carries that the body passes through
+        // unchanged are then forwarded from their guarded inputs, and a scan where nothing folds residualizes
+        // unchanged.
 
         // The rule requests all nested-computation work through its region access (region 0 is the body), which keeps
         // its bounds free of the operation family's own semantic traits.
@@ -1733,11 +1736,11 @@ impl<
         // guard first. The rebuilt scans and the forwarded carries use the guarded inputs, whose types prove them.
         let inputs = context.guard_inputs(&self.declared_input_types(&body_input_types)?, inputs.to_vec(), false)?;
 
-        // The trailing runtime length input of a dynamic-length scan is neither a carry nor a stacked input, so it does
-        // not make any per-iteration work known. A split forwards the carries that the body passes through itself.
+        // The trailing iteration count input of a dynamic-length scan is neither a carry nor a stacked input, so it
+        // does not make any per-iteration work known. A split forwards the carries that the body passes through itself.
         let scanned_inputs = &inputs[..body_input_types.len() - 1];
         if scanned_inputs.iter().any(PartialEvaluationValue::is_known) {
-            let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len() - 1);
+            let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_types.len() - 1);
             let mut body_known = std::iter::once(true)
                 .chain(body_inputs.iter().map(PartialEvaluationValue::is_known))
                 .collect::<Vec<bool>>();
@@ -1767,7 +1770,7 @@ impl<
                     &body_input_types,
                     &inputs,
                     &body_known,
-                    runtime_length_inputs.iter().all(PartialEvaluationValue::is_known),
+                    iteration_count_inputs.iter().all(PartialEvaluationValue::is_known),
                     false,
                     partition,
                     |constant| Ok(context.known_value(context.parent().lift(constant)?)),
@@ -2137,7 +2140,7 @@ where
                     .map(|(program, _)| program)?
             };
             let reversed_body = Arc::new(reversed_body);
-            let (scan_inputs, runtime_length_inputs) = inputs.split_at(input_linear.len());
+            let (scan_inputs, iteration_count_inputs) = inputs.split_at(input_linear.len());
 
             // A dead carry still needs an initial cotangent value for the recurrence. Gather live output cotangents,
             // known inputs, and cotangent references as sources of the runtime identities needed to materialize that
@@ -2198,11 +2201,11 @@ where
                 }
             }
 
-            // The trailing runtime length is structural, never linear, and stays last in the instruction boundary.
-            for input in runtime_length_inputs {
+            // The trailing iteration count is structural, never linear, and stays last in the instruction boundary.
+            for input in iteration_count_inputs {
                 reversed_inputs.push(input.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
                     message: format!(
-                        "`{SCAN_OPERATION_NAME}` transposition does not support a linear runtime length input; the \
+                        "`{SCAN_OPERATION_NAME}` transposition does not support a linear iteration count input; the \
                          trip count is not differentiable",
                     ),
                 })?);
@@ -2257,7 +2260,7 @@ where
 
             // Drain reversed outputs in the original input order. Promoted known initializers discard their carry
             // cotangents, and live reference carries discard their identity outputs because their buffers accumulated
-            // in place. Disconnected stacks, known inputs, ignored references, and the runtime length receive
+            // in place. Disconnected stacks, known inputs, ignored references, and the iteration count receive
             // structural zeros.
             let mut scan_cotangents = scan_cotangents.into_iter();
             inputs
@@ -2440,7 +2443,7 @@ fn scan_boundary_types<T: ScanType>(
 
 /// Returns the declared operation input types of a scan whose body declares `body_types` after its intrinsic index:
 /// the input types that [`scan_boundary_types`] derives, followed by the `dimension<length>` type of the trailing
-/// runtime length input when `length` is dynamic.
+/// iteration count input when `length` is dynamic.
 fn scan_input_types<T: ScanType>(
     body_types: &[T],
     carry_count: usize,
@@ -2448,55 +2451,56 @@ fn scan_input_types<T: ScanType>(
 ) -> Result<Vec<T>, TypeError> {
     let mut input_types = scan_boundary_types(ScanBoundarySide::Input, body_types, carry_count, length, &[])?;
     if length.variable().is_some() {
-        input_types.push(T::runtime_length_type(length)?);
+        input_types.push(T::iteration_count_type(length)?);
     }
     Ok(input_types)
 }
 
 /// Validates the runtime dimension's identity or singleton refinement independently of stacked-axis equality.
-fn validate_scan_runtime_length_type<T: ScanType>(
+fn validate_scan_iteration_count_type<T: ScanType>(
     length: &Dimension,
     input_types: &[T],
 ) -> Result<Option<usize>, TypeError> {
     let Some(variable) = length.variable() else {
         return Ok(None);
     };
-    let runtime_length_type: ArrayIrType = input_types.last().unwrap().clone().into();
-    let runtime_length_type = runtime_length_type.as_dimension_type()?;
-    if runtime_length_type.variable() == Some(variable) {
+    let iteration_count_type: ArrayIrType = input_types.last().unwrap().clone().into();
+    let iteration_count_type = iteration_count_type.as_dimension_type()?;
+    if iteration_count_type.variable() == Some(variable) {
         return Ok(None);
     }
-    let extent = runtime_length_type
+    let extent = iteration_count_type
         .extent()
-        .filter(|_| DimensionType::from(variable.clone()).is_refined_by(runtime_length_type))
+        .filter(|_| DimensionType::from(variable.clone()).is_refined_by(iteration_count_type))
         .ok_or_else(|| {
             TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` runtime length input has type `{runtime_length_type}` but \
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `{iteration_count_type}` but \
                  `{SCAN_OPERATION_NAME}` length requires `{variable}`",
             ))
         })?;
     Ok(Some(extent))
 }
 
-/// Validates the trailing runtime length input of a dynamic-length scan against the declared `length` and the
-/// reference stacks among the actual input types, and returns the concrete trip count when the runtime length input
+/// Validates the trailing iteration count input of a dynamic-length scan against the declared `length` and the
+/// reference stacks among the actual input types, and returns the concrete trip count when the iteration count input
 /// only refines `length`'s bounds instead of carrying its nominal identity.
 ///
-/// A runtime length input that carries `length`'s own [`DimensionVariable`] defines the trip count, and [`None`] is
-/// returned. A runtime length input of an unrelated identity is admissible only when its bounds pin exactly one extent
-/// inside `length`'s bounds, and the trip count is then that extent. The leading axes of stacked arrays are related to
-/// the trip count through the declared input types of the scan (refer to [`ScanOperation::declared_input_types`]), so
-/// that conflicting static extents are type errors and the scan boundary checks the relationships that the input types
-/// leave unproven. A reference stack has a static type that carries no identity that such a check could relate to the
-/// runtime length, so its leading extent must be provably equal to the trip count instead: equal to the exact trip
-/// count, or to an extent that `length`'s bounds fix when the runtime length is nominal.
+/// An iteration count input that carries `length`'s own [`DimensionVariable`] defines the trip count, and [`None`] is
+/// returned. An iteration count input of an unrelated identity is admissible only when its bounds pin exactly one
+/// extent inside `length`'s bounds, and the trip count is then that extent. The leading axes of stacked arrays are
+/// related to the trip count through the declared input types of the scan (refer to
+/// [`ScanOperation::declared_input_types`]), so that conflicting static extents are type errors and the scan boundary
+/// checks the relationships that the input types leave unproven. A reference stack has a static type that carries no
+/// identity that such a check could relate to the iteration count, so its leading extent must be provably equal to the
+/// trip count instead: equal to the exact trip count, or to an extent that `length`'s bounds fix when the iteration
+/// count is nominal.
 ///
 /// # Parameters
 ///
 ///   - `length`: Declared scan length.
-///   - `input_types`: All scan input types, whose last entry is the runtime length input when `length` is dynamic.
+///   - `input_types`: All scan input types, whose last entry is the iteration count input when `length` is dynamic.
 ///   - `carry_count`: Number of leading loop-carried inputs, which are not stacked.
-fn validate_scan_runtime_length<T: ScanType>(
+fn validate_scan_iteration_count<T: ScanType>(
     length: &Dimension,
     input_types: &[T],
     carry_count: usize,
@@ -2504,9 +2508,9 @@ fn validate_scan_runtime_length<T: ScanType>(
     if length.variable().is_none() {
         return Ok(None);
     }
-    let runtime_length_type: ArrayIrType = input_types.last().unwrap().clone().into();
-    let runtime_length_type = runtime_length_type.as_dimension_type()?;
-    let extent = validate_scan_runtime_length_type(length, input_types)?;
+    let iteration_count_type: ArrayIrType = input_types.last().unwrap().clone().into();
+    let iteration_count_type = iteration_count_type.as_dimension_type()?;
+    let extent = validate_scan_iteration_count_type(length, input_types)?;
     for (index, r#type) in input_types[carry_count..input_types.len() - 1].iter().enumerate() {
         let Some(referent) = r#type.referent() else {
             continue;
@@ -2525,7 +2529,7 @@ fn validate_scan_runtime_length<T: ScanType>(
                 None => format!("provably equal to `{length}`"),
             };
             return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` runtime length input has type `{runtime_length_type}` but stacked \
+                "`{SCAN_OPERATION_NAME}` iteration count input has type `{iteration_count_type}` but stacked \
                  input {} has type `{type}` whose leading dimension is not {requirement}",
                 carry_count + index,
                 r#type = r#type,
@@ -2539,11 +2543,11 @@ fn validate_scan_runtime_length<T: ScanType>(
 /// input types of the scan (refer to [`ScanOperation::declared_input_types`]), together with the positions of its
 /// members among those inputs (refer to [`GuardOperation::for_entry`]), or [`None`] when the actual types prove every
 /// relationship of the boundary. A rule that removes or splits the boundary of a scan stages such a guard first, so
-/// that the relationships which only that boundary checks at runtime (e.g., between an `f32[3]` stack and a runtime
-/// length of type `dimension<length>`) are still checked. The guard pins no identity, so that its outputs carry the
-/// exact facts that its checks prove (e.g., that runtime length becomes a `dimension<3>`), except that it retains the
-/// identities of its reference members, which cannot be cast (e.g., next to a `ref<f32[length]>` carry, that runtime
-/// length keeps its `length` identity).
+/// that the relationships which only that boundary checks at runtime (e.g., between an `f32[3]` stack and an iteration
+/// count of type `dimension<length>`) are still checked. The guard pins no identity, so that its outputs carry the
+/// exact facts that its checks prove (e.g., that the iteration count becomes a `dimension<3>`), except that it retains
+/// the identities of its reference members, which cannot be cast (e.g., next to a `ref<f32[length]>` carry, the
+/// iteration count keeps its `length` identity).
 fn scan_entry_guard<T: ScanType>(
     declared: &[T],
     actual: &[T],
@@ -2686,7 +2690,7 @@ enum ScanResidual<T: Type> {
 
 /// Rebuilds two scans from a partitioned iteration body, storing each varying residual once per iteration. Returns
 /// `None` when a reference cannot cross the resulting boundary, the split has no known work, or the split needs a known
-/// scan whose runtime length is not known (binding that scan would only stage a second residual scan).
+/// scan whose iteration count is not known (binding that scan would only stage a second residual scan).
 ///
 /// Computed invariant residuals are hoisted only when the declared length guarantees an iteration. Direct input
 /// forwarding never evaluates body work and remains valid when the length admits zero.
@@ -2702,7 +2706,7 @@ enum ScanResidual<T: Type> {
 ///   - `body_input_types`: Full iteration input signature, including the intrinsic index.
 ///   - `inputs`: Source operation values in the binding destinations' shared representation.
 ///   - `body_known`: Converged body input knownness, including the known intrinsic index and paired carry slots.
-///   - `runtime_length_known`: Whether the runtime length input of a dynamic scan is known (always `true` for a
+///   - `iteration_count_known`: Whether the iteration count input of a dynamic scan is known (always `true` for a
 ///     static length).
 ///   - `split_without_known_work`: Whether to rebuild the residual scan even when the known side has no work to
 ///     bind (no outputs, effects, hoisted or forwarded values). Partial evaluation keeps such a scan whole instead,
@@ -2729,7 +2733,7 @@ fn reconstruct_partitioned_scan<
     body_input_types: &[V::Type],
     inputs: &[Input],
     body_known: &[bool],
-    runtime_length_known: bool,
+    iteration_count_known: bool,
     split_without_known_work: bool,
     partition: PartitionedProgram<V, O>,
     mut lift_known_fn: LiftKnownFn,
@@ -2752,7 +2756,7 @@ fn reconstruct_partitioned_scan<
     }
     let carry_count = scan.carry_count;
     let carry_known = &body_known[1..1 + carry_count];
-    let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len() - 1);
+    let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_types.len() - 1);
     partition.validate_known_input_indices(body_known)?;
     partition.validate_canonical_residual_edges()?;
     let residual_edges = partition.residual_edges();
@@ -2931,7 +2935,7 @@ fn reconstruct_partitioned_scan<
     let needs_known_scan = known_program_output_indices.len() > passed_through_carry_count
         || !known_program.effects().classes().is_empty()
         || known_program.effects().has_deferred_work();
-    if needs_known_scan && !runtime_length_known {
+    if needs_known_scan && !iteration_count_known {
         return Ok(None);
     }
     let hoists_edges = invariant_sources.iter().any(|source| matches!(source, ScanInvariantSource::Hoisted(_)));
@@ -2953,7 +2957,7 @@ fn reconstruct_partitioned_scan<
         .filter(|&&index| index != 0)
         .map(|&index| body_inputs[index - 1].clone())
         .collect::<Vec<_>>();
-    known_scan_inputs.extend_from_slice(runtime_length_inputs);
+    known_scan_inputs.extend_from_slice(iteration_count_inputs);
     // Project the known iteration body to its retained results and effects, then convert metadata residuals to temporal
     // storage. Ordinary arrays already have that representation and need no second replay.
     let known_body = {
@@ -3002,8 +3006,9 @@ fn reconstruct_partitioned_scan<
         ..scan.clone().with_stacked_axis_shardings(known_stacked_axis_shardings)
     };
     // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original stacked
-    // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep
-    // runtime-length scans explicit because their outputs may refine the stacked inputs' symbolic extent types.
+    // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep scans
+    // with a dynamic iteration count explicit because their outputs may refine the stacked inputs' symbolic extent
+    // types.
     let forwarded_outputs = (matches!(scan.length(), Dimension::Static(_))
         && known_carry_count == 0
         && known_body.instructions().is_empty())
@@ -3270,7 +3275,7 @@ fn reconstruct_partitioned_scan<
                 _ => {}
             }
         }
-        unknown_scan_inputs.extend_from_slice(runtime_length_inputs);
+        unknown_scan_inputs.extend_from_slice(iteration_count_inputs);
         residual_outputs = bind_residual_fn(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
     }
 
@@ -3312,7 +3317,7 @@ impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
         // A rewritten batched scan must not legitimize a malformed original index, carry boundary, or stack shape.
         operation.validate_application(&input_types, body)?;
         let carry_count = operation.carry_count;
-        let (scan_inputs, runtime_length) = inputs.split_at(body_input_types.len() - 1);
+        let (scan_inputs, iteration_count) = inputs.split_at(body_input_types.len() - 1);
 
         // Pack mapped array carries at axis 0 and mapped array stacks behind their leading scan axis. Reference
         // stacks keep the physical axis fixed by their roots, which cannot be moved onto or ahead of the scan axis.
@@ -3389,7 +3394,7 @@ impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
         };
         let batched_scan = ScanOperation { carry_count: carry_count + bookkeeping_count, ..operation.clone() };
         let mut packed_inputs = bookkeeping_inputs;
-        packed_inputs.extend(carries.iter().chain(&stacks).chain(runtime_length).map(|batch| P::value(batch).clone()));
+        packed_inputs.extend(carries.iter().chain(&stacks).chain(iteration_count).map(|batch| P::value(batch).clone()));
         let mut outputs = self.parent().bind(batched_scan, vec![batched_body], packed_inputs.as_slice())?;
         check_count!("output", outputs, bookkeeping_count + output_axes.len(), ProgramError);
 
@@ -3500,7 +3505,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
     }
 
     /// Returns the inputs of the fused scan for the input duals `inputs`: the primals and the live tangents in scan
-    /// order, followed by the runtime length of a dynamic-length scan. A carry that the fixed point made live from a
+    /// order, followed by the iteration count of a dynamic-length scan. A carry that the fixed point made live from a
     /// structural-zero initial tangent receives that zero materialized from its own primal.
     ///
     /// # Errors
@@ -3518,7 +3523,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
         // The fused boundary adds one input per live tangent. Body position `0` is the intrinsic index, so live
         // body positions are offset by one from their corresponding scan inputs.
         let body_input_count = self.input_order.len() - self.activity.input_indices().len();
-        let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_count - 1);
+        let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_count - 1);
         let tangents = self
             .activity
             .input_indices()
@@ -3531,7 +3536,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
                 Some(tangent) => tangents[tangent].clone(),
                 None => body_inputs[position - 1].primal().clone(),
             })
-            .chain(runtime_length_inputs.iter().map(|input| input.primal().clone()))
+            .chain(iteration_count_inputs.iter().map(|input| input.primal().clone()))
             .collect())
     }
 
@@ -4544,7 +4549,7 @@ mod tests {
     #[test]
     fn test_scan_declared_input_types() {
         // Carries and reference stacks keep their body types, a stacked array gains the leading scan axis while keeping
-        // only the memory placement of its slice, and a dynamic scan ends with its `dimension<length>` runtime length.
+        // only the memory placement of its slice, and a dynamic scan ends with its `dimension<length>` iteration count.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let carry_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into()])));
@@ -5075,7 +5080,7 @@ mod tests {
 
         // When a first-class dimension carry shares the identity of the scan length, the carries that refer to it stay
         // symbolic because that carry may change across iterations, while the stacked output's leading axis still
-        // takes the trip count that the exact runtime length fixes before the first iteration.
+        // takes the trip count that the exact iteration count fixes before the first iteration.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let dimension_carry_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
         let array_carry_type =
@@ -5190,7 +5195,7 @@ mod tests {
     #[test]
     fn test_scan_type_inference_specializes_renamed_identities_under_dynamic_lengths() {
         // Tracing specializes a body declared over `extent` to inputs that rename that identity to `other`, whether the
-        // trip count is static or supplied by a runtime length that the stacked input shares its identity with.
+        // trip count is static or supplied by an iteration count that the stacked input shares its identity with.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let other = DimensionVariable::new("other", DimensionBounds::positive(Some(8)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
@@ -5250,12 +5255,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_inference_runtime_length() {
-        // A dynamic runtime-length input must carry the scan length's nominal identity: an unrelated dynamic identity
-        // with compatible bounds cannot redefine the stacked axis. A runtime length input whose bounds pin one exact
+    fn test_scan_type_inference_iteration_count() {
+        // A dynamic iteration count input must carry the scan length's nominal identity: an unrelated dynamic identity
+        // with compatible bounds cannot redefine the stacked axis. An iteration count input whose bounds pin one exact
         // extent inside the declared bounds (and only such an input, not one whose exact extent lies outside them)
         // fixes the trip count to that extent, and the stacked inputs are related to it like to a nominal
-        // runtime length: a stacked axis left symbolic is checked against the trip count by the scan boundary when it
+        // iteration count: a stacked axis left symbolic is checked against the trip count by the scan boundary when it
         // executes, so that it is never read a fixed number of times regardless of its independently determined
         // runtime size. The accepted refinement also types the stacked outputs at the concrete extent instead of at
         // the still-symbolic declared length.
@@ -5301,7 +5306,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "`scan` runtime length input has type `dimension<unrelated ∈ [1, 5)>` but `scan` length \
+                "`scan` iteration count input has type `dimension<unrelated ∈ [1, 5)>` but `scan` length \
                  requires `length`",
             )),
         );
@@ -5319,7 +5324,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "`scan` runtime length input has type `dimension<7>` but `scan` length requires `length`",
+                "`scan` iteration count input has type `dimension<7>` but `scan` length requires `length`",
             )),
         );
         assert_eq!(
@@ -5351,9 +5356,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_inference_relates_carries_to_the_runtime_length() {
+    fn test_scan_type_inference_relates_carries_to_the_iteration_count() {
         // A carry that the body declares with the dynamic length's identity shares that identity with the trailing
-        // runtime length input, so the scan boundary relates the two. An `f32[3]` carry refines `f32[length]` without
+        // iteration count input, so the scan boundary relates the two. An `f32[3]` carry refines `f32[length]` without
         // proving that the trip count is 3: the relationship is reported for runtime validation, staging keeps the
         // declared body instead of specializing it away, and eager interpretation rejects another trip count.
         // Program construction and tracing agree in both cases, including on rejecting an unrelated symbolic extent.
@@ -5438,15 +5443,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_inference_relates_stacks_to_the_runtime_length() {
-        // Matching the runtime length's identity does not prove that a statically refined array stack has that extent,
+    fn test_scan_type_inference_relates_stacks_to_the_iteration_count() {
+        // Matching the iteration count's identity does not prove that a statically refined array stack has that extent,
         // so the scan boundary checks it when the scan executes, and staging keeps the declared body instead of
         // specializing it. Dead-code elimination removes an unused scan, such as one without outputs, together with
         // that check (refer to `test_scan_boundary_pruning_removes_unused_scans_with_their_boundary_checks`). A
-        // reference stack has a static type that carries no identity that such a check could relate to the runtime
-        // length, so it is rejected unless its extent is provably equal.
+        // reference stack has a static type that carries no identity that such a check could relate to the iteration
+        // count, so it is rejected unless its extent is provably equal.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
-        let runtime_length = ArrayIrType::Dimension(DimensionType::from(length.clone()));
+        let iteration_count = ArrayIrType::Dimension(DimensionType::from(length.clone()));
         let stack = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
         let interface = RegionInterface::new(
             vec![ArrayType::scalar(DataType::I64).into(), ArrayType::scalar(DataType::F32).into()],
@@ -5455,24 +5460,24 @@ mod tests {
         );
         let operation = ScanOperation::<ArrayIrType>::new(0, Dimension::Dynamic(length.clone()));
         assert_eq!(
-            operation.infer_output_types(&[stack.clone(), runtime_length.clone()], std::slice::from_ref(&interface)),
+            operation.infer_output_types(&[stack.clone(), iteration_count.clone()], std::slice::from_ref(&interface)),
             Ok(vec![]),
         );
         assert_eq!(
             operation
-                .infer_region_input_types(&[stack.clone(), runtime_length.clone()], std::slice::from_ref(&interface)),
+                .infer_region_input_types(&[stack.clone(), iteration_count.clone()], std::slice::from_ref(&interface)),
             Ok(vec![None]),
         );
 
         // A body that stacks its slices produces an `f32[3]` output, and executing the scan checks the stack against
-        // the runtime length.
+        // the iteration count.
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let slice = body.add_input(ArrayType::scalar(DataType::F32).into());
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let program = scan_program(operation.clone(), body, vec![stack, runtime_length.clone()]);
+        let program = scan_program(operation.clone(), body, vec![stack, iteration_count.clone()]);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -5503,9 +5508,9 @@ mod tests {
         );
         assert_eq!(
             operation
-                .infer_output_types(&[reference.clone(), runtime_length], std::slice::from_ref(&reference_interface),),
+                .infer_output_types(&[reference.clone(), iteration_count], std::slice::from_ref(&reference_interface),),
             Err(TypeError::invalid(
-                "`scan` runtime length input has type `dimension<length ∈ [0, 8)>` but stacked input 0 has type \
+                "`scan` iteration count input has type `dimension<length ∈ [0, 8)>` but stacked input 0 has type \
                  `ref<f32[3]>` whose leading dimension is not provably equal to `length`",
             )),
         );
@@ -5892,8 +5897,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_boundary_pruning_keeps_the_runtime_length_input() {
-        // A dynamic-length scan always keeps its trailing runtime length input, which is not a body input, while its
+    fn test_scan_boundary_pruning_keeps_the_iteration_count_input() {
+        // A dynamic-length scan always keeps its trailing iteration count input, which is not a body input, while its
         // unused carry and stacked output are pruned as usual.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -5952,30 +5957,30 @@ mod tests {
         assert_eq!(pruned.interpret(inputs.clone()), Ok(vec![TestIrValue::Array(Array::scalar(7.0f32).unwrap())]));
         assert_eq!(program.interpret(inputs), Ok(vec![TestIrValue::Array(Array::scalar(7.0f32).unwrap())]));
 
-        // A static scan has no trailing runtime length input, and a dynamic scan requires exactly one, even when the
+        // A static scan has no trailing iteration count input, and a dynamic scan requires exactly one, even when the
         // body (which then contains only its unused index) and the public output boundary are empty.
         let mut liveness = TestRegionLiveness::new(|_| vec![false]);
         assert_eq!(
             TestScanOperation::new(0, 3).prune_boundary(&[ArrayType::scalar(DataType::F32)], &[], &mut liveness),
-            Err(
-                ProgramError::MalformedProgram("`scan` expects 0 trailing runtime length inputs but has 1".to_owned(),)
-            ),
+            Err(ProgramError::MalformedProgram(
+                "`scan` expects 0 trailing iteration count inputs but has 1".to_owned(),
+            )),
         );
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         assert_eq!(
             ScanOperation::<ArrayIrType>::new(0, Dimension::Dynamic(length)).prune_boundary(&[], &[], &mut liveness),
-            Err(
-                ProgramError::MalformedProgram("`scan` expects 1 trailing runtime length inputs but has 0".to_owned(),)
-            ),
+            Err(ProgramError::MalformedProgram(
+                "`scan` expects 1 trailing iteration count inputs but has 0".to_owned(),
+            )),
         );
     }
 
     #[test]
-    fn test_scan_boundary_pruning_keeps_carries_related_to_the_runtime_length() {
-        // A carry declared `f32[length]` but fed `f32[3]` is checked only at the scan boundary against the runtime
-        // length, which is not a body input. The body liveness that scan pruning queries (`AttachedRegionLiveness`)
-        // keeps the unused carry input as a validation peer of the runtime length, so the carry fixed point keeps the
-        // carry and the pruned program still rejects a runtime length of 2 exactly as the source does.
+    fn test_scan_boundary_pruning_keeps_carries_related_to_the_iteration_count() {
+        // A carry declared `f32[length]` but fed `f32[3]` is checked only at the scan boundary against the iteration
+        // count, which is not a body input. The body liveness that scan pruning queries (`AttachedRegionLiveness`)
+        // keeps the unused carry input as a validation peer of the iteration count, so the carry fixed point keeps the
+        // carry and the pruned program still rejects an iteration count of 2 exactly as the source does.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let vector_type =
@@ -6017,10 +6022,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_boundary_pruning_keeps_stacks_related_to_the_runtime_length() {
-        // An `f32[3]` stack next to a runtime length of type `dimension<length>` is checked only at the scan boundary
-        // against that runtime length, which is not a body input. Pruning keeps the stack even though the body never
-        // reads its slices, so the pruned program still rejects a runtime length of 2 exactly as the source does.
+    fn test_scan_boundary_pruning_keeps_stacks_related_to_the_iteration_count() {
+        // An `f32[3]` stack next to an iteration count of type `dimension<length>` is checked only at the scan boundary
+        // against that iteration count, which is not a body input. Pruning keeps the stack even though the body never
+        // reads its slices, so the pruned program still rejects an iteration count of 2 exactly as the source does.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -6070,15 +6075,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_boundary_pruning_drops_stacks_proven_related_to_the_runtime_length() {
-        // A dead stack whose leading dimension provably has the extent of the runtime length leaves the scan boundary
+    fn test_scan_boundary_pruning_drops_stacks_proven_related_to_the_iteration_count() {
+        // A dead stack whose leading dimension provably has the extent of the iteration count leaves the scan boundary
         // nothing to check about it, so pruning drops it like a dead stack of a scan with a static length. This holds
         // for an `f32[length]` stack next to a `dimension<length>` (one symbolic identity) and for an `f32[3]` stack
         // next to a `dimension<3>` (one fixed extent).
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let program = |stack_type: ArrayType, runtime_length_type: &DimensionType| {
+        let program = |stack_type: ArrayType, iteration_count_type: &DimensionType| {
             let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
             body.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = body.add_input(scalar_type.clone());
@@ -6097,14 +6102,14 @@ mod tests {
             scan_program(
                 ScanOperation::new(1, Dimension::Dynamic(length.clone())),
                 body,
-                vec![scalar_type.clone(), stack_type.into(), runtime_length_type.clone().into()],
+                vec![scalar_type.clone(), stack_type.into(), iteration_count_type.clone().into()],
             )
         };
-        let inputs = |runtime_length_type: &DimensionType| {
+        let inputs = |iteration_count_type: &DimensionType| {
             vec![
                 array(Array::scalar(1f32).unwrap()),
                 array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()),
-                dimension(runtime_length_type, 3),
+                dimension(iteration_count_type, 3),
             ]
         };
 
@@ -6201,7 +6206,7 @@ mod tests {
     #[test]
     fn test_scan_boundary_pruning_drops_dead_reference_stacks() {
         // A reference stack has a static type, so a scan with a dynamic length admits it only when its leading extent
-        // is provably equal to the trip count (here, the exact runtime length `dimension<3>`). The scan boundary
+        // is provably equal to the trip count (here, the exact iteration count `dimension<3>`). The scan boundary
         // therefore has nothing to check about a dead reference stack, and pruning drops it.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
@@ -6247,12 +6252,12 @@ mod tests {
 
     #[test]
     fn test_scan_boundary_pruning_removes_unused_scans_with_their_boundary_checks() {
-        // A scan without outputs checks its `f32[3]` stack against the runtime length only at its boundary. Like any
+        // A scan without outputs checks its `f32[3]` stack against the iteration count only at its boundary. Like any
         // other pure instruction, dead-code elimination removes it together with that check, so the simplified program
-        // accepts a runtime length of 2 that the source program rejects. Pruning has no boundary to prune here and
+        // accepts an iteration count of 2 that the source program rejects. Pruning has no boundary to prune here and
         // returns the program unchanged, while partial evaluation keeps the check in its entry guard.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
-        let runtime_length = ArrayIrType::Dimension(DimensionType::from(length.clone()));
+        let iteration_count = ArrayIrType::Dimension(DimensionType::from(length.clone()));
         let stack = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
@@ -6260,7 +6265,7 @@ mod tests {
         let body = body.build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let body = builder.import_program(body);
-        let inputs = vec![builder.add_input(stack.clone()), builder.add_input(runtime_length.clone())];
+        let inputs = vec![builder.add_input(stack.clone()), builder.add_input(iteration_count.clone())];
         builder
             .add_instruction(
                 ScanOperation::<ArrayIrType>::new(0, Dimension::Dynamic(length.clone())),
@@ -6303,7 +6308,7 @@ mod tests {
         assert_eq!(simplified.interpret(inputs.clone()), Ok(vec![values]));
 
         let evaluation = program
-            .partially_evaluate(&[PartialValue::Unknown(stack), PartialValue::Unknown(runtime_length)])
+            .partially_evaluate(&[PartialValue::Unknown(stack), PartialValue::Unknown(iteration_count)])
             .unwrap();
         assert_eq!(
             evaluation.program.to_string(),
@@ -7439,7 +7444,7 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_dynamic_length() {
-        // A dynamic-length scan carries one runtime-length instruction input after the body's inputs, so the scan
+        // A dynamic-length scan carries one iteration count instruction input after the body's inputs, so the scan
         // discharge rule's arity validation must accept the one-past-body parent arity instead of rejecting the
         // canonical dynamic form.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(9)).unwrap());
@@ -7462,14 +7467,14 @@ mod tests {
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
+        let iteration_count = builder.add_input(DimensionType::from(length.clone()).into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let scanned = builder
             .add_instruction(
                 ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length.clone())),
                 vec![body],
-                vec![reference, runtime_length],
+                vec![reference, iteration_count],
                 None,
             )
             .unwrap()[0];
@@ -7479,10 +7484,10 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let runtime_length = TestIrValue::Dimension(DimensionValue::new(DimensionType::from(length), 4).unwrap());
+        let iteration_count = TestIrValue::Dimension(DimensionValue::new(DimensionType::from(length), 4).unwrap());
         let eager = source
             .clone()
-            .interpret(vec![TestIrValue::Array(Array::scalar(0.0f32).unwrap()), runtime_length.clone()])
+            .interpret(vec![TestIrValue::Array(Array::scalar(0.0f32).unwrap()), iteration_count.clone()])
             .unwrap();
         assert_eq!(eager, vec![TestIrValue::Array(Array::scalar(12.0f32).unwrap())]);
         assert_eq!(
@@ -7520,7 +7525,7 @@ mod tests {
         assert_eq!(
             discharged
                 .program()
-                .interpret(vec![TestIrValue::Array(Array::scalar(0.0f32).unwrap()), runtime_length]),
+                .interpret(vec![TestIrValue::Array(Array::scalar(0.0f32).unwrap()), iteration_count]),
             Ok(eager)
         );
     }
@@ -7528,9 +7533,9 @@ mod tests {
     #[test]
     fn test_scan_reference_discharge_dynamic_length_with_an_empty_reference_carry() {
         // The body indexes an empty reference carry with its index, which is valid only when no iteration runs. A
-        // runtime length that admits iterations keeps the body, whose discharged access would slice the empty axis, so
+        // iteration count that admits iterations keeps the body, whose discharged access would slice the empty axis, so
         // discharge (which every compiled execution performs before lowering) rejects the scan with that typed error
-        // even though eager interpretation succeeds at runtime length 0.
+        // even though eager interpretation succeeds at iteration count 0.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -7555,10 +7560,10 @@ mod tests {
         let body = builder.import_program(body);
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let elements = builder.add_input(empty_type.clone().into());
-        let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
+        let iteration_count = builder.add_input(DimensionType::from(length.clone()).into());
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
         let scan = ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length.clone()));
-        let outputs = builder.add_instruction(scan, vec![body], vec![initial, root, runtime_length], None).unwrap()[0];
+        let outputs = builder.add_instruction(scan, vec![body], vec![initial, root, iteration_count], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![outputs], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
@@ -7634,14 +7639,14 @@ mod tests {
         let empty = builder.add_input(empty_type.into());
         let row_count = builder.add_input(DimensionType::from(rows.clone()).into());
         let values = builder.add_input(values_type.into());
-        let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
+        let iteration_count = builder.add_input(DimensionType::from(length.clone()).into());
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![empty], None).unwrap()[0];
         let body = builder.import_program(body);
         let outputs = builder
             .add_instruction(
                 ScanOperation::<ArrayIrType>::new(3, Dimension::Dynamic(length.clone())),
                 vec![body],
-                vec![root, row_count, values, runtime_length],
+                vec![root, row_count, values, iteration_count],
                 None,
             )
             .unwrap()
@@ -8646,8 +8651,8 @@ mod tests {
     fn test_scan_reference_discharge_moves_carried_stacks_ahead_of_array_stacks() {
         // The body maps `[carry, stack: ref<f32[3]>, x]` to `[carry + stack[index], stack[index]]` after adding `x` to
         // `stack[index]`. Discharge carries the state of the reference stack whole, so its input moves into the carry
-        // prefix ahead of the ordinary array stack, which keeps its order, and a dynamic length keeps its runtime
-        // length as the trailing input.
+        // prefix ahead of the ordinary array stack, which keeps its order, and a dynamic length keeps its iteration
+        // count as the trailing input.
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
         let row_transforms =
             vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
@@ -8686,16 +8691,16 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let program = |operation: ScanOperation<ArrayIrType>, runtime_length: Option<&DimensionType>| {
+        let program = |operation: ScanOperation<ArrayIrType>, iteration_count: Option<&DimensionType>| {
             let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
             let body = builder.import_program(body.clone());
             let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let elements = builder.add_input(stacked_type.clone().into());
             let xs = builder.add_input(stacked_type.clone().into());
-            let runtime_length = runtime_length.map(|r#type| builder.add_input(r#type.clone().into()));
+            let iteration_count = iteration_count.map(|r#type| builder.add_input(r#type.clone().into()));
             let stack =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
-            let inputs = [initial, stack, xs].into_iter().chain(runtime_length).collect::<Vec<_>>();
+            let inputs = [initial, stack, xs].into_iter().chain(iteration_count).collect::<Vec<_>>();
             let input_count = inputs.len();
             let outputs = builder.add_instruction(operation, vec![body], inputs, None).unwrap().to_vec();
             let frozen =
@@ -8744,7 +8749,7 @@ mod tests {
         );
         assert_eq!(discharged.program().interpret(inputs.clone()), Ok(expected.clone()));
 
-        // A reference stack beside a dynamic length must have a leading extent that the exact runtime length proves.
+        // A reference stack beside a dynamic length must have a leading extent that the exact iteration count proves.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         let source = program(ScanOperation::new(1, Dimension::Dynamic(length)), Some(&three));
@@ -9014,7 +9019,7 @@ mod tests {
             Ok(vec![Array::scalar(1.0).unwrap(), empty]),
         );
 
-        // A homogeneous array scan has no runtime length input, so its application rejects a dynamic length.
+        // A homogeneous array scan has no iteration count input, so its application rejects a dynamic length.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let bodies = [Arc::new(product_body())];
         let region_driver = CalleeRegionDriver::new(&bodies);
@@ -9033,7 +9038,7 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_validates_direct_rule_contracts() {
-        // Direct application validates the input count in both universes, including the trailing runtime length of a
+        // Direct application validates the input count in both universes, including the trailing iteration count of a
         // dynamic scan.
         let bodies = [Arc::new(product_body())];
         let region_driver = CalleeRegionDriver::new(&bodies);
@@ -9130,7 +9135,7 @@ mod tests {
         // A constant or renamed dimension of extent 3 refines the body's `dimension<n>` carry. Direct eager binding
         // must allocate the stacked `f32[n]` output through that accepted refinement, exactly as program replay does.
         // This is the only way in which an eager empty stack can keep a symbolic dimension: eager inputs, including the
-        // runtime length, have exact types whose facts refine every other identity, and type inference rejects outputs
+        // iteration count, have exact types whose facts refine every other identity, and type inference rejects outputs
         // with identities that neither an input carries nor an output defines. An output can define an identity only
         // as a dimension carry, whose body input and actual input are then both first-class dimensions, so the
         // "cannot eagerly allocate" error of `ArrayIrType::empty_stack` is unreachable.
@@ -9414,7 +9419,7 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_validates_concrete_dynamic_stack_lengths() {
-        // A concrete stack that shares the identity of the dynamic length must have the extent of the runtime length,
+        // A concrete stack that shares the identity of the dynamic length must have the extent of the iteration count,
         // so both program replay and direct eager binding run a matching application and reject a mismatched one.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
         let scalar = ArrayType::scalar(DataType::F64);
@@ -9444,8 +9449,8 @@ mod tests {
             ]),
             Ok(vec![carry.clone(), stack.clone()]),
         );
-        // Program entry rejects a runtime length payload that disagrees with the stack sharing its identity. Binding
-        // the scan directly validates the stack against the exact runtime length with the same error.
+        // Program entry rejects an iteration count payload that disagrees with the stack sharing its identity. Binding
+        // the scan directly validates the stack against the exact iteration count with the same error.
         for extent in [3, 1] {
             let inputs = vec![carry.clone(), stack.clone(), dimension(&DimensionType::from(length.clone()), extent)];
             let expected = Err(input_dimension_mismatch("length", 2, extent));
@@ -10712,11 +10717,11 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_guards_nested_scans_on_the_known_side() {
-        // An outer scan carries a runtime length of type `dimension<length>` and an `f32[3]` stack for an inner scan,
+        // An outer scan carries an iteration count of type `dimension<length>` and an `f32[3]` stack for an inner scan,
         // whose boundary relates the two, and an unknown accumulator. Splitting the inner scan within the outer body
         // guards that relationship, and because both of its members are known, the guard lands in the known outer
-        // scan, which passes the checked runtime length to the residual scan. An eager parent therefore rejects a
-        // mismatched runtime length while partially evaluating, as the source program rejects it while executing.
+        // scan, which passes the checked iteration count to the residual scan. An eager parent therefore rejects a
+        // mismatched iteration count while partially evaluating, as the source program rejects it while executing.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let length_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -10738,7 +10743,7 @@ mod tests {
             .unwrap();
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
-        let runtime_length = body.add_input(length_type.clone());
+        let iteration_count = body.add_input(length_type.clone());
         let accumulator = body.add_input(scalar_type.clone());
         let values = body.add_input(three_type.clone());
         let inner = body.import_program(inner);
@@ -10746,13 +10751,13 @@ mod tests {
             .add_instruction(
                 ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length.clone())),
                 vec![inner],
-                vec![accumulator, values, runtime_length],
+                vec![accumulator, values, iteration_count],
                 None,
             )
             .unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
-                vec![runtime_length, next, values],
+                vec![iteration_count, next, values],
                 vec![Placeholder; 4],
                 vec![Placeholder; 3],
             )
@@ -12246,10 +12251,10 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_keeps_known_scans_of_dynamic_length_that_forward_stacked_outputs() {
-        // The same coefficient-only known side under a runtime length keeps an explicit known scan, because the
-        // outputs of a runtime-length scan may refine the symbolic extent types of its stacked inputs. The known scan
-        // is staged into the outer trace over the known stack and runtime length, while the residual scan reads the
-        // original stack.
+        // The same coefficient-only known side under an iteration count keeps an explicit known scan, because the
+        // outputs of a scan with a dynamic iteration count may refine the symbolic extent types of its stacked inputs.
+        // The known scan is staged into the outer trace over the known stack and iteration count, while the residual
+        // scan reads the original stack.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -12277,14 +12282,14 @@ mod tests {
         );
         let outer = TestIrTracingContext::new();
         let values = outer.input(stacked_type);
-        let runtime_length = outer.input(length_type);
+        let iteration_count = outer.input(length_type);
         let evaluation = program
             .partially_evaluate_in_context(
                 &outer,
                 &[
                     PartialValue::Unknown(scalar_type),
                     PartialValue::Known(values.clone()),
-                    PartialValue::Known(runtime_length.clone()),
+                    PartialValue::Known(iteration_count.clone()),
                 ],
             )
             .unwrap();
@@ -12319,7 +12324,7 @@ mod tests {
             vec![
                 PartialEvaluationInput::Unknown(0),
                 PartialEvaluationInput::Known(values),
-                PartialEvaluationInput::Known(runtime_length),
+                PartialEvaluationInput::Known(iteration_count),
             ],
         );
         assert_eq!(
@@ -12432,7 +12437,7 @@ mod tests {
     #[test]
     fn test_scan_partial_evaluation_dynamic_length() {
         // A dynamic-length array IR scan folds its loop-invariant known carry like a static one, and the rewritten
-        // residual scan keeps the dynamic length and its trailing runtime length input. The body maps
+        // residual scan keeps the dynamic length and its trailing iteration count input. The body maps
         // `[scale, accumulator, x]` to `[scale, accumulator + scale * x, scale * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -12525,11 +12530,11 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_dynamic_length_hoists_computed_invariants() {
-        // A runtime length whose bounds exclude zero guarantees an iteration, so the split hoists computed invariant
+        // An iteration count whose bounds exclude zero guarantees an iteration, so the split hoists computed invariant
         // work as for a static length. The body maps `[scale, accumulator, x]` to
         // `[scale, accumulator + (scale * scale) * x]` over a known passed-through `scale`: the outer trace computes
         // `scale * scale` once before the scan, and the residual scan threads it as an invariant carry, even though the
-        // runtime length is unknown.
+        // iteration count is unknown.
         let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -12686,18 +12691,18 @@ mod tests {
         );
         let zero = TestIrValue::Array(Array::scalar(0i32).unwrap());
         let empty = TestIrValue::Array(Array::vector(Vec::<i32>::new()).unwrap());
-        let runtime_length =
+        let iteration_count =
             TestIrValue::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 0).unwrap());
         let context = TestIrEagerContext::new();
 
-        // A known runtime length is an eager value with the exact extent 0, so an unknown stack must be typed
+        // A known iteration count is an eager value with the exact extent 0, so an unknown stack must be typed
         // consistently with it: a symbolic leading axis could not be proven to have that extent.
         let empty_type = ArrayIrType::Array(ArrayType::new_static(DataType::I32, [0]));
         let evaluation = program
             .partially_evaluate(&[
                 PartialValue::Known(zero.clone()),
                 PartialValue::Unknown(empty_type),
-                PartialValue::Known(runtime_length.clone()),
+                PartialValue::Known(iteration_count.clone()),
             ])
             .unwrap();
         assert_eq!(
@@ -12724,7 +12729,7 @@ mod tests {
             vec![
                 PartialEvaluationInput::Unknown(1),
                 PartialEvaluationInput::Known(empty.clone()),
-                PartialEvaluationInput::Known(runtime_length.clone()),
+                PartialEvaluationInput::Known(iteration_count.clone()),
             ],
         );
         let four = TestIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap());
@@ -12764,15 +12769,15 @@ mod tests {
             evaluation.outputs,
             vec![PartialEvaluationOutput::Known(zero.clone()), PartialEvaluationOutput::Unknown(0)],
         );
-        assert_eq!(evaluation.interpret(&context, &[empty.clone(), runtime_length]), Ok(vec![zero, empty]));
+        assert_eq!(evaluation.interpret(&context, &[empty.clone(), iteration_count]), Ok(vec![zero, empty]));
     }
 
     #[test]
-    fn test_scan_partial_evaluation_with_a_known_exact_runtime_length_and_a_symbolic_stack() {
-        // A known runtime length has the exact type `dimension<3>`, which the symbolic leading axis of an unknown stack
-        // cannot be proven to match, so the scan boundary checks the stack at runtime. Partial evaluation of a program
-        // checks it earlier: its entry guard relates the declared program inputs to the known and unknown values, which
-        // refines the stack to `f32[3]` before the scan, and executing the residual program checks it.
+    fn test_scan_partial_evaluation_with_a_known_exact_iteration_count_and_a_symbolic_stack() {
+        // A known iteration count has the exact type `dimension<3>`, which the symbolic leading axis of an unknown
+        // stack cannot be proven to match, so the scan boundary checks the stack at runtime. Partial evaluation of a
+        // program checks it earlier: its entry guard relates the declared program inputs to the known and unknown
+        // values, which refines the stack to `f32[3]` before the scan, and executing the residual program checks it.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -12797,13 +12802,13 @@ mod tests {
             body.clone(),
             vec![scalar_type.clone(), stacked_type.clone(), DimensionType::from(length.clone()).into()],
         );
-        let runtime_length =
+        let iteration_count =
             TestIrValue::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 3).unwrap());
         let evaluation = program
             .partially_evaluate(&[
                 PartialValue::Known(array(Array::scalar(1f32).unwrap())),
                 PartialValue::Unknown(stacked_type.clone()),
-                PartialValue::Known(runtime_length.clone()),
+                PartialValue::Known(iteration_count.clone()),
             ])
             .unwrap();
         assert_eq!(
@@ -12834,13 +12839,13 @@ mod tests {
         );
 
         // Type inference, which every scan rule validates first, admits the application while the stack stays
-        // symbolic, and the scan boundary checks the stack against the exact runtime length when it executes.
+        // symbolic, and the scan boundary checks the stack against the exact iteration count when it executes.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let body = builder.import_program(body);
         let inputs = vec![
             builder.add_input(scalar_type),
             builder.add_input(stacked_type),
-            builder.add_input(runtime_length.r#type().into_owned()),
+            builder.add_input(iteration_count.r#type().into_owned()),
         ];
         let outputs = builder
             .add_instruction(ScanOperation::new(1, Dimension::Dynamic(length)), vec![body], inputs, None)
@@ -12863,16 +12868,16 @@ mod tests {
                 in (%3)"},
         );
         let inputs = |stack: Vec<f32>| {
-            vec![array(Array::scalar(1f32).unwrap()), array(Array::vector(stack).unwrap()), runtime_length.clone()]
+            vec![array(Array::scalar(1f32).unwrap()), array(Array::vector(stack).unwrap()), iteration_count.clone()]
         };
         assert_eq!(program.interpret(inputs(vec![1.0, 2.0, 3.0])), Ok(vec![array(Array::scalar(7f32).unwrap())]));
         assert_eq!(program.interpret(inputs(vec![1.0, 2.0])), Err(input_dimension_mismatch("length", 2, 3)));
     }
 
     #[test]
-    fn test_scan_partial_evaluation_keeps_scans_whole_for_an_unknown_runtime_length() {
-        // A split that stacks known per-iteration work needs a known scan over the runtime length. Under a staging
-        // known side with an unknown runtime length, that known scan could only be residualized next to the unknown
+    fn test_scan_partial_evaluation_keeps_scans_whole_for_an_unknown_iteration_count() {
+        // A split that stacks known per-iteration work needs a known scan over the iteration count. Under a staging
+        // known side with an unknown iteration count, that known scan could only be residualized next to the unknown
         // scan, so the scan stays whole: the outer trace gains nothing and one residual scan consumes the known stack.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -12945,11 +12950,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_splits_with_a_known_carry_related_to_an_unknown_runtime_length() {
+    fn test_scan_partial_evaluation_splits_with_a_known_carry_related_to_an_unknown_iteration_count() {
         // The body declares its passed-through carry as `f32[length]`, which the known `f32[3]` carry relates to the
-        // unknown runtime length. A residual entry guard checks that relationship before the split, which narrows the
-        // runtime length to `dimension<3>`, so the known carry is forwarded and only the unknown carry stays in the
-        // residual scan, while the residual program still rejects a mismatched runtime length when it runs.
+        // unknown iteration count. A residual entry guard checks that relationship before the split, which narrows the
+        // iteration count to `dimension<3>`, so the known carry is forwarded and only the unknown carry stays in the
+        // residual scan, while the residual program still rejects a mismatched iteration count when it runs.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let vector_type =
@@ -14377,7 +14382,7 @@ mod tests {
     #[test]
     fn test_scan_batching_array_ir_preserves_reverse_and_unroll() {
         // The array IR rule threads the mapped extent as a leading replicated carry and keeps the dynamic length, its
-        // trailing runtime length input, the visit order, and the unroll factor of the source scan. The body maps
+        // trailing iteration count input, the visit order, and the unroll factor of the source scan. The body maps
         // `[carry, x]` to `[carry + x, carry]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -14448,12 +14453,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_array_ir_keeps_runtime_lengths_replicated() {
-        // A runtime length mapped over the batch would give each batch item its own trip count, which one scan over the
-        // packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch construction
-        // rejects it before any rule runs, as the `ArrayIrBatch` tests pin), so the rule always receives a replicated
-        // runtime length. It threads that length unchanged as the trailing input of the batched reversed scan, while
-        // the carry stays at batch axis 0 and the stacked input keeps its batch axis behind the leading scan axis.
+    fn test_scan_batching_array_ir_keeps_iteration_counts_replicated() {
+        // An iteration count mapped over the batch would give each batch item its own trip count, which one scan over
+        // the packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch
+        // construction rejects it before any rule runs, as the `ArrayIrBatch` tests pin), so the rule always receives a
+        // replicated iteration count. It threads that length unchanged as the trailing input of the batched reversed
+        // scan, while the carry stays at batch axis 0 and the stacked input keeps its batch axis behind the leading
+        // scan axis.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -14525,7 +14531,7 @@ mod tests {
 
     #[test]
     fn test_scan_batching_array_ir_validates_concrete_eager_runtime_extents() {
-        // An eager runtime length and the packed eager arrays it describes have exact types, so valid direct binding
+        // An eager iteration count and the packed eager arrays it describes have exact types, so valid direct binding
         // executes and unequal lengths are rejected before they can truncate or over-read the packed stack.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -14635,10 +14641,10 @@ mod tests {
 
     #[test]
     fn test_scan_batching_array_ir_retains_relationships_of_stacks_beside_passed_through_carries() {
-        // An `f32[3]` stack next to a runtime length of type `dimension<length>` is checked only at the scan boundary,
-        // and the only carry passes through unchanged. Forwarding the carry from its batched input would leave the
-        // staged batched scan dead and drop that check, so the batched scan keeps producing it and rejects a runtime
-        // length of 2 exactly as the source program does.
+        // An `f32[3]` stack next to an iteration count of type `dimension<length>` is checked only at the scan
+        // boundary, and the only carry passes through unchanged. Forwarding the carry from its batched input would
+        // leave the staged batched scan dead and drop that check, so the batched scan keeps producing it and rejects an
+        // iteration count of 2 exactly as the source program does.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -14682,12 +14688,12 @@ mod tests {
         );
         let carries = array(Array::vector(vec![1f32, 2.0]).unwrap());
         let values = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
-        let inputs = |runtime_length| {
+        let inputs = |iteration_count| {
             vec![
                 TestIrValue::Dimension(extent.clone()),
                 carries.clone(),
                 values.clone(),
-                dimension(&DimensionType::from(length.clone()), runtime_length),
+                dimension(&DimensionType::from(length.clone()), iteration_count),
             ]
         };
         let mismatch = Err(input_dimension_mismatch("length", 3, 2));
@@ -15059,10 +15065,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_zero_runtime_length_through_interpretation_partial_evaluation_and_batching() {
-        // A dynamic-length scan whose runtime length is zero runs no iteration when interpreted, partially evaluated,
-        // or batched: each staged program keeps one scan over the runtime length, and executing it at length zero
-        // returns the initial carry next to empty stacks. `test_scan_differentiation_zero_runtime_length` covers the
+    fn test_scan_zero_iteration_count_through_interpretation_partial_evaluation_and_batching() {
+        // A dynamic-length scan whose iteration count is zero runs no iteration when interpreted, partially evaluated,
+        // or batched: each staged program keeps one scan over the iteration count, and executing it at length zero
+        // returns the initial carry next to empty stacks. `test_scan_differentiation_zero_iteration_count` covers the
         // differentiation transforms of the same scan.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
         let length_type = DimensionType::from(length.clone());
@@ -15309,7 +15315,7 @@ mod tests {
             ]
         };
 
-        // The runtime length's extent agrees with the concrete stack. The unused stack has a structural-zero tangent,
+        // The iteration count's extent agrees with the concrete stack. The unused stack has a structural-zero tangent,
         // so only the known scan validates its original extents before returning the unchanged carry; the tangent body
         // needs no stack coefficient.
         let (outputs, pushforward) = linearize_scan_rule(&operation, &body, primals(3), &[1]).unwrap();
@@ -15327,11 +15333,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_keeps_runtime_length_relationships_on_the_primal_scan() {
-        // A carry declared `f32[length]` but supplied as `f32[3]` relates the runtime length to the extent 3, which
+    fn test_scan_differentiation_keeps_iteration_count_relationships_on_the_primal_scan() {
+        // A carry declared `f32[length]` but supplied as `f32[3]` relates the iteration count to the extent 3, which
         // only the scan boundary checks. Separate-context linearization splits that boundary, so it guards the primal
-        // inputs first: the primal program checks the relationship before its scan, which receives the runtime length
-        // narrowed to `dimension<3>`, and rejects a mismatched runtime length exactly as the source program does.
+        // inputs first: the primal program checks the relationship before its scan, which receives the iteration count
+        // narrowed to `dimension<3>`, and rejects a mismatched iteration count exactly as the source program does.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let vector_type =
@@ -15382,7 +15388,7 @@ mod tests {
         assert_eq!(program.interpret(inputs(2)), Err(input_dimension_mismatch("length", 3, 2)));
         assert_eq!(linearization.primal().interpret(inputs(2)), Err(input_dimension_mismatch("length", 3, 2)));
 
-        // With a matching runtime length, the sum carry squares itself on each of the three iterations and stacks the
+        // With a matching iteration count, the sum carry squares itself on each of the three iterations and stacks the
         // value that it squared, while the related carry passes through.
         assert_eq!(
             linearization.primal().interpret(inputs(3)),
@@ -15397,7 +15403,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_casts_narrowed_stack_tangents_through_primal_witnesses() {
-        // An `f32[length]` stack next to an exact runtime length of type `dimension<3>` is checked only at the scan
+        // An `f32[length]` stack next to an exact iteration count of type `dimension<3>` is checked only at the scan
         // boundary. The JVP guards the primal inputs, which narrows the stack to `f32[3]`, and casts the live stack
         // tangent to that type through a `dimension_size` witness of the primal stack, so a tangent whose extent
         // differs from the primal's is rejected. Linearization keeps the guard in the primal program, which returns
@@ -15421,17 +15427,17 @@ mod tests {
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let runtime_length = dimension(&DimensionType::from(length.clone()), 3);
+        let iteration_count = dimension(&DimensionType::from(length.clone()), 3);
         let program = scan_program(
             ScanOperation::new(1, Dimension::Dynamic(length.clone())),
             body,
-            vec![scalar_type, stacked_type, runtime_length.r#type().into_owned()],
+            vec![scalar_type, stacked_type, iteration_count.r#type().into_owned()],
         );
         let primals = |count: usize| {
             vec![
                 array(Array::scalar(2f32).unwrap()),
                 array(Array::vector(vec![1f32; count]).unwrap()),
-                runtime_length.clone(),
+                iteration_count.clone(),
             ]
         };
         let tangents =
@@ -15507,10 +15513,10 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_retains_reference_identities_in_entry_guards() {
-        // An `f32[3]` stack next to a `ref<f32[length]>` carry and a runtime length of type `dimension<length>` leaves
-        // `length` unproven. The JVP's entry guard checks all three members, but a reference cannot be cast, so it
-        // retains the reference's `length` identity instead of narrowing to `dimension<3>`, and it has outputs only
-        // for the stack and the runtime length. The guarded stack enters the fused scan as an `f32[length]`, its
+        // An `f32[3]` stack next to a `ref<f32[length]>` carry and an iteration count of type `dimension<length>`
+        // leaves `length` unproven. The JVP's entry guard checks all three members, but a reference cannot be cast, so
+        // it retains the reference's `length` identity instead of narrowing to `dimension<3>`, and it has outputs only
+        // for the stack and the iteration count. The guarded stack enters the fused scan as an `f32[length]`, its
         // tangent is cast to that type through a witness, and the reference carry is threaded unchanged.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -15587,12 +15593,12 @@ mod tests {
                     ]
                 in (%10, %12)"},
         );
-        let inputs = |runtime_length: usize| {
+        let inputs = |iteration_count: usize| {
             vec![
                 array(Array::scalar(2f32).unwrap()),
-                TestIrValue::Reference(ArrayReference::new(Array::vector(vec![0f32; runtime_length]).unwrap())),
+                TestIrValue::Reference(ArrayReference::new(Array::vector(vec![0f32; iteration_count]).unwrap())),
                 array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()),
-                dimension(&DimensionType::from(length.clone()), runtime_length),
+                dimension(&DimensionType::from(length.clone()), iteration_count),
                 array(Array::scalar(1f32).unwrap()),
                 array(Array::vector(vec![1f32, 1.0, 1.0]).unwrap()),
             ]
@@ -16300,9 +16306,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_zero_runtime_length() {
-        // A dynamic-length scan whose runtime length is zero runs no iteration under forward mode, linearization, or
-        // its pullback: each staged program keeps one scan over the runtime length, and executing it at length zero
+    fn test_scan_differentiation_zero_iteration_count() {
+        // A dynamic-length scan whose iteration count is zero runs no iteration under forward mode, linearization, or
+        // its pullback: each staged program keeps one scan over the iteration count, and executing it at length zero
         // returns the initial carry, or its tangent or cotangent, next to empty stacks.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
         let length_type = DimensionType::from(length.clone());
@@ -16417,10 +16423,10 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_guards_zero_trip_scans() {
-        // A carry declared `f32[length]` but supplied as `f32[3]` relates the runtime length to the extent 3, which the
-        // source scan checks even when no iteration runs. The JVP program and the primal program of the linearization
-        // check it through an entry guard before their scans, so they reject a runtime length of 0 like eager
-        // interpretation does.
+        // A carry declared `f32[length]` but supplied as `f32[3]` relates the iteration count to the extent 3, which
+        // the source scan checks even when no iteration runs. The JVP program and the primal program of the
+        // linearization check it through an entry guard before their scans, so they reject an iteration count of 0 like
+        // eager interpretation does.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let vector_type =
@@ -16484,7 +16490,7 @@ mod tests {
         };
         assert_eq!(jvp.interpret(jvp_inputs(0)), mismatch);
 
-        // With a matching runtime length, the sum carry squares itself three times from `2` with the unit tangent
+        // With a matching iteration count, the sum carry squares itself three times from `2` with the unit tangent
         // `2 · s · ṡ` (i.e., `4`, `32`, and `1024`), while the related carry and its tangent pass through.
         let related = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
         let sum = array(Array::scalar(256f32).unwrap());
@@ -16529,7 +16535,7 @@ mod tests {
     #[test]
     fn test_scan_differentiation_dynamic_length() {
         // A dynamic-length array IR scan differentiates through its fused scan like a static one, threading its
-        // trailing runtime length input, which has no tangent. The body maps `[carry, x]` to `[carry * x, carry * x]`.
+        // trailing iteration count input, which has no tangent. The body maps `[carry, x]` to `[carry * x, carry * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -18433,9 +18439,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transform_orders_with_an_unknown_runtime_length() {
+    fn test_scan_transform_orders_with_an_unknown_iteration_count() {
         // A dynamic-length cumulative product whose stacked input alone is differentiated and mapped. Both orders of
-        // batching and forward-mode differentiation stage the same fused scan, which keeps the trailing runtime length
+        // batching and forward-mode differentiation stage the same fused scan, which keeps the trailing iteration count
         // and threads the batch extent as a leading carry, and both compute the same values.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -18551,8 +18557,8 @@ mod tests {
         assert_eq!(batched_then_differentiated.interpret(inputs.clone()), outputs);
         assert_eq!(differentiated_then_batched.interpret(inputs), outputs);
 
-        // Partial evaluation of the differentiated program with a known primal carry and an unknown runtime length
-        // keeps the fused scan whole, because a known scan over the runtime length could not run on the known side.
+        // Partial evaluation of the differentiated program with a known primal carry and an unknown iteration count
+        // keeps the fused scan whole, because a known scan over the iteration count could not run on the known side.
         let evaluation = program
             .jvp_with_respect_to(&[1])
             .unwrap()
@@ -20038,9 +20044,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transposition_rejects_linear_runtime_lengths() {
-        // The trailing runtime length of a dynamic-length scan is structural, so selecting it as a linear input is
-        // rejected: the reversed scan needs the runtime length as a known value.
+    fn test_scan_transposition_rejects_linear_iteration_counts() {
+        // The trailing iteration count of a dynamic-length scan is structural, so selecting it as a linear input is
+        // rejected: the reversed scan needs the iteration count as a known value.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -20070,7 +20076,7 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]).map(|pullback| pullback.to_string()),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "`scan` transposition does not support a linear runtime length input; the trip count is \
+                message: "`scan` transposition does not support a linear iteration count input; the trip count is \
                           not differentiable"
                     .to_string(),
             })),
@@ -20790,7 +20796,7 @@ mod tests {
         // Only the final carry is a program output, so the stacked output is dead and its cotangent is a structural
         // zero of the dynamically shaped stacked type.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let runtime_length = builder.add_input(ArrayIrType::Dimension(DimensionType::from(length.clone())));
+        let iteration_count = builder.add_input(ArrayIrType::Dimension(DimensionType::from(length.clone())));
         let initial_carry = builder.add_input(item_type);
         let stacked_input = builder.add_input(stacked_type.clone());
         let body_region = builder.import_region(body.entry_region_ref());
@@ -20798,7 +20804,7 @@ mod tests {
             .add_instruction(
                 TestIrOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
                 vec![body_region],
-                vec![initial_carry, stacked_input, runtime_length],
+                vec![initial_carry, stacked_input, iteration_count],
                 None,
             )
             .unwrap()
@@ -21780,16 +21786,16 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_runtime_length_type() {
+    fn test_scan_type_iteration_count_type() {
         // An array IR scan takes a dynamic trip count from a trailing `dimension<length>` input, which a homogeneous
         // array scan does not admit.
         let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
         assert_eq!(
-            <ArrayIrType as ScanType>::runtime_length_type(&length),
+            <ArrayIrType as ScanType>::iteration_count_type(&length),
             Ok(ArrayIrType::Dimension(DimensionType::from(length.clone()))),
         );
         assert_eq!(
-            <ArrayType as ScanType>::runtime_length_type(&length),
+            <ArrayType as ScanType>::iteration_count_type(&length),
             Err(TypeError::invalid(
                 "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
@@ -21828,7 +21834,7 @@ mod tests {
     #[test]
     fn test_scan_type_validate_scan_body_type_signature() {
         // A declared body needs a scalar `i64` index and the same carry types on both of its boundaries, independently
-        // of the inputs that bind it, and a dynamic length requires a family that admits a runtime length.
+        // of the inputs that bind it, and a dynamic length requires a family that admits an iteration count.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
@@ -21881,8 +21887,8 @@ mod tests {
     #[test]
     fn test_scan_type_validate_scan_input_type_signature() {
         // The inputs must refine the declared carries and supply stacks whose slices refine the declared slices,
-        // followed by a runtime length of the declared identity, or of one exact extent within its bounds, for a
-        // dynamic length. How that runtime length relates to the stacked axes is not validated here.
+        // followed by an iteration count of the declared identity, or of one exact extent within its bounds, for a
+        // dynamic length. How that iteration count relates to the stacked axes is not validated here.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
@@ -21997,7 +22003,7 @@ mod tests {
             )),
         );
 
-        // A runtime length input that pins one exact extent applies the same refinement rule to stacked references as
+        // An iteration count input that pins one exact extent applies the same refinement rule to stacked references as
         // to stacked arrays.
         let dynamic_length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
@@ -22023,7 +22029,7 @@ mod tests {
                 &Dimension::Dynamic(dynamic_length),
             ),
             Err(TypeError::invalid(
-                "`scan` runtime length input has type `dimension<4>` but stacked input 0 has type \
+                "`scan` iteration count input has type `dimension<4>` but stacked input 0 has type \
                  `ref<f32[length, 2]>` whose leading dimension is not refined to extent 4",
             )),
         );
@@ -22033,7 +22039,7 @@ mod tests {
     fn test_scan_type_infer_scan_output_types() {
         // The outputs are the carries followed by the stacked body outputs along a leading axis of the trip count,
         // placed as declared and refined by the facts that the inputs establish, including the trip count that an
-        // exact runtime length fixes.
+        // exact iteration count fixes.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();

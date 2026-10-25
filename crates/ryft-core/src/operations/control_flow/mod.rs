@@ -89,7 +89,7 @@ pub mod select;
 pub mod r#while;
 
 pub use condition::{CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType};
-pub use scan::{SCAN_OPERATION_NAME, ScanOperation, ScanType};
+pub use scan::{SCAN_OPERATION_NAME, ScanInterpretationDomain, ScanOperation, ScanType};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
 

@@ -33,6 +33,7 @@ use crate::operations::composites::rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer, CustomVjpOperation,
     derive_bijective_identity_renaming,
 };
+use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -137,20 +138,26 @@ impl<Input, Output> Debug for ExplicitJvp<Input, Output> {
 pub struct JvpFromPrimal;
 
 /// Forward-mode configuration of a [`Composite`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
-/// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` with [`MaybeZero`] leaves, of which the structurally zero ones are
-/// [`MaybeZero::Zero`]s (refer to [`Composite::with_symbolic_zero_jvp`]). `Tracer` is the tracer type of the closure's
-/// input leaves, which the leaves of its tangents wrap.
+/// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves, of which the
+/// structurally zero ones are [`MaybeZero::Zero`]s (refer to [`Composite::with_symbolic_zero_jvp`]). `Tracer` is the
+/// tracer type of the closure's leaves, which the leaves of its tangents wrap.
 pub struct SymbolicZeroJvp<Tracer: Typed + Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
-    jvp: Arc<dyn Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output), ProgramError> + Send + Sync>,
+    jvp: Arc<
+        dyn Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output::To<MaybeZero<Tracer>>), ProgramError>
+            + Send
+            + Sync,
+    >,
 }
 
 impl<Tracer: Typed + Parameter, Input, Output> Debug for SymbolicZeroJvp<Tracer, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("SymbolicZeroJvp").finish_non_exhaustive()
@@ -180,23 +187,29 @@ impl<Input, Output, Residual> Debug for ExplicitVjp<Input, Output, Residual> {
 }
 
 /// Reverse-mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
-/// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` with
-/// [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
-/// [`Composite::with_symbolic_zero_vjp`]). `Tracer` is the tracer type of the closures' output leaves, which the leaves
-/// of the seeds wrap.
+/// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` and returns
+/// `x̄` with [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
+/// [`Composite::with_symbolic_zero_vjp`]). `Tracer` is the tracer type of the closures' leaves, which the leaves of the
+/// seeds and cotangents wrap.
 pub struct SymbolicZeroVjp<Tracer: Typed + Parameter, Input, Output, Residual>
 where
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangent_seeds)`.
-    backward: Arc<dyn Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input, ProgramError> + Send + Sync>,
+    backward: Arc<
+        dyn Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input::To<MaybeZero<Tracer>>, ProgramError>
+            + Send
+            + Sync,
+    >,
 }
 
 impl<Tracer: Typed + Parameter, Input, Output, Residual> Debug for SymbolicZeroVjp<Tracer, Input, Output, Residual>
 where
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -363,7 +376,8 @@ where
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
-    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Output::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
 {
     fn configure(
         &self,
@@ -381,7 +395,7 @@ where
                 primals.iter().map(|primal| primal.r#type().into_owned()),
             )?;
             let tangent_activity = tangents.iter().map(|tangent| !tangent.is_zero()).collect::<Vec<_>>();
-            let program = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, _>(
+            let (program, output_tangent_zeros) = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, _>(
                 &name,
                 jvp.as_ref(),
                 input_types,
@@ -393,7 +407,18 @@ where
             let mut values = primals.to_vec();
             values.extend(tangents.iter().filter_map(MaybeZero::as_value).cloned());
             let mut outputs = program.interpret_in_context(primals[0].context(), values)?;
-            let output_tangents = outputs.split_off(output_structure.parameter_count());
+            let mut live_output_tangents = outputs.split_off(output_structure.parameter_count()).into_iter();
+
+            // The traced program returns only the live output tangents, so the structural zeros are reinserted at
+            // their positions, typed by the tangent types of the replayed outputs.
+            let output_tangents = outputs
+                .iter()
+                .zip(output_tangent_zeros)
+                .map(|(output, is_zero)| match is_zero {
+                    true => Ok(MaybeZero::Zero(output.r#type().tangent()?)),
+                    false => Ok(MaybeZero::Value(live_output_tangents.next().unwrap())),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
             Ok((outputs, output_tangents))
         })
     }
@@ -516,7 +541,8 @@ where
     V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + CustomVjpOperation<V>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
-    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Input::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Output::Family:
@@ -560,20 +586,31 @@ where
                         "`{name}` backward rule has neither leading inputs nor non-zero seeds",
                     )));
                 };
-                let program = trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
-                    &name,
-                    backward.as_ref(),
-                    &input_structure,
-                    types(&leading_inputs[..non_differentiated_count]),
-                    structure,
-                    residual_types,
-                    output_structure.clone(),
-                    seeds,
-                    named_axes.clone(),
-                )?;
+                let (program, cotangent_zeros) =
+                    trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
+                        &name,
+                        backward.as_ref(),
+                        &input_structure,
+                        types(&leading_inputs[..non_differentiated_count]),
+                        structure,
+                        residual_types,
+                        output_structure.clone(),
+                        seeds,
+                        named_axes.clone(),
+                    )?;
                 let mut values = leading_inputs.to_vec();
                 values.extend(live_seeds);
-                program.interpret_in_context(&context, values)
+                let mut live_cotangents = program.interpret_in_context(&context, values)?.into_iter();
+
+                // The traced program returns only the live cotangents, so the structural zeros are reinserted at their
+                // positions. Their types were traced at the actual types of the leading inputs and seeds.
+                Ok(cotangent_zeros
+                    .into_iter()
+                    .map(|zero| match zero {
+                        Some(r#type) => MaybeZero::Zero(r#type),
+                        None => MaybeZero::Value(live_cotangents.next().unwrap()),
+                    })
+                    .collect::<Vec<_>>())
             }
         };
         definition.with_symbolic_zero_vjp(forward, backward)
@@ -729,9 +766,14 @@ where
     }
 }
 
-/// Batching configuration of a [`Composite`] (i.e., [`DefaultBatching`], [`CustomBatching`], or
-/// [`AxisDependentBatching`]), which installs its custom batching rule, if any, in the retained definition that a call
-/// registers for the operation family `(V, O)`.
+/// Batching configuration of a [`Composite`] that batches its calls sequentially, by looping over the batch items with
+/// a scan (refer to [`Composite::with_sequential_batching`]).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SequentialBatching;
+
+/// Batching configuration of a [`Composite`] (i.e., [`DefaultBatching`], [`CustomBatching`], [`AxisDependentBatching`],
+/// or [`SequentialBatching`]), which installs its custom batching rule or sequential batching, if any, in the retained
+/// definition that a call registers for the operation family `(V, O)`.
 pub trait CompositeBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -846,6 +888,26 @@ where
             input_structure,
             output_structure,
         ))
+    }
+}
+
+impl<V, O, Input, Output> CompositeBatching<V, O, Input, Output> for SequentialBatching
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    V: 'static + Value<Type: Eq + Hash + ScanType>,
+    O: 'static + Operation<Type = V::Type> + From<ScanOperation<V::Type>>,
+    Input: Parameterized<CustomRuleTracer<V, O>>,
+    Output: Parameterized<CustomRuleTracer<V, O>>,
+{
+    #[inline]
+    fn configure(
+        &self,
+        definition: CustomRuleDefinition<V, O>,
+        _name: &Cow<'static, str>,
+        _input_structure: &Input::ParameterStructure,
+        _output_structure: &Output::ParameterStructure,
+    ) -> CustomRuleDefinition<V, O> {
+        definition.with_sequential_batching()
     }
 }
 
@@ -1230,12 +1292,14 @@ where
     Ok(program.into_flat_program())
 }
 
-/// Traces the structured custom Vector-Jacobian Product (VJP) backward closure `backward`, which receives structural
-/// zeros, in the `(V, O)` family and returns its flat rule program over
-/// `[non_differentiated_inputs..., residuals..., non_zero_output_cotangents...]`, which returns one cotangent per
-/// differentiated input. The closure receives a seed value whose leaves are the non-zero seeds and [`MaybeZero::Zero`]s
-/// at the positions of the structural-zero seeds, and it is otherwise validated as by
-/// [`trace_custom_vjp_backward_rule`].
+/// Traces the structured custom Vector-Jacobian Product (VJP) backward closure `backward`, which receives and returns
+/// structural zeros, in the `(V, O)` family and returns its flat rule program over
+/// `[non_differentiated_inputs..., residuals..., non_zero_output_cotangents...]`, which returns the cotangent of each
+/// differentiated input that is not a structural zero, together with the type of each differentiated input's
+/// structural-zero cotangent (or [`None`] for a cotangent that the program returns). The closure receives a seed value
+/// whose leaves are the non-zero seeds and [`MaybeZero::Zero`]s at the positions of the structural-zero seeds, it
+/// returns a cotangent value whose leaves are [`MaybeZero`]s (i.e., the analogue of a JAX backward rule returning
+/// `None` or a `SymbolicZero` for an input), and it is otherwise validated as by [`trace_custom_vjp_backward_rule`].
 ///
 /// # Parameters
 ///
@@ -1259,17 +1323,25 @@ fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, B
     output_structure: Output::ParameterStructure,
     seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
     named_axes: Vec<(String, NamedAxis)>,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<Option<V::Type>>), ProgramError>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
-    Input: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
+    Input: Parameterized<
+            CustomRuleTracer<V, O>,
+            Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
     Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
     Residual: Parameterized<CustomRuleTracer<V, O>>,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
-    Backward: ?Sized + Fn(Residual, Output::To<MaybeZero<CustomRuleTracer<V, O>>>) -> Result<Input, ProgramError>,
+    Backward: ?Sized
+        + Fn(
+            Residual,
+            Output::To<MaybeZero<CustomRuleTracer<V, O>>>,
+        ) -> Result<Input::To<MaybeZero<CustomRuleTracer<V, O>>>, ProgramError>,
 {
     let non_differentiated_count = non_differentiated_types.len();
     let residual_types = Residual::To::<V::Type>::from_parameters(residual_structure, residual_types)?;
@@ -1278,6 +1350,7 @@ where
         .filter_map(MaybeZero::as_value)
         .map(|seed| seed.r#type().into_owned())
         .collect::<Vec<_>>();
+    let mut cotangent_zeros = None;
     let (_, program) = DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
         |(_, residuals, live_seeds): (Vec<CustomRuleTracer<V, O>>, Residual, Vec<CustomRuleTracer<V, O>>)| {
             let mut live_seeds = live_seeds.into_iter();
@@ -1301,12 +1374,28 @@ where
                 )
                 .into());
             }
-            Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
+
+            // Only the live cotangents become program outputs, while the structural zeros are recorded by type.
+            let mut zeros = Vec::new();
+            let mut live_cotangents = Vec::new();
+            for cotangent in cotangents.into_parameters().skip(non_differentiated_count) {
+                match cotangent {
+                    MaybeZero::Value(cotangent) => {
+                        zeros.push(None);
+                        live_cotangents.push(cotangent);
+                    }
+                    MaybeZero::Zero(r#type) => zeros.push(Some(r#type)),
+                }
+            }
+            cotangent_zeros = Some(zeros);
+            Ok(live_cotangents)
         },
         (non_differentiated_types, residual_types, live_seed_types),
         named_axes,
     )?;
-    Ok(program.into_flat_program())
+
+    // The closure ran exactly once, so the structural zeros are always recorded.
+    Ok((program.into_flat_program(), cotangent_zeros.unwrap()))
 }
 
 /// Traces the structured custom Jacobian-Vector Product (JVP) closure `jvp` at `input_types` in the `(V, O)` family and
@@ -1362,12 +1451,14 @@ where
     without_non_differentiated_tangent_inputs(name, program.into_flat_program(), input_count, non_differentiated_count)
 }
 
-/// Traces the structured custom Jacobian-Vector Product (JVP) closure `jvp`, which receives structural zeros, at
-/// `input_types` in the `(V, O)` family and returns its flat rule program over `[inputs..., active_tangents...]`, which
-/// returns `[outputs..., output_tangents...]`. The closure receives a tangent value whose leaves are the active
-/// tangents of the differentiated inputs and [`MaybeZero::Zero`]s at the positions of their inactive tangents and of
-/// every non-differentiated input. Both halves of the closure's result must have the primal output structure
-/// `output_structure`.
+/// Traces the structured custom Jacobian-Vector Product (JVP) closure `jvp`, which receives and returns structural
+/// zeros, at `input_types` in the `(V, O)` family and returns its flat rule program over
+/// `[inputs..., active_tangents...]`, which returns `[outputs..., live_output_tangents...]`, together with whether each
+/// output tangent is a structural zero that the program does not return. The closure receives a tangent value whose
+/// leaves are the active tangents of the differentiated inputs and [`MaybeZero::Zero`]s at the positions of their
+/// inactive tangents and of every non-differentiated input, and it returns an output tangent value with [`MaybeZero`]
+/// leaves, whose structural zeros must have the tangent types of their outputs. Both halves of the closure's result
+/// must have the primal output structure `output_structure`.
 ///
 /// # Parameters
 ///
@@ -1387,7 +1478,7 @@ fn trace_symbolic_zero_custom_jvp_rule<V, O, Input, Output, Jvp>(
     output_structure: &Output::ParameterStructure,
     non_differentiated_count: usize,
     named_axes: Vec<(String, NamedAxis)>,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<bool>), ProgramError>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type: DifferentiableType>,
@@ -1397,8 +1488,13 @@ where
         ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
     Output: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
-    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Jvp: ?Sized + Fn(Input, Input::To<MaybeZero<CustomRuleTracer<V, O>>>) -> Result<(Output, Output), ProgramError>,
+    Output::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+    Jvp: ?Sized
+        + Fn(
+            Input,
+            Input::To<MaybeZero<CustomRuleTracer<V, O>>>,
+        ) -> Result<(Output, Output::To<MaybeZero<CustomRuleTracer<V, O>>>), ProgramError>,
 {
     let input_structure = input_types.parameter_structure();
     let tangent_types = input_types.parameters().map(|r#type| r#type.tangent()).collect::<Result<Vec<_>, _>>()?;
@@ -1407,34 +1503,70 @@ where
         .zip(tangent_activity)
         .filter_map(|(r#type, active)| active.then(|| r#type.clone()))
         .collect::<Vec<_>>();
-    let ((output_types, output_tangent_types), program) =
-        DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
-            |(inputs, active_tangents): (Input, Vec<CustomRuleTracer<V, O>>)| {
-                let mut active_tangents = active_tangents.into_iter();
-                let leaves = tangent_types.iter().enumerate().map(|(index, r#type)| {
-                    let active =
-                        index.checked_sub(non_differentiated_count).is_some_and(|index| tangent_activity[index]);
-                    match active {
-                        true => MaybeZero::Value(active_tangents.next().unwrap()),
-                        false => MaybeZero::Zero(r#type.clone()),
-                    }
-                });
-                jvp(
-                    inputs,
-                    Input::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(input_structure.clone(), leaves)?,
+    let mut output_tangent_zeros = None;
+    let ((output_types, _), program) = DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
+        |(inputs, active_tangents): (Input, Vec<CustomRuleTracer<V, O>>)| {
+            let mut active_tangents = active_tangents.into_iter();
+            let leaves = tangent_types.iter().enumerate().map(|(index, r#type)| {
+                let active = index.checked_sub(non_differentiated_count).is_some_and(|index| tangent_activity[index]);
+                match active {
+                    true => MaybeZero::Value(active_tangents.next().unwrap()),
+                    false => MaybeZero::Zero(r#type.clone()),
+                }
+            });
+            let (outputs, output_tangents) = jvp(
+                inputs,
+                Input::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(input_structure.clone(), leaves)?,
+            )?;
+            let output_tangent_structure = output_tangents.parameter_structure();
+            if &output_tangent_structure != output_structure {
+                return Err(rule_structure_mismatch(
+                    name,
+                    "JVP",
+                    "output tangent",
+                    output_structure,
+                    &output_tangent_structure,
                 )
-            },
-            (input_types, active_tangent_types),
-            named_axes,
-        )?;
-    for (value, rule_structure) in
-        [("output", output_types.parameter_structure()), ("output tangent", output_tangent_types.parameter_structure())]
-    {
-        if &rule_structure != output_structure {
-            return Err(rule_structure_mismatch(name, "JVP", value, output_structure, &rule_structure).into());
-        }
+                .into());
+            }
+
+            // Only the live output tangents become program outputs, while each structural zero must have the tangent
+            // type of its output, because the replay reinserts it with that type.
+            let mut zeros = Vec::new();
+            let mut live_output_tangents = Vec::new();
+            for (index, (output, tangent)) in outputs.parameters().zip(output_tangents.into_parameters()).enumerate() {
+                match tangent {
+                    MaybeZero::Value(tangent) => {
+                        zeros.push(false);
+                        live_output_tangents.push(tangent);
+                    }
+                    MaybeZero::Zero(r#type) => {
+                        let expected = output.r#type().tangent()?;
+                        if r#type != expected {
+                            return Err(TypeError::invalid(format!(
+                                "{} JVP rule returned a structural-zero tangent of type `{type}` for output {index}, \
+                                 whose tangent type is `{expected}`",
+                                describe_composite(name),
+                            ))
+                            .into());
+                        }
+                        zeros.push(true);
+                    }
+                }
+            }
+            output_tangent_zeros = Some(zeros);
+            Ok((outputs, live_output_tangents))
+        },
+        (input_types, active_tangent_types),
+        named_axes,
+    )?;
+    let output_type_structure = output_types.parameter_structure();
+    if &output_type_structure != output_structure {
+        return Err(rule_structure_mismatch(name, "JVP", "output", output_structure, &output_type_structure).into());
     }
-    Ok(program.into_flat_program())
+
+    // The closure ran exactly once, so the structural zeros are always recorded.
+    Ok((program.into_flat_program(), output_tangent_zeros.unwrap()))
 }
 
 /// Returns the error reported when the `value` structure (e.g., `"output"`) of the `rule` rule (e.g., `"JVP"`) of the
@@ -1806,6 +1938,15 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
     /// rule computes both the outputs and their tangents, so deriving the primal from it would make every
     /// un-differentiated call pay for tangent computation.
     ///
+    /// There is no analogue of JAX's [`defjvps`][defjvps], which takes one closure per argument and sums their
+    /// contributions. Inputs here are arbitrary [`Parameterized`] structures rather than positional arguments, so a
+    /// closure per input leaf would have to be indexed by flattened leaf position, which discards the structure that
+    /// the rule otherwise receives, and one rule over the structured tangent `ẋ` already expresses the same derivative
+    /// by summing the per-leaf contributions itself. A rule that should skip the contributions of inactive leaves, as
+    /// `defjvps` does for the arguments that are not differentiated, can use [`Self::with_symbolic_zero_jvp`] instead.
+    ///
+    /// [defjvps]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvps.html
+    ///
     /// # Parameters
     ///
     ///   - `jvp`: Closure implementing `(x, ẋ) ↦ (y, ẏ)`, where `ẏ = J_f(x) · ẋ`.
@@ -1839,18 +1980,52 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
     }
 
     /// Returns this function with the provided Jacobian-Vector Product (JVP) rule `(x, ẋ) ↦ (y, ẏ)`, which is used as
-    /// the rule of [`Self::with_jvp`] except that it receives `ẋ` with [`MaybeZero`] leaves (i.e., as an
-    /// `Input::To<MaybeZero<Tracer>>` value, such as `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an
-    /// input `(DomainTracer<C>, DomainTracer<C>)`): the leaves of structurally zero input tangents (e.g., those of
-    /// inputs that are not being differentiated, and those of every non-differentiated input) are
-    /// [`MaybeZero::Zero`]s, which lets the rule skip the work that they would otherwise require. Each pattern of
-    /// structurally zero input tangents is a separate specialization of the rule. This is the analogue of JAX's
-    /// `defjvp(..., symbolic_zeros=True)`.
+    /// the rule of [`Self::with_jvp`] except that it receives `ẋ` and returns `ẏ` with [`MaybeZero`] leaves (i.e., as
+    /// `Input::To<MaybeZero<Tracer>>` and `Output::To<MaybeZero<Tracer>>` values, such as
+    /// `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an input `(DomainTracer<C>, DomainTracer<C>)`).
+    /// The leaves of structurally zero input tangents (e.g., those of inputs that are not being differentiated, and
+    /// those of every non-differentiated input) are [`MaybeZero::Zero`]s, which lets the rule skip the work that they
+    /// would otherwise require, and the rule returns a [`MaybeZero::Zero`] of the output's tangent type for an output
+    /// whose tangent it knows to be zero (e.g., an output that does not depend on the active inputs), which then stays
+    /// a structural zero for the transforms that consume the tangent (e.g., reverse mode transposes no work for it).
+    /// Each pattern of structurally zero input tangents is a separate specialization of the rule. This is the analogue
+    /// of JAX's `defjvp(..., symbolic_zeros=True)`, including its symbolic-zero output tangents.
     ///
     /// `Tracer` must usually be annotated, because it cannot be inferred from `Input` (a [`Parameterized`] structure
     /// is generic over its leaf type): annotate the tangent parameter of the closure (e.g., `tangent:
     /// MaybeZero<Tracer>`) or pass `Tracer` explicitly. A `Tracer` that differs from the tracers of the context in
     /// which the function is called is rejected at compile time by [`Self::call`] rather than by this function.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     Array, ArrayOperation, Cos, DomainTracer, EagerContext, MaybeZero, ProgramError, Sin, Typed, composite,
+    /// #     differentiate_at,
+    /// # };
+    /// # fn main() -> Result<(), ProgramError> {
+    /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+    ///
+    /// // `x ↦ (sin(x), x)` whose rule declares the tangent of its second output to be a structural zero (e.g., because
+    /// // that output only reports the point at which the first one was evaluated).
+    /// let function = composite(|x: Tracer| Ok((x.sin()?, x))).with_symbolic_zero_jvp(
+    ///     |x: Tracer, tangent: MaybeZero<Tracer>| {
+    ///         let sine_tangent = match tangent {
+    ///             MaybeZero::Value(tangent) => MaybeZero::Value(x.cos()? * tangent),
+    ///             MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type),
+    ///         };
+    ///         let zero = MaybeZero::Zero(x.r#type().into_owned());
+    ///         Ok(((x.sin()?, x), (sine_tangent, zero)))
+    ///     },
+    /// );
+    /// let gradient = differentiate_at(Array::scalar(0.5f64)?).gradient(|x| {
+    ///     let (sine, point) = function.call(x)?;
+    ///     Ok(sine + point)
+    /// })?;
+    /// assert_eq!(gradient, Array::scalar(0.5f64.cos())?);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
     pub fn with_symbolic_zero_jvp<Tracer, Jvp>(
         self,
@@ -1859,7 +2034,11 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
     where
         Tracer: Typed + Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
-        Jvp: 'static + Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output), ProgramError> + Send + Sync,
+        Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+        Jvp: 'static
+            + Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output::To<MaybeZero<Tracer>>), ProgramError>
+            + Send
+            + Sync,
     {
         let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let jvp = SymbolicZeroJvp { jvp: Arc::new(jvp) };
@@ -1941,7 +2120,10 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     /// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) carrier whose transpose replays the backward
     /// program, so reverse mode uses exactly the user-supplied gradient, and the original call is never transposed. A
     /// call batched before it is differentiated batches both rule programs traced at the unbatched types and sums the
-    /// cotangents that the batched backward program produces for replicated inputs over the batch axis.
+    /// cotangents that the batched backward program produces for replicated inputs over the batch axis. There is no
+    /// analogue of JAX's `optimize_remat` option: under rematerialization (refer to
+    /// [`RematerializeOperation`](crate::RematerializeOperation)), the forward pass still runs `forward` rather than
+    /// the primal, instead of deferring `forward` to the backward pass that needs its residuals.
     ///
     /// Higher-order differentiation differentiates the backward program's ordinary operations, because the pullback
     /// replays that program inline. Both forward and reverse mode apply to a pullback, with respect to the primal
@@ -1970,15 +2152,50 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     }
 
     /// Returns this function with the provided reverse-mode forward rule `x ↦ (y, r)` and backward rule `(r, ȳ) ↦ x̄`,
-    /// which are used as the rules of [`Self::with_vjp`] except that the backward rule receives `ȳ` with [`MaybeZero`]
-    /// leaves (i.e., as an `Output::To<MaybeZero<Tracer>>` value): the leaves of structural-zero cotangent seeds (e.g.,
-    /// those of unused outputs) are [`MaybeZero::Zero`]s. This is the analogue of JAX's
-    /// `defvjp(..., symbolic_zeros=True)`, except that the forward rule receives no per-input differentiation flags.
+    /// which are used as the rules of [`Self::with_vjp`] except that the backward rule receives `ȳ` and returns `x̄`
+    /// with [`MaybeZero`] leaves (i.e., as `Output::To<MaybeZero<Tracer>>` and `Input::To<MaybeZero<Tracer>>` values).
+    /// The leaves of structural-zero cotangent seeds (e.g., those of unused outputs) are [`MaybeZero::Zero`]s, and the
+    /// rule returns a [`MaybeZero::Zero`] of an input's cotangent type for an input whose cotangent it knows to be zero
+    /// (e.g., an input that it treats as a parameter), which then contributes nothing to that input's cotangent and
+    /// stays a structural zero instead of being materialized and accumulated. This is the analogue of JAX's
+    /// `defvjp(..., symbolic_zeros=True)` together with a backward rule that returns `None` or a `SymbolicZero` for an
+    /// input, except that the forward rule receives no per-input differentiation flags (JAX's `perturbed` flags).
     ///
-    /// `Tracer` must usually be annotated, because it cannot be inferred from `Output` (a [`Parameterized`] structure
-    /// is generic over its leaf type): annotate the seed parameter of the backward closure (e.g., `seed:
+    /// `Tracer` must usually be annotated, because it cannot be inferred from `Input` or `Output` (a [`Parameterized`]
+    /// structure is generic over its leaf type): annotate the seed parameter of the backward closure (e.g., `seed:
     /// MaybeZero<Tracer>`) or pass `Tracer` explicitly. A `Tracer` that differs from the tracers of the context in
     /// which the function is called is rejected at compile time by [`Composite::call`] rather than by this function.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     Array, ArrayOperation, DomainTracer, EagerContext, MaybeZero, ProgramError, Typed, composite,
+    /// #     differentiate_at,
+    /// # };
+    /// # fn main() -> Result<(), ProgramError> {
+    /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+    ///
+    /// // `(scale, x) ↦ scale · x`, whose backward rule treats `scale` as a parameter by returning a structural zero
+    /// // for its cotangent instead of computing `x · ȳ`.
+    /// let scaled = composite(|(scale, x): (Tracer, Tracer)| Ok(scale * x)).with_symbolic_zero_vjp(
+    ///     |(scale, x): (Tracer, Tracer)| Ok((scale.clone() * x.clone(), (scale, x))),
+    ///     |(scale, x): (Tracer, Tracer), seed: MaybeZero<Tracer>| {
+    ///         let scale_cotangent = MaybeZero::Zero(scale.r#type().into_owned());
+    ///         let x_cotangent = match seed {
+    ///             MaybeZero::Value(seed) => MaybeZero::Value(scale * seed),
+    ///             MaybeZero::Zero(_) => MaybeZero::Zero(x.r#type().into_owned()),
+    ///         };
+    ///         Ok((scale_cotangent, x_cotangent))
+    ///     },
+    /// );
+    /// let inputs = (Array::scalar(3.0f64)?, Array::scalar(2.0f64)?);
+    /// let (scale_gradient, x_gradient) = differentiate_at(inputs).gradient(|inputs| scaled.call(inputs))?;
+    /// assert_eq!(scale_gradient, Array::scalar(0.0f64)?);
+    /// assert_eq!(x_gradient, Array::scalar(3.0f64)?);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
     pub fn with_symbolic_zero_vjp<Tracer, Residual, Forward, Backward>(
         self,
@@ -1987,9 +2204,13 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     ) -> Composite<Input, Output, Jvp, SymbolicZeroVjp<Tracer, Input, Output, Residual>, Batching>
     where
         Tracer: Typed + Parameter,
+        Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
         Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
         Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
-        Backward: 'static + Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input, ProgramError> + Send + Sync,
+        Backward: 'static
+            + Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input::To<MaybeZero<Tracer>>, ProgramError>
+            + Send
+            + Sync,
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
         let vjp = SymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward) };
@@ -2009,7 +2230,11 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     /// residuals `r` (with the structure that the forward rule returned), the output cotangent seeds with
     /// [`MaybeZero`] leaves (i.e., as an `Output::To<MaybeZero<Tracer>>` value), and the accumulators with
     /// [`CotangentAccumulator`] leaves (i.e., as an `Input::To<CotangentAccumulator>` value; the accumulators of
-    /// non-differentiated inputs are never needed). It returns a [`ProgramError`] like the other rules.
+    /// non-differentiated inputs are never needed). It returns a [`ProgramError`] like the other rules. An accumulator
+    /// to which the rule submits nothing (or only [`MaybeZero::Zero`]s, which emit no work) leaves its input's
+    /// cotangent a structural zero, so skipping an accumulator is how this rule declares a zero cotangent (i.e., the
+    /// analogue of a JAX backward rule returning `None` for an input, as [`Self::with_symbolic_zero_vjp`] expresses
+    /// with [`MaybeZero::Zero`]).
     ///
     /// `Tracer` and `Transposition` must usually be annotated, because neither can be inferred from `Input` or
     /// `Output` (a [`Parameterized`] structure is generic over its leaf type): annotate the transposition context and
@@ -2159,6 +2384,53 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         let batching = AxisDependentBatching { rule: Arc::new(rule) };
         Self::with_configuration(primal, jvp, vjp, batching, None, non_differentiated_count, name)
+    }
+
+    /// Returns this function with sequential batching, which batches its calls by looping over the batch items with a
+    /// scan (refer to [`ScanOperation`]) whose body applies the unbatched call to one item at a time, instead of
+    /// structurally batching its primal. This is the analogue of JAX's [`custom_batching.sequential_vmap`][sequential],
+    /// and a convenience over [`Self::with_batching`] for primals that have no batched form (e.g., a foreign kernel
+    /// called by [`Self::from_custom_call`] that processes one item at a time): the mapped inputs are moved to axis 0
+    /// and sliced by the scan, the replicated inputs are passed to every iteration unchanged, and every output is
+    /// mapped at axis 0. The batch extent must be static, and the context's family must support scans (i.e., its types
+    /// implement [`ScanType`] and its operations contain [`ScanOperation`]).
+    ///
+    /// Unlike a custom batching rule, which replaces the call's primal while preserving the call, batching replaces
+    /// the call with the scan, whose body calls the unbatched function. The function's derivative rules therefore keep
+    /// governing every item: differentiating the batched call differentiates the scan, whose body applies the
+    /// function's rules one item at a time, and a derivative derived from the primal that is batched after it is taken
+    /// is batched sequentially as well (i.e., JAX's `custom_vmap_jvp` behavior for `sequential_vmap`). Batching the
+    /// scan again at an enclosing batching level batches its body, whose call is again batched sequentially, so nested
+    /// batching yields nested scans.
+    ///
+    /// [sequential]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     Array, ArrayOperation, BatchAxis, DomainTracer, EagerContext, ProgramError, Sin, batch, composite,
+    /// # };
+    /// # fn main() -> Result<(), ProgramError> {
+    /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+    ///
+    /// // `x ↦ sin(x) · y` for one item at a time, with `y` shared by every batch item.
+    /// let function = composite(|(x, y): (Tracer, Tracer)| Ok(x.sin()? * y)).with_sequential_batching();
+    /// let outputs: Array = batch(
+    ///     |inputs| function.call(inputs),
+    ///     (Array::vector(vec![0.5f64, 1.0])?, Array::scalar(2.0f64)?),
+    ///     (BatchAxis::new(0), BatchAxis::replicated()),
+    ///     BatchAxis::new(0),
+    ///     None,
+    /// )?;
+    /// assert_eq!(outputs, Array::vector(vec![2.0 * 0.5f64.sin(), 2.0 * 1.0f64.sin()])?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn with_sequential_batching(self) -> Composite<Input, Output, Jvp, Vjp, SequentialBatching> {
+        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        Self::with_configuration(primal, jvp, vjp, SequentialBatching, None, non_differentiated_count, name)
     }
 
     /// Returns this function with the provided batch axes for the outputs of its batched calls, one per flattened
@@ -2315,7 +2587,7 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 ///     [`Composite::with_accumulating_vjp`] adds ones whose backward rule submits its cotangents to their destinations
 ///     (e.g., caller-provided buffers) instead of returning them, and
 ///   - [`Composite::with_batching`] adds a custom batching rule, which batches calls instead of structurally batching
-///     their primal.
+///     their primal, and [`Composite::with_sequential_batching`] batches calls by looping over their batch items.
 ///
 /// [`Composite::from_custom_call`] creates a function whose primal calls a foreign kernel. Every transform without a
 /// configured rule treats the primal as it treats any other function, so a function without derivative rules (e.g., one
@@ -2434,7 +2706,30 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 ///     batching applied _after_ forward-mode differentiation (refer to [`Composite::with_batching`]), and
 ///   - _differentiation_ replays the selected derivative rule programs instead of differentiating the primal (refer to
 ///     [`Composite::with_jvp`] and [`Composite::with_vjp`] for the semantics of each mode, including higher-order
-///     differentiation).
+///     differentiation), and
+///   - _dead code elimination_ (i.e., [`Program::into_pruned`]) prunes the unused outputs of a call from its primal
+///     while keeping every input, as JAX does for its custom derivative calls, and the call's rules are projected onto
+///     its remaining outputs, except that a call whose forward-mode rule is derived from its primal and that has a
+///     custom batching rule stays whole.
+///
+/// # Differences from JAX
+///
+/// Beyond the transforms that JAX lacks (e.g., reverse mode through a custom batching rule), the following differences
+/// are deliberate:
+///
+///   - **Partial Evaluation:** A call with unknown inputs is kept whole as a residual, together with its retained
+///     rules, rather than having the work that depends only on its known inputs hoisted out of it, because its rules
+///     are specialized for the complete call.
+///   - **Foreign Kernels:** A function created by [`Composite::from_custom_call`] needs at least one input, whose
+///     context the kernel call dispatches through.
+///   - **Differentiation Flags:** The reverse-mode forward rule receives no per-input differentiation flags (i.e.,
+///     JAX's `perturbed` flags), while the backward rule can still skip structural-zero seeds and return
+///     structural-zero cotangents (refer to [`Composite::with_symbolic_zero_vjp`]).
+///   - **Rematerialization:** There is no analogue of JAX's `optimize_remat` option (refer to
+///     [`Composite::with_vjp`]).
+///   - **Non-Differentiated Inputs:** Non-differentiated inputs are a prefix of flattened leaves, which must receive
+///     stopped gradients, rather than static argument positions whose gradients are stopped implicitly (refer to
+///     [`Composite::with_non_differentiated_count`]).
 ///
 /// # Parameters
 ///
@@ -3438,10 +3733,10 @@ mod tests {
             move |(x, y): (Tracer, Tracer), tangents: (MaybeZero<Tracer>, MaybeZero<Tracer>)| {
                 observed.lock().unwrap().push((tangents.0.is_zero(), tangents.1.is_zero()));
                 let tangent = match tangents {
-                    (MaybeZero::Value(dx), MaybeZero::Value(dy)) => dx * y.clone() + x.clone() * dy,
-                    (MaybeZero::Value(dx), MaybeZero::Zero(_)) => dx * y.clone(),
-                    (MaybeZero::Zero(_), MaybeZero::Value(dy)) => x.clone() * dy,
-                    (MaybeZero::Zero(r#type), MaybeZero::Zero(_)) => x.context().zero(&r#type)?,
+                    (MaybeZero::Value(dx), MaybeZero::Value(dy)) => MaybeZero::Value(dx * y.clone() + x.clone() * dy),
+                    (MaybeZero::Value(dx), MaybeZero::Zero(_)) => MaybeZero::Value(dx * y.clone()),
+                    (MaybeZero::Zero(_), MaybeZero::Value(dy)) => MaybeZero::Value(x.clone() * dy),
+                    (MaybeZero::Zero(r#type), MaybeZero::Zero(_)) => MaybeZero::Zero(r#type),
                 };
                 Ok((x * y, tangent))
             }
@@ -3459,6 +3754,82 @@ mod tests {
             Ok((Array::scalar(6.0).unwrap(), Array::scalar(5.0).unwrap())),
         );
         assert_eq!(*observed.lock().unwrap(), vec![(false, true), (false, false)]);
+    }
+
+    #[test]
+    fn test_composite_with_symbolic_zero_jvp_zero_output_tangents() {
+        // The JVP rule of `x ↦ (sin(x), x)` declares the tangent of its second output to be a structural zero (i.e.,
+        // it treats that output as a constant). The zero is materialized at the boundary of the rule's specialization,
+        // where replaying it recovers the structural zero, so it stays zero under forward mode, batching, reverse mode,
+        // and second-order differentiation, which all differ from the derivative of the primal.
+        type Tracer = DomainTracer<ArrayContext>;
+        let function =
+            composite(|x: Tracer| Ok((x.sin()?, x))).with_symbolic_zero_jvp(|x: Tracer, tangent: MaybeZero<Tracer>| {
+                let sine_tangent = match tangent {
+                    MaybeZero::Value(tangent) => MaybeZero::Value(x.cos()? * tangent),
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type),
+                };
+                let point_tangent = MaybeZero::Zero(x.r#type().into_owned());
+                Ok(((x.sin()?, x), (sine_tangent, point_tangent)))
+            });
+        let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
+        let jvp = program.into_flat_program().jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = cos %0
+                    %3:f64[] = mul %2 %1
+                    %4:f64[] = sin %0
+                    %5:f64[] = zero [type=f64[]]
+                    %6:f64[] = zero [type=f64[]]
+                in (%4, %0, %3, %6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
+            Ok((
+                (Array::scalar(2.0f64.sin()).unwrap(), Array::scalar(2.0).unwrap()),
+                (Array::scalar(2.0f64.cos()).unwrap(), Array::scalar(0.0).unwrap()),
+            )),
+        );
+
+        // Batching the derivative batches the materialized zero with the rest of the rule's specialization.
+        let batched = jvp
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0); 2],
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0); 4]),
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let x = [0.5, 1.0, 1.5];
+        assert_eq!(
+            batched.interpret(vec![Array::vector(x.to_vec()).unwrap(), Array::vector(vec![1.0; 3]).unwrap()]),
+            Ok(vec![
+                Array::vector(x.iter().map(|x| f64::sin(*x)).collect()).unwrap(),
+                Array::vector(x.to_vec()).unwrap(),
+                Array::vector(x.iter().map(|x| f64::cos(*x)).collect()).unwrap(),
+                Array::vector(vec![0.0; 3]).unwrap(),
+            ]),
+        );
+
+        // Reverse mode transposes no work for the structural zero, so the second output contributes nothing to the
+        // gradient, and second-order differentiation differentiates the replayed rule.
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| {
+                differentiate_at(x)
+                    .gradient(|x| {
+                        let (sine, point) = function.call(x)?;
+                        Ok::<_, ProgramError>(sine + point)
+                    })
+                    .unwrap()
+            }),
+            Ok((Array::scalar(2.0f64.cos()).unwrap(), Array::scalar(-(2.0f64.sin())).unwrap())),
+        );
     }
 
     #[test]
@@ -4262,11 +4633,11 @@ mod tests {
                     observed.lock().unwrap().push((seeds.0.is_zero(), seeds.1.is_zero()));
                     Ok(match seeds {
                         (MaybeZero::Value(sine_seed), MaybeZero::Value(cosine_seed)) => {
-                            cosine * sine_seed - sine * cosine_seed
+                            MaybeZero::Value(cosine * sine_seed - sine * cosine_seed)
                         }
-                        (MaybeZero::Value(sine_seed), MaybeZero::Zero(_)) => cosine * sine_seed,
-                        (MaybeZero::Zero(_), MaybeZero::Value(cosine_seed)) => -(sine * cosine_seed),
-                        (MaybeZero::Zero(r#type), MaybeZero::Zero(_)) => cosine.context().zero(&r#type)?,
+                        (MaybeZero::Value(sine_seed), MaybeZero::Zero(_)) => MaybeZero::Value(cosine * sine_seed),
+                        (MaybeZero::Zero(_), MaybeZero::Value(cosine_seed)) => MaybeZero::Value(-(sine * cosine_seed)),
+                        (MaybeZero::Zero(r#type), MaybeZero::Zero(_)) => MaybeZero::Zero(r#type),
                     })
                 }
             },
@@ -4284,6 +4655,91 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_with_symbolic_zero_vjp_zero_cotangents() {
+        // The backward rule of `(scale, x) ↦ scale · x · x` treats `scale` as a parameter by returning a structural
+        // zero for its cotangent. The zero is never computed: the pullback returns it as a structural zero, the
+        // transposed program of a batched call has no output for it, and second-order differentiation differentiates
+        // the backward rule's ordinary operations through its residuals.
+        type Tracer = DomainTracer<ArrayContext>;
+        let function = composite(|(scale, x): (Tracer, Tracer)| Ok(scale * x.clone() * x)).with_symbolic_zero_vjp(
+            |(scale, x): (Tracer, Tracer)| Ok((scale.clone() * x.clone() * x.clone(), (scale, x))),
+            |(scale, x): (Tracer, Tracer), seed: MaybeZero<Tracer>| {
+                let scale_cotangent = MaybeZero::Zero(scale.r#type().into_owned());
+                let x_cotangent = match seed {
+                    MaybeZero::Value(seed) => MaybeZero::Value((scale.clone() + scale) * x * seed),
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type),
+                };
+                Ok((scale_cotangent, x_cotangent))
+            },
+        );
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let inputs = (Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap());
+        let (_, pullback) = differentiate_at(inputs.clone()).vjp(|inputs| function.call(inputs)).unwrap();
+        assert_eq!(
+            pullback.apply(Array::scalar(1.0).unwrap()),
+            Ok((MaybeZero::Zero(scalar_type.clone()), MaybeZero::Value(Array::scalar(12.0).unwrap()))),
+        );
+        assert_eq!(
+            differentiate_at(inputs.clone()).gradient(|inputs| function.call(inputs)),
+            Ok((Array::scalar(0.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+
+        // A call batched before it is differentiated batches the backward specialization, which keeps the structural
+        // zero, so the pullback materializes it only at its own boundary.
+        let (_, program) =
+            ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
+        let batched = program
+            .into_flat_program()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let linearization = batched
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3] .
+                let %3:f64[] = add %1 %1
+                    %4:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %3
+                    %5:f64[3] = mul %4 %2
+                    %6:f64[3] = mul %5 %0
+                    %7:f64[] = zero [type=f64[]]
+                in (%7, %6)
+            "}
+            .trim_end(),
+        );
+        let residuals = linearization
+            .primal()
+            .interpret(vec![Array::scalar(3.0).unwrap(), Array::vector(vec![1.0, 2.0, 3.0]).unwrap()])
+            .unwrap();
+        let mut pullback_inputs = vec![Array::vector(vec![1.0; 3]).unwrap()];
+        pullback_inputs.extend(residuals.into_iter().skip(1));
+        assert_eq!(
+            pullback.interpret(pullback_inputs),
+            Ok(vec![Array::scalar(0.0).unwrap(), Array::vector(vec![6.0, 12.0, 18.0]).unwrap()]),
+        );
+
+        // The second derivatives `∂²f/∂x∂scale = 2 x` and `∂²f/∂x² = 2 scale` come from the operations of the backward
+        // rule.
+        assert_eq!(
+            differentiate_at(inputs).value_and_gradient(|inputs| {
+                let (_, x_gradient) = differentiate_at(inputs).gradient(|inputs| function.call(inputs)).unwrap();
+                x_gradient
+            }),
+            Ok((Array::scalar(12.0).unwrap(), (Array::scalar(4.0).unwrap(), Array::scalar(6.0).unwrap()))),
+        );
+    }
+
+    #[test]
     fn test_composite_with_symbolic_zero_vjp_dimension_residuals() {
         // The forward rule saves the dimension `n · n` of its input's extent `n`. Replaying the traced forward rule
         // mints a fresh identity for that dimension, so the backward rule must find the residual structure by type
@@ -4295,7 +4751,7 @@ mod tests {
         let function = composite(|x: ArrayIrTracer| Ok(x)).with_symbolic_zero_vjp(
             saved_extent,
             |_: ArrayIrTracer, seed: MaybeZero<ArrayIrTracer>| match seed {
-                MaybeZero::Value(seed) => Ok(seed),
+                MaybeZero::Value(seed) => Ok(MaybeZero::Value(seed)),
                 MaybeZero::Zero(_) => {
                     Err(ProgramError::InvalidArgument { message: "unexpected zero seed".to_string() })
                 }
@@ -4319,7 +4775,7 @@ mod tests {
             move |(): (), seed: MaybeZero<Tracer>| {
                 invocations.fetch_add(1, Ordering::SeqCst);
                 match seed {
-                    MaybeZero::Value(seed) => Ok(seed),
+                    MaybeZero::Value(seed) => Ok(MaybeZero::Value(seed)),
                     MaybeZero::Zero(_) => {
                         Err(ProgramError::InvalidArgument { message: "unexpected zero seed".to_string() })
                     }
@@ -6215,6 +6671,118 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_composite_with_sequential_batching() {
+        // Sequential batching loops over the batch items with a scan whose body calls the unbatched function, which
+        // agrees with structurally batching the same primal, including for an input mapped along an axis other than 0
+        // and for a replicated input, which becomes an invariant carry of the scan.
+        type Tracer = DomainTracer<ArrayContext>;
+        let primal = |(x, y): (Tracer, Tracer)| Ok(x.sin()? * y);
+        let sequential = composite(primal).with_sequential_batching().with_name("sine");
+        let structural = composite(primal).with_name("sine");
+        let inputs =
+            (Array::matrix(2, 3, vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0]).unwrap(), Array::vector(vec![2.0, -1.0]).unwrap());
+        let axes = (BatchAxis::new(1), BatchAxis::replicated());
+        let expected: Array =
+            batch(|inputs| structural.call(inputs), inputs.clone(), axes, BatchAxis::new(0), None).unwrap();
+        let actual: Array = batch(|inputs| sequential.call(inputs), inputs, axes, BatchAxis::new(0), None).unwrap();
+        assert_eq!(actual, expected);
+
+        // The batched program replaces the call with the scan, whose body applies the call to one item.
+        let vector_type = ArrayType::new_static(DataType::F64, [2]);
+        let (_, program) =
+            ArrayContext::trace(|inputs| sequential.call(inputs), (vector_type.clone(), vector_type)).unwrap();
+        let batched = program
+            .into_flat_program()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(1), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3], %1:f64[2] .
+                let %2:f64[3, 2] = transpose [permutation=[1, 0]] %0
+                    %3:f64[2], %4:f64[3, 2] = scan [carry_count=1, length=3, reverse=false] %1 %2 [
+                        body={
+                            lambda %0:i64[], %1:f64[2], %2:f64[2] .
+                            let %3:f64[2] = composite [name=\"sine\"] %2 %1 [
+                                primal={
+                                    lambda %0:f64[2], %1:f64[2] .
+                                    let %2:f64[2] = sin %0
+                                        %3:f64[2] = mul %2 %1
+                                    in (%3)
+                                },
+                            ]
+                            in (%1, %3)
+                        },
+                    ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // The derivatives of the batched call are those of the scan, whose body differentiates the call one item at a
+        // time, and a derivative taken before batching is batched sequentially as well.
+        let x = Array::matrix(3, 2, vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0]).unwrap();
+        let y = Array::vector(vec![2.0, -1.0]).unwrap();
+        let x_tangent = Array::matrix(3, 2, vec![1.0; 6]).unwrap();
+        let y_tangent = Array::vector(vec![0.0, 0.0]).unwrap();
+        let expected_tangent = Array::matrix(
+            3,
+            2,
+            [0.5f64, 1.0, 1.5, 2.0, 2.5, 3.0]
+                .iter()
+                .zip([2.0, -1.0].iter().cycle())
+                .map(|(x, y)| f64::cos(*x) * y)
+                .collect(),
+        )
+        .unwrap();
+        let (_, program) = ArrayContext::trace(
+            |inputs| sequential.call(inputs),
+            (ArrayType::new_static(DataType::F64, [2]), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+        let batch_then_differentiate = program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0
+            .jvp()
+            .unwrap();
+        let outputs = batch_then_differentiate
+            .interpret(vec![x.clone(), y.clone(), x_tangent.clone(), y_tangent.clone()])
+            .unwrap();
+        assert_eq!(outputs[1], expected_tangent);
+        let differentiate_then_batch = program
+            .jvp()
+            .unwrap()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0); 2]),
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        println!("RENDERING differentiate_then_batch\n{differentiate_then_batch}");
+        assert_eq!(differentiate_then_batch.to_string(), "");
+        let outputs = differentiate_then_batch.interpret(vec![x, y, x_tangent, y_tangent]).unwrap();
+        assert_eq!(outputs[1], expected_tangent);
     }
 
     #[test]
