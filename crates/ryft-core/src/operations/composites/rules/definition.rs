@@ -2,50 +2,48 @@
 //! stores its JVP, VJP, and batching callbacks, and the [`CustomVjpOperation`] requirements that its reverse-mode rules
 //! place on the operation family.
 
-use std::any::{Any, TypeId};
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Display};
-use std::hash::{Hash, Hasher};
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
-use lru::LruCache;
-
-use crate::arrays::{ArrayType, DataType, ShardingDimension};
-use crate::axes::{Axis, NamedAxis};
+use crate::arrays::{ArrayType, DataType};
+use crate::axes::NamedAxis;
 use crate::batching::{
-    BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
-    DiagonalBatchingPolicy, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
+    BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingPolicy, DiagonalBatchingPolicy,
+    ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
 };
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
-    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext,
+    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext,
 };
-use crate::macros::{check_count, check_types};
+use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::composites::describe_composite;
+use crate::operations::composites::rules::specialization::{
+    CustomRuleDerivation, specialization_error, transpose_backward_source_program,
+};
+use crate::operations::composites::rules::{
+    CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleDerivationKey, CustomRuleDifferentiator,
+    CustomRuleDischarger, CustomRuleProgram, CustomRuleSequentialScan, CustomRuleSpecializationRequest,
+    CustomRuleTracer, CustomRuleTransposer,
+};
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
-use crate::parameters::{Parameter, Placeholder};
+use crate::parameters::Parameter;
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ReferenceAccessOperation,
-    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType,
-    ReferenceTransform, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation, ReferenceDischargePolicy,
+    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
+    ReferenceType, Type, Typed, Value,
 };
-use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheError};
-use crate::tracing::{Tracer, TracingContext};
-use crate::operations::composites::describe_composite;
-use crate::operations::composites::rules::{CustomRuleBatchedOutputs, CustomRuleBatcher, CustomRuleDerivationKey, CustomRuleDifferentiator, CustomRuleDischarger, CustomRuleProgram, CustomRuleSequentialScan, CustomRuleSpecializationRequest, CustomRuleTracer, CustomRuleTransposer};
-use crate::operations::composites::rules::registration::{CustomRuleReference, CustomRuleRegistration};
-use crate::operations::composites::rules::specialization::{CustomRuleDerivation, specialization_error, transpose_backward_source_program};
-use crate::operations::composites::transpose::CompositeTransposeOperation;
+use crate::specialization::{ReentrantSpecializationError, SpecializationCacheError};
+use crate::tracing::TracingContext;
 
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
 static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);
@@ -130,7 +128,7 @@ where
 
 /// Retained custom Vector-Jacobian Product (VJP) forward rule `(p, x) ↦ (y, r)`, which returns the primal outputs
 /// together with the residuals that the backward rule consumes.
-trait CustomVjpForwardRule<V, O>: Send + Sync {
+pub(super) trait CustomVjpForwardRule<V, O>: Send + Sync {
     /// Applies this rule to the provided primal inputs.
     fn apply(
         &self,
@@ -165,7 +163,9 @@ where
 /// output, and it returns one cotangent per differentiated input. This is the primary reverse-mode form: it is a pure
 /// function of its inputs, like any other traced program, and transposition adds its results to whatever destination
 /// each differentiated input's cotangent has.
-pub(in crate::operations::composites) trait CustomVjpBackwardRule<V, O>: Send + Sync {
+pub(in crate::operations::composites) trait CustomVjpBackwardRule<V, O>:
+    Send + Sync
+{
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
@@ -200,7 +200,9 @@ where
 /// that they would otherwise require, and that returns its input cotangents as [`MaybeZero`]s, so that it can declare
 /// an input cotangent to be a structural zero without computing it. It is otherwise identical to
 /// [`CustomVjpBackwardRule`].
-pub(in crate::operations::composites) trait CustomSymbolicZeroVjpBackwardRule<V, O>: Send + Sync {
+pub(in crate::operations::composites) trait CustomSymbolicZeroVjpBackwardRule<V, O>:
+    Send + Sync
+{
     /// Applies this rule to the provided leading inputs and output cotangent seeds.
     fn apply(
         &self,
@@ -239,7 +241,9 @@ where
 /// differentiated inputs to their accumulators. A single rule therefore serves returned, caller-buffer, and ignored
 /// destinations, and can, for example, update only the affected entries of a caller-provided buffer instead of
 /// returning a full-sized cotangent.
-pub(in crate::operations::composites) trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
+pub(in crate::operations::composites) trait CustomVjpAccumulatingBackwardRule<V, O>:
+    Send + Sync
+{
     /// Applies this rule in the provided transposition context.
     fn apply(
         &self,
@@ -281,7 +285,7 @@ where
 /// Retained custom batching rule, which batches a call of a [`CustomRuleDefinition`] instead of structurally batching
 /// its primal region. It receives the batching level, the level's boundary inputs (e.g., a first-class batch extent),
 /// the call's batched inputs, and their batch axes, and it returns the batched outputs together with their batch axes.
-trait CustomBatchingRule<V: Typed, O>: Send + Sync {
+pub(super) trait CustomBatchingRule<V: Typed, O>: Send + Sync {
     /// Applies this rule to the provided batched inputs.
     fn apply(
         &self,
@@ -495,7 +499,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     pub(super) id: u64,
 
     /// Human-readable label used for rendering and diagnostics.
-    name: Cow<'static, str>,
+    pub(super) name: Cow<'static, str>,
 
     /// Named axes with which every rule is traced (refer to [`Self::with_named_axes`]).
     pub(super) named_axes: Vec<(String, NamedAxis)>,
@@ -549,7 +553,7 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Specializations that each thread is producing without a cache (i.e., after the registration handle was
     /// dropped), which reject recursive production exactly as a [`SpecializationCache`] does. The markers contain
     /// static keys only, so they never retain a program.
-    uncached_in_flight: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
+    pub(super) uncached_in_flight: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
 
     /// Definitions derived from this definition (refer to [`CustomRuleSpecializer::derived`]), held weakly so that a
     /// derived definition that some call still holds keeps its identity whether or not its registration is alive,
@@ -1081,26 +1085,29 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, Shape, ShardingDimension,
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, ShardingDimension};
+    use crate::batching::BatchingLevelExtent;
+    use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
+    use crate::operations::composites::rules::registration::CustomRuleRegistration;
+    use crate::operations::composites::rules::specialization::{
+        CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules,
     };
-    use crate::contexts::Context;
-    use crate::operations::arithmetic::MulOperation;
-    use crate::operations::references::{ReferenceAddUpdate, ReferenceNew, ReferenceRead};
-    use crate::programs::ReferenceType;
-    use crate::tests::{TestArrayOperation, hash_of};
-    use crate::operations::composites::builder::composite;
-    use crate::operations::composites::rules::{CustomRuleBackwardSpecializationKey, CustomRuleBatchingLevel, CustomRuleDerivationKind, CustomRuleSpecializationKey};
-    use crate::operations::composites::rules::specialization::{CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules, boundary_input_count};
     use crate::operations::composites::rules::tests::{MemberTracer, batching_rule_key};
-    use crate::operations::composites::tests::{IrTracer, MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition};
+    use crate::operations::composites::rules::{
+        CustomRuleBackwardSpecializationKey, CustomRuleBatchingLevel, CustomRuleDerivationKind,
+        CustomRuleSpecializationKey,
+    };
+    use crate::operations::composites::tests::{
+        MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition,
+    };
+    use crate::operations::references::{ReferenceAddUpdate, ReferenceNew, ReferenceRead};
+    use crate::programs::TypeError;
+    use crate::tests::TestArrayOperation;
 
     use super::*;
 

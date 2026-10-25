@@ -1,14 +1,12 @@
 //! The [`CompositeOperation`] that calls a primal program with custom derivative rules. The operation holds its rules
-//! either as attached rule regions or as retained rule sets (refer to [`CustomRuleSource`]), and reverse mode replaces a
-//! call with reverse-mode rules with a [`CompositeTransposeOperation`] carrier.
+//! either as attached rule regions or as retained rule sets (refer to [`CustomRuleSource`]), and reverse mode replaces
+//! a call with reverse-mode rules with a [`CompositeTransposeOperation`] carrier.
 
 // TODO(eaplatanios): Review this module.
 
-use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::LazyLock;
 
 use crate::axes::Axis;
 use crate::batching::{
@@ -19,27 +17,33 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext, TranspositionDriver,
+    DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::composites::rules::{
+    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey,
+    CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey,
+    CustomRuleSpecializer, CustomRuleTracer, derive_bijective_identity_renaming,
+};
+use crate::operations::composites::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
+use crate::operations::composites::{
+    describe_composite, replay_custom_jvp_rule, retained_carrier_batching, validate_composite_discharge_inputs,
+    validate_composite_reference_boundary, validate_composite_replay, validate_deferred_forward_rule,
+    validate_non_differentiated_count,
+};
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value, discharge_local_reference_operation,
-    discharge_reference_free_operation,
+    EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
+    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    discharge_local_reference_operation,
 };
 use crate::tracing::TracingContext;
-use crate::operations::composites::{describe_composite, replay_custom_jvp_rule, retained_carrier_batching, validate_composite_discharge_inputs, validate_composite_reference_boundary, validate_composite_replay, validate_deferred_forward_rule, validate_non_differentiated_count};
-use crate::operations::composites::rules::{CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey, CustomRuleDerivationKey, CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource, CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, boundary_input_count, derive_bijective_identity_renaming};
-use crate::operations::composites::transpose::{CompositeTransposeOperation, CompositeTransposeRules};
 
 /// Canonical operation name for [`CompositeOperation`].
 pub const COMPOSITE_OPERATION_NAME: &str = "composite";
@@ -1991,36 +1995,39 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, DataType,
-        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
+        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingLevelExtent, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
         batch,
     };
-    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::contexts::{Context, EagerContext};
     use crate::differentiation::forward::JvpPartitionTransform;
     use crate::differentiation::{
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, EverythingSavable,
-        ForwardModeDifferentiate, ReverseModeDifferentiate, TransposedProgram, TransposedProgramCotangent,
-        TranspositionDriver, differentiate_at, rematerialize,
+        ForwardModeDifferentiate, ReverseModeDifferentiate, TransposedProgramCotangent, differentiate_at,
+        rematerialize,
     };
-    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::zero::ZeroOperation;
-    use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::composites::builder::composite;
+    use crate::operations::composites::rules::{
+        CustomRuleBackwardSpecializationKey, CustomRuleRegistration, LiftedCustomRules,
+    };
+    use crate::operations::composites::tests::{
+        ArrayContext, ConvertedProgram, EagerArrayIrContext, IrDefinition, IrTracer, MemberDefinition,
+        ReferenceRuleDifferentiationDriver, RuleCounters, TestContext, TestDefinition, TestRegistration,
+        batched_program, call_jvp, composite_call_program, cube_definition, cube_program, custom_rule_program,
+        ir_custom_rule_program, member_cube_definition,
+    };
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::debugging::Print;
-    use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::differentiation::linear_call::tests::scalar_multiply_program;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
-    use crate::operations::manipulation::padding::PadOperation;
-    use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
@@ -2028,20 +2035,13 @@ mod tests {
     };
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::{
-        PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue,
-        PartialValue, PartiallyEvaluatableOperation,
-    };
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        AtomId, EffectClass, EffectClasses, Effects, FlatProgram, InputRegionProvenance, MaybeZero, OperationProvider,
-        OutputRegionProvenance, Program, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation,
-        ReferenceType, RegionDriver, RegionInterface, RegionRole, RegionSlot, ValueProjection,
+        EffectClass, EffectClasses, FlatProgram, InputRegionProvenance, MaybeZero, OutputRegionProvenance,
+        ProgramBuilder, ReferenceType, RegionInterface, RegionRole, RegionSlot,
     };
     use crate::tests::{TestArrayOperation, hash_of};
-    use crate::tracing::{DomainTracer, Trace, TracingContext};
-    use crate::operations::composites::builder::composite;
-    use crate::operations::composites::rules::{CustomRuleBackwardSpecializationKey, CustomRuleDefinition, CustomRuleRegistration, LiftedCustomRules};
-    use crate::operations::composites::tests::{ArrayContext, ConvertedProgram, EagerArrayIrContext, IrDefinition, IrTracer, MemberDefinition, ReferenceRuleDifferentiationDriver, RuleCounters, TestContext, TestDefinition, TestRegistration, batched_program, call_jvp, composite_call_program, cube_definition, cube_program, custom_rule_program, ir_custom_rule_program, member_cube_definition};
+    use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
 

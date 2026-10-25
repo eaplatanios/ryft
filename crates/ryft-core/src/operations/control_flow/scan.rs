@@ -1,6 +1,8 @@
 //! Loops over a shape-determined number of iterations through [`ScanOperation`], which applies an attached body
 //! [`Region`](crate::Region) to loop-carried state, consuming one slice of each stacked input and producing one slice
-//! of each stacked output per iteration.
+//! of each stacked output per iteration. [`Scan::scan`] traces a body over structured carries and inputs using an
+//! explicit context. The global [`scan()`] function recovers that context from input values. [`ScanOptions`] selects
+//! the iteration count, direction, unroll factor, and stacked-output axis shardings.
 //!
 //! A scan application takes the initial carries followed by the stacked inputs and, when its iteration count is
 //! dynamic, a trailing first-class dimension that supplies the iteration count. It returns the final carries followed
@@ -2534,13 +2536,15 @@ where
 enum ScanIterationCount<V> {
     /// Infer a static count from the stacked inputs.
     Inferred,
+
     /// Use the provided static count.
     Static(usize),
+
     /// Consume a first-class dimension value as the count.
     Value(V),
 }
 
-/// Configuration of [`Scan::scan`] and [`scan`]. The carry count is derived from the structured initial state.
+/// Configuration of [`Scan::scan`] and [`scan()`]. The carry count is derived from the structured initial state.
 ///
 /// By default, the iteration count is inferred from a stacked input with a statically known leading extent. A scan
 /// without stacked values needs an explicit count. Dynamic counts use [`Self::with_iteration_count_value`], including
@@ -2601,6 +2605,10 @@ impl<V: Value> ScanOptions<V> {
     }
 
     /// Sets the lowering unroll factor, which must be at least one (refer to [`ScanOperation::with_unroll`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::Type`] when `unroll` is zero.
     pub fn with_unroll(mut self, unroll: usize) -> Result<Self, ProgramError> {
         // Reuse the operation's validation rather than define another unroll contract for the frontend.
         self.unroll = ScanOperation::<V::Type>::new(0, 0).with_unroll(unroll)?.unroll();
@@ -2704,7 +2712,7 @@ impl<V: Value> ScanOptions<V> {
 }
 
 /// Context constructor for a structured [`ScanOperation`]. The explicit context also supports scans with no input
-/// values, for which the global [`scan`] function cannot recover an execution domain.
+/// values, for which the global [`scan()`] function cannot recover an execution domain.
 ///
 /// The body receives the intrinsic scalar `i64` index, the carried state, and the slices of stacked array inputs.
 /// Reference stacks enter whole, so the index can be used to construct views explicitly. It returns the next carried
@@ -2895,6 +2903,25 @@ where
 /// Runs [`Scan::scan`] in the execution domain recovered from the first carry or stacked-input leaf, or from an
 /// explicit iteration-count value. Structured carries and inputs may be empty individually; when all three sources
 /// contain no values, use the context constructor instead.
+///
+/// ```
+/// use ryft_core::{Array, ProgramError, ScanOptions, scan};
+///
+/// # fn main() -> Result<(), ProgramError> {
+/// let (sum, prefixes) = scan(
+///     |_, carry, item| {
+///         let next = carry + item;
+///         Ok((next.clone(), next))
+///     },
+///     Array::scalar(0f32)?,
+///     Array::vector(vec![1f32, 2.0, 3.0])?,
+///     ScanOptions::new(),
+/// )?;
+/// assert_eq!(sum, Array::scalar(6f32)?);
+/// assert_eq!(prefixes, Array::vector(vec![1f32, 3.0, 6.0])?);
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// # Errors
 ///
@@ -4217,7 +4244,7 @@ mod tests {
     };
     use crate::operations::sharding::shard_map::{ShardMap, ShardMapOperation};
     use crate::operations::trigonometric::SinOperation;
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{PartialEvaluationInput, PartialTracer};
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, InstructionId, Program, ProgramBuilder,
@@ -22832,7 +22859,7 @@ mod tests {
     fn test_scan_frontend_structure() {
         /// A state whose static tag must survive tracing, without requiring Clone on runtime structures.
         #[derive(ryft_macros::Parameterized)]
-        struct State<P: crate::parameters::Parameter> {
+        struct State<P: Parameter> {
             /// Runtime state leaf.
             value: P,
 
@@ -22984,11 +23011,11 @@ mod tests {
             lambda %0:f32[length], %1:i64[] .
             let %2:dimension<3> = dimension_from_scalar [bounds=[3, 4)] %1
                 %3:f32[3] = scan [carry_count=0, iteration_count=length, reverse=false] %0 %2 [
-                body={
-                    lambda %0:i64[], %1:f32[] .
-                    in (%1)
-                },
-            ]
+                    body={
+                        lambda %0:i64[], %1:f32[] .
+                        in (%1)
+                    },
+                ]
             in (%3)"}
         );
         let inputs = array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());

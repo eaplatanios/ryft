@@ -636,12 +636,13 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, AssertOperation, BatchAxis,
-        BatchedProgram, ConditionOperation, Device, DeviceMesh, DimensionBounds, DimensionSizeOperation, DimensionType,
-        DimensionValue, DimensionVariable, EffectClass, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation,
-        NegOperation, OneLikeOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ShardMap,
-        ShardMapOperation, Sharding, ShardingDimension, TypeError, WhileOperation,
+        Add, AddOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, AssertOperation, BatchAxis,
+        BatchedProgram, ConditionOperation, ConvertElementType, Device, DeviceMesh, DimensionBounds,
+        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, Placeholder, PrintOperation,
+        ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation, ReferenceReadOperation, ReferenceType,
+        RngBitGeneratorOperation, ScanOptions, ShardMap, ShardMapOperation, Sharding, ShardingDimension,
+        TracingContext, TypeError, WhileOperation, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
@@ -658,7 +659,10 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, XlaOptions, XlaSession, compile_statefully, to_mlir_module_for_program};
+    use crate::{
+        CompiledXlaFunction, FromPjrt, XlaArray, XlaOptions, XlaSession, compile, compile_statefully,
+        to_mlir_module_for_program,
+    };
 
     use super::*;
 
@@ -3859,5 +3863,185 @@ mod tests {
                 MixedValue::Dimension(0),
             ]),
         );
+    }
+
+    #[test]
+    fn test_scan_frontend_execution() {
+        // Tuple carries and output slices retain their parameter order through frontend tracing and XLA lowering.
+        // Reversed scans stack suffix sums/products at the original input positions, including the unrolled tail.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let inputs_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let client = execution_client();
+        for (reverse, sums, products) in
+            [(false, vec![1.0, 3.0, 6.0], vec![1.0, 2.0, 6.0]), (true, vec![6.0, 5.0, 3.0], vec![6.0, 6.0, 3.0])]
+        {
+            let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+                |(carry, inputs)| {
+                    scan(
+                        |_, (sum, product), value| {
+                            let sum = sum.add(&value)?;
+                            let product = product.mul(&value)?;
+                            Ok(((sum.clone(), product.clone()), (sum, product)))
+                        },
+                        carry,
+                        inputs,
+                        ScanOptions::new().with_reverse(reverse).with_unroll(2)?,
+                    )
+                },
+                ((scalar_type.clone(), scalar_type.clone()), inputs_type.clone()),
+            )
+            .unwrap();
+            let program = program.into_flat_program();
+            assert_eq!(
+                program.to_string(),
+                formatdoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[3] .
+                    let %3:f64[], %4:f64[], %5:f64[3], %6:f64[3] = scan \
+                    [carry_count=2, iteration_count=3, reverse={reverse}, unroll=2] %0 %1 %2 [
+                        body={{
+                            lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
+                            let %4:f64[] = add %1 %3
+                                %5:f64[] = mul %2 %3
+                            in (%4, %5, %4, %5)
+                        }},
+                    ]
+                    in (%3, %4, %5, %6)"},
+            );
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &program,
+                    &[
+                        MixedValue::Array(vec![0.0], vec![]),
+                        MixedValue::Array(vec![1.0], vec![]),
+                        MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
+                    ],
+                    &[],
+                ),
+                Ok(vec![
+                    MixedValue::Array(vec![6.0], vec![]),
+                    MixedValue::Array(vec![6.0], vec![]),
+                    MixedValue::Array(sums, vec![3]),
+                    MixedValue::Array(products, vec![3]),
+                ]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_frontend_execution_dynamic_count() {
+        // The count value supplies the frontend's execution domain when there is no carry or stacked input. Its
+        // runtime extent controls the output allocation's logical shape, including the empty result.
+        let count_type = DimensionType::new("iterations", DimensionBounds::non_negative(Some(5)).unwrap());
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |count| {
+                let ((), outputs) = scan(
+                    |index, (), ()| Ok(((), index.convert_element_type(DataType::F64)?)),
+                    (),
+                    (),
+                    ScanOptions::new().with_iteration_count_value(count).with_unroll(2)?,
+                )?;
+                Ok(outputs)
+            },
+            ArrayIrType::Dimension(count_type),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<iterations ∈ [0, 5)> .
+                let %1:f64[iterations] = scan [carry_count=0, iteration_count=iterations, reverse=false, unroll=2] %0 [
+                    body={
+                        lambda %0:i64[] .
+                        let %1:f64[] = convert_element_type [data_type=f64] %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+        let client = execution_client();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]),
+            Ok(vec![MixedValue::Array(vec![0.0, 1.0, 2.0], vec![3]), MixedValue::Dimension(3)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(0)], &[]),
+            Ok(vec![MixedValue::Array(vec![], vec![0]), MixedValue::Dimension(0)]),
+        );
+    }
+
+    #[test]
+    fn test_scan_frontend_execution_through_compile() {
+        // The public array-only compilation facade projects its tracers into ArrayType; the frontend's nested body
+        // and its region must lift back into the backend's array IR operation family before lowering.
+        let client = execution_client();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let device_id = device.id().unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&device).unwrap()],
+        )
+        .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let scalar_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let inputs_type = ArrayType::new_static(DataType::F64, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(carry, inputs)| {
+                scan(
+                    |_, carry, item| {
+                        let next = carry.add(&item)?;
+                        Ok((next.clone(), next))
+                    },
+                    carry,
+                    inputs,
+                    ScanOptions::new(),
+                )
+                .unwrap()
+            },
+            (scalar_type.clone(), inputs_type.clone()),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let scalar = "f64[][sharding={mesh<['x'=1:auto]>, []}]";
+        let stack = "f64[3][sharding={mesh<['x'=1:auto]>, [{}]}]";
+        assert_eq!(
+            compiled.source_program().program().to_string(),
+            formatdoc! {"
+                lambda %0:{scalar}, %1:{stack} .
+                let %2:{scalar}, %3:{stack} = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
+                    body={{
+                        lambda %0:i64[], %1:{scalar}, %2:{scalar} .
+                        let %3:{scalar} = add %1 %2
+                        in (%3, %3)
+                    }},
+                ]
+                in (%2, %3)"},
+        );
+        let carry = XlaArray::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes(&[0f64])).unwrap();
+        let inputs =
+            XlaArray::from_host_buffer(&domain, inputs_type, mesh, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
+        let (sum, prefixes) = domain.interpret(&compiled.executable_function(), (carry, inputs)).unwrap();
+        let outputs = [sum, prefixes]
+            .into_iter()
+            .map(|output| {
+                let bytes = output
+                    .device_shard(device_id)
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                values_from_bytes::<f64>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, vec![vec![6.0], vec![1.0, 3.0, 6.0]]);
     }
 }

@@ -18,57 +18,28 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::any::{Any, TypeId};
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::thread::ThreadId;
+use std::hash::Hash;
+use std::sync::Arc;
 
-use lru::LruCache;
-
-use crate::arrays::{ArrayType, DataType, ShardingDimension};
-use crate::axes::{Axis, NamedAxis};
-use crate::batching::{
-    BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
-    DiagonalBatchingPolicy, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
-};
-use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
-    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext,
-};
-use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
-use crate::operations::control_flow::scan::{ScanOperation, ScanType};
-use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
-use crate::parameters::{Parameter, Placeholder};
-use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ReferenceAccessOperation,
-    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType,
-    ReferenceTransform, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-};
-use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheError};
+use crate::arrays::ShardingDimension;
+use crate::batching::{BatchAxis, BatchingError, BatchingLevel, BatchingLevelExtent};
+use crate::differentiation::{CotangentDestinationKind, DifferentiationError, TransposedProgramCotangent};
+use crate::parameters::Parameter;
+use crate::programs::{Program, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed};
 use crate::tracing::{Tracer, TracingContext};
-use crate::operations::composites::rules::specialization::CustomRuleDerivation;
-use crate::operations::composites::transpose::CompositeTransposeOperation;
 
 mod definition;
 mod registration;
 mod specialization;
 
+pub(in crate::operations::composites) use definition::CustomVjpBackward;
 pub use definition::{CustomRuleDefinition, CustomVjpOperation};
 pub use registration::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleRegistration};
 pub use specialization::{CustomRuleSource, CustomRuleSpecializer, LiftedCustomRules, UnavailableCustomRules};
-pub(in crate::operations::composites) use definition::CustomVjpBackward;
-pub(in crate::operations::composites) use specialization::{boundary_input_count, derive_bijective_identity_renaming, validate_rule_output_types};
+pub(in crate::operations::composites) use specialization::{
+    boundary_input_count, derive_bijective_identity_renaming, validate_rule_output_types,
+};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
 pub(super) const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
@@ -526,22 +497,8 @@ pub type CustomRuleProgram<V, O> = Arc<CustomRuleSpecialization<V, O>>;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
-    use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, Shape, ShardingDimension,
-    };
-    use crate::contexts::Context;
-    use crate::operations::arithmetic::MulOperation;
-    use crate::operations::references::{ReferenceAddUpdate, ReferenceNew, ReferenceRead};
-    use crate::programs::ReferenceType;
-    use crate::tests::{TestArrayOperation, hash_of};
-    use crate::operations::composites::tests::MemberDefinition;
+    use crate::arrays::{Array, ArrayOperation, ArrayType, ShardingDimension};
 
     use super::*;
 

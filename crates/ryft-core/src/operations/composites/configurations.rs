@@ -2,39 +2,31 @@
 //! the structured rule closures type-erased, and the adapters that register those closures as the flat, family-level
 //! rules of [`CustomRuleDefinition`]s.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use thiserror::Error;
-
-use crate::axes::{NamedAxes, NamedAxis};
-use crate::batching::{
-    Batch, BatchAxis, BatchAxisSpecification, BatchableType, BatchingError, BatchingLevel, BatchingLevelExtent,
-    BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy, RecursiveBatchingPolicy, batch,
-};
-use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::axes::NamedAxis;
+use crate::batching::{BatchAxis, BatchableType, BatchingLevel, BatchingLevelExtent, DiagonalBatchingPolicy};
+use crate::contexts::{EagerContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, ResidualZeroProvider,
-    TranspositionContext,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, ResidualZeroProvider, TranspositionContext,
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::composites::describe_composite;
+use crate::operations::composites::rules::{
+    CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation, derive_bijective_identity_renaming,
+};
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
-use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
 };
-use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
-use crate::operations::composites::describe_composite;
-use crate::operations::composites::builder::{Composite, composite};
-use crate::operations::composites::call::CompositeOperation;
-use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleTracer, CustomVjpOperation, derive_bijective_identity_renaming};
+use crate::tracing::{DomainTracingContext, TracingContext};
 
 /// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
@@ -46,7 +38,7 @@ pub struct DefaultJvp;
 /// closure implementing `(x, ẋ) ↦ (y, ẏ)` (refer to [`Composite::with_jvp`]).
 pub struct ExplicitJvp<Input, Output> {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
-    jvp: Arc<dyn Fn(Input, Input) -> Result<(Output, Output), ProgramError> + Send + Sync>,
+    pub(super) jvp: Arc<dyn Fn(Input, Input) -> Result<(Output, Output), ProgramError> + Send + Sync>,
 }
 
 impl<Input, Output> Debug for ExplicitJvp<Input, Output> {
@@ -70,7 +62,7 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
-    jvp: Arc<
+    pub(super) jvp: Arc<
         dyn Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output::To<MaybeZero<Tracer>>), ProgramError>
             + Send
             + Sync,
@@ -97,10 +89,10 @@ pub struct DefaultVjp;
 /// type `Residual` (refer to [`Composite::with_vjp`]).
 pub struct ExplicitVjp<Input, Output, Residual> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
-    forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
+    pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangents)`.
-    backward: Arc<dyn Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync>,
+    pub(super) backward: Arc<dyn Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync>,
 
     /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
     pub(super) deferred_forward: bool,
@@ -127,10 +119,10 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, residuals)` from the primal input value.
-    forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
+    pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangent_seeds)`.
-    backward: Arc<
+    pub(super) backward: Arc<
         dyn Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input::To<MaybeZero<Tracer>>, ProgramError>
             + Send
             + Sync,
@@ -164,11 +156,11 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, residuals)` from the primal input value.
-    forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
+    pub(super) forward: Arc<dyn Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync>,
 
     /// Closure submitting the input cotangents, computed from `(residuals, output_cotangent_seeds)`, to their
     /// accumulators.
-    backward: Arc<
+    pub(super) backward: Arc<
         dyn Fn(
                 &mut Transposition,
                 Residual,
@@ -661,7 +653,7 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
 {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
-    rule: Arc<
+    pub(super) rule: Arc<
         dyn Fn(
                 BatchingLevelExtent<Tracer>,
                 Input,
@@ -692,7 +684,7 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
 {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
-    rule: Arc<
+    pub(super) rule: Arc<
         dyn Fn(
                 BatchingLevelExtent<Tracer>,
                 Input,
@@ -1584,47 +1576,16 @@ fn without_non_differentiated_tangent_inputs<V: Value, O: Operation<Type = V::Ty
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionType,
         ShardingDimension,
     };
-    use crate::axes::AxisError;
-    use crate::batching::{
-        BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
-    };
-    use crate::contexts::{Context, EagerContext, ProjectedContext};
-    use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationError, DifferentiationRule,
-        differentiate_at,
-    };
-    use crate::macros::check_gradient;
-    use crate::operations::arithmetic::{AddOperation, MulOperation};
-    use crate::operations::collectives::axis_index::AxisIndex;
-    use crate::operations::collectives::parallel_reduce::ParallelReduce;
-    use crate::operations::constants::zero::Zero;
-    use crate::operations::custom_call::CustomCallBatching;
-    use crate::operations::differentiation::stop_gradient::StopGradient;
-    use crate::operations::dimensions::dimension_size::DimensionSize;
-    use crate::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::operations::manipulation::broadcasting::DynamicBroadcast;
-    use crate::operations::manipulation::conversions::{Cast, ConvertElementType};
-    use crate::operations::manipulation::padding::PadOperation;
-    use crate::operations::manipulation::slicing::Slice;
-    use crate::operations::reductions::{Reduce, ReductionKind};
-    use crate::operations::references::{
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceNew, ReferenceRead, ReferenceWrite,
-    };
-    use crate::operations::trigonometric::{Cos, Sin};
+    use crate::batching::BatchAxis;
     use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, MaybeZero, ReferenceType, ValueProjection};
-    use crate::tracing::Trace;
-    use crate::operations::composites::tests::IrTracer;
 
     use super::*;
 

@@ -5,10 +5,10 @@ use indoc::formatdoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, BatchAxis, BindingRegionDriver, Context,
-    DataType, Domain, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, NamedAxes, NamedAxis, Operation, ProgramError,
-    Provenance, ProvenanceScope, Scan, ScanOptions, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Tracer,
-    TracingContext, Typed, ValueProjection, ValueResolution, batch, differentiate_at, scan,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BatchAxis, BindingRegionDriver,
+    Context, DataType, Domain, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, NamedAxes, NamedAxis, Operation,
+    ProgramError, Provenance, ProvenanceScope, Scan, ScanOptions, ShardMap, ShardMapOperation, Sharding,
+    ShardingDimension, Tracer, TracingContext, Typed, ValueProjection, ValueResolution, batch, differentiate_at, scan,
 };
 
 type IrValue = ArrayIrValue<Array>;
@@ -45,18 +45,22 @@ fn test_scan_frontend_propagates_manual_variation_across_carries() {
                 )?;
                 Ok(vec![carries.0, carries.1, carries.2])
             },
-            vec![invariant_type.clone().into(), invariant_type.clone().into(), varying_type.clone().into()],
+            vec![
+                ArrayIrType::Array(invariant_type.clone()),
+                ArrayIrType::Array(invariant_type.clone()),
+                ArrayIrType::Array(varying_type.clone()),
+            ],
             vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
         )
         .unwrap();
+        let scan_attributes = format!("carry_count=3, iteration_count={iteration_count}, reverse=false");
         assert_eq!(
             program.to_string(),
             formatdoc! {"
                 lambda %0:{invariant}, %1:{invariant}, %2:{varying} .
                 let %3:{varying} = parallel_vary [axis_name=\"m\"] %0
                     %4:{varying} = parallel_vary [axis_name=\"m\"] %1
-                    %5:{varying}, %6:{varying}, %7:{varying} = scan \
-            [carry_count=3, iteration_count={iteration_count}, reverse=false] %3 %4 %2 [
+                    %5:{varying}, %6:{varying}, %7:{varying} = scan [{scan_attributes}] %3 %4 %2 [
                         body={{
                             lambda %0:i64[], %1:{varying}, %2:{varying}, %3:{varying} .
                             in (%2, %3, %3)
@@ -128,7 +132,7 @@ fn test_scan_frontend_transposes_entry_variation_outside_the_loop() {
             )?;
             Ok(vec![carry])
         },
-        vec![invariant_type.into(), varying_stack_type.into()],
+        vec![ArrayIrType::Array(invariant_type), ArrayIrType::Array(varying_stack_type)],
         vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
     )
     .unwrap();
@@ -324,5 +328,25 @@ fn test_scan_frontend_composes_batching_and_forward_differentiation() {
                 Array::matrix(2, 3, vec![2.0f64, 6.0, 24.0, 5.0, 30.0, 210.0]).unwrap(),
             ),
         )),
+    );
+}
+
+#[test]
+fn test_scan_frontend_stacked_axis_shardings() {
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+    let input_type = ArrayType::new_static(DataType::F32, [3])
+        .with_sharding(Sharding::replicated(mesh.clone(), 1))
+        .unwrap();
+    let output_type = ArrayType::new_static(DataType::F32, [3])
+        .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+        .unwrap();
+    assert_eq!(
+        scan(
+            |_, (), slice| Ok(((), slice)),
+            (),
+            Array::from_elements(input_type, &[1f32, 2.0, 3.0]).unwrap(),
+            ScanOptions::new().with_stacked_axis_shardings(vec![ShardingDimension::sharded(["x"])]),
+        ),
+        Ok(((), Array::from_elements(output_type, &[1f32, 2.0, 3.0]).unwrap())),
     );
 }

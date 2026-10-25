@@ -56,40 +56,24 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::borrow::Cow;
-use std::fmt::{Debug, Display};
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
-use std::sync::LazyLock;
+use std::hash::Hash;
 
-use crate::axes::Axis;
-use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingLevelExtent,
-    BatchingPolicy, ProgramBatchingOutputAxesPolicy,
-};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::batching::BatchAxis;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext, TranspositionDriver,
+    DifferentiationPolicy, ResidualZeroProvider,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
+use crate::macros::check_count;
+use crate::operations::composites::rules::{
+    CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleSpecializationKey, boundary_input_count,
+};
 use crate::operations::constants::zero::Zero;
-use crate::parameters::{Parameter, Placeholder};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value, discharge_local_reference_operation,
-    discharge_reference_free_operation,
+    EffectsSummary, Operation, ProgramError, ReferenceBoundary, ReferenceDischargePolicy, ReferenceDischargeValue,
+    RegionRef, Type, TypeError, Typed, Value,
 };
 use crate::tracing::TracingContext;
-use crate::operations::composites::rules::{CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleSpecializationKey, boundary_input_count};
 
 mod builder;
 mod call;
@@ -107,11 +91,11 @@ pub use configurations::{
     DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
-pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 pub use rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
     CustomRuleTracer, CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
 };
+pub use transpose::{COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation};
 
 /// Renders the [`composite`](COMPOSITE_OPERATION_NAME) operation name for diagnostics, followed by the name of the
 /// retained definition `name` unless it is the default name of [`Composite`](crate::Composite)s (i.e., the operation
@@ -476,7 +460,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, ShardingDimension};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, ShardingDimension,
+    };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{
@@ -484,10 +470,13 @@ mod tests {
         DifferentiationPolicy, ForwardModeDifferentiate, Linearization,
     };
     use crate::operations::arithmetic::MulOperation;
+    use crate::operations::references::ReferenceNewOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartitionedProgram;
-    use crate::programs::{FlatProgram, Operation, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef, TypeError, Typed, Value};
-    use crate::operations::references::ReferenceNewOperation;
+    use crate::programs::{
+        FlatProgram, Operation, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef,
+        TypeError, Typed, Value,
+    };
     use crate::tests::TestArrayOperation;
     use crate::tracing::Trace;
 

@@ -5,7 +5,6 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
@@ -14,28 +13,23 @@ use thiserror::Error;
 
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
-    Batch, BatchAxis, BatchAxisSpecification, BatchableType, BatchingError, BatchingLevel, BatchingLevelExtent,
-    BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy, RecursiveBatchingPolicy, batch,
+    Batch, BatchAxis, BatchAxisSpecification, BatchableType, BatchingError, BatchingLevelExtent, BatchingPolicy,
+    BatchingTracer, RecursiveBatchingPolicy, batch,
 };
-use crate::contexts::{Context, EagerContext, StagingContext};
-use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, ResidualZeroProvider,
-    TranspositionContext,
+use crate::contexts::Context;
+use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType};
+use crate::operations::composites::call::{COMPOSITE_OPERATION_NAME, CompositeOperation};
+use crate::operations::composites::configurations::{
+    AccumulatingVjp, AxisDependentBatching, CompositeBatching, CompositeJvp, CompositeVjp, CustomBatching,
+    DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
+    SymbolicZeroJvp, SymbolicZeroVjp,
 };
-use crate::macros::check_count;
-use crate::operations::arithmetic::AddOperation;
-use crate::operations::control_flow::scan::{ScanOperation, ScanType};
+use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration};
+use crate::operations::composites::validate_non_differentiated_count;
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
-};
+use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
-use crate::operations::composites::validate_non_differentiated_count;
-use crate::operations::composites::call::{COMPOSITE_OPERATION_NAME, CompositeOperation};
-use crate::operations::composites::configurations::{AccumulatingVjp, AxisDependentBatching, CompositeBatching, CompositeJvp, CompositeVjp, CustomBatching, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp};
-use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration};
 
 /// Error returned by [`check_batching_rule_consistency`].
 #[derive(Error, Clone, Debug, PartialEq)]
@@ -1428,12 +1422,13 @@ mod tests {
     use crate::contexts::{Context, EagerContext, ProjectedContext};
     use crate::differentiation::{
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationError, DifferentiationRule,
-        differentiate_at,
+        TranspositionContext, differentiate_at,
     };
     use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
+    use crate::operations::composites::rules::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
     use crate::operations::differentiation::stop_gradient::StopGradient;
@@ -1451,8 +1446,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{FlatProgram, MaybeZero, ReferenceType, ValueProjection};
     use crate::tracing::Trace;
-    use crate::operations::composites::rules::CustomRuleSource;
-    use crate::operations::composites::tests::batched_program;
 
     use super::*;
 

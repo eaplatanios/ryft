@@ -3,54 +3,34 @@
 //! registered definition without forming reference cycles.
 
 use std::any::{Any, TypeId};
-use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::thread::ThreadId;
 
 use lru::LruCache;
 
-use crate::arrays::{ArrayType, DataType, ShardingDimension};
-use crate::axes::{Axis, NamedAxis};
-use crate::batching::{
-    BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
-    DiagonalBatchingPolicy, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
-};
-use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, CotangentDestinationKind, DifferentiableOperation,
-    DifferentiableType, DifferentiationError, ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext,
-};
-use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
-use crate::operations::control_flow::scan::{ScanOperation, ScanType};
-use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
-use crate::parameters::{Parameter, Placeholder};
-use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ReferenceAccessOperation,
-    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType,
-    ReferenceTransform, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-};
-use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheError};
-use crate::tracing::{Tracer, TracingContext};
+use crate::differentiation::DifferentiationError;
 use crate::operations::composites::call::COMPOSITE_OPERATION_NAME;
-use crate::operations::composites::rules::{CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingRuleKey, CustomRuleDerivationKey, CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationKey, CustomRuleSpecializationRequest};
 use crate::operations::composites::rules::definition::CustomRuleDefinition;
-use crate::operations::composites::rules::specialization::{CustomRuleDerivation, LiftedCustomRules, specialization_error};
+use crate::operations::composites::rules::specialization::specialization_error;
+use crate::operations::composites::rules::{
+    CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleBackwardSpecializationKey, CustomRuleBatchingRuleKey,
+    CustomRuleDerivationKey, CustomRuleProgram, CustomRuleSpecialization, CustomRuleSpecializationKey,
+    CustomRuleSpecializationRequest,
+};
+use crate::parameters::Parameter;
+use crate::programs::{ProgramError, Typed};
+use crate::specialization::SpecializationCache;
 
 /// Bounded specialization caches of one registered [`CustomRuleDefinition`], keyed by static information only and
 /// owned by its [`CustomRuleRegistration`] handle (refer to the Ownership section of [`CustomRuleDefinition`]).
 pub(in crate::operations::composites) struct CustomRuleCaches<V: Typed + Parameter, O> {
     /// Specializations of the forward-mode rule.
-    pub(in crate::operations::composites) jvp_specializations: SpecializationCache<CustomRuleSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
+    pub(in crate::operations::composites) jvp_specializations:
+        SpecializationCache<CustomRuleSpecializationKey<V::Type>, CustomRuleProgram<V, O>>,
 
     /// Specializations of the reverse-mode forward rule.
     pub(in crate::operations::composites) forward_specializations:
@@ -311,25 +291,19 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for WeakCustomRuleRegistrat
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, Shape, ShardingDimension,
-    };
+    use crate::arrays::{ArrayType, DataType};
     use crate::contexts::Context;
-    use crate::operations::arithmetic::MulOperation;
-    use crate::operations::references::{ReferenceAddUpdate, ReferenceNew, ReferenceRead};
-    use crate::programs::ReferenceType;
-    use crate::tests::{TestArrayOperation, hash_of};
-    use crate::operations::composites::builder::composite;
     use crate::operations::composites::call::CompositeOperation;
     use crate::operations::composites::rules::specialization::CustomRuleSpecializer;
-    use crate::operations::composites::tests::{RuleCounters, TestDefinition, cube_definition, cube_program, custom_rule_program};
+    use crate::operations::composites::tests::{
+        RuleCounters, TestDefinition, cube_definition, cube_program, custom_rule_program,
+    };
+    use crate::tests::hash_of;
 
     use super::*;
 

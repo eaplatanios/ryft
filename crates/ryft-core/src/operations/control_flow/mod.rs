@@ -16,9 +16,10 @@
 //!     per-item masking. An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) additionally permits
 //!     reverse-mode differentiation through a masked tangent scan.
 //!   - **Shape-Determined Loops:** [`ScanOperation`] threads loop-carried state through a body while consuming slices
-//!     of stacked array inputs and producing stacked outputs. Its body also receives the slice index; reference inputs
-//!     supply complete roots. [`reverse`](ScanOperation::with_reverse) changes visit order without changing the pairing
-//!     of input and output slices, while [`unroll`](ScanOperation::with_unroll) controls backend lowering.
+//!     of stacked array inputs and producing stacked outputs. [`Scan::scan`] traces a body over structured state in an
+//!     explicit context; [`scan()`] recovers the context from input values. Its body also receives the slice index;
+//!     reference inputs supply complete roots. [`reverse`](ScanOperation::with_reverse) changes visit order without
+//!     changing the pairing of input and output slices, while [`unroll`](ScanOperation::with_unroll) controls lowering.
 //!
 //! Branch and loop computations are [`Region`](crate::Region)s attached to an instruction, rather than fields of its
 //! operation payload. [`WhileType`] and [`ScanType`] define their type-family contracts. The operation rules provide
