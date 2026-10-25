@@ -1461,13 +1461,8 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension input per
-// dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference verifies
-// that each input defines its output axis's variable or refines it to an exact extent. The trailing inputs never reach
-// the foreign kernel; they only ground the declared logical result extents.
 impl MemberOperation<ArrayIrType> for CustomCallOperation {
+    #[inline]
     fn infer_parent_region_input_types(
         &self,
         _input_types: &[ArrayIrType],
@@ -1482,10 +1477,15 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
+        // In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension input
+        // per dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference
+        // verifies that each input defines its output axis's variable or refines it to an exact extent. The trailing
+        // inputs never reach the foreign kernel; they only ground the declared logical result extents.
         check_count!("region", region_interfaces, 0, TypeError);
         let (array_input_count, refinements, _) = self.refine_declared_output_types(input_types)?;
         let array_input_types =
             input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+
         // Aliases compare the effective output contract: an exact trailing extent can make a symbolic declaration
         // match a concrete input, and inherited manual variation can make a sharded input match an output declared
         // without a sharding.
@@ -1507,11 +1507,7 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
     }
 }
 
-// Mixed-universe interpretation splits the inputs into the kernel's array inputs and the trailing declared result
-// extents, runs the kernel through the projected array value family, and verifies that every dynamic output axis has
-// exactly the extent its input declared before lifting the outputs back into the parent value family.
-impl<C> MemberInterpretableOperation<C> for CustomCallOperation
-where
+impl<
     C: Domain<
             Type = ArrayIrType,
             Value: ValueProjection<
@@ -1519,6 +1515,7 @@ where
                 Projected: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>,
             > + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
+> MemberInterpretableOperation<C> for CustomCallOperation
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
@@ -1526,6 +1523,10 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Mixed-universe interpretation splits the inputs into the kernel's array inputs and the trailing declared
+        // result extents, runs the kernel through the projected array value family, and verifies that every dynamic
+        // output axis has exactly the extent its input declared before lifting the outputs back into the parent
+        // value family.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_parent_output_types(input_types.as_slice(), &[])?;
         let (array_input_count, _, output_types) = self.refine_declared_output_types(input_types.as_slice())?;
@@ -1539,6 +1540,7 @@ where
             .cloned()
             .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
             .collect::<Result<Vec<_>, _>>()?;
+
         // The projected kernel sees the declaration refined by the concrete invocation's extents, so its own alias
         // validation and allocation agree with the mixed boundary rather than seeing the unrefined symbolic declaration
         // again. Metadata that inference only inherits (e.g., manual variation sharding) stays undeclared.
@@ -1567,36 +1569,29 @@ where
     }
 }
 
-// Mixed array/dimension batching rule for [`CustomCallOperation`]. It applies the same all-replicated shortcut and
-// the same [`CustomCallBatching`] behaviors as the homogeneous rule above, with two composite-universe additions.
-//
-// Every trailing first-class output-extent input must be replicated: a per-batch-item extent would make the call's
-// results ragged, which the array IR cannot represent. An extent-free call whose mapped extent is statically known is
-// exactly the homogeneous contract, so it delegates to the projected homogeneous rule through
-// [`batch_projected_operation`]. A dynamic mapped extent stays here, because a first-class dimension is not an array
-// value and cannot cross the projected array boundary as a scan trip count or broadcast extent.
-//
-// [`Sequential`](CustomCallBatching::Sequential) threads the replicated extents as leading invariant scan carries
-// and consumes the mapped rows one per iteration, so the body's call sees exactly the per-item extents it declared.
-// [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
-// batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
-// dimension is itself dynamic.
-impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
-    for CustomCallOperation
-where
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Transpose>,
-    C::Operation: OperationPayloadProjection
-        + From<CustomCallOperation>
-        + From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + From<ScanOperation<C::Type>>
-        + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<CustomCallOperation>
-        + From<BroadcastOperation>
-        + From<ScanOperation<ArrayType>>
-        + From<TransposeOperation>,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<
+    C: ContextProjection<
+            ArrayType,
+            Type = ArrayIrType,
+            Value: DimensionSize
+                       + DynamicBroadcast
+                       + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Transpose>,
+            Operation: OperationPayloadProjection
+                           + OperationProjection<
+                ArrayType,
+                Projected: From<CustomCallOperation>
+                               + From<BroadcastOperation>
+                               + From<ScanOperation<ArrayType>>
+                               + From<TransposeOperation>,
+            > + From<CustomCallOperation>
+                           + From<DynamicBroadcastOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ScanOperation<C::Type>>,
+        >,
+> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -1604,6 +1599,18 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // This rule applies the same all-replicated shortcut and the same `CustomCallBatching` behaviors as the
+        // homogeneous rule above, with two composite-universe additions. Every trailing first-class output-extent input
+        // must be replicated: a per-batch-item extent would make the call's results ragged, which the array IR cannot
+        // represent. An extent-free call whose mapped extent is statically known is exactly the homogeneous contract,
+        // so it delegates to the projected homogeneous rule through `batch_projected_operation`. A dynamic mapped
+        // extent stays here, because a first-class dimension is not an array value and cannot cross the projected
+        // array boundary as a scan trip count or broadcast extent. `CustomCallBatching::Sequential` threads the
+        // replicated extents as leading invariant scan carries and consumes the mapped rows one per iteration, so the
+        // body's call sees exactly the per-item extents it declared. `CustomCallBatching::BroadcastAll` instead rebinds
+        // one call whose declared outputs gain the mapped batch dimension, prepending the transform's extent value to
+        // each output's trailing extent group when that batch dimension is itself dynamic.
+
         // Each dynamic output axis occurrence contributes one trailing extent input, including repeated identities.
         let extent_count = self
             .output_types
@@ -1634,10 +1641,11 @@ where
         match self.batching {
             CustomCallBatching::Rejected => Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "custom call `{}` has no batching rule for input {index} mapped at batch {}; invoke a \
+                    "custom call `{}` has no batching rule for input {} mapped at batch {}; invoke a \
                      kernel that understands the batch axis, or select an explicit batching behavior with \
                      `CustomCallOperation::with_batching`",
                     self.target_name,
+                    index,
                     mapped.batch_axis(),
                 ),
             }),
