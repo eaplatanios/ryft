@@ -58,17 +58,17 @@
 
 use ryft_macros::capability;
 
-use crate::arrays::{ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType};
-use crate::axes::{Axes, AxisError, NamedAxes};
-use crate::batching::RecursiveBatchingPolicy;
-use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{CotangentBatchingPolicy, DifferentiableType};
+use crate::arrays::{ArrayIrType, ArrayType, DataType};
+use crate::axes::{Axes, AxisError};
+use crate::contexts::{Domain, StagingContext};
+use crate::differentiation::DifferentiableType;
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
-use crate::operations::composites::functions::{JvpComposite, composite};
-use crate::operations::composites::operations::CompositeOperation;
+use crate::operations::composites::functions::{
+    CompositeCallContext, CompositeJvp, ExplicitJvp, JvpComposite, composite,
+};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -420,17 +420,9 @@ where
     composite: JvpComposite<(DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
 }
 
-impl<
-    D: Domain<
-            Type = ArrayType,
-            Constant: 'static + Send + Sync,
-            Operation: 'static + Send + Sync + From<CompositeOperation<D::Constant, D::Operation>>,
-        >,
-> SoftmaxCrossEntropyWithTargetLogits<D>
+impl<D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>> SoftmaxCrossEntropyWithTargetLogits<D>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
-    ArrayBatchingPolicy:
-        RecursiveBatchingPolicy<DomainTracingContext<D>> + CotangentBatchingPolicy<DomainTracingContext<D>>,
 {
     /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
     /// reducing the class axes. Both inputs must have the same real floating-point element type and static shape.
@@ -446,14 +438,17 @@ where
     /// Returns a [`ProgramError`] for incompatible inputs, invalid, duplicate, or empty class axes, unsupported array
     /// metadata, or a failed operation while tracing or evaluating the primal or derivative rule.
     pub fn call<
-        V: Value<Type = ArrayType, Domain: Context<Constant = D::Constant, Operation = D::Operation> + NamedAxes>
-            + ManualVariationAlignment
-            + StopGradient,
+        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
+        V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment + StopGradient,
     >(
         &self,
         logits: V,
         target_logits: V,
-    ) -> Result<V, ProgramError> {
+    ) -> Result<V, ProgramError>
+    where
+        ExplicitJvp<(DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>:
+            CompositeJvp<C::Constant, C::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
+    {
         // Placement is validated before the alignment below, which would otherwise report a `parallel_vary` error
         // for a reduced input instead of this function's own rejection. The primal validates the remaining contract.
         validate_normalization_placement("softmax_cross_entropy_with_target_logits", &logits.r#type())?;
