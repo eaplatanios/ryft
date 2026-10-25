@@ -281,7 +281,7 @@ impl<
         let input = flattened.inputs.pop().unwrap();
         let axis = flattened.axis;
         let pivot = input.argmax_with_index_data_type(axis, DataType::I64)?;
-        let mask = normalization_index_mask(&input, &pivot, axis)?;
+        let mask = one_hot_mask(&input, &pivot, axis)?;
         let zero = input.zero_like()?;
         let pivot_value = mask.select(&input, &zero)?.reduce_sum(&[axis], None)?;
         let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
@@ -380,7 +380,7 @@ impl<
         let labels = aligned.pop().unwrap();
         let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
         let log_probabilities = flattened.inputs.pop().unwrap().log_softmax(flattened.axis)?;
-        integer_label_loss(&log_probabilities, &labels, None, flattened.axis)?
+        cross_entropy_loss_with_integer_labels(&log_probabilities, &labels, None, flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -403,7 +403,7 @@ impl<
         let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
         let mask = flattened.inputs.pop().unwrap();
         let log_probabilities = flattened.inputs.pop().unwrap().masked_log_softmax(&mask, flattened.axis)?;
-        integer_label_loss(&log_probabilities, &labels, Some(&mask), flattened.axis)?
+        cross_entropy_loss_with_integer_labels(&log_probabilities, &labels, Some(&mask), flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 }
@@ -571,8 +571,6 @@ fn validate_normalization_labels(
     validate_normalization_placement(function, labels_type)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Reduces `targets` and precomputed `log_probabilities` over the single class `axis` to compute
 /// [`Softmax::softmax_cross_entropy`]. With `mask`, log-probabilities must already be normalized over that mask as in
 /// [`Softmax::masked_log_softmax`]; the loss follows [`Softmax::masked_softmax_cross_entropy`]. The caller supplies
@@ -597,11 +595,11 @@ fn cross_entropy_loss<
     terms.reduce_sum(&[axis], None)?.neg()
 }
 
-/// Selects each label's negative log-probability along `axis`, with the invalid-label and empty-mask behavior of
-/// [`Softmax::softmax_cross_entropy_with_integer_labels`] and
+/// Selects each label's negative log-probability along `axis`, with the invalid-label
+/// and empty-mask behavior of [`Softmax::softmax_cross_entropy_with_integer_labels`] and
 /// [`Softmax::masked_softmax_cross_entropy_with_integer_labels`]. The caller supplies validated, aligned inputs,
 /// `i64` labels, and log-probabilities computed in working precision over the same optional `mask`.
-fn integer_label_loss<
+fn cross_entropy_loss_with_integer_labels<
     V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
         + ZeroLike
         + Neg
@@ -616,7 +614,7 @@ fn integer_label_loss<
     mask: Option<&V>,
     axis: usize,
 ) -> Result<V, ProgramError> {
-    let label_mask = normalization_index_mask(log_probabilities, labels, axis)?;
+    let label_mask = one_hot_mask(log_probabilities, labels, axis)?;
     let loss = label_mask
         .select(log_probabilities, &log_probabilities.zero_like()?)?
         .reduce_sum(&[axis], None)?
@@ -637,18 +635,21 @@ fn integer_label_loss<
 /// The `indices` have `i64` elements and the input shape with `axis` removed; out-of-range indices select nothing.
 /// The mask preserves the input's placement and manual variation. Indices must already vary over the input's manual
 /// axes.
-fn normalization_index_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcast>(
+fn one_hot_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcast>(
     input: &V,
     indices: &V,
     axis: usize,
 ) -> Result<V, ProgramError> {
     let index_type = input.r#type().into_owned().with_data_type(DataType::I64).with_layout(None);
-    // Coordinates are non-differentiable constants, so they can carry the input's variation directly. No skipped
-    // `parallel_vary` transpose is needed for these constants.
+
+    // Coordinates are non-differentiable constants, so they can carry the input's variation directly.
+    // No skipped `parallel_vary` transpose is needed for these constants.
     let coordinates = input.domain().iota(&index_type, axis)?;
     let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
     coordinates.equal(&indices.broadcast(index_type, &output_axes)?)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Boxed primal function whose leading input contains the fixed target logits.
 type SoftTargetPrimal<D> =

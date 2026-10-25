@@ -28,13 +28,13 @@ pub mod exponential;
 pub mod extrema;
 pub mod logical;
 pub mod manipulation;
-pub mod normalization;
 pub mod quantization;
 pub mod random;
 pub mod reductions;
 pub mod references;
 pub mod rounding;
 pub mod sharding;
+pub mod softmax;
 pub mod sorting;
 pub mod special;
 pub mod tagging;
@@ -142,9 +142,6 @@ pub use manipulation::{
     TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
     UpdateSliceOperation,
 };
-pub use normalization::{
-    DifferentiableSoftmaxCrossEntropyWithTargetLogits, Softmax, softmax_cross_entropy_with_target_logits,
-};
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use random::{
     CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
@@ -172,6 +169,9 @@ pub use sharding::{
     ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer, ShardingOperations, TracedShardMap, shard_map,
     shard_map_in_context, shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes,
     trace_shard_map_with_options,
+};
+pub use softmax::{
+    DifferentiableSoftmaxCrossEntropyWithTargetLogits, Softmax, softmax_cross_entropy_with_target_logits,
 };
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
