@@ -1569,8 +1569,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     C: ContextProjection<
             ArrayType,
@@ -1599,18 +1597,6 @@ impl<
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-        // This rule applies the same all-replicated shortcut and the same `CustomCallBatching` behaviors as the
-        // homogeneous rule above, with two composite-universe additions. Every trailing first-class output-extent input
-        // must be replicated: a per-batch-item extent would make the call's results ragged, which the array IR cannot
-        // represent. An extent-free call whose mapped extent is statically known is exactly the homogeneous contract,
-        // so it delegates to the projected homogeneous rule through `batch_projected_operation`. A dynamic mapped
-        // extent stays here, because a first-class dimension is not an array value and cannot cross the projected
-        // array boundary as a scan trip count or broadcast extent. `CustomCallBatching::Sequential` threads the
-        // replicated extents as leading invariant scan carries and consumes the mapped rows one per iteration, so the
-        // body's call sees exactly the per-item extents it declared. `CustomCallBatching::BroadcastAll` instead rebinds
-        // one call whose declared outputs gain the mapped batch dimension, prepending the transform's extent value to
-        // each output's trailing extent group when that batch dimension is itself dynamic.
-
         // Each dynamic output axis occurrence contributes one trailing extent input, including repeated identities.
         let extent_count = self
             .output_types
@@ -1622,15 +1608,21 @@ impl<
             return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
         };
         let (arrays, extents) = inputs.split_at(array_input_count);
+
+        // Output extents must be shared across batch items: mapped extents would require ragged output arrays.
         for extent in extents {
             extent.validate_replicated_dimension()?;
         }
+
+        // With only array inputs and a static batch extent, the homogeneous rule has everything it needs. Dynamic
+        // extents stay here so the resulting scans and calls can consume their first-class dimension inputs.
         let batch_dimension =
             <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
         if extents.is_empty() && batch_dimension.value().is_some() {
             return batch_projected_operation(context, self, inputs);
         }
 
+        // When all array inputs are invariant, bind the call once and keep its outputs replicated.
         let Some((index, mapped)) = arrays.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
         else {
             let values = inputs.iter().map(ArrayIrBatch::value).cloned().collect::<Vec<_>>();
@@ -1650,6 +1642,7 @@ impl<
                 ),
             }),
             CustomCallBatching::Sequential { .. } => {
+                // Move mapped axes to axis `0`; replicated arrays and output extents become invariant scan carries.
                 let aligned = arrays
                     .iter()
                     .map(|input| {
@@ -1660,14 +1653,18 @@ impl<
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+
+                // A dynamic trip count needs its dimension value as a trailing scan input; static counts live
+                // in the scan payload. The body reuses the carried extents for each item's original output shapes.
                 let length_input = batch_dimension.variable().map(|_| context.axis_extent());
                 self.batch_sequential(context, &aligned, extents, batch_dimension, length_input)
             }
             CustomCallBatching::BroadcastAll
             | CustomCallBatching::ExpandDimensions
             | CustomCallBatching::Vectorized => {
-                // First-class output extents stay separate from the kernel's array inputs. Singleton expansion
-                // preserves each invariant array's own extents and placement rather than using the mapped extent.
+                // Stage one call with batch-prefixed outputs. Mapped inputs use leading axis `0`; replicated arrays
+                // gain the full batch extent for `BroadcastAll`, a singleton axis for `ExpandDimensions`, or keep
+                // their shape for `Vectorized`. First-class output extents stay separate from the kernel's inputs.
                 let aligned = arrays
                     .iter()
                     .map(|input| {
@@ -1677,6 +1674,9 @@ impl<
                         if self.batching == CustomCallBatching::Vectorized {
                             return Ok(input.clone());
                         }
+
+                        // The remaining case is singleton expansion. Use the input's runtime extents for its original
+                        // axes and preserve their placement; the new length-one axis is replicated.
                         let value_type = input.value().r#type();
                         let input_type = <&ArrayType>::try_from(value_type.as_ref())?;
                         let output_type = input_type.batched(0, Dimension::Static(1), ShardingDimension::Replicated)?;
@@ -1699,14 +1699,17 @@ impl<
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_types =
                     self.batch_prefixed_output_types(batch_dimension.clone(), context.axis_sharding())?;
+
+                // Shift explicit layout declarations for inputs that gain a leading batch axis. `Vectorized`
+                // leaves replicated inputs unexpanded and keeps their original layout declarations.
                 let input_layouts = self.batch_prefixed_input_layouts(|index| {
                     self.batching != CustomCallBatching::Vectorized
                         || arrays.get(index).is_some_and(|input| !input.batch_axis().is_replicated())
                 })?;
                 let operation = Self { output_types, input_layouts, ..self.clone() };
 
-                // Regroup the trailing extents: each output's inserted batch axis is its new leading dynamic axis,
-                // followed by that output's originally declared extents in axis order.
+                // Regroup the trailing extents in output/axis order. A dynamic batch axis contributes the shared batch
+                // extent before each output's original extents. Static batch axes add no extent inputs.
                 let mut values = aligned.iter().map(|batch| batch.value().clone()).collect::<Vec<_>>();
                 let mut declared_extents = extents.iter();
                 for output_type in &self.output_types {
@@ -1796,6 +1799,8 @@ impl CustomCall for Array {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<ArrayIrType> for ArrayIrValue<A> {
     fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
