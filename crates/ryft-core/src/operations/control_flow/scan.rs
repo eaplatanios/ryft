@@ -447,8 +447,6 @@ impl ScanType for ArrayIrType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Runtime iteration of a [`ScanOperation`] in a domain. [`ScanType`] describes the type family contract independently
 /// of execution; this interface supplies the index, slices, and accumulators in the domain's own value representation.
 /// The same type family can use different representations, such as eager array IR values and per-device bundles in the
@@ -479,6 +477,22 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     ///
     /// Returns an error when the index value cannot be constructed.
     fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError>;
+
+    /// Returns the empty stacked output of type `output_type` of a scan that runs no iterations, whose body declares
+    /// `body_input_types`, and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the
+    /// trailing iteration count). The body types include the intrinsic index input. Resolve any dynamic slice
+    /// dimensions that the value representation requires from these type/value bindings; the leading stack
+    /// extent is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output cannot be allocated or its dynamic dimensions cannot be resolved.
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        body_input_types: &[Self::Type],
+        inputs: &[Self::Value],
+    ) -> Result<Self::Value, ProgramError>;
 
     /// Returns the slice of `stack` that the body reads at `iteration`. For example, reading iteration `2` from an
     /// array of shape `[4, 2, 3]` returns `stack[2]`, an array of shape `[2, 3]`.
@@ -537,38 +551,59 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
         iteration: usize,
         value: Self::Value,
     ) -> Result<Self::Value, ProgramError>;
-
-    /// Returns the empty stacked output of type `output_type` of a scan that runs no iterations, whose body declares
-    /// `body_input_types`, and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the
-    /// trailing iteration count). The body types include the intrinsic index input. Resolve any dynamic slice
-    /// dimensions that the value representation requires from these type/value bindings; the leading stack
-    /// extent is zero.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the output cannot be allocated or its dynamic dimensions cannot be resolved.
-    fn empty_stack(
-        &self,
-        output_type: &Self::Type,
-        body_input_types: &[Self::Type],
-        inputs: &[Self::Value],
-    ) -> Result<Self::Value, ProgramError>;
 }
 
 impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C::Value> + Fill<i64, C::Value>>
     ScanInterpretationDomain for C
 {
+    #[inline]
     fn iteration_count(_iteration_count: &Self::Value) -> Result<usize, ProgramError> {
         // Validation rejects a homogeneous scan with a dynamic length before any iteration count is read.
         Err(ProgramError::MalformedProgram(format!("homogeneous `{SCAN_OPERATION_NAME}` has no iteration count input")))
     }
 
+    #[inline]
     fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError> {
         self.fill(&ArrayType::scalar(DataType::I64), iteration as i64)
     }
 
+    #[inline]
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        _body_input_types: &[Self::Type],
+        _inputs: &[Self::Value],
+    ) -> Result<Self::Value, ProgramError> {
+        self.zero(output_type)
+    }
+
     fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError> {
-        read_scan_iteration(stack, iteration)
+        // Derive the slice bounds and result shape from the stacked value's own fully static type.
+        // Validated scans guarantee that the leading axis has an extent greater than `iteration`.
+        let stack_type = stack.r#type().into_owned();
+        let (slice_type, _) = scan_slice_type(&stack_type, 0)?;
+        let dimensions = stack_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| {
+                dimension.value().ok_or_else(|| {
+                    TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` iteration extraction requires a static stacked type \
+                         but got `{stack_type}`"
+                    ))
+                    .into()
+                })
+            })
+            .collect::<Result<Vec<usize>, ProgramError>>()?;
+        let mut start_indices = vec![0; dimensions.len()];
+        start_indices[0] = iteration;
+        let mut limit_indices = dimensions.clone();
+        limit_indices[0] = iteration + 1;
+        let unit_strides = vec![1; dimensions.len()];
+        let iteration_value =
+            stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
+        iteration_value.reshape_with_output_sharding(slice_type.shape().clone(), slice_type.sharding().cloned())
     }
 
     fn write_iteration(
@@ -580,8 +615,8 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
         iteration: usize,
         value: Self::Value,
     ) -> Result<Self::Value, ProgramError> {
-        // The values of this domain are generic and have no capability that only relabels their manual variation (the
-        // `ParallelVary` capability of an eager array requires an active manual mesh), so a slice whose manual
+        // The values of this domain are generic and have no capability that only relabels their manual variation
+        // (the `ParallelVary` capability of an eager array requires an active manual mesh), so a slice whose manual
         // variation differs from that of the stack is rejected. The variation that the placement of the stacked axis
         // introduces is left out of the comparison: the stack always varies over those axes, and a slice may or may
         // not.
@@ -612,9 +647,10 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
                         }
                     };
                     return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` body returns a slice of output {output_index} that varies over {} \
-                         after earlier slices that vary over {}; every slice of a stacked output must have the same \
-                         manual variation",
+                        "`{}` body returns a slice of output {} that varies over {} after earlier slices that vary \
+                         over {}; every slice of a stacked output must have the same manual variation",
+                        SCAN_OPERATION_NAME,
+                        output_index,
                         render(&returned),
                         render(&stacked),
                     ))
@@ -624,6 +660,7 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
             }
             None => self.zero(&placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?)?,
         };
+
         // A placement over manual mesh axes makes the stack vary over them, and so must every written slice, which
         // this domain cannot relabel: a slice that does not vary over them is rejected before the in-place update
         // would reject it with a less specific message.
@@ -635,25 +672,21 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output {output_index} over the manual \
+                    "`{}` cannot place the stacked axis of output {} over the manual \
                      mesh axes `{}` for slices that do not vary over them",
+                    SCAN_OPERATION_NAME,
+                    output_index,
                     missing.join("`, `"),
                 ))
                 .into());
             }
         }
+
         write_scan_iteration(stack, iteration, value, axis_sharding)
     }
-
-    fn empty_stack(
-        &self,
-        output_type: &Self::Type,
-        _body_input_types: &[Self::Type],
-        _inputs: &[Self::Value],
-    ) -> Result<Self::Value, ProgramError> {
-        self.zero(output_type)
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Array IR scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
 // count from the trailing first-class dimension input. A concrete [`Array`] relabels its type without changing its
@@ -668,54 +701,6 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
     fn iteration_index(&self, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         Ok(ArrayIrValue::Array(context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)?))
-    }
-
-    fn read_iteration(stack: &ArrayIrValue<Array>, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
-        Ok(match stack {
-            ArrayIrValue::Reference(_) => stack.clone(),
-            _ => ArrayIrValue::Array(read_scan_iteration(
-                <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(stack)?,
-                iteration,
-            )?),
-        })
-    }
-
-    fn write_iteration(
-        &self,
-        _output_index: usize,
-        stack: Option<ArrayIrValue<Array>>,
-        iteration_count: usize,
-        axis_sharding: &ShardingDimension,
-        iteration: usize,
-        value: ArrayIrValue<Array>,
-    ) -> Result<ArrayIrValue<Array>, ProgramError> {
-        let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
-        let stack = match stack {
-            Some(stack) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stack)?,
-            None => {
-                let stack_type = placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?;
-                EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
-            }
-        };
-        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives the
-        // stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
-        // replicated placement on the missing axis's mesh; its elements stay unchanged.
-        let types = [stack.r#type().into_owned(), value.r#type().into_owned()];
-        let axes = manual_variation_axes(&types);
-        let mut joined = vary_over_missing_manual_axes(vec![stack, value], &types, &axes, |value, axis, mesh| {
-            let mut input_type = value.r#type().into_owned();
-            if input_type.sharding().is_none() {
-                let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
-                input_type =
-                    input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-            }
-            let output_type =
-                ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
-            Array::from_logical_bytes(output_type, &value.logical_bytes())
-        })?;
-        let value = joined.pop().unwrap();
-        let stack = joined.pop().unwrap();
-        Ok(ArrayIrValue::Array(write_scan_iteration(stack, iteration, value, axis_sharding)?))
     }
 
     fn empty_stack(
@@ -758,6 +743,54 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
             .collect::<Result<Vec<_>, _>>()?;
         let output_type = output_type.clone().with_shape(Shape::new(dimensions));
         Ok(ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type)?))
+    }
+
+    fn read_iteration(stack: &ArrayIrValue<Array>, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
+        Ok(match stack {
+            ArrayIrValue::Reference(_) => stack.clone(),
+            _ => ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::read_iteration(
+                <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(stack)?,
+                iteration,
+            )?),
+        })
+    }
+
+    fn write_iteration(
+        &self,
+        _output_index: usize,
+        stack: Option<ArrayIrValue<Array>>,
+        iteration_count: usize,
+        axis_sharding: &ShardingDimension,
+        iteration: usize,
+        value: ArrayIrValue<Array>,
+    ) -> Result<ArrayIrValue<Array>, ProgramError> {
+        let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
+        let stack = match stack {
+            Some(stack) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stack)?,
+            None => {
+                let stack_type = placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?;
+                EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
+            }
+        };
+        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives the
+        // stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
+        // replicated placement on the missing axis's mesh; its elements stay unchanged.
+        let types = [stack.r#type().into_owned(), value.r#type().into_owned()];
+        let axes = manual_variation_axes(&types);
+        let mut joined = vary_over_missing_manual_axes(vec![stack, value], &types, &axes, |value, axis, mesh| {
+            let mut input_type = value.r#type().into_owned();
+            if input_type.sharding().is_none() {
+                let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
+                input_type =
+                    input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+            }
+            let output_type =
+                ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
+            Array::from_logical_bytes(output_type, &value.logical_bytes())
+        })?;
+        let value = joined.pop().unwrap();
+        let stack = joined.pop().unwrap();
+        Ok(ArrayIrValue::Array(write_scan_iteration(stack, iteration, value, axis_sharding)?))
     }
 }
 
@@ -2598,38 +2631,6 @@ fn forward_scan_carries<V: Value, O: Operation<Type = V::Type>, Carry: Clone>(
     }
 }
 
-/// Extracts slice `iteration` of a stacked value along its leading axis and drops that axis.
-///
-/// The slice bounds and the squeezed shape are derived from the stacked value's own type, which must be fully static
-/// with a leading axis of extent greater than `iteration` (guaranteed for stacked scan values by construction).
-pub(crate) fn read_scan_iteration<V: Value<Type = ArrayType> + Slice + Reshape>(
-    stack: &V,
-    iteration: usize,
-) -> Result<V, ProgramError> {
-    let stack_type = stack.r#type().into_owned();
-    let (slice_type, _) = scan_slice_type(&stack_type, 0)?;
-    let dimensions = stack_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| {
-            dimension.value().ok_or_else(|| {
-                TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` iteration extraction requires a static stacked type but got `{stack_type}`"
-                ))
-                .into()
-            })
-        })
-        .collect::<Result<Vec<usize>, ProgramError>>()?;
-    let mut start_indices = vec![0; dimensions.len()];
-    start_indices[0] = iteration;
-    let mut limit_indices = dimensions.clone();
-    limit_indices[0] = iteration + 1;
-    let unit_strides = vec![1; dimensions.len()];
-    let iteration_value = stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
-    iteration_value.reshape_with_output_sharding(slice_type.shape().clone(), slice_type.sharding().cloned())
-}
-
 /// Returns the type of the stack of `iteration_count` slices of type `slice_type` that an eager scan assembles. When
 /// `slice_type` has sharding, the new leading axis uses `axis_sharding` on the same mesh; otherwise, the stack stays
 /// unsharded, exactly as in output inference (refer to `scan_boundary_types`).
@@ -4372,6 +4373,25 @@ mod tests {
                 .collect::<Vec<_>>())
         })?;
         Ok((outputs, pushforward.program().clone()))
+    }
+
+    #[test]
+    fn test_scan_interpretation_domain_read_iteration() {
+        // Reading an iteration selects the slice at that index along the leading axis and drops that axis.
+        let stack = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(TestEagerContext::read_iteration(&stack, 0), Ok(Array::vector(vec![1.0, 2.0]).unwrap()));
+        assert_eq!(TestEagerContext::read_iteration(&stack, 2), Ok(Array::vector(vec![5.0, 6.0]).unwrap()));
+        let stack = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(TestEagerContext::read_iteration(&stack, 1), Ok(Array::scalar(2.0).unwrap()));
+        assert_eq!(
+            TestEagerContext::read_iteration(&Array::scalar(1.0f64).unwrap(), 0),
+            Err(TypeError::invalid(
+                "`scan` cannot slice a stacked value of type `f64[]` along its scan axis (cannot remove dimension at \
+                 index 0 for rank-0 array type); reshard it so that its scan axis is not sharded over explicit mesh \
+                 axes",
+            )
+            .into()),
+        );
     }
 
     #[test]
@@ -22147,25 +22167,6 @@ mod tests {
         let mut outputs = vec!["final scale", "final accumulator", "final reference"];
         forward_scan_carries(body.entry_region_ref(), 0, &["scale", "accumulator", "reference"], &mut outputs);
         assert_eq!(outputs, vec!["final scale", "final accumulator", "final reference"]);
-    }
-
-    #[test]
-    fn test_read_scan_iteration() {
-        // Reading an iteration selects the slice at that index along the leading axis and drops that axis.
-        let stack = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(read_scan_iteration(&stack, 0), Ok(Array::vector(vec![1.0, 2.0]).unwrap()));
-        assert_eq!(read_scan_iteration(&stack, 2), Ok(Array::vector(vec![5.0, 6.0]).unwrap()));
-        let stack = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(read_scan_iteration(&stack, 1), Ok(Array::scalar(2.0).unwrap()));
-        assert_eq!(
-            read_scan_iteration(&Array::scalar(1.0f64).unwrap(), 0),
-            Err(TypeError::invalid(
-                "`scan` cannot slice a stacked value of type `f64[]` along its scan axis (cannot remove dimension at \
-                 index 0 for rank-0 array type); reshard it so that its scan axis is not sharded over explicit mesh \
-                 axes",
-            )
-            .into()),
-        );
     }
 
     #[test]
