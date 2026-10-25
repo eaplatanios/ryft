@@ -906,24 +906,6 @@ impl CustomCallOperation {
         Ok(())
     }
 
-    /// Returns this [`CustomCallOperation`] with every declared output identity renamed according to `renaming`.
-    #[inline]
-    fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        Ok(Self {
-            target_name: self.target_name.clone(),
-            attributes: self.attributes.clone(),
-            input_layouts: self.input_layouts.clone(),
-            input_output_aliases: self.input_output_aliases.clone(),
-            output_types: self
-                .output_types
-                .iter()
-                .map(|r#type| r#type.rename_identities(renaming))
-                .collect::<Result<Vec<_>, _>>()?,
-            effect_class: self.effect_class,
-            batching: self.batching,
-        })
-    }
-
     /// Returns the number of array inputs of a mixed invocation with `input_types`, the refinements that its trailing
     /// first-class output-extent inputs establish, and this call's declared output types refined by them. Each trailing
     /// extent either defines the identity of its declared output axis or has an exact type that refines that axis to
@@ -1212,8 +1194,6 @@ impl Display for CustomCallOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Operation for CustomCallOperation {
     type Type = ArrayType;
 
@@ -1229,6 +1209,7 @@ impl Operation for CustomCallOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let array_input_types = input_types.iter().collect::<Vec<_>>();
+
         // Aliases are compared against the effective output types, after undeclared shardings inherit the inputs'
         // manual variation, so an input carrying exactly that variation can alias an output declared without one.
         let output_types = self.infer_array_output_types(array_input_types.as_slice())?;
@@ -1244,6 +1225,7 @@ impl Operation for CustomCallOperation {
                 )));
             }
         }
+
         Ok(output_types)
     }
 
@@ -1254,7 +1236,19 @@ impl Operation for CustomCallOperation {
 
     #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        self.renamed(renaming)
+        Ok(Self {
+            target_name: self.target_name.clone(),
+            attributes: self.attributes.clone(),
+            input_layouts: self.input_layouts.clone(),
+            input_output_aliases: self.input_output_aliases.clone(),
+            output_types: self
+                .output_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            effect_class: self.effect_class,
+            batching: self.batching,
+        })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1291,6 +1285,7 @@ impl Operation for CustomCallOperation {
 impl_reference_dischargeable_operation!(@reference_free CustomCallOperation);
 
 impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1308,6 +1303,8 @@ impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> Partial
     for CustomCallOperation
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how a
 // batch axis threads through it. A call whose inputs are *all replicated* is nevertheless bound unchanged through the
@@ -1427,8 +1424,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl_differentiable_operation! {
     CustomCallOperation,
     jvp<C>
@@ -1502,7 +1497,7 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
         &self,
         renaming: &TypeIdentityRenaming<DimensionVariable>,
     ) -> Result<Self, TypeError> {
-        self.renamed(renaming)
+        self.rename_type_identities(renaming)
     }
 }
 
