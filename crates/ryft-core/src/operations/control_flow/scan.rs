@@ -480,48 +480,69 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// Returns an error when the index value cannot be constructed.
     fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError>;
 
-    /// Returns the body input of iteration `iteration` for the stacked input `stack`. Arrays lose their leading scan
-    /// axis with the placement inferred for that slice (refer to [`ScanOperation`]). References enter unchanged as
-    /// whole roots, preserving allocation identity and aliasing so the body can form its own views.
+    /// Returns the slice of `stack` that the body reads at `iteration`. For example, reading iteration `2` from an
+    /// array of shape `[4, 2, 3]` returns `stack[2]`, an array of shape `[2, 3]`.
+    ///
+    /// Removing the leading axis preserves the sharding of the remaining axes. Sharding of the removed axis over
+    /// [`Auto`](MeshAxisType::Auto) mesh axes is dropped; sharding over [`Manual`](MeshAxisType::Manual) mesh axes
+    /// makes the slice vary over those mesh axes. Sharding over [`Explicit`](MeshAxisType::Explicit) mesh axes must
+    /// be removed by resharding before the scan.
+    ///
+    /// A reference input is returned unchanged: the body receives the same reference to the whole stack, preserving
+    /// allocation identity and aliasing. It uses its separate index input to select a view of that reference.
     ///
     /// # Errors
     ///
-    /// Returns an error when the value cannot be sliced at the requested index with the required metadata.
+    /// Returns an error when the slice cannot be read with the required shape and sharding.
     fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError>;
 
-    /// Writes the body output `value` of iteration `iteration` as that slice of the stacked output `accumulator` (i.e.,
-    /// output `output` of the scan), which is allocated with `length` slices of the type of `value`, with its leading
-    /// axis placed as `placement` declares (refer to [`ScanOperation::with_stacked_axis_shardings`]), when it is
-    /// [`None`]. A body may declare its stacked outputs without manual variation, so that only their values reveal it,
-    /// and the variation of a slice can then differ from that of the earlier slices (e.g., when the body stacks a carry
-    /// whose variation an earlier iteration changed). A domain whose values can relabel their manual variation widens
-    /// the stack and the slice to the join of their variation, as `parallel_vary` does, while a domain that cannot
-    /// rejects the slice. Only stacks are widened: a carry keeps the type that the last iteration returns for it (or
-    /// its entry type when the scan runs no iteration), which can vary over fewer manual axes than the join of its
-    /// entry and body types.
+    /// Writes one body output into `stack` at `iteration` and returns the updated stack. For example, with
+    /// `iteration_count = 4`, a `value` of shape `[2, 3]` is written to `stack[iteration]` in a stack of shape
+    /// `[4, 2, 3]`.
     ///
-    /// `iteration` is the logical slice position, independently of visit order. The first write may target the last
-    /// slice of a reversed scan, and subsequent writes must preserve all previously written slices.
+    /// When `stack` is [`None`], allocate it using the actual type of `value`, prepending an axis of extent
+    /// `iteration_count`. If that type has sharding, the new axis uses `axis_sharding` on the same mesh; otherwise,
+    /// the stack stays unsharded (refer to [`ScanOperation::with_stacked_axis_shardings`]). The actual value supplies
+    /// runtime shape and sharding information that the body's declared output type may lack.
+    ///
+    /// `iteration` selects the destination slice, independently of visit order: a reversed scan with four iterations
+    /// first writes slice `3`. Every write must preserve the slices written by earlier iterations.
+    ///
+    /// Slices from different iterations may vary over different manual mesh axes, even when the body's declared output
+    /// type does not record that variation. If this domain can change variation metadata without changing elements,
+    /// make both the stack and the new slice vary over the union of the mesh axes they vary over, as
+    /// [`ParallelVaryOperation`] does, including any variation introduced by `axis_sharding`. Otherwise, reject
+    /// incompatible variation. Carries do not pass through this function: each keeps the type returned by the last
+    /// iteration, or its initial type when no iterations run.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_index`: Index of this scan output, including preceding carry outputs, for error messages.
+    ///   - `stack`: Stack returned by the previous write, or [`None`] for the first write.
+    ///   - `iteration_count`: Total number of slices in the stack, used when allocating it.
+    ///   - `axis_sharding`: Sharding of the stack's new leading axis, applied on the slice's existing mesh, if any.
+    ///   - `iteration`: Destination index along the stack's leading axis.
+    ///   - `value`: Slice produced by the body at this iteration.
     ///
     /// # Errors
     ///
-    /// Returns an error when allocation or writing fails, or the slice, placement, or variation is incompatible with
+    /// Returns an error when allocation or writing fails, or the slice, sharding, or variation is incompatible with
     /// the stack representation.
     fn write_iteration(
         &self,
-        output: usize,
-        accumulator: Option<Self::Value>,
-        length: usize,
-        placement: &ShardingDimension,
+        output_index: usize,
+        stack: Option<Self::Value>,
+        iteration_count: usize,
+        axis_sharding: &ShardingDimension,
         iteration: usize,
         value: Self::Value,
     ) -> Result<Self::Value, ProgramError>;
 
-    /// Returns the empty stacked output of type `output_type` of a scan that runs no iteration, whose body declares
-    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the
+    /// Returns the empty stacked output of type `output_type` of a scan that runs no iterations, whose body declares
+    /// `body_input_types`, and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the
     /// trailing iteration count). The body types include the intrinsic index input. Resolve any dynamic slice
-    /// dimensions that the value representation requires from these type/value bindings; the leading stack extent is
-    /// zero.
+    /// dimensions that the value representation requires from these type/value bindings; the leading stack
+    /// extent is zero.
     ///
     /// # Errors
     ///
@@ -552,10 +573,10 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
 
     fn write_iteration(
         &self,
-        output: usize,
-        accumulator: Option<Self::Value>,
-        length: usize,
-        placement: &ShardingDimension,
+        output_index: usize,
+        stack: Option<Self::Value>,
+        iteration_count: usize,
+        axis_sharding: &ShardingDimension,
         iteration: usize,
         value: Self::Value,
     ) -> Result<Self::Value, ProgramError> {
@@ -564,14 +585,14 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
         // variation differs from that of the stack is rejected. The variation that the placement of the stacked axis
         // introduces is left out of the comparison: the stack always varies over those axes, and a slice may or may
         // not.
-        let accumulator = match accumulator {
-            Some(accumulator) => {
+        let stack = match stack {
+            Some(stack) => {
                 let variation = |value: &Self::Value| {
                     value
                         .r#type()
                         .sharding()
                         .map(|sharding| {
-                            let placed = placement.manual_axes(sharding.mesh());
+                            let placed = axis_sharding.manual_axes(sharding.mesh());
                             sharding
                                 .varying_manual_axes()
                                 .iter()
@@ -581,7 +602,7 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
                         })
                         .unwrap_or_default()
                 };
-                let (stacked, returned) = (variation(&accumulator), variation(&value));
+                let (stacked, returned) = (variation(&stack), variation(&value));
                 if stacked != returned {
                     let render = |axes: &BTreeSet<String>| {
                         if axes.is_empty() {
@@ -591,37 +612,37 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
                         }
                     };
                     return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` body returns a slice of output {output} that varies over {} after \
-                         earlier slices that vary over {}; every slice of a stacked output must have the same manual \
-                         variation",
+                        "`{SCAN_OPERATION_NAME}` body returns a slice of output {output_index} that varies over {} \
+                         after earlier slices that vary over {}; every slice of a stacked output must have the same \
+                         manual variation",
                         render(&returned),
                         render(&stacked),
                     ))
                     .into());
                 }
-                accumulator
+                stack
             }
-            None => self.zero(&placed_scan_stack_type(&value.r#type(), length, placement)?)?,
+            None => self.zero(&placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?)?,
         };
         // A placement over manual mesh axes makes the stack vary over them, and so must every written slice, which
         // this domain cannot relabel: a slice that does not vary over them is rejected before the in-place update
         // would reject it with a less specific message.
         if let Some(sharding) = value.r#type().sharding() {
-            let missing = placement
+            let missing = axis_sharding
                 .manual_axes(sharding.mesh())
                 .into_iter()
                 .filter(|axis| !sharding.varying_manual_axes().contains(axis))
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output {output} over the manual mesh \
-                     axes `{}` for slices that do not vary over them",
+                    "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output {output_index} over the manual \
+                     mesh axes `{}` for slices that do not vary over them",
                     missing.join("`, `"),
                 ))
                 .into());
             }
         }
-        write_scan_iteration(accumulator, iteration, value, placement)
+        write_scan_iteration(stack, iteration, value, axis_sharding)
     }
 
     fn empty_stack(
@@ -661,41 +682,40 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
 
     fn write_iteration(
         &self,
-        _output: usize,
-        accumulator: Option<ArrayIrValue<Array>>,
-        length: usize,
-        placement: &ShardingDimension,
+        _output_index: usize,
+        stack: Option<ArrayIrValue<Array>>,
+        iteration_count: usize,
+        axis_sharding: &ShardingDimension,
         iteration: usize,
         value: ArrayIrValue<Array>,
     ) -> Result<ArrayIrValue<Array>, ProgramError> {
         let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
-        let accumulator = match accumulator {
-            Some(accumulator) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(accumulator)?,
+        let stack = match stack {
+            Some(stack) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stack)?,
             None => {
-                let stack_type = placed_scan_stack_type(&value.r#type(), length, placement)?;
+                let stack_type = placed_scan_stack_type(&value.r#type(), iteration_count, axis_sharding)?;
                 EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
             }
         };
         // Join manual variation across iterations (and the variation that the placement of the stacked axis gives the
         // stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
         // replicated placement on the missing axis's mesh; its elements stay unchanged.
-        let types = [accumulator.r#type().into_owned(), value.r#type().into_owned()];
+        let types = [stack.r#type().into_owned(), value.r#type().into_owned()];
         let axes = manual_variation_axes(&types);
-        let mut joined =
-            vary_over_missing_manual_axes(vec![accumulator, value], &types, &axes, |value, axis, mesh| {
-                let mut input_type = value.r#type().into_owned();
-                if input_type.sharding().is_none() {
-                    let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
-                    input_type =
-                        input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-                }
-                let output_type =
-                    ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
-                Array::from_logical_bytes(output_type, &value.logical_bytes())
-            })?;
+        let mut joined = vary_over_missing_manual_axes(vec![stack, value], &types, &axes, |value, axis, mesh| {
+            let mut input_type = value.r#type().into_owned();
+            if input_type.sharding().is_none() {
+                let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
+                input_type =
+                    input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+            }
+            let output_type =
+                ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
+            Array::from_logical_bytes(output_type, &value.logical_bytes())
+        })?;
         let value = joined.pop().unwrap();
-        let accumulator = joined.pop().unwrap();
-        Ok(ArrayIrValue::Array(write_scan_iteration(accumulator, iteration, value, placement)?))
+        let stack = joined.pop().unwrap();
+        Ok(ArrayIrValue::Array(write_scan_iteration(stack, iteration, value, axis_sharding)?))
     }
 
     fn empty_stack(
@@ -2610,46 +2630,46 @@ pub(crate) fn read_scan_iteration<V: Value<Type = ArrayType> + Slice + Reshape>(
     iteration_value.reshape_with_output_sharding(slice_type.shape().clone(), slice_type.sharding().cloned())
 }
 
-/// Returns the type of the stack of `length` slices of type `slice_type` that an eager scan assembles, with its leading
-/// axis placed as `placement` declares, exactly as output inference builds a stacked output type (refer to
-/// `scan_boundary_types`).
+/// Returns the type of the stack of `iteration_count` slices of type `slice_type` that an eager scan assembles. When
+/// `slice_type` has sharding, the new leading axis uses `axis_sharding` on the same mesh; otherwise, the stack stays
+/// unsharded, exactly as in output inference (refer to `scan_boundary_types`).
 fn placed_scan_stack_type(
     slice_type: &ArrayType,
-    length: usize,
-    placement: &ShardingDimension,
+    iteration_count: usize,
+    axis_sharding: &ShardingDimension,
 ) -> Result<ArrayType, TypeError> {
-    slice_type.batched(0, length.into(), placement.clone()).map_err(|error| {
+    slice_type.batched(0, iteration_count.into(), axis_sharding.clone()).map_err(|error| {
         TypeError::invalid(format!(
             "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type `{slice_type}` on \
-             `{placement}` ({error})",
+             `{axis_sharding}` ({error})",
         ))
     })
 }
 
-/// Writes `value` as slice `iteration` of `accumulator`, whose leading axis is placed as `placement` declares,
-/// prepending a unit axis to `value` first. An in-place update must agree with the stack on explicit mesh axes and on
-/// the variation that manual mesh axes introduce, so the unit axis carries such a placement; a placement over auto mesh
-/// axes is a hint that the update need not repeat (and that a reshape cannot request).
+/// Writes `value` as slice `iteration` of `stack` by prepending a unit axis to `value`. If `value` has sharding, the
+/// unit axis uses `axis_sharding` on the same mesh. An in-place update must agree with the stack on explicit mesh axes
+/// and on the variation that manual mesh axes introduce, so the unit axis carries such sharding; sharding over auto
+/// mesh axes is a hint that the update need not repeat (and that a reshape cannot request).
 pub(crate) fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
-    accumulator: V,
+    stack: V,
     iteration: usize,
     value: V,
-    placement: &ShardingDimension,
+    axis_sharding: &ShardingDimension,
 ) -> Result<V, ProgramError> {
     let value_type = value.r#type().into_owned();
-    let expanded_type = placed_scan_stack_type(&value_type, 1, placement)?;
-    let requests_placement = expanded_type.sharding().is_some_and(|sharding| {
-        matches!(placement, ShardingDimension::Sharded(axis_names)
+    let expanded_type = placed_scan_stack_type(&value_type, 1, axis_sharding)?;
+    let requests_sharding = expanded_type.sharding().is_some_and(|sharding| {
+        matches!(axis_sharding, ShardingDimension::Sharded(axis_names)
             if axis_names.iter().all(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto)))
     });
-    let expanded = if requests_placement {
+    let expanded = if requests_sharding {
         value.reshape_with_output_sharding(expanded_type.shape().clone(), expanded_type.sharding().cloned())?
     } else {
         value.reshape(expanded_type.shape().clone())?
     };
     let mut start_indices = vec![0; value_type.rank() + 1];
     start_indices[0] = iteration;
-    accumulator.update_slice(&expanded, start_indices.as_slice())
+    stack.update_slice(&expanded, start_indices.as_slice())
 }
 
 /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body passes
