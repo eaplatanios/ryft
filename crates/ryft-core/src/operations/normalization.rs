@@ -278,7 +278,28 @@ impl<
     fn log_softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("log_softmax", &self.r#type(), axes.into())?;
         let mut flattened = FlattenedClassInputs::new(vec![self.convert_element_type(working_type)?], &axes)?;
-        let output = log_softmax_along(&flattened.inputs.pop().unwrap(), flattened.axis)?;
+        let input = flattened.inputs.pop().unwrap();
+        let axis = flattened.axis;
+        let pivot = input.argmax_with_index_data_type(axis, DataType::I64)?;
+        let mask = normalization_index_mask(&input, &pivot, axis)?;
+        let zero = input.zero_like()?;
+        let pivot_value = mask.select(&input, &zero)?.reduce_sum(&[axis], None)?;
+        let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
+        let pivot_value = pivot_value.broadcast(input.r#type().into_owned(), &output_axes)?;
+
+        // The pivot must be a constant zero rather than `input[pivot] - input[pivot]`: the latter permits an automatic
+        // differentiation implementation to subtract two rounded coefficients and erase its small gradient. Selecting
+        // one index also preserves the full derivative at ties, unlike treating every maximum as a constant zero.
+        let shifted = mask.select(&zero, &input.sub(&pivot_value)?)?;
+        let tail = mask.select(&zero, &shifted.exp()?)?.reduce_sum(&[axis], None)?;
+        let correction = tail.ln_1p()?.broadcast(input.r#type().into_owned(), &output_axes)?;
+        let output = shifted.sub(&correction)?;
+
+        // A singleton still follows the documented non-finite semantics. The finite test also propagates a NaN
+        // chosen by argmax without relying on arithmetic in an otherwise excluded slot.
+        let finite = pivot_value.sub(&pivot_value)?.equal(&zero)?;
+        let nan = input.domain().fill(&input.r#type(), f64::NAN)?;
+        let output = finite.select(&output, &nan)?;
         flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
@@ -289,7 +310,13 @@ impl<
         let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
         let mask = flattened.inputs.pop().unwrap();
         let input = flattened.inputs.pop().unwrap();
-        let output = masked_log_softmax_along(&input, &mask, flattened.axis)?;
+
+        // Unselected classes are excluded exactly like `-∞` logits, which also discards any NaN they hold. A row
+        // without a selected class normalizes to NaNs, which the final selection replaces by `-∞`. The literal is
+        // a non-differentiable constant, so it carries the input's placement and variation directly.
+        let negative_infinity = input.domain().fill(&input.r#type(), f64::NEG_INFINITY)?;
+        let log_probabilities = mask.select(&input, &negative_infinity)?.log_softmax(flattened.axis)?;
+        let output = mask.select(&log_probabilities, &negative_infinity)?;
         flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
@@ -305,7 +332,7 @@ impl<
         let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
         let targets = flattened.inputs.pop().unwrap();
         let input = flattened.inputs.pop().unwrap();
-        let log_probabilities = log_softmax_along(&input, flattened.axis)?;
+        let log_probabilities = input.log_softmax(flattened.axis)?;
         cross_entropy_loss(&targets, &log_probabilities, None, flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
@@ -328,7 +355,7 @@ impl<
         let mask = flattened.inputs.pop().unwrap();
         let targets = flattened.inputs.pop().unwrap();
         let input = flattened.inputs.pop().unwrap();
-        let log_probabilities = masked_log_softmax_along(&input, &mask, flattened.axis)?;
+        let log_probabilities = input.masked_log_softmax(&mask, flattened.axis)?;
         cross_entropy_loss(&targets, &log_probabilities, Some(&mask), flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
@@ -352,7 +379,8 @@ impl<
         ])?;
         let labels = aligned.pop().unwrap();
         let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
-        integer_label_loss(&flattened.inputs.pop().unwrap(), &labels, None, flattened.axis)?
+        let log_probabilities = flattened.inputs.pop().unwrap().log_softmax(flattened.axis)?;
+        integer_label_loss(&log_probabilities, &labels, None, flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -374,7 +402,8 @@ impl<
         let labels = aligned.pop().unwrap();
         let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
         let mask = flattened.inputs.pop().unwrap();
-        integer_label_loss(&flattened.inputs.pop().unwrap(), &labels, Some(&mask), flattened.axis)?
+        let log_probabilities = flattened.inputs.pop().unwrap().masked_log_softmax(&mask, flattened.axis)?;
+        integer_label_loss(&log_probabilities, &labels, Some(&mask), flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 }
@@ -544,71 +573,18 @@ fn validate_normalization_labels(
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Computes log-probabilities along `axis` with one pivot class per row held at a constant zero.
-fn log_softmax_along<V>(input: &V, axis: usize) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
-        + ZeroLike
-        + Sub
-        + Exp
-        + Ln1p
-        + Compare
-        + Select
-        + Broadcast
-        + Reduce
-        + ArgMax,
-{
-    let pivot = input.argmax_with_index_data_type(axis, DataType::I64)?;
-    let mask = normalization_index_mask(input, &pivot, axis)?;
-    let zero = input.zero_like()?;
-    let pivot_value = mask.select(input, &zero)?.reduce_sum(&[axis], None)?;
-    let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
-    let pivot_value = pivot_value.broadcast(input.r#type().into_owned(), &output_axes)?;
-
-    // The pivot must be a constant zero rather than `input[pivot] - input[pivot]`: the latter permits an AD
-    // implementation to subtract two rounded coefficients and erase its small gradient. Selecting one index
-    // also preserves the full derivative at ties, unlike treating every maximum as a constant zero.
-    let shifted = mask.select(&zero, &input.sub(&pivot_value)?)?;
-    let tail = mask.select(&zero, &shifted.exp()?)?.reduce_sum(&[axis], None)?;
-    let correction = tail.ln_1p()?.broadcast(input.r#type().into_owned(), &output_axes)?;
-    let output = shifted.sub(&correction)?;
-
-    // A singleton still follows the documented non-finite semantics. The finite test also propagates a NaN
-    // chosen by argmax without relying on arithmetic in an otherwise excluded slot.
-    let finite = pivot_value.sub(&pivot_value)?.equal(&zero)?;
-    let nan = input.domain().fill(&input.r#type(), f64::NAN)?;
-    finite.select(&output, &nan)
-}
-
-/// Computes the log-probabilities of the classes that `mask` selects along `axis`, with negative infinity for the
-/// other classes and for every class of a row without a selected class.
-fn masked_log_softmax_along<V>(input: &V, mask: &V, axis: usize) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
-        + ZeroLike
-        + Sub
-        + Exp
-        + Ln1p
-        + Compare
-        + Select
-        + Broadcast
-        + Reduce
-        + ArgMax,
-{
-    // Unselected classes are excluded exactly like `-∞` logits, which also discards any NaN they hold. A row without
-    // a selected class normalizes to NaNs, which the final selection replaces by `-∞`. The literal is a
-    // non-differentiable constant, so it carries the input's placement and variation directly.
-    let negative_infinity = input.domain().fill(&input.r#type(), f64::NEG_INFINITY)?;
-    let log_probabilities = log_softmax_along(&mask.select(input, &negative_infinity)?, axis)?;
-    mask.select(&log_probabilities, &negative_infinity)
-}
-
-/// Computes `-sum(targets * log_probabilities)` over `axis` with `0 * log(0) = 0`, counting only the classes that
-/// `mask` selects when it is provided.
-fn cross_entropy_loss<V>(targets: &V, log_probabilities: &V, mask: Option<&V>, axis: usize) -> Result<V, ProgramError>
-where
+/// Reduces `targets` and precomputed `log_probabilities` over the single class `axis` to compute
+/// [`Softmax::softmax_cross_entropy`]. With `mask`, log-probabilities must already be normalized over that mask as in
+/// [`Softmax::masked_log_softmax`]; the loss follows [`Softmax::masked_softmax_cross_entropy`]. The caller supplies
+/// validated, aligned inputs with targets and log-probabilities in working precision.
+fn cross_entropy_loss<
     V: Value<Type = ArrayType, Domain: Fill<f64, V>> + ZeroLike + Neg + Mul + Compare + And + Select + Reduce,
-{
+>(
+    targets: &V,
+    log_probabilities: &V,
+    mask: Option<&V>,
+    axis: usize,
+) -> Result<V, ProgramError> {
     let zero = targets.zero_like()?;
     let negative_infinity = log_probabilities.domain().fill(&log_probabilities.r#type(), f64::NEG_INFINITY)?;
     let excluded_zero = targets.equal(&zero)?.and(&log_probabilities.equal(&negative_infinity)?)?;
@@ -621,31 +597,28 @@ where
     terms.reduce_sum(&[axis], None)?.neg()
 }
 
-/// Computes the negative log-probability of the class that each label names along `axis`, with NaN for a label
-/// outside `[0, class_count)`, over the classes that `mask` selects when it is provided (a row without a selected
-/// class then has zero loss, whatever its label).
-fn integer_label_loss<V>(input: &V, labels: &V, mask: Option<&V>, axis: usize) -> Result<V, ProgramError>
-where
+/// Selects each label's negative log-probability along `axis`, with the invalid-label and empty-mask behavior of
+/// [`Softmax::softmax_cross_entropy_with_integer_labels`] and
+/// [`Softmax::masked_softmax_cross_entropy_with_integer_labels`]. The caller supplies validated, aligned inputs,
+/// `i64` labels, and log-probabilities computed in working precision over the same optional `mask`.
+fn integer_label_loss<
     V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
         + ZeroLike
         + Neg
-        + Sub
-        + Exp
-        + Ln1p
         + Compare
         + Select
         + Broadcast
         + ConvertElementType
-        + Reduce
-        + ArgMax,
-{
-    let label_mask = normalization_index_mask(input, labels, axis)?;
-    let log_probabilities = match mask {
-        Some(mask) => masked_log_softmax_along(input, mask, axis)?,
-        None => log_softmax_along(input, axis)?,
-    };
+        + Reduce,
+>(
+    log_probabilities: &V,
+    labels: &V,
+    mask: Option<&V>,
+    axis: usize,
+) -> Result<V, ProgramError> {
+    let label_mask = normalization_index_mask(log_probabilities, labels, axis)?;
     let loss = label_mask
-        .select(&log_probabilities, &log_probabilities.zero_like()?)?
+        .select(log_probabilities, &log_probabilities.zero_like()?)?
         .reduce_sum(&[axis], None)?
         .neg()?;
     let valid = label_mask
@@ -660,12 +633,15 @@ where
     }
 }
 
-/// Compares class coordinates with one index per row, preserving the input's placement and manual variation. The
-/// indices must already vary over the input's manual axes.
-fn normalization_index_mask<V>(input: &V, indices: &V, axis: usize) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcast,
-{
+/// Builds a Boolean mask with `input`'s shape, selecting the class named by `indices` in each row along `axis`.
+/// The `indices` have `i64` elements and the input shape with `axis` removed; out-of-range indices select nothing.
+/// The mask preserves the input's placement and manual variation. Indices must already vary over the input's manual
+/// axes.
+fn normalization_index_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcast>(
+    input: &V,
+    indices: &V,
+    axis: usize,
+) -> Result<V, ProgramError> {
     let index_type = input.r#type().into_owned().with_data_type(DataType::I64).with_layout(None);
     // Coordinates are non-differentiable constants, so they can carry the input's variation directly. No skipped
     // `parallel_vary` transpose is needed for these constants.
@@ -2138,35 +2114,35 @@ mod tests {
             indoc! {"
             lambda %0:f32[2, 3], %1:i32[2] .
             let %2:i64[2] = convert_element_type [data_type=i64] %1
-                %3:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
-                %4:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %2
-                %5:bool[2, 3] = compare [direction=Equal] %3 %4
-                %6:i64[2] = argmax [axis=1, index_data_type=i64] %0
-                %7:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
-                %8:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %6
-                %9:bool[2, 3] = compare [direction=Equal] %7 %8
-                %10:f32[2, 3] = zero_like %0
-                %11:f32[2, 3] = select %9 %0 %10
-                %12:f32[2] = reduce [kind=sum, axes=[1]] %11
-                %13:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[0]] %12
-                %14:f32[2, 3] = sub %0 %13
-                %15:f32[2, 3] = select %9 %10 %14
-                %16:f32[2, 3] = exp %15
-                %17:f32[2, 3] = select %9 %10 %16
-                %18:f32[2] = reduce [kind=sum, axes=[1]] %17
-                %19:f32[2] = ln_1p %18
-                %20:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[0]] %19
-                %21:f32[2, 3] = sub %15 %20
-                %22:f32[2, 3] = sub %13 %13
-                %23:bool[2, 3] = compare [direction=Equal] %22 %10
-                %24:f32[] = constant [value=NaN]
-                %25:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[]] %24
-                %26:f32[2, 3] = select %23 %21 %25
-                %27:f32[2, 3] = zero_like %26
-                %28:f32[2, 3] = select %5 %26 %27
+                %3:i64[2] = argmax [axis=1, index_data_type=i64] %0
+                %4:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
+                %5:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %3
+                %6:bool[2, 3] = compare [direction=Equal] %4 %5
+                %7:f32[2, 3] = zero_like %0
+                %8:f32[2, 3] = select %6 %0 %7
+                %9:f32[2] = reduce [kind=sum, axes=[1]] %8
+                %10:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[0]] %9
+                %11:f32[2, 3] = sub %0 %10
+                %12:f32[2, 3] = select %6 %7 %11
+                %13:f32[2, 3] = exp %12
+                %14:f32[2, 3] = select %6 %7 %13
+                %15:f32[2] = reduce [kind=sum, axes=[1]] %14
+                %16:f32[2] = ln_1p %15
+                %17:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[0]] %16
+                %18:f32[2, 3] = sub %12 %17
+                %19:f32[2, 3] = sub %10 %10
+                %20:bool[2, 3] = compare [direction=Equal] %19 %7
+                %21:f32[] = constant [value=NaN]
+                %22:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[]] %21
+                %23:f32[2, 3] = select %20 %18 %22
+                %24:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
+                %25:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %2
+                %26:bool[2, 3] = compare [direction=Equal] %24 %25
+                %27:f32[2, 3] = zero_like %23
+                %28:f32[2, 3] = select %26 %23 %27
                 %29:f32[2] = reduce [kind=sum, axes=[1]] %28
                 %30:f32[2] = neg %29
-                %31:i64[2, 3] = convert_element_type [data_type=i64] %5
+                %31:i64[2, 3] = convert_element_type [data_type=i64] %26
                 %32:i64[2] = reduce [kind=sum, axes=[1]] %31
                 %33:i64[2] = zero_like %2
                 %34:bool[2] = compare [direction=GreaterThan] %32 %33
@@ -2206,56 +2182,56 @@ indoc! {"
             lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:i32[][sharding={mesh<['x'=2:manual]>, []}] .
             let %2:i64[][sharding={mesh<['x'=2:manual]>, []}] = convert_element_type [data_type=i64] %1
                 %3:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %2
-                %4:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %0
+                %5:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
                     type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     dimension=0,
                 ]
-                %5:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                %6:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %4
+                %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %5 %6
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %0 %8
+                %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
+                %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %10
+                %12:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %0 %11
+                %13:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %8 %12
+                %14:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %13
+                %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %8 %14
+                %16:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %15
+                %17:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = ln_1p %16
+                %18:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %17
+                %19:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %13 %18
+                %20:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %11 %11
+                %21:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %20 %8
+                %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
+                %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %22
+                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %21 %19 %23
+                %25:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                    type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    dimension=0,
+                ]
+                %26:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %3
-                %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %4 %5
-                %7:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %0
-                %8:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
-                    type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    dimension=0,
-                ]
-                %9:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %7
-                %10:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %8 %9
-                %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
-                %12:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %10 %0 %11
-                %13:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %12
-                %14:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %13
-                %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %0 %14
-                %16:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %10 %11 %15
-                %17:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %16
-                %18:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %10 %11 %17
-                %19:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %18
-                %20:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = ln_1p %19
-                %21:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %20
-                %22:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %16 %21
-                %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %14 %14
-                %24:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %23 %11
-                %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
-                %26:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %25
-                %27:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %24 %22 %26
-                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %27
-                %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %6 %27 %28
+                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %25 %26
+                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
+                %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
-                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=i64] %6
+                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
                 %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %3
                 %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = compare [direction=GreaterThan] %33 %34
@@ -2280,56 +2256,56 @@ indoc! {"
             lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], %1:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
             let %2:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = convert_element_type [data_type=i64] %1
                 %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %0
-                %4:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %3
+                %5:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
                     type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     dimension=0,
                 ]
-                %5:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                %6:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %4
+                %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %5 %6
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
+                %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %3 %8
+                %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
+                %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %10
+                %12:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %3 %11
+                %13:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %8 %12
+                %14:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %13
+                %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %8 %14
+                %16:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %15
+                %17:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = ln_1p %16
+                %18:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %17
+                %19:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %13 %18
+                %20:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %11 %11
+                %21:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %20 %8
+                %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
+                %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %22
+                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %21 %19 %23
+                %25:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                    type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    dimension=0,
+                ]
+                %26:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %2
-                %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %4 %5
-                %7:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %3
-                %8:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
-                    type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    dimension=0,
-                ]
-                %9:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %7
-                %10:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %8 %9
-                %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
-                %12:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %10 %3 %11
-                %13:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %12
-                %14:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %13
-                %15:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %3 %14
-                %16:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %10 %11 %15
-                %17:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %16
-                %18:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %10 %11 %17
-                %19:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %18
-                %20:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = ln_1p %19
-                %21:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %20
-                %22:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %16 %21
-                %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %14 %14
-                %24:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %23 %11
-                %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
-                %26:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
-                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
-                    output_axes=[],
-                ] %25
-                %27:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %24 %22 %26
-                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %27
-                %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %6 %27 %28
+                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %25 %26
+                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
+                %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
-                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=i64] %6
+                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
                 %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %2
                 %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = compare [direction=GreaterThan] %33 %34
