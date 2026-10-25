@@ -864,6 +864,14 @@ fn cross_entropy_loss<
     let negative_infinity = log_probabilities.domain().fill(&log_probabilities.r#type(), f64::NEG_INFINITY)?;
     let excluded_zero = targets.equal(&zero)?.and(&log_probabilities.equal(&negative_infinity)?)?;
     let log_probabilities = excluded_zero.select(&zero, log_probabilities)?;
+
+    // Mask the coefficient before multiplication so the target pullback cannot multiply a zero cotangent by an
+    // excluded negative infinite log-probability. The final selection also excludes non-finite target payloads.
+    let log_probabilities = match mask {
+        Some(mask) => mask.select(&log_probabilities, &zero)?,
+        None => log_probabilities,
+    };
+
     let terms = targets.mul(&log_probabilities)?;
     let terms = match mask {
         Some(mask) => mask.select(&terms, &zero)?,
@@ -934,7 +942,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, bf16,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f8e4m3fn, f8e8m0fnu, f16,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, batch};
@@ -944,9 +952,11 @@ mod tests {
     use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
-    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::partial::{
+        PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer, PartialValue,
+    };
     use crate::programs::ValueProjection;
-    use crate::tracing::{Trace, Tracer, TracingContext};
+    use crate::tracing::{Trace, TracingContext};
 
     use super::*;
 
@@ -986,26 +996,27 @@ mod tests {
         assert_abs_diff_eq!(actual[2], 1.0 / denominator, epsilon = 1e-15);
         assert_eq!(
             Array::scalar(1.0f32).unwrap().reshape([1]).unwrap().softmax(0),
-            Ok(Array::vector(vec![1.0f32]).unwrap())
+            Ok(Array::vector(vec![1.0f32]).unwrap()),
         );
         assert_eq!(
             Array::matrix(0, 2, Vec::<f32>::new()).unwrap().softmax(1),
-            Ok(Array::matrix(0, 2, Vec::<f32>::new()).unwrap())
+            Ok(Array::matrix(0, 2, Vec::<f32>::new()).unwrap()),
         );
+
         // The array IR universe projects to the same contract, including the singleton and empty edge cases.
         let array_ir = ArrayIrValue::Array(input.clone());
         assert_eq!(array_ir.softmax(0), Ok(ArrayIrValue::Array(input.softmax(0).unwrap())));
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap()).softmax(0),
-            Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap())),
         );
         assert_eq!(
             ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap()).softmax(1),
-            Ok(ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap()))
+            Ok(ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap())),
         );
         assert_eq!(
             ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap()).softmax(0),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis"))),
         );
     }
 
@@ -1018,31 +1029,50 @@ mod tests {
         let output = input.softmax([0, 2]).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3, 2]));
         let output = output.to_f64s();
-        for j in 0..3 {
-            let group = [(0, 0), (0, 1), (1, 0), (1, 1)].map(|(i, k)| (i * 3 + j) * 2 + k);
+        for row in 0..3 {
+            let group = [(0, 0), (0, 1), (1, 0), (1, 1)]
+                .map(|(outer_class, inner_class)| (outer_class * 3 + row) * 2 + inner_class);
             let denominator = group.iter().map(|&index| values[index].exp()).sum::<f64>();
             for index in group {
                 assert_abs_diff_eq!(output[index], values[index].exp() / denominator, epsilon = 1e-15);
             }
         }
         assert_abs_diff_eq!(input.softmax([0, 1, 2]).unwrap().to_f64s().iter().sum::<f64>(), 1.0, epsilon = 1e-15);
-        assert_eq!(input.softmax([-1, -3]), input.softmax([0, 2]));
-        assert_eq!(input.softmax(vec![2usize]), input.softmax(2));
+        assert_eq!(input.softmax([-1, -3]), Ok(input.softmax([0, 2]).unwrap()));
+        assert_eq!(input.softmax(vec![2usize]), Ok(input.softmax(2).unwrap()));
+    }
+
+    #[test]
+    fn test_softmax_narrow_inputs() {
+        let correction = (-8.0f32).exp().ln_1p();
+        let output = Array::vector(vec![f16::from_f32(4.0), f16::from_f32(-4.0)]).unwrap().softmax(0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F16, [2]));
+        assert_eq!(
+            output.elements::<f16>(),
+            Ok(vec![f16::from_f32((-correction).exp()), f16::from_f32((-8.0 - correction).exp())]),
+        );
+        let output = Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(); 2]).unwrap().softmax(0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F8E4M3FN, [2]));
+        assert_eq!(output.logical_bytes(), vec![0x30, 0x30]);
+
+        // Exponent-only formats retain a representable singleton probability.
+        let input = Array::vector(vec![f8e8m0fnu::from_f64(1.0).unwrap()]).unwrap();
+        assert_eq!(input.softmax(0).unwrap().logical_bytes(), vec![0x7f]);
     }
 
     #[test]
     fn test_softmax_validation() {
         assert_eq!(
             Array::vector(vec![1i32]).unwrap().softmax(0),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires real floating-point logits")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires real floating-point logits"))),
         );
         assert_eq!(
             Array::vector(Vec::<f32>::new()).unwrap().softmax(0),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis"))),
         );
         assert_eq!(
             Array::vector(vec![1.0f32]).unwrap().softmax(1),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` axis 1 is out of bounds for rank 1")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` axis 1 is out of bounds for rank 1"))),
         );
         let dynamic = ArrayType::new(
             DataType::F32,
@@ -1050,28 +1080,35 @@ mod tests {
         );
         assert_eq!(
             ArrayContext::trace(|input| input.softmax(0), dynamic).map(|(output_type, _)| output_type),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a static input shape")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a static input shape"))),
         );
         let (mesh, _, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let reduced = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
             ArrayContext::trace(|input| input.softmax(0), reduced).map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid("`softmax` does not support unreduced or reduced inputs"))),
         );
+        let unreduced = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            ArrayContext::trace(|input| input.softmax(0), unreduced).map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid("`softmax` does not support unreduced or reduced inputs"))),
+        );
         let input = Array::matrix(2, 2, vec![0.0f32; 4]).unwrap();
         assert_eq!(
             input.softmax([0, 0]),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` axes contain duplicate axis 0")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` axes contain duplicate axis 0"))),
         );
         assert_eq!(
             input.softmax(Vec::<usize>::new()),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires at least one class axis")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires at least one class axis"))),
         );
         assert_eq!(
             Array::matrix(2, 0, Vec::<f32>::new()).unwrap().softmax([0, 1]),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis"))),
         );
     }
 
@@ -1110,10 +1147,10 @@ mod tests {
                 %24:bf16[2] = convert_element_type [data_type=bf16] %23
             in (%24)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let input = Array::vector(vec![bf16::from_f32(4.0), bf16::from_f32(-4.0)]).unwrap();
-        assert_eq!(program.interpret(input.clone()), input.softmax(0));
+        assert_eq!(program.interpret(input.clone()), Ok(input.softmax(0).unwrap()));
     }
 
     #[test]
@@ -1132,30 +1169,35 @@ mod tests {
             indoc! {"
             lambda %0:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] .
             let %1:i64[][sharding={mesh<['d'=2:explicit]>, []}] = argmax [axis=0, index_data_type=i64] %0
-                %2:i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = iota [type=i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], dimension=0]
-                %3:i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = broadcast [output_type=i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %1
+                %2:i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    iota [type=i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], dimension=0]
+                %3:i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    broadcast [output_type=i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %1
                 %4:bool[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = compare [direction=Equal] %2 %3
                 %5:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = zero_like %0
                 %6:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %4 %0 %5
                 %7:f32[][sharding={mesh<['d'=2:explicit]>, []}] = reduce [kind=sum, axes=[0]] %6
-                %8:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %7
+                %8:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %7
                 %9:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = sub %0 %8
                 %10:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %4 %5 %9
                 %11:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = exp %10
                 %12:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %4 %5 %11
                 %13:f32[][sharding={mesh<['d'=2:explicit]>, []}] = reduce [kind=sum, axes=[0]] %12
                 %14:f32[][sharding={mesh<['d'=2:explicit]>, []}] = ln_1p %13
-                %15:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %14
+                %15:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %14
                 %16:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = sub %10 %15
                 %17:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = sub %8 %8
                 %18:bool[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = compare [direction=Equal] %17 %5
                 %19:f32[][sharding={mesh<['d'=2:explicit]>, []}] = constant [value=NaN]
-                %20:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %19
+                %20:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %19
                 %21:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %18 %16 %20
                 %22:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = exp %21
             in (%22)
         "}
-            .trim_end()
+            .trim_end(),
         );
     }
 
@@ -1198,11 +1240,11 @@ mod tests {
                 %26:f32[2, 3, 2] = exp %25
             in (%26)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let values = (0..12).map(|index| (index as f32) * 0.3 - 1.0).collect::<Vec<_>>();
         let input = Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3, 2]), &values).unwrap();
-        assert_eq!(program.interpret(input.clone()), input.softmax([0, 2]));
+        assert_eq!(program.interpret(input.clone()), Ok(input.softmax([0, 2]).unwrap()));
     }
 
     #[test]
@@ -1221,8 +1263,16 @@ mod tests {
         .unwrap();
         let input = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
         let known = program.partially_evaluate(&[PartialValue::Known(input.clone())]).unwrap();
-        assert_eq!(known.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(
+            known.program().to_string(),
+            indoc! {"
+                lambda  .
+                in ()
+            "}
+            .trim_end(),
+        );
         assert_eq!(known.outputs(), &[PartialEvaluationOutput::Known(input.softmax(0).unwrap())]);
+
         // With unknown logits, the class coordinates and the NaN fill fold into known residual inputs.
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input.r#type().into_owned())]).unwrap();
         assert_eq!(unknown.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
@@ -1251,7 +1301,7 @@ mod tests {
                 %21:f64[3] = exp %20
             in (%21)
         "}
-            .trim_end()
+            .trim_end(),
         );
         assert_eq!(unknown.interpret(&EagerContext::new(), &[input.clone()]), Ok(vec![input.softmax(0).unwrap()]));
     }
@@ -1283,7 +1333,12 @@ mod tests {
         let gradient = gradient.elements::<f32>().unwrap();
         let expected = (-(2.0 * (-18.0f64).exp()).ln_1p()).exp() as f32;
         assert_eq!(output.elements::<f32>(), Ok(vec![expected]));
-        assert!(gradient[0] > 3.0e-8 && gradient[0] < 3.1e-8);
+        let tail = (-18.0f64).exp();
+        let denominator = 1.0 + 2.0 * tail;
+        let expected_tail = (tail / denominator.powi(2)) as f32;
+        assert_abs_diff_eq!(gradient[0], 2.0 * expected_tail, epsilon = 4e-15);
+        assert_abs_diff_eq!(gradient[1], -expected_tail, epsilon = 2e-15);
+        assert_abs_diff_eq!(gradient[2], -expected_tail, epsilon = 2e-15);
         assert_eq!(gradient[0], -(gradient[1] + gradient[2]));
     }
 
@@ -1316,19 +1371,73 @@ mod tests {
             Array::vector(vec![1.0f32, 2.0])
                 .unwrap()
                 .masked_softmax(&Array::vector(vec![false, false]).unwrap(), 0),
-            Ok(Array::vector(vec![0.0f32, 0.0]).unwrap())
+            Ok(Array::vector(vec![0.0f32, 0.0]).unwrap()),
         );
         assert_eq!(
             Array::vector(vec![f32::NEG_INFINITY, 2.0])
                 .unwrap()
                 .masked_softmax(&Array::vector(vec![true, true]).unwrap(), 0),
-            Ok(Array::vector(vec![0.0f32, 1.0]).unwrap())
+            Ok(Array::vector(vec![0.0f32, 1.0]).unwrap()),
         );
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
             array_ir.masked_softmax(&ArrayIrValue::Array(mask.clone()), 0),
-            Ok(ArrayIrValue::Array(logits.masked_softmax(&mask, 0).unwrap()))
+            Ok(ArrayIrValue::Array(logits.masked_softmax(&mask, 0).unwrap())),
         );
+        assert_eq!(
+            ArrayIrValue::Array(Array::vector(vec![f32::NAN]).unwrap())
+                .masked_softmax(&ArrayIrValue::Array(Array::vector(vec![false]).unwrap()), 0),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0f32]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_masked_softmax_multiple_axes() {
+        // Different remaining rows select three classes, two classes, and no classes. The unselected maximum in
+        // the first row and the noncontiguous class axes expose a misplaced mask during flattening or restoration.
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3, 2]);
+        let logits = Array::from_elements(
+            input_type.clone(),
+            &[0.0f64, 100.0, 2.0, 3.0, 10.0, -5.0, 1.0, 2.0, -7.0, 1.0, 4.0, 6.0],
+        )
+        .unwrap();
+        let mask = Array::from_elements(
+            input_type.clone().with_data_type(DataType::Boolean),
+            &[true, false, false, true, false, false, true, true, true, false, false, false],
+        )
+        .unwrap();
+        let output = logits.masked_softmax(&mask, [0, 2]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        let first_denominator = 1.0 + (-1.0f64).exp() + (-2.0f64).exp();
+        let second_denominator = 1.0 + (-10.0f64).exp();
+        let expected = Array::from_elements(
+            input_type,
+            &[
+                (-2.0f64).exp() / first_denominator,
+                0.0,
+                0.0,
+                1.0 / second_denominator,
+                0.0,
+                0.0,
+                (-1.0f64).exp() / first_denominator,
+                1.0 / first_denominator,
+                (-10.0f64).exp() / second_denominator,
+                0.0,
+                0.0,
+                0.0,
+            ],
+        )
+        .unwrap();
+        assert_abs_diff_eq!(output, expected, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_masked_softmax_narrow_inputs() {
+        // Numerical conversion maps an excluded probability zero to the exponent-only format's NaN encoding.
+        let input = Array::vector(vec![f8e8m0fnu::from_f64(1.0).unwrap()]).unwrap();
+        let output = input.masked_softmax(&Array::vector(vec![false]).unwrap(), 0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F8E8M0FNU, [1]));
+        assert_eq!(output.logical_bytes(), vec![0xff]);
     }
 
     #[test]
@@ -1341,8 +1450,90 @@ mod tests {
         assert_eq!(logits.masked_softmax(&Array::vector(vec![1i32, 0]).unwrap(), 0), expected);
         assert_eq!(
             Array::vector(vec![1i32, 0]).unwrap().masked_softmax(&Array::vector(vec![true, true]).unwrap(), 0),
-            Err(ProgramError::Type(TypeError::invalid("`masked_softmax` requires real floating-point logits")))
+            Err(ProgramError::Type(TypeError::invalid("`masked_softmax` requires real floating-point logits"))),
         );
+    }
+
+    #[test]
+    fn test_masked_softmax_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+
+        // Enter an actual manual region: concrete Array values cannot execute parallel_vary themselves. Return
+        // the selected probability as a differentiated output and every probability as auxiliary output.
+        let evaluate = |logits: Array, mask: Array, input_shardings: (Sharding, Sharding)| {
+            let ((_, output), gradient) = differentiate_at(ArrayIrValue::Array(logits))
+                .with_captures(ArrayIrValue::Array(mask))
+                .with_auxiliary_output()
+                .value_and_gradient(|logits, mask| {
+                    let (output, selected) = shard_map(
+                        |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
+                            let output = logits.masked_softmax(&mask, 0).unwrap();
+                            (output.clone(), output.slice_axis(0, 0, 1, 1).unwrap())
+                        },
+                        (
+                            ValueProjection::<ArrayType>::into_projected(logits)?,
+                            ValueProjection::<ArrayType>::into_projected(mask)?,
+                        ),
+                        mesh.clone(),
+                        input_shardings,
+                        (sharded.clone(), sharded.clone()),
+                    )?;
+                    Ok::<_, ProgramError>((selected.reduce_sum(&[0], None)?.into_value(), output.into_value()))
+                })
+                .unwrap();
+            (array(output), array(gradient))
+        };
+        let sharded_type = ArrayType::new_static(DataType::F64, [6]).with_sharding(sharded.clone()).unwrap();
+        let replicated_type = ArrayType::new_static(DataType::F64, [3]).with_sharding(replicated.clone()).unwrap();
+        let logits = Array::from_elements(sharded_type.clone(), &[0.0f64, 5.0, 0.0, 0.0, 5.0, 0.0]).unwrap();
+        let mask =
+            Array::from_elements(replicated_type.clone().with_data_type(DataType::Boolean), &[true, false, true])
+                .unwrap();
+        let expected = Array::from_elements(sharded_type.clone(), &[0.5f64, 0.0, 0.5, 0.5, 0.0, 0.5]).unwrap();
+        let (output, gradient) = evaluate(logits, mask, (sharded.clone(), replicated.clone()));
+        assert_eq!(output, expected);
+        assert_eq!(gradient, Array::from_elements(sharded_type, &[0.25f64, 0.0, -0.25, 0.25, 0.0, -0.25]).unwrap());
+
+        // A varying mask weakens replicated logits; transposition must sum both devices' contributions once.
+        let logits = Array::from_elements(replicated_type.clone(), &[0.0f64, 5.0, 0.0]).unwrap();
+        let mask = Array::from_elements(
+            ArrayType::new_static(DataType::Boolean, [6]).with_sharding(sharded.clone()).unwrap(),
+            &[true, false, true, true, false, true],
+        )
+        .unwrap();
+        let (output, gradient) = evaluate(logits, mask, (replicated, sharded.clone()));
+        assert_eq!(output, expected);
+        assert_eq!(gradient, Array::from_elements(replicated_type, &[0.5f64, 0.0, -0.5]).unwrap());
+    }
+
+    #[test]
+    fn test_masked_softmax_partial_evaluation_and_batching() {
+        // Batch the known side of partial evaluation with a replicated mask. Each logical batch row normalizes its
+        // own selected classes, and all operations fold into a known array instead of residual work.
+        let partial = PartialEvaluationContext::new(ArrayContext::new());
+        let logits = PartialTracer::new(
+            partial.clone(),
+            PartialEvaluationValue::known(Array::matrix(2, 3, vec![0.0f64, 9.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
+        );
+        let mask =
+            PartialTracer::new(partial, PartialEvaluationValue::known(Array::vector(vec![true, false, true]).unwrap()));
+        let output = batch(
+            |(logits, mask): (_, _)| logits.masked_softmax(&mask, 0),
+            (logits, mask),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+            BatchAxis::new(0),
+            2,
+        )
+        .unwrap();
+        let output = output.value().unwrap();
+        let output = output.as_known().unwrap();
+        let denominator = 1.0 + (-2.0f64).exp();
+        let expected =
+            Array::matrix(2, 3, vec![0.5f64, 0.0, 0.5, (-2.0f64).exp() / denominator, 0.0, 1.0 / denominator]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 3]));
+        assert_abs_diff_eq!(output, &expected, epsilon = 1e-15);
     }
 
     #[test]
@@ -1354,6 +1545,7 @@ mod tests {
             step = 1e-5,
             tolerance = 1e-8,
         );
+
         // Unselected classes receive zero derivatives, and the selected ones the derivatives of their own softmax.
         let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
         let mask = Array::vector(vec![true, false, true]).unwrap();
@@ -1369,45 +1561,70 @@ mod tests {
     }
 
     #[test]
+    fn test_masked_softmax_differentiation_empty_mask() {
+        let logits = Array::vector(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]).unwrap();
+        let mask = Array::vector(vec![false, false, false]).unwrap();
+        let (output, gradient) = differentiate_at(logits)
+            .with_captures(mask)
+            .value_and_gradient(|logits, mask| logits.masked_softmax(&mask, 0)?.reduce_sum(&[0], None))
+            .unwrap();
+        assert_eq!(output, Array::scalar(0.0f64).unwrap());
+        assert_eq!(gradient, Array::vector(vec![0.0f64, 0.0, 0.0]).unwrap());
+    }
+
+    #[test]
     fn test_log_softmax() {
         let logits = Array::vector(vec![9.0f32, -9.0, -9.0]).unwrap();
         let output = logits.log_softmax(0).unwrap().elements::<f32>().unwrap();
-        assert!(output[0] < -3.0e-8 && output[0] > -3.1e-8);
+        let expected = -(2.0 * (-18.0f64).exp()).ln_1p() as f32;
+        assert_abs_diff_eq!(output[0], expected, epsilon = 4e-15);
         assert_eq!(&output[1..], &[-18.0, -18.0]);
-        let output = Array::vector(vec![bf16::from_f32(4.0), bf16::from_f32(-4.0)])
-            .unwrap()
-            .log_softmax(0)
-            .unwrap()
-            .elements::<bf16>()
-            .unwrap();
-        assert!(output[0].to_f32() < 0.0);
+        assert_eq!(Array::vector(vec![1.0f32]).unwrap().log_softmax(0), Ok(Array::vector(vec![0.0f32]).unwrap()));
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(array_ir.log_softmax(0), Ok(ArrayIrValue::Array(logits.log_softmax(0).unwrap())));
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![f32::NEG_INFINITY, 0.0]).unwrap()).log_softmax(0),
-            Ok(ArrayIrValue::Array(Array::vector(vec![f32::NEG_INFINITY, 0.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![f32::NEG_INFINITY, 0.0]).unwrap())),
         );
-        let ArrayIrValue::Array(output) =
-            ArrayIrValue::Array(Array::vector(vec![f32::NAN, 0.0]).unwrap()).log_softmax(0).unwrap()
-        else {
-            panic!("expected an array")
-        };
-        assert!(output.to_f64s().iter().all(|value| value.is_nan()));
+        let output = array(ArrayIrValue::Array(Array::vector(vec![f32::NAN, 0.0]).unwrap()).log_softmax(0).unwrap());
+        let output = output.elements::<f32>().unwrap();
+        assert_eq!(output.len(), 2);
+        assert!(output[0].is_nan() && output[1].is_nan());
+    }
+
+    #[test]
+    fn test_log_softmax_narrow_inputs() {
+        // Expected values begin with exactly represented inputs and round the independent F32 result only once.
+        let correction = (-8.0f32).exp().ln_1p();
+        let output = Array::vector(vec![bf16::from_f32(4.0), bf16::from_f32(-4.0)]).unwrap().log_softmax(0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::BF16, [2]));
+        assert_eq!(output.elements::<bf16>(), Ok(vec![bf16::from_f32(-correction), bf16::from_f32(-8.0 - correction)]),);
+        let output = Array::vector(vec![f16::from_f32(4.0), f16::from_f32(-4.0)]).unwrap().log_softmax(0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F16, [2]));
+        assert_eq!(output.elements::<f16>(), Ok(vec![f16::from_f32(-correction), f16::from_f32(-8.0 - correction)]));
+        let output = Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(); 2]).unwrap().log_softmax(0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F8E4M3FN, [2]));
+        assert_eq!(output.logical_bytes(), vec![0xb3, 0xb3]);
+
+        // A finite singleton's zero log-probability is unrepresentable in the exponent-only format.
+        let output = Array::vector(vec![f8e8m0fnu::from_f64(1.0).unwrap()]).unwrap().log_softmax(0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F8E8M0FNU, [1]));
+        assert_eq!(output.logical_bytes(), vec![0xff]);
     }
 
     #[test]
     fn test_log_softmax_validation() {
         assert_eq!(
             Array::vector(vec![1.0f32]).unwrap().log_softmax(-2),
-            Err(ProgramError::Type(TypeError::invalid("`log_softmax` axis -2 is out of bounds for rank 1")))
+            Err(ProgramError::Type(TypeError::invalid("`log_softmax` axis -2 is out of bounds for rank 1"))),
         );
         assert_eq!(
             Array::vector(vec![true]).unwrap().log_softmax(0),
-            Err(ProgramError::Type(TypeError::invalid("`log_softmax` requires real floating-point logits")))
+            Err(ProgramError::Type(TypeError::invalid("`log_softmax` requires real floating-point logits"))),
         );
         assert_eq!(
             Array::matrix(2, 0, Vec::<f64>::new()).unwrap().log_softmax(1),
-            Err(ProgramError::Type(TypeError::invalid("`log_softmax` requires a non-empty class axis")))
+            Err(ProgramError::Type(TypeError::invalid("`log_softmax` requires a non-empty class axis"))),
         );
     }
 
@@ -1430,7 +1647,7 @@ mod tests {
                     .elements::<f32>()
                     .unwrap()
                     .iter()
-                    .all(|value| value.is_nan())
+                    .all(|value| value.is_nan()),
             );
         }
     }
@@ -1466,10 +1683,10 @@ mod tests {
                 %21:f32[2] = select %18 %16 %20
             in (%21)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let input = Array::vector(vec![9.0f32, -9.0]).unwrap();
-        assert_eq!(program.interpret(input.clone()), input.log_softmax(0));
+        assert_eq!(program.interpret(input.clone()), Ok(input.log_softmax(0).unwrap()));
     }
 
     #[test]
@@ -1481,8 +1698,16 @@ mod tests {
         .unwrap();
         let input = Array::vector(vec![9.0f32, -9.0]).unwrap();
         let known = program.partially_evaluate(&[PartialValue::Known(input.clone())]).unwrap();
-        assert_eq!(known.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(
+            known.program().to_string(),
+            indoc! {"
+                lambda  .
+                in ()
+            "}
+            .trim_end(),
+        );
         assert_eq!(known.outputs(), &[PartialEvaluationOutput::Known(input.log_softmax(0).unwrap())]);
+
         // With unknown logits, only the constants fold: the class coordinates and the NaN fill become known residual
         // inputs of the residual program.
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input.r#type().into_owned())]).unwrap();
@@ -1510,7 +1735,7 @@ mod tests {
                 %20:f32[2] = select %11 %19 %2
             in (%20)
         "}
-            .trim_end()
+            .trim_end(),
         );
         assert_eq!(unknown.interpret(&EagerContext::new(), &[input.clone()]), Ok(vec![input.log_softmax(0).unwrap()]));
     }
@@ -1532,14 +1757,20 @@ mod tests {
             step = 1e-5,
             tolerance = 1e-8,
         );
+
         // The dominant class keeps its small `1 - p` derivative, accumulated from the other classes' probabilities.
         let input = Array::vector(vec![9.0f32, -9.0, -9.0]).unwrap();
         let (output, gradient) = differentiate_at(input)
             .value_and_gradient(|input| input.log_softmax(0)?.slice_axis(0, 0, 1, 1)?.reshape([]))
             .unwrap();
-        assert!(output.elements::<f32>().unwrap()[0] < -3.0e-8);
+        let tail = (-18.0f64).exp();
+        let expected = -(2.0 * tail).ln_1p() as f32;
+        assert_abs_diff_eq!(output.elements::<f32>().unwrap()[0], expected, epsilon = 4e-15);
         let gradient = gradient.elements::<f32>().unwrap();
-        assert!(gradient[0] > 3.0e-8 && gradient[0] < 3.1e-8);
+        let expected_tail = (tail / (1.0 + 2.0 * tail)) as f32;
+        assert_abs_diff_eq!(gradient[0], 2.0 * expected_tail, epsilon = 4e-15);
+        assert_abs_diff_eq!(gradient[1], -expected_tail, epsilon = 2e-15);
+        assert_abs_diff_eq!(gradient[2], -expected_tail, epsilon = 2e-15);
         assert_eq!(gradient[0], -(gradient[1] + gradient[2]));
     }
 
@@ -1554,12 +1785,80 @@ mod tests {
             Array::vector(vec![1.0f32, 2.0])
                 .unwrap()
                 .masked_log_softmax(&Array::vector(vec![false, false]).unwrap(), 0),
-            Ok(Array::vector(vec![f32::NEG_INFINITY, f32::NEG_INFINITY]).unwrap())
+            Ok(Array::vector(vec![f32::NEG_INFINITY, f32::NEG_INFINITY]).unwrap()),
         );
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
             array_ir.masked_log_softmax(&ArrayIrValue::Array(mask.clone()), 0),
-            Ok(ArrayIrValue::Array(logits.masked_log_softmax(&mask, 0).unwrap()))
+            Ok(ArrayIrValue::Array(logits.masked_log_softmax(&mask, 0).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::Array(Array::vector(vec![f32::NAN]).unwrap())
+                .masked_log_softmax(&ArrayIrValue::Array(Array::vector(vec![false]).unwrap()), 0),
+            Ok(ArrayIrValue::Array(Array::vector(vec![f32::NEG_INFINITY]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_masked_log_softmax_multiple_axes() {
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3, 2]);
+        let logits = Array::from_elements(
+            input_type.clone(),
+            &[0.0f64, 100.0, 2.0, 3.0, 10.0, -5.0, 1.0, 2.0, -7.0, 1.0, 4.0, 6.0],
+        )
+        .unwrap();
+        let mask = Array::from_elements(
+            input_type.clone().with_data_type(DataType::Boolean),
+            &[true, false, false, true, false, false, true, true, true, false, false, false],
+        )
+        .unwrap();
+        let output = logits.masked_log_softmax(&mask, [0, 2]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        let output = output.elements::<f64>().unwrap();
+        let first_correction = ((-1.0f64).exp() + (-2.0f64).exp()).ln_1p();
+        let second_correction = (-10.0f64).exp().ln_1p();
+        assert_abs_diff_eq!(output[0], -2.0 - first_correction, epsilon = 1e-15);
+        assert_abs_diff_eq!(output[6], -1.0 - first_correction, epsilon = 1e-15);
+        assert_abs_diff_eq!(output[7], -first_correction, epsilon = 1e-15);
+        assert_abs_diff_eq!(output[3], -second_correction, epsilon = 1e-15);
+        assert_abs_diff_eq!(output[8], -10.0 - second_correction, epsilon = 1e-15);
+        assert_eq!(
+            [output[1], output[2], output[4], output[5], output[9], output[10], output[11]],
+            [f64::NEG_INFINITY; 7],
+        );
+    }
+
+    #[test]
+    fn test_masked_log_softmax_validation() {
+        let logits = Array::vector(vec![0.0f32, 0.0]).unwrap();
+        let expected = Err(ProgramError::Type(TypeError::invalid(
+            "`masked_log_softmax` mask must be a Boolean array with the logits' shape",
+        )));
+        assert_eq!(logits.masked_log_softmax(&Array::vector(vec![true]).unwrap(), 0), expected);
+        assert_eq!(logits.masked_log_softmax(&Array::vector(vec![1i32, 0]).unwrap(), 0), expected);
+        assert_eq!(
+            Array::vector(vec![1i32, 0])
+                .unwrap()
+                .masked_log_softmax(&Array::vector(vec![true, true]).unwrap(), 0),
+            Err(ProgramError::Type(TypeError::invalid("`masked_log_softmax` requires real floating-point logits"))),
+        );
+        assert_eq!(
+            logits.masked_log_softmax(&Array::vector(vec![true, true]).unwrap(), 1),
+            Err(ProgramError::Type(TypeError::invalid("`masked_log_softmax` axis 1 is out of bounds for rank 1"))),
+        );
+        let (mesh, _, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
+        let unreduced = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            ArrayContext::trace(
+                |(logits, mask): (_, _)| logits.masked_log_softmax(&mask, 0),
+                (unreduced, ArrayType::new_static(DataType::Boolean, [2])),
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`masked_log_softmax` does not support unreduced or reduced inputs"
+            ))),
         );
     }
 
@@ -1602,11 +1901,67 @@ mod tests {
                 %26:f32[2] = select %1 %25 %3
             in (%26)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let logits = Array::vector(vec![9.0f32, -9.0]).unwrap();
         let mask = Array::vector(vec![false, true]).unwrap();
-        assert_eq!(program.interpret((logits.clone(), mask.clone())), logits.masked_log_softmax(&mask, 0));
+        assert_eq!(program.interpret((logits.clone(), mask.clone())), Ok(logits.masked_log_softmax(&mask, 0).unwrap()));
+    }
+
+    #[test]
+    fn test_masked_log_softmax_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let evaluate = |logits: Array, mask: Array, input_shardings: (Sharding, Sharding)| {
+            let ((_, output), gradient) = differentiate_at(ArrayIrValue::Array(logits))
+                .with_captures(ArrayIrValue::Array(mask))
+                .with_auxiliary_output()
+                .value_and_gradient(|logits, mask| {
+                    let (output, selected) = shard_map(
+                        |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
+                            let output = logits.masked_log_softmax(&mask, 0).unwrap();
+                            (output.clone(), output.slice_axis(0, 0, 1, 1).unwrap())
+                        },
+                        (
+                            ValueProjection::<ArrayType>::into_projected(logits)?,
+                            ValueProjection::<ArrayType>::into_projected(mask)?,
+                        ),
+                        mesh.clone(),
+                        input_shardings,
+                        (sharded.clone(), sharded.clone()),
+                    )?;
+                    Ok::<_, ProgramError>((selected.reduce_sum(&[0], None)?.into_value(), output.into_value()))
+                })
+                .unwrap();
+            (array(output), array(gradient))
+        };
+        let sharded_type = ArrayType::new_static(DataType::F64, [6]).with_sharding(sharded.clone()).unwrap();
+        let replicated_type = ArrayType::new_static(DataType::F64, [3]).with_sharding(replicated.clone()).unwrap();
+        let logits = Array::from_elements(sharded_type.clone(), &[0.0f64, 5.0, 0.0, 0.0, 5.0, 0.0]).unwrap();
+        let mask =
+            Array::from_elements(replicated_type.clone().with_data_type(DataType::Boolean), &[true, false, true])
+                .unwrap();
+        let selected = -2.0f64.ln();
+        let expected = Array::from_elements(
+            sharded_type.clone(),
+            &[selected, f64::NEG_INFINITY, selected, selected, f64::NEG_INFINITY, selected],
+        )
+        .unwrap();
+        let (output, gradient) = evaluate(logits, mask, (sharded.clone(), replicated.clone()));
+        assert_eq!(output, expected);
+        assert_eq!(gradient, Array::from_elements(sharded_type, &[0.5f64, 0.0, -0.5, 0.5, 0.0, -0.5]).unwrap());
+
+        // The replicated-logit pullback combines the two local log-probability derivatives by a cross-device sum.
+        let logits = Array::from_elements(replicated_type.clone(), &[0.0f64, 5.0, 0.0]).unwrap();
+        let mask = Array::from_elements(
+            ArrayType::new_static(DataType::Boolean, [6]).with_sharding(sharded.clone()).unwrap(),
+            &[true, false, true, true, false, true],
+        )
+        .unwrap();
+        let (output, gradient) = evaluate(logits, mask, (replicated, sharded.clone()));
+        assert_eq!(output, expected);
+        assert_eq!(gradient, Array::from_elements(replicated_type, &[1.0f64, 0.0, -1.0]).unwrap());
     }
 
     #[test]
@@ -1624,12 +1979,29 @@ mod tests {
             .with_captures(mask)
             .value_and_gradient(|logits, mask| logits.masked_log_softmax(&mask, 0)?.slice_axis(0, 0, 1, 1)?.reshape([]))
             .unwrap();
+
         // The dominant selected class keeps its small loss and derivative despite the larger unselected logit.
-        assert!(output.elements::<f32>().unwrap()[0] < -1.5e-8);
+        let tail = (-18.0f64).exp();
+        let expected = -tail.ln_1p() as f32;
+        assert_abs_diff_eq!(output.elements::<f32>().unwrap()[0], expected, epsilon = 2e-15);
         let gradient = gradient.elements::<f32>().unwrap();
-        assert!(gradient[0] > 1.5e-8 && gradient[0] < 1.6e-8);
+        let expected_tail = (tail / (1.0 + tail)) as f32;
+        assert_abs_diff_eq!(gradient[0], expected_tail, epsilon = 2e-15);
         assert_eq!(gradient[1], 0.0);
+        assert_abs_diff_eq!(gradient[2], -expected_tail, epsilon = 2e-15);
         assert_eq!(gradient[0], -gradient[2]);
+    }
+
+    #[test]
+    fn test_masked_log_softmax_differentiation_empty_mask() {
+        let logits = Array::vector(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]).unwrap();
+        let mask = Array::vector(vec![false, false, false]).unwrap();
+        let (output, gradient) = differentiate_at(logits)
+            .with_captures(mask)
+            .value_and_gradient(|logits, mask| logits.masked_log_softmax(&mask, 0)?.reduce_sum(&[0], None))
+            .unwrap();
+        assert_eq!(output, Array::scalar(f64::NEG_INFINITY).unwrap());
+        assert_eq!(gradient, Array::vector(vec![0.0f64, 0.0, 0.0]).unwrap());
     }
 
     #[test]
@@ -1637,30 +2009,31 @@ mod tests {
         let logits = Array::vector(vec![9.0f32, -9.0, -9.0]).unwrap();
         let targets = Array::vector(vec![1.0f32, 0.0, 0.0]).unwrap();
         let loss = logits.softmax_cross_entropy(&targets, 0).unwrap();
-        assert!(loss.elements::<f32>().unwrap()[0] > 3.0e-8);
+        let expected_loss = (2.0 * (-18.0f64).exp()).ln_1p() as f32;
+        assert_abs_diff_eq!(loss.elements::<f32>().unwrap()[0], expected_loss, epsilon = 1e-14);
         assert_eq!(
             loss,
-            logits.log_softmax(0).unwrap().slice_axis(0, 0, 1, 1).unwrap().reshape([]).unwrap().neg().unwrap()
+            logits.log_softmax(0).unwrap().slice_axis(0, 0, 1, 1).unwrap().reshape([]).unwrap().neg().unwrap(),
         );
+
         // An excluded class with a zero target contributes `0 * log(0) = 0`.
         let logits = Array::vector(vec![f64::NEG_INFINITY, 0.0]).unwrap();
         let targets = Array::vector(vec![0.0f64, 1.0]).unwrap();
         assert_eq!(logits.softmax_cross_entropy(&targets, 0), Ok(Array::scalar(0.0f64).unwrap()));
+
         // Targets convert to the logits' working type and the result keeps the logits' element type.
         let logits = Array::vector(vec![bf16::from_f32(1.0), bf16::from_f32(0.0)]).unwrap();
         let targets = Array::vector(vec![0.5f64, 0.5]).unwrap();
-        let loss = logits.softmax_cross_entropy(&targets, 0).unwrap();
-        assert_eq!(loss.r#type().data_type(), DataType::BF16);
-        assert_abs_diff_eq!(loss.to_f64s()[0], (1.0f64).exp().ln_1p() - 0.5, epsilon = 1e-2);
+        assert_eq!(logits.softmax_cross_entropy(&targets, 0), Ok(Array::scalar(bf16::from_bits(0x3f50)).unwrap()));
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
             array_ir.softmax_cross_entropy(&ArrayIrValue::Array(targets.clone()), 0),
-            Ok(ArrayIrValue::Array(logits.softmax_cross_entropy(&targets, 0).unwrap()))
+            Ok(ArrayIrValue::Array(logits.softmax_cross_entropy(&targets, 0).unwrap())),
         );
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![f64::NEG_INFINITY, 0.0]).unwrap())
                 .softmax_cross_entropy(&ArrayIrValue::Array(Array::vector(vec![0.0f64, 1.0]).unwrap()), 0),
-            Ok(ArrayIrValue::Array(Array::scalar(0.0f64).unwrap()))
+            Ok(ArrayIrValue::Array(Array::scalar(0.0f64).unwrap())),
         );
     }
 
@@ -1679,7 +2052,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             logits.softmax_cross_entropy(&targets, [1, 2]),
-            logits.reshape([2, 4]).unwrap().softmax_cross_entropy(&targets.reshape([2, 4]).unwrap(), 1)
+            Ok(logits.reshape([2, 4]).unwrap().softmax_cross_entropy(&targets.reshape([2, 4]).unwrap(), 1).unwrap()),
         );
     }
 
@@ -1693,7 +2066,7 @@ mod tests {
         assert_eq!(logits.softmax_cross_entropy(&Array::vector(vec![1.0f32]).unwrap(), 0), expected);
         assert_eq!(
             Array::vector(vec![1i32, 0]).unwrap().softmax_cross_entropy(&logits, 0),
-            Err(ProgramError::Type(TypeError::invalid("`softmax_cross_entropy` requires real floating-point logits")))
+            Err(ProgramError::Type(TypeError::invalid("`softmax_cross_entropy` requires real floating-point logits"))),
         );
         let (mesh, _, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let reduced = ArrayType::new_static(DataType::F32, [2])
@@ -1706,7 +2079,7 @@ mod tests {
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy` does not support unreduced or reduced inputs"
+                "`softmax_cross_entropy` does not support unreduced or reduced inputs",
             ))),
         );
     }
@@ -1755,11 +2128,14 @@ mod tests {
                 %32:f32[] = neg %31
             in (%32)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let logits = Array::vector(vec![9.0f32, -9.0]).unwrap();
         let targets = Array::vector(vec![0.0f32, 1.0]).unwrap();
-        assert_eq!(program.interpret((logits.clone(), targets.clone())), logits.softmax_cross_entropy(&targets, 0));
+        assert_eq!(
+            program.interpret((logits.clone(), targets.clone())),
+            Ok(logits.softmax_cross_entropy(&targets, 0).unwrap()),
+        );
     }
 
     #[test]
@@ -1779,8 +2155,10 @@ mod tests {
             program.to_string(),
             indoc! {"
             lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
-            let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %1
-                %3:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %0
+            let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %1
+                %3:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    argmax [axis=0, index_data_type=i64] %0
                 %4:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
                     type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     dimension=0,
@@ -1789,7 +2167,8 @@ mod tests {
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %3
-                %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %4 %5
+                %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %4 %5
                 %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
                 %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %6 %0 %7
                 %9:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %8
@@ -1809,7 +2188,8 @@ mod tests {
                 ] %16
                 %18:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %12 %17
                 %19:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %10 %10
-                %20:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %19 %7
+                %20:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %19 %7
                 %21:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
                 %22:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -1822,8 +2202,10 @@ mod tests {
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %25
-                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %2 %24
-                %28:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %23 %26
+                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %2 %24
+                %28:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %23 %26
                 %29:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %27 %28
                 %30:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %29 %24 %23
                 %31:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %2 %30
@@ -1831,7 +2213,7 @@ mod tests {
                 %33:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %32
             in (%33)
         "}
-            .trim_end()
+            .trim_end(),
         );
     }
 
@@ -1865,11 +2247,11 @@ mod tests {
                 %9:f32[] = neg %8
             in (%9)
         "}
-            .trim_end()
+            .trim_end(),
         );
         assert_eq!(
             known.interpret(&EagerContext::new(), &[targets.clone()]),
-            Ok(vec![logits.softmax_cross_entropy(&targets, 0).unwrap()])
+            Ok(vec![logits.softmax_cross_entropy(&targets, 0).unwrap()]),
         );
     }
 
@@ -1901,6 +2283,7 @@ mod tests {
             step = 1e-5,
             tolerance = 1e-8,
         );
+
         // A saturated target class keeps its small loss and gradient, with the gradient summing to zero exactly.
         let logits = Array::vector(vec![9.0f32, -9.0, -9.0]).unwrap();
         let targets = Array::vector(vec![1.0f32, 0.0, 0.0]).unwrap();
@@ -1908,9 +2291,13 @@ mod tests {
             .with_captures(targets)
             .value_and_gradient(|logits, targets| logits.softmax_cross_entropy(&targets, 0))
             .unwrap();
-        assert!(loss.elements::<f32>().unwrap()[0] > 3.0e-8);
+        let expected_tail = (-18.0f64).exp();
+        assert_abs_diff_eq!(loss.elements::<f32>().unwrap()[0], (2.0 * expected_tail).ln_1p() as f32, epsilon = 1e-14);
         let gradient = gradient.elements::<f32>().unwrap();
-        assert!(gradient[0] < -3.0e-8);
+        let expected_gradient = (expected_tail / (1.0 + 2.0 * expected_tail)) as f32;
+        assert_abs_diff_eq!(gradient[0], -2.0 * expected_gradient, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[1], expected_gradient, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[2], expected_gradient, epsilon = 1e-14);
         assert_eq!(gradient[0], -(gradient[1] + gradient[2]));
     }
 
@@ -1923,6 +2310,7 @@ mod tests {
             .value_and_gradient(|targets, logits| logits.softmax_cross_entropy(&targets, 0))
             .unwrap();
         assert_eq!(gradient.elements::<f64>(), Ok(vec![std::f64::consts::LN_2; 2]));
+
         // The derivative with respect to a zero target of an excluded class is defined as zero.
         let logits = Array::vector(vec![f64::NEG_INFINITY, 0.0]).unwrap();
         let targets = Array::vector(vec![0.0f64, 1.0]).unwrap();
@@ -1935,28 +2323,51 @@ mod tests {
 
     #[test]
     fn test_masked_softmax_cross_entropy() {
-        // Unselected classes contribute nothing, whatever their target, and the selected ones normalize alone.
+        // Selected logits normalize alone, while the targets retain their original probability mass.
         let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
-        let targets = Array::vector(vec![0.25f64, 1.0, 0.75]).unwrap();
+        let targets = Array::vector(vec![0.2f64, 0.5, 0.3]).unwrap();
         let mask = Array::vector(vec![true, false, true]).unwrap();
-        let expected = Array::vector(vec![1.0f64, 3.0])
-            .unwrap()
-            .softmax_cross_entropy(&Array::vector(vec![0.25f64, 0.75]).unwrap(), 0)
-            .unwrap();
-        assert_eq!(logits.masked_softmax_cross_entropy(&targets, &mask, 0), Ok(expected));
+        let correction = (-2.0f64).exp().ln_1p();
+        let expected = 0.2 * (2.0 + correction) + 0.3 * correction;
+        let loss = logits.masked_softmax_cross_entropy(&targets, &mask, 0).unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        assert_abs_diff_eq!(loss.to_f64s()[0], expected, epsilon = 1e-15);
         assert_eq!(
             logits.masked_softmax_cross_entropy(&targets, &Array::vector(vec![false; 3]).unwrap(), 0),
-            Ok(Array::scalar(0.0f64).unwrap())
+            Ok(Array::scalar(0.0f64).unwrap()),
         );
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
             array_ir.masked_softmax_cross_entropy(
                 &ArrayIrValue::Array(targets.clone()),
                 &ArrayIrValue::Array(mask.clone()),
-                0
+                0,
             ),
-            Ok(ArrayIrValue::Array(logits.masked_softmax_cross_entropy(&targets, &mask, 0).unwrap()))
+            Ok(ArrayIrValue::Array(loss.clone())),
         );
+
+        // Payloads outside the mask remain excluded even when they are non-finite.
+        let targets = Array::vector(vec![0.2f64, f64::NAN, 0.3]).unwrap();
+        assert_eq!(logits.masked_softmax_cross_entropy(&targets, &mask, 0), Ok(loss));
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_multiple_axes() {
+        // The noncontiguous class axes must flatten the same way for logits, targets, and the asymmetric mask.
+        let r#type = ArrayType::new_static(DataType::F64, [2, 2, 2]);
+        let logits =
+            Array::from_elements(r#type.clone(), &[1.0f64, 100.0, 2.0, -200.0, 3.0, 4.0, 1000.0, 0.0]).unwrap();
+        let targets = Array::from_elements(r#type, &[0.2f64, 0.5, 0.1, 0.2, 0.3, 0.0, 0.4, 0.3]).unwrap();
+        let mask = Array::from_elements(
+            ArrayType::new_static(DataType::Boolean, [2, 2, 2]),
+            &[true, false, false, true, true, false, false, true],
+        )
+        .unwrap();
+        let loss = logits.masked_softmax_cross_entropy(&targets, &mask, [0, 2]).unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2]));
+        let correction = (-2.0f64).exp().ln_1p();
+        assert_abs_diff_eq!(loss.to_f64s()[0], 0.2 * (2.0 + correction) + 0.3 * correction, epsilon = 1e-15);
+        assert_abs_diff_eq!(loss.to_f64s()[1], 40.0 + 0.5 * (-200.0f64).exp().ln_1p(), epsilon = 1e-13);
     }
 
     #[test]
@@ -1966,27 +2377,150 @@ mod tests {
         assert_eq!(
             logits.masked_softmax_cross_entropy(&targets, &Array::vector(vec![true]).unwrap(), 0),
             Err(ProgramError::Type(TypeError::invalid(
-                "`masked_softmax_cross_entropy` mask must be a Boolean array with the logits' shape"
-            )))
+                "`masked_softmax_cross_entropy` mask must be a Boolean array with the logits' shape",
+            ))),
         );
         assert_eq!(
             logits.masked_softmax_cross_entropy(
                 &Array::vector(vec![1i32, 0]).unwrap(),
                 &Array::vector(vec![true, true]).unwrap(),
-                0
+                0,
             ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`masked_softmax_cross_entropy` probability targets must have the logits' shape and real floating-point \
-                 elements"
-            )))
+                 elements",
+            ))),
         );
     }
 
     #[test]
-    fn test_masked_softmax_cross_entropy_differentiation() {
-        // The gradient is the selected probabilities minus the targets, and zero for unselected classes.
+    fn test_masked_softmax_cross_entropy_manual_variation() {
+        // The masks vary while logits and targets are replicated. Aligning the logits inside the manual region
+        // must make their pullback sum the two devices' distinct masked-loss contributions.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 2);
+        let sharded_mask =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated])
+                .unwrap();
+        let sharded_loss = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [1, 3]).with_sharding(replicated.clone()).unwrap();
+        let logits = ArrayIrValue::Array(Array::from_elements(input_type.clone(), &[0.0f64; 3]).unwrap());
+        let targets = ArrayIrValue::Array(Array::from_elements(input_type.clone(), &[0.2f64, 0.5, 0.3]).unwrap());
+        let mask = ArrayIrValue::Array(
+            Array::from_elements(
+                ArrayType::new_static(DataType::Boolean, [2, 3]).with_sharding(sharded_mask.clone()).unwrap(),
+                &[true, false, true, false, true, true],
+            )
+            .unwrap(),
+        );
+        let ((_, loss), gradient) = differentiate_at(logits)
+            .with_captures((targets, mask))
+            .with_auxiliary_output()
+            .value_and_gradient(|logits, (targets, mask)| {
+                let loss = shard_map(
+                    |(logits, targets, mask): (
+                        ShardMapTracer<ArrayIrTracingContext>,
+                        ShardMapTracer<ArrayIrTracingContext>,
+                        ShardMapTracer<ArrayIrTracingContext>,
+                    )| logits.masked_softmax_cross_entropy(&targets, &mask, 1).unwrap(),
+                    (
+                        ValueProjection::<ArrayType>::into_projected(logits)?,
+                        ValueProjection::<ArrayType>::into_projected(targets)?,
+                        ValueProjection::<ArrayType>::into_projected(mask)?,
+                    ),
+                    mesh,
+                    (replicated.clone(), replicated, sharded_mask),
+                    sharded_loss.clone(),
+                )?;
+                Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
+            })
+            .unwrap();
+        let loss = array(loss);
+        assert_eq!(
+            loss.r#type().as_ref(),
+            &ArrayType::new_static(DataType::F64, [2]).with_sharding(sharded_loss).unwrap(),
+        );
+        assert_abs_diff_eq!(loss.to_f64s()[0], 0.5 * std::f64::consts::LN_2, epsilon = 1e-15);
+        assert_abs_diff_eq!(loss.to_f64s()[1], 0.8 * std::f64::consts::LN_2, epsilon = 1e-15);
+        let gradient = array(gradient);
+        assert_eq!(gradient.r#type().as_ref(), &input_type);
+        let gradient = gradient.to_f64s();
+        assert_abs_diff_eq!(gradient[0], 0.05, epsilon = 1e-15);
+        assert_abs_diff_eq!(gradient[1], -0.1, epsilon = 1e-15);
+        assert_abs_diff_eq!(gradient[2], 0.05, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_partial_evaluation() {
+        // Known logits and mask leave only the loss over the unknown targets, including safe target coefficients.
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<_>| {
+                inputs[0].masked_softmax_cross_entropy(&inputs[1], &inputs[2], 0).map(|output| vec![output])
+            },
+            vec![
+                ArrayType::new_static(DataType::F64, [3]),
+                ArrayType::new_static(DataType::F64, [3]),
+                ArrayType::new_static(DataType::Boolean, [3]),
+            ],
+        )
+        .unwrap();
         let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
-        let targets = Array::vector(vec![0.25f64, 1.0, 0.75]).unwrap();
+        let targets = Array::vector(vec![0.2f64, 0.5, 0.3]).unwrap();
+        let mask = Array::vector(vec![true, false, true]).unwrap();
+        let known = program
+            .partially_evaluate(&[
+                PartialValue::Known(logits),
+                PartialValue::Unknown(targets.r#type().into_owned()),
+                PartialValue::Known(mask),
+            ])
+            .unwrap();
+        assert_eq!(
+            known.program().to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:bool[3], %2:f64[3], %3:bool[3] .
+                let %4:f64[3] = zero_like %0
+                    %5:bool[3] = compare [direction=Equal] %0 %4
+                    %6:bool[3] = and %5 %1
+                    %7:f64[3] = select %6 %4 %2
+                    %8:f64[3] = select %3 %7 %4
+                    %9:f64[3] = mul %0 %8
+                    %10:f64[3] = select %3 %9 %4
+                    %11:f64[] = reduce [kind=sum, axes=[0]] %10
+                    %12:f64[] = neg %11
+                in (%12)
+            "}
+            .trim_end(),
+        );
+        let output = known.interpret(&EagerContext::new(), &[targets]).unwrap();
+        assert_eq!(output[0].r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        let correction = (-2.0f64).exp().ln_1p();
+        assert_abs_diff_eq!(output[0].to_f64s()[0], 0.2 * (2.0 + correction) + 0.3 * correction, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_batching() {
+        let logits = Array::matrix(2, 3, vec![1.0f64, 7.0, 3.0, 3.0, 7.0, 1.0]).unwrap();
+        let targets = Array::vector(vec![0.2f64, 0.5, 0.3]).unwrap();
+        let mask = Array::vector(vec![true, false, true]).unwrap();
+        let loss = batch(
+            |(logits, targets, mask)| logits.masked_softmax_cross_entropy(&targets, &mask, 0),
+            (logits, targets, mask),
+            (BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2]));
+        let correction = (-2.0f64).exp().ln_1p();
+        assert_abs_diff_eq!(loss.to_f64s()[0], 0.2 * (2.0 + correction) + 0.3 * correction, epsilon = 1e-15);
+        assert_abs_diff_eq!(loss.to_f64s()[1], 0.2 * correction + 0.3 * (2.0 + correction), epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_differentiation() {
+        // The gradient is the selected target mass times the selected probabilities minus the selected targets.
+        let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
+        let targets = Array::vector(vec![0.2f64, 0.5, 0.3]).unwrap();
         let mask = Array::vector(vec![true, false, true]).unwrap();
         let (_, gradient) = differentiate_at(logits)
             .with_captures((targets, mask))
@@ -1994,21 +2528,58 @@ mod tests {
             .unwrap();
         let probability = (-2.0f64).exp() / (1.0 + (-2.0f64).exp());
         let gradient = gradient.to_f64s();
-        assert_abs_diff_eq!(gradient[0], probability - 0.25, epsilon = 1e-15);
+        assert_abs_diff_eq!(gradient[0], 0.5 * probability - 0.2, epsilon = 1e-15);
         assert_eq!(gradient[1], 0.0);
-        assert_abs_diff_eq!(gradient[2], (1.0 - probability) - 0.75, epsilon = 1e-15);
+        assert_abs_diff_eq!(gradient[2], 0.5 * (1.0 - probability) - 0.3, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_differentiation_probability_targets() {
+        let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
+        let targets = Array::vector(vec![0.2f64, 0.5, 0.3]).unwrap();
+        let mask = Array::vector(vec![true, false, true]).unwrap();
+        let gradient = differentiate_at(targets)
+            .with_captures((logits, mask))
+            .gradient(|targets, (logits, mask)| logits.masked_softmax_cross_entropy(&targets, &mask, 0))
+            .unwrap();
+        let correction = (-2.0f64).exp().ln_1p();
+        assert_eq!(gradient.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [3]));
+        let gradient = gradient.elements::<f64>().unwrap();
+        assert_abs_diff_eq!(gradient[0], 2.0 + correction, epsilon = 1e-15);
+        assert_eq!(gradient[1], 0.0);
+        assert_abs_diff_eq!(gradient[2], correction, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_differentiation_empty_mask() {
+        let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
+        let targets = Array::vector(vec![0.2f64, 0.5, 0.3]).unwrap();
+        let mask = Array::vector(vec![false; 3]).unwrap();
+        assert_eq!(
+            differentiate_at((logits, targets))
+                .with_captures(mask)
+                .value_and_gradient(|(logits, targets), mask| logits.masked_softmax_cross_entropy(&targets, &mask, 0)),
+            Ok((
+                Array::scalar(0.0f64).unwrap(),
+                (Array::vector(vec![0.0f64; 3]).unwrap(), Array::vector(vec![0.0f64; 3]).unwrap()),
+            )),
+        );
     }
 
     #[test]
     fn test_softmax_cross_entropy_with_integer_labels() {
         let logits = Array::matrix(2, 3, vec![9.0f32, -9.0, -9.0, -9.0, 9.0, -9.0]).unwrap();
         let labels = Array::vector(vec![0i32, 1]).unwrap();
-        let loss = logits.softmax_cross_entropy_with_integer_labels(&labels, -1).unwrap().elements::<f32>().unwrap();
-        assert!(loss.iter().all(|&value| value > 3.0e-8 && value < 3.1e-8));
+        let loss = logits.softmax_cross_entropy_with_integer_labels(&labels, -1).unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2]));
+        let loss = loss.elements::<f32>().unwrap();
+        let expected = (2.0 * (-18.0f64).exp()).ln_1p() as f32;
+        assert_abs_diff_eq!(loss[0], expected, epsilon = 1e-14);
+        assert_abs_diff_eq!(loss[1], expected, epsilon = 1e-14);
         let singleton = Array::vector(vec![2.0f32]).unwrap();
         assert_eq!(
             singleton.softmax_cross_entropy_with_integer_labels(&Array::scalar(0i32).unwrap(), 0),
-            Ok(Array::scalar(0.0f32).unwrap())
+            Ok(Array::scalar(0.0f32).unwrap()),
         );
         for label in [-1i64, 1] {
             assert!(
@@ -2017,25 +2588,24 @@ mod tests {
                     .unwrap()
                     .elements::<f32>()
                     .unwrap()[0]
-                    .is_nan()
+                    .is_nan(),
             );
         }
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
             array_ir.softmax_cross_entropy_with_integer_labels(&ArrayIrValue::Array(labels.clone()), -1),
-            Ok(ArrayIrValue::Array(logits.softmax_cross_entropy_with_integer_labels(&labels, -1).unwrap()))
+            Ok(ArrayIrValue::Array(logits.softmax_cross_entropy_with_integer_labels(&labels, -1).unwrap())),
         );
         assert_eq!(
             ArrayIrValue::Array(singleton.clone())
                 .softmax_cross_entropy_with_integer_labels(&ArrayIrValue::Array(Array::scalar(0i32).unwrap()), 0),
-            Ok(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap()))
+            Ok(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())),
         );
-        let ArrayIrValue::Array(output) = ArrayIrValue::Array(singleton)
-            .softmax_cross_entropy_with_integer_labels(&ArrayIrValue::Array(Array::scalar(1i32).unwrap()), 0)
-            .unwrap()
-        else {
-            panic!("expected an array")
-        };
+        let output = array(
+            ArrayIrValue::Array(singleton)
+                .softmax_cross_entropy_with_integer_labels(&ArrayIrValue::Array(Array::scalar(1i32).unwrap()), 0)
+                .unwrap(),
+        );
         assert!(output.to_f64s()[0].is_nan());
     }
 
@@ -2050,17 +2620,18 @@ mod tests {
         let labels = Array::vector(vec![3i32, 2]).unwrap();
         assert_eq!(
             logits.softmax_cross_entropy_with_integer_labels(&labels, [1, 2]),
-            logits.reshape([2, 4]).unwrap().softmax_cross_entropy_with_integer_labels(&labels, 1)
+            Ok(logits.reshape([2, 4]).unwrap().softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap()),
         );
         let labels = Array::vector(vec![1i32, 3]).unwrap();
         assert_eq!(
             logits.softmax_cross_entropy_with_integer_labels(&labels, [0, 2]),
-            logits
+            Ok(logits
                 .transpose([1, 0, 2])
                 .unwrap()
                 .reshape([2, 4])
                 .unwrap()
                 .softmax_cross_entropy_with_integer_labels(&labels, 1)
+                .unwrap()),
         );
     }
 
@@ -2076,8 +2647,8 @@ mod tests {
         assert_eq!(
             logits.softmax_cross_entropy_with_integer_labels(&Array::scalar(0i32).unwrap(), 2),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_integer_labels` axis 2 is out of bounds for rank 1"
-            )))
+                "`softmax_cross_entropy_with_integer_labels` axis 2 is out of bounds for rank 1",
+            ))),
         );
         let (mesh, _, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let reduced = ArrayType::scalar(DataType::I32)
@@ -2090,7 +2661,7 @@ mod tests {
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_integer_labels` does not support unreduced or reduced inputs"
+                "`softmax_cross_entropy_with_integer_labels` does not support unreduced or reduced inputs",
             ))),
         );
     }
@@ -2144,13 +2715,13 @@ mod tests {
                 %37:f32[2] = select %34 %30 %36
             in (%37)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let logits = Array::matrix(2, 3, vec![9.0f32, -9.0, -9.0, -9.0, 9.0, -9.0]).unwrap();
         let labels = Array::vector(vec![0i32, 2]).unwrap();
         assert_eq!(
             program.interpret((logits.clone(), labels.clone())),
-            logits.softmax_cross_entropy_with_integer_labels(&labels, -1)
+            Ok(logits.softmax_cross_entropy_with_integer_labels(&labels, -1).unwrap()),
         );
     }
 
@@ -2171,11 +2742,12 @@ mod tests {
         assert_eq!(output_type, varying_loss);
         assert_eq!(
             program.to_string(),
-indoc! {"
+            indoc! {"
             lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:i32[][sharding={mesh<['x'=2:manual]>, []}] .
             let %2:i64[][sharding={mesh<['x'=2:manual]>, []}] = convert_element_type [data_type=i64] %1
                 %3:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %2
-                %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %0
+                %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    argmax [axis=0, index_data_type=i64] %0
                 %5:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
                     type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     dimension=0,
@@ -2184,7 +2756,8 @@ indoc! {"
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %4
-                %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %5 %6
+                %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %5 %6
                 %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %0 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
@@ -2204,7 +2777,8 @@ indoc! {"
                 ] %17
                 %19:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %13 %18
                 %20:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %11 %11
-                %21:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %20 %8
+                %21:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %20 %8
                 %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
                 %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -2219,20 +2793,23 @@ indoc! {"
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %3
-                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %25 %26
+                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %25 %26
                 %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
                 %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
-                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=i64] %27
+                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
                 %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %3
-                %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = compare [direction=GreaterThan] %33 %34
+                %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    compare [direction=GreaterThan] %33 %34
                 %36:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
                 %37:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = select %35 %31 %36
             in (%37)
         "}
-            .trim_end()
+            .trim_end(),
         );
 
         // Varying labels with invariant logits vary the logits first, so the loss varies too.
@@ -2247,9 +2824,12 @@ indoc! {"
             program.to_string(),
             indoc! {"
             lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}], %1:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
-            let %2:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = convert_element_type [data_type=i64] %1
-                %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %0
-                %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %3
+            let %2:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                convert_element_type [data_type=i64] %1
+                %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %0
+                %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    argmax [axis=0, index_data_type=i64] %3
                 %5:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
                     type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     dimension=0,
@@ -2258,7 +2838,8 @@ indoc! {"
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %4
-                %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %5 %6
+                %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %5 %6
                 %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %3 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
@@ -2278,7 +2859,8 @@ indoc! {"
                 ] %17
                 %19:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %13 %18
                 %20:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %11 %11
-                %21:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %20 %8
+                %21:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %20 %8
                 %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
                 %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -2293,20 +2875,23 @@ indoc! {"
                     output_type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %2
-                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %25 %26
+                %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %25 %26
                 %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
                 %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
-                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = convert_element_type [data_type=i64] %27
+                %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
                 %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %2
-                %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = compare [direction=GreaterThan] %33 %34
+                %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    compare [direction=GreaterThan] %33 %34
                 %36:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
                 %37:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = select %35 %31 %36
             in (%37)
         "}
-            .trim_end()
+            .trim_end(),
         );
     }
 
@@ -2321,67 +2906,56 @@ indoc! {"
                 .unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
-        let logits =
-            Array::matrix(4, 3, vec![9.0f32, -9.0, -9.0, 0.0, 1.0, 2.0, -9.0, 9.0, -9.0, 2.0, 1.0, 0.0]).unwrap();
-        let labels = Array::vector(vec![0i32, 2]).unwrap();
+        let logits = Array::from_elements(
+            ArrayType::new_static(DataType::F32, [4, 3]).with_sharding(sharded_rows.clone()).unwrap(),
+            &[9.0f32, -9.0, -9.0, 0.0, 1.0, 2.0, -9.0, 9.0, -9.0, 2.0, 1.0, 0.0],
+        )
+        .unwrap();
+        let labels = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [2]).with_sharding(replicated.clone()).unwrap(),
+            &[0i32, 2],
+        )
+        .unwrap();
         let tiled_labels = Array::vector(vec![0i32, 2, 0, 2]).unwrap();
-        let (_, program) = ArrayIrContext::trace(
-            |inputs: Vec<Tracer<ArrayIrTracingContext>>| {
+        let ((_, loss), gradient) = differentiate_at(ArrayIrValue::Array(logits.clone()))
+            .with_captures(ArrayIrValue::Array(labels))
+            .with_auxiliary_output()
+            .value_and_gradient(|logits, labels| {
                 let loss = shard_map(
                     |(logits, labels): (
                         ShardMapTracer<ArrayIrTracingContext>,
                         ShardMapTracer<ArrayIrTracingContext>,
-                    )| { logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap() },
+                    )| logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap(),
                     (
-                        ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?,
-                        ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?,
+                        ValueProjection::<ArrayType>::into_projected(logits)?,
+                        ValueProjection::<ArrayType>::into_projected(labels)?,
                     ),
-                    mesh.clone(),
-                    (sharded_rows.clone(), replicated.clone()),
+                    mesh,
+                    (sharded_rows, replicated),
                     sharded.clone(),
                 )?;
-                let gradient = differentiate_at(inputs[0].clone())
-                    .with_captures(inputs[1].clone())
-                    .gradient(|logits, labels| {
-                        let loss = shard_map(
-                            |(logits, labels): (
-                                ShardMapTracer<ArrayIrTracingContext>,
-                                ShardMapTracer<ArrayIrTracingContext>,
-                            )| {
-                                logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap()
-                            },
-                            (
-                                ValueProjection::<ArrayType>::into_projected(logits)?,
-                                ValueProjection::<ArrayType>::into_projected(labels)?,
-                            ),
-                            mesh.clone(),
-                            (sharded_rows.clone(), replicated.clone()),
-                            sharded.clone(),
-                        )?;
-                        Ok::<_, ProgramError>(loss.reduce_sum(&[0], None)?.into_value())
-                    })
-                    .map_err(ProgramError::from)?;
-                Ok(vec![loss.into_value(), gradient])
-            },
-            vec![ArrayIrType::from(logits.r#type().into_owned()), ArrayIrType::from(labels.r#type().into_owned())],
-        )
-        .unwrap();
-        let mut outputs =
-            program.interpret(vec![ArrayIrValue::Array(logits.clone()), ArrayIrValue::Array(labels)]).unwrap();
-        let gradient = array(outputs.pop().unwrap());
-        let loss = array(outputs.pop().unwrap());
-        assert_eq!(loss.r#type().sharding(), Some(&sharded));
+                Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
+            })
+            .unwrap();
+        let loss = array(loss);
+        let expected_loss = logits.softmax_cross_entropy_with_integer_labels(&tiled_labels, 1).unwrap();
         assert_eq!(
-            loss.to_f64s(),
-            logits.softmax_cross_entropy_with_integer_labels(&tiled_labels, 1).unwrap().to_f64s()
+            loss,
+            Array::from_elements(
+                ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded).unwrap(),
+                &expected_loss.elements::<f32>().unwrap(),
+            )
+            .unwrap(),
         );
+        let gradient = array(gradient);
+        assert_eq!(gradient.r#type(), logits.r#type());
         let expected_gradient = differentiate_at(logits)
             .with_captures(tiled_labels)
             .gradient(|logits, labels| {
                 logits.softmax_cross_entropy_with_integer_labels(&labels, 1)?.reduce_sum(&[0], None)
             })
             .unwrap();
-        assert_eq!(gradient.to_f64s(), expected_gradient.to_f64s());
+        assert_eq!(gradient, expected_gradient);
     }
 
     #[test]
@@ -2432,11 +3006,11 @@ indoc! {"
                 %28:f32[] = select %4 %27 %5
             in (%28)
         "}
-            .trim_end()
+            .trim_end(),
         );
         assert_eq!(
             known.interpret(&EagerContext::new(), &[logits.clone()]),
-            Ok(vec![logits.softmax_cross_entropy_with_integer_labels(&labels, 0).unwrap()])
+            Ok(vec![logits.softmax_cross_entropy_with_integer_labels(&labels, 0).unwrap()]),
         );
     }
 
@@ -2474,6 +3048,14 @@ indoc! {"
             })
             .unwrap();
         let gradient = gradient.elements::<f32>().unwrap();
+        let tail = (-18.0f64).exp();
+        let probability = (tail / (1.0 + 2.0 * tail)) as f32;
+        assert_abs_diff_eq!(gradient[0], -2.0 * probability, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[1], probability, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[2], probability, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[3], probability, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[4], -2.0 * probability, epsilon = 1e-14);
+        assert_abs_diff_eq!(gradient[5], probability, epsilon = 1e-14);
         assert_eq!(gradient[0], -(gradient[1] + gradient[2]));
         assert_eq!(gradient[4], -(gradient[3] + gradient[5]));
     }
@@ -2498,9 +3080,9 @@ indoc! {"
             logits.masked_softmax_cross_entropy_with_integer_labels(
                 &Array::vector(vec![0i32, 5]).unwrap(),
                 &unselected,
-                1
+                1,
             ),
-            Ok(Array::vector(vec![0.0f64, 0.0]).unwrap())
+            Ok(Array::vector(vec![0.0f64, 0.0]).unwrap()),
         );
         assert!(
             logits
@@ -2508,19 +3090,39 @@ indoc! {"
                 .unwrap()
                 .to_f64s()
                 .iter()
-                .all(|value| value.is_nan())
+                .all(|value| value.is_nan()),
         );
         let array_ir = ArrayIrValue::Array(logits.clone());
         assert_eq!(
             array_ir.masked_softmax_cross_entropy_with_integer_labels(
                 &ArrayIrValue::Array(labels.clone()),
                 &ArrayIrValue::Array(mask.clone()),
-                1
+                1,
             ),
             Ok(ArrayIrValue::Array(
                 logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &mask, 1).unwrap()
-            ))
+            )),
         );
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_with_integer_labels_multiple_axes() {
+        let logits = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [2, 2, 2]),
+            &[1.0f64, 100.0, 2.0, -200.0, 3.0, 4.0, 1000.0, 0.0],
+        )
+        .unwrap();
+        let mask = Array::from_elements(
+            ArrayType::new_static(DataType::Boolean, [2, 2, 2]),
+            &[true, false, false, true, true, false, false, true],
+        )
+        .unwrap();
+        let labels = Array::vector(vec![0i32, 3]).unwrap();
+        let loss = logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &mask, [0, 2]).unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2]));
+        let loss = loss.elements::<f64>().unwrap();
+        assert_abs_diff_eq!(loss[0], 2.0 + (-2.0f64).exp().ln_1p(), epsilon = 1e-15);
+        assert_abs_diff_eq!(loss[1], (-200.0f64).exp().ln_1p(), epsilon = 1e-100);
     }
 
     #[test]
@@ -2530,20 +3132,40 @@ indoc! {"
         assert_eq!(
             logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &Array::vector(vec![true]).unwrap(), 0),
             Err(ProgramError::Type(TypeError::invalid(
-                "`masked_softmax_cross_entropy_with_integer_labels` mask must be a Boolean array with the logits' shape"
-            )))
+                "`masked_softmax_cross_entropy_with_integer_labels` mask must be a Boolean array \
+                 with the logits' shape",
+            ))),
         );
         assert_eq!(
             logits.masked_softmax_cross_entropy_with_integer_labels(
                 &Array::scalar(0.0f32).unwrap(),
                 &Array::vector(vec![true, true]).unwrap(),
-                0
+                0,
             ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`masked_softmax_cross_entropy_with_integer_labels` labels must have the logits' shape with the class \
-                 axes removed and integer elements"
-            )))
+                 axes removed and integer elements",
+            ))),
         );
+    }
+
+    #[test]
+    fn test_masked_softmax_cross_entropy_with_integer_labels_batching() {
+        let logits = Array::matrix(2, 3, vec![1.0f64, 7.0, 3.0, 3.0, 7.0, 1.0]).unwrap();
+        let labels = Array::scalar(0i32).unwrap();
+        let mask = Array::matrix(2, 3, vec![true, false, true, false, true, true]).unwrap();
+        let loss = batch(
+            |(logits, labels, mask)| logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &mask, 0),
+            (logits, labels, mask),
+            (BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2]));
+        let loss = loss.elements::<f64>().unwrap();
+        assert_abs_diff_eq!(loss[0], 2.0 + (-2.0f64).exp().ln_1p(), epsilon = 1e-15);
+        assert_eq!(loss[1], f64::INFINITY);
     }
 
     #[test]
@@ -2564,13 +3186,27 @@ indoc! {"
     }
 
     #[test]
-    fn test_differentiable_softmax_cross_entropy_with_target_logits_call() {
+    fn test_masked_softmax_cross_entropy_with_integer_labels_differentiation_empty_mask() {
+        let logits = Array::vector(vec![1.0f64, 7.0, 3.0]).unwrap();
+        let labels = Array::scalar(9i32).unwrap();
+        let mask = Array::vector(vec![false; 3]).unwrap();
+        assert_eq!(
+            differentiate_at(logits).with_captures((labels, mask)).value_and_gradient(|logits, (labels, mask)| {
+                logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &mask, 0)
+            },),
+            Ok((Array::scalar(0.0f64).unwrap(), Array::vector(vec![0.0f64; 3]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_softmax_cross_entropy_with_target_logits_call() {
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         let teacher = Array::vector(vec![2.0f64, 1.0, 0.0]).unwrap();
         let output = function.call(teacher.clone(), teacher).unwrap();
         let denominator = 1.0 + (-1.0f64).exp() + (-2.0f64).exp();
         let expected = denominator.ln() + ((-1.0f64).exp() + 2.0 * (-2.0f64).exp()) / denominator;
-        assert!((output.to_f64s()[0] - expected).abs() < 1e-15);
+        assert_eq!(output.r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+        assert_abs_diff_eq!(output.elements::<f64>().unwrap()[0], expected, epsilon = 1e-15);
 
         let student = Array::matrix(2, 2, vec![0.0f64, 0.0, 0.0, 0.0]).unwrap();
         let teacher = Array::matrix(2, 2, vec![0.0f64, 0.0, 0.0, 0.0]).unwrap();
@@ -2581,39 +3217,96 @@ indoc! {"
     }
 
     #[test]
-    fn test_differentiable_softmax_cross_entropy_with_target_logits_call_validation() {
+    fn test_softmax_cross_entropy_with_target_logits_call_validation() {
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         assert_eq!(
             function.call(Array::vector(vec![0.0f32]).unwrap(), Array::vector(vec![0.0f64]).unwrap()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` requires logits and target logits with the same shape and element type",
+                "`softmax_cross_entropy_with_target_logits` requires logits and target logits \
+                 with the same shape and element type",
+            ))),
+        );
+        assert_eq!(
+            function.call(Array::vector(vec![0.0f32, 0.0]).unwrap(), Array::vector(vec![0.0f32]).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` requires logits and target logits \
+                 with the same shape and element type",
             ))),
         );
         assert_eq!(
             function.call(Array::vector(vec![0i32]).unwrap(), Array::vector(vec![0i32]).unwrap()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` requires real floating-point logits"
+                "`softmax_cross_entropy_with_target_logits` requires real floating-point logits",
             ))),
         );
         assert_eq!(
             function.call(Array::vector(Vec::<f32>::new()).unwrap(), Array::vector(Vec::<f32>::new()).unwrap()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` requires a non-empty class axis"
+                "`softmax_cross_entropy_with_target_logits` requires a non-empty class axis",
             ))),
         );
         assert_eq!(
             softmax_cross_entropy_with_target_logits::<ArrayContext>(1)
                 .call(Array::vector(vec![0.0f32]).unwrap(), Array::vector(vec![0.0f32]).unwrap()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` axis 1 is out of bounds for rank 1"
+                "`softmax_cross_entropy_with_target_logits` axis 1 is out of bounds for rank 1",
             ))),
         );
+        assert_eq!(
+            softmax_cross_entropy_with_target_logits::<ArrayContext>(Vec::<usize>::new())
+                .call(Array::vector(vec![0.0f32]).unwrap(), Array::vector(vec![0.0f32]).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` requires at least one class axis",
+            ))),
+        );
+        assert_eq!(
+            softmax_cross_entropy_with_target_logits::<ArrayContext>([0, 0])
+                .call(Array::vector(vec![0.0f32]).unwrap(), Array::vector(vec![0.0f32]).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` axes contain duplicate axis 0",
+            ))),
+        );
+        let dynamic = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(
+            ArrayContext::trace(|(logits, targets)| function.call(logits, targets), (dynamic.clone(), dynamic))
+                .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` requires a static input shape",
+            ))),
+        );
+
         // Placement is rejected before the inputs are aligned, so a reduced teacher beside a varying student reports
         // this function's rejection rather than a failed variation transition.
         let (mesh, varying, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let reduced = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap())
             .unwrap();
+        assert_eq!(
+            ArrayContext::trace(
+                |(logits, targets)| function.call(logits, targets),
+                (reduced.clone(), ArrayType::new_static(DataType::F32, [2])),
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` does not support unreduced or reduced inputs",
+            ))),
+        );
+        let unreduced = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            ArrayContext::trace(
+                |(logits, targets)| function.call(logits, targets),
+                (unreduced, ArrayType::new_static(DataType::F32, [2])),
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` does not support unreduced or reduced inputs",
+            ))),
+        );
         assert_eq!(
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |(student, teacher): (_, _)| function.call(student, teacher),
@@ -2622,9 +3315,39 @@ indoc! {"
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` does not support unreduced or reduced inputs"
+                "`softmax_cross_entropy_with_target_logits` does not support unreduced or reduced inputs",
             ))),
         );
+    }
+
+    #[test]
+    fn test_softmax_cross_entropy_with_target_logits_call_empty_rows() {
+        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(1);
+        let logits = Array::matrix(0, 2, Vec::<f32>::new()).unwrap();
+        assert_eq!(function.call(logits.clone(), logits.clone()), Ok(Array::vector(Vec::<f32>::new()).unwrap()));
+        assert_eq!(
+            differentiate_at(logits.clone())
+                .with_captures(logits.clone())
+                .value_and_gradient(|logits, targets| function.call(logits, targets)?.reduce_sum(&[0], None)),
+            Ok((Array::scalar(0.0f32).unwrap(), logits)),
+        );
+    }
+
+    #[test]
+    fn test_softmax_cross_entropy_with_target_logits_call_non_finite() {
+        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
+        let finite = Array::vector(vec![0.0f32, 1.0]).unwrap();
+
+        // Invalid rows produce NaN whether they parameterize the predictions or the targets.
+        for values in [vec![f32::NAN, 0.0], vec![f32::INFINITY, 0.0], vec![f32::NEG_INFINITY; 2]] {
+            let invalid = Array::vector(values).unwrap();
+            let loss = function.call(invalid.clone(), finite.clone()).unwrap();
+            assert_eq!(loss.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+            assert!(loss.elements::<f32>().unwrap()[0].is_nan());
+            let loss = function.call(finite.clone(), invalid).unwrap();
+            assert_eq!(loss.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+            assert!(loss.elements::<f32>().unwrap()[0].is_nan());
+        }
     }
 
     #[test]
@@ -2635,28 +3358,51 @@ indoc! {"
             .with_captures(teacher)
             .value_and_gradient(|student, teacher| function.call(student, teacher))
             .unwrap();
-        assert!(loss.to_f64s()[0] > 0.0);
+        let denominator = 1.0 + (-1.0f64).exp() + (-2.0f64).exp();
+        let expected = denominator.ln() + ((-1.0f64).exp() + 2.0 * (-2.0f64).exp()) / denominator;
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(f64::from(loss.elements::<f32>().unwrap()[0]), expected, epsilon = 1e-7);
         assert_eq!(gradient, Array::vector(vec![0.0f32, 0.0, 0.0]).unwrap());
     }
 
     #[test]
     fn test_softmax_cross_entropy_with_target_logits_multiple_axes() {
-        // Several class axes are flattened inside the retained rules, so the loss and the student gradient equal
-        // those of the flattened logits.
-        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>([0, 1]);
-        let flat = softmax_cross_entropy_with_target_logits::<ArrayContext>(0);
-        let student = Array::matrix(2, 2, vec![1.0f64, 0.5, -0.5, 2.0]).unwrap();
-        let teacher = Array::matrix(2, 2, vec![0.0f64, -0.5, -1.5, 1.0]).unwrap();
-        let (loss, gradient) = differentiate_at(student.clone())
-            .with_captures(teacher.clone())
-            .value_and_gradient(|student, teacher| function.call(student, teacher))
+        // The noncontiguous class axes require a permutation, and each remaining row has a different, nonzero gradient.
+        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>([0, 2]);
+        let logits_values = [1.0f64, -1.0, 0.5, 1.5, -0.5, 2.0, 0.0, 1.0, 2.5, -1.0, 1.0, 0.0];
+        let target_values = [0.0f64, 0.5, 1.0, -0.5, 0.0, 0.0, 1.0, -1.0, 0.5, 1.0, -0.5, 1.5];
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3, 2]);
+        let logits = Array::from_elements(input_type.clone(), &logits_values).unwrap();
+        let targets = Array::from_elements(input_type.clone(), &target_values).unwrap();
+        let losses = function.call(logits.clone(), targets.clone()).unwrap();
+        let gradient = differentiate_at(logits)
+            .with_captures(targets)
+            .gradient(|logits, targets| function.call(logits, targets)?.reduce_sum(&[0], None))
             .unwrap();
-        let (expected_loss, expected_gradient) = differentiate_at(student.reshape([4]).unwrap())
-            .with_captures(teacher.reshape([4]).unwrap())
-            .value_and_gradient(|student, teacher| flat.call(student, teacher))
-            .unwrap();
-        assert_eq!(loss, expected_loss);
-        assert_eq!(gradient.reshape([4]), Ok(expected_gradient));
+        assert_eq!(losses.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [3]));
+        assert_eq!(gradient.r#type().as_ref(), &input_type);
+        let losses = losses.elements::<f64>().unwrap();
+        let gradient = gradient.elements::<f64>().unwrap();
+
+        // Each oracle normalizes the four classes of one original middle-axis coordinate independently.
+        for row in 0..3 {
+            let indices = [2 * row, 2 * row + 1, 6 + 2 * row, 7 + 2 * row];
+            let denominator = indices.iter().map(|&index| logits_values[index].exp()).sum::<f64>();
+            let target_denominator = indices.iter().map(|&index| target_values[index].exp()).sum::<f64>();
+            let expected_loss = indices
+                .iter()
+                .map(|&index| {
+                    target_values[index].exp() / target_denominator * (denominator.ln() - logits_values[index])
+                })
+                .sum::<f64>();
+            assert_abs_diff_eq!(losses[row], expected_loss, epsilon = 1e-14);
+            for index in indices {
+                let expected =
+                    logits_values[index].exp() / denominator - target_values[index].exp() / target_denominator;
+                assert!(expected.abs() > 1e-3);
+                assert_abs_diff_eq!(gradient[index], expected, epsilon = 1e-14);
+            }
+        }
     }
 
     #[test]
@@ -2732,11 +3478,11 @@ indoc! {"
                 ]
             in (%3)
         "}
-            .trim_end()
+            .trim_end(),
         );
         let student = Array::vector(vec![1.0f32, 0.0]).unwrap();
         let teacher = Array::vector(vec![0.0f32, 0.0]).unwrap();
-        assert_eq!(program.interpret((student.clone(), teacher.clone())), function.call(student, teacher));
+        assert_eq!(program.interpret((student.clone(), teacher.clone())), Ok(function.call(student, teacher).unwrap()));
     }
 
     #[test]
@@ -2852,7 +3598,7 @@ indoc! {"
                 ]
             in (%4)
         "}
-            .trim_end()
+            .trim_end(),
         );
 
         // An invariant student is varied before the call, and the gradient of the varying loss with respect to it
@@ -3048,15 +3794,14 @@ indoc! {"
                 %110:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %109
             in (%110)
         "}
-            .trim_end()
+            .trim_end(),
         );
     }
 
     #[test]
     fn test_softmax_cross_entropy_with_target_logits_shard_map() {
-        // Inside a `shard_map`, each device holds two student rows beside the same two replicated teacher rows. The
-        // call aligns the invariant teacher, and the reference emulation executes the primal and the student
-        // gradient device by device with the results of the unsharded call.
+        // Each device holds two prediction rows and the same two target rows. Eager reference emulation executes
+        // both the primal and its derivative; auxiliary output preserves every row loss for comparison.
         let function = softmax_cross_entropy_with_target_logits::<ProjectedContext<ArrayIrContext, ArrayType>>(-1);
         let plain = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3071,56 +3816,36 @@ indoc! {"
         let teacher = Array::matrix(2, 3, vec![2.0f32, 1.0, 0.0, 2.0, 1.0, 0.0]).unwrap();
         let tiled_teacher =
             Array::matrix(4, 3, vec![2.0f32, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0, 0.0]).unwrap();
-        let (_, program) = ArrayIrContext::trace(
-            |inputs: Vec<Tracer<ArrayIrTracingContext>>| {
+        let ((_, loss), gradient) = differentiate_at(ArrayIrValue::Array(student.clone()))
+            .with_captures(ArrayIrValue::Array(teacher))
+            .with_auxiliary_output()
+            .value_and_gradient(|student, teacher| {
                 let loss = shard_map(
-                    |(student, teacher): (
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
-                    )| { function.call(student, teacher).unwrap() },
+                    |(student, teacher): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
+                        function.call(student, teacher).unwrap()
+                    },
                     (
-                        ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?,
-                        ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?,
+                        ValueProjection::<ArrayType>::into_projected(student)?,
+                        ValueProjection::<ArrayType>::into_projected(teacher)?,
                     ),
                     mesh.clone(),
                     (sharded_rows.clone(), replicated.clone()),
                     sharded.clone(),
                 )?;
-                let gradient = differentiate_at(inputs[0].clone())
-                    .with_captures(inputs[1].clone())
-                    .gradient(|student, teacher| {
-                        let loss = shard_map(
-                            |(student, teacher): (
-                                ShardMapTracer<ArrayIrTracingContext>,
-                                ShardMapTracer<ArrayIrTracingContext>,
-                            )| { function.call(student, teacher).unwrap() },
-                            (
-                                ValueProjection::<ArrayType>::into_projected(student)?,
-                                ValueProjection::<ArrayType>::into_projected(teacher)?,
-                            ),
-                            mesh.clone(),
-                            (sharded_rows.clone(), replicated.clone()),
-                            sharded.clone(),
-                        )?;
-                        Ok::<_, ProgramError>(loss.reduce_sum(&[0], None)?.into_value())
-                    })
-                    .map_err(ProgramError::from)?;
-                Ok(vec![loss.into_value(), gradient])
-            },
-            vec![ArrayIrType::from(student.r#type().into_owned()), ArrayIrType::from(teacher.r#type().into_owned())],
-        )
-        .unwrap();
-        let mut outputs =
-            program.interpret(vec![ArrayIrValue::Array(student.clone()), ArrayIrValue::Array(teacher)]).unwrap();
-        let gradient = array(outputs.pop().unwrap());
-        let loss = array(outputs.pop().unwrap());
-        assert_eq!(loss.r#type().sharding(), Some(&sharded));
-        let (expected_loss, expected_gradient) = differentiate_at(student)
-            .with_captures(tiled_teacher)
-            .value_and_gradient(|student, teacher| plain.call(student, teacher)?.reduce_sum(&[0], None))
+                Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
+            })
             .unwrap();
-        assert_eq!(loss.reduce_sum(&[0], None).unwrap().to_f64s(), expected_loss.to_f64s());
-        assert_eq!(gradient.to_f64s(), expected_gradient.to_f64s());
+        let gradient = array(gradient);
+        let loss = array(loss);
+        let expected_losses = plain.call(student.clone(), tiled_teacher.clone()).unwrap();
+        let expected_gradient = differentiate_at(student)
+            .with_captures(tiled_teacher)
+            .gradient(|student, teacher| plain.call(student, teacher)?.reduce_sum(&[0], None))
+            .unwrap();
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded).unwrap());
+        assert_eq!(loss.elements::<f32>(), Ok(expected_losses.elements::<f32>().unwrap()));
+        assert_eq!(gradient.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [4, 3]));
+        assert_eq!(gradient, expected_gradient);
     }
 
     #[test]
@@ -3136,11 +3861,19 @@ indoc! {"
         let known = program
             .partially_evaluate(&[PartialValue::Known(student.clone()), PartialValue::Known(teacher.clone())])
             .unwrap();
-        assert_eq!(known.program().to_string(), "lambda  .\nin ()");
+        assert_eq!(
+            known.program().to_string(),
+            indoc! {"
+                lambda  .
+                in ()
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             known.outputs(),
-            &[PartialEvaluationOutput::Known(function.call(student.clone(), teacher.clone()).unwrap())]
+            &[PartialEvaluationOutput::Known(function.call(student.clone(), teacher.clone()).unwrap())],
         );
+
         // A known teacher alone cannot fold the call, whose primal needs both inputs, so the call stays residual.
         let unknown = program
             .partially_evaluate(&[
@@ -3211,11 +3944,11 @@ indoc! {"
             ]
             in (%2)
         "}
-            .trim_end()
+            .trim_end(),
         );
         assert_eq!(
             unknown.interpret(&EagerContext::new(), &[student.clone()]),
-            Ok(vec![function.call(student, teacher).unwrap()])
+            Ok(vec![function.call(student, teacher).unwrap()]),
         );
     }
 
@@ -3234,6 +3967,63 @@ indoc! {"
             ),
             Ok(Array::vector(vec![2.0f64.ln(), 1000.0]).unwrap()),
         );
+    }
+
+    #[test]
+    fn test_softmax_cross_entropy_with_target_logits_batching_differentiation() {
+        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
+        let logits_values = [2.0f32 - 1e-7, 1.0 + 1e-7, 0.0, 2.0 + 2e-7, 1.0 - 1e-7, 0.0];
+        let logits = Array::matrix(2, 3, logits_values.to_vec()).unwrap();
+        let targets = Array::vector(vec![2.0f32, 1.0, 0.0]).unwrap();
+
+        // Differentiate an already batched call with one replicated target distribution.
+        let after_batch = differentiate_at(logits.clone())
+            .with_captures(targets.clone())
+            .gradient(|logits, targets| {
+                batch(
+                    |(logits, targets)| function.call(logits, targets),
+                    (logits, targets),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )?
+                .reduce_sum(&[0], None)
+            })
+            .unwrap();
+
+        // Batch the custom prediction gradient in the opposite transform order.
+        let before_batch = batch(
+            |(logits, targets)| {
+                differentiate_at(logits)
+                    .with_captures(targets)
+                    .gradient(|logits, targets| function.call(logits, targets))
+                    .map_err(ProgramError::from)
+            },
+            (logits, targets),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        assert_eq!(after_batch.r#type().as_ref(), &expected_type);
+        assert_eq!(before_batch.r#type().as_ref(), &expected_type);
+        let after_batch = after_batch.elements::<f32>().unwrap();
+        let before_batch = before_batch.elements::<f32>().unwrap();
+        let target_weights = [1.0, (-1.0f64).exp(), (-2.0f64).exp()];
+        let target_denominator = target_weights.iter().sum::<f64>();
+        for row in 0..2 {
+            let values = &logits_values[3 * row..3 * row + 3];
+            let denominator = values.iter().map(|&value| (f64::from(value) - 2.0).exp()).sum::<f64>();
+            for class in 0..3 {
+                let index = 3 * row + class;
+                let expected =
+                    (f64::from(values[class]) - 2.0).exp() / denominator - target_weights[class] / target_denominator;
+                assert!(expected.abs() > 1e-10);
+                assert_abs_diff_eq!(f64::from(after_batch[index]), expected, epsilon = 1e-13);
+                assert_abs_diff_eq!(f64::from(before_batch[index]), expected, epsilon = 1e-13);
+            }
+        }
     }
 
     #[test]
@@ -3263,8 +4053,8 @@ indoc! {"
                 .gradient(|(student, teacher)| function.call(student, teacher))
                 .unwrap();
         let expected = 1.0 / (1.0 + (-2.0f64).exp()) - 0.5;
-        assert!((student_gradient.to_f64s()[0] - expected).abs() < 1e-15);
-        assert!((student_gradient.to_f64s()[1] + expected).abs() < 1e-15);
+        assert_abs_diff_eq!(student_gradient.elements::<f64>().unwrap()[0], expected, epsilon = 1e-15);
+        assert_abs_diff_eq!(student_gradient.elements::<f64>().unwrap()[1], -expected, epsilon = 1e-15);
         assert_eq!(teacher_gradient, Array::vector(vec![0.0f64, 0.0]).unwrap());
     }
 
@@ -3286,7 +4076,7 @@ indoc! {"
         for (axis, (actual, &student)) in gradient.iter().zip(&student_values).enumerate() {
             let expected =
                 (f64::from(student) - 2.0).exp() / student_denominator - (-(axis as f64)).exp() / teacher_denominator;
-            assert!((actual - expected).abs() < 1e-13, "class {axis}: {actual} differs from {expected}");
+            assert_abs_diff_eq!(*actual, expected, epsilon = 1e-13);
         }
         assert!(gradient[0] < 0.0);
         assert!(gradient[1] > 0.0);
@@ -3305,14 +4095,18 @@ indoc! {"
             .with_captures(teacher)
             .value_and_gradient(|student, teacher| function.call(student, teacher))
             .unwrap();
-        assert!(loss.to_f64s()[0].is_finite());
+        let target_denominator = 1.0 + (-1.0f64).exp();
+        let log_denominator = student_values[..2].iter().map(|&value| f64::from(value).exp()).sum::<f64>().ln();
+        let expected_loss = (log_denominator - f64::from(student_values[0])) / target_denominator
+            + (-1.0f64).exp() / target_denominator * (log_denominator - f64::from(student_values[1]));
+        assert_abs_diff_eq!(f64::from(loss.elements::<f32>().unwrap()[0]), expected_loss, epsilon = 1e-7);
         let gradient = gradient.to_f64s();
         let student_denominator = student_values[..2].iter().map(|&value| (f64::from(value) - 2.0).exp()).sum::<f64>();
         let teacher_denominator = 1.0 + (-1.0f64).exp();
         for (axis, (actual, &student)) in gradient[..2].iter().zip(&student_values[..2]).enumerate() {
             let expected =
                 (f64::from(student) - 2.0).exp() / student_denominator - (-(axis as f64)).exp() / teacher_denominator;
-            assert!((actual - expected).abs() < 1e-13, "class {axis}: {actual} differs from {expected}");
+            assert_abs_diff_eq!(*actual, expected, epsilon = 1e-13);
         }
         assert_eq!(gradient[2], 0.0);
         assert!(gradient[0] < 0.0 && gradient[1] > 0.0);
@@ -3326,6 +4120,7 @@ indoc! {"
             .gradient(|student, teacher| function.call(student, teacher))
             .unwrap();
         assert_eq!(gradient, Array::vector(vec![0.0f32, 0.0, 0.0]).unwrap());
+
         // A shared mask does not take part in the offset, so a negative common offset also cancels exactly.
         let gradient = differentiate_at(Array::vector(vec![-1.0f32, -1.5, f32::NEG_INFINITY]).unwrap())
             .with_captures(Array::vector(vec![0.0f32, -0.5, f32::NEG_INFINITY]).unwrap())
@@ -3357,6 +4152,7 @@ indoc! {"
                 .value_and_gradient(|student, teacher| function.call(student, teacher)),
             Ok((Array::scalar(0.0f32).unwrap(), Array::vector(vec![0.0f32, 0.0]).unwrap())),
         );
+
         // A class that only the teacher masks routes the row through the direct difference and keeps the loss finite,
         // while a class that only the student masks makes the loss infinite.
         let (loss, gradient) = differentiate_at(Array::vector(vec![0.0f32, 0.0]).unwrap())
@@ -3382,14 +4178,21 @@ indoc! {"
     #[test]
     fn test_softmax_cross_entropy_with_target_logits_differentiation_narrow_inputs() {
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
-        let teacher = Array::vector(vec![2.0f32, 1.0, 0.0]).unwrap().convert_element_type(DataType::BF16).unwrap();
-        let (loss, gradient) = differentiate_at(teacher.clone())
-            .with_captures(teacher)
-            .value_and_gradient(|student, teacher| function.call(student, teacher))
+        let logits = Array::vector(vec![bf16::from_f32(1.0), bf16::from_f32(0.0)]).unwrap();
+        let targets = Array::vector(vec![bf16::from_f32(0.0); 2]).unwrap();
+        let (loss, gradient) = differentiate_at(logits)
+            .with_captures(targets)
+            .value_and_gradient(|logits, targets| function.call(logits, targets))
             .unwrap();
-        assert_eq!(loss.r#type().data_type(), DataType::BF16);
-        assert_eq!(gradient.r#type().data_type(), DataType::BF16);
-        assert_eq!(gradient.to_f64s(), vec![0.0, 0.0, 0.0]);
+
+        // These represented `BF16` inputs are exact. Compute the reference in `F32` and round only the final values.
+        let expected_loss = bf16::from_f32(1.0f32.exp().ln_1p() - 0.5);
+        let probability = 1.0f32 / (1.0 + (-1.0f32).exp());
+        let expected_gradient = [bf16::from_f32(probability - 0.5), bf16::from_f32(0.5 - probability)];
+        assert_eq!(loss.r#type().as_ref(), &ArrayType::scalar(DataType::BF16));
+        assert_eq!(gradient.r#type().as_ref(), &ArrayType::new_static(DataType::BF16, [2]));
+        assert_eq!(loss.elements::<bf16>(), Ok(vec![expected_loss]));
+        assert_eq!(gradient.elements::<bf16>(), Ok(expected_gradient.to_vec()));
     }
 
     #[test]
@@ -3400,7 +4203,7 @@ indoc! {"
             .jvp(Array::vector(vec![3.0f64, -2.0]).unwrap(), |student, teacher| function.call(student, teacher))
             .unwrap();
         let expected = 5.0 * (1.0 / (1.0 + (-1.0f64).exp()) - 0.5);
-        assert!((tangent.to_f64s()[0] - expected).abs() < 1e-15);
+        assert_abs_diff_eq!(tangent.elements::<f64>().unwrap()[0], expected, epsilon = 1e-15);
     }
 
     #[test]
@@ -3411,6 +4214,21 @@ indoc! {"
             .hessian(|student, teacher| function.call(student, teacher))
             .unwrap();
         assert_eq!(hessian.values()[0], Array::matrix(2, 2, vec![0.25f64, -0.25, -0.25, 0.25]).unwrap());
+
+        // Even when both inputs are active, mixed and target-target derivatives stay exactly zero.
+        let hessian =
+            differentiate_at((Array::vector(vec![0.0f64, 0.0]).unwrap(), Array::vector(vec![0.0f64, 0.0]).unwrap()))
+                .hessian(|(logits, targets)| function.call(logits, targets))
+                .unwrap();
+        assert_eq!(
+            hessian.values(),
+            &[
+                Array::matrix(2, 2, vec![0.25f64, -0.25, -0.25, 0.25]).unwrap(),
+                Array::matrix(2, 2, vec![0.0f64; 4]).unwrap(),
+                Array::matrix(2, 2, vec![0.0f64; 4]).unwrap(),
+                Array::matrix(2, 2, vec![0.0f64; 4]).unwrap(),
+            ],
+        );
 
         // Unselected centered differences may be NaN at shared masks or enormous at distant logits. The guarded
         // exponential branch must not contaminate either Hessian with non-finite coefficients.
@@ -3429,7 +4247,7 @@ indoc! {"
             .unwrap();
         assert_eq!(
             hessian.values()[0],
-            Array::matrix(3, 3, vec![0.25f64, -0.25, 0.0, -0.25, 0.25, 0.0, 0.0, 0.0, 0.0]).unwrap()
+            Array::matrix(3, 3, vec![0.25f64, -0.25, 0.0, -0.25, 0.25, 0.0, 0.0, 0.0, 0.0]).unwrap(),
         );
 
         let hessian = differentiate_at(Array::vector(vec![-1000.0f64, 1000.0]).unwrap())
