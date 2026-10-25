@@ -170,9 +170,7 @@ pub use sharding::{
     shard_map_in_context, shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes,
     trace_shard_map_with_options,
 };
-pub use softmax::{
-    DifferentiableSoftmaxCrossEntropyWithTargetLogits, Softmax, softmax_cross_entropy_with_target_logits,
-};
+pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};

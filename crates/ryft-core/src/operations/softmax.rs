@@ -83,7 +83,7 @@ use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{ArgMax, Reduce};
 use crate::programs::{ProgramError, TypeError, Typed, Value};
-use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext};
 
 /// Capability that provides support for stable softmax normalization and cross-entropy along one or more class axes.
 /// `axes` accepts one axis or a list of axes, and negative axes count from the end. Several class axes are normalized
@@ -408,6 +408,259 @@ impl<
     }
 }
 
+/// Cross-entropy function created by [`softmax_cross_entropy_with_target_logits`]. Target logits parameterize a
+/// fixed distribution and are not differentiated. Prediction derivatives use the logits' difference before rounding
+/// probabilities, preserving small gradients when the two distributions nearly match. A retained custom Jacobian Vector
+/// Product (JVP) function supplies both differentiation modes and remains differentiable at higher orders. Create the
+/// function once and reuse it to share cached rule specializations across calls.
+#[allow(clippy::type_complexity)]
+pub struct SoftmaxCrossEntropyWithTargetLogits<D: Domain<Type = ArrayType>>
+where
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+{
+    /// Retained custom function whose leading target input is non-differentiated plumbing.
+    function: CustomFunction<
+        (DomainTracer<D>, DomainTracer<D>),
+        DomainTracer<D>,
+        Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>,
+        WithJvp<
+            Box<
+                dyn Fn(
+                        (DomainTracer<D>, DomainTracer<D>),
+                        (DomainTracer<D>, DomainTracer<D>),
+                    ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+impl<
+    D: Domain<
+            Type = ArrayType,
+            Constant: 'static,
+            Operation: 'static + From<CustomFunctionOperation<D::Constant, D::Operation>>,
+        >,
+> SoftmaxCrossEntropyWithTargetLogits<D>
+where
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+    <ArrayType as BatchableType>::Policy:
+        RecursiveBatchingPolicy<DomainTracingContext<D>> + CotangentBatchingPolicy<DomainTracingContext<D>>,
+    CustomRuleRegistration<D::Constant, D::Operation>: Send,
+    WithJvp<
+        Box<
+            dyn Fn(
+                    (DomainTracer<D>, DomainTracer<D>),
+                    (DomainTracer<D>, DomainTracer<D>),
+                ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
+                + Send
+                + Sync,
+        >,
+    >: CustomFunctionJvp<D::Constant, D::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
+{
+    /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
+    /// reducing the class axes. Both inputs must have the same real floating-point element type and static shape.
+    /// Target derivatives are explicitly stopped, so differentiation over both inputs returns a zero target gradient.
+    /// Manual variation is aligned before the custom function boundary, so its transpose sums replicated inputs'
+    /// contributions once.
+    ///
+    /// The inputs' domain supplies the call context, so this function can be reused with eager and transformed values
+    /// that share its constant and operation types.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for incompatible inputs, invalid, duplicate, or empty class axes, unsupported array
+    /// metadata, or a failed operation while tracing or evaluating the primal or derivative rule.
+    pub fn call<V: Value<Type = ArrayType> + ManualVariationAlignment + StopGradient>(
+        &self,
+        logits: V,
+        target_logits: V,
+    ) -> Result<V, ProgramError>
+    where
+        V::Domain: Context<Constant = D::Constant, Operation = D::Operation> + NamedAxes,
+    {
+        // Placement is validated before the alignment below, which would otherwise report a `parallel_vary` error for
+        // a reduced input instead of this function's own rejection. The primal validates the remaining contract.
+        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &logits.r#type())?;
+        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &target_logits.r#type())?;
+        let target_logits = target_logits.stop_gradient()?;
+        let mut inputs = V::align_manual_variation(&[target_logits, logits])?;
+        let logits = inputs.pop().unwrap();
+        let target_logits = inputs.pop().unwrap();
+        self.function.call((target_logits, logits))
+    }
+}
+
+/// Creates cross-entropy with a fixed target distribution supplied as logits rather than rounded probabilities.
+///
+/// Each call returns `-sum(softmax(target_logits) * log_softmax(logits), axes)` and removes the class axes,
+/// which are normalized jointly as in [`Softmax`]. The inputs must have equal static shapes and real floating-point
+/// element types; every class axis must be non0empty. Negative axes count from the end. Computation uses `f32` for
+/// narrower inputs and restores the original output element type. Negative infinity can mask classes; NaN, positive
+/// infinity, and rows containing only masked logits produce NaNs as in [`Softmax`].
+///
+/// Near matching distributions, the custom JVP computes the probability difference with `expm1` and `ln_1p` before
+/// rounding either distribution to probabilities. Distant distributions use a direct difference with a correction
+/// for its floating-point sum, so the gradient sums to zero up to the rounding of the target probabilities' own sum.
+/// A class that both distributions mask contributes nothing to the loss or its derivatives and does not affect the
+/// choice between the two formulas, so masked class sets keep the cancellation-resistant gradient; a class that
+/// only one of them masks routes its row through the direct difference. Target logits are fixed, including under
+/// higher-order differentiation. To differentiate probability targets themselves, use
+/// [`Softmax::softmax_cross_entropy`] instead.
+///
+/// This implements the cancellation-resistant derivative in
+/// [A Fix for Softmax and Cross-Entropy](https://jonbarron.info/softmaxfix/) as a differentiable JVP, so prediction
+/// Hessians remain available. The returned function retains its rules and should be reused across calls; refer to
+/// [`SoftmaxCrossEntropyWithTargetLogits`]. To embed its staged calls and retained rules in a composite value universe,
+/// use [`Program::into_unprojected`](crate::programs::Program::into_unprojected).
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayOperation, EagerContext, differentiate_at, softmax_cross_entropy_with_target_logits};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let loss = softmax_cross_entropy_with_target_logits::<EagerContext<Array, ArrayOperation<Array>>>(-1);
+/// let target_logits = Array::vector(vec![2.0f32, 1.0, 0.0])?;
+/// let gradient = differentiate_at(target_logits.clone()).with_captures(target_logits)
+///     .gradient(|logits, target_logits| loss.call(logits, target_logits))?;
+/// assert_eq!(gradient.elements::<f32>()?, vec![0.0f32, 0.0, 0.0]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn softmax_cross_entropy_with_target_logits<D>(axes: impl Into<Axes>) -> SoftmaxCrossEntropyWithTargetLogits<D>
+where
+    D: Domain<Type = ArrayType>,
+    D::Constant: 'static,
+    D::Operation: 'static,
+    DomainTracer<D>: Abs
+        + And
+        + Broadcast
+        + Compare
+        + ConvertElementType
+        + Exp
+        + ExpM1
+        + Ln1p
+        + Mul
+        + Neg
+        + Or
+        + Reduce
+        + Reshape
+        + Select
+        + Softmax
+        + Sub
+        + Transpose,
+    DomainTracingContext<D>:
+        StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation> + Fill<f64, DomainTracer<D>>,
+{
+    let axes = axes.into();
+    let primal_axes = axes.clone();
+    let primal: Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync> =
+        Box::new(move |(target_logits, logits)| {
+            let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &primal_axes)?;
+            let target_probabilities = inputs.target_logits.softmax(inputs.axis)?;
+            let log_probabilities = inputs.logits.log_softmax(inputs.axis)?;
+
+            // Avoid multiplying zero target probabilities by masked log-probabilities.
+            // This literal has the logits' placement and variation because it is a non-differentiable constant.
+            let zero = target_probabilities.domain().fill(target_probabilities.r#type().as_ref(), 0.0)?;
+            let log_probabilities = target_probabilities.equal(&zero)?.select(&zero, &log_probabilities)?;
+            target_probabilities
+                .mul(&log_probabilities)?
+                .reduce_sum(&[inputs.axis], None)?
+                .neg()?
+                .convert_element_type(inputs.output_data_type)
+        });
+    let jvp: Box<
+        dyn Fn(
+                (DomainTracer<D>, DomainTracer<D>),
+                (DomainTracer<D>, DomainTracer<D>),
+            ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
+            + Send
+            + Sync,
+    > = Box::new(move |(target_logits, logits), (_, tangent)| {
+        let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &axes)?;
+        let CrossEntropyInputsWithTargetLogits { target_logits, logits, class_axes, axis, output_data_type } = inputs;
+        let log_probabilities = logits.log_softmax(axis)?;
+        let probabilities = log_probabilities.exp()?;
+        let target_probabilities = target_logits.softmax(axis)?;
+
+        // Avoid multiplying zero target probabilities by masked log-probabilities.
+        // This literal has the logits' placement and variation because it is a non-differentiable constant.
+        let zero = target_probabilities.domain().fill(target_probabilities.r#type().as_ref(), 0.0)?;
+        let log_probabilities = target_probabilities.equal(&zero)?.select(&zero, &log_probabilities)?;
+        let loss = target_probabilities
+            .mul(&log_probabilities)?
+            .reduce_sum(&[axis], None)?
+            .neg()?
+            .convert_element_type(output_data_type)?;
+
+        // Compute the stable probability difference, retaining differentiable dependence on the prediction logits.
+        let input_type = logits.r#type().into_owned();
+        let broadcast_axes = (0..input_type.rank()).filter(|&dimension| dimension != axis).collect::<Vec<_>>();
+        // Broadcast outputs take the default layout, like the class coordinates, because the logits' layout need not
+        // apply to another element type.
+        let broadcast = |value: DomainTracer<D>| {
+            let output_type = input_type.clone().with_data_type(value.r#type().data_type()).with_layout(None);
+            value.broadcast(output_type, &broadcast_axes)
+        };
+        // Literals inherit the inputs' placement and variation; none can carry a tangent.
+        let zero = logits.domain().fill(&input_type, 0.0)?;
+        let one = logits.domain().fill(&input_type, 1.0)?;
+        let infinity = logits.domain().fill(&input_type, f64::INFINITY)?;
+        let negative_infinity = logits.domain().fill(&input_type, f64::NEG_INFINITY)?;
+        // A class that both distributions mask has zero probability on both sides, so it contributes nothing to the
+        // gradient. Its raw difference is `-∞ - -∞ = NaN`, which must neither take part in the arithmetic nor decide
+        // which formula the row uses.
+        let excluded = target_logits.equal(&negative_infinity)?.and(&logits.equal(&negative_infinity)?)?;
+        let difference = logits.sub(&target_logits)?;
+        let finite_difference = difference.abs()?.less_than(&infinity)?;
+        // Remove a common offset exactly before weighted centering. Rounded probabilities need not sum to exactly one,
+        // so weighting a constant difference directly could otherwise leave a tiny nonzero gradient for equal
+        // softmaxes. Only finite differences take part in the offset; a row without any keeps a zero offset, which
+        // keeps the discarded branch finite.
+        let offset = finite_difference.select(&difference, &negative_infinity)?.reduce_max(&[axis])?;
+        let offset_type = offset.r#type().into_owned();
+        let finite_offset = offset.abs()?.less_than(&logits.domain().fill(&offset_type, f64::INFINITY)?)?;
+        let offset = broadcast(finite_offset.select(&offset, &logits.domain().fill(&offset_type, 0.0)?)?)?;
+        let difference = finite_difference.select(&difference.sub(&offset)?, &zero)?;
+        let centered =
+            difference.sub(&broadcast(target_probabilities.mul(&difference)?.reduce_sum(&[axis], None)?)?)?;
+
+        // Only close rows need the cancellation-resistant formula. Sanitize its input before expm1, rather than
+        // selecting an overflowing result afterward: reverse-mode derivatives of an unused infinite branch can
+        // otherwise be NaN. The all-finite test routes a class that only one distribution masks through the direct
+        // probability difference, while a class that both mask is excluded from the test. Masking the raw differences
+        // before reduce_max keeps the discarded branch's higher derivatives finite as well.
+        let close = excluded.or(&finite_difference.and(&centered.abs()?.less_than(&one)?)?)?.reduce_all(&[axis])?;
+        let close = broadcast(close)?;
+        let centered = close.select(&centered, &zero)?;
+        let correction = broadcast(target_probabilities.mul(&centered.exp_m1()?)?.reduce_sum(&[axis], None)?.ln_1p()?)?;
+        let log_ratio = centered.sub(&correction)?;
+        let near_difference = target_probabilities.mul(&log_ratio.exp_m1()?)?;
+        let direct_difference = probabilities.sub(&target_probabilities)?;
+        let near = close.and(&log_ratio.abs()?.less_than(&one)?)?;
+        let difference = near.select(&near_difference, &direct_difference)?;
+        let residual = broadcast(difference.reduce_sum(&[axis], None)?)?;
+        let gradient = difference.sub(&probabilities.mul(&residual)?)?;
+        let tangent = tangent.convert_element_type(logits.r#type().data_type())?;
+        let mut flattened = FlattenedClassInputs::new(vec![tangent], &class_axes)?;
+        let output_tangent = gradient
+            .mul(&flattened.inputs.pop().unwrap())?
+            .reduce_sum(&[axis], None)?
+            .convert_element_type(loss.r#type().tangent()?.data_type())?;
+        Ok((loss, output_tangent))
+    });
+    SoftmaxCrossEntropyWithTargetLogits {
+        function: custom_function(primal)
+            .with_jvp(jvp)
+            .with_non_differentiated_count(1)
+            .with_name("softmax_cross_entropy_with_target_logits"),
+    }
+}
+
 /// Array inputs with their class axes flattened for single-axis arithmetic, together with the information needed to
 /// restore their original shape and axis order.
 struct FlattenedClassInputs<V> {
@@ -649,189 +902,6 @@ fn one_hot_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcas
     coordinates.equal(&indices.broadcast(index_type, &output_axes)?)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Cross-entropy function created by [`softmax_cross_entropy_with_target_logits`].
-///
-/// Target logits parameterize a fixed distribution and are not differentiated. Prediction derivatives use the logits'
-/// difference before rounding probabilities, preserving small gradients when the two distributions nearly match. A
-/// retained custom JVP supplies both differentiation modes and remains differentiable at higher orders. Create the
-/// function once and reuse it to share cached rule specializations across calls.
-#[allow(clippy::type_complexity)]
-pub struct SoftmaxCrossEntropyWithTargetLogits<D: Domain<Type = ArrayType>>
-where
-    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
-{
-    /// Retained custom function whose leading target input is non-differentiated plumbing.
-    function: CustomFunction<
-        (DomainTracer<D>, DomainTracer<D>),
-        DomainTracer<D>,
-        Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>,
-        WithJvp<
-            Box<
-                dyn Fn(
-                        (DomainTracer<D>, DomainTracer<D>),
-                        (DomainTracer<D>, DomainTracer<D>),
-                    ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-                    + Send
-                    + Sync,
-            >,
-        >,
-    >,
-}
-
-impl<D: Domain<Type = ArrayType>> SoftmaxCrossEntropyWithTargetLogits<D>
-where
-    D::Constant: 'static,
-    D::Operation: 'static,
-    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
-{
-    /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
-    /// reducing the class axes. Both inputs must have the same real floating-point element type and static shape.
-    /// Target derivatives are explicitly stopped, so differentiation over both inputs returns a zero target gradient.
-    /// Manual variation is aligned before the custom function boundary, so its transpose sums replicated inputs'
-    /// contributions once.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] for incompatible inputs, invalid, duplicate, or empty class axes, unsupported array
-    /// metadata, or a failed operation while tracing or evaluating the primal or derivative rule.
-    pub fn call<C, V>(&self, logits: V, target_logits: V) -> Result<V, ProgramError>
-    where
-        C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation> + NamedAxes,
-        C::Operation: From<CustomFunctionOperation<C::Constant, C::Operation>>,
-        V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment + StopGradient,
-        <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
-            + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
-        CustomRuleRegistration<C::Constant, C::Operation>: Send,
-        WithJvp<
-            Box<
-                dyn Fn(
-                        (DomainTracer<D>, DomainTracer<D>),
-                        (DomainTracer<D>, DomainTracer<D>),
-                    ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-                    + Send
-                    + Sync,
-            >,
-        >: CustomFunctionJvp<C::Constant, C::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
-    {
-        // Placement is validated before the alignment below, which would otherwise report a `parallel_vary` error for
-        // a reduced input instead of this function's own rejection. The primal validates the remaining contract.
-        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &logits.r#type())?;
-        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &target_logits.r#type())?;
-        let target_logits = target_logits.stop_gradient()?;
-        let mut inputs = V::align_manual_variation(&[target_logits, logits])?;
-        let logits = inputs.pop().unwrap();
-        let target_logits = inputs.pop().unwrap();
-        self.function.call((target_logits, logits))
-    }
-}
-
-/// Creates cross-entropy with a fixed target distribution supplied as logits rather than rounded probabilities.
-///
-/// Each call returns `-sum(softmax(target_logits) * log_softmax(logits), axes)` and removes the class axes,
-/// which are normalized jointly as in [`Softmax`]. The inputs must have equal static shapes and real floating-point
-/// element types; every class axis must be non0empty. Negative axes count from the end. Computation uses `f32` for
-/// narrower inputs and restores the original output element type. Negative infinity can mask classes; NaN, positive
-/// infinity, and rows containing only masked logits produce NaNs as in [`Softmax`].
-///
-/// Near matching distributions, the custom JVP computes the probability difference with `expm1` and `ln_1p` before
-/// rounding either distribution to probabilities. Distant distributions use a direct difference with a correction
-/// for its floating-point sum, so the gradient sums to zero up to the rounding of the target probabilities' own sum.
-/// A class that both distributions mask contributes nothing to the loss or its derivatives and does not affect the
-/// choice between the two formulas, so masked class sets keep the cancellation-resistant gradient; a class that
-/// only one of them masks routes its row through the direct difference. Target logits are fixed, including under
-/// higher-order differentiation. To differentiate probability targets themselves, use
-/// [`Softmax::softmax_cross_entropy`] instead.
-///
-/// This implements the cancellation-resistant derivative in
-/// [A Fix for Softmax and Cross-Entropy](https://jonbarron.info/softmaxfix/) as a differentiable JVP, so prediction
-/// Hessians remain available. The returned function retains its rules and should be reused across calls; refer to
-/// [`SoftmaxCrossEntropyWithTargetLogits`]. To embed its staged calls and retained rules in a composite value universe,
-/// use [`Program::into_unprojected`](crate::programs::Program::into_unprojected).
-///
-/// # Example
-///
-/// ```rust
-/// # use ryft_core::{Array, ArrayOperation, EagerContext, differentiate_at, softmax_cross_entropy_with_target_logits};
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let loss = softmax_cross_entropy_with_target_logits::<EagerContext<Array, ArrayOperation<Array>>>(-1);
-/// let target_logits = Array::vector(vec![2.0f32, 1.0, 0.0])?;
-/// let gradient = differentiate_at(target_logits.clone()).with_captures(target_logits)
-///     .gradient(|logits, target_logits| loss.call(logits, target_logits))?;
-/// assert_eq!(gradient.elements::<f32>()?, vec![0.0f32, 0.0, 0.0]);
-/// # Ok(())
-/// # }
-/// ```
-pub fn softmax_cross_entropy_with_target_logits<D>(axes: impl Into<Axes>) -> SoftmaxCrossEntropyWithTargetLogits<D>
-where
-    D: Domain<Type = ArrayType>,
-    D::Constant: 'static,
-    D::Operation: 'static,
-    DomainTracer<D>: Abs
-        + And
-        + Broadcast
-        + Compare
-        + ConvertElementType
-        + Exp
-        + ExpM1
-        + Ln1p
-        + Mul
-        + Neg
-        + Or
-        + Reduce
-        + Reshape
-        + Select
-        + Softmax
-        + Sub
-        + Transpose,
-    DomainTracingContext<D>:
-        StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation> + Fill<f64, DomainTracer<D>>,
-{
-    let axes = axes.into();
-    let primal_axes = axes.clone();
-    let primal: Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync> =
-        Box::new(move |(target_logits, logits)| {
-            let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &primal_axes)?;
-            soft_target_loss(
-                &inputs.target_logits.softmax(inputs.axis)?,
-                &inputs.logits.log_softmax(inputs.axis)?,
-                inputs.axis,
-            )?
-            .convert_element_type(inputs.output_data_type)
-        });
-    let jvp: Box<
-        dyn Fn(
-                (DomainTracer<D>, DomainTracer<D>),
-                (DomainTracer<D>, DomainTracer<D>),
-            ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-            + Send
-            + Sync,
-    > = Box::new(move |(target_logits, logits), (_, tangent)| {
-        let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &axes)?;
-        let CrossEntropyInputsWithTargetLogits { target_logits, logits, class_axes, axis, output_data_type } = inputs;
-        let log_probabilities = logits.log_softmax(axis)?;
-        let probabilities = log_probabilities.exp()?;
-        let target_probabilities = target_logits.softmax(axis)?;
-        let loss = soft_target_loss(&target_probabilities, &log_probabilities, axis)?
-            .convert_element_type(output_data_type)?;
-        let gradient = soft_target_gradient(&target_logits, &logits, &target_probabilities, &probabilities, axis)?;
-        let tangent = tangent.convert_element_type(logits.r#type().data_type())?;
-        let mut flattened = FlattenedClassInputs::new(vec![tangent], &class_axes)?;
-        let output_tangent = gradient
-            .mul(&flattened.inputs.pop().unwrap())?
-            .reduce_sum(&[axis], None)?
-            .convert_element_type(loss.r#type().tangent()?.data_type())?;
-        Ok((loss, output_tangent))
-    });
-    SoftmaxCrossEntropyWithTargetLogits {
-        function: custom_function(primal)
-            .with_jvp(jvp)
-            .with_non_differentiated_count(1)
-            .with_name("softmax_cross_entropy_with_target_logits"),
-    }
-}
-
 /// Validated target and prediction logits in working precision, with flattened class axes and metadata for the loss
 /// and its JVP.
 struct CrossEntropyInputsWithTargetLogits<V> {
@@ -886,78 +956,6 @@ impl<V: Value<Type = ArrayType> + ConvertElementType + Reshape + Transpose> Cros
     }
 }
 
-/// Computes the primal loss without multiplying zero target probabilities by masked log-probabilities.
-fn soft_target_loss<V>(teacher_probabilities: &V, log_probabilities: &V, axis: usize) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Compare + Mul + Neg + Reduce + Select,
-    V::Domain: Fill<f64, V>,
-{
-    // This literal has the logits' placement and variation because it is a non-differentiable constant.
-    let zero = teacher_probabilities.domain().fill(teacher_probabilities.r#type().as_ref(), 0.0)?;
-    let log_probabilities = teacher_probabilities.equal(&zero)?.select(&zero, log_probabilities)?;
-    teacher_probabilities.mul(&log_probabilities)?.reduce_sum(&[axis], None)?.neg()
-}
-
-/// Computes the stable prediction probability difference, retaining differentiable dependence on the prediction logits.
-fn soft_target_gradient<V>(
-    teacher: &V,
-    student: &V,
-    teacher_probabilities: &V,
-    student_probabilities: &V,
-    axis: usize,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Abs + And + Broadcast + Compare + ExpM1 + Ln1p + Mul + Or + Reduce + Select + Sub,
-    V::Domain: Fill<f64, V>,
-{
-    let input_type = student.r#type().into_owned();
-    let broadcast_axes = (0..input_type.rank()).filter(|&dimension| dimension != axis).collect::<Vec<_>>();
-    // Broadcast outputs take the default layout, like the class coordinates, because the logits' layout need not apply
-    // to another element type.
-    let broadcast = |value: V| {
-        let output_type = input_type.clone().with_data_type(value.r#type().data_type()).with_layout(None);
-        value.broadcast(output_type, &broadcast_axes)
-    };
-    // Literals inherit the inputs' placement and variation; none can carry a tangent.
-    let zero = student.domain().fill(&input_type, 0.0)?;
-    let one = student.domain().fill(&input_type, 1.0)?;
-    let infinity = student.domain().fill(&input_type, f64::INFINITY)?;
-    let negative_infinity = student.domain().fill(&input_type, f64::NEG_INFINITY)?;
-    // A class that both distributions mask has zero probability on both sides, so it contributes nothing to the
-    // gradient. Its raw difference is `-∞ - -∞ = NaN`, which must neither take part in the arithmetic nor decide
-    // which formula the row uses.
-    let excluded = teacher.equal(&negative_infinity)?.and(&student.equal(&negative_infinity)?)?;
-    let difference = student.sub(teacher)?;
-    let finite_difference = difference.abs()?.less_than(&infinity)?;
-    // Remove a common offset exactly before weighted centering. Rounded probabilities need not sum to exactly one,
-    // so weighting a constant difference directly could otherwise leave a tiny nonzero gradient for equal softmaxes.
-    // Only finite differences take part in the offset; a row without any keeps a zero offset, which keeps the
-    // discarded branch finite.
-    let offset = finite_difference.select(&difference, &negative_infinity)?.reduce_max(&[axis])?;
-    let offset_type = offset.r#type().into_owned();
-    let finite_offset = offset.abs()?.less_than(&student.domain().fill(&offset_type, f64::INFINITY)?)?;
-    let offset = broadcast(finite_offset.select(&offset, &student.domain().fill(&offset_type, 0.0)?)?)?;
-    let difference = finite_difference.select(&difference.sub(&offset)?, &zero)?;
-    let centered = difference.sub(&broadcast(teacher_probabilities.mul(&difference)?.reduce_sum(&[axis], None)?)?)?;
-
-    // Only close rows need the cancellation-resistant formula. Sanitize its input before expm1, rather than selecting
-    // an overflowing result afterward: reverse-mode derivatives of an unused infinite branch can otherwise be NaN.
-    // The all-finite test routes a class that only one distribution masks through the direct probability difference,
-    // while a class that both mask is excluded from the test. Masking the raw differences before reduce_max keeps the
-    // discarded branch's higher derivatives finite as well.
-    let close = excluded.or(&finite_difference.and(&centered.abs()?.less_than(&one)?)?)?.reduce_all(&[axis])?;
-    let close = broadcast(close)?;
-    let centered = close.select(&centered, &zero)?;
-    let correction = broadcast(teacher_probabilities.mul(&centered.exp_m1()?)?.reduce_sum(&[axis], None)?.ln_1p()?)?;
-    let log_ratio = centered.sub(&correction)?;
-    let near_difference = teacher_probabilities.mul(&log_ratio.exp_m1()?)?;
-    let direct_difference = student_probabilities.sub(teacher_probabilities)?;
-    let near = close.and(&log_ratio.abs()?.less_than(&one)?)?;
-    let difference = near.select(&near_difference, &direct_difference)?;
-    let residual = broadcast(difference.reduce_sum(&[axis], None)?)?;
-    difference.sub(&student_probabilities.mul(&residual)?)
-}
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -978,7 +976,7 @@ mod tests {
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ValueProjection;
-    use crate::tracing::{Trace, Tracer};
+    use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
 

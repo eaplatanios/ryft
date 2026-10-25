@@ -68,7 +68,7 @@ use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOper
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
-use crate::operations::control_flow::scan::{ScanIterationType, ScanOperation};
+use crate::operations::control_flow::scan::{ScanInterpretationDomain, ScanOperation};
 use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate};
 use crate::operations::custom_functions::operations::CUSTOM_FUNCTION_OPERATION_NAME;
 use crate::operations::differentiation::linear_call::LINEAR_CALL_OPERATION_NAME;
@@ -884,27 +884,27 @@ type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 // differs from that of its stack widens both to the join of their variation exactly as when the scan binds per device.
 // The devices agree on a dynamic trip count, because they agree on the type of the runtime length (refer to
 // `lockstep_values`), which is its extent.
-impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for ArrayIrType {
+impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDomain<O> {
     fn runtime_length(runtime_length: &LockstepValue<O>) -> Result<usize, ProgramError> {
-        <Self as ScanIterationType<DeviceContext>>::runtime_length(&runtime_length.0[0])
+        DeviceContext::runtime_length(&runtime_length.0[0])
     }
 
-    fn iteration_index(context: &LockstepDomain<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
-        let index = <Self as ScanIterationType<DeviceContext>>::iteration_index(&DeviceContext::new(), iteration)?;
-        Ok(LockstepValue::new(vec![index; context.device_count]))
+    fn iteration_index(&self, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
+        let index = DeviceContext::new().iteration_index(iteration)?;
+        Ok(LockstepValue::new(vec![index; self.device_count]))
     }
 
     fn read_iteration(stack: &LockstepValue<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
         stack
             .0
             .iter()
-            .map(|stack| <Self as ScanIterationType<DeviceContext>>::read_iteration(stack, iteration))
+            .map(|stack| DeviceContext::read_iteration(stack, iteration))
             .collect::<Result<_, _>>()
             .map(LockstepValue::new)
     }
 
     fn write_iteration(
-        context: &LockstepDomain<O>,
+        &self,
         output: usize,
         accumulator: Option<LockstepValue<O>>,
         length: usize,
@@ -914,41 +914,28 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
     ) -> Result<LockstepValue<O>, ProgramError> {
         let accumulators = match accumulator {
             Some(accumulator) => accumulator.0.into_iter().map(Some).collect(),
-            None => vec![None; context.device_count],
+            None => vec![None; self.device_count],
         };
         accumulators
             .into_iter()
             .zip(value.0)
             .map(|(accumulator, value)| {
-                <Self as ScanIterationType<DeviceContext>>::write_iteration(
-                    &DeviceContext::new(),
-                    output,
-                    accumulator,
-                    length,
-                    placement,
-                    iteration,
-                    value,
-                )
+                DeviceContext::new().write_iteration(output, accumulator, length, placement, iteration, value)
             })
             .collect::<Result<_, _>>()
             .map(LockstepValue::new)
     }
 
     fn empty_stack(
-        context: &LockstepDomain<O>,
-        output_type: &Self,
-        body_input_types: &[Self],
+        &self,
+        output_type: &Self::Type,
+        body_input_types: &[Self::Type],
         inputs: &[LockstepValue<O>],
     ) -> Result<LockstepValue<O>, ProgramError> {
-        (0..context.device_count)
+        (0..self.device_count)
             .map(|device| {
                 let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
-                <Self as ScanIterationType<DeviceContext>>::empty_stack(
-                    &DeviceContext::new(),
-                    output_type,
-                    body_input_types,
-                    &inputs,
-                )
+                DeviceContext::new().empty_stack(output_type, body_input_types, &inputs)
             })
             .collect::<Result<_, _>>()
             .map(LockstepValue::new)

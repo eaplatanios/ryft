@@ -94,6 +94,637 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Member of a [`ScanType`] family, which decides the role that a value of that type can play on a scan boundary.
+#[derive(Copy, Clone, Debug)]
+pub enum ScanMember<'t> {
+    /// Array of the provided type.
+    Array(&'t ArrayType),
+
+    /// Reference to an array of the provided type.
+    Reference(&'t ArrayType),
+
+    /// First-class dimension of the provided type.
+    Dimension(&'t DimensionType),
+}
+
+impl<'t> ScanMember<'t> {
+    /// Returns the [`DimensionType`] of this member when it is the trailing runtime length input of a dynamic-length
+    /// scan, which must be a first-class dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when this member is not a first-class dimension.
+    fn runtime_length_type(self) -> Result<&'t DimensionType, TypeError> {
+        let kind_name = match self {
+            Self::Dimension(r#type) => return Ok(r#type),
+            Self::Array(_) => "an array",
+            Self::Reference(_) => "a reference",
+        };
+        Err(TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` runtime length input must be a first-class dimension but got {kind_name}",
+        )))
+    }
+}
+
+/// Type-family semantics for [`ScanOperation`].
+///
+/// These rules are independent of the execution domain, so inference, transforms, and lowering can validate scans
+/// without requiring any runtime value representation or iteration capabilities.
+///
+/// A family describes each of its types as a [`ScanMember`]: an array, a reference to an array, or a first-class
+/// dimension. The scan contract is stated once over those members, and each family only restricts it: [`ArrayType`]
+/// stacks per-iteration arrays along a static leading axis and requires a static length and fully static bodies, while
+/// [`ArrayIrType`] additionally permits references and first-class dimensions in carry positions and a dynamic length
+/// supplied by a trailing dimension input. Every family requires the body's first input to be a scalar
+/// [`I64`](DataType::I64) slice index.
+///
+/// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the body
+/// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
+/// dimensions have a stacked value representation. Scan lengths are [`Dimension`]s, so every implementing family uses
+/// [`DimensionVariable`]s as its type identities. A dynamic length and every stacked leading axis must have equal
+/// extents: static extents must agree, and the scan boundary checks at runtime the relationships that the input types
+/// leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type that carries
+/// no identity that such a check could relate to the runtime length, so its leading extent must be provably equal to
+/// the trip count.
+pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
+    /// Returns the [`ScanMember`] that this type describes.
+    fn scan_member(&self) -> ScanMember<'_>;
+
+    /// Returns the type of the trailing runtime length input of a scan whose trip count is the dynamic `length` (i.e.,
+    /// the first-class `dimension<length>`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this family admits no dynamic scan length.
+    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError>;
+
+    /// Validates the restrictions that this family places on the members of a declared iteration body beyond the shared
+    /// index and carry contract (e.g., homogeneous array bodies must be fully static).
+    ///
+    /// # Parameters
+    ///
+    ///   - `body_input_types`: Declared body inputs after the intrinsic index.
+    ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
+    fn validate_scan_body_members(body_input_types: &[Self], body_output_types: &[Self]) -> Result<(), TypeError>;
+
+    /// Validates the intrinsic index and carry contracts of a declared iteration body independently of the values
+    /// that bind it. Transform rules use this before rewriting or eliminating a scan so specialization cannot erase
+    /// an invalid source signature. Every reference stack must have a static referent whose leading axis is the scan
+    /// length, and every stacked output must be an array.
+    ///
+    /// # Parameters
+    ///
+    ///   - `body_input_types`: Declared body inputs, including the intrinsic scalar `i64` index.
+    ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
+    ///   - `carry_count`: Number of matching carry positions on both boundaries.
+    ///   - `length`: Declared trip count, validated independently of a runtime value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index, carry counts or types, length, or family-specific boundary roles are invalid.
+    fn validate_scan_body_type_signature(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: &Dimension,
+    ) -> Result<(), TypeError> {
+        // Validate the declared trip count before inspecting or specializing the body signature.
+        if let Some(length) = length.value()
+            && length > MAX_DIMENSION_EXTENT
+        {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` length {length} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
+            )));
+        }
+        if length.variable().is_some() {
+            Self::runtime_length_type(length)?;
+        }
+        if body_input_types.first() != Some(&Self::from(ArrayType::scalar(DataType::I64))) {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
+            )));
+        }
+        let body_input_types = &body_input_types[1..];
+        // The signature is validated independently of the stacked-axis placements, which output inference applies.
+        scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length, &[])?;
+        scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, length, &[])?;
+        check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
+            &body_input_types[..carry_count],
+            &body_output_types[..carry_count],
+        ]);
+        Self::validate_scan_body_members(body_input_types, body_output_types)
+    }
+
+    /// Validates the operation inputs against the declared iteration inputs, including the type and identity of a
+    /// trailing runtime length. This checks ordinary type refinement independently of how the runtime length relates
+    /// to the stacked axes, which [`Self::infer_scan_output_types`] additionally validates. Callers must first validate
+    /// the body signature. Reference inputs refine their declared referents; their allocation identity is validated
+    /// separately from these type relationships.
+    ///
+    /// # Parameters
+    ///
+    ///   - `body_input_types`: Validated body inputs, including the intrinsic index.
+    ///   - `carry_count`: Number of leading carried inputs.
+    ///   - `length`: Declared trip count.
+    ///   - `input_types`: Actual operation input types, including a trailing runtime length for dynamic scans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched input counts, ordinary types, or runtime length types.
+    fn validate_scan_input_type_signature(
+        body_input_types: &[Self],
+        carry_count: usize,
+        length: &Dimension,
+        input_types: &[Self],
+    ) -> Result<(), TypeError> {
+        let body_input_types = &body_input_types[1..];
+        let expected_input_types =
+            scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length, &[])?;
+        check_count!(
+            "input",
+            input_types,
+            expected_input_types.len() + usize::from(length.variable().is_some()),
+            TypeError
+        );
+        for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
+            match (body_input_types[index].scan_member(), actual.scan_member()) {
+                (ScanMember::Array(declared), ScanMember::Array(actual)) if index >= carry_count => {
+                    // Validate the slice the body receives, including its placement and manual variation, rather than
+                    // comparing whole-stack metadata with the declared boundary type.
+                    if actual.rank() == 0 {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have rank at least 1 but has type \
+                             `{actual}`",
+                        )));
+                    }
+                    let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
+                    if !length.is_refined_by(&leading_dimension) {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` \
+                             but has type `{actual}`",
+                        )));
+                    }
+                    if !declared.is_refined_by(&slice_type) {
+                        return Err(TypeError::invalid(format!(
+                            "`{SCAN_OPERATION_NAME}` stacked input {index} has type `{actual}`, whose slice type \
+                             `{slice_type}` does not refine its body input type `{declared}`",
+                        )));
+                    }
+                }
+                _ => validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?,
+            }
+        }
+        validate_scan_runtime_length_type(length, input_types)?;
+        Ok(())
+    }
+
+    /// Derives the instantiated body input types, `[index, carry..., x_slice_or_reference...]`, from this scan's
+    /// operation input types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the runtime length input when
+    ///     `length` is dynamic.
+    ///   - `body_input_count`: Number of inputs of the attached body, including its intrinsic index input.
+    ///   - `carry_count`: Number of loop-carried state leaves.
+    ///   - `length`: Declared scan length.
+    fn infer_scan_body_input_types(
+        input_types: &[Self],
+        body_input_count: usize,
+        carry_count: usize,
+        length: &Dimension,
+    ) -> Result<Vec<Self>, TypeError> {
+        let stacked_input_end = body_input_count
+            .checked_sub(1)
+            .ok_or_else(|| TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body must have a slice index input")))?;
+        check_count!("input", input_types, stacked_input_end + usize::from(length.variable().is_some()), TypeError);
+        if carry_count > stacked_input_end {
+            return Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body input count {stacked_input_end}",
+            )));
+        }
+        let mut body_input_types = vec![Self::from(ArrayType::scalar(DataType::I64))];
+        body_input_types.extend_from_slice(&input_types[..carry_count]);
+        for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
+            // Arrays enter as slices. References enter as whole roots, so the body can form its own indexed view: only
+            // their leading extent must be the scan length, whatever the placement of that axis (as
+            // `scan_boundary_types` and `validate_scan_input_type_signature` admit it), so a referent is not sliced.
+            let (stacked_type, is_reference) = match r#type.scan_member() {
+                ScanMember::Array(stacked_type) => (stacked_type, false),
+                ScanMember::Reference(stacked_type) => (stacked_type, true),
+                ScanMember::Dimension(_) => {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` stacked input {} must be an array or a reference but got `{type}`",
+                        carry_count + index,
+                        r#type = r#type,
+                    )));
+                }
+            };
+            if stacked_type.rank() == 0 {
+                return Err(TypeError::invalid(format!(
+                    "`{SCAN_OPERATION_NAME}` stacked input {} must have rank at least 1",
+                    carry_count + index,
+                )));
+            }
+            let (body_input_type, leading_dimension) = if is_reference {
+                (r#type.clone(), stacked_type.dimension(0))
+            } else {
+                let (slice_type, leading_dimension) = scan_slice_type(stacked_type, 0)?;
+                (Self::from(slice_type), leading_dimension)
+            };
+            if !length.is_refined_by(&leading_dimension) {
+                return Err(TypeError::invalid(format!(
+                    "`{SCAN_OPERATION_NAME}` stacked input {} must have leading dimension `{length}` but has \
+                     type `{type}`",
+                    carry_count + index,
+                    r#type = r#type,
+                )));
+            }
+            body_input_types.push(body_input_type);
+        }
+        validate_scan_runtime_length(length, input_types, carry_count)?;
+        Ok(body_input_types)
+    }
+
+    /// Validates a scan body signature and this scan's operation input types against it, and returns the operation
+    /// output types, `[carry..., stacked_y...]`.
+    ///
+    /// The expected operation input types are derived from the body signature. Carries and reference stacks are
+    /// validated against their body-declared types, and stacked arrays through their slices, which are what the body
+    /// receives on each iteration (refer to [`ScanOperation`] for how a slice drops the placement of the scan axis).
+    /// Actual `input_types` may carry more precise metadata, such as the normalized
+    /// [`Sharding`](crate::arrays::Sharding)s that concrete backend array types carry. Validation therefore uses the
+    /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. Reference
+    /// inputs refine their declared referents, and an aliased carry output retains its input allocation's own type. The
+    /// output types are the carry output types of the body followed by its stacked output types, each stacked along a
+    /// new leading scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the
+    /// body to sharded inputs) and leave unspecified the ones that it does not. They are further refined by the static
+    /// extents that the inputs establish for dynamic dimensions (e.g., an `f32[3]` carry input for a carry that the
+    /// body declares as `f32[rows]`), except where a carry defines the dimension's identity and may therefore change it
+    /// across iterations.
+    ///
+    /// # Parameters
+    ///
+    ///   - `body_input_types`: Body input types, `[index, carry..., x_slice_or_reference...]`.
+    ///   - `body_output_types`: Body output types, `[carry..., y_slice...]`.
+    ///   - `carry_count`: Number of loop-carried state leaves.
+    ///   - `length`: Declared scan length.
+    ///   - `stacked_axis_shardings`: Placements of the leading scan axes of the stacked outputs (refer to
+    ///     [`ScanOperation::with_stacked_axis_shardings`]).
+    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the runtime length input when
+    ///     `length` is dynamic.
+    fn infer_scan_output_types(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: &Dimension,
+        stacked_axis_shardings: &[ShardingDimension],
+        input_types: &[Self],
+    ) -> Result<Vec<Self>, TypeError> {
+        Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, length)?;
+        Self::validate_scan_input_type_signature(body_input_types, carry_count, length, input_types)?;
+        let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, length)?;
+        // A runtime length input that only refines the declared bounds fixes the trip count to one exact extent, so the
+        // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
+        // them symbolic would type a concretely sized result as an independent runtime extent.
+        let effective_length = effective_scan_length(length, input_types, carry_count)?;
+        let output_types = scan_boundary_types(
+            ScanBoundarySide::Output,
+            body_output_types,
+            carry_count,
+            &effective_length,
+            stacked_axis_shardings,
+        )?;
+        // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
+        // separate step from the trip-count refinement above: the stacked outputs' leading axis describes the trip
+        // count that is fixed before the first iteration, so it stays refined even when a first-class dimension carry
+        // shares the length's identity and keeps every carry that refers to it symbolic. A runtime length of another
+        // type (e.g., the exact type of an eager dimension value) is a member of the facts like every other input, so
+        // that no carry declared with the length's identity establishes an extent that disagrees with the trip count,
+        // while one that carries the length's own identity establishes nothing beyond the declared bounds. Only the
+        // carries preserve the identities of reference inputs.
+        let nominal_runtime_length = length.variable().is_some_and(|variable| {
+            matches!(input_types.last().map(Self::scan_member), Some(ScanMember::Dimension(r#type))
+                if r#type.variable() == Some(variable))
+        });
+        let fact_count = expected_input_types.len() - usize::from(nominal_runtime_length);
+        refine_output_types(
+            &expected_input_types[..fact_count],
+            &input_types[..fact_count],
+            output_types.as_slice(),
+            |index| (index < carry_count).then_some(index),
+        )
+    }
+}
+
+impl ScanType for ArrayType {
+    #[inline]
+    fn scan_member(&self) -> ScanMember<'_> {
+        ScanMember::Array(self)
+    }
+
+    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
+        Err(TypeError::invalid(format!(
+            "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use a composite \
+             `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
+        )))
+    }
+
+    fn validate_scan_body_members(body_input_types: &[Self], body_output_types: &[Self]) -> Result<(), TypeError> {
+        // Homogeneous bodies cannot carry dynamic array shapes. Report body positions, including the index input.
+        for (role, index, r#type) in body_input_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| ("input", index + 1, r#type))
+            .chain(body_output_types.iter().enumerate().map(|(index, r#type)| ("output", index, r#type)))
+        {
+            for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
+                if dimension.value().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` body {role} {index} must have a fully static type but axis {axis} of \
+                         `{type}` has size `{dimension}`",
+                        r#type = r#type,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ScanType for ArrayIrType {
+    #[inline]
+    fn scan_member(&self) -> ScanMember<'_> {
+        match self {
+            Self::Array(r#type) => ScanMember::Array(r#type),
+            Self::Reference(r#type) => ScanMember::Reference(r#type.referent()),
+            Self::Dimension(r#type) => ScanMember::Dimension(r#type),
+        }
+    }
+
+    #[inline]
+    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
+        Ok(Self::Dimension(DimensionType::from(length.clone())))
+    }
+
+    #[inline]
+    fn validate_scan_body_members(_body_input_types: &[Self], _body_output_types: &[Self]) -> Result<(), TypeError> {
+        Ok(())
+    }
+}
+
+/// Runtime iteration of a [`ScanOperation`] in a domain. [`ScanType`] describes the type-family contract independently
+/// of execution; this interface supplies the index, slices, and accumulators in the domain's own value representation.
+/// The same type family can use different representations, such as eager composite values and per-device bundles in
+/// the lockstep `shard_map` emulator, without changing its inference or transform rules.
+pub(crate) trait ScanInterpretationDomain: Domain<Type: ScanType> {
+    /// Returns the trip count that the trailing runtime length input of a dynamic-length scan, `runtime_length`,
+    /// supplies.
+    fn runtime_length(runtime_length: &Self::Value) -> Result<usize, ProgramError>;
+
+    /// Returns the value of the intrinsic index input of iteration `iteration`.
+    fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError>;
+
+    /// Returns the body input of iteration `iteration` for the stacked input `stack`.
+    fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError>;
+
+    /// Writes the body output `value` of iteration `iteration` as that slice of the stacked output `accumulator` (i.e.,
+    /// output `output` of the scan), which is allocated with `length` slices of the type of `value`, with its leading
+    /// axis placed as `placement` declares (refer to [`ScanOperation::with_stacked_axis_shardings`]), when it is
+    /// [`None`]. A body may declare its stacked outputs without manual variation, so that only their values reveal it,
+    /// and the variation of a slice can then differ from that of the earlier slices (e.g., when the body stacks a carry
+    /// whose variation an earlier iteration changed). A domain whose values can relabel their manual variation widens
+    /// the stack and the slice to the join of their variation, as `parallel_vary` does, while a domain that cannot
+    /// rejects the slice. Only stacks are widened: a carry keeps the type that the last iteration returns for it (or
+    /// its entry type when the scan runs no iteration), which can vary over fewer manual axes than the join of its
+    /// entry and body types.
+    fn write_iteration(
+        &self,
+        output: usize,
+        accumulator: Option<Self::Value>,
+        length: usize,
+        placement: &ShardingDimension,
+        iteration: usize,
+        value: Self::Value,
+    ) -> Result<Self::Value, ProgramError>;
+
+    /// Returns the empty stacked output of type `output_type` of a scan that runs no iteration, whose body declares
+    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs).
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        body_input_types: &[Self::Type],
+        inputs: &[Self::Value],
+    ) -> Result<Self::Value, ProgramError>;
+}
+
+impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C::Value> + Fill<i64, C::Value>>
+    ScanInterpretationDomain for C
+{
+    fn runtime_length(_runtime_length: &Self::Value) -> Result<usize, ProgramError> {
+        // Validation rejects a homogeneous scan with a dynamic length before any runtime length is read.
+        Err(ProgramError::MalformedProgram(format!("homogeneous `{SCAN_OPERATION_NAME}` has no runtime length input")))
+    }
+
+    fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError> {
+        self.fill(&ArrayType::scalar(DataType::I64), iteration as i64)
+    }
+
+    fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError> {
+        read_scan_iteration(stack, iteration)
+    }
+
+    fn write_iteration(
+        &self,
+        output: usize,
+        accumulator: Option<Self::Value>,
+        length: usize,
+        placement: &ShardingDimension,
+        iteration: usize,
+        value: Self::Value,
+    ) -> Result<Self::Value, ProgramError> {
+        // The values of this domain are generic and have no capability that only relabels their manual variation (the
+        // `ParallelVary` capability of an eager array requires an active manual mesh), so a slice whose manual
+        // variation differs from that of the stack is rejected. The variation that the placement of the stacked axis
+        // introduces is left out of the comparison: the stack always varies over those axes, and a slice may or may
+        // not.
+        let accumulator = match accumulator {
+            Some(accumulator) => {
+                let variation = |value: &Self::Value| {
+                    value
+                        .r#type()
+                        .sharding()
+                        .map(|sharding| {
+                            let placed = placement.manual_axes(sharding.mesh());
+                            sharding
+                                .varying_manual_axes()
+                                .iter()
+                                .filter(|axis| !placed.contains(axis))
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                let (stacked, returned) = (variation(&accumulator), variation(&value));
+                if stacked != returned {
+                    let render = |axes: &BTreeSet<String>| {
+                        if axes.is_empty() {
+                            "no manual axes".to_owned()
+                        } else {
+                            format!("`{}`", axes.iter().cloned().collect::<Vec<_>>().join("`, `"))
+                        }
+                    };
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` body returns a slice of output {output} that varies over {} after \
+                         earlier slices that vary over {}; every slice of a stacked output must have the same manual \
+                         variation",
+                        render(&returned),
+                        render(&stacked),
+                    ))
+                    .into());
+                }
+                accumulator
+            }
+            None => self.zero(&placed_scan_stack_type(&value.r#type(), length, placement)?)?,
+        };
+        // A placement over manual mesh axes makes the stack vary over them, and so must every written slice, which
+        // this domain cannot relabel: a slice that does not vary over them is rejected before the in-place update
+        // would reject it with a less specific message.
+        if let Some(sharding) = value.r#type().sharding() {
+            let missing = placement
+                .manual_axes(sharding.mesh())
+                .into_iter()
+                .filter(|axis| !sharding.varying_manual_axes().contains(axis))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output {output} over the manual mesh \
+                     axes `{}` for slices that do not vary over them",
+                    missing.join("`, `"),
+                ))
+                .into());
+            }
+        }
+        write_scan_iteration(accumulator, iteration, value, placement)
+    }
+
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        _body_input_types: &[Self::Type],
+        _inputs: &[Self::Value],
+    ) -> Result<Self::Value, ProgramError> {
+        self.zero(output_type)
+    }
+}
+
+// Composite scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
+// count from the trailing first-class dimension input. A concrete [`Array`] relabels its type without changing its
+// elements, so a slice whose manual variation differs from that of its stack widens both to the join of their
+// variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its stacks the
+// same way whether or not its body uses collectives over the emulated manual axes.
+impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext<ArrayIrValue<Array>, O> {
+    fn runtime_length(runtime_length: &ArrayIrValue<Array>) -> Result<usize, ProgramError> {
+        Ok(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(runtime_length)?.extent())
+    }
+
+    fn iteration_index(&self, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        Ok(ArrayIrValue::Array(context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)?))
+    }
+
+    fn read_iteration(stack: &ArrayIrValue<Array>, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
+        Ok(match stack {
+            ArrayIrValue::Reference(_) => stack.clone(),
+            _ => ArrayIrValue::Array(read_scan_iteration(
+                <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(stack)?,
+                iteration,
+            )?),
+        })
+    }
+
+    fn write_iteration(
+        &self,
+        _output: usize,
+        accumulator: Option<ArrayIrValue<Array>>,
+        length: usize,
+        placement: &ShardingDimension,
+        iteration: usize,
+        value: ArrayIrValue<Array>,
+    ) -> Result<ArrayIrValue<Array>, ProgramError> {
+        let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
+        let accumulator = match accumulator {
+            Some(accumulator) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(accumulator)?,
+            None => {
+                let stack_type = placed_scan_stack_type(&value.r#type(), length, placement)?;
+                EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
+            }
+        };
+        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives the
+        // stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
+        // replicated placement on the missing axis's mesh; its elements stay unchanged.
+        let types = [accumulator.r#type().into_owned(), value.r#type().into_owned()];
+        let axes = manual_variation_axes(&types);
+        let mut joined =
+            vary_over_missing_manual_axes(vec![accumulator, value], &types, &axes, |value, axis, mesh| {
+                let mut input_type = value.r#type().into_owned();
+                if input_type.sharding().is_none() {
+                    let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
+                    input_type =
+                        input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+                }
+                let output_type =
+                    ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
+                Array::from_logical_bytes(output_type, &value.logical_bytes())
+            })?;
+        let value = joined.pop().unwrap();
+        let accumulator = joined.pop().unwrap();
+        Ok(ArrayIrValue::Array(write_scan_iteration(accumulator, iteration, value, placement)?))
+    }
+
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        body_input_types: &[Self::Type],
+        inputs: &[ArrayIrValue<Array>],
+    ) -> Result<ArrayIrValue<Array>, ProgramError> {
+        // The leading axis of an empty stack has extent zero. An identity that an output defines (e.g., a dimension
+        // carry) stays symbolic after refinement, so it is resolved through the input that the body declares with that
+        // identity, which may be a constant or renamed dimension that validation accepted as refining it.
+        let output_type = <&ArrayType>::try_from(output_type)?;
+        let dimensions = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                _ if axis == 0 => Ok(Dimension::Static(0)),
+                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                Dimension::Dynamic(variable) => body_input_types[1..]
+                    .iter()
+                    .zip(inputs)
+                    .find_map(|(declared_type, input)| match (declared_type, input) {
+                        (ArrayIrType::Dimension(declared_type), ArrayIrValue::Dimension(value))
+                            if declared_type.variable() == Some(variable) =>
+                        {
+                            Some(Dimension::Static(value.extent()))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        TypeError::invalid(format!(
+                            "cannot eagerly allocate `{}` output `{}` because its dynamic dimension `{}` is not \
+                             supplied as a first-class `{}` input",
+                            SCAN_OPERATION_NAME, output_type, variable, SCAN_OPERATION_NAME,
+                        ))
+                    }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_type = output_type.clone().with_shape(Shape::new(dimensions));
+        Ok(ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type)?))
+    }
+}
+
 /// Canonical operation name for [`ScanOperation`].
 pub const SCAN_OPERATION_NAME: &str = "scan";
 
@@ -973,7 +1604,7 @@ impl<
     }
 }
 
-impl<C: Domain<Type: ScanIterationType<C>>> InterpretableOperation<C> for ScanOperation<C::Type> {
+impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -985,7 +1616,7 @@ impl<C: Domain<Type: ScanIterationType<C>>> InterpretableOperation<C> for ScanOp
         // pairing. Reference stacks enter as whole roots so aliased views keep sharing storage. Validation precedes
         // every iteration, including a zero-trip scan. Stacks are allocated from their first actual slice, placed as
         // the declared stacked-axis placement requires, to retain placement metadata, and later writes reconcile manual
-        // variation through `ScanIterationType::write_iteration`. Empty stacks use inferred output types. The
+        // variation through `ScanInterpretationDomain::write_iteration`. Empty stacks use inferred output types. The
         // `shard_map` emulator runs this same rule over its per-device values.
 
         let body = driver.region(0)?;
@@ -995,7 +1626,7 @@ impl<C: Domain<Type: ScanIterationType<C>>> InterpretableOperation<C> for ScanOp
             Some(length) => (inputs, length),
             None => {
                 let (runtime_length, inputs) = inputs.split_last().unwrap();
-                (inputs, C::Type::runtime_length(runtime_length)?)
+                (inputs, C::runtime_length(runtime_length)?)
             }
         };
         let (carries, stacks) = inputs.split_at(self.carry_count);
@@ -1003,10 +1634,10 @@ impl<C: Domain<Type: ScanIterationType<C>>> InterpretableOperation<C> for ScanOp
         let mut accumulators = vec![None; output_types.len() - self.carry_count];
         for visit in 0..length {
             let iteration = if self.reverse { length - 1 - visit } else { visit };
-            let mut iteration_inputs = vec![C::Type::iteration_index(context, iteration)?];
+            let mut iteration_inputs = vec![context.iteration_index(iteration)?];
             iteration_inputs.extend(carries.iter().cloned());
             for stack in stacks {
-                iteration_inputs.push(C::Type::read_iteration(stack, iteration)?);
+                iteration_inputs.push(C::read_iteration(stack, iteration)?);
             }
             let mut iteration_outputs = driver.interpret_region(context, 0, iteration_inputs)?;
             check_count!("output", iteration_outputs, self.carry_count + accumulators.len(), ProgramError);
@@ -1014,8 +1645,7 @@ impl<C: Domain<Type: ScanIterationType<C>>> InterpretableOperation<C> for ScanOp
             carries = iteration_outputs;
             for (index, (accumulator, output)) in accumulators.iter_mut().zip(stacked_outputs).enumerate() {
                 let output_index = self.carry_count + index;
-                *accumulator = Some(C::Type::write_iteration(
-                    context,
+                *accumulator = Some(context.write_iteration(
                     output_index,
                     accumulator.take(),
                     length,
@@ -1028,263 +1658,10 @@ impl<C: Domain<Type: ScanIterationType<C>>> InterpretableOperation<C> for ScanOp
         for (accumulator, output_type) in accumulators.into_iter().zip(&output_types[self.carry_count..]) {
             carries.push(match accumulator {
                 Some(stack) => stack,
-                None => C::Type::empty_stack(context, output_type, &body.input_types(), inputs)?,
+                None => context.empty_stack(output_type, &body.input_types(), inputs)?,
             });
         }
         Ok(carries)
-    }
-}
-
-/// Type family whose [`ScanOperation`]s the [`Domain`] `C` interprets iteration by iteration (refer to its
-/// [`InterpretableOperation`] implementation).
-pub(crate) trait ScanIterationType<C: Domain<Type = Self>>: ScanType {
-    /// Returns the trip count that the trailing runtime length input of a dynamic-length scan, `runtime_length`,
-    /// supplies.
-    fn runtime_length(runtime_length: &C::Value) -> Result<usize, ProgramError>;
-
-    /// Returns the value of the intrinsic index input of iteration `iteration`.
-    fn iteration_index(context: &C, iteration: usize) -> Result<C::Value, ProgramError>;
-
-    /// Returns the body input of iteration `iteration` for the stacked input `stack`.
-    fn read_iteration(stack: &C::Value, iteration: usize) -> Result<C::Value, ProgramError>;
-
-    /// Writes the body output `value` of iteration `iteration` as that slice of the stacked output `accumulator` (i.e.,
-    /// output `output` of the scan), which is allocated with `length` slices of the type of `value`, with its leading
-    /// axis placed as `placement` declares (refer to [`ScanOperation::with_stacked_axis_shardings`]), when it is
-    /// [`None`]. A body may declare its stacked outputs without manual variation, so that only their values reveal it,
-    /// and the variation of a slice can then differ from that of the earlier slices (e.g., when the body stacks a carry
-    /// whose variation an earlier iteration changed). A family whose values can relabel their manual variation widens
-    /// the stack and the slice to the join of their variation, as `parallel_vary` does, while a family that cannot
-    /// rejects the slice. Only stacks are widened: a carry keeps the type that the last iteration returns for it (or
-    /// its entry type when the scan runs no iteration), which can vary over fewer manual axes than the join of its
-    /// entry and body types.
-    fn write_iteration(
-        context: &C,
-        output: usize,
-        accumulator: Option<C::Value>,
-        length: usize,
-        placement: &ShardingDimension,
-        iteration: usize,
-        value: C::Value,
-    ) -> Result<C::Value, ProgramError>;
-
-    /// Returns the empty stacked output of type `output_type` of a scan that runs no iteration, whose body declares
-    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs).
-    fn empty_stack(
-        context: &C,
-        output_type: &Self,
-        body_input_types: &[Self],
-        inputs: &[C::Value],
-    ) -> Result<C::Value, ProgramError>;
-}
-
-impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C::Value> + Fill<i64, C::Value>>
-    ScanIterationType<C> for ArrayType
-{
-    fn runtime_length(_runtime_length: &C::Value) -> Result<usize, ProgramError> {
-        // Validation rejects a homogeneous scan with a dynamic length before any runtime length is read.
-        Err(ProgramError::MalformedProgram(format!("homogeneous `{SCAN_OPERATION_NAME}` has no runtime length input")))
-    }
-
-    fn iteration_index(context: &C, iteration: usize) -> Result<C::Value, ProgramError> {
-        context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)
-    }
-
-    fn read_iteration(stack: &C::Value, iteration: usize) -> Result<C::Value, ProgramError> {
-        read_scan_iteration(stack, iteration)
-    }
-
-    fn write_iteration(
-        context: &C,
-        output: usize,
-        accumulator: Option<C::Value>,
-        length: usize,
-        placement: &ShardingDimension,
-        iteration: usize,
-        value: C::Value,
-    ) -> Result<C::Value, ProgramError> {
-        // The values of this family are generic and have no capability that only relabels their manual variation (the
-        // `ParallelVary` capability of an eager array requires an active manual mesh), so a slice whose manual
-        // variation differs from that of the stack is rejected. The variation that the placement of the stacked axis
-        // introduces is left out of the comparison: the stack always varies over those axes, and a slice may or may
-        // not.
-        let accumulator = match accumulator {
-            Some(accumulator) => {
-                let variation = |value: &C::Value| {
-                    value
-                        .r#type()
-                        .sharding()
-                        .map(|sharding| {
-                            let placed = placement.manual_axes(sharding.mesh());
-                            sharding
-                                .varying_manual_axes()
-                                .iter()
-                                .filter(|axis| !placed.contains(axis))
-                                .cloned()
-                                .collect::<BTreeSet<_>>()
-                        })
-                        .unwrap_or_default()
-                };
-                let (stacked, returned) = (variation(&accumulator), variation(&value));
-                if stacked != returned {
-                    let render = |axes: &BTreeSet<String>| {
-                        if axes.is_empty() {
-                            "no manual axes".to_owned()
-                        } else {
-                            format!("`{}`", axes.iter().cloned().collect::<Vec<_>>().join("`, `"))
-                        }
-                    };
-                    return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` body returns a slice of output {output} that varies over {} after \
-                         earlier slices that vary over {}; every slice of a stacked output must have the same manual \
-                         variation",
-                        render(&returned),
-                        render(&stacked),
-                    ))
-                    .into());
-                }
-                accumulator
-            }
-            None => context.zero(&placed_scan_stack_type(&value.r#type(), length, placement)?)?,
-        };
-        // A placement over manual mesh axes makes the stack vary over them, and so must every written slice, which
-        // this family cannot relabel: a slice that does not vary over them is rejected before the in-place update
-        // would reject it with a less specific message.
-        if let Some(sharding) = value.r#type().sharding() {
-            let missing = placement
-                .manual_axes(sharding.mesh())
-                .into_iter()
-                .filter(|axis| !sharding.varying_manual_axes().contains(axis))
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of output {output} over the manual mesh \
-                     axes `{}` for slices that do not vary over them",
-                    missing.join("`, `"),
-                ))
-                .into());
-            }
-        }
-        write_scan_iteration(accumulator, iteration, value, placement)
-    }
-
-    fn empty_stack(
-        context: &C,
-        output_type: &Self,
-        _body_input_types: &[Self],
-        _inputs: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        context.zero(output_type)
-    }
-}
-
-// Composite scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
-// count from the trailing first-class dimension input. A concrete [`Array`] relabels its type without changing its
-// elements, so a slice whose manual variation differs from that of its stack widens both to the join of their
-// variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its stacks the
-// same way whether or not its body uses collectives over the emulated manual axes.
-impl<O: Operation<Type = ArrayIrType>> ScanIterationType<EagerContext<ArrayIrValue<Array>, O>> for ArrayIrType {
-    fn runtime_length(runtime_length: &ArrayIrValue<Array>) -> Result<usize, ProgramError> {
-        Ok(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(runtime_length)?.extent())
-    }
-
-    fn iteration_index(
-        _context: &EagerContext<ArrayIrValue<Array>, O>,
-        iteration: usize,
-    ) -> Result<ArrayIrValue<Array>, ProgramError> {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        Ok(ArrayIrValue::Array(context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)?))
-    }
-
-    fn read_iteration(stack: &ArrayIrValue<Array>, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
-        Ok(match stack {
-            ArrayIrValue::Reference(_) => stack.clone(),
-            _ => ArrayIrValue::Array(read_scan_iteration(
-                <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(stack)?,
-                iteration,
-            )?),
-        })
-    }
-
-    fn write_iteration(
-        _context: &EagerContext<ArrayIrValue<Array>, O>,
-        _output: usize,
-        accumulator: Option<ArrayIrValue<Array>>,
-        length: usize,
-        placement: &ShardingDimension,
-        iteration: usize,
-        value: ArrayIrValue<Array>,
-    ) -> Result<ArrayIrValue<Array>, ProgramError> {
-        let value = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value)?;
-        let accumulator = match accumulator {
-            Some(accumulator) => <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(accumulator)?,
-            None => {
-                let stack_type = placed_scan_stack_type(&value.r#type(), length, placement)?;
-                EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
-            }
-        };
-        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives the
-        // stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
-        // replicated placement on the missing axis's mesh; its elements stay unchanged.
-        let types = [accumulator.r#type().into_owned(), value.r#type().into_owned()];
-        let axes = manual_variation_axes(&types);
-        let mut joined =
-            vary_over_missing_manual_axes(vec![accumulator, value], &types, &axes, |value, axis, mesh| {
-                let mut input_type = value.r#type().into_owned();
-                if input_type.sharding().is_none() {
-                    let sharding = Sharding::replicated(mesh.clone(), input_type.rank());
-                    input_type =
-                        input_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
-                }
-                let output_type =
-                    ParallelVaryOperation::new(axis.to_string()).infer_output_types(&[input_type], &[])?.remove(0);
-                Array::from_logical_bytes(output_type, &value.logical_bytes())
-            })?;
-        let value = joined.pop().unwrap();
-        let accumulator = joined.pop().unwrap();
-        Ok(ArrayIrValue::Array(write_scan_iteration(accumulator, iteration, value, placement)?))
-    }
-
-    fn empty_stack(
-        _context: &EagerContext<ArrayIrValue<Array>, O>,
-        output_type: &Self,
-        body_input_types: &[Self],
-        inputs: &[ArrayIrValue<Array>],
-    ) -> Result<ArrayIrValue<Array>, ProgramError> {
-        // The leading axis of an empty stack has extent zero. An identity that an output defines (e.g., a dimension
-        // carry) stays symbolic after refinement, so it is resolved through the input that the body declares with that
-        // identity, which may be a constant or renamed dimension that validation accepted as refining it.
-        let output_type = <&ArrayType>::try_from(output_type)?;
-        let dimensions = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .enumerate()
-            .map(|(axis, dimension)| match dimension {
-                _ if axis == 0 => Ok(Dimension::Static(0)),
-                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-                Dimension::Dynamic(variable) => body_input_types[1..]
-                    .iter()
-                    .zip(inputs)
-                    .find_map(|(declared_type, input)| match (declared_type, input) {
-                        (Self::Dimension(declared_type), ArrayIrValue::Dimension(value))
-                            if declared_type.variable() == Some(variable) =>
-                        {
-                            Some(Dimension::Static(value.extent()))
-                        }
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        TypeError::invalid(format!(
-                            "cannot eagerly allocate `{}` output `{}` because its dynamic dimension `{}` is not \
-                             supplied as a first-class `{}` input",
-                            SCAN_OPERATION_NAME, output_type, variable, SCAN_OPERATION_NAME,
-                        ))
-                    }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_type = output_type.clone().with_shape(Shape::new(dimensions));
-        Ok(ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type)?))
     }
 }
 
@@ -1889,382 +2266,6 @@ where
         for (accumulator, contribution) in accumulators.iter().zip(contributions) {
             accumulator.accumulate(context, contribution)?;
         }
-        Ok(())
-    }
-}
-
-/// Type-family semantics for [`ScanOperation`].
-///
-/// A family describes each of its types as a [`ScanMember`]: an array, a reference to an array, or a first-class
-/// dimension. The scan contract is stated once over those members, and each family only restricts it: [`ArrayType`]
-/// stacks per-iteration arrays along a static leading axis and requires a static length and fully static bodies, while
-/// [`ArrayIrType`] additionally permits references and first-class dimensions in carry positions and a dynamic length
-/// supplied by a trailing dimension input. Every family requires the body's first input to be a scalar
-/// [`I64`](DataType::I64) slice index.
-///
-/// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the body
-/// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
-/// dimensions have a stacked value representation. Scan lengths are [`Dimension`]s, so every implementing family uses
-/// [`DimensionVariable`]s as its type identities. A dynamic length and every stacked leading axis must have equal
-/// extents: static extents must agree, and the scan boundary checks at runtime the relationships that the input types
-/// leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type that carries
-/// no identity that such a check could relate to the runtime length, so its leading extent must be provably equal to
-/// the trip count.
-pub trait ScanType: Type<Identity = DimensionVariable> + From<ArrayType> {
-    /// Returns the [`ScanMember`] that this type describes.
-    fn scan_member(&self) -> ScanMember<'_>;
-
-    /// Returns the type of the trailing runtime length input of a scan whose trip count is the dynamic `length` (i.e.,
-    /// the first-class `dimension<length>`).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this family admits no dynamic scan length.
-    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError>;
-
-    /// Validates the restrictions that this family places on the members of a declared iteration body beyond the shared
-    /// index and carry contract (e.g., homogeneous array bodies must be fully static).
-    ///
-    /// # Parameters
-    ///
-    ///   - `body_input_types`: Declared body inputs after the intrinsic index.
-    ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
-    fn validate_scan_body_members(body_input_types: &[Self], body_output_types: &[Self]) -> Result<(), TypeError>;
-
-    /// Validates the intrinsic index and carry contracts of a declared iteration body independently of the values
-    /// that bind it. Transform rules use this before rewriting or eliminating a scan so specialization cannot erase
-    /// an invalid source signature. Every reference stack must have a static referent whose leading axis is the scan
-    /// length, and every stacked output must be an array.
-    ///
-    /// # Parameters
-    ///
-    ///   - `body_input_types`: Declared body inputs, including the intrinsic scalar `i64` index.
-    ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
-    ///   - `carry_count`: Number of matching carry positions on both boundaries.
-    ///   - `length`: Declared trip count, validated independently of a runtime value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the index, carry counts or types, length, or family-specific boundary roles are invalid.
-    fn validate_scan_body_type_signature(
-        body_input_types: &[Self],
-        body_output_types: &[Self],
-        carry_count: usize,
-        length: &Dimension,
-    ) -> Result<(), TypeError> {
-        // Validate the declared trip count before inspecting or specializing the body signature.
-        if let Some(length) = length.value()
-            && length > MAX_DIMENSION_EXTENT
-        {
-            return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` length {length} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
-            )));
-        }
-        if length.variable().is_some() {
-            Self::runtime_length_type(length)?;
-        }
-        if body_input_types.first() != Some(&Self::from(ArrayType::scalar(DataType::I64))) {
-            return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` body input 0 must be a scalar `i64` slice index",
-            )));
-        }
-        let body_input_types = &body_input_types[1..];
-        // The signature is validated independently of the stacked-axis placements, which output inference applies.
-        scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length, &[])?;
-        scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, length, &[])?;
-        check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
-            &body_input_types[..carry_count],
-            &body_output_types[..carry_count],
-        ]);
-        Self::validate_scan_body_members(body_input_types, body_output_types)
-    }
-
-    /// Validates the operation inputs against the declared iteration inputs, including the type and identity of a
-    /// trailing runtime length. This checks ordinary type refinement independently of how the runtime length relates
-    /// to the stacked axes, which [`Self::infer_scan_output_types`] additionally validates. Callers must first validate
-    /// the body signature. Reference inputs refine their declared referents; their allocation identity is validated
-    /// separately from these type relationships.
-    ///
-    /// # Parameters
-    ///
-    ///   - `body_input_types`: Validated body inputs, including the intrinsic index.
-    ///   - `carry_count`: Number of leading carried inputs.
-    ///   - `length`: Declared trip count.
-    ///   - `input_types`: Actual operation input types, including a trailing runtime length for dynamic scans.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for mismatched input counts, ordinary types, or runtime length types.
-    fn validate_scan_input_type_signature(
-        body_input_types: &[Self],
-        carry_count: usize,
-        length: &Dimension,
-        input_types: &[Self],
-    ) -> Result<(), TypeError> {
-        let body_input_types = &body_input_types[1..];
-        let expected_input_types =
-            scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length, &[])?;
-        check_count!(
-            "input",
-            input_types,
-            expected_input_types.len() + usize::from(length.variable().is_some()),
-            TypeError
-        );
-        for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
-            match (body_input_types[index].scan_member(), actual.scan_member()) {
-                (ScanMember::Array(declared), ScanMember::Array(actual)) if index >= carry_count => {
-                    // Validate the slice the body receives, including its placement and manual variation, rather than
-                    // comparing whole-stack metadata with the declared boundary type.
-                    if actual.rank() == 0 {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have rank at least 1 but has type \
-                             `{actual}`",
-                        )));
-                    }
-                    let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
-                    if !length.is_refined_by(&leading_dimension) {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` \
-                             but has type `{actual}`",
-                        )));
-                    }
-                    if !declared.is_refined_by(&slice_type) {
-                        return Err(TypeError::invalid(format!(
-                            "`{SCAN_OPERATION_NAME}` stacked input {index} has type `{actual}`, whose slice type \
-                             `{slice_type}` does not refine its body input type `{declared}`",
-                        )));
-                    }
-                }
-                _ => validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?,
-            }
-        }
-        validate_scan_runtime_length_type(length, input_types)?;
-        Ok(())
-    }
-
-    /// Derives the instantiated body input types, `[index, carry..., x_slice_or_reference...]`, from this scan's
-    /// operation input types.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the runtime length input when
-    ///     `length` is dynamic.
-    ///   - `body_input_count`: Number of inputs of the attached body, including its intrinsic index input.
-    ///   - `carry_count`: Number of loop-carried state leaves.
-    ///   - `length`: Declared scan length.
-    fn infer_scan_body_input_types(
-        input_types: &[Self],
-        body_input_count: usize,
-        carry_count: usize,
-        length: &Dimension,
-    ) -> Result<Vec<Self>, TypeError> {
-        let stacked_input_end = body_input_count
-            .checked_sub(1)
-            .ok_or_else(|| TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body must have a slice index input")))?;
-        check_count!("input", input_types, stacked_input_end + usize::from(length.variable().is_some()), TypeError);
-        if carry_count > stacked_input_end {
-            return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body input count {stacked_input_end}",
-            )));
-        }
-        let mut body_input_types = vec![Self::from(ArrayType::scalar(DataType::I64))];
-        body_input_types.extend_from_slice(&input_types[..carry_count]);
-        for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
-            // Arrays enter as slices. References enter as whole roots, so the body can form its own indexed view: only
-            // their leading extent must be the scan length, whatever the placement of that axis (as
-            // `scan_boundary_types` and `validate_scan_input_type_signature` admit it), so a referent is not sliced.
-            let (stacked_type, is_reference) = match r#type.scan_member() {
-                ScanMember::Array(stacked_type) => (stacked_type, false),
-                ScanMember::Reference(stacked_type) => (stacked_type, true),
-                ScanMember::Dimension(_) => {
-                    return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` stacked input {} must be an array or a reference but got `{type}`",
-                        carry_count + index,
-                        r#type = r#type,
-                    )));
-                }
-            };
-            if stacked_type.rank() == 0 {
-                return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` stacked input {} must have rank at least 1",
-                    carry_count + index,
-                )));
-            }
-            let (body_input_type, leading_dimension) = if is_reference {
-                (r#type.clone(), stacked_type.dimension(0))
-            } else {
-                let (slice_type, leading_dimension) = scan_slice_type(stacked_type, 0)?;
-                (Self::from(slice_type), leading_dimension)
-            };
-            if !length.is_refined_by(&leading_dimension) {
-                return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` stacked input {} must have leading dimension `{length}` but has \
-                     type `{type}`",
-                    carry_count + index,
-                    r#type = r#type,
-                )));
-            }
-            body_input_types.push(body_input_type);
-        }
-        validate_scan_runtime_length(length, input_types, carry_count)?;
-        Ok(body_input_types)
-    }
-
-    /// Validates a scan body signature and this scan's operation input types against it, and returns the operation
-    /// output types, `[carry..., stacked_y...]`.
-    ///
-    /// The expected operation input types are derived from the body signature. Carries and reference stacks are
-    /// validated against their body-declared types, and stacked arrays through their slices, which are what the body
-    /// receives on each iteration (refer to [`ScanOperation`] for how a slice drops the placement of the scan axis).
-    /// Actual `input_types` may carry more precise metadata, such as the normalized
-    /// [`Sharding`](crate::arrays::Sharding)s that concrete backend array types carry. Validation therefore uses the
-    /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. Reference
-    /// inputs refine their declared referents, and an aliased carry output retains its input allocation's own type. The
-    /// output types are the carry output types of the body followed by its stacked output types, each stacked along a
-    /// new leading scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the
-    /// body to sharded inputs) and leave unspecified the ones that it does not. They are further refined by the static
-    /// extents that the inputs establish for dynamic dimensions (e.g., an `f32[3]` carry input for a carry that the
-    /// body declares as `f32[rows]`), except where a carry defines the dimension's identity and may therefore change it
-    /// across iterations.
-    ///
-    /// # Parameters
-    ///
-    ///   - `body_input_types`: Body input types, `[index, carry..., x_slice_or_reference...]`.
-    ///   - `body_output_types`: Body output types, `[carry..., y_slice...]`.
-    ///   - `carry_count`: Number of loop-carried state leaves.
-    ///   - `length`: Declared scan length.
-    ///   - `stacked_axis_shardings`: Placements of the leading scan axes of the stacked outputs (refer to
-    ///     [`ScanOperation::with_stacked_axis_shardings`]).
-    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the runtime length input when
-    ///     `length` is dynamic.
-    fn infer_scan_output_types(
-        body_input_types: &[Self],
-        body_output_types: &[Self],
-        carry_count: usize,
-        length: &Dimension,
-        stacked_axis_shardings: &[ShardingDimension],
-        input_types: &[Self],
-    ) -> Result<Vec<Self>, TypeError> {
-        Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, length)?;
-        Self::validate_scan_input_type_signature(body_input_types, carry_count, length, input_types)?;
-        let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, length)?;
-        // A runtime length input that only refines the declared bounds fixes the trip count to one exact extent, so the
-        // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
-        // them symbolic would type a concretely sized result as an independent runtime extent.
-        let effective_length = effective_scan_length(length, input_types, carry_count)?;
-        let output_types = scan_boundary_types(
-            ScanBoundarySide::Output,
-            body_output_types,
-            carry_count,
-            &effective_length,
-            stacked_axis_shardings,
-        )?;
-        // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
-        // separate step from the trip-count refinement above: the stacked outputs' leading axis describes the trip
-        // count that is fixed before the first iteration, so it stays refined even when a first-class dimension carry
-        // shares the length's identity and keeps every carry that refers to it symbolic. A runtime length of another
-        // type (e.g., the exact type of an eager dimension value) is a member of the facts like every other input, so
-        // that no carry declared with the length's identity establishes an extent that disagrees with the trip count,
-        // while one that carries the length's own identity establishes nothing beyond the declared bounds. Only the
-        // carries preserve the identities of reference inputs.
-        let nominal_runtime_length = length.variable().is_some_and(|variable| {
-            matches!(input_types.last().map(Self::scan_member), Some(ScanMember::Dimension(r#type))
-                if r#type.variable() == Some(variable))
-        });
-        let fact_count = expected_input_types.len() - usize::from(nominal_runtime_length);
-        refine_output_types(
-            &expected_input_types[..fact_count],
-            &input_types[..fact_count],
-            output_types.as_slice(),
-            |index| (index < carry_count).then_some(index),
-        )
-    }
-}
-
-/// Member of a [`ScanType`] family, which decides the role that a value of that type can play on a scan boundary.
-#[derive(Copy, Clone, Debug)]
-pub enum ScanMember<'t> {
-    /// Array of the provided type.
-    Array(&'t ArrayType),
-
-    /// Reference to an array of the provided type.
-    Reference(&'t ArrayType),
-
-    /// First-class dimension of the provided type.
-    Dimension(&'t DimensionType),
-}
-
-impl<'t> ScanMember<'t> {
-    /// Returns the [`DimensionType`] of this member when it is the trailing runtime length input of a dynamic-length
-    /// scan, which must be a first-class dimension.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] when this member is not a first-class dimension.
-    fn runtime_length_type(self) -> Result<&'t DimensionType, TypeError> {
-        let kind_name = match self {
-            Self::Dimension(r#type) => return Ok(r#type),
-            Self::Array(_) => "an array",
-            Self::Reference(_) => "a reference",
-        };
-        Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` runtime length input must be a first-class dimension but got {kind_name}",
-        )))
-    }
-}
-
-impl ScanType for ArrayType {
-    #[inline]
-    fn scan_member(&self) -> ScanMember<'_> {
-        ScanMember::Array(self)
-    }
-
-    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
-        Err(TypeError::invalid(format!(
-            "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use a composite \
-             `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
-        )))
-    }
-
-    fn validate_scan_body_members(body_input_types: &[Self], body_output_types: &[Self]) -> Result<(), TypeError> {
-        // Homogeneous bodies cannot carry dynamic array shapes. Report body positions, including the index input.
-        for (role, index, r#type) in body_input_types
-            .iter()
-            .enumerate()
-            .map(|(index, r#type)| ("input", index + 1, r#type))
-            .chain(body_output_types.iter().enumerate().map(|(index, r#type)| ("output", index, r#type)))
-        {
-            for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
-                if dimension.value().is_none() {
-                    return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` body {role} {index} must have a fully static type but axis {axis} of \
-                         `{type}` has size `{dimension}`",
-                        r#type = r#type,
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ScanType for ArrayIrType {
-    #[inline]
-    fn scan_member(&self) -> ScanMember<'_> {
-        match self {
-            Self::Array(r#type) => ScanMember::Array(r#type),
-            Self::Reference(r#type) => ScanMember::Reference(r#type.referent()),
-            Self::Dimension(r#type) => ScanMember::Dimension(r#type),
-        }
-    }
-
-    #[inline]
-    fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
-        Ok(Self::Dimension(DimensionType::from(length.clone())))
-    }
-
-    #[inline]
-    fn validate_scan_body_members(_body_input_types: &[Self], _body_output_types: &[Self]) -> Result<(), TypeError> {
         Ok(())
     }
 }
