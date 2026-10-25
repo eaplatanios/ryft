@@ -87,22 +87,21 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Stable softmax normalization and cross-entropy along one or more class axes. `axes` accepts one axis or a list of
-/// axes, and negative axes count from the end. Several class axes are normalized jointly, as if they were flattened
-/// into one class axis in increasing axis order (the tuple `axis` of the JAX and optax functions), which is also the
-/// order in which an integer label indexes the classes. Inputs have real floating-point elements and static shapes,
-/// with at least one class along every class axis. Half-precision and smaller formats use `f32` arithmetic
-/// internally; `f64` keeps its precision. Normalization outputs retain the input element type. Logits of negative
-/// infinity represent excluded classes. A row containing NaN or positive infinity, or consisting entirely of negative
-/// infinity, produces NaNs. A finite singleton has probability one and log-probability zero, subject to the final
-/// element-format conversion. Formats that cannot represent an output (e.g., zero or negative log-probabilities in
-/// `f8e8m0fnu`) follow [`ConvertElementType`]'s conversion semantics and can produce NaNs.
+/// Capability that provides support for stable softmax normalization and cross-entropy along one or more class axes.
+/// `axes` accepts one axis or a list of axes, and negative axes count from the end. Several class axes are normalized
+/// jointly, as if they were flattened into one class axis in increasing axis order, which is also the order in which
+/// an integer label indexes the classes. Inputs have real floating-point elements and static shapes, with at least one
+/// class along every class axis. Half-precision and smaller formats use `f32` arithmetic internally; `f64` keeps its
+/// precision. Normalization outputs retain the input element type. Logits of negative infinity represent excluded
+/// classes. A row containing NaN or positive infinity, or consisting entirely of negative infinity, produces NaNs.
+/// A finite singleton has probability one and log-probability zero, subject to the final element-format conversion.
+/// Formats that cannot represent an output (e.g., zero or negative log-probabilities in `f8e8m0fnu`) follow
+/// [`ConvertElementType`]'s conversion semantics and can produce NaNs.
 ///
-/// The `masked_*` functions take a Boolean `mask` with the logits' shape that selects the classes taking part, like
-/// the `where` argument of the JAX and optax functions. A class outside the mask has probability zero and
-/// log-probability negative infinity, contributes nothing to a loss, and receives a zero derivative, whatever logit
-/// it holds; a row without any selected class has zero probabilities, negative infinite log-probabilities, and a
-/// zero loss.
+/// The `masked_*` functions take a Boolean `mask` with the logits' shape that selects the classes taking part. A class
+/// outside the mask has probability zero and log-probability negative infinity, contributes nothing to a loss, and
+/// receives a zero derivative, whatever logit it holds; a row without any selected class has zero probabilities,
+/// negative infinite log-probabilities, and a zero loss.
 ///
 /// These functions preserve small losses and derivatives even when the largest probability rounds to one. Computing
 /// `log(softmax(logits))` or subtracting a logit from a separately rounded log-sum-exp loses that information.
