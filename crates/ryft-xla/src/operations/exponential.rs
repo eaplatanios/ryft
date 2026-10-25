@@ -1,14 +1,16 @@
 use ryft_core::{
-    ArrayType, DataType, ExpOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
+    ArrayType, DataType, Dimension, ExpM1Operation, ExpOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
+    LogisticOperation,
 };
-use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
+use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
 use crate::experimental::lowering::types::{
-    lower_f64_constant_splat, lower_tensor_type, lower_unplaced_constant_output,
+    lower_explicit_shape, lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_tensor_type, lower_unplaced_constant_output,
 };
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::lower_extremum_to_mlir;
@@ -29,6 +31,33 @@ impl LowerableOperation for ExpOperation<ArrayType> {
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.exponential should return one result").as_ref()])
+    }
+}
+
+impl LowerableOperation for ExpM1Operation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if output_types[0].data_type().is_complex() {
+            return Ok(vec![lower_complex_exp_m1_to_mlir(
+                input_values[0],
+                &output_types[0],
+                lower_accuracy(self.accuracy()),
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?]);
+        }
+        let result = lowerer.block.append_operation(stable_hlo::exponential_minus_one(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).expect("stablehlo.exponential_minus_one should return one result").as_ref()])
     }
 }
 
@@ -110,15 +139,263 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
         lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result = lowerer.block.append_operation(stable_hlo::logistic(
-            input_values[0],
-            lower_accuracy(self.accuracy()),
+        let output_type = &output_types[0];
+        // Native logistic expands to `1 / (1 + exp(-x))`, whose exponential overflows before a negative
+        // sigmoid tail underflows. Select the exponential's sign so its real component stays nonpositive.
+        let complex = output_type.data_type().is_complex();
+        let narrow = !complex && !matches!(output_type.data_type(), DataType::F32 | DataType::F64);
+        let working_type = if narrow { output_type.clone().with_data_type(DataType::F32) } else { output_type.clone() };
+        let working_tensor_type = lower_tensor_type(&working_type, lowerer.context, lowerer.location)?;
+        let input = if narrow {
+            lowerer
+                .block
+                .append_operation(stable_hlo::convert(input_values[0], working_tensor_type, lowerer.location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            input_values[0]
+        };
+        let part_type = working_type.clone().with_data_type(match working_type.data_type() {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            data_type => data_type,
+        });
+        let real = if complex {
+            lowerer
+                .block
+                .append_operation(stable_hlo::real(input, lowerer.location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            input
+        };
+        let one = lower_exponential_constant_like(
+            1.0,
+            real,
+            &part_type,
+            &mut lowerer.block,
+            lowerer.context,
             lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.logistic should return one result").as_ref()])
+        )?;
+        let zero = lower_exponential_constant_like(
+            0.0,
+            real,
+            &part_type,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let nonnegative = lowerer
+            .block
+            .append_operation(stable_hlo::compare(
+                real,
+                zero,
+                stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+                stable_hlo::ComparisonType::Float,
+                lowerer.location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let one = if complex {
+            lowerer
+                .block
+                .append_operation(stable_hlo::complex(one, zero, lowerer.location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            one
+        };
+        let negative_input = lowerer
+            .block
+            .append_operation(stable_hlo::negate(input, lowerer.location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let exponential_input = lowerer
+            .block
+            .append_operation(stable_hlo::select(nonnegative, negative_input, input, lowerer.location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let exponential = lowerer
+            .block
+            .append_operation(stable_hlo::exponential(
+                exponential_input,
+                lower_accuracy(self.accuracy()),
+                lowerer.location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let denominator = lowerer
+            .block
+            .append_operation(stable_hlo::add(one, exponential, lowerer.location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let positive = lowerer
+            .block
+            .append_operation(stable_hlo::divide(one, denominator, lowerer.location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let negative = lowerer
+            .block
+            .append_operation(stable_hlo::divide(exponential, denominator, lowerer.location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let output = lowerer
+            .block
+            .append_operation(stable_hlo::select(nonnegative, positive, negative, lowerer.location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        Ok(vec![if narrow {
+            lowerer
+                .block
+                .append_operation(stable_hlo::convert(
+                    output,
+                    lower_tensor_type(output_type, lowerer.context, lowerer.location)?,
+                    lowerer.location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            output
+        }])
     }
+}
+
+/// Broadcasts a real scalar literal to an exemplar's runtime shape, retaining bounded dynamic dimensions.
+fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
+    factor: f64,
+    input: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    if output_type.static_shape().is_some() {
+        return lower_f64_constant_splat(factor, output_type, output_tensor_type, block, context, location);
+    }
+    let scalar_type = ArrayType::scalar(output_type.data_type());
+    let scalar = lower_f64_constant_splat(
+        factor,
+        &scalar_type,
+        lower_tensor_type(&scalar_type, context, location)?,
+        block,
+        context,
+        location,
+    )?;
+    let dimensions = output_type
+        .shape()
+        .dimensions()
+        .iter()
+        .enumerate()
+        .map(|(axis, dimension)| match dimension {
+            Dimension::Static(extent) => {
+                Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
+            }
+            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
+        })
+        .collect::<Result<Vec<_>, LoweringError>>()?;
+    let shape = lower_explicit_shape(&dimensions, block, context, location)?;
+    let broadcast = block
+        .append_operation(stable_hlo::dynamic_broadcast(scalar, shape, &[], None, None, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    Ok(block
+        .append_operation(tensor::cast(broadcast, output_tensor_type, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref())
+}
+
+/// Lowers complex `exp_m1` without recovering `exp(real)` by adding one to a rounded `exp_m1(real)`.
+fn lower_complex_exp_m1_to_mlir<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    accuracy: Accuracy,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
+        DataType::F32
+    } else {
+        DataType::F64
+    });
+    let two = lower_exponential_constant_like(2.0, input, &part_type, block, context, location)?;
+    let half = lower_exponential_constant_like(0.5, input, &part_type, block, context, location)?;
+    let real_input = block.append_operation(stable_hlo::real(input, location)?)?.result(0).unwrap().as_ref();
+    let imaginary = block.append_operation(stable_hlo::imag(input, location)?)?.result(0).unwrap().as_ref();
+    let exponential_minus_one = block
+        .append_operation(stable_hlo::exponential_minus_one(real_input, accuracy, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let cosine = block
+        .append_operation(stable_hlo::cosine(imaginary, accuracy, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let half_imaginary = block
+        .append_operation(stable_hlo::multiply(imaginary, half, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let half_sine = block
+        .append_operation(stable_hlo::sine(half_imaginary, accuracy, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let squared_half_sine = block
+        .append_operation(stable_hlo::multiply(half_sine, half_sine, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let correction = block
+        .append_operation(stable_hlo::multiply(two, squared_half_sine, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let real = block
+        .append_operation(stable_hlo::multiply(exponential_minus_one, cosine, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let real = block
+        .append_operation(stable_hlo::subtract(real, correction, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    // This independent exponential retains the imaginary tail after the real output has rounded to minus one.
+    let exponential = block
+        .append_operation(stable_hlo::exponential(real_input, accuracy, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let sine = block
+        .append_operation(stable_hlo::sine(imaginary, accuracy, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let imaginary = block
+        .append_operation(stable_hlo::multiply(exponential, sine, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
 }
 
 /// Lowers a principal complex `ln_1p` without cancellation near zero or magnitude underflow near `-1`.
@@ -449,11 +726,161 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayOperation, Dimension, Placeholder, Shape};
 
-    use crate::experimental::lowering::tests::{XlaProgramBuilder, lowered_unary_module};
+    use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::XlaArrayConstant;
 
     use super::*;
+
+    /// Lowers one unary operation while retaining its bounded dynamic input and result shape.
+    fn lowered_dynamic_unary_module(operation: ArrayOperation<XlaArrayConstant>, data_type: DataType) -> String {
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("size", Some(5))])));
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        to_mlir_module_for_plain_program(&program, "main").unwrap()
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_exp_m1() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::ExpM1(ExpM1Operation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.exponential_minus_one %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::ExpM1(ExpM1Operation::new()), DataType::C64, vec![]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<complex<f32>>) -> tensor<complex<f32>> {
+                    %cst = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+                    %cst_0 = stablehlo.constant dense<5.000000e-01> : tensor<f32>
+                    %0 = stablehlo.real %arg0 : (tensor<complex<f32>>) -> tensor<f32>
+                    %1 = stablehlo.imag %arg0 : (tensor<complex<f32>>) -> tensor<f32>
+                    %2 = stablehlo.exponential_minus_one %0 : tensor<f32>
+                    %3 = stablehlo.cosine %1 : tensor<f32>
+                    %4 = stablehlo.multiply %1, %cst_0 : tensor<f32>
+                    %5 = stablehlo.sine %4 : tensor<f32>
+                    %6 = stablehlo.multiply %5, %5 : tensor<f32>
+                    %7 = stablehlo.multiply %cst, %6 : tensor<f32>
+                    %8 = stablehlo.multiply %2, %3 : tensor<f32>
+                    %9 = stablehlo.subtract %8, %7 : tensor<f32>
+                    %10 = stablehlo.exponential %0 : tensor<f32>
+                    %11 = stablehlo.sine %1 : tensor<f32>
+                    %12 = stablehlo.multiply %10, %11 : tensor<f32>
+                    %13 = stablehlo.complex %9, %12 : tensor<complex<f32>>
+                    return %13 : tensor<complex<f32>>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_logistic() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Logistic(LogisticOperation::new()), DataType::F64, vec![]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.compare GE, %arg0, %cst_0, FLOAT : (tensor<f64>, tensor<f64>) -> tensor<i1>
+                    %1 = stablehlo.negate %arg0 : tensor<f64>
+                    %2 = stablehlo.select %0, %1, %arg0 : tensor<i1>, tensor<f64>
+                    %3 = stablehlo.exponential %2 : tensor<f64>
+                    %4 = stablehlo.add %cst, %3 : tensor<f64>
+                    %5 = stablehlo.divide %cst, %4 : tensor<f64>
+                    %6 = stablehlo.divide %3, %4 : tensor<f64>
+                    %7 = stablehlo.select %0, %5, %6 : tensor<i1>, tensor<f64>
+                    return %7 : tensor<f64>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_logistic_dynamic_shape() {
+        assert_eq!(
+            lowered_dynamic_unary_module(ArrayOperation::Logistic(LogisticOperation::new()), DataType::F64),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>> {
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %2 = stablehlo.reshape %1 : (tensor<i64>) -> tensor<1xi64>
+                    %3 = stablehlo.dynamic_broadcast_in_dim %cst, %2, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast = tensor.cast %3 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    %6 = stablehlo.reshape %5 : (tensor<i64>) -> tensor<1xi64>
+                    %7 = stablehlo.dynamic_broadcast_in_dim %cst_0, %6, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast_1 = tensor.cast %7 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %8 = stablehlo.compare GE, %arg0, %cast_1, FLOAT : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<?xi1, #stablehlo.bounds<4>>
+                    %9 = stablehlo.negate %arg0 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %10 = stablehlo.select %8, %9, %arg0 : tensor<?xi1, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>
+                    %11 = stablehlo.exponential %10 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %12 = stablehlo.add %cast, %11 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %13 = stablehlo.divide %cast, %12 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %14 = stablehlo.divide %11, %12 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %15 = stablehlo.select %8, %13, %14 : tensor<?xi1, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>
+                    return %15 : tensor<?xf64, #stablehlo.bounds<4>>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_exp_m1_dynamic_shape() {
+        assert_eq!(
+            lowered_dynamic_unary_module(ArrayOperation::ExpM1(ExpM1Operation::new()), DataType::C128),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xcomplex<f64>, #stablehlo.bounds<4>> {
+                    %cst = stablehlo.constant dense<2.000000e+00> : tensor<f64>
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %2 = stablehlo.reshape %1 : (tensor<i64>) -> tensor<1xi64>
+                    %3 = stablehlo.dynamic_broadcast_in_dim %cst, %2, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast = tensor.cast %3 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %cst_0 = stablehlo.constant dense<5.000000e-01> : tensor<f64>
+                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    %6 = stablehlo.reshape %5 : (tensor<i64>) -> tensor<1xi64>
+                    %7 = stablehlo.dynamic_broadcast_in_dim %cst_0, %6, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast_1 = tensor.cast %7 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %8 = stablehlo.real %arg0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %9 = stablehlo.imag %arg0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %10 = stablehlo.exponential_minus_one %8 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %11 = stablehlo.cosine %9 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %12 = stablehlo.multiply %9, %cast_1 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %13 = stablehlo.sine %12 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %14 = stablehlo.multiply %13, %13 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %15 = stablehlo.multiply %cast, %14 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %16 = stablehlo.multiply %10, %11 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %17 = stablehlo.subtract %16, %15 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %18 = stablehlo.exponential %8 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %19 = stablehlo.sine %9 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %20 = stablehlo.multiply %18, %19 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %21 = stablehlo.complex %17, %20 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    return %21 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                  }
+                }
+            "},
+        );
+    }
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_ln_1p_and_log_add_exp() {

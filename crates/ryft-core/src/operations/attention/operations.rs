@@ -200,21 +200,27 @@ pub const DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME: &str = "dot_product_att
 /// for query, key, value, and a present differentiable bias, in that order. Boolean masks, integer sequence lengths,
 /// and a non-differentiable bias have zero-space cotangents outside this operation.
 ///
-/// The portable composition recovers the attention probabilities as `P = exp(logits - residual)` and applies
+/// The portable composition recomputes normalized probabilities `P` from the masked logits in `f32`, avoiding precision
+/// lost when the public output or residual was rounded to a narrower query data type. It applies
 ///
 /// ```text
 /// dV = transpose(P) * dO
-/// dS = P * (dO * transpose(V) - sum(dO * O))
+/// dW = dO * transpose(V)
+/// C = dW - dW[pivot]
+/// dS = P * (C - sum(P * C))
 /// dQ = scale * dS * K
 /// dK = scale * transpose(dS) * Q.
 /// ```
 ///
-/// It uses the forward configuration and visibility predicate, reduces grouped query heads back to each key/value
-/// head, reduces a broadcast bias cotangent to its original shape, and zeroes padded query rows. Portable evaluation is
-/// owned by [`dot_product_attention_backward_ir_composition`]; this operation remains only so a fused forward's
-/// transpose can select the matching backend backward ABI. Higher-order derivatives should differentiate the ordinary
-/// portable composition instead of differentiating this boundary. Batching uses the same rectangular storage
-/// normalization as [`DotProductAttentionOperation`].
+/// The pivot is the first maximum logit in each row. Its `dS` entry is replaced by the negative sum of all other entries,
+/// preserving the dominant derivative when its probability rounds to one. The output and residual remain validated
+/// inputs for the fused ABI; the portable composition does not use their numerical values. It uses the forward
+/// configuration and visibility predicate, reduces grouped query heads back to each key/value head, reduces a broadcast
+/// bias cotangent to its original shape, and zeroes padded query rows. Portable evaluation is owned by
+/// [`dot_product_attention_backward_ir_composition`]; this operation remains only so a fused forward's transpose can
+/// select the matching backend backward ABI. Higher-order derivatives should differentiate the ordinary portable
+/// composition instead of differentiating this boundary. Batching uses the same rectangular storage normalization as
+/// [`DotProductAttentionOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DotProductAttentionBackwardOperation {
     /// Value-independent semantics of the differentiated forward operation.

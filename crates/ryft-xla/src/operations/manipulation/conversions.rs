@@ -2870,9 +2870,9 @@ mod tests {
         // The first cast constrains the physical buffer to its new column-major layout. The second cast keeps that
         // layout but narrows the bounded dynamic axis, which slices a new buffer that it does not constrain again.
         // Layouts are only observable where a value crosses a boundary (executable inputs and outputs, and custom-call
-        // operands and results), and every such boundary states the layout of its own declared type. XLA rejects
-        // bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only a static
-        // result of such a cast can be observed, and its consumer still receives the declared column-major storage.
+        // inputs and outputs). The custom call explicitly requests the column-major layout to observe this storage.
+        // XLA rejects bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only
+        // a static result of such a cast can be observed, and its consumer still receives the declared column-major storage.
         let client = execution_client();
         REGISTRATION
             .get_or_init(|| {
@@ -2889,7 +2889,7 @@ mod tests {
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
         let laid_out = source.clone().with_layout(layout.clone());
-        let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout);
+        let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone());
         let copied = ArrayType::new_static(DataType::F64, [6]);
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(source.clone().into());
@@ -2910,7 +2910,12 @@ mod tests {
             )
             .unwrap()[0];
         let output = builder
-            .add_instruction(CustomCallOperation::new(TARGET, vec![copied.clone()]), Vec::new(), vec![value], None)
+            .add_instruction(
+                CustomCallOperation::new(TARGET, vec![copied.clone()]).with_input_layouts([Some(layout)]),
+                Vec::new(),
+                vec![value],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])

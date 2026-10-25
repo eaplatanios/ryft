@@ -9,7 +9,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{CotangentBatchingPolicy, DifferentiableType};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::attention::{
-    AttentionConfiguration, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
     DOT_PRODUCT_ATTENTION_OPERATION_NAME, DotProductAttention, DotProductAttentionBackwardOperation,
     DotProductAttentionOperation,
 };
@@ -24,7 +24,7 @@ use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-/// Residuals retained by the fused attention reverse rule.
+/// Residuals retained by the attention reverse rule.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
 pub struct AttentionResiduals<P: Parameter> {
     /// Forward inputs, including the present optional leaves.
@@ -82,7 +82,7 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-/// Stages the fused attention backward boundary over one canonical input structure.
+/// Stages the attention backward boundary over one canonical input structure.
 fn bind_attention_backward<D: Domain<Type = ArrayType>>(
     inputs: AttentionInputs<DomainTracer<D>>,
     output: DomainTracer<D>,
@@ -193,10 +193,17 @@ where
 /// Creates the differentiable scaled dot-product attention entry point for one canonical [`AttentionInputs`] tree.
 ///
 /// The primal path returns only the attended output. Reverse-mode differentiation runs a residual-producing forward
-/// with the same configuration and then applies the narrow fused-backward boundary. Optional Boolean masks and integer
-/// sequence lengths remain ordinary structural leaves of `inputs`; their cotangents are produced by Ryft's existing
-/// zero-space machinery, while a present floating-point bias receives the cotangent returned by the backward program.
-/// This one structured entry point replaces separate query/key/value, bias, and sequence-length tuple families.
+/// with the same configuration and then applies the narrow backward boundary. [`AttentionImplementation::Automatic`]
+/// selects [`AttentionImplementation::Portable`] for this training entry point, preserving small dominant-logit
+/// gradients with its stabilized backward composition. Explicitly requesting [`AttentionImplementation::Fused`] opts
+/// into the backend's native forward and backward kernels, including their numerical behavior; the portable gradient
+/// guarantees do not apply to those kernels. Dropout requires an explicit fused configuration. Inference through
+/// [`DotProductAttention`] retains automatic fusion.
+///
+/// Optional Boolean masks and integer sequence lengths remain ordinary structural leaves of `inputs`; their cotangents
+/// are produced by Ryft's existing zero-space machinery, while a present floating-point bias receives the cotangent
+/// returned by the backward program. This one structured entry point replaces separate query/key/value, bias, and
+/// sequence-length tuple families.
 ///
 /// The returned function retains its rules (refer to [`DifferentiableDotProductAttention`]), so it should be created
 /// once and called many times, which shares the traced rule specializations across its calls. To embed the resulting
@@ -219,6 +226,10 @@ where
     DomainTracer<D>: DotProductAttention,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
+    let configuration = match configuration.implementation() {
+        AttentionImplementation::Automatic => configuration.with_implementation(AttentionImplementation::Portable),
+        AttentionImplementation::Portable | AttentionImplementation::Fused => configuration,
+    };
     let primal: AttentionPrimal<D> = Box::new(move |inputs| {
         let (output, _) = DomainTracer::<D>::dot_product_attention(inputs, configuration.with_residual(false))?;
         Ok(output)
@@ -254,6 +265,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
+    use half::bf16;
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -266,6 +280,19 @@ mod tests {
     use crate::tracing::Trace;
 
     use super::*;
+
+    /// Differentiates the sum of one portable attention output at unit score scale.
+    fn attention_sum_gradient(inputs: AttentionInputs<Array>) -> (Array, AttentionInputs<Array>) {
+        let function = differentiable_dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(
+            AttentionConfiguration::new().with_scale(1.0),
+        );
+        EagerContext::<Array, ArrayOperation<Array>>::new()
+            .differentiate_at(inputs)
+            .value_and_gradient(|inputs| {
+                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
+            .unwrap()
+    }
 
     #[test]
     fn test_differentiable_dot_product_attention_call() {
@@ -297,6 +324,44 @@ mod tests {
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec!["parallel_vary", "parallel_vary", "custom_function"],
         );
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_implementation_selection() {
+        let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
+        for (requested, selected) in [
+            (AttentionImplementation::Automatic, "portable"),
+            (AttentionImplementation::Portable, "portable"),
+            (AttentionImplementation::Fused, "fused"),
+        ] {
+            let function = differentiable_dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(
+                AttentionConfiguration::new().with_implementation(requested),
+            );
+            let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+                |inputs| function.call(inputs),
+                AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
+                    let %3:f32[1, 1, 1, 1] = custom_function [name=\"dot_product_attention\"] %0 %1 %2 [
+                        primal={
+                            lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
+                            let %3:f32[1, 1, 1, 1] = dot_product_attention [
+                                implementation=SELECTED,
+                                signature=AttentionInputSignature { bias: false, mask: false, query_sequence_lengths: false, key_value_sequence_lengths: false },
+                            ] %0 %1 %2
+                            in (%3)
+                        },
+                    ]
+                    in (%3)
+                "}
+                .trim_end()
+                .replace("SELECTED", selected),
+            );
+        }
     }
 
     #[test]
@@ -365,6 +430,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(gradients.bias.unwrap().r#type().data_type(), DataType::Zero);
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_saturated_logits() {
+        let inputs = AttentionInputs::new(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [1, 1, 1, 1]), &[1.0f32]).unwrap(),
+            Array::from_elements(ArrayType::new_static(DataType::F32, [1, 2, 1, 1]), &[0.0f32, -20.0]).unwrap(),
+            Array::from_elements(ArrayType::new_static(DataType::F32, [1, 2, 1, 1]), &[1.0f32, 0.0]).unwrap(),
+        );
+        let (output, gradients) = attention_sum_gradient(inputs);
+        assert_eq!(output.to_f64s(), vec![1.0]);
+        let key_gradient = gradients.key.to_f64s();
+        let tail = (-20.0f64).exp();
+        let expected = tail / (1.0 + tail).powi(2);
+        assert_abs_diff_eq!(key_gradient[0], expected, epsilon = 1e-15);
+        assert_eq!(key_gradient[0], -key_gradient[1]);
+        assert_abs_diff_eq!(gradients.query.to_f64s()[0], 20.0 * expected, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_ties_and_mask() {
+        let inputs = AttentionInputs {
+            mask: Some(
+                Array::from_elements(ArrayType::new_static(DataType::Boolean, [1, 1, 1, 3]), &[true, true, false])
+                    .unwrap(),
+            ),
+            ..AttentionInputs::new(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [1, 1, 1, 1]), &[1.0f32]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [1, 3, 1, 1]), &[0.0f32, 0.0, 100.0])
+                    .unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [1, 3, 1, 1]), &[1.0f32, 0.0, 12.0]).unwrap(),
+            )
+        };
+        let (output, gradients) = attention_sum_gradient(inputs);
+        assert_eq!(output.to_f64s(), vec![0.5]);
+        assert_eq!(gradients.key.to_f64s(), vec![0.25, -0.25, 0.0]);
+        assert_eq!(gradients.query.to_f64s(), vec![0.0]);
+        assert_eq!(gradients.value.to_f64s(), vec![0.5, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_narrow_residual() {
+        // The BF16 log-sum-exp residual rounds 1000 + log(2) to 1000. Reconstructing probabilities from that
+        // statistic would double the gradient; recomputing normalization retains the correct quarter gradients.
+        let inputs = AttentionInputs::new(
+            Array::from_elements(ArrayType::new_static(DataType::BF16, [1, 1, 1, 1]), &[bf16::from_f32(1.0)]).unwrap(),
+            Array::from_elements(
+                ArrayType::new_static(DataType::BF16, [1, 2, 1, 1]),
+                &[bf16::from_f32(1000.0), bf16::from_f32(1000.0)],
+            )
+            .unwrap(),
+            Array::from_elements(
+                ArrayType::new_static(DataType::BF16, [1, 2, 1, 1]),
+                &[bf16::from_f32(1.0), bf16::from_f32(0.0)],
+            )
+            .unwrap(),
+        );
+        let (output, gradients) = attention_sum_gradient(inputs);
+        assert_eq!(output.to_f64s(), vec![0.5]);
+        assert_eq!(gradients.key.to_f64s(), vec![0.25, -0.25]);
+        assert_eq!(gradients.query.to_f64s(), vec![0.0]);
     }
 
     #[test]

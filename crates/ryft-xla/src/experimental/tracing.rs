@@ -2655,7 +2655,7 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %1 = stablehlo.custom_call @ryft.test.add_one(%arg1) {api_version = 4 : i32, backend_config = {}} : (tensor<2xf32>) -> tensor<2xf32>
+                      %1 = stablehlo.custom_call @ryft.test.add_one(%arg1) {api_version = 4 : i32, backend_config = {}, operand_layouts = [dense<0> : tensor<1xindex>], result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<2xf32>) -> tensor<2xf32>
                       sdy.return %1 : tensor<2xf32>
                     } : (tensor<4xf32>) -> tensor<4xf32>
                     return %0 : tensor<4xf32>

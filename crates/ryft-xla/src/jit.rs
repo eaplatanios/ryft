@@ -1866,7 +1866,7 @@ mod tests {
         ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
         ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
-        Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, StopGradient,
+        Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax, StopGradient,
         StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
         ZeroLike, differentiate_at,
     };
@@ -5159,6 +5159,148 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_stable_cross_entropy_gradients() {
+        use ryft_core::{ProjectedContext, Softmax, softmax_cross_entropy_with_target_logits};
+
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaSession::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let label_type = ArrayType::scalar(DataType::I32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<XlaDomain<'_>, ArrayType>>(-1);
+        // Compile each complete stabilized derivative so optimizer rewrites cannot hide behind eager operation
+        // boundaries. Integer labels and teacher logits parameterize their respective losses without differentiation.
+        let compiled: CompiledXlaFunction<
+            '_,
+            (ArrayType, ArrayType, ArrayType, ArrayType),
+            (ArrayType, ArrayType, ArrayType),
+        > = compile(
+            move |(logits, labels, student, teacher)| {
+                let (loss, hard_gradient) = differentiate_at(logits)
+                    .with_captures(labels)
+                    .value_and_gradient(|logits, labels| logits.softmax_cross_entropy_with_integer_labels(&labels, 0))
+                    .unwrap();
+                let soft_gradient = differentiate_at(student)
+                    .with_captures(teacher)
+                    .gradient(|student, teacher| soft_target.call(student, teacher))
+                    .unwrap();
+                (loss, hard_gradient, soft_gradient)
+            },
+            (vector_type.clone(), label_type.clone(), vector_type.clone(), vector_type.clone()),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let student_values = [2.0f32 - 1e-7, 1.0f32 + 1e-7, 0.0];
+        let logits = XlaArray::from_host_buffer(
+            &domain,
+            vector_type.clone(),
+            mesh.clone(),
+            &values_to_bytes(&[9.0f32, -9.0, -9.0]),
+        )
+        .unwrap();
+        let labels = XlaArray::from_host_buffer(&domain, label_type, mesh.clone(), &values_to_bytes(&[0i32])).unwrap();
+        let student =
+            XlaArray::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), &values_to_bytes(&student_values))
+                .unwrap();
+        let teacher =
+            XlaArray::from_host_buffer(&domain, vector_type, mesh, &values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
+        let (loss, hard_gradient, soft_gradient) =
+            domain.interpret(&compiled.executable_function(), (logits, labels, student, teacher)).unwrap();
+
+        let tail = (-18.0f64).exp();
+        let loss = read_f32_array(&client, &loss)[0] as f64;
+        assert!((loss - (2.0 * tail).ln_1p()).abs() < 1e-13);
+        let hard_gradient = read_f32_array(&client, &hard_gradient);
+        let expected = tail / (1.0 + 2.0 * tail);
+        assert!((f64::from(hard_gradient[0]) + 2.0 * expected).abs() < 1e-13);
+        assert!((f64::from(hard_gradient[1]) - expected).abs() < 1e-13);
+        assert!((f64::from(hard_gradient[2]) - expected).abs() < 1e-13);
+        assert!((hard_gradient.iter().map(|&value| f64::from(value)).sum::<f64>()).abs() < 1e-13);
+
+        // Use the represented f32 logits in the f64 oracle so the comparison measures probability cancellation,
+        // rather than a discrepancy between intended and representable student perturbations.
+        let student_denominator = student_values.iter().map(|&value| (f64::from(value) - 2.0).exp()).sum::<f64>();
+        let teacher_denominator = 1.0 + (-1.0f64).exp() + (-2.0f64).exp();
+        for (class, actual) in read_f32_array(&client, &soft_gradient).into_iter().enumerate() {
+            let expected = (f64::from(student_values[class]) - 2.0).exp() / student_denominator
+                - (-(class as f64)).exp() / teacher_denominator;
+            assert!((f64::from(actual) - expected).abs() < 1e-13, "class {class}: {actual} differs from {expected}");
+        }
+    }
+
+    #[test]
+    fn test_compile_softmax_sharded_class_axis() {
+        // A class axis sharded over two devices normalizes across both shards: the partitioner combines the argmax
+        // and the sums across the devices, the probabilities keep the input's sharding, and the loss and gradient of
+        // a replicated integer label match the unsharded arithmetic.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
+        let engine = XlaSession::new(&client).domain();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let logits_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let label_type = ArrayType::scalar(DataType::I32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
+            |(logits, labels)| {
+                let probabilities = logits.softmax(0).unwrap();
+                let (loss, gradient) = differentiate_at(logits)
+                    .with_captures(labels)
+                    .value_and_gradient(|logits, labels| logits.softmax_cross_entropy_with_integer_labels(&labels, 0))
+                    .unwrap();
+                (probabilities, loss, gradient)
+            },
+            (logits_type.clone(), label_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let values = [9.0f32, -9.0, 1.0, -9.0];
+        let logits = XlaArray::from_host_buffer(&engine, logits_type, mesh.clone(), &values_to_bytes(&values)).unwrap();
+        let labels = XlaArray::from_host_buffer(&engine, label_type, mesh, &values_to_bytes(&[2i32])).unwrap();
+        let (probabilities, loss, gradient) =
+            engine.interpret(&compiled.executable_function(), (logits, labels)).unwrap();
+        assert_eq!(probabilities.sharding(), &sharding);
+        assert_eq!(gradient.sharding(), &sharding);
+        let read_shards = |array: &XlaArray<'_>| {
+            let mut observed = Vec::new();
+            for device in client.addressable_devices().unwrap().iter().take(2) {
+                let bytes = array
+                    .device_shard(device.id().unwrap())
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                observed.extend(values_from_bytes::<f32>(&bytes));
+            }
+            observed
+        };
+        let denominator = values.iter().map(|&value| (f64::from(value) - 9.0).exp()).sum::<f64>();
+        let expected_probabilities =
+            values.iter().map(|&value| (f64::from(value) - 9.0).exp() / denominator).collect::<Vec<_>>();
+        for (actual, expected) in read_shards(&probabilities).into_iter().zip(&expected_probabilities) {
+            assert!((f64::from(actual) - expected).abs() < 1e-7, "{actual} differs from {expected}");
+        }
+        let expected_loss = 8.0 + denominator.ln();
+        assert!((f64::from(read_f32_array(&client, &loss)[0]) - expected_loss).abs() < 1e-5);
+        for (class, actual) in read_shards(&gradient).into_iter().enumerate() {
+            let expected = expected_probabilities[class] - if class == 2 { 1.0 } else { 0.0 };
+            assert!((f64::from(actual) - expected).abs() < 1e-7, "class {class}: {actual} differs from {expected}");
+        }
+    }
+
+    #[test]
     fn test_interpret_async_retains_zero_output_completion() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -5544,7 +5686,7 @@ mod tests {
             |(dead, live)| {
                 let predicate = live.compare(&(-live.clone()), ComparisonDirection::GreaterThan).unwrap();
                 predicate
-                    .condition((dead, live), |(_, live)| Ok(live.clone() * live), |(_, live)| Ok(live))
+                    .condition(|(_, live)| Ok(live.clone() * live), |(_, live)| Ok(live), (dead, live))
                     .unwrap()
             },
             (dynamic_type, scalar_type.clone()),

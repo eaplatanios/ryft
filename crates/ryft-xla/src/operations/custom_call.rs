@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
 
 use ryft_core::macros::check_count;
@@ -19,9 +18,9 @@ use crate::operations::assertions::lower_output_extent_validation;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer};
 
 /// Returns the minor-to-major layout required by one custom-call array type.
-fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Option<Vec<usize>>, LoweringError> {
+fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, LoweringError> {
     let Some(layout) = r#type.layout() else {
-        return Ok(None);
+        return Ok((0..r#type.rank()).rev().collect());
     };
     let Layout::Tiled(layout) = layout else {
         return Err(LoweringError::UnsupportedOp {
@@ -47,35 +46,22 @@ fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Option<Vec<usize>>, Lo
             ),
         });
     }
-    Ok(Some(layout.minor_to_major().to_vec()))
+    Ok(layout.minor_to_major().to_vec())
 }
 
-/// Returns the complete StableHLO custom-call layout lists when at least one array type requests an explicit layout.
+/// Returns complete StableHLO custom-call layout constraints, using dense row-major storage for unspecified layouts.
 fn lower_custom_call_memory_layouts(
     input_types: &[ArrayType],
     output_types: &[ArrayType],
     has_effect_token: bool,
-) -> Result<Option<CustomCallMemoryLayouts>, LoweringError> {
-    let input_layouts = input_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
-    let output_layouts = output_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
-    if input_layouts.iter().chain(&output_layouts).all(Option::is_none) {
-        return Ok(None);
-    }
-    let mut operands = input_types
-        .iter()
-        .zip(input_layouts)
-        .map(|(r#type, layout)| layout.unwrap_or_else(|| (0..r#type.rank()).rev().collect()))
-        .collect::<Vec<_>>();
-    let mut results = output_types
-        .iter()
-        .zip(output_layouts)
-        .map(|(r#type, layout)| layout.unwrap_or_else(|| (0..r#type.rank()).rev().collect()))
-        .collect::<Vec<_>>();
+) -> Result<CustomCallMemoryLayouts, LoweringError> {
+    let mut operands = input_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
+    let mut results = output_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
     if has_effect_token {
         operands.push(Vec::new());
         results.push(Vec::new());
     }
-    Ok(Some(CustomCallMemoryLayouts { operands, results }))
+    Ok(CustomCallMemoryLayouts { operands, results })
 }
 
 /// Lowers named custom-call attributes to MLIR named attributes, in declaration order. Refer to
@@ -238,24 +224,19 @@ pub(crate) fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     let token_class = custom_call_token_class(operation)?;
     let has_token = token_class.is_some();
     check_count!("input", input_types, input_values.len(), ProgramError);
-    let input_types = if operation.input_layouts().is_empty() {
-        Cow::Borrowed(input_types)
-    } else {
-        Cow::Owned(
-            input_types
-                .iter()
-                .zip(operation.input_layouts())
-                .map(|(input_type, layout)| match layout {
-                    Some(layout) => input_type.clone().with_layout(layout.clone()),
-                    None => input_type.clone(),
-                })
-                .collect::<Vec<_>>(),
-        )
-    };
-    let input_types = input_types.as_ref();
+    // Input type layouts describe the incoming values. The kernel receives the call's declared layouts instead,
+    // with omitted declarations and `None` entries requesting dense row-major storage.
+    let input_types = input_types
+        .iter()
+        .enumerate()
+        .map(|(index, input_type)| {
+            input_type.clone().with_layout(operation.input_layouts().get(index).cloned().flatten())
+        })
+        .collect::<Vec<_>>();
+    let input_types = input_types.as_slice();
     let attributes = lower_custom_call_attributes(operation.attributes(), context, location)?;
     let backend_config = context.dictionary_attribute(&attributes);
-    let memory_layouts = lower_custom_call_memory_layouts(input_types, output_types, has_token)?;
+    let memory_layouts = Some(lower_custom_call_memory_layouts(input_types, output_types, has_token)?);
     #[cfg(feature = "mosaic-gpu")]
     let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
     {
@@ -425,7 +406,10 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
             .map(|output_type| custom_call_physical_type(output_type, "output"))
             .collect::<Result<Vec<_>, _>>()?;
         for alias in self.input_output_aliases() {
-            physical_output_types[alias.output_index()] = physical_input_types[alias.input_index()].clone();
+            // The aliased buffer takes the input's physical bounds but retains the output's kernel layout contract.
+            let layout = physical_output_types[alias.output_index()].layout().cloned();
+            physical_output_types[alias.output_index()] =
+                physical_input_types[alias.input_index()].clone().with_layout(layout);
         }
         // XLA custom calls accept only static operands, so each bounded dynamic array input crosses the foreign
         // boundary as its dense buffer at the inclusive bound, exactly like the results allocated above. The kernel
@@ -593,6 +577,7 @@ mod tests {
                 .with_attribute("count", 4i64)
                 .with_attribute("flag", true)
                 .with_attribute("label", "x")
+                .with_input_layouts([column_major_type.layout().cloned(), None])
                 .with_input_output_alias(0, 1)
                 .unwrap()
                 .with_effect_class(EffectClass::OrderedIo);
@@ -643,10 +628,13 @@ mod tests {
                         {label = \"between\"}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> \
                         !stablehlo.token
                     %3:2 = stablehlo.custom_call @ryft.test.record(%arg1, %2) {api_version = 4 : i32, \
-                        backend_config = {}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> \
+                        backend_config = {}, has_side_effect = true, operand_layouts = [dense<[1, 0]> : \
+                        tensor<2xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<[1, 0]> : \
+                        tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<2x3xf32>, !stablehlo.token) -> \
                         (tensor<2x3xf32>, !stablehlo.token)
                     %4 = stablehlo.custom_call @ryft.test.add_one(%3#0) {api_version = 4 : i32, backend_config = \
-                        {}} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                        {}, operand_layouts = [dense<[1, 0]> : tensor<2xindex>], result_layouts = \
+                        [dense<[1, 0]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
                     return %4 : tensor<2x3xf32>
                   }
                 }
@@ -883,7 +871,7 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main() {
-                    stablehlo.custom_call @ryft.test.binary() {api_version = 4 : i32, backend_config = {empty = "", module = "\00\80\FF"}} : () -> ()
+                    stablehlo.custom_call @ryft.test.binary() {api_version = 4 : i32, backend_config = {empty = "", module = "\00\80\FF"}, operand_layouts = [], result_layouts = []} : () -> ()
                     return
                   }
                 }
@@ -933,7 +921,7 @@ mod tests {
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<8> : tensor<i32>
                     %3 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<8xf32>
-                    %4 = stablehlo.custom_call @ryft.test.dynamic(%3) {api_version = 4 : i32, backend_config = {}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]} : (tensor<8xf32>) -> tensor<8xf32>
+                    %4 = stablehlo.custom_call @ryft.test.dynamic(%3) {api_version = 4 : i32, backend_config = {}, operand_layouts = [dense<0> : tensor<1xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<8xf32>) -> tensor<8xf32>
                     %5 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
                     %6 = stablehlo.set_dimension_size %4, %5, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
                     %7 = stablehlo.get_dimension_size %6, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
@@ -993,7 +981,7 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main() -> tensor<3xf32> {
-                    %0 = stablehlo.custom_call @ryft.test.exact() {api_version = 4 : i32, backend_config = {}} : () -> tensor<3xf32>
+                    %0 = stablehlo.custom_call @ryft.test.exact() {api_version = 4 : i32, backend_config = {}, operand_layouts = [], result_layouts = [dense<0> : tensor<1xindex>]} : () -> tensor<3xf32>
                     return %0 : tensor<3xf32>
                   }
                 }
@@ -1054,7 +1042,7 @@ mod tests {
                     %6 = stablehlo.set_dimension_size %0, %c_0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<8xf32>
                     %7 = stablehlo.after_all  : !stablehlo.token
                     %8:3 = "stablehlo.if"(%3) ({
-                      %13:3 = stablehlo.custom_call @ryft.test.dynamic_guard(%6, %7) {api_version = 4 : i32, backend_config = {}, has_side_effect = true, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>]} : (tensor<8xf32>, !stablehlo.token) -> (tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token)
+                      %13:3 = stablehlo.custom_call @ryft.test.dynamic_guard(%6, %7) {api_version = 4 : i32, backend_config = {}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<8xf32>, !stablehlo.token) -> (tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token)
                       stablehlo.return %13#0, %13#1, %13#2 : tensor<8xf32>, tensor<3x3xf32>, !stablehlo.token
                     }, {
                       %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
@@ -1088,7 +1076,7 @@ mod tests {
                         %1 = stablehlo.after_all  : !stablehlo.token
                         %2 = stablehlo.custom_call @ryft.assert(%0, %arg0, %1) {api_version = 4 : i32, backend_config = {actor = "custom_call", kind = "generic", label_0 = "size", label_count = "1", message = "input dimension `size` expected 3"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
                         %3:2 = "stablehlo.if"(%0) ({
-                          %4:2 = stablehlo.custom_call @ryft.test.guarded(%2) {api_version = 4 : i32, backend_config = {}, has_side_effect = true} : (!stablehlo.token) -> (tensor<3x3xf64>, !stablehlo.token)
+                          %4:2 = stablehlo.custom_call @ryft.test.guarded(%2) {api_version = 4 : i32, backend_config = {}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>], result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (!stablehlo.token) -> (tensor<3x3xf64>, !stablehlo.token)
                           stablehlo.return %4#0, %4#1 : tensor<3x3xf64>, !stablehlo.token
                         }, {
                           %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
@@ -1111,7 +1099,7 @@ mod tests {
                         %2 = stablehlo.custom_call @ryft.assert(%0, %arg0, %1) {api_version = 4 : i32, backend_config = {actor = "custom_call", kind = "generic", label_0 = "size", label_count = "1", message = "input dimension `size` expected 3"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
                         %3 = stablehlo.after_all  : !stablehlo.token
                         %4:2 = "stablehlo.if"(%0) ({
-                          %5:2 = stablehlo.custom_call @ryft.test.guarded(%3) {api_version = 4 : i32, backend_config = {}, has_side_effect = true} : (!stablehlo.token) -> (tensor<3x3xf64>, !stablehlo.token)
+                          %5:2 = stablehlo.custom_call @ryft.test.guarded(%3) {api_version = 4 : i32, backend_config = {}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>], result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (!stablehlo.token) -> (tensor<3x3xf64>, !stablehlo.token)
                           stablehlo.return %5#0, %5#1 : tensor<3x3xf64>, !stablehlo.token
                         }, {
                           %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
@@ -1183,7 +1171,7 @@ mod tests {
                     %1 = stablehlo.after_all  : !stablehlo.token
                     %2 = stablehlo.custom_call @ryft.assert(%0, %arg0, %1) {api_version = 4 : i32, backend_config = {actor = "custom_call", kind = "generic", label_0 = "size", label_count = "1", message = "input dimension `size` expected 3"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
                     %3 = "stablehlo.if"(%0) ({
-                      %4 = stablehlo.custom_call @ryft.test.guarded() {api_version = 4 : i32, backend_config = {}} : () -> tensor<3x3xf64>
+                      %4 = stablehlo.custom_call @ryft.test.guarded() {api_version = 4 : i32, backend_config = {}, operand_layouts = [], result_layouts = [dense<[1, 0]> : tensor<2xindex>]} : () -> tensor<3x3xf64>
                       stablehlo.return %4 : tensor<3x3xf64>
                     }, {
                       %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>

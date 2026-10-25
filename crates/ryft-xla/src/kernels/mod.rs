@@ -718,7 +718,7 @@ pub(crate) mod tests {
             formatdoc! {r#"
             module {{
               func.func @main(%arg0: tensor<i32>) -> tensor<i32> {{
-                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 2 : i64, ryft.kernel.semantic = "{semantic}"}}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]}} : (tensor<i32>) -> tensor<i32>
+                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 2 : i64, ryft.kernel.semantic = "{semantic}"}}, operand_layouts = [dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<> : tensor<0xindex>]}} : (tensor<i32>) -> tensor<i32>
                 return %0 : tensor<i32>
               }}
             }}

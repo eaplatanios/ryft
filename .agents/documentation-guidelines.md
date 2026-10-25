@@ -13,6 +13,8 @@ code comments. Preserve the documented contract, technical rationale, and links 
   documentation on the trait or implementing type, and explain implementation mechanics and invariants with ordinary
   code comments (i.e., `//`) at the beginning of the implementation or relevant method body.
 - Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
+- Keep function docstrings self-contained. When relevant, introduce mathematical notation naturally in each function's
+  own description rather than relying on a shared notation explanation in a trait or module docstring.
 - When simplifying existing documentation, preserve its architectural rationale, invariants, and relevant API links.
   Improve wording without discarding useful information merely to shorten the text.
 - When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code

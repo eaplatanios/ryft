@@ -712,7 +712,6 @@ fn body(
                         || {
                             use #core::Condition as _;
                             __kernel_predicate.condition(
-                                vec![#(#names.clone()),*],
                                 |__kernel_values| {
                                     let __kernel_context = __kernel_values[0].context().clone();
                                     #initialization
@@ -725,6 +724,7 @@ fn body(
                                     #else_body
                                     Ok(vec![#(#names.clone()),*])
                                 },
+                                vec![#(#names.clone()),*],
                             )
                         })?;
                     #restoration

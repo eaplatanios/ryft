@@ -199,24 +199,6 @@ where
     project_array::<V>(output)
 }
 
-/// Adds the implicit batch axis to the `TN` residual of an unbatched attention operation.
-fn normalize_attention_residual_ir<V>(residual: &V) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
-    V::Domain: Context<Type = ArrayIrType>,
-    V::Domain: DimensionConstant,
-{
-    let r#type = residual.r#type();
-    let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
-    if r#type.rank() == 3 {
-        return Ok(residual.clone());
-    }
-    let batch = residual.domain().dimension_constant(1)?;
-    let mut dimensions = array_dimensions(residual)?;
-    dimensions.insert(0, batch);
-    residual.clone().dynamic_reshape(dimensions.as_slice())
-}
-
 /// Applies all built-in and sequence-length masks to mixed-IR logits.
 fn apply_masks_ir<V>(
     scores: V,
@@ -547,7 +529,8 @@ where
 }
 
 /// Evaluates the portable attention backward pass in the mixed array IR using the same first-class dimensions and mask
-/// construction as [`dot_product_attention_ir_composition`].
+/// construction as [`dot_product_attention_ir_composition`]. Probabilities are recomputed from the masked logits; the
+/// output and activation inputs are validated for the shared backward boundary but do not supply its normalization.
 pub fn dot_product_attention_backward_ir_composition<V>(
     inputs: &AttentionInputs<V>,
     output: &V,
@@ -569,6 +552,7 @@ where
         + Broadcast
         + Compare
         + ConvertElementType
+        + Div
         + Dot
         + Exp
         + Mul
@@ -623,18 +607,26 @@ where
         inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
     )?;
     let prepared = prepare_attention_ir(inputs, configuration, &dimensions)?;
-    let output = normalize_attention_input_ir(output)?;
     let output_cotangent = normalize_attention_input_ir(output_cotangent)?;
     let logits = <V as ValueProjection<ArrayType>>::from_projected(prepared.logits.clone());
-    let activation = normalize_attention_residual_ir(activation)?;
-    let statistic = project_array::<V>(activation)?.transpose([0, 2, 1])?;
-    let statistic = if prepared.softmax_type == prepared.data_type {
-        statistic
-    } else {
-        statistic.convert_element_type(prepared.softmax_type)?
-    };
-    let statistic = broadcast_like::<V>(statistic, &logits, &[0, 1, 2])?;
-    let weights = prepared.logits.sub(&project_array::<V>(statistic)?)?.exp()?;
+    // The public residual and output have the query data type, which can lose the normalization correction in
+    // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
+    let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
+    let maxima = project_array::<V>(broadcast_like::<V>(maxima, &logits, &[0, 1, 2])?)?;
+    let exponentials = prepared.logits.sub(&maxima)?.exp()?;
+    let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
+    let sums = project_array::<V>(broadcast_like::<V>(sums, &logits, &[0, 1, 2])?)?;
+    let weights = exponentials.div(&sums)?;
+
+    // Pick exactly one maximum, including when logits tie. Keeping the pivot out of the final sum avoids
+    // subtracting two nearly equal dominant contributions. The integer constants cannot carry tangents.
+    let columns = V::attention_iota(&logits, 3)?;
+    let column_array = project_array::<V>(columns.clone())?;
+    let sentinel = project_array::<V>(fill_like(&columns, i32::MAX as f64)?)?;
+    let is_maximum = prepared.logits.compare(&maxima, ComparisonDirection::Equal)?;
+    let pivot = is_maximum.select(&column_array, &sentinel)?.reduce(&[3], ReductionKind::Min)?;
+    let pivot = project_array::<V>(broadcast_like::<V>(pivot, &logits, &[0, 1, 2])?)?;
+    let is_pivot = column_array.compare(&pivot, ComparisonDirection::Equal)?;
 
     let output_cotangent = match &inputs.query_sequence_lengths {
         None => project_array::<V>(output_cotangent)?,
@@ -650,17 +642,22 @@ where
     let softmax_query = convert(project_array::<V>(prepared.query.clone())?)?;
     let softmax_key = convert(project_array::<V>(prepared.expanded_key.clone())?)?;
     let softmax_value = convert(project_array::<V>(prepared.expanded_value)?)?;
-    let softmax_output = convert(project_array::<V>(output)?)?;
     let softmax_output_cotangent = convert(output_cotangent)?;
     let weight_cotangents = softmax_output_cotangent
         .dot(&softmax_value, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
-    let delta = softmax_output_cotangent
-        .mul(&softmax_output)?
-        .reduce(&[3], ReductionKind::Sum)?
-        .transpose([0, 2, 1])?;
-    let weights_ir = <V as ValueProjection<ArrayType>>::from_projected(weights.clone());
-    let delta = broadcast_like::<V>(delta, &weights_ir, &[0, 1, 2])?;
-    let logit_cotangents = weights.mul(&weight_cotangents.sub(&project_array::<V>(delta)?)?)?;
+    let zero = project_array::<V>(fill_like(&logits, 0.0)?)?;
+    let pivot_cotangent = is_pivot.select(&weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
+    let pivot_cotangent = project_array::<V>(broadcast_like::<V>(pivot_cotangent, &logits, &[0, 1, 2])?)?;
+    // Center the incoming weight cotangents before their weighted sum. This preserves a tiny dominant derivative
+    // and gives exact zero when every weight cotangent is equal, even if the rounded probabilities do not sum to one.
+    let centered = weight_cotangents.sub(&pivot_cotangent)?;
+    let delta = weights.mul(&centered)?.reduce(&[3], ReductionKind::Sum)?;
+    let delta = project_array::<V>(broadcast_like::<V>(delta, &logits, &[0, 1, 2])?)?;
+    let logit_cotangents = weights.mul(&centered.sub(&delta)?)?;
+    let other_cotangents = is_pivot.select(&zero, &logit_cotangents)?;
+    let pivot_cotangent = other_cotangents.reduce(&[3], ReductionKind::Sum)?;
+    let pivot_cotangent = project_array::<V>(broadcast_like::<V>(pivot_cotangent, &logits, &[0, 1, 2])?)?;
+    let logit_cotangents = is_pivot.select(&zero.sub(&pivot_cotangent)?, &other_cotangents)?;
     let logit_cotangents_ir = <V as ValueProjection<ArrayType>>::from_projected(logit_cotangents.clone());
     let scale_value = fill_like(&logit_cotangents_ir, prepared.scale)?;
     let scaled_logit_cotangents = logit_cotangents.mul(&project_array::<V>(scale_value)?)?;

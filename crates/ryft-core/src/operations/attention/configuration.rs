@@ -6,7 +6,8 @@ use super::*;
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AttentionImplementation {
     /// Uses a fused implementation when the active backend supports the complete configuration and otherwise uses
-    /// the portable semantic composition.
+    /// the portable semantic composition. [`differentiable_dot_product_attention`] selects the portable composition
+    /// for this choice so that training uses its stabilized backward rule.
     #[default]
     Automatic,
 

@@ -2077,7 +2077,6 @@ mod tests {
             let predicate = references[0].read()?;
             let value = references[1].read()?;
             let result = predicate.condition(
-                vec![value],
                 |inputs| {
                     inputs[0].context().bind(
                         ArrayIrOperation::from(ArrayOperation::Add(AddOperation::new())),
@@ -2086,6 +2085,7 @@ mod tests {
                     )
                 },
                 Ok,
+                vec![value],
             )?;
             references[1].write(&result[0])?;
             Ok(())

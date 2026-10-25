@@ -325,13 +325,13 @@ mod tests {
         Abs, Array, ArrayType, Atan2, BatchAxis, Ceil, Clamp, Compare, ComparisonDirection, Concatenate,
         ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, CumulativeKind, CustomCall,
         CustomCallAttribute, CustomCallOperation, DenseDifferentiableType, Device, DeviceMesh, Differentiate,
-        Dimension, DimensionBounds, Dot, EffectClass, Erf, Exp, Floor, ForwardModeDifferentiate, Gather,
+        Dimension, DimensionBounds, Dot, EffectClass, Erf, Exp, ExpM1, Floor, ForwardModeDifferentiate, Gather,
         GatherDimensionNumbers, GatherMode, GatherOptions, Layout, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max,
         MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReducePrecision, ReductionKind, Rem,
         Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions,
-        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
-        Tag, Tanh, TiledLayout, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn,
-        f8e4m3fn, f8e8m0fnu,
+        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Softmax, Sqrt, StaticShape,
+        StopGradient, Tag, Tanh, TiledLayout, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
+        f4e2m1fn, f8e4m3fn, f8e8m0fnu, softmax_cross_entropy_with_target_logits,
     };
     use ryft_pjrt::extensions::ffi::{
         FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
@@ -849,6 +849,155 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_exp_m1() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&domain, &mesh, &[-20.0, 1e-20, 0.0, 1.0]);
+        let output = read_f32s(&input.exp_m1().unwrap());
+        assert_eq!(&output[..3], &[-1.0, 1e-20, 0.0]);
+        assert!((output[3] - 1.0f32.exp_m1()).abs() < 1e-6);
+
+        let input = XlaArray::from_host_buffer(
+            &domain,
+            replicated_type(&mesh, DataType::C128, &[3]),
+            mesh,
+            &values_to_bytes::<f64>(&[1e-20, 1e-20, 0.0, 1e-10, -40.0, 1.0]),
+        )
+        .unwrap();
+        let output = input.exp_m1().unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert_eq!(values[..2], [1e-20, 1e-20]);
+        assert!((values[2] + 5e-21).abs() < 1e-35);
+        assert_eq!(values[3], 1e-10);
+        assert!((values[5] - (-40.0f64).exp() * 1.0f64.sin()).abs() < 1e-32);
+    }
+
+    #[test]
+    fn test_eager_logistic_differentiation_saturated() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&domain, &mesh, &[20.0, -20.0]);
+        let (_, tangent) = differentiate_at(input)
+            .jvp(f32_vector(&domain, &mesh, &[1.0, 1.0]), |input| input.logistic())
+            .unwrap();
+        let values = read_f32s(&tangent);
+        let expected = (-20.0f32).exp();
+        assert!((values[0] - expected).abs() < 1e-15);
+        assert!((values[1] - expected).abs() < 1e-15);
+
+        // XLA can flush subnormal results in both F32 and F64. Keep these tails above the backend's
+        // exponential underflow floor; host reference tests separately cover retained subnormal values.
+        let input = XlaArray::from_host_buffer(
+            &domain,
+            replicated_type(&mesh, DataType::F64, &[2]),
+            mesh.clone(),
+            &values_to_bytes::<f64>(&[-700.0, 700.0]),
+        )
+        .unwrap();
+        let tangent = XlaArray::from_host_buffer(
+            &domain,
+            replicated_type(&mesh, DataType::F64, &[2]),
+            mesh.clone(),
+            &values_to_bytes::<f64>(&[1.0, 1.0]),
+        )
+        .unwrap();
+        let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
+        let output = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let derivative =
+            values_from_bytes::<f64>(&shard_host_bytes(derivative.addressable_shards().next().unwrap()).unwrap());
+        let expected = (-700.0f64).exp();
+        assert!(output[0] > 0.0 && (output[0] / expected - 1.0).abs() < 1e-12);
+        assert!((derivative[0] / expected - 1.0).abs() < 1e-12);
+        assert!((derivative[1] / expected - 1.0).abs() < 1e-12);
+
+        let input = XlaArray::from_host_buffer(
+            &domain,
+            replicated_type(&mesh, DataType::C128, &[2]),
+            mesh.clone(),
+            &values_to_bytes::<f64>(&[-700.0, 0.0, 700.0, 0.0]),
+        )
+        .unwrap();
+        let tangent = XlaArray::from_host_buffer(
+            &domain,
+            replicated_type(&mesh, DataType::C128, &[2]),
+            mesh,
+            &values_to_bytes::<f64>(&[1.0, 0.0, 1.0, 0.0]),
+        )
+        .unwrap();
+        let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
+        let output = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let derivative =
+            values_from_bytes::<f64>(&shard_host_bytes(derivative.addressable_shards().next().unwrap()).unwrap());
+        assert!(output[0] > 0.0 && (output[0] / expected - 1.0).abs() < 1e-12);
+        assert_eq!([output[1], output[2], output[3]], [0.0, 1.0, 0.0]);
+        assert!((derivative[0] / expected - 1.0).abs() < 1e-12);
+        assert!((derivative[2] / expected - 1.0).abs() < 1e-12);
+        assert_eq!([derivative[1], derivative[3]], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_eager_softmax() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&domain, &mesh, &[9.0, -9.0, -9.0]);
+        let probabilities = read_f32s(&input.softmax(-1).unwrap());
+        assert!((probabilities[0] - 1.0).abs() <= f32::EPSILON);
+        assert!((probabilities[1] - (-18.0f32).exp()).abs() < 1e-14);
+        let logs = read_f32s(&input.log_softmax(-1).unwrap());
+        assert!(logs[0] < -3.0e-8 && logs[0] > -3.1e-8);
+        assert_eq!(logs[1..], [-18.0, -18.0]);
+    }
+
+    #[test]
+    fn test_eager_softmax_cross_entropy_with_integer_labels() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&domain, &mesh, &[9.0, -9.0, -9.0]);
+        let label = XlaArray::from_host_buffer(
+            &domain,
+            replicated_type(&mesh, DataType::I32, &[]),
+            mesh,
+            values_to_bytes(&[0i32]),
+        )
+        .unwrap();
+        let (loss, gradient) = differentiate_at(input)
+            .with_captures(label)
+            .value_and_gradient(|input, label| input.softmax_cross_entropy_with_integer_labels(&label, 0))
+            .unwrap();
+        assert!(read_f32s(&loss)[0] > 3.0e-8);
+        let gradient = read_f32s(&gradient);
+        assert!(gradient[0] < -3.0e-8);
+        assert_eq!(gradient[0], -(gradient[1] + gradient[2]));
+    }
+
+    #[test]
+    fn test_eager_softmax_cross_entropy_with_target_logits() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let teacher = f32_vector(&domain, &mesh, &[2.0, 1.0, 0.0]);
+        let function = softmax_cross_entropy_with_target_logits::<ProjectedContext<XlaDomain<'_>, ArrayType>>(-1);
+        let (_, gradient) = differentiate_at(teacher.clone())
+            .with_captures(teacher.clone())
+            .value_and_gradient(|student, teacher| function.call(student, teacher))
+            .unwrap();
+        assert_eq!(read_f32s(&gradient), vec![0.0, 0.0, 0.0]);
+        let student = f32_vector(&domain, &mesh, &[2.0f32 - 1e-7, 1.0f32 + 1e-7, 0.0]);
+        let (_, gradient) = differentiate_at(student)
+            .with_captures(teacher)
+            .value_and_gradient(|student, teacher| function.call(student, teacher))
+            .unwrap();
+        let gradient = read_f32s(&gradient);
+        assert!((gradient[0] + 4.596e-8).abs() < 1e-11);
+        assert!((gradient[1] - 4.144e-8).abs() < 1e-11);
+        assert!((gradient[2] - 4.513e-9).abs() < 1e-11);
+    }
+
+    #[test]
     fn test_eager_log() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
@@ -1245,6 +1394,7 @@ mod tests {
         assert_parity(&left.cos().unwrap(), &reference_left.cos().unwrap());
         assert_parity(&left.atan2(&right).unwrap(), &reference_left.atan2(&reference_right).unwrap());
         assert_parity(&left.exp().unwrap(), &reference_left.exp().unwrap());
+        assert_parity(&left.exp_m1().unwrap(), &reference_left.exp_m1().unwrap());
         assert_parity(&left.log().unwrap(), &reference_left.log().unwrap());
         assert_parity(&left.sqrt().unwrap(), &reference_left.sqrt().unwrap());
         assert_parity(&left.rsqrt().unwrap(), &reference_left.rsqrt().unwrap());
@@ -2291,7 +2441,8 @@ mod tests {
             values_to_bytes::<f32>(&[1.5, 2.5, 3.5, 4.5]),
         )
         .unwrap();
-        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![matrix_type]);
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![matrix_type.clone()])
+            .with_input_layouts([matrix_type.layout().cloned()]);
         let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&matrix_input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5, 4.5, 5.5]);
@@ -2462,7 +2613,7 @@ mod tests {
                     return FfiError::invalid_argument("expected one input and one output buffer").to_c_api(api);
                 };
                 let length = output.dimensions().iter().product::<i64>() as usize;
-                std::ptr::copy_nonoverlapping(input.data() as *const f32, output.data() as *mut f32, length);
+                std::ptr::copy(input.data() as *const f32, output.data() as *mut f32, length);
                 std::ptr::null_mut()
             }
         }
@@ -2490,6 +2641,31 @@ mod tests {
         let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&outputs[0]), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+        // Both an omitted declaration and a `None` entry request row-major storage, even when the input type and
+        // device buffer are column-major. The handler's physical copy exposes any missing conversion.
+        let column_major_type = replicated_type(&mesh, DataType::F32, &[2, 3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let input = XlaArray::from_host_buffer(
+            &domain,
+            column_major_type,
+            mesh.clone(),
+            values_to_bytes(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        let operation = CustomCallOperation::new(TARGET, vec![replicated_type(&mesh, DataType::F32, &[6])]);
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
+        assert_eq!(read_f32s(&outputs[0]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let outputs =
+            CustomCall::custom_call(&operation.with_input_layouts([None]), std::slice::from_ref(&input)).unwrap();
+        assert_eq!(read_f32s(&outputs[0]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Aliasing applies to the converted row-major buffer. The handler also permits input/output overlap.
+        let operation = CustomCallOperation::new(TARGET, vec![replicated_type(&mesh, DataType::F32, &[2, 3])])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
+        assert_eq!(read_f32s(&outputs[0]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     /// [`CustomCallOperation::call`] binds a call without array inputs directly in the eager XLA domain, which executes
@@ -2625,7 +2801,7 @@ mod tests {
     /// its body region, into the composite family.
     #[test]
     fn test_eager_custom_call_batching_executes_registered_ffi_handler() {
-        use ryft_core::{CustomCall, CustomCallBatching, CustomCallOperation};
+        use ryft_core::{CustomCall, CustomCallBatching, CustomCallOperation, CustomCallUnrolling};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2659,19 +2835,22 @@ mod tests {
         .unwrap();
         assert_eq!(read_f32s(&output), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
 
-        let sequential: XlaArray<'_> = batch(
-            move |row| {
-                let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![row_type])
-                    .with_batching(CustomCallBatching::Sequential { unroll: None });
-                Ok(CustomCall::custom_call(&operation, std::slice::from_ref(&row))?.remove(0))
-            },
-            input,
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(read_f32s(&sequential), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
+        for unroll in [CustomCallUnrolling::Disabled, CustomCallUnrolling::Factor(2), CustomCallUnrolling::Full] {
+            let sequential_row_type = row_type.clone();
+            let sequential: XlaArray<'_> = batch(
+                move |row| {
+                    let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![sequential_row_type])
+                        .with_batching(CustomCallBatching::Sequential { unroll });
+                    Ok(CustomCall::custom_call(&operation, std::slice::from_ref(&row))?.remove(0))
+                },
+                input.clone(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(read_f32s(&sequential), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
+        }
     }
 
     /// A custom call wrapped in a custom function with reverse-mode rules differentiates through the user-provided

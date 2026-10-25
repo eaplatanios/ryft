@@ -28,6 +28,7 @@ pub mod exponential;
 pub mod extrema;
 pub mod logical;
 pub mod manipulation;
+pub mod normalization;
 pub mod quantization;
 pub mod random;
 pub mod reductions;
@@ -80,7 +81,7 @@ pub use control_flow::{
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_call::{
     CUSTOM_CALL_OPERATION_NAME, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
-    CustomCallInputOutputAlias, CustomCallOperation,
+    CustomCallInputOutputAlias, CustomCallOperation, CustomCallUnrolling,
 };
 pub use custom_functions::{
     BatchingRuleConsistencyError, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
@@ -112,9 +113,9 @@ pub use dot::{
     RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
 };
 pub use exponential::{
-    EXP_OPERATION_NAME, Exp, ExpOperation, ExponentialOperations, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME,
-    LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation,
-    Logistic, LogisticOperation,
+    EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, Exp, ExpM1, ExpM1Operation, ExpOperation, ExponentialOperations,
+    LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation,
+    Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic, LogisticOperation,
 };
 pub use extrema::{
     CLAMP_OPERATION_NAME, Clamp, ClampOperation, ExtremaOperations, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max,
@@ -140,6 +141,9 @@ pub use manipulation::{
     SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
     TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
     UpdateSliceOperation,
+};
+pub use normalization::{
+    DifferentiableSoftmaxCrossEntropyWithTargetLogits, Softmax, softmax_cross_entropy_with_target_logits,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use random::{

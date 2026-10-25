@@ -1307,13 +1307,52 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         ))
     }
 
-    /// Returns the flat subprogram of this [`Program`] that keeps its whole input boundary and exposes the outputs at
-    /// the positions listed in `outputs`, in that order. This is [`Self::filtered`] over output positions rather than
-    /// [`AtomId`]s for the common case of restricting a program to some of its outputs (e.g., restricting a derived
-    /// program to its live tangent outputs). Every input is kept alive, so the input boundary is unchanged even when
-    /// the selected outputs no longer read some inputs, while instructions that no longer contribute to a selected
-    /// output are removed unless they have observable effects or deferred work. Selecting every output in order returns
-    /// an unchanged flat copy of this program, which also keeps the transform caches of its entry region.
+    /// Returns the flat subprogram of this [`Program`] whose inputs and outputs are selected by the positions in
+    /// `input_order` and `output_order`, in those orders. Input positions must be unique; output positions may repeat.
+    /// Every selected input is kept, even when unused by the selected outputs, so callers can preserve invariant state
+    /// slots. Unselected inputs may be omitted only when the retained computation does not need them.
+    ///
+    /// This is [`Self::filtered`] over public boundary positions rather than [`AtomId`]s. Instructions that no selected
+    /// output needs are removed unless they have observable effects or deferred work; refer to [`Self::filtered`] for
+    /// the graph-projection contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_order`: Positions in the original input boundary to retain, in the resulting input order.
+    ///   - `output_order`: Positions in the original output boundary to expose, in the resulting output order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when a position is out of range, or [`ProgramError::MalformedProgram`]
+    /// when an input position is repeated or a selected output or retained instruction needs an omitted input.
+    pub fn with_boundary(
+        &self,
+        input_order: &[usize],
+        output_order: &[usize],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+    where
+        O: Clone,
+    {
+        for (role, order, count) in
+            [("input", input_order, self.input_count()), ("output", output_order, self.output_count())]
+        {
+            if let Some(index) = order.iter().find(|&&index| index >= count) {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("{role} index {index} is out of range for a program with {count} {role}s"),
+                });
+            }
+        }
+        let inputs = input_order.iter().map(|&index| self.input_ids()[index]).collect::<Vec<_>>();
+        let outputs = output_order.iter().map(|&index| self.output_ids()[index]).collect::<Vec<_>>();
+        Ok(self.filtered(&inputs, &outputs, &inputs)?.0)
+    }
+
+    /// Returns the flat subprogram of this [`Program`] that keeps every input and exposes the output positions in
+    /// `outputs`, in that order. This is [`Self::with_boundary`] with the complete input boundary, for example when
+    /// restricting a derived program to its live tangent outputs. Inputs remain even when the selected outputs do not
+    /// use them; instructions that contribute to no selected output are removed unless they have observable effects or
+    /// deferred work. Selecting every output in order returns an unchanged flat copy, retaining its entry-region
+    /// transform caches.
     ///
     /// # Errors
     ///
@@ -1322,19 +1361,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     where
         O: Clone,
     {
-        let output_count = self.output_count();
-        if let Some(index) = outputs.iter().find(|&&index| index >= output_count) {
-            return Err(ProgramError::InvalidArgument {
-                message: format!("output index {index} is out of range for a program with {output_count} outputs"),
-            });
-        }
-
-        if outputs.iter().copied().eq(0..output_count) {
+        if outputs.iter().copied().eq(0..self.output_count()) {
             return Ok(self.to_flat_program());
         }
-
-        let output_ids = outputs.iter().map(|&index| self.output_ids()[index]).collect::<Vec<_>>();
-        Ok(self.filtered(self.input_ids(), &output_ids, self.input_ids())?.0)
+        self.with_boundary(&(0..self.input_count()).collect::<Vec<_>>(), outputs)
     }
 
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
@@ -2807,9 +2837,9 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
-        PrintOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, ScanOperation,
-        WhileOperation, ZeroLikeOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DivOperation, MulOperation,
+        NegOperation, PrintOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation,
+        ScanOperation, WhileOperation, ZeroLikeOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -5039,6 +5069,124 @@ mod tests {
         let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_with_boundary() {
+        // Reordering permutes both public boundaries without changing the computation.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let index = builder.add_input(ArrayType::scalar(DataType::I64));
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let quotient = builder.add_instruction(DivOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<(Array, Array, Array), (Array, Array)>(
+                vec![quotient, index],
+                (Placeholder, Placeholder, Placeholder),
+                (Placeholder, Placeholder),
+            )
+            .unwrap();
+        assert_eq!(
+            program.with_boundary(&[2, 0, 1], &[1, 0]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:i64[], %2:f64[] .
+                let %3:f64[] = div %2 %0
+                in (%1, %3)
+            "}
+            .trim_end(),
+        );
+
+        // Selected inputs remain even when unused, while omitted unused inputs disappear and outputs may repeat.
+        assert_eq!(
+            program.with_boundary(&[2, 0, 1], &[0]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:i64[], %2:f64[] .
+                let %3:f64[] = div %2 %0
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.with_boundary(&[2, 1], &[0, 0]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = div %1 %0
+                in (%2, %2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_with_boundary_without_inputs() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let first = builder.add_constant(Array::scalar(1.0).unwrap());
+        let second = builder.add_constant(Array::scalar(2.0).unwrap());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![first, second], Vec::new(), vec![Placeholder; 2])
+            .unwrap();
+        let reordered = program.with_boundary(&[], &[1, 0]).unwrap();
+        assert_eq!(
+            reordered.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = const 2.0
+                    %1:f64[] = const 1.0
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(reordered.interpret(vec![]), Ok(vec![Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap()]));
+    }
+
+    #[test]
+    fn test_program_with_boundary_invalid_selection() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap();
+        assert!(matches!(
+            program.with_boundary(&[1], &[0]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "input index 1 is out of range for a program with 1 inputs",
+        ));
+        assert!(matches!(
+            program.with_boundary(&[0], &[1]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "output index 1 is out of range for a program with 1 outputs",
+        ));
+        assert!(matches!(
+            program.with_boundary(&[0, 0], &[0]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "filter input atom %0 was provided more than once",
+        ));
+        assert!(matches!(
+            program.with_boundary(&[], &[0]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "filter atom %0 is not a selected input and has no producer",
+        ));
+    }
+
+    #[test]
+    fn test_program_with_boundary_preserves_effects() {
+        let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input], None).unwrap();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
+        assert_eq!(
+            program.with_boundary(&[1, 0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let () = zero_output_effect %1
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            program.with_boundary(&[1], &[]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "filter atom %0 is not a selected input and has no producer",
+        ));
     }
 
     #[test]

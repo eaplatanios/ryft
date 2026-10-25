@@ -1131,6 +1131,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Tanh(_)
                 | ArrayOperation::Atan2(_)
                 | ArrayOperation::Exp(_)
+                | ArrayOperation::ExpM1(_)
                 | ArrayOperation::Log(_)
                 | ArrayOperation::Logistic(_)
                 | ArrayOperation::Floor(_)

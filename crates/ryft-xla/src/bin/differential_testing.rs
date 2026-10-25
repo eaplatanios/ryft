@@ -756,7 +756,6 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                                 let mut outputs = predicate
                                     .into_value()
                                     .condition(
-                                        vec![weight.into_value(), values.into_value()],
                                         |inputs| {
                                             let weight =
                                                 ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
@@ -765,6 +764,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                                             Ok(vec![(weight * values).into_value()])
                                         },
                                         |inputs| Ok(vec![inputs[1].clone()]),
+                                        vec![weight.into_value(), values.into_value()],
                                     )
                                     .unwrap();
                                 ValueProjection::<ArrayType>::into_projected(outputs.remove(0))

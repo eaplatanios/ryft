@@ -27,22 +27,23 @@ use crate::operations::{
     DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DotProductAttention,
     DotProductAttentionBackwardOperation, DotProductAttentionOperation, DynamicBroadcastOperation,
     DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation, ExponentialOperations, ExtremaOperations,
-    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules,
-    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation,
-    ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
-    ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation,
-    ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation,
-    ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation,
-    ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations,
-    RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDot, ScaledDotOperation, ScanOperation,
-    ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation,
-    SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
-    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
-    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations,
+    ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation,
+    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
+    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
+    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
+    ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
+    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
+    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
+    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
+    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDot, ScaledDotOperation,
+    ScanOperation, ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation,
+    SinOperation, SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation,
+    Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
+    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -83,6 +84,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Tanh(TanhOperation<ArrayType>),
     Atan2(Atan2Operation<ArrayType>),
     Exp(ExpOperation<ArrayType>),
+    ExpM1(ExpM1Operation<ArrayType>),
     Log(LogOperation<ArrayType>),
     Ln1p(Ln1pOperation<ArrayType>),
     LogAddExp(LogAddExpOperation<ArrayType>),
@@ -178,6 +180,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + SaturatingSub<T>
     + TrigonometricOperations<T>
     + ExponentialOperations<T>
+    + Softmax<T>
     + Erf<T>
     + RoundingOperations<T>
     + LogicalOperations<T>
@@ -211,6 +214,7 @@ impl<
         + SaturatingSub<T>
         + TrigonometricOperations<T>
         + ExponentialOperations<T>
+        + Softmax<T>
         + Erf<T>
         + RoundingOperations<T>
         + LogicalOperations<T>

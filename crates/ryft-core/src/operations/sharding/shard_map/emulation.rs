@@ -908,6 +908,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
         output: usize,
         accumulator: Option<LockstepValue<O>>,
         length: usize,
+        placement: &ShardingDimension,
         iteration: usize,
         value: LockstepValue<O>,
     ) -> Result<LockstepValue<O>, ProgramError> {
@@ -924,6 +925,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanIterationType<LockstepDomain<O>> for 
                     output,
                     accumulator,
                     length,
+                    placement,
                     iteration,
                     value,
                 )

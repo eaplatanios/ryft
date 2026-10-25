@@ -277,6 +277,10 @@ pub trait FloatingPointArrayElement: NumericArrayElement {
     /// rules. Complex elements compute `exp(real) * (cos(imaginary) + i * sin(imaginary))`.
     fn exp(self) -> Result<Self, ProgramError>;
 
+    /// Computes `exp(self) - 1` without subtracting one from a rounded exponential, preserving accuracy near zero.
+    /// Complex elements preserve small real and imaginary components with the analytic continuation of this function.
+    fn exp_m1(self) -> Result<Self, ProgramError>;
+
     /// Computes the natural logarithm. Real zero produces negative infinity and negative inputs produce NaN when
     /// representable. Complex elements use the principal logarithm, with a branch cut along the negative real axis.
     /// Real outputs use numerical conversion, so an unrepresentable zero becomes NaN for [`f8e8m0fnu`].
@@ -1783,6 +1787,11 @@ macro_rules! impl_floating_point_array_element_for_real_floating_point_types {
             }
 
             #[inline]
+            fn exp_m1(self) -> Result<Self, ProgramError> {
+                Self::from_real(<$work>::exp_m1(($decode)(self)) as f64)
+            }
+
+            #[inline]
             fn log(self) -> Result<Self, ProgramError> {
                 Self::from_real(<$work>::ln(($decode)(self)) as f64)
             }
@@ -1819,7 +1828,13 @@ macro_rules! impl_floating_point_array_element_for_real_floating_point_types {
 
             #[inline]
             fn logistic(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::recip(<$work>::exp(-($decode)(self)) + 1.0))
+                let input = ($decode)(self);
+                ($encode)(if input >= 0.0 {
+                    <$work>::recip(<$work>::exp(-input) + 1.0)
+                } else {
+                    let exponential = <$work>::exp(input);
+                    exponential / (1.0 + exponential)
+                })
             }
         }
 
@@ -2176,6 +2191,14 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
                 Ok(Complex::exp(self))
             }
 
+            fn exp_m1(self) -> Result<Self, ProgramError> {
+                let (sine, cosine) = self.im.sin_cos();
+                let half_sine = (self.im / 2.0).sin();
+
+                // `cos(b) - 1 = -2 sin(b / 2)²` retains the real correction when `cos(b)` rounds to one.
+                Ok(Complex::new(self.re.exp_m1() * cosine - 2.0 * half_sine * half_sine, self.re.exp() * sine))
+            }
+
             #[inline]
             fn log(self) -> Result<Self, ProgramError> {
                 Ok(Complex::ln(self))
@@ -2235,7 +2258,12 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
 
             #[inline]
             fn logistic(self) -> Result<Self, ProgramError> {
-                Ok(Complex::inv(&(Complex::exp(-self) + 1.0)))
+                Ok(if self.re >= 0.0 {
+                    Complex::inv(&(Complex::exp(-self) + 1.0))
+                } else {
+                    let exponential = Complex::exp(self);
+                    exponential / (exponential + 1.0)
+                })
             }
         }
     };

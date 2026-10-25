@@ -1,6 +1,6 @@
 //! Loops over a shape-determined number of iterations through [`ScanOperation`], which applies an attached body
 //! [`Region`](crate::Region) to loop-carried state, consuming one slice of each stacked input and producing one slice
-//! of each stacked output per iteration>
+//! of each stacked output per iteration.
 //!
 //! A scan application takes the initial carries followed by the stacked inputs and, when its length is dynamic, a
 //! trailing first-class dimension that supplies the trip count. It returns the final carries followed by the stacked
@@ -944,7 +944,7 @@ where
                 )
                 .collect::<Vec<_>>();
             let output_order = (0..program.output_count()).collect::<Vec<_>>();
-            program = reorder_program_boundary(&program, &input_order, &output_order)?;
+            program = program.with_boundary(&input_order, &output_order)?;
         }
         let outputs = context.parent().bind(
             self.with_added_carries(entering.len() + carried_inputs.len()),
@@ -1480,12 +1480,15 @@ where
         }
         let fused = FusedScanJvp::<C::Constant, C::Operation>::new(self, driver, &inputs)?;
         let scan_inputs = fused.inputs(context, &inputs)?;
-        let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
+        let mut primal_outputs = if std::ptr::eq(context.primal(), context.tangent()) {
             fused.bind_fused(context.primal(), &scan_inputs)?
         } else {
             fused.bind_linearized(context, driver, body, &scan_inputs)?
         };
-        let mut outputs = fused.into_duals(outputs)?;
+        // Both paths return primals followed by live tangents. Restore structural-zero output tangents before
+        // forwarding unchanged carries from their guarded inputs.
+        let tangent_outputs = primal_outputs.split_off(fused.output_live.len());
+        let mut outputs = DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &fused.output_live)?;
         forward_scan_carries(body, self.carry_count, &inputs, &mut outputs);
         Ok(outputs)
     }
@@ -3386,7 +3389,7 @@ where
                 .chain(bookkeeping_count + 1..batched_body.input_ids().len())
                 .collect::<Vec<_>>();
             let output_order = (0..batched_body.output_ids().len()).collect::<Vec<_>>();
-            reorder_program_boundary(&batched_body, &input_order, &output_order)?
+            batched_body.with_boundary(&input_order, &output_order)?
         }
     };
     let batched_scan = ScanOperation { carry_count: carry_count + bookkeeping_count, ..operation.clone() };
@@ -3433,22 +3436,6 @@ fn live_scan_signature_permutation(has_tangent: &[bool], carry_count: usize) -> 
     permutation
 }
 
-/// Reorders inputs and selects outputs through the shared graph projection. The caller constructs these positions
-/// from validated scan signatures; keeping every selected input alive preserves unused carry slots.
-fn reorder_program_boundary<V, O>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
-    input_order: &[usize],
-    output_order: &[usize],
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
-where
-    V: Value,
-    O: Operation<Type = V::Type>,
-{
-    let inputs = input_order.iter().map(|&index| program.input_ids()[index]).collect::<Vec<_>>();
-    let outputs = output_order.iter().map(|&index| program.output_ids()[index]).collect::<Vec<_>>();
-    program.filtered(&inputs, &outputs, &inputs).map(|(program, _)| program)
-}
-
 /// Fused forward-mode application of a [`ScanOperation`]: one scan over the compact fused body that carries a tangent
 /// exactly for the body inputs and outputs whose tangents are live. Plumbing references, zero-space inputs, and
 /// structural-zero tangents are not live, so inactive carries keep structural-zero tangents instead of threading
@@ -3465,9 +3452,6 @@ struct FusedScanJvp<V: Value, O: Operation<Type = V::Type>> {
 
     /// Fused forward-mode program of the body with respect to `input_indices`, in JVP order.
     jvp_program: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
-    /// Whether the tangent of each body input is live, including the intrinsic index, whose tangent never is.
-    input_tangent_liveness: Vec<bool>,
 
     /// Indices of the body inputs whose tangents are live, in order.
     input_indices: Vec<usize>,
@@ -3525,7 +3509,6 @@ impl<V: Value<Type: ScanType + DifferentiableType>, O: Operation<Type = V::Type>
         Ok(Self {
             operation,
             jvp_program: activity.jvp_program().clone(),
-            input_tangent_liveness,
             input_indices,
             input_order,
             output_order,
@@ -3551,13 +3534,14 @@ impl<V: Value<Type: ScanType + DifferentiableType>, O: Operation<Type = V::Type>
         P: DifferentiationPolicy<C>,
         O: ResidualZeroProvider<V::Type, Operation = O>,
     {
-        let body_input_count = self.input_tangent_liveness.len();
+        // The fused boundary adds one input per live tangent. Body position `0` is the intrinsic index, so live
+        // body positions are offset by one from their corresponding scan inputs.
+        let body_input_count = self.input_order.len() - self.input_indices.len();
         let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_count - 1);
-        let tangents = body_inputs
+        let tangents = self
+            .input_indices
             .iter()
-            .zip(&self.input_tangent_liveness[1..])
-            .filter(|(_, live)| **live)
-            .map(|(input, _)| context.materialize_dual_tangent(input))
+            .map(|&index| context.materialize_dual_tangent(&body_inputs[index - 1]))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self.input_order[1..]
             .iter()
@@ -3594,7 +3578,7 @@ impl<V: Value<Type: ScanType + DifferentiableType>, O: Operation<Type = V::Type>
                 None => position,
             })
             .collect::<Vec<_>>();
-        let body = reorder_program_boundary(&self.jvp_program, &self.input_order, &body_output_order)?;
+        let body = self.jvp_program.with_boundary(&self.input_order, &body_output_order)?;
         let outputs = context.bind(O::from(self.operation.clone()), vec![body], scan_inputs)?;
         self.to_jvp_order(outputs)
     }
@@ -3624,7 +3608,7 @@ impl<V: Value<Type: ScanType + DifferentiableType>, O: Operation<Type = V::Type>
         V::Type: TemporalResidualType,
         O: From<ScanOperation<V::Type>> + TemporalResidualOperation<V::Type>,
     {
-        let body_input_count = self.input_tangent_liveness.len();
+        let body_input_count = self.input_order.len() - self.input_indices.len();
         let body_output_count = self.output_live.len();
         let live_input_count = self.input_indices.len();
         let (primal_program, tangent_program, residual_count) =
@@ -3725,20 +3709,6 @@ impl<V: Value<Type: ScanType + DifferentiableType>, O: Operation<Type = V::Type>
             ordered[position] = Some(output);
         }
         Ok(ordered.into_iter().map(Option::unwrap).collect())
-    }
-
-    /// Pairs the fused scan's `outputs`, in JVP order, into one dual per scan output.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of pairing a primal output with its tangent.
-    fn into_duals<Output: Value<Type = V::Type>>(
-        self,
-        outputs: Vec<Output>,
-    ) -> Result<Vec<DifferentiationDual<Output>>, DifferentiationError> {
-        let mut primal_outputs = outputs;
-        let tangent_outputs = primal_outputs.split_off(self.output_live.len());
-        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &self.output_live)
     }
 }
 
@@ -22274,35 +22244,5 @@ mod tests {
         assert_eq!(live_scan_signature_permutation(&[true, false, true, true], 2), vec![0, 1, 4, 2, 3, 5, 6]);
         assert_eq!(live_scan_signature_permutation(&[false, true, false], 1), vec![0, 1, 2, 3]);
         assert_eq!(live_scan_signature_permutation(&[false, false], 2), vec![0, 1]);
-    }
-
-    #[test]
-    fn test_reorder_program_boundary() {
-        // Reordering permutes both public boundaries without changing the computation.
-        let program = scalar_body(2, |builder, inputs| {
-            let quotient =
-                builder.add_instruction(DivOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None).unwrap()[0];
-            vec![quotient, inputs[0]]
-        });
-        let reordered = reorder_program_boundary(&program, &[2, 0, 1], &[1, 0]).unwrap();
-        assert_eq!(
-            reordered.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:i64[], %2:f64[] .
-                let %3:f64[] = div %2 %0
-                in (%1, %3)
-            "}
-            .trim_end(),
-        );
-
-        // Nullary programs reorder only their outputs.
-        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
-        let first = builder.add_constant(Array::scalar(1.0).unwrap());
-        let second = builder.add_constant(Array::scalar(2.0).unwrap());
-        let nullary = builder.build(vec![first, second], Vec::new(), vec![Placeholder; 2]).unwrap();
-        assert_eq!(
-            reorder_program_boundary(&nullary, &[], &[1, 0]).unwrap().interpret(vec![]),
-            Ok(vec![Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap(),])
-        );
     }
 }

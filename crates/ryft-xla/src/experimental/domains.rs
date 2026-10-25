@@ -5736,6 +5736,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Tan(_)
         | ArrayOperation::Atan2(_)
         | ArrayOperation::Exp(_)
+        | ArrayOperation::ExpM1(_)
         | ArrayOperation::Log(_)
         | ArrayOperation::Ln1p(_)
         | ArrayOperation::LogAddExp(_)
@@ -12433,23 +12434,16 @@ mod tests {
             [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
         );
         assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
+        // Three visible keys have equal scores and values 0, 1, 2. Each query contributes
+        // `dS[j] = (1 / 3) * 8 * (j - 1)`, so summing three visible queries gives `dK[j] = 8 * (j - 1)`
+        // and `dV[j] = 3 * (1 / 3) = 1`. The rounded BF16 residual must not rescale these probabilities.
         assert_eq!(
             read_bf16s(&client, &at_bound[3]),
-            [-7.78125, 0.0, 7.78125, 0.0]
-                .into_iter()
-                .cycle()
-                .take(16)
-                .flat_map(|value| [value; 8])
-                .collect::<Vec<_>>(),
+            [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
         );
         assert_eq!(
             read_bf16s(&client, &at_bound[4]),
-            [0.97265625, 0.97265625, 0.97265625, 0.0]
-                .into_iter()
-                .cycle()
-                .take(16)
-                .flat_map(|value| [value; 8])
-                .collect::<Vec<_>>(),
+            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
         );
 
         let zero = XlaArray::from_host_buffer(&domain, size_type, mesh, 0_i64.to_ne_bytes().as_slice()).unwrap();
