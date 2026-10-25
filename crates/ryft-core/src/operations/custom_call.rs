@@ -40,8 +40,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext};
 use crate::differentiation::{
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, MemberDifferentiableOperation,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    MemberDifferentiableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -1203,40 +1203,6 @@ impl CustomCallOperation {
             }),
         }
     }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the forward-mode differentiation of this call in either universe. Foreign kernels have no derivable
-    /// derivative, so users must call them through a [`custom_function`](crate::custom_function) with derivative rules
-    /// to propagate live tangents (which is also how JAX handles `ffi_call` differentiation). When every input tangent
-    /// is a structural zero, including when the call has no inputs, the outputs carry no tangent either, and so the
-    /// call is replayed unchanged on the primal inputs and each output is paired with a structural zero tangent. This
-    /// case is reached whenever the driver's own zero-tangent shortcut does not apply (e.g., for calls with no inputs).
-    fn jvp_without_tangents<C: Context<Operation: From<CustomCallOperation>>>(
-        &self,
-        context: &C,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C::Type: DifferentiableType,
-    {
-        if inputs.iter().any(|input| !input.tangent().is_zero()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "custom call `{}` has no differentiation rule; call it through a `custom_function` with \
-                     derivative rules to provide one",
-                    self.target_name,
-                ),
-            }
-            .into());
-        }
-        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        context
-            .bind(self.clone(), Vec::new(), primals.as_slice())?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect()
-    }
 }
 
 impl Display for CustomCallOperation {
@@ -1245,6 +1211,8 @@ impl Display for CustomCallOperation {
         self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Operation for CustomCallOperation {
     type Type = ArrayType;
@@ -1459,6 +1427,8 @@ where
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl_differentiable_operation! {
     CustomCallOperation,
     jvp<C>
@@ -1466,7 +1436,27 @@ impl_differentiable_operation! {
         C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>,
     {
         |operation, context, _driver, inputs| {
-            operation.jvp_without_tangents(context.primal(), inputs)
+            // Foreign kernels require explicit custom-function derivative rules to propagate live tangents.
+            if inputs.iter().any(|input| !input.tangent().is_zero()) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "custom call `{}` has no differentiation rule; call it through a `custom_function` with \
+                         derivative rules to provide one",
+                        operation.target_name,
+                    ),
+                }
+                .into());
+            }
+
+            // Replay the primal call with structural-zero output tangents, including when the call has no inputs
+            // and the driver's usual zero-tangent shortcut does not apply.
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            context
+                .primal()
+                .bind(operation.clone(), Vec::new(), primals.as_slice())?
+                .into_iter()
+                .map(DifferentiationDual::new_with_zero_tangent)
+                .collect()
         }
     },
     transpose = @nonlinear,
@@ -1739,9 +1729,27 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>> Membe
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The trailing output-extent inputs are integer dimensions whose tangents are always structural zeros, so the
-        // mixed universe follows the same rule as the homogeneous one.
-        self.jvp_without_tangents(context.primal(), inputs)
+        // Trailing output extents are integer dimensions with structural-zero tangents. Any live array tangent
+        // still requires explicit custom-function derivative rules for the foreign kernel.
+        if inputs.iter().any(|input| !input.tangent().is_zero()) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no differentiation rule; call it through a `custom_function` with \
+                     derivative rules to provide one",
+                    self.target_name,
+                ),
+            }
+            .into());
+        }
+
+        // Replay the primal call with structural-zero output tangents, including calls without inputs.
+        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        context
+            .primal()
+            .bind(self.clone(), Vec::new(), primals.as_slice())?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect()
     }
 }
 
