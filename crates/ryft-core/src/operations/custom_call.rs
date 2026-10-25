@@ -873,6 +873,107 @@ impl CustomCallOperation {
         Ok((array_input_count, refinements, output_types))
     }
 
+    /// Batches this call through a scan over `arrays`, whose mapped axes have already been aligned to axis `0`.
+    /// Replicated arrays and trailing output `extents` are invariant carries. The body restores the call's original
+    /// input order, then returns those carries unchanged followed by the per-item results. `length_input` supplies
+    /// the scan's runtime trip count when `batch_dimension` is dynamic.
+    fn batch_sequential<
+        C: Context<Type: From<ArrayType>, Operation: From<CustomCallOperation> + From<ScanOperation<C::Type>>>,
+        P: BatchingPolicy<C>,
+    >(
+        &self,
+        context: &BatchingContext<C, P>,
+        arrays: &[P::Batch],
+        extents: &[P::Batch],
+        batch_dimension: Dimension,
+        length_input: Option<&C::Value>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        // Replicated arrays are invariant carries; mapped arrays are stacks that the scan slices along axis `0`.
+        // Retain the original indices so the carry/stack partition does not change the custom call's input order.
+        let (carry_indices, stacked_indices): (Vec<_>, Vec<_>) =
+            (0..arrays.len()).partition(|&index| P::batch_axis(&arrays[index]).is_replicated());
+
+        // The scan supplies an iteration index before the carries and slices; the custom call does not consume it.
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+
+        // Extents lead the carries so the call can reuse them as its trailing dimension inputs.
+        let mut carry_inputs = extents
+            .iter()
+            .map(|extent| builder.add_input(P::unbatched_type(extent).into_owned()))
+            .collect::<Vec<_>>();
+        let mut packed = extents.iter().map(P::value).cloned().collect::<Vec<_>>();
+        let mut call_inputs = vec![None; arrays.len()];
+
+        // Declare body inputs and pack scan inputs in the same carry-first order. Body types omit the mapped axis,
+        // while packed values retain it so the scan can select each iteration's slice.
+        for &index in carry_indices.iter().chain(stacked_indices.iter()) {
+            let input = builder.add_input(P::unbatched_type(&arrays[index]).into_owned());
+            call_inputs[index] = Some(input);
+            if P::batch_axis(&arrays[index]).is_replicated() {
+                carry_inputs.push(input);
+            }
+            packed.push(P::value(&arrays[index]).clone());
+        }
+
+        // Restore the custom call's array input order, then append its result extents from the leading carries.
+        // The partition visits every array exactly once, so every input slot is populated before unwrapping.
+        let call_inputs = call_inputs
+            .into_iter()
+            .map(Option::unwrap)
+            .chain(carry_inputs[..extents.len()].iter().copied())
+            .collect::<Vec<_>>();
+
+        // Per-item outputs can vary over the mapped axis's manual mesh axes, just as `ArrayType::unbatched` exposes
+        // on input slices. Extend declared shardings accordingly; outputs without a sharding inherit input variation
+        // during inference. Single-call batching records this variation through `ArrayType::batched` instead.
+        let output_types = self
+            .output_types
+            .iter()
+            .map(|output_type| {
+                let Some(sharding) = output_type.sharding() else {
+                    return Ok(output_type.clone());
+                };
+                let manual_axes = context.axis_sharding().manual_axes(sharding.mesh());
+                if manual_axes.is_empty() {
+                    return Ok(output_type.clone());
+                }
+                let mut sharding = sharding.clone();
+                sharding
+                    .extend_varying_manual_axes(manual_axes)
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+
+        // Apply the call to one item and return all invariant carries unchanged. Only the call's results are stacked
+        // by the scan, so carried extents remain available to declare the result shapes on every iteration.
+        let operation = Self { output_types, ..self.clone() };
+        let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
+        let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
+        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            body_outputs,
+            vec![Placeholder; 1 + extents.len() + arrays.len()],
+            vec![Placeholder; carry_inputs.len() + self.output_types.len()],
+        )?;
+
+        // Stacked results carry the batch axis's placement, like every other batched value.
+        let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
+            .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
+        if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
+            scan = scan.with_unroll(unroll)?;
+        }
+
+        // A dynamic trip count is a trailing scan input, separate from the per-item result extents carried above.
+        packed.extend(length_input.cloned());
+        let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
+        check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
+
+        // Drop the invariant carry results; each remaining stack exposes its leading scan axis as the batch axis.
+        outputs.drain(..carry_inputs.len());
+        outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect()
+    }
+
     /// Returns this call's declared input layouts for a single-call batching strategy, in which the inputs
     /// selected by `batch_prefixed` gain a leading batch axis and their declared layouts shift accordingly. Refer to
     /// [`batch_prefixed_layout`](Self::batch_prefixed_layout) for how layouts shift. Inputs that keep their shape keep
@@ -952,89 +1053,6 @@ impl CustomCallOperation {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Batches this call through a scan over `arrays`, whose mapped axes have already been aligned to axis 0.
-    /// Replicated arrays and trailing output `extents` are invariant carries. The body restores the call's original
-    /// input order, then returns those carries unchanged followed by the per-item results. `length_input` supplies
-    /// the scan's runtime trip count when `batch_dimension` is dynamic.
-    fn batch_sequential<C: Context, P: BatchingPolicy<C>>(
-        &self,
-        context: &BatchingContext<C, P>,
-        arrays: &[P::Batch],
-        extents: &[P::Batch],
-        batch_dimension: Dimension,
-        length_input: Option<&C::Value>,
-    ) -> Result<Vec<P::Batch>, BatchingError>
-    where
-        C::Type: From<ArrayType>,
-        C::Operation: From<CustomCallOperation> + From<ScanOperation<C::Type>>,
-    {
-        let (carry_indices, stacked_indices): (Vec<_>, Vec<_>) =
-            (0..arrays.len()).partition(|&index| P::batch_axis(&arrays[index]).is_replicated());
-        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-        builder.add_input(ArrayType::scalar(DataType::I64).into());
-        // Extents lead the carries so the call can reuse them as its trailing dimension inputs.
-        let mut carry_inputs = extents
-            .iter()
-            .map(|extent| builder.add_input(P::unbatched_type(extent).into_owned()))
-            .collect::<Vec<_>>();
-        let mut packed = extents.iter().map(P::value).cloned().collect::<Vec<_>>();
-        let mut call_inputs = vec![None; arrays.len()];
-        for &index in carry_indices.iter().chain(stacked_indices.iter()) {
-            let input = builder.add_input(P::unbatched_type(&arrays[index]).into_owned());
-            call_inputs[index] = Some(input);
-            if P::batch_axis(&arrays[index]).is_replicated() {
-                carry_inputs.push(input);
-            }
-            packed.push(P::value(&arrays[index]).clone());
-        }
-        let call_inputs = call_inputs
-            .into_iter()
-            .map(Option::unwrap)
-            .chain(carry_inputs[..extents.len()].iter().copied())
-            .collect::<Vec<_>>();
-        // Per-item outputs can vary over the mapped axis's manual mesh axes, just as `ArrayType::unbatched` exposes
-        // on input slices. Extend declared shardings accordingly; outputs without a sharding inherit input variation
-        // during inference. Single-call batching records this variation through `ArrayType::batched` instead.
-        let output_types = self
-            .output_types
-            .iter()
-            .map(|output_type| {
-                let Some(sharding) = output_type.sharding() else {
-                    return Ok(output_type.clone());
-                };
-                let manual_axes = context.axis_sharding().manual_axes(sharding.mesh());
-                if manual_axes.is_empty() {
-                    return Ok(output_type.clone());
-                }
-                let mut sharding = sharding.clone();
-                sharding
-                    .extend_varying_manual_axes(manual_axes)
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let operation = Self { output_types, ..self.clone() };
-        let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
-        let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
-        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-            body_outputs,
-            vec![Placeholder; 1 + extents.len() + arrays.len()],
-            vec![Placeholder; carry_inputs.len() + self.output_types.len()],
-        )?;
-
-        // Stacked results carry the batch axis's placement, like every other batched value.
-        let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
-            .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
-        if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
-            scan = scan.with_unroll(unroll)?;
-        }
-        packed.extend(length_input.cloned());
-        let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
-        check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
-        outputs.drain(..carry_inputs.len());
-        outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect()
-    }
 
     /// Returns the [`ScanOperation`] unroll factor that the selected sequential [`CustomCallBatching`] behavior requests
     /// for a mapped axis of extent `batch_dimension`, or [`None`] to keep one kernel call per loop trip.
