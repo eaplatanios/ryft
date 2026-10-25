@@ -66,9 +66,7 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
-use crate::operations::composites::functions::{
-    CompositeCallContext, CompositeJvp, ExplicitJvp, JvpComposite, composite,
-};
+use crate::operations::composites::functions::{CompositeCallContext, JvpComposite, composite};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -444,11 +442,7 @@ where
         &self,
         logits: V,
         target_logits: V,
-    ) -> Result<V, ProgramError>
-    where
-        ExplicitJvp<(DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>:
-            CompositeJvp<C::Constant, C::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
-    {
+    ) -> Result<V, ProgramError> {
         // Placement is validated before the alignment below, which would otherwise report a `parallel_vary` error
         // for a reduced input instead of this function's own rejection. The primal validates the remaining contract.
         validate_normalization_placement("softmax_cross_entropy_with_target_logits", &logits.r#type())?;

@@ -14395,7 +14395,7 @@ mod tests {
                 let %2:f64[] = condition %1 %0 [
                     true={
                         lambda %0:f64[] .
-                        let %1:f64[] = scan [carry_count=1, length=3, reverse=true] %0 [
+                        let %1:f64[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                             body={
                                 lambda %0:i64[], %1:f64[] .
                                 let %2:f64[] = add %1 %1
@@ -14406,7 +14406,7 @@ mod tests {
                     },
                     false={
                         lambda %0:f64[] .
-                        let %1:f64[] = scan [carry_count=1, length=3, reverse=true] %0 [
+                        let %1:f64[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                             body={
                                 lambda %0:i64[], %1:f64[] .
                                 let %2:f64[] = add %1 %1

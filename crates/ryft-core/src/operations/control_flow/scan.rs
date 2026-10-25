@@ -3,34 +3,34 @@
 //! of each stacked output per iteration.
 //!
 //! A scan application takes the initial carries followed by the stacked inputs and, when its iteration count is
-//! dynamic, a trailing first-class dimension that supplies the trip count. It returns the final carries followed by the
-//! stacked outputs. The body maps the iteration index, the carries, and the current slices (or whole reference stacks)
-//! to the next carries and the slices of the stacked outputs, and it must return each reference carry as the reference
-//! that it entered with. [`ScanType`] states this contract once using the type universe's array, dimension, and
-//! reference projections, including that every stacked leading axis has the trip count as its extent. Conflicting
-//! static extents are type errors, while the scan boundary checks at runtime the relationships between its inputs that
-//! their types leave unproven (e.g., two carries that the body declares as `f32[n]` but that are supplied as `f32[n]`
-//! and `f32[3]`, or an `f32[3]` stack next to an iteration count of type `dimension<iteration_count>`). A rule that
-//! removes or splits the boundary first stages an entry guard that performs the same checks. Every transformation rule
-//! validates this complete contract before it executes, rewrites, or stages the body (reference discharge over the
-//! allocations that it threads), so whether an application is accepted depends neither on the transformation nor on the
-//! trip count. The exception is dead-code elimination (e.g., [`Program::into_simplified`]), which removes an unused
-//! scan together with its boundary checks, like any other pure instruction, whereas partial evaluation keeps those
-//! checks in its entry guard. The rules are:
+//! dynamic, a trailing first-class dimension that supplies the iteration count. It returns the final carries followed
+//! by the stacked outputs. The body maps the iteration index, the carries, and the current slices (or whole reference
+//! stacks) to the next carries and the slices of the stacked outputs, and it must return each reference carry as the
+//! reference that it entered with. [`ScanType`] states this contract once using the type universe's array, dimension,
+//! and reference projections, including that every stacked leading axis has the iteration count as its extent.
+//! Conflicting static extents are type errors, while the scan boundary checks at runtime the relationships between its
+//! inputs that their types leave unproven (e.g., two carries that the body declares as `f32[n]` but that are supplied
+//! as `f32[n]` and `f32[3]`, or an `f32[3]` stack next to an iteration count of type `dimension<iteration_count>`). A
+//! rule that removes or splits the boundary first stages an entry guard that performs the same checks. Every
+//! transformation rule validates this complete contract before it executes, rewrites, or stages the body (reference
+//! discharge over the allocations that it threads), so whether an application is accepted depends neither on the
+//! transformation nor on the iteration count. The exception is dead-code elimination (e.g.,
+//! [`Program::into_simplified`]), which removes an unused scan together with its boundary checks, like any other pure
+//! instruction, whereas partial evaluation keeps those checks in its entry guard. The rules are:
 //!
 //!   - **Interpretation:** The body runs once per iteration in visit order (from the last slice to the first for a
 //!     reversed scan), and each output stack is allocated from the type of its first slice, with its leading axis
 //!     placed as the scan declares for that output.
 //!   - **Reference Discharge:** A discharged reference carry or stack becomes a whole-root state carry that the body
-//!     indexes itself, and a zero-trip scan over empty state is replaced by an entry guard over its boundary.
+//!     indexes itself, and a scan with no iterations over empty state is replaced by an entry guard over its boundary.
 //!   - **Boundary Pruning:** The kept carries are the fixed point of the carries that the used outputs need, while
 //!     stacked inputs and outputs are pruned independently, except that a dead stack whose leading extent the input
 //!     types do not prove equal to the iteration count is kept, so that the boundary still checks it.
 //!   - **Partial Evaluation:** A fixed point over carry knownness splits the scan into a known scan, which stacks the
 //!     per-iteration residuals that the unknown side consumes, and a residual scan, while loop-invariant residuals are
 //!     computed once before the loop.
-//!   - **Batching:** One batched scan carries every mapped carry at batch axis 0 and keeps the batch axes of the
-//!     stacks off their leading scan axis, with a bounded fixed point over which carries are batched.
+//!   - **Batching:** One batched scan carries every mapped carry at batch axis 0 and keeps the batch axes of the stacks
+//!     off their leading scan axis, with a bounded fixed point over which carries are batched.
 //!   - **Differentiation:** Forward mode stages one fused scan over a fixed point of the live carry tangents,
 //!     separate-context linearization stacks varying residuals and hoists invariant ones, and transposition runs the
 //!     transposed body in a scan of the opposite direction.
@@ -113,7 +113,7 @@ use crate::tracing::{Tracer, TracingContext};
 /// have equal extents: static extents must agree, and the scan boundary checks at runtime the relationships that the
 /// input types leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type
 /// that carries no identity that such a check could relate to the iteration count, so its leading extent must be
-/// provably equal to the trip count.
+/// provably equal to the iteration count.
 pub trait ScanType:
     Type<Identity = DimensionVariable>
     + ArrayMemberType
@@ -140,15 +140,15 @@ pub trait ScanType:
 
     /// Validates the intrinsic index and carry contracts of a declared iteration body independently of the values that
     /// bind it. Transform rules use this before rewriting or eliminating a scan so specialization cannot erase an
-    /// invalid source signature. Every reference stack must have a static referent whose leading axis is the iteration
-    /// count, and every stacked output must be an array.
+    /// invalid source signature. Every reference stack must have a static referent whose leading extent equals the
+    /// iteration count, and every stacked output must be an array.
     ///
     /// # Parameters
     ///
     ///   - `body_input_types`: Declared body inputs, including the intrinsic scalar `i64` index.
     ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
     ///   - `carry_count`: Number of matching carry positions on both boundaries.
-    ///   - `iteration_count`: Declared trip count, validated independently of a runtime value.
+    ///   - `iteration_count`: Declared iteration count, validated independently of a runtime value.
     ///
     /// # Errors
     ///
@@ -160,7 +160,7 @@ pub trait ScanType:
         carry_count: usize,
         iteration_count: &Dimension,
     ) -> Result<(), TypeError> {
-        // Validate the declared trip count before inspecting or specializing the body signature.
+        // Validate the declared iteration count before inspecting or specializing the body signature.
         if let Some(iteration_count) = iteration_count.value()
             && iteration_count > MAX_DIMENSION_EXTENT
         {
@@ -375,8 +375,8 @@ pub trait ScanType:
         Self::validate_scan_input_type_signature(body_input_types, carry_count, iteration_count, input_types)?;
         let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, iteration_count)?;
 
-        // An iteration count input that only refines the declared bounds fixes the trip count to one exact extent, so
-        // the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared iteration
+        // An iteration count input that only refines the declared bounds fixes the iteration count to one exact extent,
+        // so the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared iteration
         // count. Leaving them symbolic would type a concretely sized result as an independent runtime extent.
         let effective_iteration_count = match validate_scan_iteration_count(iteration_count, input_types, carry_count)?
         {
@@ -392,13 +392,13 @@ pub trait ScanType:
         )?;
 
         // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
-        // separate step from the trip-count refinement above: the stacked outputs' leading axis describes the trip
-        // count that is fixed before the first iteration, so it stays refined even when a first-class dimension carry
-        // shares the iteration count's identity and keeps every carry that refers to it symbolic. An iteration count
-        // of another type (e.g., the exact type of an eager dimension value) is a member of the facts like every other
-        // input, so that no carry declared with the iteration count's identity establishes an extent that disagrees
-        // with the trip count, while one that carries the iteration count's own identity establishes nothing beyond
-        // the declared bounds. Only the carries preserve the identities of reference inputs.
+        // separate step from the iteration count refinement above: the stacked outputs' leading axis describes the
+        // iteration count that is fixed before the first iteration, so it stays refined even when a first-class
+        // dimension carry shares the iteration count's identity and keeps every carry that refers to it symbolic. An
+        // iteration count of another type (e.g., the exact type of an eager dimension value) is a member of the facts
+        // like every other input, so that no carry declared with the iteration count's identity establishes an extent
+        // that disagrees with the iteration count, while one that carries the iteration count's own identity
+        // establishes nothing beyond the declared bounds. Only the carries preserve the identities of reference inputs.
         let nominal_iteration_count = iteration_count.variable().is_some_and(|variable| {
             matches!(input_types.last().cloned().map(Into::into), Some(ArrayIrType::Dimension(r#type))
                 if r#type.variable() == Some(variable))
@@ -418,8 +418,8 @@ impl ScanType for ArrayType {
     fn iteration_count_type(iteration_count: &Dimension) -> Result<Self, TypeError> {
         Err(TypeError::invalid(format!(
             "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `{iteration_count}`; \
-             use an array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip \
-             count",
+             use an array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic \
+             iteration count",
         )))
     }
 
@@ -476,8 +476,8 @@ pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the value cannot supply a valid trip count. Static-only families never call this function
-    /// through a validated scan and may reject the request.
+    /// Returns an error when the value cannot supply a valid iteration count. Static-only families never call this
+    /// function through a validated scan and may reject the request.
     fn iteration_count(iteration_count: &Self::Value) -> Result<usize, ProgramError>;
 
     /// Returns the value of the intrinsic index input of iteration `iteration`, as a scalar [`I64`](DataType::I64)
@@ -696,10 +696,10 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
     }
 }
 
-// Array IR scans interpret their array stacks through the homogeneous array `EagerContext` and take a dynamic trip
-// count from the trailing first-class dimension input. A concrete `Array` relabels its type without changing its
-// elements, so a slice whose manual variation differs from that of its stack widens both to the join of their
-// variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its
+// Array IR scans interpret their array stacks through the homogeneous array `EagerContext` and take a dynamic
+// iteration count from the trailing first-class dimension input. A concrete `Array` relabels its type without
+// changing its elements, so a slice whose manual variation differs from that of its stack widens both to the join
+// of their variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its
 // stacks the same way whether or not its body uses collectives over the emulated manual axes.
 impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext<ArrayIrValue<Array>, O> {
     #[inline]
@@ -814,9 +814,9 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 
 /// [`Operation`] that applies a nested body [`Program`] a shape-determined number of times over loop-carried state,
 /// consuming one slice of each stacked array input per iteration and stacking the body's per-iteration outputs.
-/// Reference inputs supply complete roots so the body can select its own views. The shape-determined trip count lets
-/// linearization save per-iteration residuals in stacks with known shapes and lets transposition process those stacks
-/// in reverse visit order.
+/// Reference inputs supply complete roots so the body can select its own views. The shape-determined iteration count
+/// lets linearization save per-iteration residuals in stacks with known shapes and lets transposition process those
+/// stacks in reverse visit order.
 ///
 /// The body [`Program`] maps `[index, carry..., x_slice_or_reference...]` to `[carry..., y_slice...]`. Input zero is a
 /// scalar [`I64`](DataType::I64) array containing the selected slice index. The next [`carry_count`](Self::carry_count)
@@ -826,18 +826,18 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 ///
 /// Operation inputs are `[carry..., stacked_xs...]` and outputs are `[final_carry..., stacked_ys...]`. The intrinsic
 /// index is not an operation input or carry. Iteration `i` consumes slice `i` of every stacked array input and produces
-/// slice `i` of every stacked output. With [`reverse`](Self::reverse), the body receives indices from `iteration_count
-/// - 1` down to `0`: visit order changes but input/output slice pairing stays the same. Transposition flips that order
-/// and obtains the index from the reversed loop, without storing a stack of indices.
+/// slice `i` of every stacked output. With [`reverse`](Self::reverse), the body receives indices in descending order,
+/// from `iteration_count - 1` to `0`: visit order changes but input/output slice pairing stays the same. Transposition
+/// flips that order and obtains the index from the reversed loop, without storing a stack of indices.
 ///
 /// The explicit [`iteration_count`](Self::iteration_count) also supports scans with no stacked inputs. Homogeneous
 /// [`ArrayType`] scans require a static iteration count. [`ArrayIrType`] scans may use a dynamic dimension identity and
 /// consume its matching first-class dimension value as a trailing runtime input. Every stacked leading axis must then
 /// have the iteration count as its extent, which the scan boundary checks at runtime when the input types leave it
 /// unproven (e.g., for an `f32[3]` stack next to an iteration count of type `dimension<iteration_count>`). An iteration
-/// count of an unrelated identity is admitted only when its bounds fix one exact extent, which then is the trip count.
-/// Reference stacks have static types that carry no identity that a runtime check could relate to the iteration count,
-/// so their leading extents must be provably equal to the trip count.
+/// count of an unrelated identity is admitted only when its bounds fix one exact extent, which then is the iteration
+/// count. Reference stacks have static types that carry no identity that a runtime check could relate to the iteration
+/// count, so their leading extents must be provably equal to the iteration count.
 ///
 /// An array IR body receiving `ref<[iteration_count, t]>` selects its current slice by attaching a leading dynamic
 /// index transform to each access, with the body's index input as the first transform binding. Reference operations and
@@ -849,8 +849,8 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
 /// **lowering_only** attribute: interpretation and every transform rule (e.g., differentiation, transposition,
 /// batching, etc.) ignore it semantically but preserve it on whatever scan they re-stage, while lowerings emit `unroll`
-/// body copies per loop trip followed by the `iteration_count % unroll` remaining iterations, and no loop at all when
-/// `unroll` is at least a static `iteration_count`.
+/// body copies per lowered loop iteration followed by the `iteration_count % unroll` remaining iterations, and no loop
+/// at all when `unroll` is at least a static `iteration_count`.
 ///
 /// The body computation is not part of this payload: it is a [`Region`](crate::Region) attached to the
 /// [`Instruction`](crate::Instruction) applying the operation (the single [`region_slots`](Operation::region_slots)
@@ -862,13 +862,14 @@ pub struct ScanOperation<T: Type> {
     /// Number of loop-carried state leaves after the body index input and at the front of its outputs.
     carry_count: usize,
 
-    /// Shape-determined trip count of this [`ScanOperation`].
+    /// Number of iterations, represented by a static extent or a dynamic dimension identity.
     iteration_count: Dimension,
 
     /// Boolean indicating whether iterations visit the stacked slices in reverse order.
     reverse: bool,
 
-    /// Lowering-only unroll factor: the number of body copies emitted per loop trip (`1` keeps one body per trip).
+    /// Lowering-only unroll factor: the number of body copies emitted per lowered loop iteration (`1` keeps one body
+    /// per iteration).
     unroll: usize,
 
     /// Placement of the leading scan axis of each stacked output, in output order; the stacked outputs beyond this
@@ -883,7 +884,7 @@ pub struct ScanOperation<T: Type> {
 }
 
 impl<T: Type> ScanOperation<T> {
-    /// Creates a new [`ScanOperation`] with the provided carry count and shape-determined trip count, visiting
+    /// Creates a new [`ScanOperation`] with the provided carry count and iteration count, visiting
     /// iterations in increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`]
     /// mapping `[index, carry..., x_slice_or_reference...]` to `[carry..., y_slice...]` is supplied separately as the
     /// operation's attached region (via the region driver passed to [`Context::bind`]), and
@@ -892,7 +893,7 @@ impl<T: Type> ScanOperation<T> {
     /// # Parameters
     ///
     ///   - `carry_count`: Number of loop-carried state leaves, excluding the intrinsic body index input.
-    ///   - `iteration_count`: Shape-determined trip count.
+    ///   - `iteration_count`: Number of iterations, as a static or dynamic [`Dimension`].
     #[inline]
     pub fn new<N: Into<Dimension>>(carry_count: usize, iteration_count: N) -> Self {
         Self {
@@ -916,8 +917,8 @@ impl<T: Type> ScanOperation<T> {
 
     /// Returns this [`ScanOperation`] with the lowering unroll factor set to `unroll`, which must be at least `1`.
     /// Unrolling is lowering-only: interpretation and transform rules ignore the factor but preserve it on every scan
-    /// they derive, while lowerings emit `unroll` consecutive body copies per loop trip and follow the loop with the
-    /// `iteration_count % unroll` remaining iterations. A factor of at least a static
+    /// they derive, while lowerings emit `unroll` consecutive body copies per lowered loop iteration and follow the
+    /// loop with the `iteration_count % unroll` remaining iterations. A factor of at least a static
     /// [`iteration_count`](Self::iteration_count) unrolls the scan completely, with no loop at all (e.g., `usize::MAX`
     /// fully unrolls a scan of any static iteration count).
     pub fn with_unroll(mut self, unroll: usize) -> Result<Self, ProgramError> {
@@ -957,7 +958,8 @@ impl<T: Type> ScanOperation<T> {
         self.carry_count
     }
 
-    /// Returns the shape-determined trip count of this [`ScanOperation`].
+    /// Returns the declared iteration count as a [`Dimension`]. A dynamic count identifies the trailing first-class
+    /// dimension input that supplies its runtime extent.
     #[inline]
     pub fn iteration_count(&self) -> &Dimension {
         &self.iteration_count
@@ -984,8 +986,8 @@ impl<T: Type> ScanOperation<T> {
         self.reverse
     }
 
-    /// Returns the lowering-only unroll factor of this [`ScanOperation`] (the number of body copies emitted per loop
-    /// trip; `1` when no unrolling was requested via [`with_unroll`](Self::with_unroll)).
+    /// Returns the lowering-only unroll factor of this [`ScanOperation`] (the number of body copies emitted per lowered
+    /// loop iteration; `1` when no unrolling was requested via [`with_unroll`](Self::with_unroll)).
     #[inline]
     pub fn unroll(&self) -> usize {
         self.unroll
@@ -1059,8 +1061,8 @@ impl<T: ScanType> ScanOperation<T> {
     /// scan axis while keeping only the memory placement of its slice: scan input validation compares the slices of the
     /// actual stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g.,
     /// one whose scan axis is sharded over an `Auto` mesh axis). The iteration count shares its identity with every
-    /// carry or stack that the body declares with the iteration count's identity, so these types relate the trip count
-    /// to those inputs. Backends that check the entry of a scan whose body they inline (e.g., with a
+    /// carry or stack that the body declares with the iteration count's identity, so these types relate the iteration
+    /// count to those inputs. Backends that check the entry of a scan whose body they inline (e.g., with a
     /// [`GuardOperation`]) and transform rules that remove or split the scan boundary relate the actual inputs to these
     /// types.
     ///
@@ -1452,8 +1454,8 @@ impl<
         // to the threaded state, which preserves arbitrary validated indexing (e.g., passing the root and the index
         // into a nested call). A stack whose handle aliases a reference carry or another stack shares the state of that
         // earlier input, as the handles share storage under eager interpretation. Preserved reference stacks keep their
-        // complete handles and explicit indexing, and a zero-trip scan executes no access and leaves the stacked state
-        // unchanged.
+        // complete handles and explicit indexing, and a scan with no iterations executes no access and leaves the
+        // stacked state unchanged.
         //
         // Discharged state joins the leading carry prefix rather than following the declared inputs: the synthesized
         // carries are inserted immediately after the source carries, in the parent input list, in the body's input
@@ -1506,7 +1508,7 @@ impl<
             Some(extent) => Dimension::Static(extent),
             None => self.iteration_count.clone(),
         };
-        // No reference access executes for zero trips, including accesses through declared carries or captures.
+        // No reference access executes for zero iterations, including accesses through declared carries or captures.
         // Elide bodies whose whole-root states would otherwise lower an unreachable index into an empty axis.
         let mut has_empty_root = false;
         for allocation in summary.reached_allocations() {
@@ -1526,7 +1528,7 @@ impl<
             let boundary_values =
                 inputs.iter().map(|input| context.boundary_value(input)).collect::<Result<Vec<_>, _>>()?;
             // Prefer an explicit dimension leaf, otherwise reify an array axis. Preserved references cannot supply
-            // extents here: zero trips must execute no reference read.
+            // extents here: zero iterations must execute no reference read.
             let extent_source = |variable: &DimensionVariable| {
                 boundary_values
                     .iter()
@@ -1557,13 +1559,13 @@ impl<
                     .all(|variable| extent_source(variable).is_some())
             });
             // A preserved reference can be the only carrier of a dynamic slice extent. Keep the scan boundary in that
-            // case: its body owns the extent, and no iteration or reference read executes for zero trips.
+            // case: its body owns the extent, and no iteration or reference read executes for zero iterations.
             if has_output_extents {
                 let mut outputs = carry_inputs.to_vec();
-                // A zero-trip scan still validates the relationships between its inputs that their types cannot prove
-                // (refer to `scan_entry_guard`). An entry guard over the discharged boundary values retains that
-                // validation, with each input that the body declares as a reference at its referent type when
-                // discharged, and the value carries flow through it.
+                // A scan with no iterations still validates the relationships between its inputs that their types
+                // cannot prove (refer to `scan_entry_guard`). An entry guard over the discharged boundary values
+                // retains that validation, with each input that the body declares as a reference at its referent type
+                // when discharged, and the value carries flow through it.
                 let actual_types = boundary_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
                 let declared_types = scan_input_types(&source_input_types[1..], carry_count, &self.iteration_count)?
                     .into_iter()
@@ -1718,10 +1720,10 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
     ) -> Result<Vec<C::Value>, ProgramError> {
         // Iterations consume and write the slice at their explicit index; reversing changes visit order, not this
         // pairing. Reference stacks enter as whole roots so aliased views keep sharing storage. Validation precedes
-        // every iteration, including a zero-trip scan. Stacks are allocated from their first actual slice, placed as
-        // the declared stacked-axis placement requires, to retain placement metadata, and later writes reconcile manual
-        // variation through `ScanInterpretationDomain::write_iteration`. Empty stacks use inferred output types. The
-        // `shard_map` emulator runs this same rule over its per-device values.
+        // every iteration, including a scan with no iterations. Stacks are allocated from their first actual slice,
+        // placed as the declared stacked-axis placement requires, to retain placement metadata, and later writes
+        // reconcile manual variation through `ScanInterpretationDomain::write_iteration`. Empty stacks use inferred
+        // output types. The `shard_map` emulator runs this same rule over its per-device values.
 
         let body = driver.region(0)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -2286,7 +2288,7 @@ where
                 reversed_inputs.push(input.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
                     message: format!(
                         "`{SCAN_OPERATION_NAME}` transposition does not support a linear iteration count input; the \
-                         trip count is not differentiable",
+                         iteration count is not differentiable",
                     ),
                 })?);
             }
@@ -2562,18 +2564,18 @@ fn validate_scan_iteration_count_type<T: ScanType>(
 }
 
 /// Validates the trailing iteration count input of a scan with a dynamic iteration count against the declared
-/// `iteration_count` and the reference stacks among the actual input types, and returns the concrete trip count when
-/// the iteration count input only refines `iteration_count`'s bounds instead of carrying its nominal identity.
+/// `iteration_count` and the reference stacks among the actual input types, and returns the concrete iteration count
+/// when the iteration count input only refines `iteration_count`'s bounds instead of carrying its nominal identity.
 ///
-/// An iteration count input that carries `iteration_count`'s own [`DimensionVariable`] defines the trip count, and
+/// An iteration count input that carries `iteration_count`'s own [`DimensionVariable`] defines the iteration count, and
 /// [`None`] is returned. An iteration count input of an unrelated identity is admissible only when its bounds pin
-/// exactly one extent inside `iteration_count`'s bounds, and the trip count is then that extent. The leading axes of
-/// stacked arrays are related to the trip count through the declared input types of the scan (refer to
+/// exactly one extent inside `iteration_count`'s bounds, and the iteration count is then that extent. The leading axes
+/// of stacked arrays are related to the iteration count through the declared input types of the scan (refer to
 /// [`ScanOperation::declared_input_types`]), so that conflicting static extents are type errors and the scan boundary
 /// checks the relationships that the input types leave unproven. A reference stack has a static type that carries no
 /// identity that such a check could relate to the iteration count, so its leading extent must be provably equal to the
-/// trip count instead: equal to the exact trip count, or to an extent that `iteration_count`'s bounds fix when the
-/// iteration count is nominal.
+/// iteration count instead: equal to the exact iteration count, or to an extent that `iteration_count`'s bounds fix
+/// when the iteration count is nominal.
 ///
 /// # Parameters
 ///
@@ -2641,10 +2643,10 @@ fn scan_entry_guard<T: ScanType>(
 }
 
 /// Replaces the output of every non-reference carry that `body` passes through unchanged with that carry's input. Such
-/// a carry ends with its initial value regardless of the trip count, so forwarding the input lets later work depend on
-/// it instead of on the scan, keeps a known initial value known under partial evaluation, and preserves a symbolic-zero
-/// tangent under differentiation. Reference carries are never forwarded, because their later uses must stay ordered
-/// after the effects of the scan.
+/// a carry ends with its initial value regardless of the iteration count, so forwarding the input lets later work
+/// depend on it instead of on the scan, keeps a known initial value known under partial evaluation, and preserves a
+/// symbolic-zero tangent under differentiation. Reference carries are never forwarded, because their later uses must
+/// stay ordered after the effects of the scan.
 fn forward_scan_carries<V: Value, O: Operation<Type = V::Type>, Carry: Clone>(
     body: RegionRef<'_, V, O>,
     carry_count: usize,
@@ -2815,9 +2817,9 @@ fn reconstruct_partitioned_scan<
     let (known_program, residual_program, known_input_indices, residual_inputs, partition_outputs) =
         partition.into_parts();
 
-    // The residual program need not read every residual input (e.g., a zero-trip partition can carry a dimension edge
-    // that no residual instruction reads). Drop such inputs before splicing, so that the rebuilt body neither restores
-    // unused edges nor redefines identities that its own inputs already establish.
+    // The residual program need not read every residual input (e.g., a partition with no iterations can carry a
+    // dimension edge that no residual instruction reads). Drop such inputs before splicing, so that the rebuilt body
+    // neither restores unused edges nor redefines identities that its own inputs already establish.
     let residual_input_ids = residual_program.input_ids().to_vec();
     let residual_output_ids = residual_program.output_ids().to_vec();
     let (residual_program, live_residual_inputs) =
@@ -2864,8 +2866,8 @@ fn reconstruct_partitioned_scan<
     }
 
     // Classify each edge as an index, invariant, forwarded stack, recovered identity, or value to stack. Computed
-    // invariant work is hoisted only when an iteration is guaranteed, since even pure work may fail on a zero-trip
-    // scan. The known body's outputs are the known next-carries, then the known per-iteration outputs, then the
+    // invariant work is hoisted only when an iteration is guaranteed, since even pure work may fail on a scan with no
+    // iterations. The known body's outputs are the known next-carries, then the known per-iteration outputs, then the
     // residuals that it stacks. Absolute positions into this list equal positions into the known scan's outputs,
     // because the known scan's outputs are its final carries followed by its stacked per-iteration outputs in the same
     // order.
@@ -3347,7 +3349,7 @@ fn reconstruct_partitioned_scan<
 
 impl<C: Context<Type: ScanType>, P: BatchingPolicy<C>> BatchingContext<C, P> {
     /// Batches an application of `operation` to `inputs`, binding one scan over a batched body in the parent context.
-    /// The program size is independent of the trip count under eager and staging parents alike. Every
+    /// The program size is independent of the iteration count under eager and staging parents alike. Every
     /// [`BatchingPolicy`] uses this structural path, with its own carriers and boundary bookkeeping inputs.
     ///
     /// Carries enter and leave each iteration at the same batch axes. Stacked inputs lose their leading scan axis
@@ -3963,8 +3965,8 @@ mod tests {
         scalar_body(4, |_, inputs| vec![inputs[2], inputs[3], inputs[4], inputs[1]])
     }
 
-    /// Builds a body for zero-length scan tests that maps `[carry, x]` to `[carry, carry, 7]`: its first
-    /// stacked result follows the carry's batch axis and its second stacked result is a replicated constant.
+    /// Builds a body for scan with no iterations tests that maps `[carry, x]` to `[carry, carry, 7]`: its first stacked
+    /// result follows the carry's batch axis and its second stacked result is a replicated constant.
     fn zero_length_body(carry_type: ArrayType, slice_type: ArrayType) -> TestProgram {
         let mut builder = ProgramBuilder::<Array, TestOperation>::new();
         let _index = builder.add_input(ArrayType::scalar(DataType::I64));
@@ -4832,7 +4834,7 @@ mod tests {
             )),
         );
 
-        // The body index must be a scalar `i64`, and a homogeneous array scan requires a static length.
+        // The body index must be a scalar `i64`, and a homogeneous array scan requires a static iteration count.
         let mistyped_index_body = RegionInterface::new(
             vec![ArrayType::scalar(DataType::I32), scalar_type.clone()],
             vec![scalar_type.clone()],
@@ -4847,8 +4849,8 @@ mod tests {
             TestScanOperation::new(1, Dimension::Dynamic(length))
                 .infer_output_types(&[scalar_type, stacked_type], interfaces.as_slice()),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
-                 trailing first-class dimension input for a dynamic trip count",
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
+                 with a trailing first-class dimension input for a dynamic iteration count",
             )),
         );
     }
@@ -5150,8 +5152,8 @@ mod tests {
         );
 
         // When a first-class dimension carry shares the identity of the scan length, the carries that refer to it stay
-        // symbolic because that carry may change across iterations, while the stacked output's leading axis still
-        // takes the trip count that the exact iteration count fixes before the first iteration.
+        // symbolic because that carry may change across iterations, while the stacked output's leading axis still takes
+        // the iteration count that the exact iteration count fixes before the first iteration.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let dimension_carry_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
         let array_carry_type =
@@ -5266,7 +5268,7 @@ mod tests {
     #[test]
     fn test_scan_type_inference_specializes_renamed_identities_under_dynamic_iteration_counts() {
         // Tracing specializes a body declared over `extent` to inputs that rename that identity to `other`, whether the
-        // trip count is static or supplied by an iteration count that the stacked input shares its identity with.
+        // iteration count is static or supplied by an iteration count that the stacked input shares its identity with.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let other = DimensionVariable::new("other", DimensionBounds::positive(Some(8)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
@@ -5330,11 +5332,11 @@ mod tests {
         // A dynamic iteration count input must carry the scan length's nominal identity: an unrelated dynamic identity
         // with compatible bounds cannot redefine the stacked axis. An iteration count input whose bounds pin one exact
         // extent inside the declared bounds (and only such an input, not one whose exact extent lies outside them)
-        // fixes the trip count to that extent, and the stacked inputs are related to it like to a nominal
-        // iteration count: a stacked axis left symbolic is checked against the trip count by the scan boundary when it
-        // executes, so that it is never read a fixed number of times regardless of its independently determined
-        // runtime size. The accepted refinement also types the stacked outputs at the concrete extent instead of at
-        // the still-symbolic declared length.
+        // fixes the iteration count to that extent, and the stacked inputs are related to it like to a nominal
+        // iteration count: a stacked axis left symbolic is checked against the iteration count by the scan boundary
+        // when it executes, so that it is never read a fixed number of times regardless of its independently determined
+        // runtime size. The accepted refinement also types the stacked outputs at the concrete extent instead of at the
+        // still-symbolic declared length.
         let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
@@ -5406,7 +5408,7 @@ mod tests {
             Ok(vec![dimension_type.clone(), static_stacked_type]),
         );
 
-        // Executing the scan checks the symbolic stack against the exact trip count.
+        // Executing the scan checks the symbolic stack against the exact iteration count.
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(dimension_type.clone());
@@ -5430,8 +5432,8 @@ mod tests {
     fn test_scan_type_inference_relates_carries_to_the_iteration_count() {
         // A carry that the body declares with the dynamic length's identity shares that identity with the trailing
         // iteration count input, so the scan boundary relates the two. An `f32[3]` carry refines `f32[length]` without
-        // proving that the trip count is 3: the relationship is reported for runtime validation, staging keeps the
-        // declared body instead of specializing it away, and eager interpretation rejects another trip count.
+        // proving that the iteration count is 3: the relationship is reported for runtime validation, staging keeps the
+        // declared body instead of specializing it away, and eager interpretation rejects another iteration count.
         // Program construction and tracing agree in both cases, including on rejecting an unrelated symbolic extent.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let carry_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into()])));
@@ -5775,7 +5777,8 @@ mod tests {
         );
         assert_eq!(empty.output_sources(2, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
 
-        // A dynamic trip count can be zero, so its carried outputs retain the initial input source through feedback.
+        // A dynamic iteration count can be zero, so its carried outputs retain the initial input source through
+        // feedback.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let dynamic = ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length));
         let dynamic_boundary = RegionDataFlowBoundary { input_count: 4, ..boundary };
@@ -5800,7 +5803,7 @@ mod tests {
             vec![vec![false, false, true], vec![true, false, true], vec![true, true, true]],
         );
 
-        // A zero-length scan never executes its body, so it demands nothing from it and queries nothing.
+        // A scan with no iterations never executes its body, so it demands nothing from it and queries nothing.
         let mut liveness =
             TestRegionLiveness::new(|used_outputs| vec![false, used_outputs[2], used_outputs[0], used_outputs[2]]);
         assert_eq!(
@@ -5898,8 +5901,8 @@ mod tests {
 
     #[test]
     fn test_scan_boundary_pruning_zero_iteration_count() {
-        // Pruning a zero-length scan follows the same liveness through its body even though no iteration executes:
-        // the unused carry and stacked output are dropped, and the kept carry returns its initial value.
+        // Pruning a scan with no iterations follows the same liveness through its body even though no iteration
+        // executes: the unused carry and stacked output are dropped, and the kept carry returns its initial value.
         let body = scalar_body(3, |builder, inputs| {
             let [_, sum, unused, value]: [AtomId; 4] = inputs.try_into().unwrap();
             let next_sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, value], None).unwrap()[0];
@@ -5969,8 +5972,8 @@ mod tests {
 
     #[test]
     fn test_scan_boundary_pruning_keeps_the_iteration_count_input() {
-        // A dynamic-length scan always keeps its trailing iteration count input, which is not a body input, while its
-        // unused carry and stacked output are pruned as usual.
+        // A scan with a dynamic iteration count always keeps its trailing iteration count input, which is not a body
+        // input, while its unused carry and stacked output are pruned as usual.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -6148,9 +6151,9 @@ mod tests {
     #[test]
     fn test_scan_boundary_pruning_drops_stacks_proven_related_to_the_iteration_count() {
         // A dead stack whose leading dimension provably has the extent of the iteration count leaves the scan boundary
-        // nothing to check about it, so pruning drops it like a dead stack of a scan with a static length. This holds
-        // for an `f32[length]` stack next to a `dimension<length>` (one symbolic identity) and for an `f32[3]` stack
-        // next to a `dimension<3>` (one fixed extent).
+        // nothing to check about it, so pruning drops it like a dead stack of a scan with a static iteration count.
+        // This holds for an `f32[length]` stack next to a `dimension<length>` (one symbolic identity) and for an
+        // `f32[3]` stack next to a `dimension<3>` (one fixed extent).
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -6277,7 +6280,7 @@ mod tests {
     #[test]
     fn test_scan_boundary_pruning_drops_dead_reference_stacks() {
         // A reference stack has a static type, so a scan with a dynamic length admits it only when its leading extent
-        // is provably equal to the trip count (here, the exact iteration count `dimension<3>`). The scan boundary
+        // is provably equal to the iteration count (here, the exact iteration count `dimension<3>`). The scan boundary
         // therefore has nothing to check about a dead reference stack, and pruning drops it.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
@@ -6447,8 +6450,8 @@ mod tests {
 
     #[test]
     fn test_scan_rename_type_identities() {
-        // Renaming rewrites the identity of a dynamic length and preserves every other field, while a static length
-        // has no identity to rename.
+        // Renaming rewrites the identity of a dynamic length and preserves every other field, while a static iteration
+        // count has no identity to rename.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let renamed = DimensionVariable::new("renamed", DimensionBounds::positive(Some(8)).unwrap());
         let mut renaming = TypeIdentityRenaming::new();
@@ -7253,9 +7256,10 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_publishes_zero_iteration_count_stacked_reference_unchanged() {
-        // A zero-trip scan publishes unchanged reference state without constructing an invalid access to an empty root.
-        // Mutation summaries are conservative: a body that writes its per-iteration view publishes the stacked
-        // allocation's final state even for a zero-length scan, whose published state is then simply the entering one.
+        // A scan with no iterations publishes unchanged reference state without constructing an invalid access to an
+        // empty root. Mutation summaries are conservative: a body that writes its per-iteration view publishes the
+        // stacked allocation's final state even for a scan with no iterations, whose published state is then simply the
+        // entering one.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -7313,8 +7317,8 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_preserves_zero_iteration_count_state_identity() {
-        // A zero-length scan never runs the body that would update its reference carry, so the discharged state carry
-        // publishes the entering state unchanged as the allocation's final state.
+        // A scan with no iterations never runs the body that would update its reference carry, so the discharged state
+        // carry publishes the entering state unchanged as the allocation's final state.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -7400,9 +7404,10 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_builds_refined_zero_iteration_count_stacks() {
-        // A zero-length scan whose stacked reference reaches a nested `condition` whole is a carried root, so discharge
-        // builds its outputs without running or lowering its body. The empty stacked output takes the scan's inferred
-        // output types: a static `f32[3]` carry input refines the stacked `f32[rows]` slices to the type `f32[0, 3]`.
+        // A scan with no iterations whose stacked reference reaches a nested `condition` whole is a carried root, so
+        // discharge builds its outputs without running or lowering its body. The empty stacked output takes the scan's
+        // inferred output types: a static `f32[3]` carry input refines the stacked `f32[rows]` slices to the type
+        // `f32[0, 3]`.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -7515,9 +7520,9 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_dynamic_iteration_count() {
-        // A dynamic-length scan carries one iteration count instruction input after the body's inputs, so the scan
-        // discharge rule's arity validation must accept the one-past-body parent arity instead of rejecting the
-        // canonical dynamic form.
+        // A scan with a dynamic iteration count carries one iteration count instruction input after the body's inputs,
+        // so the scan discharge rule's arity validation must accept the one-past-body parent arity instead of rejecting
+        // the canonical dynamic form.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(9)).unwrap());
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -7675,10 +7680,10 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_preserves_zero_iteration_count_dimension_identities() {
-        // Both the trip count and a slice dimension retain their nominal identities despite zero-trip elision.
-        // The unreachable empty-root access is through a declared carry, not an optimized stacked reference. The
-        // `rows` carry relates to the `f32[rows]` carry through the program inputs that share `rows`, so program entry
-        // validates their payloads and the elided scan needs no entry guard.
+        // Both the iteration count and a slice dimension retain their nominal identities despite elision of scans with
+        // no iterations. The unreachable empty-root access is through a declared carry, not an optimized stacked
+        // reference. The `rows` carry relates to the `f32[rows]` carry through the program inputs that share `rows`, so
+        // program entry validates their payloads and the elided scan needs no entry guard.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(1)).unwrap());
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let values_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
@@ -7761,9 +7766,9 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_zero_iteration_count_preserves_entry_relationships() {
-        // A zero-trip scan still validates its entering carries: here, a renamed dimension constant of extent 2 must
-        // agree with the referent of the `ref<f32[n]>` carry allocated from the program input. An empty reference
-        // carry lets discharge elide the scan, which must not remove that validation: an entry guard over the
+        // A scan with no iterations still validates its entering carries: here, a renamed dimension constant of extent
+        // 2 must agree with the referent of the `ref<f32[n]>` carry allocated from the program input. An empty
+        // reference carry lets discharge elide the scan, which must not remove that validation: an entry guard over the
         // discharged boundary retains it, so the discharged program rejects an `f32[3]` input as well.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let renamed_type = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
@@ -7862,9 +7867,9 @@ mod tests {
     fn test_scan_reference_discharge_zero_iteration_count_guards_preserved_reference_members() {
         // As in `test_scan_reference_discharge_zero_length_preserves_entry_relationships`, a constant `f32[2]` carry
         // must agree with the referent of the `ref<f32[n]>` carry allocated from the program input, and discharging the
-        // empty reference carry elides the zero-trip scan. Here, partial discharge preserves the `ref<f32[n]>` carry,
-        // so the entry guard relates the array carry to the preserved reference itself. The guard retains `n`, which
-        // the preserved reference still carries, so the array carry leaves it as `f32[n]`.
+        // empty reference carry elides the scan with no iterations. Here, partial discharge preserves the `ref<f32[n]>`
+        // carry, so the entry guard relates the array carry to the preserved reference itself. The guard retains `n`,
+        // which the preserved reference still carries, so the array carry leaves it as `f32[n]`.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()]));
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
@@ -7927,8 +7932,8 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_zero_iteration_count_recovers_output_shapes() {
-        // A zero-trip scan with an empty reference carry is elided by discharge, which allocates its empty stacked
-        // output from an extent read off its other carries. Here the extent `rows` is the leading axis of an
+        // A scan with no iterations with an empty reference carry is elided by discharge, which allocates its empty
+        // stacked output from an extent read off its other carries. Here the extent `rows` is the leading axis of an
         // `f32[rows]` array carry.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let values_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into()]));
@@ -8028,7 +8033,8 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_preserves_zero_output_shape_in_a_preserved_reference() {
-        // Partial discharge must retain a zero-trip body boundary when its only dynamic extent remains in a handle.
+        // Partial discharge must retain a body boundary for a scan with no iterations when its only dynamic extent
+        // remains in a handle.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let values_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.into()]));
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
@@ -8941,9 +8947,9 @@ mod tests {
     fn test_scan_reference_discharge_rejects_carries_returned_as_captures_of_their_own_allocation() {
         // The body returns, as its reference carry, the capture that the scan also passes as that carry, so the
         // returned reference denotes the very allocation that the carry enters with. The rule compares body positions
-        // rather than the allocations that one application denotes, so the scan is rejected whatever its trip count,
-        // as by every other rule. (An eager program cannot embed a reference as a constant, so captures reach this
-        // rule through capture-lifted programs like this one.)
+        // rather than the allocations that one application denotes, so the scan is rejected whatever its iteration
+        // count, as by every other rule. (An eager program cannot embed a reference as a constant, so captures reach
+        // this rule through capture-lifted programs like this one.)
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
@@ -9079,7 +9085,7 @@ mod tests {
             Ok(vec![Array::scalar(8.0).unwrap()]),
         );
 
-        // A zero-length scan returns its initial carries and empty stacked outputs.
+        // A scan with no iterations returns its initial carries and empty stacked outputs.
         let empty = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0]), &[]).unwrap();
         assert_eq!(
             context.bind(
@@ -9101,8 +9107,8 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
-                 trailing first-class dimension input for a dynamic trip count",
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
+                 with a trailing first-class dimension input for a dynamic iteration count",
             ))),
         );
     }
@@ -9589,7 +9595,7 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_reports_first_iteration_errors_without_allocating_indices() {
-        // The largest supported trip count must reach the first body's failure without first allocating one index
+        // The largest supported iteration count must reach the first body's failure without first allocating one index
         // per iteration. Both visit orders report their actual first index, in both type universes and after batching.
         let mut builder = ProgramBuilder::<Array, TestOperation>::new();
         let index = builder.add_input(ArrayType::scalar(DataType::I64));
@@ -9858,7 +9864,7 @@ mod tests {
         assert_eq!(reversed_stack.read(), Ok(Array::vector(vec![13.0f32, 7.0, 4.0]).unwrap()));
         assert_eq!(unrolled_reversed_stack.read(), reversed_stack.read());
 
-        // A zero-length scan runs no iteration, so the carry passes through and the referent is never touched.
+        // A scan with no iterations runs no iteration, so the carry passes through and the referent is never touched.
         let empty_stack = ArrayReference::new(Array::vector(Vec::<f32>::new()).unwrap());
         assert_eq!(
             scanned(ScanOperation::new(1, 0), 0)
@@ -10018,10 +10024,10 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_splits_zero_iteration_count_scans_without_probing_the_body() {
-        // A zero-length scan runs no iteration, so partial evaluation must not evaluate its body's known work outside
-        // the loop: the split keeps the division by the known zero carry in the zero-trip known scan, which stacks it
-        // as an empty residual edge, and never hoists it (signed array division by zero would yield -1, but no slice
-        // is evaluated here). The passed-through carry keeps its known initial value as its final value.
+        // A scan with no iterations runs no iteration, so partial evaluation must not evaluate its body's known work
+        // outside the loop: the split keeps the division by the known zero carry in the known scan with no iterations,
+        // which stacks it as an empty residual edge, and never hoists it (signed array division by zero would yield -1,
+        // but no slice is evaluated here). The passed-through carry keeps its known initial value as its final value.
         let carry_type = ArrayType::scalar(DataType::I32);
         let stacked_type = ArrayType::new_static(DataType::I32, [0]);
         let mut body = ProgramBuilder::<Array, TestOperation>::new();
@@ -10554,7 +10560,7 @@ mod tests {
         assert_eq!(evaluation.program.to_string(), residual);
         assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&vector)), mismatch);
 
-        // A zero-trip scan is guarded the same way.
+        // A scan with no iterations is guarded the same way.
         let program = single_scan_program(&body, 2, 0);
         assert_eq!(program.interpret(vec![dimension(&n_type, 2), vector.clone()]), mismatch);
         let evaluation = program
@@ -11044,8 +11050,8 @@ mod tests {
             Err(input_dimension_mismatch("n", 4, 3)),
         );
 
-        // A zero-trip scan splits no known work, but the carry still passes through its body, so it is forwarded the
-        // same way and the residual header checks the relationship.
+        // A scan with no iterations splits no known work, but the carry still passes through its body, so it is
+        // forwarded the same way and the residual header checks the relationship.
         let program = single_scan_program(&body, 2, 0);
         assert_eq!(program.interpret(vec![three.clone(), four.clone()]), Err(input_dimension_mismatch("n", 3, 4)));
         let outer = TestIrTracingContext::new();
@@ -12652,10 +12658,10 @@ mod tests {
     #[test]
     fn test_scan_partial_evaluation_dynamic_iteration_count_hoists_computed_invariants() {
         // An iteration count whose bounds exclude zero guarantees an iteration, so the split hoists computed invariant
-        // work as for a static length. The body maps `[scale, accumulator, x]` to
-        // `[scale, accumulator + (scale * scale) * x]` over a known passed-through `scale`: the outer trace computes
-        // `scale * scale` once before the scan, and the residual scan threads it as an invariant carry, even though the
-        // iteration count is unknown.
+        // work as for a static iteration count. The body maps `[scale, accumulator, x]` to `[scale, accumulator +
+        // (scale * scale) * x]` over a known passed-through `scale`: the outer trace computes `scale * scale` once
+        // before the scan, and the residual scan threads it as an invariant carry, even though the iteration count is
+        // unknown.
         let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -12770,7 +12776,7 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_dynamic_iteration_count_that_admits_zero() {
-        // Neither a known zero trip count nor an unknown trip count that admits zero may evaluate the body's
+        // Neither a known zero iteration count nor an unknown iteration count that admits zero may evaluate the body's
         // division by a known zero carry during specialization. The body is never executed when the count is zero.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
@@ -13509,8 +13515,8 @@ mod tests {
     #[test]
     fn test_scan_batching_validates_direct_body_and_input_contracts() {
         // A direct rule invocation must not repair the body's index or index past an excessive carry count, and even a
-        // passed-through zero-trip carry must satisfy the original logical input contract. The homogeneous and array IR
-        // families share the batching rule, so both report the same errors.
+        // carry passed through a scan with no iterations must satisfy the original logical input contract. The
+        // homogeneous and array IR families share the batching rule, so both report the same errors.
         let context = BatchingContext::new(TestEagerContext::new(), 2);
         let array_ir_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             TestIrEagerContext::new(),
@@ -13928,9 +13934,9 @@ mod tests {
 
     #[test]
     fn test_scan_batching_zero_iteration_count() {
-        // A zero-length scan batched under a staging parent still batches its body structurally: the carry keeps its
-        // mapped axis, the stacked carry output is mapped behind the leading scan dimension, and the stacked constant
-        // output stays replicated.
+        // A scan with no iterations batched under a staging parent still batches its body structurally: the carry keeps
+        // its mapped axis, the stacked carry output is mapped behind the leading scan dimension, and the stacked
+        // constant output stays replicated.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let carry_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(carry_sharding).unwrap();
@@ -14016,9 +14022,9 @@ mod tests {
 
     #[test]
     fn test_scan_batching_zero_iteration_count_with_manual_axes() {
-        // A zero-length scan over values that vary over a manual mesh axis batches its body structurally like one over
-        // explicit mesh axes: the carry and the stacked carry output keep the carry's manual variation, while the
-        // stacked constant output stays replicated and invariant.
+        // A scan with no iterations over values that vary over a manual mesh axis batches its body structurally like
+        // one over explicit mesh axes: the carry and the stacked carry output keep the carry's manual variation, while
+        // the stacked constant output stays replicated and invariant.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
             .unwrap()
@@ -14575,8 +14581,8 @@ mod tests {
 
     #[test]
     fn test_scan_batching_array_ir_keeps_iteration_counts_replicated() {
-        // An iteration count mapped over the batch would give each batch item its own trip count, which one scan over
-        // the packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch
+        // An iteration count mapped over the batch would give each batch item its own iteration count, which one scan
+        // over the packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch
         // construction rejects it before any rule runs, as the `ArrayIrBatch` tests pin), so the rule always receives a
         // replicated iteration count. It threads that length unchanged as the trailing input of the batched reversed
         // scan, while the carry stays at batch axis 0 and the stacked input keeps its batch axis behind the leading
@@ -15187,10 +15193,10 @@ mod tests {
 
     #[test]
     fn test_scan_zero_iteration_count_through_interpretation_partial_evaluation_and_batching() {
-        // A dynamic-length scan whose iteration count is zero runs no iteration when interpreted, partially evaluated,
-        // or batched: each staged program keeps one scan over the iteration count, and executing it at length zero
-        // returns the initial carry next to empty stacks. `test_scan_differentiation_zero_iteration_count` covers the
-        // differentiation transforms of the same scan.
+        // A scan with a dynamic iteration count whose iteration count is zero runs no iteration when interpreted,
+        // partially evaluated, or batched: each staged program keeps one scan over the iteration count, and executing
+        // it at length zero returns the initial carry next to empty stacks.
+        // `test_scan_differentiation_zero_iteration_count` covers the differentiation transforms of the same scan.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
@@ -15968,8 +15974,8 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_linearizes_zero_iteration_count_reference_carries() {
-        // Linearizing a reference carry of a zero-trip scan must not restore an unused residual dimension whose
-        // identity the tangent body's inputs already establish.
+        // Linearizing a reference carry of a scan with no iterations must not restore an unused residual dimension
+        // whose identity the tangent body's inputs already establish.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()]));
         let body = pass_through_body(&[vector_type.clone().into(), ReferenceType::new(vector_type).into()]);
@@ -16030,8 +16036,8 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_keeps_reference_only_reset_tangents_structural() {
-        // A reference makes dependence conservative, but resetting an inactive numeric carry to a constant must
-        // not give that carry a live tangent slot. Its tangent remains a structural zero at either trip count.
+        // A reference makes dependence conservative, but resetting an inactive numeric carry to a constant must not
+        // give that carry a live tangent slot. Its tangent remains a structural zero at either iteration count.
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -16075,9 +16081,9 @@ mod tests {
     #[test]
     fn test_scan_differentiation_keeps_active_reset_carry_tangents_paired() {
         // The numeric carry is active from the start, so its tangent slot stays paired across the boundary even though
-        // the body resets it to a constant in a body whose reference makes dependence conservative. A zero-trip scan
-        // returns the incoming carry tangent, while iterating replaces it with the reset value's zero tangent, and the
-        // transposed scan mirrors both for the carry cotangent.
+        // the body resets it to a constant in a body whose reference makes dependence conservative. A scan with no
+        // iterations returns the incoming carry tangent, while iterating replaces it with the reset value's zero
+        // tangent, and the transposed scan mirrors both for the carry cotangent.
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -16342,8 +16348,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_zero_iteration_count() {
-        // A zero-length scan returns its initial carries and empty stacked outputs, so the carry tangents and
+    fn test_scan_differentiation_zero_static_iteration_count() {
+        // A scan with no iterations returns its initial carries and empty stacked outputs, so the carry tangents and
         // cotangents pass through unchanged and the stacked tangents and cotangents are empty.
         let empty = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0]), &[]).unwrap();
         let program = scan_program(
@@ -16427,10 +16433,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_zero_iteration_count() {
-        // A dynamic-length scan whose iteration count is zero runs no iteration under forward mode, linearization, or
-        // its pullback: each staged program keeps one scan over the iteration count, and executing it at length zero
-        // returns the initial carry, or its tangent or cotangent, next to empty stacks.
+    fn test_scan_differentiation_zero_dynamic_iteration_count() {
+        // A scan with a dynamic iteration count whose iteration count is zero runs no iteration under forward mode,
+        // linearization, or its pullback: each staged program keeps one scan over the iteration count, and executing it
+        // at length zero returns the initial carry, or its tangent or cotangent, next to empty stacks.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
@@ -16543,7 +16549,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_guards_zero_trip_scans() {
+    fn test_scan_differentiation_guards_scans_with_zero_iterations() {
         // A carry declared `f32[length]` but supplied as `f32[3]` relates the iteration count to the extent 3, which
         // the source scan checks even when no iteration runs. The JVP program and the primal program of the
         // linearization check it through an entry guard before their scans, so they reject an iteration count of 0 like
@@ -20166,8 +20172,8 @@ mod tests {
 
     #[test]
     fn test_scan_transposition_rejects_linear_iteration_counts() {
-        // The trailing iteration count of a dynamic-length scan is structural, so selecting it as a linear input is
-        // rejected: the reversed scan needs the iteration count as a known value.
+        // The trailing iteration count of a scan with a dynamic iteration count is structural, so selecting it as a
+        // linear input is rejected: the reversed scan needs the iteration count as a known value.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -20197,9 +20203,10 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]).map(|pullback| pullback.to_string()),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "`scan` transposition does not support a linear iteration count input; the trip count is \
+                message:
+                    "`scan` transposition does not support a linear iteration count input; the iteration count is \
                           not differentiable"
-                    .to_string(),
+                        .to_string(),
             })),
         );
     }
@@ -20291,8 +20298,8 @@ mod tests {
 
     #[test]
     fn test_scan_transposition_zero_iteration_count() {
-        // A zero-length scan is the identity on its carries, so its transposition passes the carry cotangent through
-        // and gives the empty stacked input an empty cotangent.
+        // A scan with no iterations is the identity on its carries, so its transposition passes the carry cotangent
+        // through and gives the empty stacked input an empty cotangent.
         let body = scalar_body(2, |builder, inputs| {
             let next =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None).unwrap()[0];
@@ -20473,7 +20480,7 @@ mod tests {
         assert_eq!(transposed.interpret(vec![TestIrValue::Reference(reference.clone())]), Ok(Vec::new()));
         assert_eq!(reference.read(), Ok(Array::scalar(7.0f64).unwrap()));
 
-        // A zero-trip scan may expose its dormant rule to transposition, but must never execute its update.
+        // A scan with no iterations may expose its dormant rule to transposition, but must never execute its update.
         let empty_program =
             scan_program(ScanOperation::new(1, 0), body, vec![reference_type]).with_outputs(&[]).unwrap();
         let empty_transposed = empty_program.transpose_with_respect_to(&[], &[]).unwrap();
@@ -21908,8 +21915,8 @@ mod tests {
 
     #[test]
     fn test_scan_type_iteration_count_type() {
-        // An array IR scan takes a dynamic trip count from a trailing `dimension<length>` input, which a homogeneous
-        // array scan does not admit.
+        // An array IR scan takes a dynamic iteration count from a trailing `dimension<length>` input, which a
+        // homogeneous array scan does not admit.
         let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
         assert_eq!(
             <ArrayIrType as ScanType>::iteration_count_type(&length),
@@ -21918,8 +21925,8 @@ mod tests {
         assert_eq!(
             <ArrayType as ScanType>::iteration_count_type(&length),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
-                 trailing first-class dimension input for a dynamic trip count",
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
+                 with a trailing first-class dimension input for a dynamic iteration count",
             )),
         );
     }
@@ -21981,8 +21988,8 @@ mod tests {
         assert_eq!(
             ArrayType::validate_scan_body_type_signature(&body_input_types[1..], &[scalar_type.clone()], 0, &length),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
-                 trailing first-class dimension input for a dynamic trip count",
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` \
+                 with a trailing first-class dimension input for a dynamic iteration count",
             )),
         );
         assert_eq!(
@@ -22158,8 +22165,8 @@ mod tests {
 
     #[test]
     fn test_scan_type_infer_scan_output_types() {
-        // The outputs are the carries followed by the stacked body outputs along a leading axis of the trip count,
-        // placed as declared and refined by the facts that the inputs establish, including the trip count that an
+        // The outputs are the carries followed by the stacked body outputs along a leading axis of the iteration count,
+        // placed as declared and refined by the facts that the inputs establish, including the iteration count that an
         // exact iteration count fixes.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F64);

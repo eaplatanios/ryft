@@ -3509,7 +3509,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f32[3, 2], %1:f32[2] .
-                let %2:f32[2], %3:f32[3, 2] = scan [carry_count=1, length=3, reverse=false] %1 %0 [
+                let %2:f32[2], %3:f32[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[2], %2:f32[2] .
                         let %3:f32[2] = custom_call [target=ryft.test.add_one, has_side_effect=true, \
@@ -3541,7 +3541,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
-                let %3:dimension<rows ∈ [1, 9)>, %4:f32[batch, rows] = scan [carry_count=1, length=batch, \
+                let %3:dimension<rows ∈ [1, 9)>, %4:f32[batch, rows] = scan [carry_count=1, iteration_count=batch, \
                 reverse=false] %2 %1 %0 [
                     body={
                         lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2] .
@@ -3574,7 +3574,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:f32[2], %3:dimension<rows ∈ [1, 9)> .
-                let %4:dimension<rows ∈ [1, 9)>, %5:f32[2], %6:f32[batch, rows] = scan [carry_count=2, length=batch, \
+                let %4:dimension<rows ∈ [1, 9)>, %5:f32[2], %6:f32[batch, rows] = scan [carry_count=2, iteration_count=batch, \
                 reverse=false] %3 %2 %1 %0 [
                     body={
                         lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2], %3:f32[2] .
@@ -3614,7 +3614,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f32[3, 2] .
-                let %1:f32[3, 2] = scan [carry_count=0, length=3, reverse=false] %0 [
+                let %1:f32[3, 2] = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2] = custom_call [
@@ -3655,7 +3655,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 2] .
-                let %1:f32[2, 2] = scan [carry_count=0, length=2, reverse=false] %0 [
+                let %1:f32[2, 2] = scan [carry_count=0, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2][layout=tiled{0:T(2)}] = custom_call [
@@ -3702,7 +3702,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2] .
-                let %2:f32[batch, 2] = scan [carry_count=0, length=batch, reverse=false] %1 %0 [
+                let %2:f32[batch, 2] = scan [carry_count=0, iteration_count=batch, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2][layout=tiled{0:T(2)}] = custom_call [
@@ -3753,7 +3753,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2], %2:dimension<2> .
-                let %3:dimension<2>, %4:f32[batch, 2] = scan [carry_count=1, length=batch, reverse=false] %2 %1 %0 [
+                let %3:dimension<2>, %4:f32[batch, 2] = scan [carry_count=1, iteration_count=batch, reverse=false] %2 %1 %0 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2] .
                         let %3:f32[2][layout=tiled{0:T(2)}] = custom_call [
@@ -3801,7 +3801,7 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:{packed} .
-                let %1:{packed} = scan [carry_count=0, length=2, reverse=false, stacked_axis_shardings=[{{'m'}}]] %0 [
+                let %1:{packed} = scan [carry_count=0, iteration_count=2, reverse=false, stacked_axis_shardings=[{{'m'}}]] %0 [
                     body={{
                         lambda %0:i64[], %1:{varying} .
                         let %2:{varying} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
@@ -3836,7 +3836,7 @@ mod tests {
             batched,
             indoc! {"
                 lambda %0:f32[3, 2, 3], %1:f32[2, 3] .
-                let %2:f32[2, 3], %3:f32[3, 2] = scan [carry_count=1, length=3, reverse=false] %1 %0 [
+                let %2:f32[2, 3], %3:f32[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[2, 3], %2:f32[2, 3] .
                         let %3:f32[2] = custom_call [target=kernel, input_layouts=[tiled{0,1}, tiled{1,0}], \
@@ -3867,7 +3867,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2, 3], %2:f32[2, 3] .
-                let %3:f32[2, 3], %4:f32[batch, 2] = scan [carry_count=1, length=batch, reverse=false] %2 %1 %0 [
+                let %3:f32[2, 3], %4:f32[batch, 2] = scan [carry_count=1, iteration_count=batch, reverse=false] %2 %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[2, 3], %2:f32[2, 3] .
                         let %3:f32[2] = custom_call [target=kernel, input_layouts=[tiled{0,1}, tiled{1,0}], \
@@ -3894,7 +3894,7 @@ mod tests {
             batched,
             indoc! {"
                 lambda %0:f32[4, 2] .
-                let %1:f32[4, 2] = scan [carry_count=0, length=4, reverse=false, unroll=2] %0 [
+                let %1:f32[4, 2] = scan [carry_count=0, iteration_count=4, reverse=false, unroll=2] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=2)] %1
@@ -3910,7 +3910,7 @@ mod tests {
             batched,
             indoc! {"
                 lambda %0:f32[3, 2] .
-                let %1:f32[3, 2] = scan [carry_count=0, length=3, reverse=false, unroll=2] %0 [
+                let %1:f32[3, 2] = scan [carry_count=0, iteration_count=3, reverse=false, unroll=2] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=2)] %1
@@ -3943,7 +3943,7 @@ mod tests {
             batched,
             indoc! {"
                 lambda %0:f32[4, 2] .
-                let %1:f32[4, 2] = scan [carry_count=0, length=4, reverse=false, unroll=4] %0 [
+                let %1:f32[4, 2] = scan [carry_count=0, iteration_count=4, reverse=false, unroll=4] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=full)] %1
@@ -3961,7 +3961,7 @@ mod tests {
             batched,
             indoc! {"
                 lambda %0:f32[0, 2] .
-                let %1:f32[0, 2] = scan [carry_count=0, length=0, reverse=false] %0 [
+                let %1:f32[0, 2] = scan [carry_count=0, iteration_count=0, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2] .
                         let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=full)] %1
@@ -4003,7 +4003,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4, 2], %1:dimension<rows ∈ [1, 9)> .
                 let %2:dimension<4> = const 4
-                    %3:dimension<rows ∈ [1, 9)>, %4:f32[4, rows] = scan [carry_count=1, length=4, reverse=false, \
+                    %3:dimension<rows ∈ [1, 9)>, %4:f32[4, rows] = scan [carry_count=1, iteration_count=4, reverse=false, \
                 unroll=4] %1 %0 [
                         body={
                             lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2] .
@@ -4049,10 +4049,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 3, 2] .
                 let %1:f32[3, 2, 2] = transpose [permutation=[1, 0, 2]] %0
-                    %2:f32[3, 2, 2] = scan [carry_count=0, length=3, reverse=false] %1 [
+                    %2:f32[3, 2, 2] = scan [carry_count=0, iteration_count=3, reverse=false] %1 [
                         body={
                             lambda %0:i64[], %1:f32[2, 2] .
-                            let %2:f32[2, 2] = scan [carry_count=0, length=2, reverse=false] %1 [
+                            let %2:f32[2, 2] = scan [carry_count=0, iteration_count=2, reverse=false] %1 [
                                 body={
                                     lambda %0:i64[], %1:f32[2] .
                                     let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential] %1

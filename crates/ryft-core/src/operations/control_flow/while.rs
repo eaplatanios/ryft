@@ -9665,7 +9665,7 @@ mod tests {
                             in (%5, %1, %12, %7, %10)
                         },
                     ]
-                    %11:f64[] = scan [carry_count=1, length=3, reverse=false] %2 %9 %10 [
+                    %11:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %2 %9 %10 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:bool[] .
                             let %4:f64[] = condition %3 %1 %2 [
@@ -9790,7 +9790,7 @@ mod tests {
                     ]
                     %13:f64[] = zero [type=f64[]]
                     %14:f64[] = zero [type=f64[]]
-                    %15:f64[], %16:f64[], %17:f64[] = scan [carry_count=3, length=4, reverse=false] %13 %14 %4 %12 [
+                    %15:f64[], %16:f64[], %17:f64[] = scan [carry_count=3, iteration_count=4, reverse=false] %13 %14 %4 %12 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:bool[] .
                             let %5:f64[], %6:f64[], %7:f64[] = condition %4 %1 %2 %3 [
@@ -9873,7 +9873,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:bool[5] .
-                let %2:f64[] = scan [carry_count=1, length=5, reverse=true] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=5, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:bool[] .
                         let %3:f64[] = condition %2 %1 [
@@ -9956,7 +9956,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:bool[4], %2:f64[4] .
-                let %3:f64[] = scan [carry_count=1, length=4, reverse=true] %0 %1 %2 [
+                let %3:f64[] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:bool[], %3:f64[] .
                         let %4:f64[] = condition %2 %1 %3 [
@@ -10356,7 +10356,7 @@ mod tests {
                         },
                     ]
                     %11:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                        scan [carry_count=1, length=3, reverse=false] %2 %9 %10 [
+                        scan [carry_count=1, iteration_count=3, reverse=false] %2 %9 %10 [
                         body={
                             lambda %0:i64[], %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
                                 %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %3:bool[] .
@@ -10475,7 +10475,7 @@ mod tests {
                         },
                     ]
                     %9:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = scan [carry_count=1, \
-                        length=3, reverse=false] %1 %7 %8 [
+                        iteration_count=3, reverse=false] %1 %7 %8 [
                         body={
                             lambda %0:i64[], %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
                                 %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
@@ -10515,7 +10515,7 @@ mod tests {
                     %1:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
                     %2:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = scan [carry_count=1, \
-                    length=3, reverse=true] %0 %1 %2 [
+                    iteration_count=3, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
                             %2:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
@@ -10687,7 +10687,7 @@ mod tests {
                         },
                     ]
                     %16:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                        scan [carry_count=1, length=3, reverse=false] %2 %13 %14 %15 [
+                        scan [carry_count=1, iteration_count=3, reverse=false] %2 %13 %14 %15 [
                         body={
                             lambda %0:i64[], \
                                 %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
@@ -11036,7 +11036,7 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[5], %2:f64[5, 3], %3:bool[5, 3] .
-                let %4:f64[3] = scan [carry_count=1, length=5, reverse=true] %0 %1 %2 %3 [
+                let %4:f64[3] = scan [carry_count=1, iteration_count=5, reverse=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:bool[], %3:f64[3], %4:bool[3] .
                         let %5:f64[3] = condition %2 %1 %3 %4 [
@@ -11161,7 +11161,7 @@ mod tests {
                     ]
                     %12:f64[4, 3] = transpose [permutation=[1, 0]] %10
                     %13:bool[4, 3] = transpose [permutation=[1, 0]] %11
-                    %14:f64[3] = scan [carry_count=1, length=4, reverse=false] %1 %12 %13 [
+                    %14:f64[3] = scan [carry_count=1, iteration_count=4, reverse=false] %1 %12 %13 [
                         body={
                             lambda %0:i64[], %1:f64[3], %2:f64[3], %3:bool[3] .
                             let %4:f64[3] = stop_gradient %2
@@ -11673,7 +11673,7 @@ mod tests {
                             in (%4, %9, %7)
                         },
                     ]
-                    %7:f32[] = scan [carry_count=1, length=2, reverse=false] %1 %6 [
+                    %7:f32[] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %6 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:bool[] .
                             let %3:f32[] = condition %2 %1 [
@@ -11721,7 +11721,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:bool[2] .
-                let %2:f32[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:bool[] .
                         let %3:f32[] = condition %2 %1 [
@@ -11743,7 +11743,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:bool[2] .
-                let %2:f32[] = scan [carry_count=1, length=2, reverse=true] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:bool[] .
                         let %3:f32[] = condition %2 %1 [
@@ -12004,7 +12004,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:bool[4] .
-                let %3:f64[], %4:f64[3] = scan [carry_count=2, length=4, reverse=true] %0 %1 %2 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=2, iteration_count=4, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[3], %3:bool[] .
                         let %4:f64[], %5:f64[3] = condition %3 %1 %2 [
@@ -12079,7 +12079,7 @@ mod tests {
                             in (%0, %4, %9, %7)
                         },
                     ]
-                    %9:f64[] = scan [carry_count=1, length=4, reverse=false] %2 %8 [
+                    %9:f64[] = scan [carry_count=1, iteration_count=4, reverse=false] %2 %8 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:bool[] .
                             let %3:f64[] = condition %2 %1 [
@@ -12220,7 +12220,7 @@ mod tests {
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[4], %2:bool[4, 3] .
-                let %3:f64[3] = scan [carry_count=1, length=4, reverse=true] %0 %1 %2 [
+                let %3:f64[3] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:bool[], %3:bool[3] .
                         let %4:f64[3] = condition %2 %1 %3 [
@@ -12354,7 +12354,7 @@ mod tests {
                             in (%0, %8, %9, %17, %12, %15)
                         },
                     ]
-                    %14:f64[3] = scan [carry_count=1, length=4, reverse=false] %2 %12 %13 [
+                    %14:f64[3] = scan [carry_count=1, iteration_count=4, reverse=false] %2 %12 %13 [
                         body={
                             lambda %0:i64[], %1:f64[3], %2:bool[3], %3:bool[] .
                             let %4:f64[3] = condition %3 %1 %2 [
@@ -12509,7 +12509,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[extent], %1:dimension<extent ∈ [1, 8)>, %2:bool[4] .
-                let %3:dimension<extent ∈ [1, 8)>, %4:f64[extent] = scan [carry_count=2, length=4, reverse=false] %1 \
+                let %3:dimension<extent ∈ [1, 8)>, %4:f64[extent] = scan [carry_count=2, iteration_count=4, reverse=false] %1 \
                     %0 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:bool[] .
@@ -12696,7 +12696,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:bool[4], %2:i64[4], %3:i64[4] .
-                let %4:f64[] = scan [carry_count=1, length=4, reverse=false] %0 %1 %2 %3 [
+                let %4:f64[] = scan [carry_count=1, iteration_count=4, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:bool[], %3:i64[], %4:i64[] .
                         let %5:f64[] = condition %2 %1 %3 %4 [
@@ -12981,7 +12981,7 @@ mod tests {
             tangent.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[4], %2:f64[4] .
-                let %3:f64[3] = scan [carry_count=1, length=4, reverse=false] %0 %1 %2 [
+                let %3:f64[3] = scan [carry_count=1, iteration_count=4, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:bool[], %3:f64[] .
                         let %4:f64[3] = condition %2 %1 %3 [
@@ -13020,7 +13020,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[4], %2:f64[4] .
-                let %3:f64[3] = scan [carry_count=1, length=4, reverse=true] %0 %1 %2 [
+                let %3:f64[3] = scan [carry_count=1, iteration_count=4, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:bool[], %3:f64[] .
                         let %4:f64[3] = condition %2 %1 %3 [
@@ -13436,7 +13436,7 @@ mod tests {
                             in (%0, %1, %5, %10, %8)
                         },
                     ]
-                    %13:ref<f32[]>, %14:ref<f32[]>, %15:f32[] = scan [carry_count=3, length=2, reverse=false] %5 %5 %3 \
+                    %13:ref<f32[]>, %14:ref<f32[]>, %15:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] %5 %5 %3 \
                 %12 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[], %4:bool[] .
