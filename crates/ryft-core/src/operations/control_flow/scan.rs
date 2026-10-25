@@ -180,11 +180,11 @@ pub trait ScanType:
             )));
         }
 
-        let body_input_types = &body_input_types[1..];
-
         // The signature is validated independently of the stacked-axis placements, which output inference applies.
-        scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, iteration_count, &[])?;
-        scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, iteration_count, &[])?;
+        let scan = ScanOperation::<Self>::new(carry_count, iteration_count.clone());
+        scan.declared_input_types(body_input_types)?;
+        scan.declared_output_types(body_output_types)?;
+        let body_input_types = &body_input_types[1..];
         check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
@@ -214,16 +214,13 @@ pub trait ScanType:
         iteration_count: &Dimension,
         input_types: &[Self],
     ) -> Result<(), TypeError> {
-        let body_input_types = &body_input_types[1..];
         let expected_input_types =
-            scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, iteration_count, &[])?;
-        check_count!(
-            "input",
-            input_types,
-            expected_input_types.len() + usize::from(iteration_count.variable().is_some()),
-            TypeError
-        );
-        for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
+            ScanOperation::<Self>::new(carry_count, iteration_count.clone()).declared_input_types(body_input_types)?;
+        check_count!("input", input_types, expected_input_types.len(), TypeError);
+        let body_input_types = &body_input_types[1..];
+        for (index, (expected, actual)) in
+            expected_input_types[..body_input_types.len()].iter().zip(input_types).enumerate()
+        {
             if index >= carry_count
                 && let (Ok(declared), Ok(actual)) = (body_input_types[index].as_array_type(), actual.as_array_type())
             {
@@ -292,7 +289,8 @@ pub trait ScanType:
         for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
             // Arrays enter as slices. References enter as whole roots, so the body can form its own indexed view:
             // only their leading extent must be the iteration count, whatever the placement of that axis (as
-            // `scan_boundary_types` and `validate_scan_input_type_signature` admit it), so a referent is not sliced.
+            // `ScanOperation::declared_input_types` and `validate_scan_input_type_signature` admit it), so a referent is
+            // not sliced.
             let (stacked_type, is_reference) = if let Some(referent) = r#type.referent() {
                 (referent.as_array_type()?, true)
             } else if let Ok(stacked_type) = r#type.as_array_type() {
@@ -373,7 +371,8 @@ pub trait ScanType:
     ) -> Result<Vec<Self>, TypeError> {
         Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, iteration_count)?;
         Self::validate_scan_input_type_signature(body_input_types, carry_count, iteration_count, input_types)?;
-        let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, iteration_count)?;
+        let scan = ScanOperation::<Self>::new(carry_count, iteration_count.clone());
+        let expected_input_types = scan.declared_input_types(body_input_types)?;
 
         // An iteration count input that only refines the declared bounds fixes the iteration count to one exact extent,
         // so the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared iteration
@@ -383,13 +382,12 @@ pub trait ScanType:
             Some(extent) => Dimension::Static(extent),
             None => iteration_count.clone(),
         };
-        let output_types = scan_boundary_types(
-            ScanBoundarySide::Output,
-            body_output_types,
-            carry_count,
-            &effective_iteration_count,
-            stacked_axis_shardings,
-        )?;
+        let output_types = ScanOperation {
+            iteration_count: effective_iteration_count,
+            stacked_axis_shardings: stacked_axis_shardings.to_vec(),
+            ..scan
+        }
+        .declared_output_types(body_output_types)?;
 
         // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
         // separate step from the iteration count refinement above: the stacked outputs' leading axis describes the
@@ -1052,8 +1050,8 @@ impl<T: ScanType> ScanOperation<T> {
     /// one whose scan axis is sharded over an `Auto` mesh axis). The iteration count shares its identity with every
     /// carry or stack that the body declares with the iteration count's identity, so these types relate the iteration
     /// count to those inputs. Backends that check the entry of a scan whose body they inline (e.g., with a
-    /// [`GuardOperation`]) and transform rules that remove or split the scan boundary relate the actual inputs to these
-    /// types.
+    /// [`GuardOperation`]) and transform rules that remove or split the scan boundary relate the actual
+    /// inputs to these types.
     ///
     /// # Errors
     ///
@@ -1064,15 +1062,77 @@ impl<T: ScanType> ScanOperation<T> {
         let Some((_, body_input_types)) = body_input_types.split_first() else {
             return Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body has no index input")));
         };
-        scan_input_types(body_input_types, self.carry_count, &self.iteration_count)
+
+        let carry_count = self.carry_count;
+        let iteration_count = &self.iteration_count;
+        if carry_count > body_input_types.len() {
+            return Err(TypeError::invalid(format!(
+                "`{}` carry count {} exceeds the body input count {}",
+                SCAN_OPERATION_NAME,
+                carry_count,
+                body_input_types.len(),
+            )));
+        }
+
+        let mut input_types = body_input_types[..carry_count].to_vec();
+        for (index, r#type) in body_input_types[carry_count..].iter().enumerate() {
+            let index = carry_count + index;
+            input_types.push(if let Some(referent) = r#type.referent() {
+                let referent = referent.as_array_type()?;
+
+                // Reference access paths require a static root shape even in the array IR family.
+                for (axis, dimension) in referent.shape().dimensions().iter().enumerate() {
+                    if dimension.value().is_none() {
+                        return Err(TypeError::invalid(format!(
+                            "`{}` body input {} must have a fully static type but axis {} of `{}` has size `{}`",
+                            SCAN_OPERATION_NAME,
+                            index + 1,
+                            axis,
+                            referent,
+                            dimension,
+                        )));
+                    }
+                }
+
+                if referent.rank() == 0 || !iteration_count.is_refined_by(&referent.dimension(0)) {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` reference input {index} must have \
+                         leading dimension `{iteration_count}`",
+                    )));
+                }
+
+                r#type.clone()
+            } else {
+                let Ok(slice_type) = r#type.as_array_type() else {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` stacked body input {} must be an array but got `{}`",
+                        SCAN_OPERATION_NAME,
+                        index + 1,
+                        r#type,
+                    )));
+                };
+
+                // Entry guards relate stack identities, but its own slice determines the admitted sharding.
+                let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
+                dimensions.push(iteration_count.clone());
+                dimensions.extend(slice_type.shape().dimensions().iter().cloned());
+                T::from(ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory()))
+            });
+        }
+
+        if iteration_count.variable().is_some() {
+            input_types.push(T::iteration_count_type(iteration_count)?);
+        }
+
+        Ok(input_types)
     }
 
     /// Returns the declared output types of this [`ScanOperation`] when its body declares `body_output_types` (i.e.,
     /// the next carries followed by the slices of the stacked outputs). Carries keep their types, and a stacked output
     /// gains a leading scan axis of the declared iteration count, placed as [`Self::stacked_axis_shardings`] declares
     /// (replicated by default), while keeping the sharding and memory placement of its slice (refer to
-    /// [`ScanType::infer_scan_output_types`] for the types that inference refines from these). Backends that allocate
-    /// the stacked outputs of a scan whose body they inline use these types.
+    /// [`ScanType::infer_scan_output_types`] for the types that inference refines from these). Backends
+    /// that allocate the stacked outputs of a scan whose body they inline use these types.
     ///
     /// # Errors
     ///
@@ -1080,13 +1140,63 @@ impl<T: ScanType> ScanOperation<T> {
     /// array, more stacked-axis placements than stacked outputs, or a placement that a stacked output's sharding
     /// cannot express.
     pub fn declared_output_types(&self, body_output_types: &[T]) -> Result<Vec<T>, TypeError> {
-        scan_boundary_types(
-            ScanBoundarySide::Output,
-            body_output_types,
-            self.carry_count,
-            &self.iteration_count,
-            &self.stacked_axis_shardings,
-        )
+        let carry_count = self.carry_count;
+        let iteration_count = &self.iteration_count;
+        if carry_count > body_output_types.len() {
+            return Err(TypeError::invalid(format!(
+                "`{}` carry count {} exceeds the body output count {}",
+                SCAN_OPERATION_NAME,
+                carry_count,
+                body_output_types.len(),
+            )));
+        }
+
+        if self.stacked_axis_shardings.len() > body_output_types.len() - carry_count {
+            return Err(TypeError::invalid(format!(
+                "`{}` places {} stacked axes but its body has {} stacked outputs",
+                SCAN_OPERATION_NAME,
+                self.stacked_axis_shardings.len(),
+                body_output_types.len() - carry_count,
+            )));
+        }
+
+        let mut output_types = body_output_types[..carry_count].to_vec();
+        for (index, r#type) in body_output_types.iter().enumerate().skip(carry_count) {
+            if r#type.referent().is_some() {
+                return Err(TypeError::invalid(format!(
+                    "`{}` stacked body output {} must be an array but got `{}`; \
+                     a body cannot return a per-iteration reference view",
+                    SCAN_OPERATION_NAME, index, r#type,
+                )));
+            }
+
+            let Ok(slice_type) = r#type.as_array_type() else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` stacked body output {} must be an array but got `{}`",
+                    SCAN_OPERATION_NAME, index, r#type,
+                )));
+            };
+
+            // Replicated insertion preserves the slice's placement without adding variation. Other placements use
+            // `batched`, which records manual-axis variation and rejects axes absent from the slice's mesh.
+            let stacked_axis_sharding =
+                self.stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
+            let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
+                // Inserting a replicated dimension into a valid sharding cannot fail.
+                slice_type.with_inserted_dimension(0, iteration_count.clone()).unwrap()
+            } else {
+                slice_type.batched(0, iteration_count.clone(), stacked_axis_sharding.clone()).map_err(|error| {
+                    TypeError::invalid(format!(
+                        "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
+                         `{slice_type}` on `{stacked_axis_sharding}` ({error})",
+                    ))
+                })?
+            };
+
+            output_types.push(T::from(stacked_type));
+        }
+
+        Ok(output_types)
     }
 
     /// Validates the application of this scan to inputs of the types `input_types` (i.e., the carries and the stacked
@@ -1556,7 +1666,8 @@ impl<
                 // retains that validation, with each input that the body declares as a reference at its referent type
                 // when discharged, and the value carries flow through it.
                 let actual_types = boundary_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-                let declared_types = scan_input_types(&source_input_types[1..], carry_count, &self.iteration_count)?
+                let declared_types = self
+                    .declared_input_types(&source_input_types)?
                     .into_iter()
                     .zip(&actual_types)
                     .map(|(declared_type, actual_type)| match declared_type {
@@ -2399,134 +2510,6 @@ fn scan_slice_type(stacked_type: &ArrayType, axis: usize) -> Result<(ArrayType, 
     })
 }
 
-/// Side of a scan's body signature used to derive its operation boundary. Reference stacks are admitted only
-/// as inputs; a body cannot return a reference to be stacked.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum ScanBoundarySide {
-    Input,
-    Output,
-}
-
-impl Display for ScanBoundarySide {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Input => "input",
-            Self::Output => "output",
-        })
-    }
-}
-
-/// Derives operation types from a body's carry and trailing types, excluding its intrinsic index input. Carries are
-/// unchanged and trailing arrays gain a leading scan axis, which `stacked_axis_shardings` places on the output side
-/// through [`ArrayType::batched`] (stacked outputs beyond the list are replicated); the input side ignores the
-/// placements, because stacked inputs carry their own. A trailing input reference already names the whole stack and
-/// keeps its type; a trailing reference output and a trailing first-class dimension are rejected.
-fn scan_boundary_types<T: ScanType>(
-    side: ScanBoundarySide,
-    body_types: &[T],
-    carry_count: usize,
-    iteration_count: &Dimension,
-    stacked_axis_shardings: &[ShardingDimension],
-) -> Result<Vec<T>, TypeError> {
-    if carry_count > body_types.len() {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body {side} count {}",
-            body_types.len(),
-        )));
-    }
-    if stacked_axis_shardings.len() > body_types.len() - carry_count {
-        return Err(TypeError::invalid(format!(
-            "`{SCAN_OPERATION_NAME}` places {} stacked axes but its body has {} stacked {side}s",
-            stacked_axis_shardings.len(),
-            body_types.len() - carry_count,
-        )));
-    }
-    let mut boundary_types = body_types[..carry_count].to_vec();
-    for (index, r#type) in body_types[carry_count..].iter().enumerate() {
-        let index = carry_count + index;
-        boundary_types.push(if let Some(referent) = r#type.referent() {
-            if side == ScanBoundarySide::Output {
-                return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` stacked body output {index} must be an array but got `{type}`; a body \
-                     cannot return a per-iteration reference view",
-                    r#type = r#type,
-                )));
-            }
-            let referent = referent.as_array_type()?;
-            // Reference access paths require a static root shape even in the array IR family.
-            for (axis, dimension) in referent.shape().dimensions().iter().enumerate() {
-                if dimension.value().is_none() {
-                    return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` body input {} must have a fully static type but axis {axis} of \
-                         `{type}` has size `{dimension}`",
-                        index + 1,
-                        r#type = referent,
-                    )));
-                }
-            }
-            if referent.rank() == 0 || !iteration_count.is_refined_by(&referent.dimension(0)) {
-                return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` reference input {index} must have leading dimension `{iteration_count}`",
-                )));
-            }
-            r#type.clone()
-        } else {
-            let Ok(slice_type) = r#type.as_array_type() else {
-                return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` stacked body {side} {} must be an array but got `{type}`",
-                    index + usize::from(side == ScanBoundarySide::Input),
-                    r#type = r#type,
-                )));
-            };
-            match side {
-                ScanBoundarySide::Input => {
-                    // Entry guards relate stack identities, but its own slice determines the admitted sharding.
-                    let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-                    dimensions.push(iteration_count.clone());
-                    dimensions.extend(slice_type.shape().dimensions().iter().cloned());
-                    T::from(
-                        ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory()),
-                    )
-                }
-                ScanBoundarySide::Output => {
-                    // Replicated insertion preserves the slice's placement without adding variation. Other placements use
-                    // `batched`, which records manual-axis variation and rejects axes absent from the slice's mesh.
-                    let stacked_axis_sharding =
-                        stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
-                    let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
-                        // Inserting a replicated dimension into a valid sharding cannot fail.
-                        slice_type.with_inserted_dimension(0, iteration_count.clone()).unwrap()
-                    } else {
-                        slice_type.batched(0, iteration_count.clone(), stacked_axis_sharding.clone()).map_err(|error| {
-                            TypeError::invalid(format!(
-                                "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
-                                 `{slice_type}` on `{stacked_axis_sharding}` ({error})",
-                            ))
-                        })?
-                    };
-                    T::from(stacked_type)
-                }
-            }
-        });
-    }
-    Ok(boundary_types)
-}
-
-/// Returns the declared operation input types of a scan whose body declares `body_types` after its intrinsic index: the
-/// input types that [`scan_boundary_types`] derives, followed by the `dimension<iteration_count>` type of the trailing
-/// iteration count input when `iteration_count` is dynamic.
-fn scan_input_types<T: ScanType>(
-    body_types: &[T],
-    carry_count: usize,
-    iteration_count: &Dimension,
-) -> Result<Vec<T>, TypeError> {
-    let mut input_types = scan_boundary_types(ScanBoundarySide::Input, body_types, carry_count, iteration_count, &[])?;
-    if iteration_count.variable().is_some() {
-        input_types.push(T::iteration_count_type(iteration_count)?);
-    }
-    Ok(input_types)
-}
-
 /// Validates the runtime dimension's identity or singleton refinement independently of stacked-axis equality.
 fn validate_scan_iteration_count_type<T: ScanType>(
     iteration_count: &Dimension,
@@ -2652,7 +2635,7 @@ fn forward_scan_carries<V: Value, O: Operation<Type = V::Type>, Carry: Clone>(
 
 /// Returns the type of the stack of `iteration_count` slices of type `slice_type` that an eager scan assembles. When
 /// `slice_type` has sharding, the new leading axis uses `axis_sharding` on the same mesh; otherwise, the stack stays
-/// unsharded, exactly as in output inference (refer to `scan_boundary_types`).
+/// unsharded, exactly as in output inference (refer to [`ScanOperation::declared_output_types`]).
 fn placed_scan_stack_type(
     slice_type: &ArrayType,
     iteration_count: usize,
@@ -22194,6 +22177,18 @@ mod tests {
                 &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [4])],
             ),
             Err(TypeError::invalid("`scan` stacked input 1 must have leading dimension `3` but has type `f64[4]`")),
+        );
+        // Excess placements are invalid even when they request implicit replication.
+        assert_eq!(
+            ArrayType::infer_scan_output_types(
+                &[index_type.clone(), scalar_type.clone(), scalar_type.clone()],
+                &[scalar_type.clone(), scalar_type.clone()],
+                1,
+                &Dimension::Static(3),
+                &[ShardingDimension::Replicated, ShardingDimension::Replicated],
+                &[scalar_type.clone(), ArrayType::new_static(DataType::F64, [3])],
+            ),
+            Err(TypeError::invalid("`scan` places 2 stacked axes but its body has 1 stacked outputs")),
         );
 
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
