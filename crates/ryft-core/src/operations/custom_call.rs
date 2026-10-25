@@ -48,6 +48,7 @@ use crate::macros::{check_count, impl_differentiable_operation, impl_reference_d
 use crate::operations::Capability;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
+use crate::operations::custom_functions::operations::CUSTOM_FUNCTION_OPERATION_NAME;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
@@ -1426,8 +1427,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl_differentiable_operation! {
     CustomCallOperation,
     jvp<C>
@@ -1439,9 +1438,10 @@ impl_differentiable_operation! {
             if inputs.iter().any(|input| !input.tangent().is_zero()) {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "custom call `{}` has no differentiation rule; call it through a `custom_function` with \
-                         derivative rules to provide one",
+                        "custom call `{}` has no differentiation rule; call it through a `{}` \
+                         with derivative rules to provide one",
                         operation.target_name,
+                        CUSTOM_FUNCTION_OPERATION_NAME,
                     ),
                 }
                 .into());
@@ -1460,6 +1460,8 @@ impl_differentiable_operation! {
     },
     transpose = @nonlinear,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension input per
 // dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference verifies
@@ -1733,9 +1735,9 @@ impl<C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>> Membe
         if inputs.iter().any(|input| !input.tangent().is_zero()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "custom call `{}` has no differentiation rule; call it through a `custom_function` with \
+                    "custom call `{}` has no differentiation rule; call it through a `{}` with \
                      derivative rules to provide one",
-                    self.target_name,
+                    self.target_name, CUSTOM_FUNCTION_OPERATION_NAME,
                 ),
             }
             .into());
