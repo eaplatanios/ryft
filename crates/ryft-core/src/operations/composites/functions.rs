@@ -178,11 +178,18 @@ pub struct ExplicitVjp<Input, Output, Residual> {
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangents)`.
     backward: Arc<dyn Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync>,
+
+    /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
+    deferred_forward: bool,
 }
 
 impl<Input, Output, Residual> Debug for ExplicitVjp<Input, Output, Residual> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ExplicitVjp").finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("ExplicitVjp");
+        if self.deferred_forward {
+            debug.field("deferred_forward", &true);
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -205,6 +212,9 @@ where
             + Send
             + Sync,
     >,
+
+    /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
+    deferred_forward: bool,
 }
 
 impl<Tracer: Typed + Parameter, Input, Output, Residual> Debug for SymbolicZeroVjp<Tracer, Input, Output, Residual>
@@ -213,7 +223,11 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SymbolicZeroVjp").finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("SymbolicZeroVjp");
+        if self.deferred_forward {
+            debug.field("deferred_forward", &true);
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -241,6 +255,9 @@ where
             + Send
             + Sync,
     >,
+
+    /// Whether reverse mode defers `forward` to the backward pass (refer to [`Composite::with_deferred_forward`]).
+    deferred_forward: bool,
 }
 
 impl<Tracer: Typed + Parameter, Transposition, Input, Output, Residual> Debug
@@ -250,7 +267,11 @@ where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("AccumulatingVjp").finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("AccumulatingVjp");
+        if self.deferred_forward {
+            debug.field("deferred_forward", &true);
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -530,7 +551,8 @@ where
                 program.interpret_in_context(&context, values)
             }
         };
-        definition.with_vjp(forward, backward)
+        let definition = definition.with_vjp(forward, backward);
+        if self.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
@@ -613,7 +635,8 @@ where
                     .collect::<Vec<_>>())
             }
         };
-        definition.with_symbolic_zero_vjp(forward, backward)
+        let definition = definition.with_symbolic_zero_vjp(forward, backward);
+        if self.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
@@ -691,7 +714,8 @@ where
                 backward(context, residuals, seeds, accumulators)
             }
         };
-        definition.with_accumulating_vjp(forward, backward)
+        let definition = definition.with_accumulating_vjp(forward, backward);
+        if self.deferred_forward { definition.with_deferred_forward_rule() } else { definition }
     }
 }
 
@@ -2120,10 +2144,10 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     /// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) carrier whose transpose replays the backward
     /// program, so reverse mode uses exactly the user-supplied gradient, and the original call is never transposed. A
     /// call batched before it is differentiated batches both rule programs traced at the unbatched types and sums the
-    /// cotangents that the batched backward program produces for replicated inputs over the batch axis. There is no
-    /// analogue of JAX's `optimize_remat` option: under rematerialization (refer to
-    /// [`RematerializeOperation`](crate::RematerializeOperation)), the forward pass still runs `forward` rather than
-    /// the primal, instead of deferring `forward` to the backward pass that needs its residuals.
+    /// cotangents that the batched backward program produces for replicated inputs over the batch axis. By default,
+    /// the forward pass runs `forward` and keeps its residuals alive for the backward pass, while
+    /// [`Composite::with_deferred_forward`] (i.e., the analogue of JAX's `optimize_remat` option) runs the primal in
+    /// the forward pass instead and defers `forward` to the backward pass that needs its residuals.
     ///
     /// Higher-order differentiation differentiates the backward program's ordinary operations, because the pullback
     /// replays that program inline. Both forward and reverse mode apply to a pullback, with respect to the primal
@@ -2147,7 +2171,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
         Backward: 'static + Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync,
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
-        let vjp = ExplicitVjp { forward: Arc::new(forward), backward: Arc::new(backward) };
+        let vjp = ExplicitVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
     }
 
@@ -2213,7 +2237,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
             + Sync,
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
-        let vjp = SymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward) };
+        let vjp = SymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
     }
 
@@ -2263,8 +2287,99 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
             + Sync,
     {
         let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
-        let vjp = AccumulatingVjp { forward: Arc::new(forward), backward: Arc::new(backward) };
+        let vjp = AccumulatingVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Self::with_configuration(primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, name)
+    }
+}
+
+impl<Input, Output, Jvp, Residual, Batching>
+    Composite<Input, Output, Jvp, ExplicitVjp<Input, Output, Residual>, Batching>
+{
+    /// Returns this function with its reverse-mode forward rule deferred to the backward pass, which is the analogue of
+    /// JAX's `custom_vjp(..., optimize_remat=True)`. Reverse mode then computes the outputs of each call with the
+    /// primal, rather than with `forward`, and keeps only the call's inputs alive for the backward pass, where it runs
+    /// `forward` on them to recover the residuals `r` right before `backward` consumes them. This trades recomputing
+    /// `forward` for the memory that its residuals would otherwise occupy between the two passes, and it pays off when
+    /// the primal is cheaper than `forward` (e.g., when computing the residuals is the expensive part of `forward`).
+    ///
+    /// The swap applies wherever reverse mode partitions a call (e.g., in [`vjp`](crate::ReverseModeDifferentiate::vjp)
+    /// and in rematerialized bodies, refer to [`rematerialize`](crate::rematerialize)), so a residual policy that saves
+    /// everything still saves only the call's inputs, while one that saves nothing recomputes those inputs. Forward
+    /// mode, batching, and interpretation are unaffected, and so is a call whose unused outputs were pruned (refer to
+    /// [`CustomRuleDefinition::with_deferred_forward_rule`]). Higher-order differentiation differentiates the replayed
+    /// forward and backward programs like the rest of the pullback.
+    ///
+    /// The same function is available for [`SymbolicZeroVjp`] and [`AccumulatingVjp`] configurations (i.e., after
+    /// [`Composite::with_symbolic_zero_vjp`] or [`Composite::with_accumulating_vjp`]). Calls staged before this
+    /// reconfiguration keep their original rules.
+    ///
+    /// # Errors
+    ///
+    /// `forward` runs in the backward pass, where its effects would execute out of order with the rest of the program,
+    /// so reverse mode rejects a call whose `forward` has effects (e.g., a `print` or a reference update) with a
+    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a call before differentiating it is
+    /// supported, but batching a reverse-mode derivative after it is taken and before it is transposed (e.g., batching
+    /// a linearization) is rejected with a [`BatchingError::UnsupportedOperation`] that names this function.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayOperation, Cos, DomainTracer, EagerContext, ProgramError, Sin, composite};
+    /// # use ryft_core::differentiate_at;
+    /// # fn main() -> Result<(), ProgramError> {
+    /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+    ///
+    /// // `sin` whose forward rule saves `cos(x)` as its residual, which the deferral recomputes in the backward pass.
+    /// let sine = composite(|x: Tracer| Ok(x.sin()?))
+    ///     .with_vjp(|x: Tracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+    ///     .with_deferred_forward();
+    /// let x = Array::scalar(0.5f64)?;
+    /// let (value, pullback) = differentiate_at(x.clone()).vjp(|x| sine.call(x))?;
+    /// assert_eq!(value, Array::scalar(0.5f64.sin())?);
+    /// assert_eq!(pullback.residuals(), &[x]);
+    /// assert_eq!(pullback.apply_materialized(Array::scalar(1.0f64)?)?, Array::scalar(0.5f64.cos())?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn with_deferred_forward(mut self) -> Self {
+        self.vjp.deferred_forward = true;
+        self.registrations = CompositeRegistrations::default();
+        self
+    }
+}
+
+impl<Tracer, Input, Output, Jvp, Residual, Batching>
+    Composite<Input, Output, Jvp, SymbolicZeroVjp<Tracer, Input, Output, Residual>, Batching>
+where
+    Tracer: Typed + Parameter,
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+{
+    /// Returns this function with its reverse-mode forward rule deferred to the backward pass, exactly as for the
+    /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
+    #[inline]
+    pub fn with_deferred_forward(mut self) -> Self {
+        self.vjp.deferred_forward = true;
+        self.registrations = CompositeRegistrations::default();
+        self
+    }
+}
+
+impl<Tracer, Transposition, Input, Output, Jvp, Residual, Batching>
+    Composite<Input, Output, Jvp, AccumulatingVjp<Tracer, Transposition, Input, Output, Residual>, Batching>
+where
+    Tracer: Typed + Parameter,
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+{
+    /// Returns this function with its reverse-mode forward rule deferred to the backward pass, exactly as for the
+    /// rules of [`Composite::with_vjp`] (refer to the [`ExplicitVjp`] form of this function for the semantics).
+    #[inline]
+    pub fn with_deferred_forward(mut self) -> Self {
+        self.vjp.deferred_forward = true;
+        self.registrations = CompositeRegistrations::default();
+        self
     }
 }
 
@@ -2725,8 +2840,10 @@ impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite
 ///   - **Differentiation Flags:** The reverse-mode forward rule receives no per-input differentiation flags (i.e.,
 ///     JAX's `perturbed` flags), while the backward rule can still skip structural-zero seeds and return
 ///     structural-zero cotangents (refer to [`Composite::with_symbolic_zero_vjp`]).
-///   - **Rematerialization:** There is no analogue of JAX's `optimize_remat` option (refer to
-///     [`Composite::with_vjp`]).
+///   - **Rematerialization:** [`Composite::with_deferred_forward`], the analogue of JAX's `optimize_remat` option,
+///     swaps the primal into the forward pass wherever reverse mode partitions a call, rather than only where dead code
+///     elimination finds the forward rule's residuals unused (e.g., inside a rematerialized body), and it also supports
+///     structural-zero and accumulating backward rules and higher-order differentiation, which JAX's option rejects.
 ///   - **Non-Differentiated Inputs:** Non-differentiated inputs are a prefix of flattened leaves, which must receive
 ///     stopped gradients, rather than static argument positions whose gradients are stopped implicitly (refer to
 ///     [`Composite::with_non_differentiated_count`]).
@@ -4974,6 +5091,72 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_with_deferred_forward() {
+        // `sin` whose forward rule saves `cos(x)`. Deferring the forward rule changes what the pullback keeps alive,
+        // from that residual to the input `x`, but not the value or the gradient, for every form of the reverse-mode
+        // rules.
+        type Tracer = DomainTracer<ArrayContext>;
+        type Transposition = TranspositionContext<Array, ArrayOperation<Array>>;
+        let x = Array::scalar(0.5f64).unwrap();
+        let value = Array::scalar(0.5f64.sin()).unwrap();
+        let seed = Array::scalar(2.0f64).unwrap();
+        let gradient = Array::scalar(2.0 * 0.5f64.cos()).unwrap();
+        let function = composite(|x: Tracer| Ok(x.sin()?))
+            .with_name("sine")
+            .with_vjp(|x: Tracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
+        let (output, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(output, value);
+        assert_eq!(pullback.residuals(), &[Array::scalar(0.5f64.cos()).unwrap()]);
+        assert_eq!(pullback.apply_materialized(seed.clone()), Ok(gradient.clone()));
+
+        let function = function.with_deferred_forward();
+        assert_eq!(
+            format!("{function:?}"),
+            "Composite { name: \"sine\", jvp: DefaultJvp, vjp: ExplicitVjp { deferred_forward: true, .. }, \
+             batching: DefaultBatching, batched_output_axes: None, non_differentiated_count: 0, .. }",
+        );
+        let (output, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(output, value);
+        assert_eq!(pullback.residuals(), std::slice::from_ref(&x));
+        assert_eq!(pullback.apply_materialized(seed.clone()), Ok(gradient.clone()));
+
+        // A backward rule that receives structural-zero seeds.
+        let function = composite(|x: Tracer| Ok(x.sin()?))
+            .with_symbolic_zero_vjp(
+                |x: Tracer| Ok((x.sin()?, x.cos()?)),
+                |cosine: Tracer, seed: MaybeZero<Tracer>| match seed {
+                    MaybeZero::Value(seed) => Ok(MaybeZero::Value(cosine * seed)),
+                    MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(r#type)),
+                },
+            )
+            .with_deferred_forward();
+        let (output, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(output, value);
+        assert_eq!(pullback.residuals(), std::slice::from_ref(&x));
+        assert_eq!(pullback.apply_materialized(seed.clone()), Ok(gradient.clone()));
+
+        // A backward rule that submits its cotangent to its accumulator.
+        let function = composite(|x: Tracer| Ok(x.sin()?))
+            .with_accumulating_vjp(
+                |x: Tracer| Ok((x.sin()?, x.cos()?)),
+                |context: &mut Transposition,
+                 cosine: Tracer,
+                 seed: MaybeZero<Tracer>,
+                 accumulator: CotangentAccumulator| {
+                    if let MaybeZero::Value(seed) = seed {
+                        accumulator.accumulate(context, MaybeZero::Value(cosine * seed))?;
+                    }
+                    Ok(())
+                },
+            )
+            .with_deferred_forward();
+        let (output, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(output, value);
+        assert_eq!(pullback.residuals(), std::slice::from_ref(&x));
+        assert_eq!(pullback.apply_materialized(seed), Ok(gradient));
+    }
+
+    #[test]
     fn test_composite_with_batching() {
         // The rule of `(x, y) ↦ x · y` computes `y · x`, which shows that it takes precedence over structurally
         // batching the primal, and declares that the output follows the mapped input. It is traced once per batching
@@ -6651,7 +6834,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2, 3], %1:f64[2] .
                 let %2:f64[3, 2] = transpose [permutation=[1, 0]] %0
-                    %3:f64[2], %4:f64[3, 2] = scan [carry_count=1, length=3, reverse=false] %1 %2 [
+                    %3:f64[2], %4:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %2 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2] .
                             let %3:f64[2] = composite [name=\"sine\"] %2 %1 [
@@ -6709,7 +6892,7 @@ mod tests {
             differentiate_then_batch.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[3] .
-                let %3:f64[], %4:f64[3], %5:f64[3] = scan [carry_count=1, length=3, reverse=false] %1 %0 %2 [
+                let %3:f64[], %4:f64[3], %5:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[], %5:f64[] = composite [name=\"jvp(sine)\"] %2 %1 %3 [

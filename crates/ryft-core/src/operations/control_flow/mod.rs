@@ -72,9 +72,10 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::Context;
+use crate::macros::check_count;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
+use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
 use crate::programs::{
     Operation, ProgramError, ReferenceId, ReferenceRoot, RegionRef, Type, TypeError, TypeIdentityPosition,
     TypeRefinements, Value,
@@ -93,42 +94,39 @@ pub use scan::{SCAN_OPERATION_NAME, ScanInterpretationDomain, ScanOperation, Sca
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
 
-/// Type-family storage policy for values that must cross an iteration boundary as stacked residuals.
+/// Operation-family storage and conversions for residuals saved separately for each loop iteration.
 ///
-/// Array residuals store themselves directly. An array IR backend can instead assign a checked array-backed storage
-/// type to metadata values such as first-class dimensions, keeping the temporal representation explicit in SSA.
-pub(crate) trait TemporalResidualType: Type {
-    /// Returns the per-iteration array-backed storage type for this residual.
-    fn temporal_storage_type(&self) -> Result<Self, TypeError>;
-}
+/// Arrays store themselves directly. First-class dimensions are converted to scalar arrays before stacking and
+/// restored after slicing. Conversions are region-free unary operations with one output, so the stored type is
+/// inferred from the same operation that produces the stored value. Save and restore functions return `None` when no
+/// conversion is needed.
+pub(crate) trait ResidualStackOperation<T: Type>: Operation<Type = T> {
+    /// Returns the per-iteration array storage type, inferred from [`Self::residual_to_storage`] when conversion is
+    /// needed.
+    fn residual_storage_type(residual_type: &T) -> Result<T, TypeError> {
+        let Some(operation) = Self::residual_to_storage(residual_type)? else {
+            return Ok(residual_type.clone());
+        };
+        let mut output_types = operation.infer_output_types(std::slice::from_ref(residual_type), &[])?;
+        check_count!("output", output_types, 1, TypeError);
+        Ok(output_types.remove(0))
+    }
 
-/// Operation-family conversions paired with [`TemporalResidualType`].
-///
-/// Returning `None` means the residual already uses its storage representation. Returning an operation makes the
-/// conversion visible in the generated program before stacking or after slicing one iteration's stored value.
-pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<Type = T> {
-    /// Returns the operation that converts a residual to temporal storage, if conversion is required.
+    /// Returns the operation that converts a residual to an array for stacking, if conversion is required.
     fn residual_to_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 
-    /// Returns the operation that restores a residual from temporal storage, if conversion is required.
+    /// Returns the operation that restores a residual from its stored array slice, if conversion is required.
     fn residual_from_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 
     /// Returns the operation that recovers a residual of type `residual_type` from a value of type `carrier_type` that
     /// already carries the residual's identity (e.g., the size of the array axis that a first-class dimension
     /// describes), or `None` when `carrier_type` carries no such identity. A rebuilt loop body uses this instead of
-    /// restoring the residual from temporal storage when one of its inputs already establishes that identity, because
+    /// restoring the residual from its stored value when one of its inputs already establishes that identity, because
     /// the restored residual would define the identity a second time.
     fn residual_from_carrier(residual_type: &T, carrier_type: &T) -> Result<Option<Self>, TypeError>;
 }
 
-impl TemporalResidualType for ArrayType {
-    #[inline]
-    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
-        Ok(self.clone())
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O {
+impl<O: Operation<Type = ArrayType>> ResidualStackOperation<ArrayType> for O {
     #[inline]
     fn residual_to_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
         Ok(None)
@@ -145,24 +143,9 @@ impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O 
     }
 }
 
-// Array IR residuals store arrays directly and first-class dimensions as scalar arrays. A reference never defines
-// temporal storage because the transforms thread references through loops as carries and never save them as residuals.
-impl TemporalResidualType for ArrayIrType {
-    #[inline]
-    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
-        Ok(match self {
-            Self::Array(r#type) => Self::Array(r#type.clone()),
-            Self::Dimension(_) => Self::Array(ArrayType::scalar(DIMENSION_DATA_TYPE)),
-            Self::Reference(_) => {
-                return Err(TypeError::invalid(
-                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
-                ));
-            }
-        })
-    }
-}
-
-impl<O> TemporalResidualOperation<ArrayIrType> for O
+// Array IR residuals store arrays directly and first-class dimensions as scalar arrays. References are threaded
+// through loop carries instead of stored in residual stacks.
+impl<O> ResidualStackOperation<ArrayIrType> for O
 where
     O: Operation<Type = ArrayIrType>
         + From<DimensionFromScalarOperation>
@@ -175,7 +158,7 @@ where
             ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
             ArrayIrType::Reference(_) => {
                 return Err(TypeError::invalid(
-                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                    "a reference cannot be stored in a residual stack; references are threaded as carries",
                 ));
             }
         })
@@ -187,7 +170,7 @@ where
             ArrayIrType::Dimension(r#type) => Some(Self::from(DimensionFromScalarOperation::new(r#type.clone()))),
             ArrayIrType::Reference(_) => {
                 return Err(TypeError::invalid(
-                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                    "a reference cannot be stored in a residual stack; references are threaded as carries",
                 ));
             }
         })
@@ -573,7 +556,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DimensionType, DimensionValue};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
+        DimensionType, DimensionValue, Memory,
+    };
     use crate::axes::Axis;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
@@ -583,10 +569,11 @@ mod tests {
     use crate::contexts::Context;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Atom, Operation, Program, ProgramError, Region, RegionDriver, RegionLiveness, RegionRef, Value,
+        Atom, Operation, Program, ProgramError, ReferenceType, Region, RegionDriver, RegionLiveness, RegionRef,
+        TypeError, Value,
     };
 
-    use super::{SCAN_OPERATION_NAME, validate_reference_carry_axis};
+    use super::{ResidualStackOperation, SCAN_OPERATION_NAME, validate_reference_carry_axis};
 
     /// Array IR value, which admits references and first-class dimensions.
     pub(super) type TestIrValue = ArrayIrValue<Array>;
@@ -756,6 +743,26 @@ mod tests {
         ) -> Result<P::Batch, BatchingError> {
             P::align_batch_axis(context, batch, axis)
         }
+    }
+
+    #[test]
+    fn test_residual_stack_operation_residual_storage_type() {
+        // Arrays keep their metadata in both families; dimensions use scalar array storage, and references are rejected.
+        let array_type = ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true });
+        assert_eq!(ArrayOperation::<Array>::residual_storage_type(&array_type), Ok(array_type.clone()));
+        assert_eq!(TestIrOperation::residual_storage_type(&array_type.clone().into()), Ok(array_type.clone().into()));
+
+        let dimension_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        assert_eq!(
+            TestIrOperation::residual_storage_type(&dimension_type.into()),
+            Ok(ArrayType::scalar(DataType::I64).into()),
+        );
+        assert_eq!(
+            TestIrOperation::residual_storage_type(&ReferenceType::new(array_type).into()),
+            Err(TypeError::invalid(
+                "a reference cannot be stored in a residual stack; references are threaded as carries",
+            )),
+        );
     }
 
     #[test]

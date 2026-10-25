@@ -563,7 +563,7 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                 Self::While(WhileOperation::new().with_iteration_bound(operation.iteration_bound()).unwrap())
             }
             ArrayOperation::Scan(operation) => Self::Scan(
-                ScanOperation::new(operation.carry_count(), operation.length().clone())
+                ScanOperation::new(operation.carry_count(), operation.iteration_count().clone())
                     .with_reverse(operation.reverse())
                     .with_unroll(operation.unroll())
                     .unwrap(),
@@ -1581,7 +1581,7 @@ mod tests {
             panic!("expected a direct array IR scan operation");
         };
         assert_eq!(promoted_scan.carry_count(), 1);
-        assert_eq!(promoted_scan.length(), &Dimension::Static(4));
+        assert_eq!(promoted_scan.iteration_count(), &Dimension::Static(4));
         assert!(promoted_scan.reverse());
         assert_eq!(promoted_scan.unroll(), 2);
 

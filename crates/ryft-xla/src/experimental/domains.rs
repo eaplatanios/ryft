@@ -15548,7 +15548,7 @@ mod tests {
             panic!("expected dynamic scan operation");
         };
         assert_eq!(scan.carry_count(), 1);
-        assert_eq!(scan.length(), &Dimension::Dynamic(length_variable));
+        assert_eq!(scan.iteration_count(), &Dimension::Dynamic(length_variable));
         let runtime_length = *scan_instruction.inputs().last().unwrap();
         assert_eq!(
             program.entry_region_ref().atoms()[runtime_length.index()].as_constant(),

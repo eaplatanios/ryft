@@ -2583,7 +2583,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f64[2, 3] .
-                    let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
+                    let %1:f64[2] = scan [carry_count=0, iteration_count=2, reverse=false] %0 [
                         body={
                             lambda %0:i64[], %1:f64[3] .
                             let %2:f64[] = dot [
@@ -2597,7 +2597,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[2] .
-                    let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                    let %2:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[] .
                             let %3:f64[] = mul %1 %2
@@ -2619,7 +2619,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f64[2, 3] .
-                    let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
+                    let %1:f64[2] = scan [carry_count=0, iteration_count=2, reverse=false] %0 [
                         body={
                             lambda %0:i64[], %1:f64[3] .
                             let %2:f64[] = dot [
@@ -2632,7 +2632,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[2] .
-                    let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                    let %2:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[] .
                             let %3:f64[] = cos %2
@@ -2701,7 +2701,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[], %2:f64[2, 3] .
-                    let %3:f64[] = scan [carry_count=1, length=2, reverse=false] %1 %2 [
+                    let %3:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %2 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[3] .
                             let %3:f64[] = dot [
@@ -2742,7 +2742,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f64[], %1:f64[2, 3] .
-                    let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                    let %2:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[3] .
                             let %3:f64[] = dot [

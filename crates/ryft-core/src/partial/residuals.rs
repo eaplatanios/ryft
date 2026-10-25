@@ -4884,7 +4884,7 @@ mod tests {
                 residual={
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = tag [key=initial] %1
-                        %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, length=3, reverse=false] %2 %1 [
+                        %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] %2 %1 [
                             body={
                                 lambda %0:i64[], %1:f64[], %2:f64[] .
                                 let %3:f64[] = dot [
@@ -4934,7 +4934,7 @@ mod tests {
                 residual={
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = tag [key=initial] %1
-                        %3:f64[], %4:f64[] = scan [carry_count=2, length=0, reverse=false] %2 %1 [
+                        %3:f64[], %4:f64[] = scan [carry_count=2, iteration_count=0, reverse=false] %2 %1 [
                             body={
                                 lambda %0:i64[], %1:f64[], %2:f64[] .
                                 let %3:f64[] = dot [
@@ -4984,7 +4984,7 @@ mod tests {
                     let %3:f64[] = condition %1 %2 [
                         true={
                             lambda %0:f64[] .
-                            let %1:f64[] = scan [carry_count=1, length=0, reverse=false] %0 [
+                            let %1:f64[] = scan [carry_count=1, iteration_count=0, reverse=false] %0 [
                                 body={
                                     lambda %0:i64[], %1:f64[] .
                                     let %2:f64[] = dot [
@@ -4998,7 +4998,7 @@ mod tests {
                         },
                         false={
                             lambda %0:f64[] .
-                            let %1:f64[] = scan [carry_count=1, length=0, reverse=false] %0 [
+                            let %1:f64[] = scan [carry_count=1, iteration_count=0, reverse=false] %0 [
                                 body={
                                     lambda %0:i64[], %1:f64[] .
                                     let %2:f64[] = dot [

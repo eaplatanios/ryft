@@ -3810,7 +3810,7 @@ mod tests {
             unreachable!();
         };
         assert_eq!(scan.carry_count(), 1);
-        assert_eq!(scan.length(), &Dimension::Static(2));
+        assert_eq!(scan.iteration_count(), &Dimension::Static(2));
         assert!(scan.reverse());
         assert_eq!(scan.unroll(), 2);
         let scan_body = array_ir.region(scan_instruction.regions()[0]).unwrap();

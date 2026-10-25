@@ -2997,7 +2997,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[], %3:f64[] = scan [carry_count=2, length=2, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[] = scan [carry_count=2, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         in (%2, %1)
@@ -3068,7 +3068,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[], %1:f64[2, 3] .
-                let %2:f64[], %3:f64[2], %4:f64[2] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[2], %4:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[3] .
                         let %3:f64[] = dot [
@@ -3084,7 +3084,7 @@ mod tests {
                 let %5:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[2] .
-                        let %5:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 %2 %3 %4 [
+                        let %5:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 %3 %4 [
                             body={
                                 lambda %0:i64[], %1:f64[], %2:f64[3], %3:f64[3], %4:f64[], %5:f64[] .
                                 let %6:f64[] = cos %5

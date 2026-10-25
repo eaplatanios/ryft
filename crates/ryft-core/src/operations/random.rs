@@ -1922,7 +1922,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:u64[3, 2] .
-                let %1:u64[3, 2], %2:u32[3, 4] = scan [carry_count=0, length=3, reverse=false] %0 [
+                let %1:u64[3, 2], %2:u32[3, 4] = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:u64[2] .
                         let %2:u64[2], %3:u32[4] = rng_bit_generator [algorithm=three_fry, output_type=u32[4]] %1
@@ -2011,7 +2011,7 @@ mod tests {
             panic!("mapped random bit generation should stage the direct array IR scan carrier");
         };
         assert_eq!(scan_operation.carry_count(), 2);
-        assert_eq!(scan_operation.length(), &Dimension::Dynamic(batch));
+        assert_eq!(scan_operation.iteration_count(), &Dimension::Dynamic(batch));
         assert_eq!(scan.inputs(), &[input_ids[2], input_ids[3], input_ids[1], input_ids[0]]);
         assert_eq!(scan.regions().len(), 1);
         assert!(matches!(

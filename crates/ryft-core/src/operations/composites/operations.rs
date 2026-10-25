@@ -178,7 +178,10 @@ enum CompositeRules<T, S> {
 /// deliberately custom derivative with the derivative of the primal implementation. Differentiating the primal region
 /// is instead an explicit registration choice (i.e., [`CompositeJvpRule::Primal`]). Reverse mode replays the forward
 /// rule and stages a [`CompositeTransposeOperation`] carrier for the backward rule, in the same representation as the
-/// call.
+/// call. Retained rules may instead defer their forward rule to the backward pass (refer to
+/// [`CustomRuleSource::defers_forward`], rendered as `deferred_forward=true`), in which case reverse mode replays the
+/// primal region and stages a carrier over the call's inputs, whose transposition replays the forward rule to recover
+/// the residuals before it applies the backward rule.
 ///
 /// # Batching
 ///
@@ -582,18 +585,25 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Clone 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug for CompositeOperation<V, O, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Retained rules are identified by the name of their definition, whose own rendering would include its rules.
+        // The deferral of a forward rule is a property of the rules that is shown only where it applies.
         let mut debug = formatter.debug_struct("CompositeOperation");
         match &self.rules {
             CompositeRules::Attached { jvp_rule, has_vjp_rule } => debug
                 .field("non_differentiated_count", &self.non_differentiated_count)
                 .field("jvp_rule", jvp_rule)
                 .field("has_vjp_rule", has_vjp_rule),
-            CompositeRules::Retained { rules, batching, discharged, kept_outputs } => debug
-                .field("name", &rules.name())
-                .field("non_differentiated_count", &self.non_differentiated_count)
-                .field("batching", batching)
-                .field("discharged", discharged)
-                .field("kept_outputs", kept_outputs),
+            CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
+                debug
+                    .field("name", &rules.name())
+                    .field("non_differentiated_count", &self.non_differentiated_count)
+                    .field("batching", batching)
+                    .field("discharged", discharged)
+                    .field("kept_outputs", kept_outputs);
+                if rules.defers_forward() {
+                    debug.field("deferred_forward", &true);
+                }
+                &mut debug
+            }
         }
         .finish()
     }
@@ -927,6 +937,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     }
                     if let Some(kept_outputs) = kept_outputs {
                         operation.field("kept_outputs", format_args!("{kept_outputs:?}"))?;
+                    }
+                    if rules.defers_forward() {
+                        operation.field("deferred_forward", true)?;
                     }
                     Ok(())
                 })
@@ -1506,6 +1519,44 @@ where
                     None,
                 )
             }
+            // A call that defers its forward rule replays its primal region instead (i.e., its batched primal region
+            // when it is batched), and its carrier receives the call's inputs in place of the residuals, from which it
+            // replays the forward rule when it is transposed. The seed extents are read from the primal outputs as
+            // usual. A call that keeps only some outputs of its rules is differentiated without deferral (below),
+            // because only the forward rule computes the outputs that it does not keep, whose seeds and runtime
+            // extents the backward rule needs.
+            CompositeRules::Retained { rules, batching, discharged, kept_outputs: None } if rules.defers_forward() => {
+                let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
+                let key =
+                    self.specialization_key(rules, batching, *discharged, &None, input_types, primal_output_types)?;
+
+                // The forward rule is traced here, on its first request, to reject an effectful forward rule before
+                // anything is staged, and the carrier's transposition replays the cached specialization.
+                let specialization = rules.forward_specialization(key.clone())?;
+                validate_deferred_forward_rule(rules.name(), specialization.program.effects())?;
+                let outputs = primal_region.interpret_in_context(context.primal(), primal_inputs)?;
+                leading_values.extend(differentiated_inputs.iter().map(|input| input.primal().clone()));
+                let extent_types = match batching {
+                    None => outputs.iter().map(|output| output.r#type().tangent()).collect::<Result<Vec<_>, _>>()?,
+                    Some(batching) => {
+                        batching.output_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?
+                    }
+                };
+                let seed_extent_types = capture_seed_extents(&outputs, &extent_types, &mut leading_values)?;
+                (
+                    outputs,
+                    seed_extent_types.len(),
+                    CompositeTransposeRules::Retained {
+                        rules: rules.clone(),
+                        batching: None,
+                        invokes_rule_directly: false,
+                        discharged: *discharged,
+                        deferred_forward: Some(key),
+                    },
+                    Vec::new(),
+                    None,
+                )
+            }
             CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
                 // Replay the forward rule specialization on the dual primals, returning every output of the rule
                 // followed by the residuals. A call that keeps only some of the rule's outputs still replays them all,
@@ -1550,45 +1601,15 @@ where
                 let seed_extent_types = capture_seed_extents(&outputs, &extent_types, &mut leading_values)?;
                 let seed_extent_count = seed_extent_types.len();
 
-                // At each level, the carrier's inputs have the batch axes of the corresponding call inputs, except for
-                // the residuals, which have the axes of that level's forward specialization, and its outputs have the
-                // call's batch axes, or those of the forward specialization for the outputs that the call does not
-                // keep.
-                let carrier_batching = match (batching, unbatched) {
-                    (Some(batching), Some(unbatched)) => {
-                        let non_differentiated_count = key.non_differentiated_count;
-                        let mut carrier_input_types = batching.input_types[..non_differentiated_count].to_vec();
-                        carrier_input_types.extend_from_slice(&unbatched.program.output_types()[rule_output_count..]);
-                        carrier_input_types.extend_from_slice(&seed_extent_types);
-                        for r#type in &batching.input_types[non_differentiated_count..] {
-                            carrier_input_types.push(r#type.tangent()?);
-                        }
-                        let mut levels = Vec::with_capacity(batching.levels.len());
-                        for (index, level) in batching.levels.iter().enumerate() {
-                            let level_key = CustomRuleSpecializationKey {
-                                levels: batching.levels[..=index].to_vec(),
-                                ..key.clone()
-                            };
-                            let level_specialization = rules.forward_specialization(level_key)?;
-                            let leading_input_count =
-                                non_differentiated_count + boundary_input_count(&batching.levels[..index]);
-                            let mut input_axes = level.input_axes[..leading_input_count].to_vec();
-                            input_axes.extend_from_slice(&level_specialization.output_axes[rule_output_count..]);
-                            input_axes.extend(std::iter::repeat_n(BatchAxis::replicated(), seed_extent_count));
-                            input_axes.extend_from_slice(&level.input_axes[leading_input_count..]);
-                            let output_axes = match kept_outputs {
-                                None => level.output_axes.clone(),
-                                Some(_) => level_specialization.output_axes[..rule_output_count].to_vec(),
-                            };
-                            levels.push(CustomRuleBatchingLevel { input_axes, output_axes, ..level.clone() });
-                        }
-                        Some(CustomRuleBatching {
-                            input_types: carrier_input_types,
-                            output_types: extent_types.clone(),
-                            levels,
-                        })
-                    }
-                    _ => None,
+                let carrier_batching = match batching {
+                    None => None,
+                    Some(_) => Some(retained_carrier_batching(
+                        rules,
+                        &key,
+                        rule_output_count,
+                        &seed_extent_types,
+                        extent_types,
+                    )?),
                 };
                 (
                     outputs,
@@ -1598,6 +1619,7 @@ where
                         batching: carrier_batching,
                         invokes_rule_directly: false,
                         discharged: *discharged,
+                        deferred_forward: None,
                     },
                     Vec::new(),
                     kept_outputs.clone(),
@@ -1753,6 +1775,13 @@ enum CompositeTransposeRules<T, S> {
         /// Whether the carrier's reference state (or that of the call from which it was staged) was discharged, which
         /// discharges its backward rule programs as well.
         discharged: bool,
+
+        /// Specialization key of the forward rule of the call from which the carrier was staged when that call defers
+        /// its forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`]), or [`None`] when the
+        /// carrier's leading inputs already contain the residuals. A deferred carrier's leading
+        /// inputs are the call's inputs (including the boundary inputs of its batching levels, which the key records),
+        /// followed by the seed extents, and it records no batching of its own.
+        deferred_forward: Option<CustomRuleSpecializationKey<T>>,
     },
 }
 
@@ -1770,7 +1799,10 @@ enum CompositeTransposeRules<T, S> {
 /// Its inputs are the known leading inputs (i.e., any batching boundary inputs, the non-differentiated inputs, the
 /// residuals, and the seed extents) followed by the differentiated inputs' tangents. The seed extents name the runtime
 /// quantities of the output tangent types (e.g., the extents of dynamically shaped outputs) that structural-zero seeds
-/// need when no other leading input names them, and the backward rule never receives them.
+/// need when no other leading input names them, and the backward rule never receives them. The carrier of a call whose
+/// retained rules defer their forward rule to the backward pass (refer to [`CustomRuleSource::defers_forward`],
+/// rendered as `deferred_forward=true`) receives every input of the call in place of the non-differentiated inputs and
+/// the residuals, and its transposition first replays the forward rule on them to recover the residuals.
 ///
 /// A [`LinearCallOperation`](crate::LinearCallOperation), by contrast, carries both an executable forward map and its
 /// transpose: it executes, lowers, differentiates, and batches through its forward region, and it transposes by
@@ -1803,7 +1835,9 @@ enum CompositeTransposeRules<T, S> {
 /// batched call, or that is batched itself (e.g., when a linearization is batched), records its batching levels as the
 /// call does, mapping every output at axis 0 when it is batched itself. Transposition derives the unbatched backward
 /// specialization and batches it once per level. Seeds, caller buffers, and leading inputs keep their recorded batch
-/// axes, and each returned cotangent is aligned to its input, summing the per-item cotangents of a replicated input.
+/// axes, and each returned cotangent is aligned to its input, summing the per-item cotangents of a replicated input. A
+/// carrier with a deferred forward rule records the batching levels of the call from which it was staged instead, and
+/// it cannot be batched itself, because its transposition would have to batch the replayed forward rule as well.
 pub struct CompositeTransposeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
     /// Number of leading known inputs (i.e., boundary inputs, non-differentiated inputs, residuals, and seed extents).
     leading_input_count: usize,
@@ -1859,6 +1893,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 batching: None,
                 invokes_rule_directly: false,
                 discharged: false,
+                deferred_forward: None,
             },
             marker: PhantomData,
         }
@@ -1907,7 +1942,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             seed_extent_count,
             input_tangent_types,
             output_tangent_types,
-            rules: CompositeTransposeRules::Retained { rules, batching: None, invokes_rule_directly: true, discharged },
+            rules: CompositeTransposeRules::Retained {
+                rules,
+                batching: None,
+                invokes_rule_directly: true,
+                discharged,
+                deferred_forward: None,
+            },
             marker: PhantomData,
         }
     }
@@ -1964,14 +2005,19 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             output_tangent_types: map_types(self.output_tangent_types),
             rules: match self.rules {
                 CompositeTransposeRules::Attached => CompositeTransposeRules::Attached,
-                CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, discharged } => {
-                    CompositeTransposeRules::Retained {
-                        rules: rules_fn(rules),
-                        batching: batching.map(CustomRuleBatching::map_types),
-                        invokes_rule_directly,
-                        discharged,
-                    }
-                }
+                CompositeTransposeRules::Retained {
+                    rules,
+                    batching,
+                    invokes_rule_directly,
+                    discharged,
+                    deferred_forward,
+                } => CompositeTransposeRules::Retained {
+                    rules: rules_fn(rules),
+                    batching: batching.map(CustomRuleBatching::map_types),
+                    invokes_rule_directly,
+                    discharged,
+                    deferred_forward: deferred_forward.map(CustomRuleSpecializationKey::map_types),
+                },
             },
             marker: PhantomData,
         }
@@ -2063,11 +2109,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug
             .field("seed_extent_count", &self.seed_extent_count)
             .field("input_tangent_types", &self.input_tangent_types)
             .field("output_tangent_types", &self.output_tangent_types);
-        if let CompositeTransposeRules::Retained { batching, invokes_rule_directly, discharged, .. } = &self.rules {
+        if let CompositeTransposeRules::Retained {
+            batching, invokes_rule_directly, discharged, deferred_forward, ..
+        } = &self.rules
+        {
             debug
                 .field("batching", batching)
                 .field("invokes_rule_directly", invokes_rule_directly)
                 .field("discharged", discharged);
+            if let Some(key) = deferred_forward {
+                debug.field("deferred_forward", key);
+            }
         }
         debug.finish()
     }
@@ -2200,14 +2252,19 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         };
         let rules = match &self.rules {
             CompositeTransposeRules::Attached => CompositeTransposeRules::Attached,
-            CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, discharged } => {
-                CompositeTransposeRules::Retained {
-                    rules: rules.clone(),
-                    batching: batching.as_ref().map(|batching| batching.rename_identities(renaming)).transpose()?,
-                    invokes_rule_directly: *invokes_rule_directly,
-                    discharged: *discharged,
-                }
-            }
+            CompositeTransposeRules::Retained {
+                rules,
+                batching,
+                invokes_rule_directly,
+                discharged,
+                deferred_forward,
+            } => CompositeTransposeRules::Retained {
+                rules: rules.clone(),
+                batching: batching.as_ref().map(|batching| batching.rename_identities(renaming)).transpose()?,
+                invokes_rule_directly: *invokes_rule_directly,
+                discharged: *discharged,
+                deferred_forward: deferred_forward.as_ref().map(|key| key.rename_identities(renaming)).transpose()?,
+            },
         };
         Ok(Self {
             leading_input_count: self.leading_input_count,
@@ -2233,7 +2290,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             }
             match &self.rules {
                 CompositeTransposeRules::Attached => Ok(()),
-                CompositeTransposeRules::Retained { batching, invokes_rule_directly, discharged, .. } => {
+                CompositeTransposeRules::Retained {
+                    batching,
+                    invokes_rule_directly,
+                    discharged,
+                    deferred_forward,
+                    ..
+                } => {
                     if let Some(batching) = batching {
                         operation.field("batching", batching)?;
                     }
@@ -2242,6 +2305,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     }
                     if *discharged {
                         operation.field("discharged", true)?;
+                    }
+                    if deferred_forward.is_some() {
+                        operation.field("deferred_forward", true)?;
                     }
                     Ok(())
                 }
@@ -2266,7 +2332,7 @@ where
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         // An attached backward region discharges its local reference state now. A carrier with a retained backward
         // rule holds no reference state of its own, and its rebound form records that its lazily traced backward rule
-        // programs must be discharged once they are traced.
+        // programs (and its deferred forward rule programs, if any) must be discharged once they are traced.
         let name = match &self.rules {
             CompositeTransposeRules::Attached => COMPOSITE_OPERATION_NAME,
             CompositeTransposeRules::Retained { rules, .. } => rules.name(),
@@ -2274,13 +2340,16 @@ where
         validate_composite_discharge_inputs(&describe_composite_transpose(name), inputs)?;
         match &self.rules {
             CompositeTransposeRules::Attached => discharge_local_reference_operation(self, context, driver, inputs),
-            CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, .. } => {
+            CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, deferred_forward, .. } => {
                 let discharged = Self {
                     rules: CompositeTransposeRules::Retained {
                         rules: rules.clone(),
                         batching: batching.clone(),
                         invokes_rule_directly: *invokes_rule_directly,
                         discharged: true,
+                        deferred_forward: deferred_forward
+                            .as_ref()
+                            .map(|key| CustomRuleSpecializationKey { discharged: true, ..key.clone() }),
                     },
                     ..self.clone()
                 };
@@ -2367,6 +2436,20 @@ where
                 ))
                 .into());
             }
+
+            // Transposing a deferred carrier replays the forward rule at the batching levels of the call from which it
+            // was staged, which its forward key records, while a level added to the carrier itself would also have to
+            // batch that replay over the carrier's leading inputs, whose batch axes no forward key describes.
+            CompositeTransposeRules::Retained { deferred_forward: Some(_), rules, .. } => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "{} defers its forward rule to the backward pass (refer to `with_deferred_forward`), so it \
+                         cannot be batched after it is differentiated; batch the call before differentiating it, or \
+                         transpose the derivative before batching it",
+                        describe_composite_transpose(rules.name()),
+                    ),
+                });
+            }
             CompositeTransposeRules::Retained { rules, batching, discharged, .. } => (rules, batching, *discharged),
         };
 
@@ -2420,6 +2503,7 @@ where
                 batching: Some(batching),
                 invokes_rule_directly: false,
                 discharged,
+                deferred_forward: None,
             },
             marker: PhantomData,
         };
@@ -2485,7 +2569,7 @@ where
             })?);
         }
         let seed_extent_count = self.seed_extent_count;
-        let (rules, batching, invokes_rule_directly, discharged) = match &self.rules {
+        let (rules, batching, invokes_rule_directly, discharged, deferred_forward) = match &self.rules {
             CompositeTransposeRules::Attached => {
                 // Unrequested gradients can omit a pure backward program, but its observable effects must still
                 // execute and its deferred work must still be staged even when all seeds are structural zeros or none
@@ -2563,9 +2647,13 @@ where
                         accumulator.accumulate(context, MaybeZero::Value(cotangent))
                     });
             }
-            CompositeTransposeRules::Retained { rules, batching, invokes_rule_directly, discharged } => {
-                (rules, batching, *invokes_rule_directly, *discharged)
-            }
+            CompositeTransposeRules::Retained {
+                rules,
+                batching,
+                invokes_rule_directly,
+                discharged,
+                deferred_forward,
+            } => (rules, batching, *invokes_rule_directly, *discharged, deferred_forward),
         };
 
         // Without leading inputs, the backward rule is a linear function of the seeds alone, so all-zero seeds give
@@ -2641,6 +2729,64 @@ where
             }
             return Ok(());
         }
+
+        // The leading inputs of a deferred carrier are the inputs of its call rather than the call's residuals, so the
+        // forward rule is replayed on them here, in the backward pass, to recover the residuals. The backward rule is
+        // then applied exactly as for the carrier that the call would have staged without deferring its forward rule:
+        // its leading inputs become the call's boundary and non-differentiated inputs, the residuals, and the seed
+        // extents, and its batching levels are derived from those that the call recorded in the forward key.
+        let deferred_batching;
+        let batching = match deferred_forward {
+            None => batching,
+            Some(key) => {
+                let call_input_count = self.leading_input_count - seed_extent_count;
+                let call_boundary_input_count = boundary_input_count(&key.levels);
+                if call_input_count != call_boundary_input_count + key.input_types.len() {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "{} has {call_input_count} call inputs but its deferred forward rule expects {} boundary \
+                         inputs and {} call inputs",
+                        describe_composite_transpose(rules.name()),
+                        call_boundary_input_count,
+                        key.input_types.len(),
+                    ))
+                    .into());
+                }
+                let rule_output_count = key.rule_output_count()?;
+                let forward = rules.forward_specialization(key.clone())?;
+                validate_deferred_forward_rule(rules.name(), forward.program.effects())?;
+
+                // Only the residuals are replayed, because the primal outputs of the forward rule were already computed
+                // by the primal and the pullback would otherwise keep their dead computation.
+                let residual_indices = (rule_output_count..forward.program.output_ids().len()).collect::<Vec<_>>();
+                let residuals = forward
+                    .program
+                    .with_outputs(&residual_indices)?
+                    .interpret_in_context(&**context, leading_values[..call_input_count].to_vec())?;
+                let seed_extents = leading_values.split_off(call_input_count);
+                leading_values.truncate(call_boundary_input_count + key.non_differentiated_count);
+                leading_values.extend(residuals);
+                leading_values.extend(seed_extents);
+                deferred_batching = match key.levels.is_empty() {
+                    true => None,
+                    false => {
+                        let seed_extent_types = leading_values[leading_values.len() - seed_extent_count..]
+                            .iter()
+                            .map(|value| value.r#type().into_owned())
+                            .collect::<Vec<_>>();
+                        let extent_types =
+                            key.output_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?;
+                        Some(retained_carrier_batching(
+                            rules,
+                            key,
+                            rule_output_count,
+                            &seed_extent_types,
+                            extent_types,
+                        )?)
+                    }
+                };
+                &deferred_batching
+            }
+        };
 
         // Key the specialization by static information only: the unbatched leading input types, the carrier's tangent
         // signature, which seeds are live, where each differentiated input's cotangent goes, and the batching levels.
@@ -2733,6 +2879,73 @@ where
         }
         Ok(())
     }
+}
+
+/// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode stages for a batched call with
+/// retained rules whose forward rule specialization key is `key` (whose levels are those of the call), whose rules have
+/// `rule_output_count` outputs, whose carrier receives seed extents of types `seed_extent_types`, and whose output
+/// tangents have the unbatched types `extent_types`. At each level, the carrier's inputs have the batch axes of the
+/// corresponding call inputs, except for the residuals, which have the axes of that level's forward specialization, and
+/// for the seed extents, which are replicated, while its outputs have the call's batch axes, or those of the forward
+/// specialization for the outputs that the call does not keep. The carrier's unbatched input types are those of the
+/// unbatched forward rule.
+fn retained_carrier_batching<V, O, S>(
+    rules: &S,
+    key: &CustomRuleSpecializationKey<V::Type>,
+    rule_output_count: usize,
+    seed_extent_types: &[V::Type],
+    extent_types: Vec<V::Type>,
+) -> Result<CustomRuleBatching<V::Type>, DifferentiationError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    V: Value<Type: DifferentiableType + Eq + Hash>,
+    O: Operation<Type = V::Type>,
+    S: CustomRuleSpecializer<V, O>,
+{
+    let unbatched = rules.forward_specialization(CustomRuleSpecializationKey { levels: Vec::new(), ..key.clone() })?;
+    let non_differentiated_count = key.non_differentiated_count;
+    let mut input_types = key.input_types[..non_differentiated_count].to_vec();
+    input_types.extend_from_slice(&unbatched.program.output_types()[rule_output_count..]);
+    input_types.extend_from_slice(seed_extent_types);
+    for r#type in &key.input_types[non_differentiated_count..] {
+        input_types.push(r#type.tangent()?);
+    }
+    let mut levels = Vec::with_capacity(key.levels.len());
+    for (index, level) in key.levels.iter().enumerate() {
+        let level_key = CustomRuleSpecializationKey { levels: key.levels[..=index].to_vec(), ..key.clone() };
+        let level_specialization = rules.forward_specialization(level_key)?;
+        let leading_input_count = non_differentiated_count + boundary_input_count(&key.levels[..index]);
+        let mut input_axes = level.input_axes[..leading_input_count].to_vec();
+        input_axes.extend_from_slice(&level_specialization.output_axes[rule_output_count..]);
+        input_axes.extend(std::iter::repeat_n(BatchAxis::replicated(), seed_extent_types.len()));
+        input_axes.extend_from_slice(&level.input_axes[leading_input_count..]);
+        let output_axes = match key.kept_outputs {
+            None => level.output_axes.clone(),
+            Some(_) => level_specialization.output_axes[..rule_output_count].to_vec(),
+        };
+        levels.push(CustomRuleBatchingLevel { input_axes, output_axes, ..level.clone() });
+    }
+    Ok(CustomRuleBatching { input_types, output_types: extent_types, levels })
+}
+
+/// Validates that the forward rule of the retained definition named `name`, which defers that rule to the backward pass
+/// (refer to [`CustomRuleSource::defers_forward`]), has a specialization with the pure `effects`, because effects of a
+/// forward rule that runs in the backward pass would execute out of order with the rest of the program.
+///
+/// # Errors
+///
+/// Returns a [`ProgramError::UnsupportedOperation`] that names `with_deferred_forward` when `effects` is not pure.
+fn validate_deferred_forward_rule(name: &str, effects: EffectsSummary) -> Result<(), ProgramError> {
+    if effects.is_pure() {
+        return Ok(());
+    }
+    Err(ProgramError::UnsupportedOperation {
+        message: format!(
+            "{} defers its forward rule to the backward pass (refer to `with_deferred_forward`), which requires a \
+             pure forward rule, but its forward rule has effects, which would run out of order in the backward pass",
+            describe_composite(name),
+        ),
+    })
 }
 
 /// Validates that the leading `non_differentiated_count` input positions of a composite call named `name` fit within
@@ -3285,8 +3498,9 @@ mod tests {
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::forward::JvpPartitionTransform;
     use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, ForwardModeDifferentiate,
-        ReverseModeDifferentiate, TransposedProgram, TransposedProgramCotangent, TranspositionDriver, differentiate_at,
+        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, EverythingSavable,
+        ForwardModeDifferentiate, ReverseModeDifferentiate, TransposedProgram, TransposedProgramCotangent,
+        TranspositionDriver, differentiate_at, rematerialize,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -3306,6 +3520,7 @@ mod tests {
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
+    use crate::operations::debugging::Print;
     use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::differentiation::linear_call::tests::scalar_multiply_program;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
@@ -5295,19 +5510,17 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let primal = builder.import_program(program.clone());
         let inputs = program.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-        assert_eq!(
-            builder
-                .add_instruction(
-                    ArrayIrOperation::Composite(CompositeOperation::new(definition.reference())),
-                    vec![primal],
-                    inputs,
-                    None,
-                )
-                .unwrap_err()
-                .to_string(),
-            "`composite` accepts reference inputs only in its leading non-differentiated segment; move input 0 \
-             of type `ref<f32[]>` before the differentiated inputs",
-        );
+        assert!(matches!(
+            builder.add_instruction(
+                ArrayIrOperation::Composite(CompositeOperation::new(definition.reference())),
+                vec![primal],
+                inputs,
+                None,
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`composite` accepts reference inputs only in its leading non-differentiated segment; \
+                               move input 0 of type `ref<f32[]>` before the differentiated inputs",
+        ));
         let staged = ir_custom_rule_program(&definition, 1, program);
         assert_eq!(
             staged.to_string(),
@@ -5705,11 +5918,13 @@ mod tests {
             .unwrap()
             .into_program_without_external_references()
             .unwrap();
-        assert_eq!(
-            discharged.jvp().unwrap_err().to_string(),
-            "`composite` `doubled` cannot differentiate a call whose reference state was discharged, because \
-             its rule programs contain reference state and its definition has no reference discharge support",
-        );
+        assert!(matches!(
+            discharged.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `doubled` cannot differentiate a call whose reference state was \
+                               discharged, because its rule programs contain reference state and its definition has \
+                               no reference discharge support",
+        ));
     }
 
     #[test]
@@ -6755,6 +6970,61 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_batching_retained_rules_deferred_forward() {
+        // Reverse mode of a batched call that defers its forward rule replays the batched primal and stages a carrier
+        // over the batched input, whose transposition batches the forward rule traced at the unbatched types to recover
+        // the batched residual `x²`, from which the batched backward rule computes `2 x² ȳ`.
+        let counters = Arc::new(RuleCounters::default());
+        let definition =
+            CustomRuleRegistration::new(cube_definition(&counters, false, true).with_deferred_forward_rule());
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let batched = batched_program(&program, 3, &[BatchAxis::new(0)]);
+        let x = Array::vector(vec![1f64, 2f64, 3f64]).unwrap();
+        let ones = Array::vector(vec![1f64; 3]).unwrap();
+        let reverse = batched
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert_eq!(
+            reverse.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = mul %0 %0
+                    %2:f64[3] = mul %1 %0
+                in (%2, %0)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            reverse.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = composite_transpose [name=\"cube\", leading_input_count=1, deferred_forward=true] %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let residuals = reverse.primal().interpret(vec![x.clone()]).unwrap();
+        let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = mul %1 %1
+                    %3:f64[3] = mul %2 %0
+                    %4:f64[3] = add %3 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![ones, residuals[1].clone()]),
+            Ok(vec![Array::vector(vec![2f64, 8f64, 18f64]).unwrap()]),
+        );
+        assert_eq!(counters.counts(), (0, 1, 1));
+    }
+
+    #[test]
     fn test_composite_batching_retained_rules_output_layout() {
         // `f(c, p) = p` with the rule `ḟ = c ṗ`, where `c` is non-differentiated: batching a mapped `c` and a
         // replicated `p` leaves the primal replicated, while the derivative is mapped.
@@ -6808,10 +7078,15 @@ mod tests {
             .with_batched_output_axes(vec![BatchAxis::replicated()]);
         let batched = batched_program(&program(definition), 3, &[BatchAxis::new(0), BatchAxis::replicated()]);
         assert_eq!(batched.interpret(vec![coefficient.clone(), parameter.clone()]), Ok(vec![parameter.clone()]));
-        assert_eq!(
-            batched.entry_region_ref().jvp(&[1]).unwrap_err().to_string(),
-            "a custom rule output is mapped along axis 0 but its batched layout requires it to be replicated",
-        );
+        assert!(matches!(
+            batched.entry_region_ref().jvp(&[1]),
+            Err(DifferentiationError::Program(error))
+                if error.downcast_custom::<BatchingError>() == Some(&BatchingError::InvalidBatchMetadata {
+                    message: "a custom rule output is mapped along axis 0 but its batched layout requires it to be \
+                              replicated"
+                        .to_string(),
+                }),
+        ));
 
         // A declared replicated output is valid when the derivative agrees with it. Here, the second output is `p`
         // itself, whose tangent `ṗ` stays replicated, while the first output is mapped.
@@ -6861,19 +7136,16 @@ mod tests {
         let definition = TestDefinition::new("scaled_parameter")
             .with_batching_support()
             .with_batched_output_axes(vec![BatchAxis::replicated()]);
-        assert_eq!(
-            program(definition)
-                .batched(
-                    3,
-                    ShardingDimension::Replicated,
-                    &[BatchAxis::replicated(), BatchAxis::new(0)],
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )
-                .map(|_| ())
-                .unwrap_err()
-                .to_string(),
-            "batched region output axes [axis 0] do not match the target output axes [replicated]",
-        );
+        assert!(matches!(
+            program(definition).batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::MisalignedBatchAxes { message })
+                if message == "batched region output axes [axis 0] do not match the target output axes [replicated]",
+        ));
     }
 
     #[test]
@@ -6919,11 +7191,12 @@ mod tests {
             batched.interpret(vec![Array::vector(vec![1f64, 2f64, 3f64]).unwrap()]),
             Ok(vec![Array::vector(vec![1f64, 8f64, 27f64]).unwrap()]),
         );
-        assert_eq!(
-            batched.jvp().unwrap_err().to_string(),
-            "`composite` `cube` cannot differentiate a batched call because its definition has no batching support \
-             (refer to `CustomRuleDefinition::with_batching_support`)",
-        );
+        assert!(matches!(
+            batched.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` cannot differentiate a batched call because its definition has no \
+                               batching support (refer to `CustomRuleDefinition::with_batching_support`)",
+        ));
     }
 
     #[test]
@@ -7587,7 +7860,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3] = scan [carry_count=0, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3] = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = mul %1 %1
@@ -7603,7 +7876,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[3] .
-                let %2:f32[3] = scan [carry_count=0, length=3, reverse=false] %0 %1 [
+                let %2:f32[3] = scan [carry_count=0, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = const 0.0
@@ -8446,7 +8719,14 @@ mod tests {
                     Ok((Array::scalar(x * x * x).unwrap(), Array::scalar(tangent).unwrap())),
                     "{forward:?} {reverse}",
                 ),
-                Err(expected) => assert_eq!(result.unwrap_err().to_string(), expected, "{forward:?} {reverse}"),
+                Err(expected) => assert!(
+                    matches!(
+                        result,
+                        Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                            if message == expected,
+                    ),
+                    "{forward:?} {reverse}",
+                ),
             }
             let result = crate::differentiation::differentiate_at(Array::scalar(x).unwrap())
                 .vjp(|input| {
@@ -8463,7 +8743,14 @@ mod tests {
                     Ok((Array::scalar(x * x * x).unwrap(), Array::scalar(gradient).unwrap())),
                     "{forward:?} {reverse}",
                 ),
-                Err(expected) => assert_eq!(result.unwrap_err().to_string(), expected, "{forward:?} {reverse}"),
+                Err(expected) => assert!(
+                    matches!(
+                        result,
+                        Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                            if message == expected,
+                    ),
+                    "{forward:?} {reverse}",
+                ),
             }
         }
 
@@ -8515,16 +8802,18 @@ mod tests {
             call_vjp(&definition, x.clone(), one.clone()),
             Ok((vec![Array::scalar(8f64).unwrap()], Array::scalar(8f64).unwrap())),
         );
-        assert_eq!(call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "rule failure");
+        assert_eq!(call_jvp(&definition, x.clone(), one.clone()), Err(DifferentiationError::Program(failure())));
 
         // A JVP rule with the wrong result structure surfaces at the same stage with a type error.
         let definition = CustomRuleRegistration::new(
             TestDefinition::new("cube").with_jvp(|primals, _| Ok((primals.to_vec(), vec![]))),
         );
-        assert_eq!(
-            call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(),
-            "`composite` `cube` JVP rule returned 1 outputs and 0 output tangents but the primal has 1 outputs",
-        );
+        assert!(matches!(
+            call_jvp(&definition, x.clone(), one.clone()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `cube` JVP rule returned 1 outputs and 0 output tangents but the primal \
+                               has 1 outputs",
+        ));
 
         // A failing forward rule surfaces at the first reverse-mode request, while a failing backward rule surfaces
         // only when the first pullback application transposes the carrier.
@@ -8534,7 +8823,7 @@ mod tests {
         );
         let jvp = Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()]));
         assert_eq!(call_jvp(&definition, x.clone(), one.clone()), jvp);
-        assert_eq!(call_vjp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "rule failure");
+        assert_eq!(call_vjp(&definition, x.clone(), one.clone()), Err(DifferentiationError::Program(failure())));
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false).with_vjp(
             |primals| Ok((vec![primals[0].clone() * primals[0].clone() * primals[0].clone()], vec![])),
             move |_, _| Err(failure()),
@@ -8551,7 +8840,10 @@ mod tests {
                 (),
             )
             .unwrap();
-        assert_eq!(pullback.apply(vec![one]).unwrap_err().to_string(), "rule failure");
+        assert!(matches!(
+            pullback.apply(vec![one]),
+            Err(ProgramError::InvalidArgument { message }) if message == "rule failure",
+        ));
     }
 
     #[test]
@@ -8564,29 +8856,33 @@ mod tests {
             let square = primals[0].clone() * primals[0].clone();
             Ok((vec![], vec![square.clone() * primals[0].clone(), square * tangents[0].clone()]))
         }));
-        assert_eq!(
-            call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(),
-            "`composite` `cube` JVP rule returned 0 outputs and 2 output tangents but the primal has 1 outputs",
-        );
+        assert!(matches!(
+            call_jvp(&definition, x.clone(), one.clone()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `cube` JVP rule returned 0 outputs and 2 output tangents but the primal \
+                               has 1 outputs",
+        ));
 
         // Correctly partitioned results still have their types validated.
         let definition = CustomRuleRegistration::new(TestDefinition::new("cube").with_jvp(|primals, tangents| {
             let tangent = tangents[0].context().lift(Array::scalar(1f32).unwrap())?;
             Ok((primals.to_vec(), vec![tangent]))
         }));
-        assert_eq!(
-            call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(),
-            "`composite` `cube` JVP rule output type signature mismatch: expected [f64[], f64[]] but got \
-             [f64[], f32[]]",
-        );
+        assert!(matches!(
+            call_jvp(&definition, x.clone(), one.clone()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `cube` JVP rule output type signature mismatch: expected \
+                               [f64[], f64[]] but got [f64[], f32[]]",
+        ));
         let definition = CustomRuleRegistration::new(TestDefinition::new("cube").with_vjp(
             |primals| Ok((vec![], vec![primals[0].clone() * primals[0].clone() * primals[0].clone()])),
             |_, _| unreachable!(),
         ));
-        assert_eq!(
-            call_vjp(&definition, x, one).unwrap_err().to_string(),
-            "`composite` `cube` forward rule returned 0 outputs but the primal has 1",
-        );
+        assert!(matches!(
+            call_vjp(&definition, x, one),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `cube` forward rule returned 0 outputs but the primal has 1",
+        ));
     }
 
     #[test]
@@ -8785,6 +9081,147 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_differentiation_retained_rules_deferred_forward() {
+        // A call whose rules defer their forward rule replays its primal on the known side and stages a carrier over
+        // its own input `x`, whose transposition replays the forward rule for the residual `x²` before applying the
+        // backward rule. The deliberately wrong gradient `2 x² ȳ` of the backward rule is that of the call without
+        // deferral.
+        let counters = Arc::new(RuleCounters::default());
+        let definition =
+            CustomRuleRegistration::new(cube_definition(&counters, false, true).with_deferred_forward_rule());
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = composite [name=\"cube\", deferred_forward=true] %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // The forward rule is traced while the carrier is staged, which validates that it is pure.
+        let reverse = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert_eq!(counters.counts(), (0, 1, 0));
+        assert_eq!(
+            reverse.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                in (%2, %0)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            reverse.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = composite_transpose [name=\"cube\", leading_input_count=1, deferred_forward=true] %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(counters.counts(), (0, 1, 1));
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %1
+                    %3:f64[] = mul %2 %0
+                    %4:f64[] = add %3 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        for seed in [1f64, 3f64] {
+            assert_eq!(
+                call_vjp(&definition, Array::scalar(2f64).unwrap(), Array::scalar(seed).unwrap()),
+                Ok((vec![Array::scalar(8f64).unwrap()], Array::scalar(8f64 * seed).unwrap())),
+            );
+        }
+        assert_eq!(counters.counts(), (0, 1, 1));
+    }
+
+    #[test]
+    fn test_composite_differentiation_retained_rules_deferred_forward_rematerialization() {
+        // Saving everything that a rematerialized body computes saves the forward rule's residual `cos(x)` of a call
+        // that does not defer its forward rule, but only the call's input `x` of one that does, while the gradient is
+        // the same.
+        type Tracer = DomainTracer<ArrayContext>;
+        let sine = || {
+            composite(|x: Tracer| Ok(x.sin()?))
+                .with_vjp(|x: Tracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+        };
+        let x = Array::scalar(0.5f64).unwrap();
+        let seed = Array::scalar(1f64).unwrap();
+        let gradient = Array::scalar(0.5f64.cos()).unwrap();
+        let eager = sine();
+        let function = rematerialize(move |x: Tracer| eager.call(x)).with_policy(EverythingSavable);
+        let (value, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(value, Array::scalar(0.5f64.sin()).unwrap());
+        assert_eq!(pullback.residuals(), &[Array::scalar(0.5f64.cos()).unwrap()]);
+        assert_eq!(pullback.apply_materialized(seed.clone()), Ok(gradient.clone()));
+        let deferred = sine().with_deferred_forward();
+        let function = rematerialize(move |x: Tracer| deferred.call(x)).with_policy(EverythingSavable);
+        let (value, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(value, Array::scalar(0.5f64.sin()).unwrap());
+        assert_eq!(pullback.residuals(), std::slice::from_ref(&x));
+        assert_eq!(pullback.apply_materialized(seed), Ok(gradient));
+    }
+
+    #[test]
+    fn test_composite_differentiation_retained_rules_deferred_forward_rejects_effectful_forward_rule() {
+        // A forward rule that prints would print in the backward pass, out of order, so reverse mode rejects it before
+        // staging anything, while ordinary execution of the call, which runs only the primal, is unaffected.
+        type Tracer = DomainTracer<ArrayContext>;
+        let function = composite(|x: Tracer| Ok(x.sin()?))
+            .with_name("sine")
+            .with_vjp(|x: Tracer| Ok((x.sin()?, x.print("x")?.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+            .with_deferred_forward();
+        let x = Array::scalar(0.5f64).unwrap();
+        assert_eq!(function.call(x.clone()), Ok(Array::scalar(0.5f64.sin()).unwrap()));
+        assert!(matches!(
+            differentiate_at(x).gradient(|x| function.call(x)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `sine` defers its forward rule to the backward pass (refer to \
+                               `with_deferred_forward`), which requires a pure forward rule, but its forward rule has \
+                               effects, which would run out of order in the backward pass",
+        ));
+    }
+
+    #[test]
+    fn test_composite_differentiation_retained_rules_deferred_forward_second_order() {
+        // The pullback replays the forward and backward rules as ordinary operations, so differentiating the gradient
+        // `cos(x) ȳ` again, in reverse or in forward mode, differentiates the recomputed residual `cos(x)`.
+        type Tracer = DomainTracer<ArrayContext>;
+        let sine = composite(|x: Tracer| Ok(x.sin()?))
+            .with_vjp(|x: Tracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+            .with_deferred_forward();
+        let x = Array::scalar(0.7f64).unwrap();
+        assert_eq!(
+            differentiate_at(x.clone()).value_and_gradient(|x| differentiate_at(x).gradient(|x| sine.call(x)).unwrap()),
+            Ok((Array::scalar(0.7f64.cos()).unwrap(), Array::scalar(-0.7f64.sin()).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(x)
+                .jvp(Array::scalar(1f64).unwrap(), |x| Ok(differentiate_at(x).gradient(|x| sine.call(x)).unwrap())),
+            Ok((Array::scalar(0.7f64.cos()).unwrap(), Array::scalar(-0.7f64.sin()).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_composite_differentiation_retained_rules_reference_residuals() {
         // A reference residual forwards a leading non-differentiated input by identity, and the backward rule receives
         // it as plumbing. The rules compute the deliberately wrong gradient `x̄ = 3 x ȳ` of `f(counter, x) = x²`.
@@ -8829,19 +9266,21 @@ mod tests {
         let definition = registration(|primals| {
             Ok((vec![ir_multiply(&primals[1], &primals[1])?], vec![primals[1].reference_new()?, primals[1].clone()]))
         });
-        assert_eq!(
-            vjp(&definition).unwrap_err().to_string(),
-            "`composite` `scaled` forward rule returns residual 0 of reference type `ref<f32[]>` that is not a \
-             leading non-differentiated input forwarded by identity",
-        );
+        assert!(matches!(
+            vjp(&definition),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `scaled` forward rule returns residual 0 of reference type `ref<f32[]>` \
+                               that is not a leading non-differentiated input forwarded by identity",
+        ));
         let definition = registration(|primals| {
             Ok((vec![ir_multiply(&primals[1], &primals[1])?], vec![primals[0].clone(), primals[0].clone()]))
         });
-        assert_eq!(
-            vjp(&definition).unwrap_err().to_string(),
-            "`composite` `scaled` forward rule returns residual 1 of reference type `ref<f32[]>` from an input \
-             already forwarded by an earlier residual",
-        );
+        assert!(matches!(
+            vjp(&definition),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `scaled` forward rule returns residual 1 of reference type `ref<f32[]>` \
+                               from an input already forwarded by an earlier residual",
+        ));
     }
 
     #[test]
@@ -8985,15 +9424,17 @@ mod tests {
         };
         assert_eq!(jvp(primal(1)), Ok((vec![Array::scalar(2f64).unwrap()], vec![Array::scalar(1f64).unwrap()])));
         assert_eq!(vjp(primal(1)), Ok(vec![Array::scalar(2f64).unwrap()]));
-        assert_eq!(
-            jvp(primal(2)).unwrap_err().to_string(),
-            "`composite` `forward_input` JVP rule returned 1 outputs and 1 output tangents but the primal has \
-             2 outputs",
-        );
-        assert_eq!(
-            vjp(primal(2)).unwrap_err().to_string(),
-            "`composite` `forward_input` forward rule returned 1 outputs but the primal has 2",
-        );
+        assert!(matches!(
+            jvp(primal(2)),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `forward_input` JVP rule returned 1 outputs and 1 output tangents but \
+                               the primal has 2 outputs",
+        ));
+        assert!(matches!(
+            vjp(primal(2)),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `forward_input` forward rule returned 1 outputs but the primal has 2",
+        ));
         assert_eq!(definition.caches().jvp_specializations.keys().len(), 1);
         assert_eq!(definition.caches().forward_specializations.keys().len(), 1);
     }
@@ -9468,18 +9909,17 @@ mod tests {
         // The carrier has no forward program, so ordinary execution and forward mode reject it.
         let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
         let context = EagerContext::<ArrayIrValue<Array>, ReferenceTestOperation>::new();
-        assert_eq!(
-            context
-                .bind(
-                    ignored_zero_effect_carrier(),
-                    Vec::new(),
-                    &[ArrayIrValue::Reference(stash.clone()), ArrayIrValue::Array(Array::scalar(3.0f64).unwrap())],
-                )
-                .unwrap_err()
-                .to_string(),
-            "`composite_transpose` `ignored_zero_effect` has no forward program to execute; it supports only \
-             reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
-        );
+        assert!(matches!(
+            context.bind(
+                ignored_zero_effect_carrier(),
+                Vec::new(),
+                &[ArrayIrValue::Reference(stash.clone()), ArrayIrValue::Array(Array::scalar(3.0f64).unwrap())],
+            ),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`composite_transpose` `ignored_zero_effect` has no forward program to execute; it \
+                               supports only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                               `jacobian_reverse`)",
+        ));
         assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
     }
 
@@ -9799,6 +10239,43 @@ mod tests {
                 if message == "`composite_transpose` `cube` source carriers are never batched",
         ));
         assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_composite_transpose_batching_retained_rules_deferred_forward() {
+        // Batching a linearization whose carrier defers its forward rule is rejected, because the carrier's forward key
+        // describes only the batching of the call from which it was staged. Transposing the linearization first yields
+        // a pullback of ordinary operations, which batches like any other program.
+        let counters = Arc::new(RuleCounters::default());
+        let definition =
+            CustomRuleRegistration::new(cube_definition(&counters, false, true).with_deferred_forward_rule());
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let reverse = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert!(matches!(
+            reverse.tangent().batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`composite_transpose` `cube` defers its forward rule to the backward pass (refer to \
+                               `with_deferred_forward`), so it cannot be batched after it is differentiated; batch \
+                               the call before differentiating it, or transpose the derivative before batching it",
+        ));
+        let pullback = reverse.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        let batched = batched_program(&pullback, 3, &[BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            batched.interpret(vec![
+                Array::vector(vec![1f64, 2f64, 3f64]).unwrap(),
+                Array::vector(vec![1f64, 2f64, 3f64]).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![2f64, 16f64, 54f64]).unwrap()]),
+        );
+        assert_eq!(counters.counts(), (0, 1, 1));
     }
 
     #[test]
@@ -10164,20 +10641,16 @@ mod tests {
         renaming.insert(original, relocated).unwrap();
         let renamed = symbolic.clone().rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.input_types(), vec![ArrayIrType::Array(relocated_type)]);
-        assert_eq!(
-            symbolic
-                .transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference])
-                .unwrap_err()
-                .to_string(),
-            "reference slicing requires a static referent type but got `f64[original]`",
-        );
-        assert_eq!(
-            renamed
-                .transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference])
-                .unwrap_err()
-                .to_string(),
-            "reference slicing requires a static referent type but got `f64[relocated]`",
-        );
+        assert!(matches!(
+            symbolic.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "reference slicing requires a static referent type but got `f64[original]`",
+        ));
+        assert!(matches!(
+            renamed.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "reference slicing requires a static referent type but got `f64[relocated]`",
+        ));
         assert_eq!(invocations.load(Ordering::SeqCst), 5);
         let seed_type: ArrayIrType = ArrayType::new_static(DataType::F64, [1]).into();
         let key = |input_extent: usize, seed_type: Option<ArrayIrType>, destination_kind| {

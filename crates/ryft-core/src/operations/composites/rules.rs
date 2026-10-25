@@ -700,6 +700,48 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
     fn is_output_kept(&self, index: usize) -> bool {
         self.kept_outputs.as_ref().is_none_or(|kept_outputs| kept_outputs[index])
     }
+
+    /// Returns this key with its types converted into the type family `U` (refer to [`CustomRuleBatching::map_types`]),
+    /// as when the carrier that stores it is converted into a family that contains the carrier's family.
+    pub(super) fn map_types<U: Type + From<T>>(self) -> CustomRuleSpecializationKey<U> {
+        let Self {
+            input_types,
+            output_types,
+            kept_outputs,
+            non_differentiated_count,
+            tangent_activity,
+            levels,
+            discharged,
+        } = self;
+        let CustomRuleBatching { input_types, output_types, levels } =
+            CustomRuleBatching { input_types, output_types, levels }.map_types();
+        CustomRuleSpecializationKey {
+            input_types,
+            output_types,
+            kept_outputs,
+            non_differentiated_count,
+            tangent_activity,
+            levels,
+            discharged,
+        }
+    }
+
+    /// Returns this key after renaming the type identities in its types and levels (refer to
+    /// [`CustomRuleBatching::rename_identities`]).
+    pub(super) fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let batching = CustomRuleBatching {
+            input_types: self.input_types.clone(),
+            output_types: self.output_types.clone(),
+            levels: self.levels.clone(),
+        }
+        .rename_identities(renaming)?;
+        Ok(Self {
+            input_types: batching.input_types,
+            output_types: batching.output_types,
+            levels: batching.levels,
+            ..self.clone()
+        })
+    }
 }
 
 /// Specialization key of the backward rule of a [`CustomRuleDefinition`]. It contains only static information, and
@@ -948,6 +990,10 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Transposer of backward-rule specialization source programs, present exactly when [`Self::backward`] is present.
     transposer: Option<Arc<CustomRuleTransposer<V, O>>>,
 
+    /// Whether reverse mode defers the forward rule to the backward pass (refer to
+    /// [`Self::with_deferred_forward_rule`]).
+    deferred_forward: bool,
+
     /// Optional batcher of traced rule programs, without which batched calls can be executed but not differentiated.
     batcher: Option<Arc<CustomRuleBatcher<V, O>>>,
 
@@ -1000,6 +1046,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             forward: None,
             backward: None,
             transposer: None,
+            deferred_forward: false,
             batcher: None,
             batched_output_axes: None,
             batching_rule: None,
@@ -1176,6 +1223,33 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.forward = Some(Arc::new(forward));
         self.backward = Some(CustomVjpBackward::Accumulating(Arc::new(backward)));
         self.transposer = Some(Arc::new(transpose_backward_source_program::<V, O>));
+        self
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with its reverse-mode forward rule deferred to the backward pass (i.e.,
+    /// the analogue of JAX's `custom_vjp(..., optimize_remat=True)`). Reverse mode then computes the outputs of a call
+    /// with its primal region, which is cheaper than the forward rule whenever the residuals cost extra work, and
+    /// stages a [`CompositeTransposeOperation`] carrier whose leading inputs are the call's own inputs rather than the
+    /// residuals. Transposing that carrier replays the forward rule on those inputs to recover the residuals and then
+    /// applies the backward rule. The call's inputs are therefore the only values that its derivative keeps alive
+    /// between the two passes, which residual policies (e.g., that of a
+    /// [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any other value, and the
+    /// forward rule runs only once, in the backward pass.
+    ///
+    /// The swap applies whenever reverse mode partitions a call, and it has no effect on a definition without
+    /// reverse-mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
+    /// [`Program::into_pruned`](crate::Program::into_pruned)) is differentiated without the swap, because only the
+    /// forward rule computes the pruned outputs, whose cotangent seeds the backward rule receives.
+    ///
+    /// # Errors
+    ///
+    /// The forward rule runs in the backward pass, where its effects would execute out of order, so reverse mode
+    /// rejects a call whose traced forward rule has effects (e.g., a `print` or a reference update) with a
+    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a carrier with a deferred forward rule
+    /// (i.e., batching a derivative after it is taken but before it is transposed) is rejected with a
+    /// [`BatchingError::UnsupportedOperation`], while batching a call before it is differentiated is supported.
+    pub fn with_deferred_forward_rule(mut self) -> Self {
+        self.deferred_forward = true;
         self
     }
 
@@ -1791,6 +1865,10 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// Returns whether the source has reverse-mode (i.e., VJP) forward and backward rules.
     fn has_vjp(&self) -> bool;
 
+    /// Returns whether the source has reverse-mode rules whose forward rule reverse mode defers to the backward pass
+    /// (refer to [`CustomRuleDefinition::with_deferred_forward_rule`]).
+    fn defers_forward(&self) -> bool;
+
     /// Returns the declared batch axes of the outputs of batched calls (refer to
     /// [`CustomRuleDefinition::with_batched_output_axes`]), or [`None`] when they are not declared.
     fn batched_output_axes(&self) -> Option<&[BatchAxis]>;
@@ -1949,6 +2027,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
     #[inline]
     fn has_vjp(&self) -> bool {
         self.definition.backward.is_some()
+    }
+
+    #[inline]
+    fn defers_forward(&self) -> bool {
+        self.definition.deferred_forward && self.has_vjp()
     }
 
     #[inline]
@@ -2520,6 +2603,9 @@ pub struct UnavailableCustomRules {
     /// Whether the original definition has reverse-mode (i.e., VJP) rules.
     has_vjp: bool,
 
+    /// Whether the original definition defers its reverse-mode forward rule to the backward pass.
+    defers_forward: bool,
+
     /// Declared batch axes of the outputs of batched calls of the original definition.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
@@ -2539,6 +2625,7 @@ impl UnavailableCustomRules {
             has_jvp: rules.has_jvp(),
             derives_jvp_from_primal: rules.derives_jvp_from_primal(),
             has_vjp: rules.has_vjp(),
+            defers_forward: rules.defers_forward(),
             batched_output_axes: rules.batched_output_axes().map(<[BatchAxis]>::to_vec),
             has_batching_rule: rules.has_batching_rule(),
             has_sequential_batching: rules.has_sequential_batching(),
@@ -2737,6 +2824,13 @@ where
         match self {
             Self::Member(rules) => rules.has_vjp(),
             Self::Unavailable(rules) => rules.has_vjp,
+        }
+    }
+
+    fn defers_forward(&self) -> bool {
+        match self {
+            Self::Member(rules) => rules.defers_forward(),
+            Self::Unavailable(rules) => rules.defers_forward,
         }
     }
 
@@ -4170,6 +4264,30 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_definition_with_deferred_forward_rule() {
+        // The deferral applies only to a definition with reverse-mode rules, configuring it traces no rule, and the
+        // sources of converted calls report the deferral of their member definition, even when unavailable.
+        fn defers_forward_in_ir<S: CustomRuleSource<ArrayIrValue<Array>, ArrayIrOperation<Array>>>(rules: &S) -> bool {
+            rules.defers_forward()
+        }
+        let counters = Arc::new(RuleCounters::default());
+        let deferred =
+            CustomRuleRegistration::new(cube_definition(&counters, false, true).with_deferred_forward_rule());
+        assert!(deferred.reference().defers_forward());
+        assert!(!CustomRuleRegistration::new(cube_definition(&counters, false, true)).reference().defers_forward());
+        assert!(
+            !CustomRuleRegistration::new(cube_definition(&counters, true, false).with_deferred_forward_rule())
+                .reference()
+                .defers_forward(),
+        );
+        assert!(defers_forward_in_ir(&LiftedCustomRules::Member(deferred.reference())));
+        assert!(defers_forward_in_ir(&LiftedCustomRules::<Array, TestArrayOperation>::Unavailable(
+            UnavailableCustomRules::from_source(&deferred.reference()),
+        )));
+        assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
     fn test_custom_rule_definition_with_batching_support() {
         // A batched specialization structurally batches the specialization traced at the unbatched types, which it
         // shares with unbatched calls, and aligns each output and tangent to the output axes of its level.
@@ -4298,7 +4416,7 @@ mod tests {
         assert!(!registration.reference().has_batching_rule());
         let (operation, index_type) =
             registration.reference().sequential_batching_scan(3, 1, &ShardingDimension::Replicated, 2).unwrap();
-        assert_eq!(operation.to_string(), "scan [carry_count=1, length=3, reverse=false]");
+        assert_eq!(operation.to_string(), "scan [carry_count=1, iteration_count=3, reverse=false]");
         assert_eq!(index_type, ArrayType::scalar(DataType::I64));
     }
 

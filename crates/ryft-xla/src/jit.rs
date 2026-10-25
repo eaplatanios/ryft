@@ -5826,7 +5826,7 @@ mod tests {
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
-                                %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, length=extent, reverse=false] %1 %0 %2 [
+                                %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, iteration_count=extent, reverse=false] %1 %0 %2 [
                                     body={
                                         lambda %0:i64[], %1:f32[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                                         let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = add %1 %1
@@ -5839,7 +5839,7 @@ mod tests {
                     %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:dimension<extent ∈ [1, 5)> .
-                            let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, length=extent, reverse=true] %0 %1 [
+                            let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, iteration_count=extent, reverse=true] %0 %1 [
                                 body={
                                     lambda %0:i64[], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                                     let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = add %1 %1

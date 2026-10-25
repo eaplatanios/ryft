@@ -119,8 +119,8 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
                 Dimension::Dynamic(_) => {
                     stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| LoweringError::UnsupportedOp {
                         op: format!(
-                            "`{SCAN_OPERATION_NAME}` length `{length}` needs a finite upper bound to allocate its \
-                             stacked outputs",
+                            "`{SCAN_OPERATION_NAME}` iteration count `{length}` needs a finite upper bound \
+                             to allocate its stacked outputs",
                         ),
                     })?
                 }
@@ -441,7 +441,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
         self.validate_region_count(lowerer.regions.len())?;
         let body = &lowerer.regions[0];
         let (context, location) = (lowerer.context, lowerer.location);
-        let (carry_count, length) = (self.carry_count(), self.length());
+        let (carry_count, length) = (self.carry_count(), self.iteration_count());
         let body_input_types = body.input_types();
         let body_output_types = body.output_types();
         let entry_types = self.declared_input_types(&body_input_types).map_err(ProgramError::from)?;
@@ -857,7 +857,7 @@ mod tests {
                 &output_types,
             ),
             Err(LoweringError::UnsupportedOp { op })
-                if op == "`scan` length `length` needs a finite upper bound to allocate its stacked outputs",
+                if op == "`scan` iteration count `length` needs a finite upper bound to allocate its stacked outputs",
         ));
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:dimension<length ∈ [0, 6)> .
-                let %2:f64[3] = scan [carry_count=1, length=length, reverse=false] %0 %1 [
+                let %2:f64[3] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[length] .
                         let %2:f64[length] = add %1 %1
@@ -1193,7 +1193,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:dimension<length ∈ [0, 6)> .
-                let %3:f64[], %4:f64[3] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %1 %2
@@ -1319,7 +1319,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:dimension<length ∈ [1, 8)> .
-                let %3:f64[3], %4:f64[] = scan [carry_count=2, length=length, reverse=false] %0 %1 %2 [
+                let %3:f64[3], %4:f64[] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[length], %2:f64[] .
                         let %3:f64[] = add %2 %2
@@ -1908,7 +1908,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[0], %2:dimension<length ∈ [0, 8)> .
                 let %3:ref<f32[0]> = reference_new %1
-                    %4:f32[], %5:ref<f32[0]> = scan [carry_count=2, length=length, reverse=false] %0 %3 %2 [
+                    %4:f32[], %5:ref<f32[0]> = scan [carry_count=2, iteration_count=length, reverse=false] %0 %3 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[0]> .
                             let %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %0
@@ -2616,7 +2616,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 5)> .
-                let %3:f64[] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %3:f64[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = zero_like %2
@@ -2906,7 +2906,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[4, 8][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] .
-                let %1:f32[4, 8][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] = scan [carry_count=0, length=4, \
+                let %1:f32[4, 8][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] = scan [carry_count=0, iteration_count=4, \
                 reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[8][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
@@ -3031,7 +3031,7 @@ mod tests {
             formatdoc!(
                 "
                 lambda %0:{carry}, %1:{stack} .
-                let %2:{carry}, %3:{stack} = scan [carry_count=1, length=4, reverse=false] %0 %1 [
+                let %2:{carry}, %3:{stack} = scan [carry_count=1, iteration_count=4, reverse=false] %0 %1 [
                     body={{
                         lambda %0:i64[], %1:{carry}, %2:{slice} .
                         let %3:{slice} = neg %2
@@ -3195,7 +3195,7 @@ mod tests {
                 ] %0 %1 [
                     body={{
                         lambda %0:{local_sum}, %1:{local_items} .
-                        let %2:{local_sum}, %3:{local_items} = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                        let %2:{local_sum}, %3:{local_items} = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                             body={{
                                 lambda %0:i64[], %1:{local_sum}, %2:{local_sum} .
                                 let %3:{local_sum} = add %1 %2
@@ -3330,7 +3330,7 @@ mod tests {
                     %5:f64[] = condition %4 %1 %2 [
                         true={
                             lambda %0:f64[], %1:f64[3] .
-                            let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                            let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                                 body={
                                     lambda %0:i64[], %1:f64[], %2:f64[] .
                                     let %3:f64[] = print [label=item] %2
@@ -3480,7 +3480,7 @@ mod tests {
                         lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[2] .
                         let %4:f64[] = one_like %0
                             %5:f64[] = add %0 %4
-                            %6:f64[] = scan [carry_count=1, length=2, reverse=false] %2 %3 [
+                            %6:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %2 %3 [
                                 body={
                                     lambda %0:i64[], %1:f64[], %2:f64[] .
                                     let %3:f64[] = print [label=item] %2
@@ -3604,7 +3604,7 @@ mod tests {
                 lambda %0:dimension<2>, %1:f64[], %2:f64[2, 3] .
                 let %3:f64[2] = broadcast [output_axes=[]] %1 %0
                     %4:f64[3, 2] = transpose [permutation=[1, 0]] %2
-                    %5:dimension<2>, %6:f64[2], %7:f64[3, 2] = scan [carry_count=2, length=3, reverse=false] %0 %3 %4 [
+                    %5:dimension<2>, %6:f64[2], %7:f64[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %3 %4 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f64[2], %3:f64[2] .
                             let %4:f64[2] = add %2 %3
@@ -3647,7 +3647,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f64[2], %2:f64[3] .
-                let %3:dimension<2>, %4:f64[2], %5:f64[3, 2] = scan [carry_count=2, length=3, reverse=false] %0 %1 %2 [
+                let %3:dimension<2>, %4:f64[2], %5:f64[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f64[2], %3:f64[] .
                         let %4:f64[2] = broadcast [output_axes=[]] %3 %1
@@ -3703,7 +3703,7 @@ mod tests {
             let carry = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
             let mut inputs = vec![carry, items];
-            if let Dimension::Dynamic(length) = scan.length() {
+            if let Dimension::Dynamic(length) = scan.iteration_count() {
                 inputs.push(builder.add_input(DimensionType::from(length.clone()).into()));
             }
             let input_count = inputs.len();
@@ -3746,7 +3746,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
-                let %3:f64[], %4:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -3756,7 +3756,7 @@ mod tests {
                     },
                 ]
                     %5:f64[] = zero [type=f64[]]
-                    %6:f64[], %7:f64[3] = scan [carry_count=1, length=3, reverse=true] %2 %1 %4 [
+                    %6:f64[], %7:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %2 %1 %4 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                             let %4:f64[] = mul %2 %1
@@ -3777,7 +3777,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
-                let %3:f64[], %4:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -3787,7 +3787,7 @@ mod tests {
                     },
                 ]
                     %5:f64[] = zero [type=f64[]]
-                    %6:f64[], %7:f64[3] = scan [carry_count=1, length=3, reverse=false] %2 %1 %4 [
+                    %6:f64[], %7:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %2 %1 %4 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                             let %4:f64[] = mul %2 %1
@@ -3810,7 +3810,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 5)>, %3:f64[] .
-                let %4:f64[], %5:f64[length] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %4:f64[], %5:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -3820,7 +3820,7 @@ mod tests {
                     },
                 ]
                     %6:f64[] = zero [type=f64[]]
-                    %7:f64[], %8:f64[length] = scan [carry_count=1, length=length, reverse=true] %3 %1 %5 %2 [
+                    %7:f64[], %8:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %3 %1 %5 %2 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                             let %4:f64[] = mul %2 %1

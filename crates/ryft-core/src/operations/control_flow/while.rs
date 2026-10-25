@@ -58,9 +58,8 @@ use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{
-    TemporalResidualOperation, TemporalResidualType, canonicalize_carry_axes, passed_through_carries,
-    refine_output_types, stabilize_carry_axes, validate_output_identities, validate_reference_carry_roots,
-    validate_region_input,
+    ResidualStackOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types, stabilize_carry_axes,
+    validate_output_identities, validate_reference_carry_roots, validate_region_input,
 };
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
@@ -1651,31 +1650,23 @@ fn rotated_discharge_regions<V: Value, O: Operation<Type = V::Type>>(
     Ok((rotated_condition, rotated_body))
 }
 
-/// Array-backed storage semantics used by bounded `while` differentiation.
+/// Type-family requirements of bounded `while` differentiation.
 ///
-/// A bounded loop stores each per-iteration residual in an ordinary leading-axis array stack. Homogeneous array
-/// programs use their residual type directly. Array IR programs additionally map first-class dimension residuals to
-/// checked scalar-array storage and restore them at the tangent-body boundary. Keeping this contract at the type-family
-/// boundary lets both operation families share the bounded-loop algorithm without making the generic control-flow rule
-/// inspect array IR variants.
+/// The [`WhileResidualStackOperation`] family supplies residual storage and conversions, so the shared loop rule does
+/// not need to inspect array IR variants.
 pub(crate) trait WhileResidualStackType:
-    DifferentiableType + TemporalResidualType + WhileType + ArrayMemberType + From<ArrayType>
+    DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>
 {
 }
 
-impl<T: DifferentiableType + TemporalResidualType + WhileType + ArrayMemberType + From<ArrayType>>
-    WhileResidualStackType for T
-{
-}
+impl<T: DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>> WhileResidualStackType for T {}
 
 /// Operation-family constructors required by the shared bounded-`while` residual-stack algorithm.
 ///
 /// The functions return operations rather than binding values, so the same contract works in the parent
 /// differentiation context and in the nested tracing contexts used to build the augmented primal body and masked
-/// tangent scan body. The dimension/scalar gateway operations come from the [`TemporalResidualOperation`] supertrait.
-pub(crate) trait WhileResidualStackOperation<T: WhileResidualStackType>:
-    Operation<Type = T> + TemporalResidualOperation<T>
-{
+/// tangent scan body. The dimension/scalar gateway operations come from the [`ResidualStackOperation`] supertrait.
+pub(crate) trait WhileResidualStackOperation<T: WhileResidualStackType>: ResidualStackOperation<T> {
     /// Constructs a zero for a statically shaped array-backed state type.
     fn residual_stack_zero(r#type: T) -> Self;
 
@@ -1758,7 +1749,7 @@ where
 
 impl<O> WhileResidualStackOperation<ArrayIrType> for O
 where
-    O: Operation<Type = ArrayIrType>
+    O: ResidualStackOperation<ArrayIrType>
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + OperationProjection<
@@ -1768,7 +1759,7 @@ where
                            + From<DynamicUpdateSliceOperation>
                            + From<SelectOperation<ArrayType>>
                            + From<ReduceOperation>,
-        > + TemporalResidualOperation<ArrayIrType>,
+        >,
     O::Projected: OperationProvider<ArrayType, ParallelVaryOperation, Operation = O::Projected>,
 {
     fn residual_stack_zero(r#type: ArrayIrType) -> Self {
@@ -2039,7 +2030,7 @@ where
     check_count!("output", tangent_program.output_ids(), tangent_state_count, ProgramError);
     let storage_types = stacked_residual_types
         .iter()
-        .map(TemporalResidualType::temporal_storage_type)
+        .map(C::Operation::residual_storage_type)
         .collect::<Result<Vec<_>, _>>()?;
     let invariant_residual_indices = invariant_residual_sources
         .iter()
@@ -2522,10 +2513,7 @@ where
     let boolean_scalar_type = V::Type::from(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
     let mask_stack_type =
         V::Type::from(boolean_scalar_type.as_array_type()?.with_inserted_dimension(0, bound.into()).unwrap());
-    let storage_types = residual_types
-        .iter()
-        .map(TemporalResidualType::temporal_storage_type)
-        .collect::<Result<Vec<_>, _>>()?;
+    let storage_types = residual_types.iter().map(O::residual_storage_type).collect::<Result<Vec<_>, _>>()?;
     let predicate_axes = predicate_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
     for storage_type in &storage_types {
         let storage_type = storage_type.as_array_type()?;

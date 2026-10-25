@@ -1333,7 +1333,7 @@ pub(crate) mod tests {
             scan,
             XlaOperation::Scan(operation)
                 if operation.carry_count() == 2
-                    && operation.length() == &Dimension::Static(5)
+                    && operation.iteration_count() == &Dimension::Static(5)
                     && operation.reverse()
         ));
 
@@ -1360,7 +1360,7 @@ pub(crate) mod tests {
             scan,
             XlaOperation::Scan(operation)
                 if operation.carry_count() == 2
-                    && operation.length() == &Dimension::Static(5)
+                    && operation.iteration_count() == &Dimension::Static(5)
                     && operation.reverse()
         ));
     }

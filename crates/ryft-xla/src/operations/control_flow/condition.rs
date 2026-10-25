@@ -1714,7 +1714,7 @@ mod tests {
             program.to_string(),
             indoc! {r#"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = zero_like %2

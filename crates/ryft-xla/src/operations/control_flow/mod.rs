@@ -870,7 +870,7 @@ mod tests {
                                 in (%0)
                             },
                         ]
-                            %4:f32[], %5:f32[2] = scan [carry_count=1, length=2, reverse=false] %3 %2 [
+                            %4:f32[], %5:f32[2] = scan [carry_count=1, iteration_count=2, reverse=false] %3 %2 [
                                 body={
                                     lambda %0:i64[], %1:f32[], %2:f32[] .
                                     let %3:f32[] = add %1 %2
@@ -984,7 +984,7 @@ mod tests {
                 let %4:f32[], %5:f32[2] = jit_call %0 %1 %2 %3 [
                     callee={
                         lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
-                        let %4:f32[] = scan [carry_count=1, length=2, reverse=true] %0 %3 [
+                        let %4:f32[] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %3 [
                             body={
                                 lambda %0:i64[], %1:f32[], %2:bool[] .
                                 let %3:f32[] = condition %2 %1 [
@@ -1001,7 +1001,7 @@ mod tests {
                                 in (%3)
                             },
                         ]
-                            %5:f32[], %6:f32[2] = scan [carry_count=1, length=2, reverse=true] %4 %1 [
+                            %5:f32[], %6:f32[2] = scan [carry_count=1, iteration_count=2, reverse=true] %4 %1 [
                                 body={
                                     lambda %0:i64[], %1:f32[], %2:f32[] .
                                     let %3:f32[] = add %1 %2
