@@ -682,22 +682,38 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
             }
         }
 
-        write_scan_iteration(stack, iteration, value, axis_sharding)
+        // Prepend a unit axis to the slice before updating the stack. On an existing mesh, that axis must preserve
+        // explicit sharding and manual variation; auto-axis sharding is a compiler hint that the update need not
+        // repeat (and that a reshape cannot request).
+        let value_type = value.r#type().into_owned();
+        let expanded_type = placed_scan_stack_type(&value_type, 1, axis_sharding)?;
+        let requests_sharding = expanded_type.sharding().is_some_and(|sharding| {
+            matches!(axis_sharding, ShardingDimension::Sharded(axis_names)
+                if axis_names.iter().all(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto)))
+        });
+        let expanded = if requests_sharding {
+            value.reshape_with_output_sharding(expanded_type.shape().clone(), expanded_type.sharding().cloned())?
+        } else {
+            value.reshape(expanded_type.shape().clone())?
+        };
+        let mut start_indices = vec![0; value_type.rank() + 1];
+        start_indices[0] = iteration;
+        stack.update_slice(&expanded, start_indices.as_slice())
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Array IR scans interpret their array stacks through the homogeneous array [`EagerContext`] and take a dynamic trip
-// count from the trailing first-class dimension input. A concrete [`Array`] relabels its type without changing its
+// Array IR scans interpret their array stacks through the homogeneous array `EagerContext` and take a dynamic trip
+// count from the trailing first-class dimension input. A concrete `Array` relabels its type without changing its
 // elements, so a slice whose manual variation differs from that of its stack widens both to the join of their
-// variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its stacks the
-// same way whether or not its body uses collectives over the emulated manual axes.
+// variation. The `shard_map` emulator delegates to these functions on every device, so a scan widens its
+// stacks the same way whether or not its body uses collectives over the emulated manual axes.
 impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext<ArrayIrValue<Array>, O> {
+    #[inline]
     fn iteration_count(iteration_count: &ArrayIrValue<Array>) -> Result<usize, ProgramError> {
         Ok(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(iteration_count)?.extent())
     }
 
+    #[inline]
     fn iteration_index(&self, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         Ok(ArrayIrValue::Array(context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)?))
@@ -745,6 +761,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
         Ok(ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type)?))
     }
 
+    #[inline]
     fn read_iteration(stack: &ArrayIrValue<Array>, iteration: usize) -> Result<ArrayIrValue<Array>, ProgramError> {
         Ok(match stack {
             ArrayIrValue::Reference(_) => stack.clone(),
@@ -757,7 +774,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
 
     fn write_iteration(
         &self,
-        _output_index: usize,
+        output_index: usize,
         stack: Option<ArrayIrValue<Array>>,
         iteration_count: usize,
         axis_sharding: &ShardingDimension,
@@ -772,8 +789,9 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
                 EagerContext::<Array, ArrayOperation<Array>>::new().zero(&stack_type)?
             }
         };
-        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives the
-        // stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
+
+        // Join manual variation across iterations (and the variation that the placement of the stacked axis gives
+        // the stack from its first write on) by relabeling both concrete arrays. An unsharded value first receives
         // replicated placement on the missing axis's mesh; its elements stay unchanged.
         let types = [stack.r#type().into_owned(), value.r#type().into_owned()];
         let axes = manual_variation_axes(&types);
@@ -790,9 +808,20 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
         })?;
         let value = joined.pop().unwrap();
         let stack = joined.pop().unwrap();
-        Ok(ArrayIrValue::Array(write_scan_iteration(stack, iteration, value, axis_sharding)?))
+
+        // Both arrays now have matching manual variation, so the homogeneous writer can perform the update.
+        Ok(ArrayIrValue::Array(EagerContext::<Array, ArrayOperation<Array>>::new().write_iteration(
+            output_index,
+            Some(stack),
+            iteration_count,
+            axis_sharding,
+            iteration,
+            value,
+        )?))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`ScanOperation`].
 pub const SCAN_OPERATION_NAME: &str = "scan";
@@ -2647,32 +2676,6 @@ fn placed_scan_stack_type(
     })
 }
 
-/// Writes `value` as slice `iteration` of `stack` by prepending a unit axis to `value`. If `value` has sharding, the
-/// unit axis uses `axis_sharding` on the same mesh. An in-place update must agree with the stack on explicit mesh axes
-/// and on the variation that manual mesh axes introduce, so the unit axis carries such sharding; sharding over auto
-/// mesh axes is a hint that the update need not repeat (and that a reshape cannot request).
-pub(crate) fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
-    stack: V,
-    iteration: usize,
-    value: V,
-    axis_sharding: &ShardingDimension,
-) -> Result<V, ProgramError> {
-    let value_type = value.r#type().into_owned();
-    let expanded_type = placed_scan_stack_type(&value_type, 1, axis_sharding)?;
-    let requests_sharding = expanded_type.sharding().is_some_and(|sharding| {
-        matches!(axis_sharding, ShardingDimension::Sharded(axis_names)
-            if axis_names.iter().all(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Auto)))
-    });
-    let expanded = if requests_sharding {
-        value.reshape_with_output_sharding(expanded_type.shape().clone(), expanded_type.sharding().cloned())?
-    } else {
-        value.reshape(expanded_type.shape().clone())?
-    };
-    let mut start_indices = vec![0; value_type.rank() + 1];
-    start_indices[0] = iteration;
-    stack.update_slice(&expanded, start_indices.as_slice())
-}
-
 /// Source of a loop-invariant value that the unknown scan of a partitioned scan threads as a carry that its body passes
 /// through unchanged.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -4391,6 +4394,41 @@ mod tests {
                  axes",
             )
             .into()),
+        );
+    }
+
+    #[test]
+    fn test_scan_interpretation_domain_write_iteration() {
+        let context = TestEagerContext::new();
+
+        // Writing an iteration stores the value as the slice at that index along the leading axis.
+        let stack = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
+        let value = Array::vector(vec![5.0, 6.0]).unwrap();
+        assert_eq!(
+            context.write_iteration(0, Some(stack), 3, &ShardingDimension::Replicated, 2, value),
+            Ok(Array::matrix(3, 2, vec![0.0, 0.0, 0.0, 0.0, 5.0, 6.0]).unwrap()),
+        );
+        let stack = Array::vector(vec![0.0, 0.0, 0.0]).unwrap();
+        let value = Array::scalar(4.0).unwrap();
+        assert_eq!(
+            context.write_iteration(0, Some(stack), 3, &ShardingDimension::Replicated, 0, value),
+            Ok(Array::vector(vec![4.0, 0.0, 0.0]).unwrap()),
+        );
+
+        // A stack whose leading axis is placed over a manual mesh axis varies over it, and so does the unit axis of
+        // a written slice that varies over it, so that the in-place update agrees with the stack; the slice keeps its
+        // elements.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let slice_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let axis_sharding = ShardingDimension::sharded(["m"]);
+        let stack_type = slice_type.batched(0, Dimension::Static(3), axis_sharding.clone()).unwrap();
+        let stack = Array::from_elements::<f64>(stack_type.clone(), &[0.0, 0.0, 0.0]).unwrap();
+        let value = Array::from_elements::<f64>(slice_type, &[4.0]).unwrap();
+        assert_eq!(
+            context.write_iteration(0, Some(stack), 3, &axis_sharding, 1, value),
+            Ok(Array::from_elements::<f64>(stack_type, &[0.0, 4.0, 0.0]).unwrap()),
         );
     }
 
@@ -22167,41 +22205,6 @@ mod tests {
         let mut outputs = vec!["final scale", "final accumulator", "final reference"];
         forward_scan_carries(body.entry_region_ref(), 0, &["scale", "accumulator", "reference"], &mut outputs);
         assert_eq!(outputs, vec!["final scale", "final accumulator", "final reference"]);
-    }
-
-    #[test]
-    fn test_write_scan_iteration() {
-        // Writing an iteration stores the value as the slice at that index along the leading axis.
-        let accumulator = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
-        assert_eq!(
-            write_scan_iteration(
-                accumulator,
-                2,
-                Array::vector(vec![5.0, 6.0]).unwrap(),
-                &ShardingDimension::Replicated,
-            ),
-            Ok(Array::matrix(3, 2, vec![0.0, 0.0, 0.0, 0.0, 5.0, 6.0]).unwrap()),
-        );
-        let accumulator = Array::vector(vec![0.0, 0.0, 0.0]).unwrap();
-        assert_eq!(
-            write_scan_iteration(accumulator, 0, Array::scalar(4.0).unwrap(), &ShardingDimension::Replicated),
-            Ok(Array::vector(vec![4.0, 0.0, 0.0]).unwrap()),
-        );
-
-        // A stack whose leading axis is placed over a manual mesh axis varies over it, and so does the unit axis of
-        // a written slice that varies over it, so that the in-place update agrees with the stack; the slice keeps its
-        // elements.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let slice_type = ArrayType::scalar(DataType::F64)
-            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
-            .unwrap();
-        let placement = ShardingDimension::sharded(["m"]);
-        let stack_type = slice_type.batched(0, Dimension::Static(3), placement.clone()).unwrap();
-        let accumulator = Array::from_elements::<f64>(stack_type.clone(), &[0.0, 0.0, 0.0]).unwrap();
-        assert_eq!(
-            write_scan_iteration(accumulator, 1, Array::from_elements::<f64>(slice_type, &[4.0]).unwrap(), &placement),
-            Ok(Array::from_elements::<f64>(stack_type, &[0.0, 4.0, 0.0]).unwrap()),
-        );
     }
 
     #[test]
