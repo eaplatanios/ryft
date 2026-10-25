@@ -1552,8 +1552,6 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation> + From<ScanOperation<ArrayIrType>>>
         + DynamicZero<C::Value>,
@@ -1580,8 +1578,8 @@ impl<
         // applies no read-only pruning, because a carry position exists in both boundaries or in neither. A carry that
         // partial reference discharge *preserved* stays a declared carry: it keeps its position and its reference type
         // on both boundaries, its accesses replay inside the body, and it publishes no successor. A preserved
-        // allocation reached only through an inherited capture gains the same kind of reference-typed carry so that the
-        // rebuilt body can bind that capture without turning it into state.
+        // allocation reached only through an inherited capture gains the same kind of reference-typed carry so
+        // that the rebuilt body can bind that capture without turning it into state.
 
         let name = self.name();
         let carry_count = self.carry_count();
@@ -1601,10 +1599,10 @@ impl<
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
-        // A discharged reference stack is carried whole: its state joins the carries and the body indexes it with its
-        // own index input. A stack whose allocation an earlier body input already threads (a reference carry or
-        // another stack of the same handle) shares that input's state, exactly as the handles alias under eager
-        // interpretation, so it needs no carry or instruction input of its own (refer to `aliased_inputs` below).
+        // A discharged reference stack is carried whole. Its state joins the carries and the body indexes it with its
+        // own index input. A stack whose allocation an earlier body input already threads (a reference carry or another
+        // stack of the same handle) shares that input's state, exactly as the handles alias under eager interpretation,
+        // so it needs no carry or instruction input of its own (refer to `aliased_inputs` below).
         let mut carried_inputs = Vec::new();
         let mut aliased_inputs = Vec::new();
         for position in 1 + carry_count..source_input_types.len() {
@@ -1625,6 +1623,7 @@ impl<
             Some(extent) => Dimension::Static(extent),
             None => self.iteration_count.clone(),
         };
+
         // No reference access executes for zero iterations, including accesses through declared carries or captures.
         // Elide bodies whose whole-root states would otherwise lower an unreachable index into an empty axis.
         let mut has_empty_root = false;
@@ -1639,11 +1638,13 @@ impl<
                     .iter()
                     .any(|dimension| dimension.bounds().extent() == Some(0));
         }
+
         if iteration_count.bounds().extent() == Some(0) && has_empty_root {
             // Keep the inferred dimension identities even when their bounds pin zero. Dynamic zeros consume the
             // corresponding runtime extents, so this shortcut preserves the public region signature.
             let boundary_values =
                 inputs.iter().map(|input| context.boundary_value(input)).collect::<Result<Vec<_>, _>>()?;
+
             // Prefer an explicit dimension leaf, otherwise reify an array axis. Preserved references cannot supply
             // extents here: zero iterations must execute no reference read.
             let extent_source = |variable: &DimensionVariable| {
@@ -1666,6 +1667,7 @@ impl<
                         })
                     })
             };
+
             let has_output_extents = output_types[carry_count..].iter().all(|output_type| {
                 let ArrayIrType::Array(output_type) = output_type else { return false };
                 output_type
@@ -1675,14 +1677,15 @@ impl<
                     .filter_map(Dimension::variable)
                     .all(|variable| extent_source(variable).is_some())
             });
+
             // A preserved reference can be the only carrier of a dynamic slice extent. Keep the scan boundary in that
             // case: its body owns the extent, and no iteration or reference read executes for zero iterations.
             if has_output_extents {
-                let mut outputs = carry_inputs.to_vec();
                 // A scan with no iterations still validates the relationships between its inputs that their types
                 // cannot prove (refer to `scan_entry_guard`). An entry guard over the discharged boundary values
-                // retains that validation, with each input that the body declares as a reference at its referent type
-                // when discharged, and the value carries flow through it.
+                // retains that validation, with each input that the body declares as a reference at its referent
+                // type when discharged, and the value carries flow through it.
+                let mut outputs = carry_inputs.to_vec();
                 let actual_types = boundary_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
                 let declared_types = self
                     .declared_input_types(&source_input_types)?
@@ -1695,6 +1698,7 @@ impl<
                         declared_type => declared_type,
                     })
                     .collect::<Vec<_>>();
+
                 if let Some((guard, members)) = scan_entry_guard(&declared_types, &actual_types)? {
                     let member_types = members.iter().map(|&index| actual_types[index].clone()).collect::<Vec<_>>();
                     let guarded = members.iter().map(|&index| boundary_values[index].clone()).collect::<Vec<_>>();
@@ -1711,6 +1715,7 @@ impl<
                         }
                     }
                 }
+
                 for output_type in &output_types[carry_count..] {
                     let output_type = <&ArrayType>::try_from(output_type)?;
                     let dimensions = output_type
@@ -1736,6 +1741,7 @@ impl<
                 return Ok(outputs);
             }
         }
+
         let carried_allocations =
             carried_inputs.iter().map(|&position| body_allocations[position].unwrap()).collect::<Vec<_>>();
         let declared = body_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
@@ -1778,6 +1784,7 @@ impl<
                 discharged_inputs.push(context.boundary_value(input)?);
             }
         }
+
         let mut program = result.into_program();
         if !carried_inputs.is_empty() || !aliased_inputs.is_empty() {
             // Move whole-root states into the carry prefix, whose final states were inserted alongside the other added
@@ -1797,11 +1804,13 @@ impl<
             let output_order = (0..program.output_count()).collect::<Vec<_>>();
             program = program.with_boundary(&input_order, &output_order)?;
         }
+
         let outputs = context.parent().bind(
             Self { carry_count: self.carry_count + (entering.len() + carried_inputs.len()), ..self.clone() },
             vec![program],
             discharged_inputs.as_slice(),
         )?;
+
         check_count!("output", outputs, source_output_count + entering.len() + carried_inputs.len(), ProgramError);
 
         let mut results = Vec::with_capacity(source_output_count);
@@ -1824,9 +1833,12 @@ impl<
                 results.push(ReferenceDischargeValue::Value(output));
             }
         }
+
         Ok(results)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C::Type> {
     #[inline]
