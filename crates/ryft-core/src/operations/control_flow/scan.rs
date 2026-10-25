@@ -264,7 +264,7 @@ pub trait ScanType:
     ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the iteration count input when
     ///     `iteration_count` is dynamic.
     ///   - `body_input_count`: Number of inputs of the attached body, including its intrinsic index input.
-    ///   - `carry_count`: Number of loop-carried state leaves.
+    ///   - `carry_count`: Number of loop-carried state values.
     ///   - `iteration_count`: Declared iteration count.
     fn infer_scan_body_input_types(
         input_types: &[Self],
@@ -357,7 +357,7 @@ pub trait ScanType:
     ///
     ///   - `body_input_types`: Body input types, `[index, carry..., x_slice_or_reference...]`.
     ///   - `body_output_types`: Body output types, `[carry..., y_slice...]`.
-    ///   - `carry_count`: Number of loop-carried state leaves.
+    ///   - `carry_count`: Number of loop-carried state values.
     ///   - `iteration_count`: Declared iteration count.
     ///   - `stacked_axis_shardings`: Placements of the leading scan axes of the stacked outputs (refer to
     ///     [`ScanOperation::with_stacked_axis_shardings`]).
@@ -807,8 +807,6 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ScanOperation`].
 pub const SCAN_OPERATION_NAME: &str = "scan";
 
@@ -859,7 +857,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// validates the body signature over the attached [`RegionInterface`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScanOperation<T: Type> {
-    /// Number of loop-carried state leaves after the body index input and at the front of its outputs.
+    /// Number of loop-carried state values after the body index input and at the front of its outputs.
     carry_count: usize,
 
     /// Number of iterations, represented by a static extent or a dynamic dimension identity.
@@ -868,8 +866,8 @@ pub struct ScanOperation<T: Type> {
     /// Boolean indicating whether iterations visit the stacked slices in reverse order.
     reverse: bool,
 
-    /// Lowering-only unroll factor: the number of body copies emitted per lowered loop iteration (`1` keeps one body
-    /// per iteration).
+    /// Lowering-only unrolling factor which specifies the number of body copies emitted per lowered loop iteration.
+    /// A value of `1` keeps one body per iteration.
     unroll: usize,
 
     /// Placement of the leading scan axis of each stacked output, in output order; the stacked outputs beyond this
@@ -883,16 +881,18 @@ pub struct ScanOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<T: Type> ScanOperation<T> {
-    /// Creates a new [`ScanOperation`] with the provided carry count and iteration count, visiting
-    /// iterations in increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`]
-    /// mapping `[index, carry..., x_slice_or_reference...]` to `[carry..., y_slice...]` is supplied separately as the
-    /// operation's attached region (via the region driver passed to [`Context::bind`]), and
-    /// [`Operation::infer_output_types`] validates its signature against `carry_count` and `iteration_count`.
+    /// Creates a new [`ScanOperation`] with the provided carry count and iteration count, visiting iterations
+    /// in increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`] mapping
+    /// `[index, carry..., x_slice_or_reference...]` to `[carry..., y_slice...]` is supplied separately as the
+    /// operation's attached region, and [`Operation::infer_output_types`] validates its signature against
+    /// `carry_count` and `iteration_count`.
     ///
     /// # Parameters
     ///
-    ///   - `carry_count`: Number of loop-carried state leaves, excluding the intrinsic body index input.
+    ///   - `carry_count`: Number of loop-carried state values, excluding the intrinsic body index input.
     ///   - `iteration_count`: Number of iterations, as a static or dynamic [`Dimension`].
     #[inline]
     pub fn new<N: Into<Dimension>>(carry_count: usize, iteration_count: N) -> Self {
@@ -952,7 +952,7 @@ impl<T: Type> ScanOperation<T> {
         self
     }
 
-    /// Returns the number of loop-carried state leaves of this [`ScanOperation`].
+    /// Returns the number of loop-carried state values of this [`ScanOperation`].
     #[inline]
     pub fn carry_count(&self) -> usize {
         self.carry_count
