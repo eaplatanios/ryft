@@ -277,20 +277,20 @@ impl<
 
     fn log_softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("log_softmax", &self.r#type(), axes.into())?;
-        let (mut values, layout) = flatten_class_axes(vec![self.convert_element_type(working_type)?], &axes)?;
-        let output = log_softmax_along(&values.pop().unwrap(), layout.axis)?;
-        layout.restore(output)?.convert_element_type(self.r#type().data_type())
+        let mut flattened = FlattenedClassInputs::new(vec![self.convert_element_type(working_type)?], &axes)?;
+        let output = log_softmax_along(&flattened.inputs.pop().unwrap(), flattened.axis)?;
+        flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
     fn masked_log_softmax<A: Into<Axes>>(&self, mask: &Self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("masked_log_softmax", &self.r#type(), axes.into())?;
         validate_normalization_mask("masked_log_softmax", &self.r#type(), &mask.r#type())?;
         let aligned = V::align_manual_variation(&[self.convert_element_type(working_type)?, mask.clone()])?;
-        let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
-        let mask = values.pop().unwrap();
-        let input = values.pop().unwrap();
-        let output = masked_log_softmax_along(&input, &mask, layout.axis)?;
-        layout.restore(output)?.convert_element_type(self.r#type().data_type())
+        let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
+        let mask = flattened.inputs.pop().unwrap();
+        let input = flattened.inputs.pop().unwrap();
+        let output = masked_log_softmax_along(&input, &mask, flattened.axis)?;
+        flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
     fn softmax_cross_entropy<A: Into<Axes>>(&self, probability_targets: &Self, axes: A) -> Result<Self, ProgramError> {
@@ -302,11 +302,11 @@ impl<
             self.convert_element_type(working_type)?,
             probability_targets.convert_element_type(working_type)?,
         ])?;
-        let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
-        let targets = values.pop().unwrap();
-        let input = values.pop().unwrap();
-        let log_probabilities = log_softmax_along(&input, layout.axis)?;
-        cross_entropy_loss(&targets, &log_probabilities, None, layout.axis)?
+        let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
+        let targets = flattened.inputs.pop().unwrap();
+        let input = flattened.inputs.pop().unwrap();
+        let log_probabilities = log_softmax_along(&input, flattened.axis)?;
+        cross_entropy_loss(&targets, &log_probabilities, None, flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -324,12 +324,12 @@ impl<
             probability_targets.convert_element_type(working_type)?,
             mask.clone(),
         ])?;
-        let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
-        let mask = values.pop().unwrap();
-        let targets = values.pop().unwrap();
-        let input = values.pop().unwrap();
-        let log_probabilities = masked_log_softmax_along(&input, &mask, layout.axis)?;
-        cross_entropy_loss(&targets, &log_probabilities, Some(&mask), layout.axis)?
+        let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
+        let mask = flattened.inputs.pop().unwrap();
+        let targets = flattened.inputs.pop().unwrap();
+        let input = flattened.inputs.pop().unwrap();
+        let log_probabilities = masked_log_softmax_along(&input, &mask, flattened.axis)?;
+        cross_entropy_loss(&targets, &log_probabilities, Some(&mask), flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -351,8 +351,8 @@ impl<
             labels.convert_element_type(DataType::I64)?,
         ])?;
         let labels = aligned.pop().unwrap();
-        let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
-        integer_label_loss(&values.pop().unwrap(), &labels, None, layout.axis)?
+        let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
+        integer_label_loss(&flattened.inputs.pop().unwrap(), &labels, None, flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -372,9 +372,9 @@ impl<
             labels.convert_element_type(DataType::I64)?,
         ])?;
         let labels = aligned.pop().unwrap();
-        let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
-        let mask = values.pop().unwrap();
-        integer_label_loss(&values.pop().unwrap(), &labels, Some(&mask), layout.axis)?
+        let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
+        let mask = flattened.inputs.pop().unwrap();
+        integer_label_loss(&flattened.inputs.pop().unwrap(), &labels, Some(&mask), flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 }
@@ -488,19 +488,52 @@ fn validate_normalization_labels(
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Layout of the class axes of the values that the single-axis arithmetic consumes: several class axes are moved to
-/// the end, in increasing order, and merged into one, while a single class axis leaves the values unchanged.
-struct FlattenedClassAxes {
-    /// Position of the (possibly merged) class axis in the flattened values.
+/// Array inputs with their class axes flattened for single-axis arithmetic, together with the information needed to
+/// restore their original shape and axis order.
+struct FlattenedClassInputs<V> {
+    /// Flattened inputs, in their original input order.
+    inputs: Vec<V>,
+
+    /// Position of the (possibly merged) class axis in the flattened inputs.
     axis: usize,
 
     /// Inverse permutation and transposed shape that restore the original layout, present for several class axes.
     restoration: Option<(Vec<usize>, Vec<usize>)>,
 }
 
-impl FlattenedClassAxes {
-    /// Restores the original layout of `value`, an output with the flattened values' shape.
-    fn restore<V: Value<Type = ArrayType> + Reshape + Transpose>(&self, value: V) -> Result<V, ProgramError> {
+impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
+    /// Flattens the class `axes` of `inputs`. Callers provide at least one input, a shared static shape, and nonempty,
+    /// distinct axes validated for that shape in increasing order. Several class axes are moved to the end and merged
+    /// into one; a single class axis leaves the inputs unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if a transpose or reshape fails.
+    fn new(inputs: Vec<V>, axes: &[usize]) -> Result<Self, ProgramError> {
+        if let [axis] = axes {
+            return Ok(Self { inputs, axis: *axis, restoration: None });
+        }
+        let input_type = inputs[0].r#type();
+        let rank = input_type.rank();
+        let shape = input_type.static_shape().unwrap();
+        let permutation = (0..rank).filter(|axis| !axes.contains(axis)).chain(axes.iter().copied()).collect::<Vec<_>>();
+        let mut inverse_permutation = vec![0; rank];
+        for (position, &axis) in permutation.iter().enumerate() {
+            inverse_permutation[axis] = position;
+        }
+        let transposed_shape = permutation.iter().map(|&axis| shape[axis]).collect::<Vec<_>>();
+        let class_axis = rank - axes.len();
+        let mut flattened_shape = transposed_shape[..class_axis].to_vec();
+        flattened_shape.push(transposed_shape[class_axis..].iter().product());
+        let inputs = inputs
+            .into_iter()
+            .map(|input| input.transpose(permutation.clone())?.reshape(flattened_shape.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { inputs, axis: class_axis, restoration: Some((inverse_permutation, transposed_shape)) })
+    }
+
+    /// Restores the original shape and axis order of `value`, an output with the flattened inputs' shape.
+    fn restore(&self, value: V) -> Result<V, ProgramError> {
         match &self.restoration {
             None => Ok(value),
             Some((inverse_permutation, transposed_shape)) => {
@@ -508,35 +541,6 @@ impl FlattenedClassAxes {
             }
         }
     }
-}
-
-/// Moves the class `axes` of every value in `values`, which share one static shape, to the end in increasing order
-/// and merges them into one class axis, so that the single-axis arithmetic serves several class axes. A single class
-/// axis returns the values unchanged.
-fn flatten_class_axes<V: Value<Type = ArrayType> + Reshape + Transpose>(
-    values: Vec<V>,
-    axes: &[usize],
-) -> Result<(Vec<V>, FlattenedClassAxes), ProgramError> {
-    if let [axis] = axes {
-        return Ok((values, FlattenedClassAxes { axis: *axis, restoration: None }));
-    }
-    let input_type = values[0].r#type();
-    let rank = input_type.rank();
-    let shape = input_type.static_shape().unwrap();
-    let permutation = (0..rank).filter(|axis| !axes.contains(axis)).chain(axes.iter().copied()).collect::<Vec<_>>();
-    let mut inverse_permutation = vec![0; rank];
-    for (position, &axis) in permutation.iter().enumerate() {
-        inverse_permutation[axis] = position;
-    }
-    let transposed_shape = permutation.iter().map(|&axis| shape[axis]).collect::<Vec<_>>();
-    let class_axis = rank - axes.len();
-    let mut flattened_shape = transposed_shape[..class_axis].to_vec();
-    flattened_shape.push(transposed_shape[class_axis..].iter().product());
-    let values = values
-        .into_iter()
-        .map(|value| value.transpose(permutation.clone())?.reshape(flattened_shape.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((values, FlattenedClassAxes { axis: class_axis, restoration: Some((inverse_permutation, transposed_shape)) }))
 }
 
 /// Computes log-probabilities along `axis` with one pivot class per row held at a constant zero.
@@ -821,9 +825,9 @@ where
             .convert_element_type(output_data_type)?;
         let gradient = soft_target_gradient(&teacher, &student, &teacher_probabilities, &student_probabilities, axis)?;
         let tangent = tangent.convert_element_type(student.r#type().data_type())?;
-        let (mut tangents, _) = flatten_class_axes(vec![tangent], &class_axes)?;
+        let mut flattened = FlattenedClassInputs::new(vec![tangent], &class_axes)?;
         let output_tangent = gradient
-            .mul(&tangents.pop().unwrap())?
+            .mul(&flattened.inputs.pop().unwrap())?
             .reduce_sum(&[axis], None)?
             .convert_element_type(loss.r#type().tangent()?.data_type())?;
         Ok((loss, output_tangent))
@@ -871,13 +875,13 @@ where
         validate_normalization("softmax_cross_entropy_with_target_logits", &student_type, axes.clone())?;
     validate_normalization_placement("softmax_cross_entropy_with_target_logits", &teacher_type)?;
     let output_data_type = student_type.data_type();
-    let (mut values, layout) = flatten_class_axes(
+    let mut flattened = FlattenedClassInputs::new(
         vec![teacher.convert_element_type(working_data_type)?, student.convert_element_type(working_data_type)?],
         &class_axes,
     )?;
-    let student = values.pop().unwrap();
-    let teacher = values.pop().unwrap();
-    Ok(SoftTargetInputs { teacher, student, class_axes, axis: layout.axis, output_data_type })
+    let student = flattened.inputs.pop().unwrap();
+    let teacher = flattened.inputs.pop().unwrap();
+    Ok(SoftTargetInputs { teacher, student, class_axes, axis: flattened.axis, output_data_type })
 }
 
 /// Computes the primal loss without multiplying zero target probabilities by masked log-probabilities.
