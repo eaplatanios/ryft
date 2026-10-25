@@ -68,9 +68,8 @@ use crate::operations::collectives::parallel_vary::{
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero};
 use crate::operations::control_flow::{
-    TemporalResidualOperation, TemporalResidualType, canonicalize_carry_axes, passed_through_carries,
-    refine_output_types, stabilize_carry_axes, validate_output_identities, validate_reference_carry_roots,
-    validate_region_input,
+    ResidualStackOperation, canonicalize_carry_axes, passed_through_carries, refine_output_types, stabilize_carry_axes,
+    validate_output_identities, validate_reference_carry_roots, validate_region_input,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::conversions::{CastOperation, CastType};
@@ -1897,12 +1896,10 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
-    T: ScanType + TemporalResidualType,
+    T: ScanType,
     V: Value<Type = T>,
-    O: Operation<Type = T> + From<ScanOperation<T>> + TemporalResidualOperation<T>,
+    O: ResidualStackOperation<T> + From<ScanOperation<T>>,
     C: Context<Type = T, Constant = V, Operation = O>,
 > PartiallyEvaluatableOperation<C> for ScanOperation<T>
 {
@@ -1913,8 +1910,8 @@ impl<
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Partial evaluation splits off the known work of a scan: a carry stays known while the body computes its next
-        // value from known values alone, a *known scan* bound in the known-side context performs the known work, and an
-        // *unknown scan* left in the residual program consumes its residuals (refer to `reconstruct_partitioned_scan`
+        // value from known values alone, a _known scan_ bound in the known-side context performs the known work, and an
+        // _unknown scan_ left in the residual program consumes its residuals (refer to `reconstruct_partitioned_scan`
         // for the full recipe). Loop-invariant residuals, such as the initial values of known carries that the body
         // passes through unchanged and pure work over them, are computed once before the scan. Those that resolve to
         // constants of the known-side context are embedded into the unknown body as constants, so that partial
@@ -1927,15 +1924,16 @@ impl<
         // unchanged are then forwarded from their guarded inputs, and a scan where nothing folds residualizes
         // unchanged.
 
-        // The rule requests all nested-computation work through its region access (region 0 is the body), which keeps
-        // its bounds free of the operation family's own semantic traits.
+        // The rule requests all nested-computation work through its region access (region 0 is the body),
+        // which keeps its bounds free of the operation family's own semantic traits.
         let body = driver.region(0)?;
         let carry_count = self.carry_count;
         let body_input_types = body.input_types();
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, body)?;
-        // When every input is known the whole scan folds by binding it in the known-side context; defer to that
-        // default behavior.
+
+        // When every input is known the whole scan folds by binding it in the known-side context so we
+        // defer to that default behavior.
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             return context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], inputs);
         }
@@ -1956,10 +1954,10 @@ impl<
                 .collect::<Vec<bool>>();
 
             // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging
-            // context. Unlike the body's derived forward-mode and transposed programs, a partition is not retained by
-            // the body region's transform cache: it depends on the configuration of the partial-evaluation context
-            // (e.g., effect folding and residual placement), so the body and the known-ness mask alone do not determine
-            // it.
+            // context. Unlike the body's derived forward-mode and transposed programs, a partition is not retained
+            // by the body region's transform cache: it depends on the configuration of the partial-evaluation context
+            // (e.g., effect folding and residual placement), so the body and the known-ness mask alone do not
+            // determine it.
             let partition = loop {
                 let partition = driver.partition_program(context, body, &body_known)?;
                 let mut changed = false;
@@ -2003,6 +2001,8 @@ impl<
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<C: Context<Type = ArrayType, Operation: From<ScanOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatchingPolicy<P>> for ScanOperation<ArrayType>
 {
@@ -2031,8 +2031,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<ScanOperation<ArrayIrType>>>
     }
 }
 
-impl<T: DifferentiableType + CastType + ScanType + TemporalResidualType, C: Context<Type = T> + Zero<C::Value>>
-    DifferentiableOperation<C> for ScanOperation<T>
+impl<T: DifferentiableType + CastType + ScanType, C: Context<Type = T> + Zero<C::Value>> DifferentiableOperation<C>
+    for ScanOperation<T>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
@@ -2041,7 +2041,7 @@ where
         + From<GuardOperation<T>>
         + From<CastOperation<T>>
         + From<T::IdentityWitnessOperation>
-        + TemporalResidualOperation<T>,
+        + ResidualStackOperation<T>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2729,7 +2729,7 @@ enum ScanStackSource {
     KnownOutput(usize),
 }
 
-/// How the unknown iteration body obtains one residual. Only ordinary values may require temporal storage.
+/// How the unknown iteration body obtains one residual. Computed values may need per-iteration array storage.
 enum ScanResidual<T: Type> {
     /// Regenerated from the unknown body's intrinsic index.
     Index,
@@ -2775,8 +2775,8 @@ enum ScanResidual<T: Type> {
 // These arguments keep source validation, boundary wiring, and the two binding destinations explicit.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_partitioned_scan<
-    V: Value<Type: ScanType + TemporalResidualType>,
-    O: Operation<Type = V::Type> + From<ScanOperation<V::Type>> + TemporalResidualOperation<V::Type>,
+    V: Value<Type: ScanType>,
+    O: ResidualStackOperation<V::Type> + From<ScanOperation<V::Type>>,
     Input: Clone,
     LiftKnownFn: FnMut(V) -> Result<Input, ProgramError>,
     ResolveConstantFn: FnMut(&Input) -> Option<V>,
@@ -3012,7 +3012,7 @@ fn reconstruct_partitioned_scan<
         .map(|&index| body_inputs[index - 1].clone())
         .collect::<Vec<_>>();
     known_scan_inputs.extend_from_slice(iteration_count_inputs);
-    // Project the known iteration body to its retained results and effects, then convert metadata residuals to temporal
+    // Project the known iteration body to its retained results and effects, then convert metadata residuals to array
     // storage. Ordinary arrays already have that representation and need no second replay.
     let known_body = {
         let known_output_atoms = known_program_output_indices
@@ -3027,7 +3027,7 @@ fn reconstruct_partitioned_scan<
                 conversions.push((position, operation));
             }
         }
-        // Arrays already are their temporal representation. Keep the projected body directly unless a metadata value
+        // Arrays already have their storage representation. Keep the projected body directly unless a metadata value
         // actually needs a storage gateway, avoiding a second replay for ordinary array scans.
         if conversions.is_empty() {
             known_body
@@ -3191,7 +3191,7 @@ fn reconstruct_partitioned_scan<
                     Ok(match residual {
                         ScanResidual::Index => Some(index_atom),
                         ScanResidual::Value { r#type, stack: Some(_) } => {
-                            Some(builder.add_input(r#type.temporal_storage_type()?))
+                            Some(builder.add_input(O::residual_storage_type(r#type)?))
                         }
                         _ => None,
                     })
@@ -3204,7 +3204,7 @@ fn reconstruct_partitioned_scan<
             }
             let invariant_atoms = invariant_atoms.into_iter().map(Option::unwrap).collect::<Vec<_>>();
             // Restore live metadata after all inputs establish their identities. Reuse an input carrier or an earlier
-            // restoration before reading temporal storage, so each nominal identity has one SSA definition.
+            // restoration before reading the stored residual, so each nominal identity has one SSA definition.
             let carriers = builder
                 .input_ids()
                 .iter()
@@ -3651,8 +3651,7 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
         scan_inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, DifferentiationError>
     where
-        C::Type: TemporalResidualType,
-        C::Operation: From<ScanOperation<C::Type>> + TemporalResidualOperation<C::Type>,
+        C::Operation: From<ScanOperation<C::Type>> + ResidualStackOperation<C::Type>,
     {
         let body_input_count = self.input_order.len() - self.activity.input_indices().len();
         let body_output_count = self.activity.output_tangent_liveness().len();
@@ -10370,7 +10369,7 @@ mod tests {
     fn test_scan_partial_evaluation_recovers_known_next_dimension_of_unknown_carry_from_its_input() {
         // This carry starts unknown, but its next value is known. Like every residual that defines an identity, that
         // next value is recovered from an unknown body input that carries its identity (here the carry itself, whose
-        // exact type it shares) instead of being stacked by a known scan and restored from temporal storage, so the
+        // exact type it shares) instead of being stacked by a known scan and restored from storage, so the
         // split leaves no known work and no residual input behind.
         let dimension = TestIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let dimension_type = dimension.r#type().into_owned();
