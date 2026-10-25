@@ -3,10 +3,8 @@
 use ryft_macros::Parameterized;
 
 use crate::arrays::ArrayType;
-use crate::axes::NamedAxes;
-use crate::batching::{BatchableType, RecursiveBatchingPolicy};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{CotangentBatchingPolicy, DifferentiableType};
+use crate::differentiation::DifferentiableType;
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::attention::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
@@ -14,13 +12,13 @@ use crate::operations::attention::{
     DotProductAttentionOperation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::composites::functions::{CompositeVjp, ExplicitVjp, VjpComposite, composite};
-use crate::operations::composites::operations::CompositeOperation;
-use crate::operations::composites::rules::CustomRuleRegistration;
+use crate::operations::composites::functions::{
+    CompositeCallContext, CompositeVjp, ExplicitVjp, VjpComposite, composite,
+};
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError, Typed, Value};
-use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext};
 
 /// Residuals retained by the attention reverse rule.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
@@ -143,12 +141,8 @@ where
     /// Aligns the inputs' manual variation and stages the attention training call.
     pub fn call<C, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
-        C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation> + NamedAxes,
-        C::Operation: From<CompositeOperation<C::Constant, C::Operation>>,
+        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
-        <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
-            + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
-        CustomRuleRegistration<C::Constant, C::Operation>: Send,
         ExplicitVjp<AttentionInputs<DomainTracer<D>>, DomainTracer<D>, AttentionResiduals<DomainTracer<D>>>:
             CompositeVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
     {

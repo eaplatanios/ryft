@@ -8,17 +8,23 @@
 //!
 //!   - **Functions:** [`composite`] creates a [`Composite`] from its primal, and configuration functions attach its
 //!     rules: a Jacobian-Vector Product (JVP) rule that governs both forward- and reverse-mode differentiation
-//!     ([`Composite::with_jvp`], the analogue of JAX's `jax.custom_jvp`), forward and backward rules that govern
-//!     reverse-mode differentiation ([`Composite::with_vjp`], the analogue of JAX's `jax.custom_vjp`), or both, as well
-//!     as a batching rule ([`Composite::with_batching`], the analogue of JAX's `jax.custom_batching.custom_vmap`).
+//!     ([`Composite::with_jvp`], the analogue of JAX's
+//!     [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html)), forward and backward
+//!     rules that govern reverse-mode differentiation ([`Composite::with_vjp`], the analogue of JAX's
+//!     [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html)), or both, as well as a
+//!     batching rule ([`Composite::with_batching`], the analogue of JAX's [`jax.custom_batching.custom_vmap`][vmap]).
 //!     [`Composite::from_custom_call`] creates a composite whose primal calls a foreign kernel.
 //!   - **Operations:** each call of a composite stages a [`CompositeOperation`], which carries the primal program
 //!     as an attached region and retains the rules as callbacks that are traced on the first request of each
 //!     specialization. Callers whose rules are already programs (e.g., kernel staging with explicit rule programs)
-//!     stage the same operation with the rule programs attached as regions instead. Reverse mode replaces either kind
-//!     of call with a [`CompositeTransposeOperation`] carrier whose transposition applies the backward rule.
+//!     stage the same operation with the rule programs attached as regions instead. Reverse mode replaces a call with
+//!     reverse-mode rules, in either representation, with a [`CompositeTransposeOperation`] carrier whose
+//!     transposition applies the backward rule, while it transposes the linearized forward-mode rule of a call
+//!     without reverse-mode rules.
 //!   - **Rules:** [`CustomRuleDefinition`] and its [`CustomRuleRegistration`] are the flat, family-level rule sets
 //!     behind the retained rules, which trace and cache the rule programs of each specialization.
+//!
+//! [vmap]: https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html
 //!
 //! Outside of the transforms that their rules govern, composites are transparent: interpretation and backend lowering
 //! replay the primal program. Refer to the documentation of [`composite`] for the calling convention and for how the
@@ -52,9 +58,10 @@ pub mod operations;
 pub mod rules;
 
 pub use functions::{
-    AccumulatingVjp, AxisDependentBatching, BatchingRuleConsistencyError, Composite, CompositeBatching, CompositeJvp,
-    CompositeVjp, CustomBatching, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite,
-    JvpFromPrimal, SymbolicZeroJvp, SymbolicZeroVjp, VjpComposite, check_batching_rule_consistency, composite,
+    AccumulatingVjp, AxisDependentBatching, BatchedComposite, BatchingRuleConsistencyError, Composite,
+    CompositeBatching, CompositeCallContext, CompositeJvp, CompositeVjp, CustomBatching, DefaultBatching, DefaultJvp,
+    DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, SymbolicZeroJvp, SymbolicZeroVjp, VjpComposite,
+    check_batching_rule_consistency, composite,
 };
 pub use operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeJvpRule, CompositeOperation,
@@ -62,11 +69,11 @@ pub use operations::{
 };
 pub use rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
-    CustomRuleTracer, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
+    CustomRuleTracer, CustomVjpOperation, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
 };
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -86,7 +93,7 @@ pub(crate) mod tests {
 
     /// Builds one flat program that binds the composite call `operation` with `regions` to inputs of `input_types` and
     /// returns all of its outputs.
-    pub(crate) fn composite_call_program<V: Value, O: Operation<Type = V::Type>>(
+    pub(super) fn composite_call_program<V: Value, O: Operation<Type = V::Type>>(
         operation: impl Into<O>,
         regions: Vec<Program<V, O, Vec<V>, Vec<V>>>,
         input_types: Vec<V::Type>,
@@ -104,8 +111,8 @@ pub(crate) mod tests {
 
     /// Supplies the regions of composite calls while making recursive differentiation an assertion failure: the custom
     /// derivative rules replay their rule regions directly and must never differentiate them recursively.
-    pub(crate) struct ReferenceRuleDifferentiationDriver {
-        pub(crate) programs: Vec<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>,
+    pub(super) struct ReferenceRuleDifferentiationDriver {
+        pub(super) programs: Vec<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>,
     }
 
     impl RegionDriver<ArrayIrValue<Array>, ArrayIrOperation<Array>> for ReferenceRuleDifferentiationDriver {
@@ -161,39 +168,39 @@ pub(crate) mod tests {
     // Fixtures of the tests of calls and carriers with retained rules.
 
     /// Eager context whose operation family registers the retained-rule operations.
-    pub(crate) type TestContext = EagerContext<Array, TestArrayOperation>;
+    pub(super) type TestContext = EagerContext<Array, TestArrayOperation>;
 
     /// Retained-rule definition over [`TestContext`].
-    pub(crate) type TestDefinition = CustomRuleDefinition<Array, TestArrayOperation>;
+    pub(super) type TestDefinition = CustomRuleDefinition<Array, TestArrayOperation>;
 
     /// Registration of a [`TestDefinition`].
-    pub(crate) type TestRegistration = CustomRuleRegistration<Array, TestArrayOperation>;
+    pub(super) type TestRegistration = CustomRuleRegistration<Array, TestArrayOperation>;
 
     /// Retained-rule definition over the production [`ArrayOperation`] member family.
-    pub(crate) type MemberDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
+    pub(super) type MemberDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
 
     /// Invocation counters of the retained rules of a [`cube_definition`].
     #[derive(Default)]
-    pub(crate) struct RuleCounters {
+    pub(super) struct RuleCounters {
         /// Number of JVP rule invocations.
-        pub(crate) jvp: AtomicUsize,
+        pub(super) jvp: AtomicUsize,
 
         /// Number of VJP forward rule invocations.
-        pub(crate) forward: AtomicUsize,
+        pub(super) forward: AtomicUsize,
 
         /// Number of VJP backward rule invocations.
-        pub(crate) backward: AtomicUsize,
+        pub(super) backward: AtomicUsize,
     }
 
     impl RuleCounters {
         /// Returns the JVP, forward, and backward invocation counts.
-        pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        pub(super) fn counts(&self) -> (usize, usize, usize) {
             (self.jvp.load(Ordering::SeqCst), self.forward.load(Ordering::SeqCst), self.backward.load(Ordering::SeqCst))
         }
     }
 
     /// Builds the primal `f(x) = x³`.
-    pub(crate) fn cube_program(r#type: &ArrayType) -> FlatProgram<TestContext> {
+    pub(super) fn cube_program(r#type: &ArrayType) -> FlatProgram<TestContext> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
         let square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -204,8 +211,8 @@ pub(crate) mod tests {
     /// Returns a definition of `f(x) = x³` whose deliberately wrong rules distinguish the selected rule: the JVP rule
     /// computes `ẏ = x² ẋ` and the VJP rule computes `x̄ = 2 x² ȳ`, while the true derivative is `3 x²`. Each rule
     /// counts its invocations in `counters`.
-    pub(crate) fn cube_definition(counters: &Arc<RuleCounters>, jvp: bool, vjp: bool) -> TestDefinition {
-        let mut definition = TestDefinition::new("cube").with_batching();
+    pub(super) fn cube_definition(counters: &Arc<RuleCounters>, jvp: bool, vjp: bool) -> TestDefinition {
+        let mut definition = TestDefinition::new("cube").with_batching_support();
         if jvp {
             let counters = counters.clone();
             definition = definition.with_jvp(move |primals, tangents| {
@@ -234,7 +241,7 @@ pub(crate) mod tests {
     }
 
     /// Returns the member-family counterpart of [`cube_definition`], whose rules are written against member tracers.
-    pub(crate) fn member_cube_definition(counters: &Arc<RuleCounters>) -> MemberDefinition {
+    pub(super) fn member_cube_definition(counters: &Arc<RuleCounters>) -> MemberDefinition {
         let (jvp_counters, forward_counters, backward_counters) =
             (counters.clone(), counters.clone(), counters.clone());
         MemberDefinition::new("cube")
@@ -255,11 +262,11 @@ pub(crate) mod tests {
                     Ok(vec![contribution.clone() + contribution])
                 },
             )
-            .with_batching()
+            .with_batching_support()
     }
 
     /// Stages one call of `definition` over an input of type `r#type`.
-    pub(crate) fn custom_rule_program(definition: &TestRegistration, r#type: ArrayType) -> FlatProgram<TestContext> {
+    pub(super) fn custom_rule_program(definition: &TestRegistration, r#type: ArrayType) -> FlatProgram<TestContext> {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let primal = builder.import_program(cube_program(&r#type));
         let input = builder.add_input(r#type);
@@ -271,7 +278,7 @@ pub(crate) mod tests {
 
     /// Returns the outputs and tangents of the forward-mode differentiation of one call of `definition` at `x` with
     /// tangent `tangent`.
-    pub(crate) fn call_jvp(
+    pub(super) fn call_jvp(
         definition: &TestRegistration,
         x: Array,
         tangent: Array,

@@ -3077,9 +3077,7 @@ mod tests {
              seed: MaybeZero<Tracer<'_>>,
              accumulator: CotangentAccumulator| {
                 let (MaybeZero::Value(seed), Some(buffer)) = (seed, accumulator.reference(context)?) else {
-                    return Err(
-                        ProgramError::InvalidArgument { message: "expected a caller buffer".to_string() }.into()
-                    );
+                    return Err(ProgramError::InvalidArgument { message: "expected a caller buffer".to_string() });
                 };
                 let slice = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1)] };
                 buffer.add_update_through(&seed, &[slice], &[])?;

@@ -5,9 +5,11 @@
 //! and replays the JVP rule, and reverse mode traces the VJP forward rule and stages a [`CompositeTransposeOperation`]
 //! whose transposition specializes the backward rule against the actual cotangent destinations. Every rule is traced
 //! lazily, on the first request of each static specialization, and cached by the definition's
-//! [`CustomRuleRegistration`]. Batching a call or carrier likewise traces no rule: it records the batching level, and a
-//! later derivative request structurally batches the rule program traced at the unbatched types (refer to the Batching
-//! sections of [`CompositeOperation`](crate::CompositeOperation) and [`CompositeTransposeOperation`]).
+//! [`CustomRuleRegistration`]. Batching a call or carrier likewise traces no derivative rule: it records the batching
+//! level, and a later derivative request structurally batches the rule program traced at the unbatched types. Only a
+//! custom batching rule (refer to [`CustomRuleDefinition::with_batching_rule`]) is traced when a call is batched,
+//! because its program becomes the batched call's primal region (refer to the Batching sections of
+//! [`CompositeOperation`](crate::CompositeOperation) and [`CompositeTransposeOperation`]).
 //!
 //! This module is the flat, family-level representation behind the public [`composite`](fn@crate::composite) builder,
 //! which adapts structured closures to the flat rule interfaces of this module. Rules may receive materialized zeros
@@ -261,7 +263,7 @@ pub(super) trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
         inputs: &[PartialValue<CustomRuleTracer<V, O>>],
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
         accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>
+    ) -> Result<(), ProgramError>
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: Value,
@@ -276,7 +278,7 @@ where
             &[PartialValue<CustomRuleTracer<V, O>>],
             &[MaybeZero<CustomRuleTracer<V, O>>],
             &[CotangentAccumulator],
-        ) -> Result<(), DifferentiationError>
+        ) -> Result<(), ProgramError>
         + Send
         + Sync,
 {
@@ -287,7 +289,7 @@ where
         inputs: &[PartialValue<CustomRuleTracer<V, O>>],
         seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
         accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
+    ) -> Result<(), ProgramError> {
         self(context, inputs, seeds, accumulators)
     }
 }
@@ -466,9 +468,9 @@ enum CustomRuleBatchedOutputs {
 /// Structural batching of a traced rule program at one recorded [`BatchingLevel`] with the provided input batch axes.
 /// Each output is aligned to its required batch axis, or keeps its natural batch axis when the requirement is [`None`].
 /// The result is the batched program, which consumes the level's boundary inputs before the source program's inputs,
-/// together with its output batch axes. [`CustomRuleDefinition::with_batching`] captures it where the operation
-/// family's batching bounds are known, because requiring them on the operations' own rules would form a cycle with the
-/// family's payload bounds.
+/// together with its output batch axes. [`CustomRuleDefinition::with_batching_support`] captures it where the
+/// operation family's batching bounds are known, because requiring them on the operations' own rules would form a cycle
+/// with the family's payload bounds.
 type CustomRuleBatcher<V, O> = dyn Fn(
         &BatchingLevel<<V as Typed>::Type>,
         &Program<V, O, Vec<V>, Vec<V>>,
@@ -485,7 +487,12 @@ type CustomRuleBatcher<V, O> = dyn Fn(
 /// batching rule with it. [`CustomRuleDefinition::with_batching_rule`] captures it where the operation family's
 /// differentiation bounds are known, because requiring them on the operations' own rules would form a cycle with the
 /// family's payload bounds.
-type CustomRuleDifferentiator<V, O> = dyn Fn(&Program<V, O, Vec<V>, Vec<V>>, &[usize]) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
+type CustomRuleDifferentiator<V, O> = dyn Fn(
+        // Program to differentiate.
+        &Program<V, O, Vec<V>, Vec<V>>,
+        // Indices of the inputs with respect to which the program is differentiated.
+        &[usize],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     + Send
     + Sync;
 
@@ -779,6 +786,57 @@ pub struct CustomRuleSpecialization<V: Typed + Parameter, O> {
 /// Shared [`CustomRuleSpecialization`], as retained by the specialization caches of a [`CustomRuleDefinition`].
 pub type CustomRuleProgram<V, O> = Arc<CustomRuleSpecialization<V, O>>;
 
+/// Operation family `Self` over values `V` whose programs the reverse-mode rules of a [`CustomRuleDefinition`] (refer
+/// to [`CustomRuleDefinition::with_vjp`]) can serve: the family transposes the programs that apply the rules, and it
+/// provides the zeros, reference allocations, reference updates, and additions with which transposition delivers
+/// cotangents to their destinations (including caller-provided buffers). It names those requirements once for every
+/// reverse-mode rule builder, and it is implemented for every family that satisfies them.
+pub trait CustomVjpOperation<V: Value<Type: ReferenceMemberType>>:
+    Operation<Type = V::Type>
+    + TransposableOperation<V, Self>
+    + ResidualZeroProvider<V::Type, Operation = Self>
+    + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
+    + OperationProvider<
+        V::Type,
+        ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+        Operation = Self,
+    > + OperationProvider<
+        V::Type,
+        ReferenceAddUpdateOperation<
+            <V::Type as ReferenceMemberType>::Referent,
+            V::Type,
+            <Self as ReferenceAccessOperation>::Transform,
+        >,
+        Operation = Self,
+    > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = Self>
+where
+    TracingContext<V, Self>: StagingContext<Type = V::Type, Constant = V, Operation = Self>,
+{
+}
+
+impl<V: Value<Type: ReferenceMemberType>, O> CustomVjpOperation<V> for O
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    O: Operation<Type = V::Type>
+        + TransposableOperation<V, O>
+        + ResidualZeroProvider<V::Type, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
+        + OperationProvider<
+            V::Type,
+            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            Operation = O,
+        > + OperationProvider<
+            V::Type,
+            ReferenceAddUpdateOperation<
+                <V::Type as ReferenceMemberType>::Referent,
+                V::Type,
+                <O as ReferenceAccessOperation>::Transform,
+            >,
+            Operation = O,
+        > + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+{
+}
+
 /// Immutable definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on
 /// the first request of each specialization. A definition is registered once (refer to [`CustomRuleRegistration`]) and
 /// shared by every call that uses it, and two definitions are the same rule set exactly when they are the same
@@ -954,27 +1012,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
-        O: 'static
-            + TransposableOperation<V, O>
-            + ResidualZeroProvider<V::Type, Operation = O>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            >
-            + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = O,
-            >
-            + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <O as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = O,
-            >
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        O: 'static + CustomVjpOperation<V>,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1004,27 +1042,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
-        O: 'static
-            + TransposableOperation<V, O>
-            + ResidualZeroProvider<V::Type, Operation = O>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            >
-            + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = O,
-            >
-            + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <O as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = O,
-            >
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        O: 'static + CustomVjpOperation<V>,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1059,27 +1077,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + ReferenceMemberType>,
-        O: 'static
-            + TransposableOperation<V, O>
-            + ResidualZeroProvider<V::Type, Operation = O>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
-            >
-            + OperationProvider<
-                V::Type,
-                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-                Operation = O,
-            >
-            + OperationProvider<
-                V::Type,
-                ReferenceAddUpdateOperation<
-                    <V::Type as ReferenceMemberType>::Referent,
-                    V::Type,
-                    <O as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = O,
-            >
-            + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+        O: 'static + CustomVjpOperation<V>,
         F: 'static
             + Fn(
                 &[CustomRuleTracer<V, O>],
@@ -1092,7 +1090,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
                 &[PartialValue<CustomRuleTracer<V, O>>],
                 &[MaybeZero<CustomRuleTracer<V, O>>],
                 &[CotangentAccumulator],
-            ) -> Result<(), DifferentiationError>
+            ) -> Result<(), ProgramError>
             + Send
             + Sync,
     {
@@ -1107,8 +1105,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns this [`CustomRuleDefinition`] with support for differentiating batched calls. Batching a call records
     /// its batching level without tracing any rule, and a later derivative request traces the rule at the unbatched
     /// types (sharing that specialization with unbatched calls) and structurally batches the traced program once per
-    /// recorded level. Without this, batched calls still execute their primal but reject differentiation.
-    pub fn with_batching(mut self) -> Self
+    /// recorded level. Without this, batched calls still execute their primal but reject differentiation, and the
+    /// derivatives of a custom batching rule cannot be batched (refer to [`Self::with_batching_rule`]).
+    pub fn with_batching_support(mut self) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
         V: 'static + Value<Type: DifferentiableType + BatchableType>,
@@ -1176,14 +1175,17 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     ///
     /// Batching a call with this rule preserves the call and its derivative rules: derivative requests of a batched
     /// call still trace the derivative rules at the unbatched types and batch them structurally (refer to
-    /// [`Self::with_batching`]), aligning their outputs to the batch axes that the rule declared, while a forward-mode
-    /// rule derived from the primal differentiates the rule's batched program. The rule is responsible for computing
-    /// the batched primal consistently with those derivative rules.
+    /// [`Self::with_batching_support`]), aligning their outputs to the batch axes that the rule declared, while a
+    /// forward-mode rule derived from the primal differentiates the rule's batched program. The rule is responsible for
+    /// computing the batched primal consistently with those derivative rules.
     ///
     /// When the forward-mode rule is derived from the primal, differentiating an unbatched call stages a derived call
     /// whose batching applies the derivative of this rule (refer to [`CustomRuleSpecializer::derived`]), which may
     /// apply the rule with every input replicated. This function therefore also captures the family's differentiation
-    /// of traced programs, which is why it requires the family's differentiation bounds.
+    /// of traced programs, which is why it requires the family's differentiation bounds. Batching those derivatives
+    /// also requires [`Self::with_batching_support`], which this function cannot configure without the family's
+    /// batching bounds: without it, the first request that batches such a derivative is rejected with a diagnostic
+    /// that names it.
     pub fn with_batching_rule<R>(mut self, rule: R) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1255,8 +1257,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     pub fn with_reference_discharge<P>(mut self) -> Self
     where
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-        V: 'static
-            + Value<Type: ReferenceDischargeableType<Policy = P> + From<P::Referent> + From<ReferenceType<P::Referent>>>,
+        V: 'static + Value<Type: ReferenceDischargeableType<Policy = P> + From<P::Referent>>,
+        V::Type: From<ReferenceType<P::Referent>>,
         O: 'static + Operation<Type = V::Type> + ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
@@ -1347,9 +1349,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             .expect("custom rule in-flight mutex is poisoned")
             .insert(marker.clone())
         {
-            return Err(specialization_error(SpecializationCacheError::<DifferentiationError>::Reentrant(
-                ReentrantSpecializationError,
-            )));
+            return Err(specialization_error(
+                self.name(),
+                SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError),
+            ));
         }
         let _marker = InFlightMarker { in_flight: &self.uncached_in_flight, marker };
         produce_fn()
@@ -1548,7 +1551,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
                 caches.batching_rule_specializations.get_or_try_insert_with(key, produce_fn)
             }
         }
-        .map_err(specialization_error)
+        .map_err(|error| specialization_error(self.definition.name(), error))
     }
 
     /// Returns the specialization for `request` converted into the family `(Vc, Oc)`, which contains this reference's
@@ -1573,7 +1576,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             .get_or_try_insert_with((TypeId::of::<(Vc, Oc)>(), request), || {
                 Ok::<_, DifferentiationError>(produce_fn()? as Arc<dyn Any + Send + Sync>)
             })
-            .map_err(specialization_error)?;
+            .map_err(|error| specialization_error(self.definition.name(), error))?;
 
         // The key names the family, so the retained specialization always belongs to it.
         Ok(specialization.downcast::<CustomRuleSpecialization<Vc, Oc>>().unwrap())
@@ -2007,10 +2010,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         //
         // The traced rule is validated against the unbatched output types of `key`.
         let Some(forward) = &self.definition.forward else {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} has no reverse-mode forward rule",
-                describe_composite(self.definition.name()),
-            ))
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("{} has no reverse-mode forward rule", describe_composite(self.definition.name())),
+            }
             .into());
         };
         // The inner specialization is requested only when the outer one is not cached.
@@ -2104,10 +2106,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // hands the rule a structural zero for every dropped output. A batched key batches the specialization of its
         // inner key at its outermost level.
         let Some(transposer) = &self.definition.transposer else {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} has no backward rule",
-                describe_composite_transpose(self.definition.name()),
-            ))
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("{} has no backward rule", describe_composite_transpose(self.definition.name())),
+            }
             .into());
         };
         // The inner specialization is requested only when the outer one is not cached.
@@ -2187,6 +2188,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             )
         })
     }
+
     fn batching_rule_specialization(
         &self,
         key: CustomRuleBatchingRuleKey<V::Type>,
@@ -2201,10 +2203,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // instead. The program becomes the primal region of the batched call, so it is discharged with the call.
         let Some(rule) = &self.definition.batching_rule else {
             let Some(derivation) = &self.definition.derivation else {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "{} has no custom batching rule",
-                    describe_composite(self.definition.name()),
-                ))
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("{} has no custom batching rule", describe_composite(self.definition.name())),
+                }
                 .into());
             };
             return self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
@@ -2246,10 +2247,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // A derived definition copies the capabilities that its calls need from the source definition and holds no
         // program, so calls whose primal regions differ share it (refer to `CustomRuleSpecializer::derived`).
         if !self.has_batching_rule() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} has no custom batching rule from which to derive rules",
-                describe_composite(self.definition.name()),
-            ))
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} has no custom batching rule from which to derive rules",
+                    describe_composite(self.definition.name()),
+                ),
+            }
             .into());
         }
         let derive = |key: CustomRuleDerivationKey| {
@@ -2675,6 +2678,7 @@ where
             }))
         })
     }
+
     fn batching_rule_specialization(
         &self,
         key: CustomRuleBatchingRuleKey<Vc::Type>,
@@ -2755,8 +2759,8 @@ where
         let (Some(differentiator), Some(batcher)) = (&source.differentiator, &source.batcher) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{} cannot batch a derivative because its source \
-                     definition has no batching support",
+                    "{} cannot batch a derivative because its source definition has no batching support (refer \
+                     to `CustomRuleDefinition::with_batching_support`)",
                     describe_composite(name),
                 ),
             }
@@ -2845,9 +2849,9 @@ where
             return Ok(CustomRuleSpecialization { program, output_axes });
         }
 
-        // Rule mode: align each primal and tangent pair with a mapped side to one axis, preferring the primal's axis. Only
-        // a replicated primal whose tangent is mapped is broadcast, in which case the rule applied at the aligned axes
-        // computes the tangents, while the primal outputs still come from the rule applied at the primal axes.
+        // Rule mode: align each primal and tangent pair with a mapped side to one axis, preferring the primal's axis.
+        // Only a replicated primal whose tangent is mapped is broadcast, in which case the rule applied at the aligned
+        // axes computes the tangents, while the primal outputs still come from the rule applied at the primal axes.
         let mut aligned_axes = key.input_axes.clone();
         for (tangent, &primal) in tangent_primal_indices.iter().enumerate() {
             let axis = if primal_axes[primal].is_replicated() { tangent_axes[tangent] } else { primal_axes[primal] };
@@ -3316,8 +3320,8 @@ where
         let Some(batcher) = &self.batcher else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "{} cannot differentiate a batched call because its \
-                     definition has no batching support",
+                    "{} cannot differentiate a batched call because its definition has no batching support \
+                     (refer to `CustomRuleDefinition::with_batching_support`)",
                     describe_composite(self.name()),
                 ),
             }
@@ -3408,15 +3412,17 @@ pub(super) fn derive_bijective_identity_renaming<T: Type>(
     renames_into(source, target)
 }
 
-/// Converts a failed or reentrant specialization of a retained custom rule into a [`DifferentiationError`], keeping
-/// the rule's own error when it produced one.
+/// Converts a failed or reentrant specialization of a retained rule of the custom rule set named `name` into a
+/// [`DifferentiationError`], keeping the rule's own error when it produced one.
 fn specialization_error<E: Debug + Display + Into<DifferentiationError>>(
+    name: &str,
     error: SpecializationCacheError<E>,
 ) -> DifferentiationError {
     match error {
         SpecializationCacheError::Production(error) => error.into(),
         error @ SpecializationCacheError::Reentrant(_) => {
-            ProgramError::UnsupportedOperation { message: error.to_string() }.into()
+            ProgramError::UnsupportedOperation { message: format!("{} makes a {error}", describe_composite(name)) }
+                .into()
         }
     }
 }
@@ -3463,12 +3469,10 @@ mod tests {
             discharged: false,
         };
         let specialize = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>, key| {
-            <LiftedCustomRules<_, _> as CustomRuleSpecializer<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::jvp_specialization(
-                rules, key,
-            )
-            .map(|_| ())
-            .unwrap_err()
-            .to_string()
+            CustomRuleSpecializer::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::jvp_specialization(rules, key)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
         };
 
         // Types without a member representation are rejected at the first derivative request.
@@ -3518,7 +3522,7 @@ mod tests {
         let registration = CustomRuleRegistration::new(
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
-                .with_batching()
+                .with_batching_support()
                 .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let key = CustomRuleDerivationKey {
@@ -3592,7 +3596,7 @@ mod tests {
                     Ok((vec![multiply(&square, &primals[0])?], vec![multiply(&square, &tangents[0])?]))
                 }
             })
-            .with_batching();
+            .with_batching_support();
         let item_type: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let level = CustomRuleBatchingLevel {
@@ -3787,7 +3791,8 @@ mod tests {
             })
         });
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let reentrant = "recursive request for a specialization that is already being produced on this thread";
+        let reentrant = "`composite` `reentrant` makes a recursive request for a specialization that is already being \
+                         produced on this thread";
         assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
         let retained = Arc::downgrade(&definition.definition());
         drop(definition);
@@ -3959,7 +3964,7 @@ mod tests {
         let registration = CustomRuleRegistration::new(
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
-                .with_batching()
+                .with_batching_support()
                 .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let key = |kind| CustomRuleDerivationKey {
@@ -4000,8 +4005,7 @@ mod tests {
                 .derived(key(CustomRuleDerivationKind::Jvp))
                 .unwrap_err()
                 .to_string(),
-            "encountered malformed program: `composite` `sine` has no custom batching rule from which to derive \
-             rules",
+            "`composite` `sine` has no custom batching rule from which to derive rules",
         );
     }
 
@@ -4013,7 +4017,7 @@ mod tests {
         let registration = CustomRuleRegistration::new(
             MemberDefinition::new("sine")
                 .with_jvp_from_primal()
-                .with_batching()
+                .with_batching_support()
                 .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
         let key = |input_count| CustomRuleDerivationKey {

@@ -21,8 +21,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, ResidualZeroProvider,
+    TranspositionContext,
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
@@ -30,16 +30,14 @@ use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, CompositeOperation, describe_composite, validate_non_differentiated_count,
 };
 use crate::operations::composites::rules::{
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer,
+    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer, CustomVjpOperation,
     derive_bijective_identity_renaming,
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
-use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation, ReferenceMemberType,
-    ReferenceTransform, Type, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceMemberType, Type, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
@@ -63,6 +61,57 @@ pub enum BatchingRuleConsistencyError {
     Batching(#[from] BatchingError),
 }
 
+/// [`Context`] in which [`Composite`]s can be called (refer to [`Composite::call`]). It names, once, what a call
+/// requires of the context's universe: the context resolves named axes (with which the primal and the rules are
+/// traced), its types are differentiable and batchable with a batching policy that can batch traced rule programs and
+/// sum the cotangents of replicated inputs, its constants and operations are `'static`, and its constants, operations,
+/// types, and type identities are [`Send`] and [`Sync`], because the registered rule definitions and their
+/// specialization caches store them and are shared across threads (which is also what makes each
+/// [`CustomRuleRegistration`] [`Send`]). Wrappers around a [`Composite`] state this one bound for their context instead
+/// of restating those requirements. It is implemented for every context that satisfies them.
+///
+/// The bound covers only requirements on the context and its associated types, which Rust propagates from a trait
+/// bound. The requirements that [`Composite::call`] places on its configurations (e.g.,
+/// `Vjp: CompositeVjp<C::Constant, C::Operation, Input, Output>`) and on its input and output structures concern other
+/// types, so a generic wrapper whose configuration is not one of the defaults still states them separately.
+pub trait CompositeCallContext:
+    NamedAxes
+    + Context<
+        Type: Eq
+                  + Hash
+                  + Send
+                  + Sync
+                  + Type<Identity: Send + Sync>
+                  + DifferentiableType
+                  + BatchableType<
+            Policy: RecursiveBatchingPolicy<TracingContext<Self::Constant, Self::Operation>>
+                        + CotangentBatchingPolicy<TracingContext<Self::Constant, Self::Operation>>,
+        >,
+        Constant: 'static + Send + Sync,
+        Operation: 'static + Send + Sync + From<CompositeOperation<Self::Constant, Self::Operation>>,
+    >
+{
+}
+
+impl<C> CompositeCallContext for C where
+    C: NamedAxes
+        + Context<
+            Type: Eq
+                      + Hash
+                      + Send
+                      + Sync
+                      + Type<Identity: Send + Sync>
+                      + DifferentiableType
+                      + BatchableType<
+                Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
+                            + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
+            >,
+            Constant: 'static + Send + Sync,
+            Operation: 'static + Send + Sync + From<CompositeOperation<C::Constant, C::Operation>>,
+        >
+{
+}
+
 /// Forward-mode configuration of a [`Composite`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
 /// with reverse-mode rules rejects forward mode (refer to [`composite`] for the rule selection).
@@ -76,6 +125,12 @@ pub struct ExplicitJvp<Input, Output> {
     jvp: Arc<dyn Fn(Input, Input) -> Result<(Output, Output), ProgramError> + Send + Sync>,
 }
 
+impl<Input, Output> Debug for ExplicitJvp<Input, Output> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ExplicitJvp").finish_non_exhaustive()
+    }
+}
+
 /// Forward-mode configuration of a [`Composite`] whose forward-mode rule is derived from its primal (refer to
 /// [`Composite::with_jvp_from_primal`]).
 #[derive(Copy, Clone, Debug, Default)]
@@ -85,12 +140,21 @@ pub struct JvpFromPrimal;
 /// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` with [`MaybeZero`] leaves, of which the structurally zero ones are
 /// [`MaybeZero::Zero`]s (refer to [`Composite::with_symbolic_zero_jvp`]). `Tracer` is the tracer type of the closure's
 /// input leaves, which the leaves of its tangents wrap.
-pub struct SymbolicZeroJvp<Input, Output, Tracer: Typed + Parameter>
+pub struct SymbolicZeroJvp<Tracer: Typed + Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
     jvp: Arc<dyn Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output), ProgramError> + Send + Sync>,
+}
+
+impl<Tracer: Typed + Parameter, Input, Output> Debug for SymbolicZeroJvp<Tracer, Input, Output>
+where
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SymbolicZeroJvp").finish_non_exhaustive()
+    }
 }
 
 /// Reverse-mode configuration of a [`Composite`] without reverse-mode rules. Reverse mode then transposes the
@@ -109,12 +173,18 @@ pub struct ExplicitVjp<Input, Output, Residual> {
     backward: Arc<dyn Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync>,
 }
 
+impl<Input, Output, Residual> Debug for ExplicitVjp<Input, Output, Residual> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ExplicitVjp").finish_non_exhaustive()
+    }
+}
+
 /// Reverse-mode configuration of a [`Composite`] with user-supplied forward and backward (i.e., Vector-Jacobian Product
 /// or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` with
 /// [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
 /// [`Composite::with_symbolic_zero_vjp`]). `Tracer` is the tracer type of the closures' output leaves, which the leaves
 /// of the seeds wrap.
-pub struct SymbolicZeroVjp<Input, Output, Residual, Tracer: Typed + Parameter>
+pub struct SymbolicZeroVjp<Tracer: Typed + Parameter, Input, Output, Residual>
 where
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
 {
@@ -125,11 +195,20 @@ where
     backward: Arc<dyn Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input, ProgramError> + Send + Sync>,
 }
 
+impl<Tracer: Typed + Parameter, Input, Output, Residual> Debug for SymbolicZeroVjp<Tracer, Input, Output, Residual>
+where
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SymbolicZeroVjp").finish_non_exhaustive()
+    }
+}
+
 /// Reverse-mode configuration of a [`Composite`] with a user-supplied forward rule closure implementing `x ↦ (y, r)`
 /// and an accumulating backward rule closure, which submits the input cotangents to their accumulators (refer to
 /// [`Composite::with_accumulating_vjp`]). `Tracer` is the tracer type of the closures' leaves, which the leaves of the
 /// seeds wrap, and `Transposition` is the type of the transposition context that the backward rule closure receives.
-pub struct AccumulatingVjp<Input, Output, Residual, Tracer: Typed + Parameter, Transposition>
+pub struct AccumulatingVjp<Tracer: Typed + Parameter, Transposition, Input, Output, Residual>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -145,10 +224,21 @@ where
                 Residual,
                 Output::To<MaybeZero<Tracer>>,
                 Input::To<CotangentAccumulator>,
-            ) -> Result<(), DifferentiationError>
+            ) -> Result<(), ProgramError>
             + Send
             + Sync,
     >,
+}
+
+impl<Tracer: Typed + Parameter, Transposition, Input, Output, Residual> Debug
+    for AccumulatingVjp<Tracer, Transposition, Input, Output, Residual>
+where
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AccumulatingVjp").finish_non_exhaustive()
+    }
 }
 
 /// Forward-mode configuration of a [`Composite`] (i.e., [`DefaultJvp`], [`ExplicitJvp`], [`SymbolicZeroJvp`], or
@@ -263,7 +353,7 @@ where
     }
 }
 
-impl<V, O, Input, Output> CompositeJvp<V, O, Input, Output> for SymbolicZeroJvp<Input, Output, CustomRuleTracer<V, O>>
+impl<V, O, Input, Output> CompositeJvp<V, O, Input, Output> for SymbolicZeroJvp<CustomRuleTracer<V, O>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -278,12 +368,12 @@ where
     fn configure(
         &self,
         definition: CustomRuleDefinition<V, O>,
-        _name: &Cow<'static, str>,
+        name: &Cow<'static, str>,
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> CustomRuleDefinition<V, O> {
-        let (jvp, named_axes) = (self.jvp.clone(), definition.named_axes().to_vec());
+        let (jvp, name, named_axes) = (self.jvp.clone(), name.clone(), definition.named_axes().to_vec());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         definition.with_symbolic_zero_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -292,6 +382,7 @@ where
             )?;
             let tangent_activity = tangents.iter().map(|tangent| !tangent.is_zero()).collect::<Vec<_>>();
             let program = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, _>(
+                &name,
                 jvp.as_ref(),
                 input_types,
                 &tangent_activity,
@@ -354,26 +445,8 @@ where
 impl<V, O, Input, Output, Residual> CompositeVjp<V, O, Input, Output> for ExplicitVjp<Input, Output, Residual>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
-    O: 'static
-        + TransposableOperation<V, O>
-        + ResidualZeroProvider<V::Type, Operation = O>
-        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
-        + OperationProvider<
-            V::Type,
-            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-            Operation = O,
-        >
-        + OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<
-                <V::Type as ReferenceMemberType>::Referent,
-                V::Type,
-                <O as ReferenceAccessOperation>::Transform,
-            >,
-            Operation = O,
-        >
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
+    O: 'static + CustomVjpOperation<V>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -417,6 +490,7 @@ where
                     )));
                 };
                 let program = trace_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
+                    &name,
                     backward.as_ref(),
                     &input_structure,
                     types(&leading_inputs[..non_differentiated_count]),
@@ -436,29 +510,11 @@ where
 }
 
 impl<V, O, Input, Output, Residual> CompositeVjp<V, O, Input, Output>
-    for SymbolicZeroVjp<Input, Output, Residual, CustomRuleTracer<V, O>>
+    for SymbolicZeroVjp<CustomRuleTracer<V, O>, Input, Output, Residual>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
-    O: 'static
-        + TransposableOperation<V, O>
-        + ResidualZeroProvider<V::Type, Operation = O>
-        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
-        + OperationProvider<
-            V::Type,
-            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-            Operation = O,
-        >
-        + OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<
-                <V::Type as ReferenceMemberType>::Referent,
-                V::Type,
-                <O as ReferenceAccessOperation>::Transform,
-            >,
-            Operation = O,
-        >
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
+    O: 'static + CustomVjpOperation<V>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -505,6 +561,7 @@ where
                     )));
                 };
                 let program = trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, _>(
+                    &name,
                     backward.as_ref(),
                     &input_structure,
                     types(&leading_inputs[..non_differentiated_count]),
@@ -524,29 +581,11 @@ where
 }
 
 impl<V, O, Input, Output, Residual> CompositeVjp<V, O, Input, Output>
-    for AccumulatingVjp<Input, Output, Residual, CustomRuleTracer<V, O>, TranspositionContext<V, O>>
+    for AccumulatingVjp<CustomRuleTracer<V, O>, TranspositionContext<V, O>, Input, Output, Residual>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
-    O: 'static
-        + TransposableOperation<V, O>
-        + ResidualZeroProvider<V::Type, Operation = O>
-        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
-        + OperationProvider<
-            V::Type,
-            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-            Operation = O,
-        >
-        + OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<
-                <V::Type as ReferenceMemberType>::Referent,
-                V::Type,
-                <O as ReferenceAccessOperation>::Transform,
-            >,
-            Operation = O,
-        >
-        + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
+    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
+    O: 'static + CustomVjpOperation<V>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<CotangentAccumulator>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -627,7 +666,12 @@ pub struct DefaultBatching;
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
 /// `(extent, x, x_axes) ↦ (y, y_axes)` (refer to [`Composite::with_batching`]). `Tracer` is the tracer type of the
 /// closure's leaves, which is also the type of dynamic extents.
-pub struct CustomBatching<Input, Output, Tracer: Parameter>
+///
+/// The name follows the vocabulary of JAX's
+/// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html) for a
+/// user-supplied batching rule, whereas the `Explicit*` configurations (e.g., [`ExplicitJvp`]) name user-supplied
+/// derivative rules that replace the ones otherwise derived from the primal.
+pub struct CustomBatching<Tracer: Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -644,11 +688,21 @@ where
     >,
 }
 
+impl<Tracer: Parameter, Input, Output> Debug for CustomBatching<Tracer, Input, Output>
+where
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CustomBatching").finish_non_exhaustive()
+    }
+}
+
 /// Batching configuration of a [`Composite`] with a user-supplied custom batching rule closure implementing
 /// `(extent, x, x_axes) ↦ (y, y_axes)` whose result may depend on its input batch axes (refer to
 /// [`Composite::with_axis_dependent_batching`]). `Tracer` is the tracer type of the closure's leaves, which is also the
 /// type of dynamic extents.
-pub struct AxisDependentBatching<Input, Output, Tracer: Parameter>
+pub struct AxisDependentBatching<Tracer: Parameter, Input, Output>
 where
     Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
     Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -663,6 +717,16 @@ where
             + Send
             + Sync,
     >,
+}
+
+impl<Tracer: Parameter, Input, Output> Debug for AxisDependentBatching<Tracer, Input, Output>
+where
+    Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+    Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AxisDependentBatching").finish_non_exhaustive()
+    }
 }
 
 /// Batching configuration of a [`Composite`] (i.e., [`DefaultBatching`], [`CustomBatching`], or
@@ -710,7 +774,7 @@ where
 }
 
 impl<V, O, Input, Output> CompositeBatching<V, O, Input, Output>
-    for CustomBatching<Input, Output, CustomRuleTracer<V, O>>
+    for CustomBatching<CustomRuleTracer<V, O>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
@@ -746,7 +810,7 @@ where
 }
 
 impl<V, O, Input, Output> CompositeBatching<V, O, Input, Output>
-    for AxisDependentBatching<Input, Output, CustomRuleTracer<V, O>>
+    for AxisDependentBatching<CustomRuleTracer<V, O>, Input, Output>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: 'static
@@ -866,13 +930,11 @@ where
                 input_axes[leading_input_count..].iter().copied(),
             )?,
         )?;
-        for structure in [outputs.parameter_structure(), output_axes.parameter_structure()] {
+        for (value, structure) in
+            [("output", outputs.parameter_structure()), ("output axis", output_axes.parameter_structure())]
+        {
             if structure != output_structure {
-                return Err(ParameterError::MismatchedParameterStructures {
-                    left_structure: format!("{output_structure:?}"),
-                    right_structure: format!("{structure:?}"),
-                }
-                .into());
+                return Err(rule_structure_mismatch(&name, "batching", value, &output_structure, &structure).into());
             }
         }
         Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
@@ -896,21 +958,21 @@ struct CompositeResidualStructures<T, Structure> {
 }
 
 impl<T: Type, Structure: Clone + Debug + PartialEq> CompositeResidualStructures<T, Structure> {
-    /// Records that a forward rule returned residuals of the provided flat types with the provided structure.
+    /// Records that the forward rule of the function named `name` returned residuals of the provided flat types with
+    /// the provided structure.
     ///
     /// # Errors
     ///
-    /// Returns a [`ParameterError`] when residuals of equivalent flat types were recorded with a different structure.
-    fn record(&self, residual_types: Vec<T>, structure: Structure) -> Result<(), ParameterError> {
+    /// Returns a [`TypeError`] when residuals of equivalent flat types were recorded with a different structure.
+    fn record(&self, name: &str, residual_types: Vec<T>, structure: Structure) -> Result<(), TypeError> {
         let mut structures = self.structures.lock().expect("composite residual mutex is poisoned");
         let recorded = structures
             .iter()
             .find(|(types, _)| derive_bijective_identity_renaming(types, &residual_types).is_some());
         match recorded {
-            Some((_, recorded)) if recorded != &structure => Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{recorded:?}"),
-                right_structure: format!("{structure:?}"),
-            }),
+            Some((_, recorded)) if recorded != &structure => {
+                Err(rule_structure_mismatch(name, "forward", "residual", recorded, &structure))
+            }
             Some(_) => Ok(()),
             None => {
                 structures.push((residual_types, structure));
@@ -979,7 +1041,7 @@ fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
 + Sync
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
+    V: 'static + Value<Type: Eq + Hash + Send + DifferentiableType + ReferenceMemberType>,
     O: 'static + Operation<Type = V::Type>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
@@ -1006,7 +1068,7 @@ where
                 &output_structure,
                 named_axes.clone(),
             )?;
-        residual_structures.record(residual_types, structure)?;
+        residual_structures.record(&name, residual_types, structure)?;
         let mut outputs = program.interpret_in_context(primals[0].context(), primals.to_vec())?;
         let residuals = outputs.split_off(output_structure.parameter_count());
         Ok((outputs, residuals))
@@ -1062,11 +1124,9 @@ where
         )?;
     let forward_output_structure = forward_output_types.parameter_structure();
     if &forward_output_structure != output_structure {
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{output_structure:?}"),
-            right_structure: format!("{forward_output_structure:?}"),
-        }
-        .into());
+        return Err(
+            rule_structure_mismatch(name, "forward", "output", output_structure, &forward_output_structure).into()
+        );
     }
 
     // Reference residuals preserve handles, not snapshots. Validate their input identities while the traced atoms are
@@ -1108,6 +1168,7 @@ where
 ///
 /// # Parameters
 ///
+///   - `name`: Name of the user-facing function, used in diagnostics.
 ///   - `backward`: Closure implementing `(r, ȳ) ↦ x̄`.
 ///   - `input_structure`: Structure of the call's inputs.
 ///   - `non_differentiated_types`: Types of the leading non-differentiated inputs.
@@ -1118,6 +1179,7 @@ where
 ///   - `named_axes`: Named axes with which the closure is traced (refer to
 ///     [`CustomRuleDefinition::with_named_axes`]).
 fn trace_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
+    name: &str,
     backward: &Backward,
     input_structure: &Input::ParameterStructure,
     non_differentiated_types: Vec<V::Type>,
@@ -1151,10 +1213,13 @@ where
             // cotangent could silently become the derivative of a different input with the same leaf type.
             let cotangent_structure = cotangents.parameter_structure();
             if &cotangent_structure != input_structure {
-                return Err(ParameterError::MismatchedParameterStructures {
-                    left_structure: format!("{input_structure:?}"),
-                    right_structure: format!("{cotangent_structure:?}"),
-                }
+                return Err(rule_structure_mismatch(
+                    name,
+                    "backward",
+                    "cotangent",
+                    input_structure,
+                    &cotangent_structure,
+                )
                 .into());
             }
             Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
@@ -1174,6 +1239,7 @@ where
 ///
 /// # Parameters
 ///
+///   - `name`: Name of the user-facing function, used in diagnostics.
 ///   - `backward`: Closure implementing `(r, ȳ) ↦ x̄`.
 ///   - `input_structure`: Structure of the call's inputs.
 ///   - `non_differentiated_types`: Types of the leading non-differentiated inputs.
@@ -1184,6 +1250,7 @@ where
 ///   - `named_axes`: Named axes with which the closure is traced (refer to
 ///     [`CustomRuleDefinition::with_named_axes`]).
 fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
+    name: &str,
     backward: &Backward,
     input_structure: &Input::ParameterStructure,
     non_differentiated_types: Vec<V::Type>,
@@ -1225,10 +1292,13 @@ where
             // Check the full input structure before dropping the non-differentiated prefix, as for materialized seeds.
             let cotangent_structure = cotangents.parameter_structure();
             if &cotangent_structure != input_structure {
-                return Err(ParameterError::MismatchedParameterStructures {
-                    left_structure: format!("{input_structure:?}"),
-                    right_structure: format!("{cotangent_structure:?}"),
-                }
+                return Err(rule_structure_mismatch(
+                    name,
+                    "backward",
+                    "cotangent",
+                    input_structure,
+                    &cotangent_structure,
+                )
                 .into());
             }
             Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
@@ -1282,13 +1352,11 @@ where
         (input_types, input_tangent_types),
         named_axes,
     )?;
-    for rule_structure in [output_types.parameter_structure(), tangent_types.parameter_structure()] {
+    for (value, rule_structure) in
+        [("output", output_types.parameter_structure()), ("output tangent", tangent_types.parameter_structure())]
+    {
         if &rule_structure != output_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{output_structure:?}"),
-                right_structure: format!("{rule_structure:?}"),
-            }
-            .into());
+            return Err(rule_structure_mismatch(name, "JVP", value, output_structure, &rule_structure).into());
         }
     }
     without_non_differentiated_tangent_inputs(name, program.into_flat_program(), input_count, non_differentiated_count)
@@ -1303,6 +1371,7 @@ where
 ///
 /// # Parameters
 ///
+///   - `name`: Name of the user-facing function, used in diagnostics.
 ///   - `jvp`: Closure implementing `(x, ẋ) ↦ (y, ẏ)`.
 ///   - `input_types`: Types of the call's inputs, with the call's input structure.
 ///   - `tangent_activity`: Whether the tangent of each differentiated input is active.
@@ -1311,6 +1380,7 @@ where
 ///   - `named_axes`: Named axes with which the closure is traced (refer to
 ///     [`CustomRuleDefinition::with_named_axes`]).
 fn trace_symbolic_zero_custom_jvp_rule<V, O, Input, Output, Jvp>(
+    name: &str,
     jvp: &Jvp,
     input_types: Input::To<V::Type>,
     tangent_activity: &[bool],
@@ -1357,16 +1427,30 @@ where
             (input_types, active_tangent_types),
             named_axes,
         )?;
-    for rule_structure in [output_types.parameter_structure(), output_tangent_types.parameter_structure()] {
+    for (value, rule_structure) in
+        [("output", output_types.parameter_structure()), ("output tangent", output_tangent_types.parameter_structure())]
+    {
         if &rule_structure != output_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{output_structure:?}"),
-                right_structure: format!("{rule_structure:?}"),
-            }
-            .into());
+            return Err(rule_structure_mismatch(name, "JVP", value, output_structure, &rule_structure).into());
         }
     }
     Ok(program.into_flat_program())
+}
+
+/// Returns the error reported when the `value` structure (e.g., `"output"`) of the `rule` rule (e.g., `"JVP"`) of the
+/// function named `name` differs from the `expected` one. It is reported like the type mismatches of rule outputs,
+/// because flattened signatures cannot distinguish differently nested collections with identical leaf types.
+fn rule_structure_mismatch<Structure: Debug>(
+    name: &str,
+    rule: &str,
+    value: &str,
+    expected: &Structure,
+    actual: &Structure,
+) -> TypeError {
+    TypeError::invalid(format!(
+        "{} {rule} rule {value} structure mismatch: expected {expected:?} but got {actual:?}",
+        describe_composite(name),
+    ))
 }
 
 /// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
@@ -1555,6 +1639,13 @@ pub type JvpComposite<Input, Output> = Composite<Input, Output, ExplicitJvp<Inpu
 pub type VjpComposite<Input, Output, Residual> =
     Composite<Input, Output, DefaultJvp, ExplicitVjp<Input, Output, Residual>>;
 
+/// [`Composite`] with a custom batching rule (refer to [`Composite::with_batching`]) whose leaves are `Tracer`s, and
+/// with the default forward-mode and reverse-mode configurations (i.e., derivatives are derived from the primal). It
+/// names the type of such a function by its tracer, input, and output types alone (e.g., for storing it in a struct
+/// field).
+pub type BatchedComposite<Tracer, Input, Output> =
+    Composite<Input, Output, DefaultJvp, DefaultVjp, CustomBatching<Tracer, Input, Output>>;
+
 impl<V: CustomCall> Composite<Vec<V>, Vec<V>> {
     /// Creates a [`Composite`], without any custom rule, whose primal calls the foreign kernel described by `operation`
     /// (i.e., it stages a [`CustomCallOperation`] whose outputs have the operation's declared output types). Foreign
@@ -1584,6 +1675,50 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
     /// receive plumbing references by identity and cannot thread their state explicitly, so the reference state of a
     /// program that calls this function with a reference input cannot be discharged (refer to
     /// [`Program::discharge_references`]).
+    ///
+    /// # Calling Pattern
+    ///
+    /// A function that wraps a composite with plumbing inputs usually prepares its inputs before the call:
+    ///
+    ///   - **Plumbing First:** The plumbing leaves are a prefix of the flattened input leaves, so a wrapper whose own
+    ///     signature takes them elsewhere reorders them to the front of the call's input.
+    ///   - **Stopped Gradients:** A call that receives a non-zero tangent for a numeric plumbing input rejects it
+    ///     rather than silently dropping it, because its rules declare no derivative with respect to that input. This
+    ///     deliberately diverges from JAX, which stops the gradients of `nondiff_argnums` implicitly. A wrapper whose
+    ///     plumbing inputs may depend on differentiated values therefore applies
+    ///     [`stop_gradient`](crate::StopGradient::stop_gradient) to them first, which states the zero derivative
+    ///     explicitly.
+    ///   - **Aligned Manual Variation:** Inside manual sharding (e.g., in the body of a `shard_map`), a wrapper aligns
+    ///     the manual variation of its inputs before the call (refer to
+    ///     [`align_manual_variation`](crate::ManualVariationAlignment::align_manual_variation)), so that the transposes
+    ///     of those alignments, which precede the call's boundary, sum the cotangent contributions of invariant inputs
+    ///     exactly once. The call cannot align its inputs itself, because alignment
+    ///     is a capability of the input values rather than of every context in which a composite can be called.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     Array, ArrayOperation, DomainTracer, EagerContext, ProgramError, StopGradient, composite,
+    /// #     differentiate_at,
+    /// # };
+    /// # fn main() -> Result<(), ProgramError> {
+    /// type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+    ///
+    /// // `(scale, x) ↦ scale · x`, whose leading `scale` leaf is plumbing, so the JVP rule ignores its tangent.
+    /// let scaled = composite(|(scale, x): (Tracer, Tracer)| Ok(scale * x))
+    ///     .with_jvp(|(scale, x), (_, tangent)| Ok((scale.clone() * x, scale * tangent)))
+    ///     .with_non_differentiated_count(1);
+    ///
+    /// // Differentiating with respect to `scale` as well requires stopping its gradient before the call.
+    /// let inputs = (Array::scalar(3.0f64)?, Array::scalar(2.0f64)?);
+    /// let (scale_gradient, x_gradient) =
+    ///     differentiate_at(inputs).gradient(|(scale, x)| scaled.call((scale.stop_gradient()?, x)))?;
+    /// assert_eq!(scale_gradient, Array::scalar(0.0f64)?);
+    /// assert_eq!(x_gradient, Array::scalar(3.0f64)?);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
         let Self { primal, jvp, vjp, batching, batched_output_axes, name, .. } = self;
@@ -1708,14 +1843,19 @@ impl<Input, Output, Vjp, Batching> Composite<Input, Output, DefaultJvp, Vjp, Bat
     /// `Input::To<MaybeZero<Tracer>>` value, such as `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an
     /// input `(DomainTracer<C>, DomainTracer<C>)`): the leaves of structurally zero input tangents (e.g., those of
     /// inputs that are not being differentiated, and those of every non-differentiated input) are
-    /// [`MaybeZero::Zero`]s, which lets the rule skip the work that they would otherwise require. Its closure
-    /// parameters must usually be annotated. Each pattern of structurally zero input tangents is a separate
-    /// specialization of the rule. This is the analogue of JAX's `defjvp(..., symbolic_zeros=True)`.
+    /// [`MaybeZero::Zero`]s, which lets the rule skip the work that they would otherwise require. Each pattern of
+    /// structurally zero input tangents is a separate specialization of the rule. This is the analogue of JAX's
+    /// `defjvp(..., symbolic_zeros=True)`.
+    ///
+    /// `Tracer` must usually be annotated, because it cannot be inferred from `Input` (a [`Parameterized`] structure
+    /// is generic over its leaf type): annotate the tangent parameter of the closure (e.g., `tangent:
+    /// MaybeZero<Tracer>`) or pass `Tracer` explicitly. A `Tracer` that differs from the tracers of the context in
+    /// which the function is called is rejected at compile time by [`Self::call`] rather than by this function.
     #[inline]
     pub fn with_symbolic_zero_jvp<Tracer, Jvp>(
         self,
         jvp: Jvp,
-    ) -> Composite<Input, Output, SymbolicZeroJvp<Input, Output, Tracer>, Vjp, Batching>
+    ) -> Composite<Input, Output, SymbolicZeroJvp<Tracer, Input, Output>, Vjp, Batching>
     where
         Tracer: Typed + Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -1832,15 +1972,19 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     /// Returns this function with the provided reverse-mode forward rule `x ↦ (y, r)` and backward rule `(r, ȳ) ↦ x̄`,
     /// which are used as the rules of [`Self::with_vjp`] except that the backward rule receives `ȳ` with [`MaybeZero`]
     /// leaves (i.e., as an `Output::To<MaybeZero<Tracer>>` value): the leaves of structural-zero cotangent seeds (e.g.,
-    /// those of unused outputs) are [`MaybeZero::Zero`]s. Its closure parameters must usually be annotated. This is the
-    /// analogue of JAX's `defvjp(..., symbolic_zeros=True)`, except that the forward rule receives no per-input
-    /// differentiation flags.
+    /// those of unused outputs) are [`MaybeZero::Zero`]s. This is the analogue of JAX's
+    /// `defvjp(..., symbolic_zeros=True)`, except that the forward rule receives no per-input differentiation flags.
+    ///
+    /// `Tracer` must usually be annotated, because it cannot be inferred from `Output` (a [`Parameterized`] structure
+    /// is generic over its leaf type): annotate the seed parameter of the backward closure (e.g., `seed:
+    /// MaybeZero<Tracer>`) or pass `Tracer` explicitly. A `Tracer` that differs from the tracers of the context in
+    /// which the function is called is rejected at compile time by [`Composite::call`] rather than by this function.
     #[inline]
-    pub fn with_symbolic_zero_vjp<Residual, Tracer, Forward, Backward>(
+    pub fn with_symbolic_zero_vjp<Tracer, Residual, Forward, Backward>(
         self,
         forward: Forward,
         backward: Backward,
-    ) -> Composite<Input, Output, Jvp, SymbolicZeroVjp<Input, Output, Residual, Tracer>, Batching>
+    ) -> Composite<Input, Output, Jvp, SymbolicZeroVjp<Tracer, Input, Output, Residual>, Batching>
     where
         Tracer: Typed + Parameter,
         Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
@@ -1865,13 +2009,19 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
     /// residuals `r` (with the structure that the forward rule returned), the output cotangent seeds with
     /// [`MaybeZero`] leaves (i.e., as an `Output::To<MaybeZero<Tracer>>` value), and the accumulators with
     /// [`CotangentAccumulator`] leaves (i.e., as an `Input::To<CotangentAccumulator>` value; the accumulators of
-    /// non-differentiated inputs are never needed). Its closure parameters must usually be annotated.
+    /// non-differentiated inputs are never needed). It returns a [`ProgramError`] like the other rules.
+    ///
+    /// `Tracer` and `Transposition` must usually be annotated, because neither can be inferred from `Input` or
+    /// `Output` (a [`Parameterized`] structure is generic over its leaf type): annotate the transposition context and
+    /// seed parameters of the backward closure (e.g., as `&mut TranspositionContext<..>` and `MaybeZero<Tracer>`) or
+    /// pass them explicitly. Types that differ from those of the context in which the function is called are rejected
+    /// at compile time by [`Composite::call`] rather than by this function.
     #[inline]
-    pub fn with_accumulating_vjp<Residual, Tracer, Transposition, Forward, Backward>(
+    pub fn with_accumulating_vjp<Tracer, Transposition, Residual, Forward, Backward>(
         self,
         forward: Forward,
         backward: Backward,
-    ) -> Composite<Input, Output, Jvp, AccumulatingVjp<Input, Output, Residual, Tracer, Transposition>, Batching>
+    ) -> Composite<Input, Output, Jvp, AccumulatingVjp<Tracer, Transposition, Input, Output, Residual>, Batching>
     where
         Tracer: Typed + Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
@@ -1883,7 +2033,7 @@ impl<Input, Output, Jvp, Batching> Composite<Input, Output, Jvp, DefaultVjp, Bat
                 Residual,
                 Output::To<MaybeZero<Tracer>>,
                 Input::To<CotangentAccumulator>,
-            ) -> Result<(), DifferentiationError>
+            ) -> Result<(), ProgramError>
             + Send
             + Sync,
     {
@@ -1901,8 +2051,13 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     /// [`BatchingLevelExtent::Dynamic`] with a first-class extent value), the batched inputs (as values of the context
     /// in which the call is batched), and their [`BatchAxis`]es (i.e., an `Input::To<BatchAxis>` value), and it
     /// returns the batched outputs together with their batch axes (i.e., an `Output::To<BatchAxis>` value). A
-    /// replicated input axis means that the input is the same for every batch item. Its closure parameters must
-    /// usually be annotated.
+    /// replicated input axis means that the input is the same for every batch item.
+    ///
+    /// `Tracer` must usually be annotated, because it cannot be inferred from `Input` or `Output` (a [`Parameterized`]
+    /// structure is generic over its leaf type): annotate the extent parameter of the closure (e.g., as
+    /// `BatchingLevelExtent<Tracer>`) or pass `Tracer` explicitly. A `Tracer` that differs from the tracers of the
+    /// context in which the function is called is rejected at compile time by [`Composite::call`] rather than by this
+    /// function. [`BatchedComposite`] names the type of a function with only a batching rule.
     ///
     /// The rule is traced when a call is batched, once per batching level and input signature, and its program becomes
     /// the batched call's primal, so the rule takes precedence over structurally batching the primal (e.g., over the
@@ -1947,7 +2102,7 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     pub fn with_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> Composite<Input, Output, Jvp, Vjp, CustomBatching<Input, Output, Tracer>>
+    ) -> Composite<Input, Output, Jvp, Vjp, CustomBatching<Tracer, Input, Output>>
     where
         Tracer: Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -1981,12 +2136,13 @@ impl<Input, Output, Jvp, Vjp> Composite<Input, Output, Jvp, Vjp, DefaultBatching
     /// The outer product costs one application of the rule's derivative with respect to those inputs per batch item,
     /// which is why a rule that only computes the batched primal (and therefore gives the same values when an input is
     /// broadcast) should use [`Self::with_batching`] instead. The family's batching policy must support taking
-    /// diagonals (refer to [`DiagonalBatchingPolicy`]).
+    /// diagonals (refer to [`DiagonalBatchingPolicy`]). `Tracer` must usually be annotated, as for
+    /// [`Self::with_batching`].
     #[inline]
     pub fn with_axis_dependent_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> Composite<Input, Output, Jvp, Vjp, AxisDependentBatching<Input, Output, Tracer>>
+    ) -> Composite<Input, Output, Jvp, Vjp, AxisDependentBatching<Tracer, Input, Output>>
     where
         Tracer: Parameter,
         Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
@@ -2045,20 +2201,13 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
     /// traced, so their errors are reported by the derivative requests that trace them.
     pub fn call<
         V: Value<Type = C::Type, Domain = C>,
-        C: Context<Type: DifferentiableType + BatchableType + Eq + Hash, Value = V> + NamedAxes,
+        C: CompositeCallContext<Value = V>,
         InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
         &self,
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        TracingContext<C::Constant, C::Operation>:
-            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-        C::Constant: 'static,
-        C::Operation: 'static + From<CompositeOperation<C::Constant, C::Operation>>,
-        <C::Type as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
-            + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
-        CustomRuleRegistration<C::Constant, C::Operation>: Send,
         Jvp: CompositeJvp<C::Constant, C::Operation, Input, Output>,
         Vjp: CompositeVjp<C::Constant, C::Operation, Input, Output>,
         Batching: CompositeBatching<C::Constant, C::Operation, Input, Output>,
@@ -2093,8 +2242,9 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
         let input_structure = input_types.parameter_structure();
         let output_structure = output_types.parameter_structure();
         let rules = self.registrations.get_or_register(&input_structure, &output_structure, &named_axes, || {
-            let definition =
-                CustomRuleDefinition::new(self.name.clone()).with_named_axes(named_axes.clone()).with_batching();
+            let definition = CustomRuleDefinition::new(self.name.clone())
+                .with_named_axes(named_axes.clone())
+                .with_batching_support();
             let definition = self.jvp.configure(
                 definition,
                 &self.name,
@@ -2130,6 +2280,21 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
         let operation = CompositeOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
         let outputs = first.domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
+    }
+}
+
+impl<Input, Output, Jvp: Debug, Vjp: Debug, Batching: Debug> Debug for Composite<Input, Output, Jvp, Vjp, Batching> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures are opaque, so the configurations print their kinds only.
+        formatter
+            .debug_struct("Composite")
+            .field("name", &self.name)
+            .field("jvp", &self.jvp)
+            .field("vjp", &self.vjp)
+            .field("batching", &self.batching)
+            .field("batched_output_axes", &self.batched_output_axes)
+            .field("non_differentiated_count", &self.non_differentiated_count)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2229,7 +2394,7 @@ impl<Input, Output, Jvp, Vjp, Batching> Composite<Input, Output, Jvp, Vjp, Batch
 /// tangent leaves that a JVP rule receives for them are placeholders that it must not use, and the cotangent leaves
 /// that a backward rule returns for them are ignored (refer to [`Composite::with_jvp`] and [`Composite::with_vjp`]).
 /// Differentiating a call with a non-zero tangent for a numeric plumbing input is rejected because the rules cannot
-/// propagate that tangent.
+/// propagate that tangent (refer to [`Composite::with_non_differentiated_count`] for how callers prepare such inputs).
 ///
 /// # References
 ///
@@ -2316,22 +2481,22 @@ pub fn composite<Input, Output, Primal: 'static + Fn(Input) -> Result<Output, Pr
 ///
 /// Returns [`BatchingRuleConsistencyError::Inconsistent`] for the first replicated input leaf whose broadcast changes
 /// a batched output leaf, and [`BatchingRuleConsistencyError::Batching`] when batching fails.
-pub fn check_batching_rule_consistency<V, F, I, O, Specification, Equivalent>(
+pub fn check_batching_rule_consistency<V, F, Input, Output, Specification, Equivalent>(
     function: F,
-    input: I,
-    input_batch_axes: I::To<BatchAxis>,
+    input: Input,
+    input_batch_axes: Input::To<BatchAxis>,
     batch_axis: Specification,
     equivalent: Equivalent,
 ) -> Result<(), BatchingRuleConsistencyError>
 where
     V: Value<Domain: Batch>,
-    F: Fn(I::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<O, ProgramError>,
-    I: Parameterized<
+    F: Fn(Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<Output, ProgramError>,
+    Input: Parameterized<
             V,
             Family: ParameterizedFamily<BatchAxis>
                         + ParameterizedFamily<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>,
         >,
-    O: Parameterized<
+    Output: Parameterized<
             BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
         >,
@@ -2343,9 +2508,9 @@ where
     let inputs = input.into_parameters().collect::<Vec<_>>();
     let input_axes = input_batch_axes.into_parameters().collect::<Vec<_>>();
     let batched = |inputs: Vec<V>, input_axes: Vec<BatchAxis>| -> Result<Vec<V>, BatchingRuleConsistencyError> {
-        let input = I::from_parameters(structure.clone(), inputs).map_err(BatchingError::from)?;
+        let input = Input::from_parameters(structure.clone(), inputs).map_err(BatchingError::from)?;
         let input_axes =
-            I::To::<BatchAxis>::from_parameters(structure.clone(), input_axes).map_err(BatchingError::from)?;
+            Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes).map_err(BatchingError::from)?;
         let outputs = batch(|input| function(input), input, input_axes, BatchAxis::new(0), batch_axis.clone())?;
         Ok(outputs.into_parameters().collect())
     };
@@ -2356,11 +2521,11 @@ where
         }
         // The leaf is broadcast by a batch of the complete input that returns only that leaf, so that its extent is
         // inferred exactly as in the batches that it is compared with.
-        let input_value = I::from_parameters(structure.clone(), inputs.clone()).map_err(BatchingError::from)?;
-        let axes =
-            I::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone()).map_err(BatchingError::from)?;
+        let input_value = Input::from_parameters(structure.clone(), inputs.clone()).map_err(BatchingError::from)?;
+        let axes = Input::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone())
+            .map_err(BatchingError::from)?;
         let broadcast: V = batch(
-            |tracers: I::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>| {
+            |tracers: Input::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>| {
                 Ok(tracers.into_parameters().nth(input).unwrap())
             },
             input_value,
@@ -2400,7 +2565,8 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext, ProjectedContext};
     use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, differentiate_at,
+        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationError, DifferentiationRule,
+        differentiate_at,
     };
     use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -2409,6 +2575,7 @@ mod tests {
     use crate::operations::composites::rules::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
+    use crate::operations::differentiation::stop_gradient::StopGradient;
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
@@ -2600,10 +2767,31 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_with_non_differentiated_count() {
+        // The leading `scale` leaf is plumbing, so the JVP rule ignores its tangent. A stopped gradient states its zero
+        // derivative, while an active tangent for it is rejected rather than silently dropped.
+        type Tracer = DomainTracer<ArrayContext>;
+        let scaled = composite(|(scale, x): (Tracer, Tracer)| Ok(scale * x))
+            .with_jvp(|(scale, x), (_, tangent)| Ok((scale.clone() * x, scale * tangent)))
+            .with_non_differentiated_count(1);
+        let inputs = (Array::scalar(3.0f64).unwrap(), Array::scalar(2.0f64).unwrap());
+        assert_eq!(
+            differentiate_at(inputs.clone()).gradient(|(scale, x)| scaled.call((scale.stop_gradient()?, x))),
+            Ok((Array::scalar(0.0f64).unwrap(), Array::scalar(3.0f64).unwrap())),
+        );
+        assert!(matches!(
+            differentiate_at(inputs).gradient(|(scale, x)| scaled.call((scale, x))),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` cannot propagate the non-zero tangent of type `f64[]` supplied for one of \
+                               its 1 leading non-differentiated inputs, because its rule has no tangent slot for them",
+        ));
+    }
+
+    #[test]
     fn test_composite_with_name() {
         // Without a name, calls are labeled by the operation name. Renaming a function that was already called must not
-        // reuse the definition registered by that call, which carries the previous name. A function without derivative
-        // rules rejects both differentiation modes and names itself in the diagnostic.
+        // reuse the definition registered by that call, which carries the previous name. A function with only
+        // reverse-mode rules rejects forward mode and names itself in the diagnostic.
         let function = composite(|x: DomainTracer<ArrayContext>| Ok(x.sin()?));
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(
@@ -2648,6 +2836,27 @@ mod tests {
                                has only reverse-mode rules; it supports only reverse-mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
         ));
+    }
+
+    #[test]
+    fn test_composite_debug() {
+        // Debug output names each configuration kind and the function, but not the closures.
+        type Tracer = DomainTracer<ArrayContext>;
+        let function = composite(|x: Tracer| Ok(x.sin()?)).with_name("sine");
+        assert_eq!(
+            format!("{function:?}"),
+            "Composite { name: \"sine\", jvp: DefaultJvp, vjp: DefaultVjp, batching: DefaultBatching, \
+             batched_output_axes: None, non_differentiated_count: 0, .. }",
+        );
+        let function = function
+            .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
+            .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+            .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()?, axis)));
+        assert_eq!(
+            format!("{function:?}"),
+            "Composite { name: \"sine\", jvp: ExplicitJvp { .. }, vjp: ExplicitVjp { .. }, \
+             batching: CustomBatching { .. }, batched_output_axes: None, non_differentiated_count: 0, .. }",
+        );
     }
 
     #[test]
@@ -2903,10 +3112,11 @@ mod tests {
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64))
                 .and_then(|(_, program)| program.into_flat_program().jvp().map(|_| ()).map_err(ProgramError::from)),
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
-                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`composite` JVP rule output structure mismatch: expected {:?} but got {:?}",
+                vec![vec![Placeholder; 2], vec![Placeholder]],
+                vec![vec![Placeholder], vec![Placeholder; 2]],
+            )))),
         );
 
         // The primal half may agree while the tangent half has the wrong structure.
@@ -2921,10 +3131,11 @@ mod tests {
         assert_eq!(
             ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64))
                 .and_then(|(_, program)| program.into_flat_program().jvp().map(|_| ()).map_err(ProgramError::from)),
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
-                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`composite` JVP rule output tangent structure mismatch: expected {:?} but got {:?}",
+                vec![vec![Placeholder; 2], vec![Placeholder]],
+                vec![vec![Placeholder], vec![Placeholder; 2]],
+            )))),
         );
     }
 
@@ -3317,10 +3528,11 @@ mod tests {
                 .vjp(|x| function.call(x))
                 .map(|_| ())
                 .map_err(ProgramError::from),
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", vec![vec![Placeholder]]),
-                right_structure: format!("{:?}", vec![vec![], vec![Placeholder]]),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`composite` forward rule residual structure mismatch: expected {:?} but got {:?}",
+                vec![vec![Placeholder]],
+                vec![vec![], vec![Placeholder]],
+            )))),
         );
     }
 
@@ -3586,10 +3798,11 @@ mod tests {
                 .vjp(|input| function.call(input))
                 .map(|_| ())
                 .map_err(ProgramError::from),
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
-                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`composite` forward rule output structure mismatch: expected {:?} but got {:?}",
+                vec![vec![Placeholder; 2], vec![Placeholder]],
+                vec![vec![Placeholder], vec![Placeholder; 2]],
+            )))),
         );
 
         // Check the full backward structure even when the first flattened leaf is non-differentiated. Reverse mode
@@ -3613,10 +3826,11 @@ mod tests {
                 .and_then(|linearization| linearization.tangent().transpose_with_respect_to(&[0, 1], &[]))
                 .map(|_| ())
                 .map_err(ProgramError::from),
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
-                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`composite` backward rule cotangent structure mismatch: expected {:?} but got {:?}",
+                vec![vec![Placeholder; 2], vec![Placeholder]],
+                vec![vec![Placeholder], vec![Placeholder; 2]],
+            )))),
         );
     }
 
@@ -4240,7 +4454,7 @@ mod tests {
             |context: &mut Transposition,
              _: ArrayIrTracer,
              seed: MaybeZero<ArrayIrTracer>,
-             accumulator: CotangentAccumulator| { accumulator.accumulate(context, seed) },
+             accumulator: CotangentAccumulator| Ok(accumulator.accumulate(context, seed)?),
         );
         let input = ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0]).unwrap());
         let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64, 4.0]).unwrap());
@@ -4669,13 +4883,8 @@ mod tests {
     /// Returns `sin` with a custom batching rule that computes `2 · sin(x)` instead (expressed through addition to
     /// avoid constant lifting), which makes visible whether a batched computation and each of its derivatives go
     /// through the rule. The rule maps its output exactly when its input is mapped.
-    fn doubled_sine_when_batched() -> Composite<
-        DomainTracer<ArrayContext>,
-        DomainTracer<ArrayContext>,
-        DefaultJvp,
-        DefaultVjp,
-        CustomBatching<DomainTracer<ArrayContext>, DomainTracer<ArrayContext>, DomainTracer<ArrayContext>>,
-    > {
+    fn doubled_sine_when_batched()
+    -> BatchedComposite<DomainTracer<ArrayContext>, DomainTracer<ArrayContext>, DomainTracer<ArrayContext>> {
         type Tracer = DomainTracer<ArrayContext>;
         composite(|x: Tracer| Ok(x.sin()?))
             .with_name("sine")
@@ -4684,16 +4893,10 @@ mod tests {
 
     /// Returns `x · y` with a custom batching rule that computes `2 · x · y` instead (refer to
     /// [`doubled_sine_when_batched`]), whose output is mapped along the first mapped input axis.
-    fn doubled_product_when_batched() -> Composite<
+    fn doubled_product_when_batched() -> BatchedComposite<
+        DomainTracer<ArrayContext>,
         (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>),
         DomainTracer<ArrayContext>,
-        DefaultJvp,
-        DefaultVjp,
-        CustomBatching<
-            (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>),
-            DomainTracer<ArrayContext>,
-            DomainTracer<ArrayContext>,
-        >,
     > {
         type Tracer = DomainTracer<ArrayContext>;
         composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_name("product").with_batching(

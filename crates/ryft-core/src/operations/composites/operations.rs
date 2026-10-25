@@ -105,7 +105,6 @@ enum CompositeRules<T, S> {
     },
 }
 
-// TODO(eaplatanios): Should this be renamed to just `CompositeOperation`?
 /// Higher-order [`Operation`] that calls a primal program with custom derivative rules. It is the operation that
 /// [`Composite`](crate::Composite) functions stage, and it is the one boundary through which every transform treats a
 /// function whose derivative is not the derivative of its implementation (e.g., a fused or foreign kernel, or a
@@ -127,10 +126,9 @@ enum CompositeRules<T, S> {
 ///     are used for pre-traced rule programs (e.g., by kernel staging), and they follow their call through every
 ///     program transform and family conversion like any other region.
 ///   - **Retained rules** ([`Self::new`]) are callbacks of a [`CustomRuleSource`] (e.g., a registered
-/// [`CustomRuleDefinition`](crate::CustomRuleDefinition)), so an ordinary call traces only its primal and never
-/// declares the effects of its
-///     rules. Each rule is traced on the first request of each static specialization and cached by the definition's
-///     [`CustomRuleRegistration`](crate::CustomRuleRegistration).
+///     [`CustomRuleDefinition`](crate::CustomRuleDefinition)), so an ordinary call traces only its primal and never
+///     declares the effects of its rules. Each rule is traced on the first request of each static specialization and
+///     cached by the definition's [`CustomRuleRegistration`](crate::CustomRuleRegistration).
 ///
 /// # Interfaces
 ///
@@ -184,10 +182,11 @@ enum CompositeRules<T, S> {
 /// structurally batching the primal region: its traced program becomes the batched call's primal region, and it
 /// declares the batch axes of the outputs. Differentiating a batched call with retained rules traces the rule at the
 /// unbatched types, sharing that specialization with unbatched calls, and batches the traced program once per recorded
-/// level (refer to [`CustomRuleDefinition::with_batching`](crate::CustomRuleDefinition::with_batching)). A derivative
-/// whose natural layout is incompatible with the declared layout is therefore rejected when it is first requested, not
-/// when the call is batched. In both representations, any boundary inputs of the batching policy (e.g., a first-class
-/// batch extent) become leading non-differentiated inputs.
+/// level (refer to
+/// [`CustomRuleDefinition::with_batching_support`](crate::CustomRuleDefinition::with_batching_support)). A
+/// derivative whose natural layout is incompatible with the declared layout is therefore rejected when it is first
+/// requested, not when the call is batched. In both representations, any boundary inputs of the batching policy (e.g.,
+/// a first-class batch extent) become leading non-differentiated inputs.
 ///
 /// A custom batching rule also stays on the path of forward-mode derivatives that are batched after they are taken.
 /// Forward-mode differentiation of an unbatched call with retained rules whose forward-mode rule is derived from its
@@ -240,6 +239,30 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
+    /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
+    /// [`CompositeOperation`] for the impact of this property on the rule interfaces. For a batched call with
+    /// retained rules, this count includes the boundary inputs that its batching levels prepended to its inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count` is
+    /// smaller than the number of those boundary inputs, which are always non-differentiated.
+    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Result<Self, TypeError> {
+        if let CompositeRules::Retained { rules, batching: Some(batching), .. } = &self.rules {
+            let boundary_input_count = batching.boundary_input_count();
+            if non_differentiated_count < boundary_input_count {
+                return Err(TypeError::invalid(format!(
+                    "batched {} must have at least {boundary_input_count} \
+                     non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
+                     its inputs, but got {non_differentiated_count}",
+                    describe_composite(rules.name()),
+                )));
+            }
+        }
+        self.non_differentiated_count = non_differentiated_count;
+        Ok(self)
+    }
+
     /// Returns the number of leading inputs that parameterize this call without being differentiated.
     #[inline]
     pub fn non_differentiated_count(&self) -> usize {
@@ -271,30 +294,6 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             CompositeRules::Attached { has_vjp_rule, .. } => *has_vjp_rule,
             CompositeRules::Retained { rules, .. } => rules.has_vjp(),
         }
-    }
-
-    /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
-    /// [`CompositeOperation`] for the impact of this property on the rule interfaces. For a batched call with
-    /// retained rules, this count includes the boundary inputs that its batching levels prepended to its inputs.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count` is
-    /// smaller than the number of those boundary inputs, which are always non-differentiated.
-    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Result<Self, TypeError> {
-        if let CompositeRules::Retained { rules, batching: Some(batching), .. } = &self.rules {
-            let boundary_input_count = batching.boundary_input_count();
-            if non_differentiated_count < boundary_input_count {
-                return Err(TypeError::invalid(format!(
-                    "batched {} must have at least {boundary_input_count} \
-                     non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
-                     its inputs, but got {non_differentiated_count}",
-                    describe_composite(rules.name()),
-                )));
-            }
-        }
-        self.non_differentiated_count = non_differentiated_count;
-        Ok(self)
     }
 
     /// Converts this call into the family `(V2, O2)` with the rule source that `rules_fn` derives from its current
@@ -1577,8 +1576,8 @@ enum CompositeTransposeRules<T, S> {
 /// Selected reverse-mode carrier of a [`CompositeOperation`] with reverse-mode rules, which its
 /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule stages in place of the call. It represents
 /// the linear map `ẋ ↦ ẏ` from the differentiated inputs' tangents to the output tangents, whose transpose `ȳ ↦ x̄` is
-/// the call's backward rule. This is the role of the `custom_lin` primitive of [JAX's custom
-/// derivatives](https://github.com/jax-ml/jax/blob/main/jax/_src/custom_derivatives.py), which has no rendered
+/// the call's backward rule. This is the role of the `custom_lin` primitive of [JAX's automatic
+/// differentiation](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/ad.py), which has no rendered
 /// documentation page and is therefore linked at its source. The map has no forward program: reverse-mode rules supply
 /// only its transpose, and deriving the map itself would differentiate the primal, which the custom rules exist to
 /// avoid. The carrier therefore rejects execution, lowering, and forward mode, and it exists only to be transposed. A
@@ -1647,9 +1646,12 @@ pub struct CompositeTransposeOperation<V: Typed + Parameter, O, S = CustomRuleRe
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
     CompositeTransposeOperation<V, O, S>
 {
-    /// Creates a new unbatched [`CompositeTransposeOperation`] that applies the retained backward rule of the provided
-    /// rules, exactly as the [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule of a
-    /// [`CompositeOperation`] with retained rules stages it.
+    /// Creates a new [`CompositeTransposeOperation`] that applies the retained backward rule of the provided rules to
+    /// an unbatched, undischarged call without seed extents. This is the carrier that the
+    /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule of a [`CompositeOperation`] with retained
+    /// rules stages for such a call, whose dead outputs need no runtime quantities beyond those that the leading inputs
+    /// name. Carriers with seed extents, batching levels, or discharged reference state are staged only by the
+    /// transforms that produce them.
     ///
     /// # Parameters
     ///
@@ -1727,10 +1729,19 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns the number of leading known inputs of this carrier.
+    /// Returns the number of leading known inputs of this carrier (i.e., any batching boundary inputs, the
+    /// non-differentiated inputs, the residuals, and the seed extents), which includes its
+    /// [`seed_extent_count`](Self::seed_extent_count) trailing seed extents.
     #[inline]
     pub fn leading_input_count(&self) -> usize {
         self.leading_input_count
+    }
+
+    /// Returns the number of trailing leading inputs of this carrier that carry the runtime extents of its output
+    /// tangent types, from which structural-zero seeds are materialized and which the backward rule never receives.
+    #[inline]
+    pub fn seed_extent_count(&self) -> usize {
+        self.seed_extent_count
     }
 
     /// Returns the tangent types of the differentiated inputs of this carrier.
@@ -1812,6 +1823,30 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             CompositeTransposeRules::Attached => format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`"),
             CompositeTransposeRules::Retained { rules, .. } => describe_composite_transpose(rules.name()),
         }
+    }
+
+    /// Returns the input types of an attached backward region: the types of the leading inputs among `input_types`,
+    /// except for the seed extents, followed by the cotangent types of the outputs.
+    fn backward_input_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
+        if self.leading_input_count > input_types.len() {
+            return Err(TypeError::invalid(format!(
+                "`{}` leading input count {} exceeds input count {}",
+                COMPOSITE_TRANSPOSE_OPERATION_NAME,
+                self.leading_input_count,
+                input_types.len(),
+            )));
+        }
+        let Some(rule_leading_input_count) = self.leading_input_count.checked_sub(self.seed_extent_count) else {
+            return Err(TypeError::invalid(format!(
+                "`{}` seed extent count {} exceeds leading input count {}",
+                COMPOSITE_TRANSPOSE_OPERATION_NAME, self.seed_extent_count, self.leading_input_count,
+            )));
+        };
+        let mut backward_input_types = input_types[..rule_leading_input_count].to_vec();
+        backward_input_types.extend(
+            self.output_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(backward_input_types)
     }
 }
 
@@ -2029,34 +2064,6 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 }
             }
         })
-    }
-}
-
-impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
-    CompositeTransposeOperation<V, O, S>
-{
-    /// Returns the input types of an attached backward region: the types of the leading inputs among `input_types`,
-    /// except for the seed extents, followed by the cotangent types of the outputs.
-    fn backward_input_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        if self.leading_input_count > input_types.len() {
-            return Err(TypeError::invalid(format!(
-                "`{}` leading input count {} exceeds input count {}",
-                COMPOSITE_TRANSPOSE_OPERATION_NAME,
-                self.leading_input_count,
-                input_types.len(),
-            )));
-        }
-        let Some(rule_leading_input_count) = self.leading_input_count.checked_sub(self.seed_extent_count) else {
-            return Err(TypeError::invalid(format!(
-                "`{}` seed extent count {} exceeds leading input count {}",
-                COMPOSITE_TRANSPOSE_OPERATION_NAME, self.seed_extent_count, self.leading_input_count,
-            )));
-        };
-        let mut backward_input_types = input_types[..rule_leading_input_count].to_vec();
-        backward_input_types.extend(
-            self.output_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?,
-        );
-        Ok(backward_input_types)
     }
 }
 
@@ -2386,10 +2393,9 @@ where
         }
         if invokes_rule_directly {
             let Some(backward) = rules.native_definition().and_then(|definition| definition.backward.as_ref()) else {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "{} has no backward rule",
-                    describe_composite_transpose(rules.name()),
-                ))
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("{} has no backward rule", describe_composite_transpose(rules.name())),
+                }
                 .into());
             };
 
@@ -2400,7 +2406,7 @@ where
             let cotangents = match backward {
                 CustomVjpBackward::Accumulating(rule) => {
                     if seed_extent_count == 0 {
-                        return rule.apply(context, inputs, outputs, accumulators);
+                        return Ok(rule.apply(context, inputs, outputs, accumulators)?);
                     }
                     let inputs = inputs[..rule_leading_input_count]
                         .iter()
@@ -2412,7 +2418,7 @@ where
                         .chain(&accumulators[self.leading_input_count..])
                         .cloned()
                         .collect::<Vec<_>>();
-                    return rule.apply(context, &inputs, outputs, &accumulators);
+                    return Ok(rule.apply(context, &inputs, outputs, &accumulators)?);
                 }
 
                 // A pure rule receives the known leading inputs and materialized seeds, and its cotangents are added
@@ -4881,7 +4887,7 @@ mod tests {
         let definition = CustomRuleRegistration::new(
             IrDefinition::new("identity")
                 .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec())))
-                .with_batching(),
+                .with_batching_support(),
         );
         let input_type: ArrayIrType = scalar_type.into();
         let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -6050,7 +6056,7 @@ mod tests {
         };
         let definition = CustomRuleRegistration::new(
             IrDefinition::new("stateful")
-                .with_batching()
+                .with_batching_support()
                 .with_batching_rule(|_, _, inputs, input_axes| {
                     let state = inputs[0].reference_new()?;
                     state.add_update(&inputs[0])?;
@@ -6180,7 +6186,7 @@ mod tests {
             .with_jvp(|primals, tangents| {
                 Ok((vec![primals[1].clone()], vec![primals[0].clone() * tangents[0].clone()]))
             })
-            .with_batching();
+            .with_batching_support();
         let program = |definition: TestDefinition| {
             let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
             let primal = builder.import_program(primal.clone());
@@ -6213,7 +6219,7 @@ mod tests {
             .with_jvp(|primals, tangents| {
                 Ok((vec![primals[1].clone()], vec![primals[0].clone() * tangents[0].clone()]))
             })
-            .with_batching()
+            .with_batching_support()
             .with_batched_output_axes(vec![BatchAxis::replicated()]);
         let batched = batched_program(&program(definition), 3, &[BatchAxis::new(0), BatchAxis::replicated()]);
         assert_eq!(batched.interpret(vec![coefficient.clone(), parameter.clone()]), Ok(vec![parameter.clone()]));
@@ -6229,7 +6235,7 @@ mod tests {
                 let outputs = vec![primals[1].clone(), primals[1].clone()];
                 Ok((outputs, vec![primals[0].clone() * tangents[0].clone(), tangents[0].clone()]))
             })
-            .with_batching()
+            .with_batching_support()
             .with_batched_output_axes(vec![BatchAxis::new(0), BatchAxis::replicated()]);
         let pair_primal = {
             let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
@@ -6268,7 +6274,7 @@ mod tests {
 
         // A declared replicated output whose primal is mapped is rejected when the call is batched.
         let definition = TestDefinition::new("scaled_parameter")
-            .with_batching()
+            .with_batching_support()
             .with_batched_output_axes(vec![BatchAxis::replicated()]);
         assert_eq!(
             program(definition)
@@ -6330,8 +6336,8 @@ mod tests {
         );
         assert_eq!(
             batched.jvp().unwrap_err().to_string(),
-            "`composite` `cube` cannot differentiate a batched call because its definition has no batching \
-             support",
+            "`composite` `cube` cannot differentiate a batched call because its definition has no batching support \
+             (refer to `CustomRuleDefinition::with_batching_support`)",
         );
     }
 
@@ -9021,7 +9027,7 @@ mod tests {
                         Ok(())
                     },
                 )
-                .with_batching(),
+                .with_batching_support(),
         );
         let input_type: ArrayIrType = ArrayType::new_static(DataType::F64, [4]).into();
         let (_, primal) =
