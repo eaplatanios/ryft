@@ -35,8 +35,8 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
-    batch_projected_operation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    MemberBatchableOperation, batch_projected_operation,
 };
 use crate::contexts::{Context, ContextProjection, Domain, EagerContext};
 use crate::differentiation::{
@@ -783,13 +783,12 @@ impl CustomCallOperation {
         self.batching
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Calls the foreign kernel described by this operation in `context` with the provided inputs, returning one value
-    /// per declared output type. This binds the operation through [`Context::bind`] and is therefore available in
-    /// every context, eager and staged alike. It is the entry point for calls without array inputs (e.g., kernels that
-    /// act as sources), which the value-level [`CustomCall`] capability cannot dispatch because it routes a call
-    /// through the context of its first input.
+    /// per declared output type. This binds the operation through [`Context::bind`] and is therefore available in every
+    /// context, eager and staged alike. It is the entry point for calls without array inputs (e.g., kernels that act as
+    /// sources), which the value-level [`CustomCall`] capability cannot dispatch because it routes a call through the
+    /// context of its first input.
+    #[inline]
     pub fn call<C: Context<Operation: From<CustomCallOperation>>>(
         &self,
         context: &C,
@@ -798,7 +797,8 @@ impl CustomCallOperation {
         context.bind(self.clone(), Vec::new(), inputs)
     }
 
-    /// Returns this payload with every declared output identity renamed according to `renaming`.
+    /// Returns this [`CustomCallOperation`] with every declared output identity renamed according to `renaming`.
+    #[inline]
     fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         Ok(Self {
             target_name: self.target_name.clone(),
@@ -818,7 +818,7 @@ impl CustomCallOperation {
     /// Returns the number of array inputs of a mixed invocation with `input_types`, the refinements that its trailing
     /// first-class output-extent inputs establish, and this call's declared output types refined by them. Each trailing
     /// extent either defines the identity of its declared output axis or has an exact type that refines that axis to
-    /// its extent (refer to `DimensionRefinements::record_input_refinement`).
+    /// its extent.
     fn refine_declared_output_types(
         &self,
         input_types: &[ArrayIrType],
@@ -831,32 +831,39 @@ impl CustomCallOperation {
             .collect::<Vec<_>>();
         let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
             return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimension(s) but received only \
-                 {} input(s)",
+                "`{}` expects {} trailing output-extent dimension(s) but received only {} input(s)",
+                CUSTOM_CALL_OPERATION_NAME,
                 dynamic_output_dimensions.len(),
                 input_types.len(),
             )));
         };
+
         let mut refinements = DimensionRefinements::default();
         for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
             let input_type = <&DimensionType>::try_from(input_type)?;
             if !refinements.record_input_refinement(expected_variable, input_type)? {
-                // A rejected input is either an exact extent outside the declared axis's bounds or a dimension of an
-                // unrelated identity, and the diagnostic names which.
+                // A rejected input is either an exact extent outside the declared axis's bounds
+                // or a dimension of an unrelated identity, and the diagnostic names which.
                 return Err(TypeError::invalid(match input_type.extent() {
                     Some(extent) => format!(
-                        "`{CUSTOM_CALL_OPERATION_NAME}` output-extent input has extent {extent}, which lies outside \
-                         the bounds {} of the corresponding declared output axis `{expected_variable}`",
+                        "`{}` output-extent input has extent {}, which lies outside \
+                         the bounds {} of the corresponding declared output axis `{}`",
+                        CUSTOM_CALL_OPERATION_NAME,
+                        extent,
                         expected_variable.bounds(),
+                        expected_variable,
                     ),
                     None => format!(
-                        "`{CUSTOM_CALL_OPERATION_NAME}` output-extent input defines dimension variable `{}`, but the \
-                         corresponding declared output axis refers to `{expected_variable}`",
+                        "`{}` output-extent input defines dimension variable `{}`, but the \
+                         corresponding declared output axis refers to `{}`",
+                        CUSTOM_CALL_OPERATION_NAME,
                         input_type.dimension(),
+                        expected_variable,
                     ),
                 }));
             }
         }
+
         let refinements = ArrayTypeRefinements::from(refinements);
         let output_types = self
             .output_types
@@ -865,6 +872,8 @@ impl CustomCallOperation {
             .collect::<Result<Vec<_>, _>>()?;
         Ok((array_input_count, refinements, output_types))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns this call's declared output types with a leading batch dimension inserted, which is the declaration a
     /// single-call batching strategy hands to its kernel.
@@ -973,6 +982,68 @@ impl CustomCallOperation {
             })
             .collect::<Result<Vec<_>, TypeError>>()?;
         Ok(Self { output_types, ..self.clone() })
+    }
+
+    /// Batches this call through a scan over `arrays`, whose mapped axes have already been aligned to axis 0.
+    /// Replicated arrays and trailing output `extents` are invariant carries. The body restores the call's original
+    /// input order, then returns those carries unchanged followed by the per-item results. `length_input` supplies
+    /// the scan's runtime trip count when `batch_dimension` is dynamic.
+    fn batch_sequential<C: Context, P: BatchingPolicy<C>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        arrays: &[P::Batch],
+        extents: &[P::Batch],
+        batch_dimension: Dimension,
+        length_input: Option<&C::Value>,
+    ) -> Result<Vec<P::Batch>, BatchingError>
+    where
+        C::Type: From<ArrayType>,
+        C::Operation: From<CustomCallOperation> + From<ScanOperation<C::Type>>,
+    {
+        let (carry_indices, stacked_indices): (Vec<_>, Vec<_>) =
+            (0..arrays.len()).partition(|&index| P::batch_axis(&arrays[index]).is_replicated());
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        // Extents lead the carries so the call can reuse them as its trailing dimension inputs.
+        let mut carry_inputs = extents
+            .iter()
+            .map(|extent| builder.add_input(P::unbatched_type(extent).into_owned()))
+            .collect::<Vec<_>>();
+        let mut packed = extents.iter().map(P::value).cloned().collect::<Vec<_>>();
+        let mut call_inputs = vec![None; arrays.len()];
+        for &index in carry_indices.iter().chain(stacked_indices.iter()) {
+            let input = builder.add_input(P::unbatched_type(&arrays[index]).into_owned());
+            call_inputs[index] = Some(input);
+            if P::batch_axis(&arrays[index]).is_replicated() {
+                carry_inputs.push(input);
+            }
+            packed.push(P::value(&arrays[index]).clone());
+        }
+        let call_inputs = call_inputs
+            .into_iter()
+            .map(Option::unwrap)
+            .chain(carry_inputs[..extents.len()].iter().copied())
+            .collect::<Vec<_>>();
+        let operation = self.per_item_operation(context.axis_sharding())?;
+        let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
+        let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
+        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            body_outputs,
+            vec![Placeholder; 1 + extents.len() + arrays.len()],
+            vec![Placeholder; carry_inputs.len() + self.output_types.len()],
+        )?;
+
+        // Stacked results carry the batch axis's placement, like every other batched value.
+        let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
+            .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
+        if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
+            scan = scan.with_unroll(unroll)?;
+        }
+        packed.extend(length_input.cloned());
+        let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
+        check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
+        outputs.drain(..carry_inputs.len());
+        outputs.into_iter().map(|output| P::batch(output, BatchAxis::new(0))).collect()
     }
 
     /// Returns the [`ScanOperation`] unroll factor that the selected sequential [`CustomCallBatching`] behavior requests
@@ -1322,67 +1393,17 @@ where
         match self.batching {
             CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
             CustomCallBatching::Sequential { .. } => {
-                // Realign every mapped input to batch axis 0 so the scan consumes one per-item row per iteration, and
-                // keep replicated inputs as invariant loop carries.
-                let mut carry_indices = Vec::new();
-                let mut stacked_indices = Vec::new();
-                let mut aligned = Vec::with_capacity(inputs.len());
-                for (index, input) in inputs.iter().enumerate() {
-                    if input.batch_axis().is_replicated() {
-                        carry_indices.push(index);
-                        aligned.push(input.clone());
-                    } else {
-                        stacked_indices.push(index);
-                        aligned.push(P::match_axis(context, input, Axis::from(0))?);
-                    }
-                }
-
-                // Build the scan body: one unbatched application of this same call over
-                // `[index, carries..., slices...]`, returning the unchanged carries followed by that item's outputs.
-                let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-                builder.add_input(ArrayType::scalar(DataType::I64));
-                let mut call_inputs = vec![None; inputs.len()];
-                let carry_inputs = carry_indices
+                let aligned = inputs
                     .iter()
-                    .map(|&index| {
-                        let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
-                        let input = builder.add_input(input_type);
-                        call_inputs[index] = Some(input);
-                        Ok(input)
+                    .map(|input| {
+                        if input.batch_axis().is_replicated() {
+                            Ok(input.clone())
+                        } else {
+                            P::match_axis(context, input, Axis::from(0))
+                        }
                     })
-                    .collect::<Result<Vec<_>, BatchingError>>()?;
-                for &index in &stacked_indices {
-                    let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
-                    call_inputs[index] = Some(builder.add_input(input_type));
-                }
-                let call_inputs = call_inputs.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-                let operation = self.per_item_operation(context.axis_sharding())?;
-                let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
-                let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
-                let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                    body_outputs,
-                    vec![Placeholder; 1 + inputs.len()],
-                    vec![Placeholder; carry_inputs.len() + self.output_types.len()],
-                )?;
-
-                // The stacked results take the batch axis's own placement, like every other batched value.
-                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), P::axis_size(context)?)
-                    .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
-                if let Some(unroll) = self.sequential_unroll(&P::axis_dimension(context)?)? {
-                    scan = scan.with_unroll(unroll)?;
-                }
-                let packed = carry_indices
-                    .iter()
-                    .chain(stacked_indices.iter())
-                    .map(|&index| aligned[index].value().clone())
-                    .collect::<Vec<_>>();
-                let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
-                check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
-                outputs.drain(..carry_inputs.len());
-                Ok(outputs
-                    .into_iter()
-                    .map(|output| ArrayBatch::new(output, BatchAxis::new(0)))
-                    .collect::<Result<Vec<_>, _>>()?)
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.batch_sequential(context, &aligned, &[], P::axis_size(context)?.into(), None)
             }
             CustomCallBatching::BroadcastAll
             | CustomCallBatching::ExpandDimensions
@@ -1616,73 +1637,18 @@ where
         match self.batching {
             CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
             CustomCallBatching::Sequential { .. } => {
-                let mut carry_indices = Vec::new();
-                let mut stacked_indices = Vec::new();
-                let mut aligned = Vec::with_capacity(arrays.len());
-                for (index, input) in arrays.iter().enumerate() {
-                    if input.batch_axis().is_replicated() {
-                        carry_indices.push(index);
-                        aligned.push(input.clone());
-                    } else {
-                        stacked_indices.push(index);
-                        aligned.push(driver.align_batch_axis(context, input.clone(), Axis::from(0))?);
-                    }
-                }
-
-                // The replicated extents lead the carries so the body's call can reuse them verbatim as its own
-                // trailing extent inputs, exactly as the unbatched call declared them.
-                let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-                builder.add_input(ArrayType::scalar(DataType::I64).into());
-                let mut carry_inputs =
-                    extents.iter().map(|extent| builder.add_input(extent.unbatched_type().clone())).collect::<Vec<_>>();
-                let mut call_inputs = vec![None; arrays.len()];
-                for &index in &carry_indices {
-                    let value_type = aligned[index].value().r#type();
-                    let input_type =
-                        <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
-                    let input = builder.add_input(input_type.into());
-                    carry_inputs.push(input);
-                    call_inputs[index] = Some(input);
-                }
-                for &index in &stacked_indices {
-                    let value_type = aligned[index].value().r#type();
-                    let input_type =
-                        <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
-                    call_inputs[index] = Some(builder.add_input(input_type.into()));
-                }
-                let call_inputs = call_inputs
-                    .into_iter()
-                    .map(Option::unwrap)
-                    .chain(carry_inputs[..extents.len()].iter().copied())
-                    .collect::<Vec<_>>();
-                let operation = self.per_item_operation(context.axis_sharding())?;
-                let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
-                let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
-                let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-                    body_outputs,
-                    vec![Placeholder; 1 + carry_inputs.len() + stacked_indices.len()],
-                    vec![Placeholder; carry_inputs.len() + self.output_types.len()],
-                )?;
-
-                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone())
-                    .with_stacked_axis_shardings(vec![context.axis_sharding().clone(); self.output_types.len()]);
-                if let Some(unroll) = self.sequential_unroll(&batch_dimension)? {
-                    scan = scan.with_unroll(unroll)?;
-                }
-                let mut packed = extents.iter().map(|extent| extent.value().clone()).collect::<Vec<_>>();
-                packed.extend(
-                    carry_indices.iter().chain(stacked_indices.iter()).map(|&index| aligned[index].value().clone()),
-                );
-                if batch_dimension.variable().is_some() {
-                    packed.push(context.axis_extent().clone());
-                }
-                let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
-                check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
-                outputs.drain(..carry_inputs.len());
-                Ok(outputs
-                    .into_iter()
-                    .map(|output| ArrayIrBatch::new(output, BatchAxis::new(0)))
-                    .collect::<Result<Vec<_>, _>>()?)
+                let aligned = arrays
+                    .iter()
+                    .map(|input| {
+                        if input.batch_axis().is_replicated() {
+                            Ok(input.clone())
+                        } else {
+                            driver.align_batch_axis(context, input.clone(), Axis::from(0))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let length_input = batch_dimension.variable().map(|_| context.axis_extent());
+                self.batch_sequential(context, &aligned, extents, batch_dimension, length_input)
             }
             CustomCallBatching::BroadcastAll
             | CustomCallBatching::ExpandDimensions
