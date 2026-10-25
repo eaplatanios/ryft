@@ -2,21 +2,21 @@
 //! [`Region`](crate::Region) to loop-carried state, consuming one slice of each stacked input and producing one slice
 //! of each stacked output per iteration.
 //!
-//! A scan application takes the initial carries followed by the stacked inputs and, when its length is dynamic, a
-//! trailing first-class dimension that supplies the trip count. It returns the final carries followed by the stacked
-//! outputs. The body maps the iteration index, the carries, and the current slices (or whole reference stacks) to the
-//! next carries and the slices of the stacked outputs, and it must return each reference carry as the reference that it
-//! entered with. [`ScanType`] states this contract once using the type universe's array, dimension, and reference
-//! projections, including that every stacked leading axis has the trip count as its extent. Conflicting static extents
-//! are type errors, while the scan boundary checks at runtime the relationships between its inputs that their types
-//! leave unproven (e.g., two carries that the body declares as `f32[n]` but that are supplied as `f32[n]` and `f32[3]`,
-//! or an `f32[3]` stack next to an iteration count of type `dimension<length>`). A rule that removes or splits the
-//! boundary first stages an entry guard that performs the same checks. Every transformation rule validates this
-//! complete contract before it executes, rewrites, or stages the body (reference discharge over the allocations that it
-//! threads), so whether an application is accepted depends neither on the transformation nor on the trip count. The
-//! exception is dead-code elimination (e.g., [`Program::into_simplified`]), which removes an unused scan together with
-//! its boundary checks, like any other pure instruction, whereas partial evaluation keeps those checks in its entry
-//! guard. The rules are:
+//! A scan application takes the initial carries followed by the stacked inputs and, when its iteration count is
+//! dynamic, a trailing first-class dimension that supplies the trip count. It returns the final carries followed by the
+//! stacked outputs. The body maps the iteration index, the carries, and the current slices (or whole reference stacks)
+//! to the next carries and the slices of the stacked outputs, and it must return each reference carry as the reference
+//! that it entered with. [`ScanType`] states this contract once using the type universe's array, dimension, and
+//! reference projections, including that every stacked leading axis has the trip count as its extent. Conflicting
+//! static extents are type errors, while the scan boundary checks at runtime the relationships between its inputs that
+//! their types leave unproven (e.g., two carries that the body declares as `f32[n]` but that are supplied as `f32[n]`
+//! and `f32[3]`, or an `f32[3]` stack next to an iteration count of type `dimension<iteration_count>`). A rule that
+//! removes or splits the boundary first stages an entry guard that performs the same checks. Every transformation rule
+//! validates this complete contract before it executes, rewrites, or stages the body (reference discharge over the
+//! allocations that it threads), so whether an application is accepted depends neither on the transformation nor on the
+//! trip count. The exception is dead-code elimination (e.g., [`Program::into_simplified`]), which removes an unused
+//! scan together with its boundary checks, like any other pure instruction, whereas partial evaluation keeps those
+//! checks in its entry guard. The rules are:
 //!
 //!   - **Interpretation:** The body runs once per iteration in visit order (from the last slice to the first for a
 //!     reversed scan), and each output stack is allocated from the type of its first slice, with its leading axis
@@ -101,19 +101,19 @@ use crate::tracing::{Tracer, TracingContext};
 /// inspected through their canonical [`ArrayIrType`] representation, so homogeneous array families need no first-class
 /// dimension projection. Conversion into that representation must preserve the member kind and metadata exposed by the
 /// projections. The scan contract is stated once over those views, and each family only restricts it: [`ArrayType`]
-/// stacks per-iteration arrays along a static leading axis and requires a static length and fully static bodies, while
-/// [`ArrayIrType`] additionally permits references and first-class dimensions in carry positions and a dynamic length
-/// supplied by a trailing dimension input. Every family requires the body's first input to be a scalar
-/// [`I64`](DataType::I64) slice index.
+/// stacks per-iteration arrays along a static leading axis and requires a static iteration count and fully static
+/// bodies, while [`ArrayIrType`] additionally permits references and first-class dimensions in carry positions and a
+/// dynamic iteration count supplied by a trailing dimension input. Every family requires the body's first input to be
+/// a scalar [`I64`](DataType::I64) slice index.
 ///
-/// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the
-/// body creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
-/// dimensions have a stacked value representation. Scan lengths are [`Dimension`]s, so every implementing family uses
-/// [`DimensionVariable`]s as its type identities. A dynamic length and every stacked leading axis must have equal
-/// extents: static extents must agree, and the scan boundary checks at runtime the relationships that the input types
-/// leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type that carries
-/// no identity that such a check could relate to the iteration count, so its leading extent must be provably equal to
-/// the trip count.
+/// Trailing array inputs enter as slices. A reference to a statically shaped array stack enters unchanged, and the body
+/// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
+/// dimensions have a stacked value representation. Iteration counts are [`Dimension`]s, so every implementing family
+/// uses [`DimensionVariable`]s as its type identities. A dynamic iteration count and every stacked leading axis must
+/// have equal extents: static extents must agree, and the scan boundary checks at runtime the relationships that the
+/// input types leave unproven (refer to [`ScanOperation::declared_input_types`]). A reference stack has a static type
+/// that carries no identity that such a check could relate to the iteration count, so its leading extent must be
+/// provably equal to the trip count.
 pub trait ScanType:
     Type<Identity = DimensionVariable>
     + ArrayMemberType
@@ -122,12 +122,12 @@ pub trait ScanType:
     + Into<ArrayIrType>
 {
     /// Returns the type of the trailing first-class dimension input that supplies the iteration count for a dynamic
-    /// `length` (i.e., `dimension<length>`).
+    /// `iteration_count` (i.e., `dimension<iteration_count>`).
     ///
     /// # Errors
     ///
-    /// Returns an error when this family admits no dynamic scan length.
-    fn iteration_count_type(length: &Dimension) -> Result<Self, TypeError>;
+    /// Returns an error when this family admits no dynamic iteration count.
+    fn iteration_count_type(iteration_count: &Dimension) -> Result<Self, TypeError>;
 
     /// Validates the restrictions that this family places on the members of a declared iteration body beyond the shared
     /// index and carry contract (e.g., homogeneous array bodies must be fully static).
@@ -138,38 +138,40 @@ pub trait ScanType:
     ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
     fn validate_scan_body_members(body_input_types: &[Self], body_output_types: &[Self]) -> Result<(), TypeError>;
 
-    /// Validates the intrinsic index and carry contracts of a declared iteration body independently of the values
-    /// that bind it. Transform rules use this before rewriting or eliminating a scan so specialization cannot erase
-    /// an invalid source signature. Every reference stack must have a static referent whose leading axis is the scan
-    /// length, and every stacked output must be an array.
+    /// Validates the intrinsic index and carry contracts of a declared iteration body independently of the values that
+    /// bind it. Transform rules use this before rewriting or eliminating a scan so specialization cannot erase an
+    /// invalid source signature. Every reference stack must have a static referent whose leading axis is the iteration
+    /// count, and every stacked output must be an array.
     ///
     /// # Parameters
     ///
     ///   - `body_input_types`: Declared body inputs, including the intrinsic scalar `i64` index.
     ///   - `body_output_types`: Declared body outputs, with carry outputs before stacked-output slices.
     ///   - `carry_count`: Number of matching carry positions on both boundaries.
-    ///   - `length`: Declared trip count, validated independently of a runtime value.
+    ///   - `iteration_count`: Declared trip count, validated independently of a runtime value.
     ///
     /// # Errors
     ///
-    /// Returns an error when the index, carry counts or types, length, or family-specific boundary roles are invalid.
+    /// Returns an error when the index, carry counts or types, iteration count, or family-specific boundary roles are
+    /// invalid.
     fn validate_scan_body_type_signature(
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: &Dimension,
+        iteration_count: &Dimension,
     ) -> Result<(), TypeError> {
         // Validate the declared trip count before inspecting or specializing the body signature.
-        if let Some(length) = length.value()
-            && length > MAX_DIMENSION_EXTENT
+        if let Some(iteration_count) = iteration_count.value()
+            && iteration_count > MAX_DIMENSION_EXTENT
         {
             return Err(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` length {length} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
+                "`{SCAN_OPERATION_NAME}` iteration count {iteration_count} exceeds \
+                 the maximum supported extent {MAX_DIMENSION_EXTENT}",
             )));
         }
 
-        if length.variable().is_some() {
-            Self::iteration_count_type(length)?;
+        if iteration_count.variable().is_some() {
+            Self::iteration_count_type(iteration_count)?;
         }
 
         if body_input_types.first() != Some(&Self::from(ArrayType::scalar(DataType::I64))) {
@@ -181,8 +183,8 @@ pub trait ScanType:
         let body_input_types = &body_input_types[1..];
 
         // The signature is validated independently of the stacked-axis placements, which output inference applies.
-        scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length, &[])?;
-        scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, length, &[])?;
+        scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, iteration_count, &[])?;
+        scan_boundary_types(ScanBoundarySide::Output, body_output_types, carry_count, iteration_count, &[])?;
         check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
@@ -200,7 +202,7 @@ pub trait ScanType:
     ///
     ///   - `body_input_types`: Validated body inputs, including the intrinsic index.
     ///   - `carry_count`: Number of leading carried inputs.
-    ///   - `length`: Declared trip count.
+    ///   - `iteration_count`: Declared iteration count.
     ///   - `input_types`: Actual operation input types, including a trailing iteration count for dynamic scans.
     ///
     /// # Errors
@@ -209,16 +211,16 @@ pub trait ScanType:
     fn validate_scan_input_type_signature(
         body_input_types: &[Self],
         carry_count: usize,
-        length: &Dimension,
+        iteration_count: &Dimension,
         input_types: &[Self],
     ) -> Result<(), TypeError> {
         let body_input_types = &body_input_types[1..];
         let expected_input_types =
-            scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, length, &[])?;
+            scan_boundary_types(ScanBoundarySide::Input, body_input_types, carry_count, iteration_count, &[])?;
         check_count!(
             "input",
             input_types,
-            expected_input_types.len() + usize::from(length.variable().is_some()),
+            expected_input_types.len() + usize::from(iteration_count.variable().is_some()),
             TypeError
         );
         for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
@@ -234,9 +236,9 @@ pub trait ScanType:
                     )));
                 }
                 let (slice_type, leading_dimension) = scan_slice_type(actual, 0)?;
-                if !length.is_refined_by(&leading_dimension) {
+                if !iteration_count.is_refined_by(&leading_dimension) {
                     return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{length}` \
+                        "`{SCAN_OPERATION_NAME}` stacked input {index} must have leading dimension `{iteration_count}` \
                          but has type `{actual}`",
                     )));
                 }
@@ -250,7 +252,7 @@ pub trait ScanType:
                 validate_region_input(SCAN_OPERATION_NAME, index, actual, expected, "expected type")?;
             }
         }
-        validate_scan_iteration_count_type(length, input_types)?;
+        validate_scan_iteration_count_type(iteration_count, input_types)?;
         Ok(())
     }
 
@@ -259,21 +261,26 @@ pub trait ScanType:
     ///
     /// # Parameters
     ///
-    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the iteration count input
-    ///     when `length` is dynamic.
+    ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the iteration count input when
+    ///     `iteration_count` is dynamic.
     ///   - `body_input_count`: Number of inputs of the attached body, including its intrinsic index input.
     ///   - `carry_count`: Number of loop-carried state leaves.
-    ///   - `length`: Declared scan length.
+    ///   - `iteration_count`: Declared iteration count.
     fn infer_scan_body_input_types(
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
-        length: &Dimension,
+        iteration_count: &Dimension,
     ) -> Result<Vec<Self>, TypeError> {
         let stacked_input_end = body_input_count
             .checked_sub(1)
             .ok_or_else(|| TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body must have a slice index input")))?;
-        check_count!("input", input_types, stacked_input_end + usize::from(length.variable().is_some()), TypeError);
+        check_count!(
+            "input",
+            input_types,
+            stacked_input_end + usize::from(iteration_count.variable().is_some()),
+            TypeError
+        );
         if carry_count > stacked_input_end {
             return Err(TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` carry count {carry_count} exceeds the body input count {stacked_input_end}",
@@ -283,8 +290,8 @@ pub trait ScanType:
         let mut body_input_types = vec![Self::from(ArrayType::scalar(DataType::I64))];
         body_input_types.extend_from_slice(&input_types[..carry_count]);
         for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
-            // Arrays enter as slices. References enter as whole roots, so the body can form its own indexed
-            // view: only their leading extent must be the scan length, whatever the placement of that axis (as
+            // Arrays enter as slices. References enter as whole roots, so the body can form its own indexed view:
+            // only their leading extent must be the iteration count, whatever the placement of that axis (as
             // `scan_boundary_types` and `validate_scan_input_type_signature` admit it), so a referent is not sliced.
             let (stacked_type, is_reference) = if let Some(referent) = r#type.referent() {
                 (referent.as_array_type()?, true)
@@ -314,12 +321,12 @@ pub trait ScanType:
                 (Self::from(slice_type), leading_dimension)
             };
 
-            if !length.is_refined_by(&leading_dimension) {
+            if !iteration_count.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
                     "`{}` stacked input {} must have leading dimension `{}` but has type `{}`",
                     SCAN_OPERATION_NAME,
                     carry_count + index,
-                    length,
+                    iteration_count,
                     r#type,
                 )));
             }
@@ -327,7 +334,7 @@ pub trait ScanType:
             body_input_types.push(body_input_type);
         }
 
-        validate_scan_iteration_count(length, input_types, carry_count)?;
+        validate_scan_iteration_count(iteration_count, input_types, carry_count)?;
         Ok(body_input_types)
     }
 
@@ -351,47 +358,48 @@ pub trait ScanType:
     ///   - `body_input_types`: Body input types, `[index, carry..., x_slice_or_reference...]`.
     ///   - `body_output_types`: Body output types, `[carry..., y_slice...]`.
     ///   - `carry_count`: Number of loop-carried state leaves.
-    ///   - `length`: Declared scan length.
+    ///   - `iteration_count`: Declared iteration count.
     ///   - `stacked_axis_shardings`: Placements of the leading scan axes of the stacked outputs (refer to
     ///     [`ScanOperation::with_stacked_axis_shardings`]).
     ///   - `input_types`: Operation input types, `[carry..., stacked_x...]`, followed by the iteration count input when
-    ///     `length` is dynamic.
+    ///     `iteration_count` is dynamic.
     fn infer_scan_output_types(
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: &Dimension,
+        iteration_count: &Dimension,
         stacked_axis_shardings: &[ShardingDimension],
         input_types: &[Self],
     ) -> Result<Vec<Self>, TypeError> {
-        Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, length)?;
-        Self::validate_scan_input_type_signature(body_input_types, carry_count, length, input_types)?;
-        let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, length)?;
+        Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, iteration_count)?;
+        Self::validate_scan_input_type_signature(body_input_types, carry_count, iteration_count, input_types)?;
+        let expected_input_types = scan_input_types(&body_input_types[1..], carry_count, iteration_count)?;
 
         // An iteration count input that only refines the declared bounds fixes the trip count to one exact extent, so
-        // the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length.
-        // Leaving them symbolic would type a concretely sized result as an independent runtime extent.
-        let effective_length = match validate_scan_iteration_count(length, input_types, carry_count)? {
+        // the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared iteration
+        // count. Leaving them symbolic would type a concretely sized result as an independent runtime extent.
+        let effective_iteration_count = match validate_scan_iteration_count(iteration_count, input_types, carry_count)?
+        {
             Some(extent) => Dimension::Static(extent),
-            None => length.clone(),
+            None => iteration_count.clone(),
         };
         let output_types = scan_boundary_types(
             ScanBoundarySide::Output,
             body_output_types,
             carry_count,
-            &effective_length,
+            &effective_iteration_count,
             stacked_axis_shardings,
         )?;
 
         // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
         // separate step from the trip-count refinement above: the stacked outputs' leading axis describes the trip
         // count that is fixed before the first iteration, so it stays refined even when a first-class dimension carry
-        // shares the length's identity and keeps every carry that refers to it symbolic. An iteration count of another
-        // type (e.g., the exact type of an eager dimension value) is a member of the facts like every other input, so
-        // that no carry declared with the length's identity establishes an extent that disagrees with the trip count,
-        // while one that carries the length's own identity establishes nothing beyond the declared bounds. Only the
-        // carries preserve the identities of reference inputs.
-        let nominal_iteration_count = length.variable().is_some_and(|variable| {
+        // shares the iteration count's identity and keeps every carry that refers to it symbolic. An iteration count
+        // of another type (e.g., the exact type of an eager dimension value) is a member of the facts like every other
+        // input, so that no carry declared with the iteration count's identity establishes an extent that disagrees
+        // with the trip count, while one that carries the iteration count's own identity establishes nothing beyond
+        // the declared bounds. Only the carries preserve the identities of reference inputs.
+        let nominal_iteration_count = iteration_count.variable().is_some_and(|variable| {
             matches!(input_types.last().cloned().map(Into::into), Some(ArrayIrType::Dimension(r#type))
                 if r#type.variable() == Some(variable))
         });
@@ -407,10 +415,11 @@ pub trait ScanType:
 
 impl ScanType for ArrayType {
     #[inline]
-    fn iteration_count_type(length: &Dimension) -> Result<Self, TypeError> {
+    fn iteration_count_type(iteration_count: &Dimension) -> Result<Self, TypeError> {
         Err(TypeError::invalid(format!(
-            "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use an array IR \
-             `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
+            "homogeneous array `{SCAN_OPERATION_NAME}` requires a static iteration count but got `{iteration_count}`; \
+             use an array IR `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip \
+             count",
         )))
     }
 
@@ -437,8 +446,8 @@ impl ScanType for ArrayType {
 
 impl ScanType for ArrayIrType {
     #[inline]
-    fn iteration_count_type(length: &Dimension) -> Result<Self, TypeError> {
-        Ok(Self::Dimension(DimensionType::from(length.clone())))
+    fn iteration_count_type(iteration_count: &Dimension) -> Result<Self, TypeError> {
+        Ok(Self::Dimension(DimensionType::from(iteration_count.clone())))
     }
 
     #[inline]
@@ -462,7 +471,8 @@ impl ScanType for ArrayIrType {
 /// covered by the blanket implementation cannot also provide an overlapping implementation of its own.
 pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// Returns the number of iterations represented by the trailing first-class dimension value, `iteration_count`,
-    /// of a dynamic-length scan. The result must agree with the extent and bounds represented by that value.
+    /// of a scan with a dynamic iteration count. The result must agree with the extent and bounds represented by that
+    /// value.
     ///
     /// # Errors
     ///
@@ -558,7 +568,7 @@ impl<C: Domain<Type = ArrayType, Value: Slice + UpdateSlice + Reshape> + Zero<C:
 {
     #[inline]
     fn iteration_count(_iteration_count: &Self::Value) -> Result<usize, ProgramError> {
-        // Validation rejects a homogeneous scan with a dynamic length before any iteration count is read.
+        // Validation rejects a homogeneous scan with a dynamic iteration count before any iteration count is read.
         Err(ProgramError::MalformedProgram(format!("homogeneous `{SCAN_OPERATION_NAME}` has no iteration count input")))
     }
 
@@ -816,30 +826,31 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 ///
 /// Operation inputs are `[carry..., stacked_xs...]` and outputs are `[final_carry..., stacked_ys...]`. The intrinsic
 /// index is not an operation input or carry. Iteration `i` consumes slice `i` of every stacked array input and produces
-/// slice `i` of every stacked output. With [`reverse`](Self::reverse), the body receives indices from `length - 1` down
-/// to `0`: visit order changes but input/output slice pairing stays the same. Transposition flips that order and
-/// obtains the index from the reversed loop, without storing a stack of indices.
+/// slice `i` of every stacked output. With [`reverse`](Self::reverse), the body receives indices from `iteration_count
+/// - 1` down to `0`: visit order changes but input/output slice pairing stays the same. Transposition flips that order
+/// and obtains the index from the reversed loop, without storing a stack of indices.
 ///
-/// The explicit [`length`](Self::length) also supports scans with no stacked inputs. Homogeneous [`ArrayType`] scans
-/// require a static length. [`ArrayIrType`] scans may use a dynamic dimension identity and consume its matching
-/// first-class dimension value as a trailing runtime input. Every stacked leading axis must then have the iteration
-/// count as its extent, which the scan boundary checks at runtime when the input types leave it unproven (e.g., for an
-/// `f32[3]` stack next to an iteration count of type `dimension<length>`). An iteration count of an unrelated identity
-/// is admitted only when its bounds fix one exact extent, which then is the trip count. Reference stacks have static
-/// types that carry no identity that a runtime check could relate to the iteration count, so their leading extents must
-/// be provably equal to the trip count.
+/// The explicit [`iteration_count`](Self::iteration_count) also supports scans with no stacked inputs. Homogeneous
+/// [`ArrayType`] scans require a static iteration count. [`ArrayIrType`] scans may use a dynamic dimension identity and
+/// consume its matching first-class dimension value as a trailing runtime input. Every stacked leading axis must then
+/// have the iteration count as its extent, which the scan boundary checks at runtime when the input types leave it
+/// unproven (e.g., for an `f32[3]` stack next to an iteration count of type `dimension<iteration_count>`). An iteration
+/// count of an unrelated identity is admitted only when its bounds fix one exact extent, which then is the trip count.
+/// Reference stacks have static types that carry no identity that a runtime check could relate to the iteration count,
+/// so their leading extents must be provably equal to the trip count.
 ///
-/// An array IR body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index
-/// transform to each access, with the body's index input as the first transform binding. Reference operations and their
-/// transforms preserve that access path. The root parameter must not be consumed or frozen inside the body. Stacked
-/// reference outputs remain unsupported: a scan cannot assemble a reference value from per-iteration handles. Reference
-/// discharge carries the state of a discharged reference stack whole, as a carry that the body indexes with its index.
+/// An array IR body receiving `ref<[iteration_count, t]>` selects its current slice by attaching a leading dynamic
+/// index transform to each access, with the body's index input as the first transform binding. Reference operations and
+/// their transforms preserve that access path. The root parameter must not be consumed or frozen inside the body.
+/// Stacked reference outputs remain unsupported: a scan cannot assemble a reference value from per-iteration handles.
+/// Reference discharge carries the state of a discharged reference stack whole, as a carry that the body indexes with
+/// its index.
 ///
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
 /// **lowering_only** attribute: interpretation and every transform rule (e.g., differentiation, transposition,
 /// batching, etc.) ignore it semantically but preserve it on whatever scan they re-stage, while lowerings emit `unroll`
-/// body copies per loop trip followed by the `length % unroll` remaining iterations, and no loop at all when `unroll`
-/// is at least a static `length`.
+/// body copies per loop trip followed by the `iteration_count % unroll` remaining iterations, and no loop at all when
+/// `unroll` is at least a static `iteration_count`.
 ///
 /// The body computation is not part of this payload: it is a [`Region`](crate::Region) attached to the
 /// [`Instruction`](crate::Instruction) applying the operation (the single [`region_slots`](Operation::region_slots)
@@ -852,7 +863,7 @@ pub struct ScanOperation<T: Type> {
     carry_count: usize,
 
     /// Shape-determined trip count of this [`ScanOperation`].
-    length: Dimension,
+    iteration_count: Dimension,
 
     /// Boolean indicating whether iterations visit the stacked slices in reverse order.
     reverse: bool,
@@ -876,17 +887,17 @@ impl<T: Type> ScanOperation<T> {
     /// iterations in increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`]
     /// mapping `[index, carry..., x_slice_or_reference...]` to `[carry..., y_slice...]` is supplied separately as the
     /// operation's attached region (via the region driver passed to [`Context::bind`]), and
-    /// [`Operation::infer_output_types`] validates its signature against `carry_count` and `length`.
+    /// [`Operation::infer_output_types`] validates its signature against `carry_count` and `iteration_count`.
     ///
     /// # Parameters
     ///
     ///   - `carry_count`: Number of loop-carried state leaves, excluding the intrinsic body index input.
-    ///   - `length`: Shape-determined trip count.
+    ///   - `iteration_count`: Shape-determined trip count.
     #[inline]
-    pub fn new<L: Into<Dimension>>(carry_count: usize, length: L) -> Self {
+    pub fn new<N: Into<Dimension>>(carry_count: usize, iteration_count: N) -> Self {
         Self {
             carry_count,
-            length: length.into(),
+            iteration_count: iteration_count.into(),
             reverse: false,
             unroll: 1,
             stacked_axis_shardings: Vec::new(),
@@ -906,8 +917,9 @@ impl<T: Type> ScanOperation<T> {
     /// Returns this [`ScanOperation`] with the lowering unroll factor set to `unroll`, which must be at least `1`.
     /// Unrolling is lowering-only: interpretation and transform rules ignore the factor but preserve it on every scan
     /// they derive, while lowerings emit `unroll` consecutive body copies per loop trip and follow the loop with the
-    /// `length % unroll` remaining iterations. A factor of at least a static [`length`](Self::length) unrolls the scan
-    /// completely, with no loop at all (e.g., `usize::MAX` fully unrolls a scan of any static length).
+    /// `iteration_count % unroll` remaining iterations. A factor of at least a static
+    /// [`iteration_count`](Self::iteration_count) unrolls the scan completely, with no loop at all (e.g., `usize::MAX`
+    /// fully unrolls a scan of any static iteration count).
     pub fn with_unroll(mut self, unroll: usize) -> Result<Self, ProgramError> {
         if unroll == 0 {
             return Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` unroll factor must be at least 1")).into());
@@ -947,8 +959,8 @@ impl<T: Type> ScanOperation<T> {
 
     /// Returns the shape-determined trip count of this [`ScanOperation`].
     #[inline]
-    pub fn length(&self) -> &Dimension {
-        &self.length
+    pub fn iteration_count(&self) -> &Dimension {
+        &self.iteration_count
     }
 
     /// Returns the placements of the leading scan axes of the stacked outputs of this [`ScanOperation`], in output
@@ -980,7 +992,7 @@ impl<T: Type> ScanOperation<T> {
     }
 
     /// Returns this [`ScanOperation`] with `additional_carry_count` extra carries appended after its existing carries,
-    /// preserving its length, direction, and unroll factor. Reference discharge uses this to widen a scan with
+    /// preserving its iteration count, direction, and unroll factor. Reference discharge uses this to widen a scan with
     /// discharged reference state carries.
     fn with_added_carries(&self, additional_carry_count: usize) -> Self {
         Self { carry_count: self.carry_count + additional_carry_count, ..self.clone() }
@@ -988,7 +1000,7 @@ impl<T: Type> ScanOperation<T> {
 
     /// Validates the instruction and body positions used by the producer-source and execution-demand contracts.
     fn validate_data_flow_boundary(&self, boundary: RegionDataFlowBoundary<'_>) -> Result<(), ProgramError> {
-        let iteration_count_input_count = usize::from(self.length.variable().is_some());
+        let iteration_count_input_count = usize::from(self.iteration_count.variable().is_some());
         if boundary.regions.len() != 1
             || boundary.output_count < self.carry_count
             || boundary.regions[0].output_count != boundary.output_count
@@ -1042,29 +1054,31 @@ impl<T: Type> ScanOperation<T> {
 impl<T: ScanType> ScanOperation<T> {
     /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e., the
     /// intrinsic iteration index followed by the carries and the slices or reference stacks of the stacked inputs),
-    /// followed by the `dimension<length>` type of the trailing iteration count input when the length is dynamic.
-    /// Carries keep their types, a reference stack keeps its type, and a stacked array gains the leading scan axis
-    /// while keeping only the memory placement of its slice: scan input validation compares the slices of the actual
-    /// stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g., one whose
-    /// scan axis is sharded over an `Auto` mesh axis). The iteration count shares its identity with every carry or
-    /// stack that the body declares with the length's identity, so these types relate the trip count to those inputs.
-    /// Backends that check the entry of a scan whose body they inline (e.g., with a [`GuardOperation`]) and transform
-    /// rules that remove or split the scan boundary relate the actual inputs to these types.
+    /// followed by the `dimension<iteration_count>` type of the trailing iteration count input when the iteration count
+    /// is dynamic. Carries keep their types, a reference stack keeps its type, and a stacked array gains the leading
+    /// scan axis while keeping only the memory placement of its slice: scan input validation compares the slices of the
+    /// actual stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g.,
+    /// one whose scan axis is sharded over an `Auto` mesh axis). The iteration count shares its identity with every
+    /// carry or stack that the body declares with the iteration count's identity, so these types relate the trip count
+    /// to those inputs. Backends that check the entry of a scan whose body they inline (e.g., with a
+    /// [`GuardOperation`]) and transform rules that remove or split the scan boundary relate the actual inputs to these
+    /// types.
     ///
     /// # Errors
     ///
     /// Returns an error when `body_input_types` has no index, fewer inputs than carries, or a stacked input that the
-    /// body cannot declare (e.g., a first-class dimension, or a reference whose leading axis is not the scan length).
+    /// body cannot declare (e.g., a first-class dimension, or a reference whose leading axis is not the iteration
+    /// count).
     pub fn declared_input_types(&self, body_input_types: &[T]) -> Result<Vec<T>, TypeError> {
         let Some((_, body_input_types)) = body_input_types.split_first() else {
             return Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` body has no index input")));
         };
-        scan_input_types(body_input_types, self.carry_count, &self.length)
+        scan_input_types(body_input_types, self.carry_count, &self.iteration_count)
     }
 
     /// Returns the declared output types of this [`ScanOperation`] when its body declares `body_output_types` (i.e.,
     /// the next carries followed by the slices of the stacked outputs). Carries keep their types, and a stacked output
-    /// gains a leading scan axis of the declared length, placed as [`Self::stacked_axis_shardings`] declares
+    /// gains a leading scan axis of the declared iteration count, placed as [`Self::stacked_axis_shardings`] declares
     /// (replicated by default), while keeping the sharding and memory placement of its slice (refer to
     /// [`ScanType::infer_scan_output_types`] for the types that inference refines from these). Backends that allocate
     /// the stacked outputs of a scan whose body they inline use these types.
@@ -1079,23 +1093,23 @@ impl<T: ScanType> ScanOperation<T> {
             ScanBoundarySide::Output,
             body_output_types,
             self.carry_count,
-            &self.length,
+            &self.iteration_count,
             &self.stacked_axis_shardings,
         )
     }
 
     /// Validates the application of this scan to inputs of the types `input_types` (i.e., the carries and the stacked
-    /// inputs, followed by the iteration count input when the length is dynamic) with the iteration `body`, and returns
-    /// its output types. Every rule validates this complete contract before it executes, rewrites, discharges, or
-    /// stages the body, so that whether an application is accepted does not depend on the transform that reaches it.
-    /// The contract consists of the boundary that [`Operation::infer_output_types`] validates and of the reference
-    /// contract that only the body reveals: the body must return every reference carry as its own body input (refer to
-    /// [`validate_reference_carry_roots`]), however the inputs of the application alias.
+    /// inputs, followed by the iteration count input when the iteration count is dynamic) with the iteration `body`,
+    /// and returns its output types. Every rule validates this complete contract before it executes, rewrites,
+    /// discharges, or stages the body, so that whether an application is accepted does not depend on the transform that
+    /// reaches it. The contract consists of the boundary that [`Operation::infer_output_types`] validates and of the
+    /// reference contract that only the body reveals: the body must return every reference carry as its own body input
+    /// (refer to [`validate_reference_carry_roots`]), however the inputs of the application alias.
     ///
     /// The boundary relates every stacked leading extent to the iteration count (refer to [`ScanType`]). Conflicting
     /// static extents are rejected here, while a relationship that the input types leave unproven (e.g., an exact
-    /// iteration count of type `dimension<3>` next to a stack of type `f32[length]`) is checked at runtime by the scan
-    /// boundary, or by the entry guard that a rule which removes or splits that boundary stages first.
+    /// iteration count of type `dimension<3>` next to a stack of type `f32[iteration_count]`) is checked at runtime by
+    /// the scan boundary, or by the entry guard that a rule which removes or splits that boundary stages first.
     ///
     /// # Parameters
     ///
@@ -1109,11 +1123,16 @@ impl<T: ScanType> ScanOperation<T> {
         // The body signature is validated before the input count, so that a body without an index is reported as
         // such; output inference then validates the inputs against the body once (and the signature a second time).
         let body_input_types = body.input_types();
-        T::validate_scan_body_type_signature(&body_input_types, &body.output_types(), self.carry_count, &self.length)?;
+        T::validate_scan_body_type_signature(
+            &body_input_types,
+            &body.output_types(),
+            self.carry_count,
+            &self.iteration_count,
+        )?;
         check_count!(
             "input",
             input_types,
-            body_input_types.len() - 1 + usize::from(self.length.variable().is_some()),
+            body_input_types.len() - 1 + usize::from(self.iteration_count.variable().is_some()),
             ProgramError
         );
         let output_types = self.infer_output_types(input_types, &[body.interface()])?;
@@ -1154,24 +1173,25 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             region_interfaces[0].input_types(),
             region_interfaces[0].output_types(),
             self.carry_count,
-            &self.length,
+            &self.iteration_count,
         )?;
         let body_input_types = T::infer_scan_body_input_types(
             input_types,
             region_interfaces[0].input_types().len(),
             self.carry_count,
-            &self.length,
+            &self.iteration_count,
         )?;
-        // A body specialized to the actual input types no longer declares the length's identity where its inputs do
-        // not prove it, which would drop the relationship between those inputs and the trailing iteration count (e.g.,
-        // a carry declared as `f32[length]` but supplied as `f32[3]`). The iteration count is not a body input, so the
-        // specialized body could not retain that relationship, and the declared body is kept instead. The declared
-        // identities are local to this comparison, so that a specialization which only renames identities (e.g., a
-        // body declared over `f32[extent]` slices supplied with `f32[other]` slices) is still requested.
-        if let Some(length) = self.length.variable() {
+        // A body specialized to the actual input types no longer declares the iteration count's identity where its
+        // inputs do not prove it, which would drop the relationship between those inputs and the trailing iteration
+        // count (e.g., a carry declared as `f32[iteration_count]` but supplied as `f32[3]`). The iteration count is not
+        // a body input, so the specialized body could not retain that relationship, and the declared body is kept
+        // instead. The declared identities are local to this comparison, so that a specialization which only renames
+        // identities (e.g., a body declared over `f32[extent]` slices supplied with `f32[other]` slices) is still
+        // requested.
+        if let Some(iteration_count) = self.iteration_count.variable() {
             let declared_input_types = self.declared_input_types(region_interfaces[0].input_types())?;
             let refinements = T::Refinements::from_local_declarations(&declared_input_types, input_types)?;
-            if refinements.identities_needing_runtime_checks().contains(length) {
+            if refinements.identities_needing_runtime_checks().contains(iteration_count) {
                 return Ok(vec![None]);
             }
         }
@@ -1207,7 +1227,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             region_interfaces[0].input_types(),
             region_interfaces[0].output_types(),
             self.carry_count,
-            &self.length,
+            &self.iteration_count,
             &self.stacked_axis_shardings,
             input_types,
         )?;
@@ -1244,15 +1264,16 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
         // Carries are kept by their fixed point, while stacked inputs and outputs are pruned independently, and the
-        // index input and the iteration count input that trails the stacked inputs of a scan with a dynamic length are
-        // always kept. The scan boundary relates the leading axis of every stacked input to that iteration count, which
-        // is not a body input, so region liveness cannot see that relationship. A dead stacked input of a scan with a
-        // dynamic length is therefore kept unless the actual input types prove that relationship, which holds when the
-        // leading dimension of the stack (of its referent, for a reference stack) and the iteration count provably have
-        // equal extents (i.e., they share a symbolic identity, as an `f32[length]` stack next to a `dimension<length>`,
-        // or both fix the same extent, as an `f32[3]` stack next to a `dimension<3>`). Otherwise the boundary checks
-        // the relationship at runtime (e.g., an `f32[3]` stack next to a `dimension<length>`), and pruning must not
-        // drop that check. The stacked inputs of a scan with a static length are related to it by their types alone.
+        // index input and the iteration count input that trails the stacked inputs of a scan with a dynamic iteration
+        // count are always kept. The scan boundary relates the leading axis of every stacked input to that iteration
+        // count, which is not a body input, so region liveness cannot see that relationship. A dead stacked input of a
+        // scan with a dynamic iteration count is therefore kept unless the actual input types prove that relationship,
+        // which holds when the leading dimension of the stack (of its referent, for a reference stack) and the
+        // iteration count provably have equal extents (i.e., they share a symbolic identity, as an
+        // `f32[iteration_count]` stack next to a `dimension<iteration_count>`, or both fix the same extent, as an
+        // `f32[3]` stack next to a `dimension<3>`). Otherwise the boundary checks the relationship at runtime (e.g., an
+        // `f32[3]` stack next to a `dimension<iteration_count>`), and pruning must not drop that check. The stacked
+        // inputs of a scan with a static iteration count are related to it by their types alone.
         let carry_count = self.carry_count;
         let (kept_carries, used_body_inputs) = self.live_carries(used_outputs, regions)?;
         let used_stacked_outputs = &used_outputs[carry_count..];
@@ -1268,7 +1289,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
                  {stacked_count} stacked inputs",
             ))
         })?;
-        let iteration_count_input_count = usize::from(self.length.variable().is_some());
+        let iteration_count_input_count = usize::from(self.iteration_count.variable().is_some());
         if trailing_count != iteration_count_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{SCAN_OPERATION_NAME}` expects {iteration_count_input_count} trailing iteration count inputs but has \
@@ -1327,13 +1348,13 @@ impl<T: ScanType> Operation for ScanOperation<T> {
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        Ok(Self { length: self.length.rename_type_identities(renaming), ..self.clone() })
+        Ok(Self { iteration_count: self.iteration_count.rename_type_identities(renaming), ..self.clone() })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, SCAN_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("carry_count", self.carry_count)?;
-            operation.field("length", &self.length)?;
+            operation.field("iteration_count", &self.iteration_count)?;
             operation.field("reverse", self.reverse)?;
             if self.unroll > 1 {
                 operation.field("unroll", self.unroll)?;
@@ -1360,7 +1381,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         // matching body output on later iterations. These are possible producers, independently of reference identity.
         let sources = if input_index == 0 {
             Vec::new()
-        } else if input_index <= self.carry_count && self.length.value() != Some(0) {
+        } else if input_index <= self.carry_count && self.iteration_count.value() != Some(0) {
             vec![
                 RegionDataFlowSource::InstructionInput(input_index - 1),
                 RegionDataFlowSource::RegionOutput(OutputRegionProvenance {
@@ -1382,7 +1403,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         self.validate_data_flow_boundary(boundary)?;
         // A statically empty scan bypasses its body, forwarding initial carries and creating empty stacked results.
         // Otherwise a carry may come from its initial binding or any body iteration, modeled through its body input.
-        let sources = if self.length.value() == Some(0) {
+        let sources = if self.iteration_count.value() == Some(0) {
             if output_index < self.carry_count {
                 vec![RegionDataFlowSource::InstructionInput(output_index)]
             } else {
@@ -1403,7 +1424,7 @@ impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
         regions: &mut dyn RegionLiveness,
     ) -> Result<Vec<Option<Vec<bool>>>, ProgramError> {
         self.validate_data_flow_boundary(boundary)?;
-        if self.length.value() == Some(0) {
+        if self.iteration_count.value() == Some(0) {
             return Ok(vec![None]);
         }
         // The carry fixed point that boundary pruning keeps already accounts for inputs demanded by retained effects.
@@ -1481,9 +1502,9 @@ impl<
             }
         }
         let summary = context.region_summary(self, 0, source_body, &body_allocations)?;
-        let length = match validate_scan_iteration_count(&self.length, &input_types, carry_count)? {
+        let iteration_count = match validate_scan_iteration_count(&self.iteration_count, &input_types, carry_count)? {
             Some(extent) => Dimension::Static(extent),
-            None => self.length.clone(),
+            None => self.iteration_count.clone(),
         };
         // No reference access executes for zero trips, including accesses through declared carries or captures.
         // Elide bodies whose whole-root states would otherwise lower an unreachable index into an empty axis.
@@ -1499,7 +1520,7 @@ impl<
                     .iter()
                     .any(|dimension| dimension.bounds().extent() == Some(0));
         }
-        if length.bounds().extent() == Some(0) && has_empty_root {
+        if iteration_count.bounds().extent() == Some(0) && has_empty_root {
             // Keep the inferred dimension identities even when their bounds pin zero. Dynamic zeros consume the
             // corresponding runtime extents, so this shortcut preserves the public region signature.
             let boundary_values =
@@ -1544,7 +1565,7 @@ impl<
                 // validation, with each input that the body declares as a reference at its referent type when
                 // discharged, and the value carries flow through it.
                 let actual_types = boundary_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-                let declared_types = scan_input_types(&source_input_types[1..], carry_count, &self.length)?
+                let declared_types = scan_input_types(&source_input_types[1..], carry_count, &self.iteration_count)?
                     .into_iter()
                     .zip(&actual_types)
                     .map(|(declared_type, actual_type)| match declared_type {
@@ -1705,8 +1726,8 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
         let body = driver.region(0)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = self.validate_application(&input_types, body)?;
-        let (inputs, length) = match self.length.value() {
-            Some(length) => (inputs, length),
+        let (inputs, iteration_count) = match self.iteration_count.value() {
+            Some(iteration_count) => (inputs, iteration_count),
             None => {
                 let (iteration_count, inputs) = inputs.split_last().unwrap();
                 (inputs, C::iteration_count(iteration_count)?)
@@ -1715,8 +1736,8 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
         let (carries, stacks) = inputs.split_at(self.carry_count);
         let mut carries = carries.to_vec();
         let mut accumulators = vec![None; output_types.len() - self.carry_count];
-        for visit in 0..length {
-            let iteration = if self.reverse { length - 1 - visit } else { visit };
+        for visit in 0..iteration_count {
+            let iteration = if self.reverse { iteration_count - 1 - visit } else { visit };
             let mut iteration_inputs = vec![context.iteration_index(iteration)?];
             iteration_inputs.extend(carries.iter().cloned());
             for stack in stacks {
@@ -1731,7 +1752,7 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
                 *accumulator = Some(context.write_iteration(
                     output_index,
                     accumulator.take(),
-                    length,
+                    iteration_count,
                     self.stacked_axis_sharding(index),
                     iteration,
                     output,
@@ -1768,8 +1789,8 @@ impl<
         // passes through unchanged and pure work over them, are computed once before the scan. Those that resolve to
         // constants of the known-side context are embedded into the unknown body as constants, so that partial
         // evaluation against known values specializes the residual body. Computed loop-invariant work is hoisted only
-        // when the declared length guarantees an iteration, so a split never runs body work that no iteration performs.
-        // Before splitting or residualizing the scan, the rule guards its complete boundary (refer to
+        // when the declared iteration count guarantees an iteration, so a split never runs body work that no iteration
+        // performs. Before splitting or residualizing the scan, the rule guards its complete boundary (refer to
         // `PartialEvaluationContext::guard_inputs`), whose declared types also relate the iteration count to the
         // leading axes of the stacked inputs, so that neither the rebuilt scans nor forwarded outputs rely on a
         // relationship that the input types leave unproven. Non-reference carries that the body passes through
@@ -1794,8 +1815,9 @@ impl<
         // guard first. The rebuilt scans and the forwarded carries use the guarded inputs, whose types prove them.
         let inputs = context.guard_inputs(&self.declared_input_types(&body_input_types)?, inputs.to_vec(), false)?;
 
-        // The trailing iteration count input of a dynamic-length scan is neither a carry nor a stacked input, so it
-        // does not make any per-iteration work known. A split forwards the carries that the body passes through itself.
+        // The trailing iteration count input of a scan with a dynamic iteration count is neither a carry nor a stacked
+        // input, so it does not make any per-iteration work known. A split forwards the carries that the body passes
+        // through itself.
         let scanned_inputs = &inputs[..body_input_types.len() - 1];
         if scanned_inputs.iter().any(PartialEvaluationValue::is_known) {
             let (body_inputs, iteration_count_inputs) = inputs.split_at(body_input_types.len() - 1);
@@ -2292,8 +2314,8 @@ where
                 })
                 .collect();
 
-            // Reverse visit order while preserving length and the lowering-only unroll factor. Residual stack slice i
-            // then meets the cotangent for the same forward iteration without reversing any arrays.
+            // Reverse visit order while preserving iteration count and the lowering-only unroll factor. Residual stack
+            // slice i then meets the cotangent for the same forward iteration without reversing any arrays.
             let reversed = ScanOperation {
                 carry_count: retained_carry_count,
                 reverse: !self.reverse,
@@ -2412,7 +2434,7 @@ fn scan_boundary_types<T: ScanType>(
     side: ScanBoundarySide,
     body_types: &[T],
     carry_count: usize,
-    length: &Dimension,
+    iteration_count: &Dimension,
     stacked_axis_shardings: &[ShardingDimension],
 ) -> Result<Vec<T>, TypeError> {
     if carry_count > body_types.len() {
@@ -2451,9 +2473,9 @@ fn scan_boundary_types<T: ScanType>(
                     )));
                 }
             }
-            if referent.rank() == 0 || !length.is_refined_by(&referent.dimension(0)) {
+            if referent.rank() == 0 || !iteration_count.is_refined_by(&referent.dimension(0)) {
                 return Err(TypeError::invalid(format!(
-                    "`{SCAN_OPERATION_NAME}` reference input {index} must have leading dimension `{length}`",
+                    "`{SCAN_OPERATION_NAME}` reference input {index} must have leading dimension `{iteration_count}`",
                 )));
             }
             r#type.clone()
@@ -2469,7 +2491,7 @@ fn scan_boundary_types<T: ScanType>(
                 ScanBoundarySide::Input => {
                     // Entry guards relate stack identities, but its own slice determines the admitted sharding.
                     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-                    dimensions.push(length.clone());
+                    dimensions.push(iteration_count.clone());
                     dimensions.extend(slice_type.shape().dimensions().iter().cloned());
                     T::from(
                         ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory()),
@@ -2482,9 +2504,9 @@ fn scan_boundary_types<T: ScanType>(
                         stacked_axis_shardings.get(index - carry_count).unwrap_or(&ShardingDimension::Replicated);
                     let stacked_type = if *stacked_axis_sharding == ShardingDimension::Replicated {
                         // Inserting a replicated dimension into a valid sharding cannot fail.
-                        slice_type.with_inserted_dimension(0, length.clone()).unwrap()
+                        slice_type.with_inserted_dimension(0, iteration_count.clone()).unwrap()
                     } else {
-                        slice_type.batched(0, length.clone(), stacked_axis_sharding.clone()).map_err(|error| {
+                        slice_type.batched(0, iteration_count.clone(), stacked_axis_sharding.clone()).map_err(|error| {
                             TypeError::invalid(format!(
                                 "`{SCAN_OPERATION_NAME}` cannot place the stacked axis of an output with slice type \
                                  `{slice_type}` on `{stacked_axis_sharding}` ({error})",
@@ -2499,27 +2521,27 @@ fn scan_boundary_types<T: ScanType>(
     Ok(boundary_types)
 }
 
-/// Returns the declared operation input types of a scan whose body declares `body_types` after its intrinsic index:
-/// the input types that [`scan_boundary_types`] derives, followed by the `dimension<length>` type of the trailing
-/// iteration count input when `length` is dynamic.
+/// Returns the declared operation input types of a scan whose body declares `body_types` after its intrinsic index: the
+/// input types that [`scan_boundary_types`] derives, followed by the `dimension<iteration_count>` type of the trailing
+/// iteration count input when `iteration_count` is dynamic.
 fn scan_input_types<T: ScanType>(
     body_types: &[T],
     carry_count: usize,
-    length: &Dimension,
+    iteration_count: &Dimension,
 ) -> Result<Vec<T>, TypeError> {
-    let mut input_types = scan_boundary_types(ScanBoundarySide::Input, body_types, carry_count, length, &[])?;
-    if length.variable().is_some() {
-        input_types.push(T::iteration_count_type(length)?);
+    let mut input_types = scan_boundary_types(ScanBoundarySide::Input, body_types, carry_count, iteration_count, &[])?;
+    if iteration_count.variable().is_some() {
+        input_types.push(T::iteration_count_type(iteration_count)?);
     }
     Ok(input_types)
 }
 
 /// Validates the runtime dimension's identity or singleton refinement independently of stacked-axis equality.
 fn validate_scan_iteration_count_type<T: ScanType>(
-    length: &Dimension,
+    iteration_count: &Dimension,
     input_types: &[T],
 ) -> Result<Option<usize>, TypeError> {
-    let Some(variable) = length.variable() else {
+    let Some(variable) = iteration_count.variable() else {
         return Ok(None);
     };
     let iteration_count_type: ArrayIrType = input_types.last().unwrap().clone().into();
@@ -2533,58 +2555,59 @@ fn validate_scan_iteration_count_type<T: ScanType>(
         .ok_or_else(|| {
             TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` iteration count input has type `{iteration_count_type}` but \
-                 `{SCAN_OPERATION_NAME}` length requires `{variable}`",
+                 `{SCAN_OPERATION_NAME}` iteration count requires `{variable}`",
             ))
         })?;
     Ok(Some(extent))
 }
 
-/// Validates the trailing iteration count input of a dynamic-length scan against the declared `length` and the
-/// reference stacks among the actual input types, and returns the concrete trip count when the iteration count input
-/// only refines `length`'s bounds instead of carrying its nominal identity.
+/// Validates the trailing iteration count input of a scan with a dynamic iteration count against the declared
+/// `iteration_count` and the reference stacks among the actual input types, and returns the concrete trip count when
+/// the iteration count input only refines `iteration_count`'s bounds instead of carrying its nominal identity.
 ///
-/// An iteration count input that carries `length`'s own [`DimensionVariable`] defines the trip count, and [`None`] is
-/// returned. An iteration count input of an unrelated identity is admissible only when its bounds pin exactly one
-/// extent inside `length`'s bounds, and the trip count is then that extent. The leading axes of stacked arrays are
-/// related to the trip count through the declared input types of the scan (refer to
+/// An iteration count input that carries `iteration_count`'s own [`DimensionVariable`] defines the trip count, and
+/// [`None`] is returned. An iteration count input of an unrelated identity is admissible only when its bounds pin
+/// exactly one extent inside `iteration_count`'s bounds, and the trip count is then that extent. The leading axes of
+/// stacked arrays are related to the trip count through the declared input types of the scan (refer to
 /// [`ScanOperation::declared_input_types`]), so that conflicting static extents are type errors and the scan boundary
 /// checks the relationships that the input types leave unproven. A reference stack has a static type that carries no
 /// identity that such a check could relate to the iteration count, so its leading extent must be provably equal to the
-/// trip count instead: equal to the exact trip count, or to an extent that `length`'s bounds fix when the iteration
-/// count is nominal.
+/// trip count instead: equal to the exact trip count, or to an extent that `iteration_count`'s bounds fix when the
+/// iteration count is nominal.
 ///
 /// # Parameters
 ///
-///   - `length`: Declared scan length.
-///   - `input_types`: All scan input types, whose last entry is the iteration count input when `length` is dynamic.
+///   - `iteration_count`: Declared iteration count.
+///   - `input_types`: All scan input types, whose last entry is the iteration count input when `iteration_count` is
+///     dynamic.
 ///   - `carry_count`: Number of leading loop-carried inputs, which are not stacked.
 fn validate_scan_iteration_count<T: ScanType>(
-    length: &Dimension,
+    iteration_count: &Dimension,
     input_types: &[T],
     carry_count: usize,
 ) -> Result<Option<usize>, TypeError> {
-    if length.variable().is_none() {
+    if iteration_count.variable().is_none() {
         return Ok(None);
     }
     let iteration_count_type: ArrayIrType = input_types.last().unwrap().clone().into();
     let iteration_count_type = iteration_count_type.as_dimension_type()?;
-    let extent = validate_scan_iteration_count_type(length, input_types)?;
+    let extent = validate_scan_iteration_count_type(iteration_count, input_types)?;
     for (index, r#type) in input_types[carry_count..input_types.len() - 1].iter().enumerate() {
         let Some(referent) = r#type.referent() else {
             continue;
         };
         let referent = referent.as_array_type()?;
-        let matches_length = referent.rank() > 0 && {
+        let matches_iteration_count = referent.rank() > 0 && {
             let dimension = referent.dimension(0);
             match extent {
                 Some(extent) => dimension.bounds().extent() == Some(extent),
-                None => length.has_equal_extents(&dimension),
+                None => iteration_count.has_equal_extents(&dimension),
             }
         };
-        if !matches_length {
+        if !matches_iteration_count {
             let requirement = match extent {
                 Some(extent) => format!("refined to extent {extent}"),
-                None => format!("provably equal to `{length}`"),
+                None => format!("provably equal to `{iteration_count}`"),
             };
             return Err(TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` iteration count input has type `{iteration_count_type}` but stacked \
@@ -2602,10 +2625,10 @@ fn validate_scan_iteration_count<T: ScanType>(
 /// members among those inputs (refer to [`GuardOperation::for_entry`]), or [`None`] when the actual types prove every
 /// relationship of the boundary. A rule that removes or splits the boundary of a scan stages such a guard first, so
 /// that the relationships which only that boundary checks at runtime (e.g., between an `f32[3]` stack and an iteration
-/// count of type `dimension<length>`) are still checked. The guard pins no identity, so that its outputs carry the
-/// exact facts that its checks prove (e.g., that the iteration count becomes a `dimension<3>`), except that it retains
-/// the identities of its reference members, which cannot be cast (e.g., next to a `ref<f32[length]>` carry, the
-/// iteration count keeps its `length` identity).
+/// count of type `dimension<iteration_count>`) are still checked. The guard pins no identity, so that its outputs carry
+/// the exact facts that its checks prove (e.g., that the iteration count becomes a `dimension<3>`), except that it
+/// retains the identities of its reference members, which cannot be cast (e.g., next to a `ref<f32[iteration_count]>`
+/// carry, the iteration count keeps its `iteration_count` identity).
 fn scan_entry_guard<T: ScanType>(
     declared: &[T],
     actual: &[T],
@@ -2721,8 +2744,8 @@ enum ScanResidual<T: Type> {
 /// `None` when a reference cannot cross the resulting boundary, the split has no known work, or the split needs a known
 /// scan whose iteration count is not known (binding that scan would only stage a second residual scan).
 ///
-/// Computed invariant residuals are hoisted only when the declared length guarantees an iteration. Direct input
-/// forwarding never evaluates body work and remains valid when the length admits zero.
+/// Computed invariant residuals are hoisted only when the declared iteration count guarantees an iteration. Direct
+/// input forwarding never evaluates body work and remains valid when the iteration count admits zero.
 ///
 /// The callers guard the original scan boundary before the split (refer to [`PartialEvaluationContext::guard_inputs`]
 /// and [`scan_entry_guard`]), so the types of `inputs` prove every relationship of that boundary, and neither rebuilt
@@ -2731,16 +2754,16 @@ enum ScanResidual<T: Type> {
 ///
 /// # Parameters
 ///
-///   - `scan`: Source scan, whose length, direction, and lowering attributes both derived scans retain.
+///   - `scan`: Source scan, whose iteration count, direction, and lowering attributes both derived scans retain.
 ///   - `body_input_types`: Full iteration input signature, including the intrinsic index.
 ///   - `inputs`: Source operation values in the binding destinations' shared representation.
 ///   - `body_known`: Converged body input knownness, including the known intrinsic index and paired carry slots.
 ///   - `iteration_count_known`: Whether the iteration count input of a dynamic scan is known (always `true` for a
-///     static length).
-///   - `split_without_known_work`: Whether to rebuild the residual scan even when the known side has no work to
-///     bind (no outputs, effects, hoisted or forwarded values). Partial evaluation keeps such a scan whole instead,
-///     while a linearization has no whole scan to fall back to, because its primal and tangent sides bind in
-///     different contexts (e.g., a scan without outputs linearizes to an empty primal side).
+///     static iteration count).
+///   - `split_without_known_work`: Whether to rebuild the residual scan even when the known side has no work to bind
+///     (no outputs, effects, hoisted or forwarded values). Partial evaluation keeps such a scan whole instead, while a
+///     linearization has no whole scan to fall back to, because its primal and tangent sides bind in different contexts
+///     (e.g., a scan without outputs linearizes to an empty primal side).
 ///   - `partition`: Known and residual body programs with their compact boundary descriptors.
 ///   - `lift_known_fn`: Lifts a body constant into the known binding destination.
 ///   - `resolve_constant_fn`: Returns the constant that a known loop-invariant value denotes, if the residual body may
@@ -2901,7 +2924,7 @@ fn reconstruct_partitioned_scan<
             .position(|&input| input == Some(feeder))
             .map(ScanInvariantSource::Carry)
             .or_else(|| {
-                (scan.length.bounds().lower() > 0 && invariant_atoms[feeder.index()])
+                (scan.iteration_count.bounds().lower() > 0 && invariant_atoms[feeder.index()])
                     .then_some(ScanInvariantSource::Hoisted(feeder))
             });
         if let Some(source) = invariant_source {
@@ -3038,7 +3061,7 @@ fn reconstruct_partitioned_scan<
     // inputs, including under reverse iteration, so rebuilding another loop would only hide their producers. Keep scans
     // with a dynamic iteration count explicit because their outputs may refine the stacked inputs' symbolic extent
     // types.
-    let forwarded_outputs = (matches!(scan.length(), Dimension::Static(_))
+    let forwarded_outputs = (matches!(scan.iteration_count(), Dimension::Static(_))
         && known_carry_count == 0
         && known_body.instructions().is_empty())
     .then(|| {
@@ -3534,8 +3557,8 @@ impl<C: Context<Type: ScanType + DifferentiableType>> FusedScanJvp<C> {
     }
 
     /// Returns the inputs of the fused scan for the input duals `inputs`: the primals and the live tangents in scan
-    /// order, followed by the iteration count of a dynamic-length scan. A carry that the fixed point made live from a
-    /// structural-zero initial tangent receives that zero materialized from its own primal.
+    /// order, followed by the iteration count of a scan with a dynamic iteration count. A carry that the fixed point
+    /// made live from a structural-zero initial tangent receives that zero materialized from its own primal.
     ///
     /// # Errors
     ///
@@ -4407,7 +4430,7 @@ mod tests {
         // Construction defaults to forward iteration without unrolling.
         let operation = TestScanOperation::new(1, 3);
         assert_eq!(operation.carry_count(), 1);
-        assert_eq!(operation.length(), &Dimension::Static(3));
+        assert_eq!(operation.iteration_count(), &Dimension::Static(3));
         assert!(!operation.reverse());
         assert_eq!(operation.unroll(), 1);
 
@@ -4428,10 +4451,10 @@ mod tests {
         assert_eq!(operation.reference_output_identity_input(1), None);
 
         // `Display` renders every semantic field and the unroll factor only when it is greater than 1.
-        assert_eq!(operation.to_string(), "scan [carry_count=1, length=3, reverse=false]");
+        assert_eq!(operation.to_string(), "scan [carry_count=1, iteration_count=3, reverse=false]");
         assert_eq!(
             TestScanOperation::new(2, 4).with_reverse(true).with_unroll(2).unwrap().to_string(),
-            "scan [carry_count=2, length=4, reverse=true, unroll=2]",
+            "scan [carry_count=2, iteration_count=4, reverse=true, unroll=2]",
         );
 
         // Equality and hashing distinguish every semantic field.
@@ -4477,7 +4500,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -4495,7 +4518,7 @@ mod tests {
         let reversed = operation.clone().with_reverse(true);
         assert!(reversed.reverse());
         assert_eq!(reversed.carry_count(), 1);
-        assert_eq!(reversed.length(), &Dimension::Static(3));
+        assert_eq!(reversed.iteration_count(), &Dimension::Static(3));
         assert_eq!(reversed.unroll(), 2);
         assert_eq!(reversed.with_reverse(false), operation);
     }
@@ -4521,12 +4544,12 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let dynamic = ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length)).with_unroll(4).unwrap();
         assert_eq!(dynamic.unroll(), 4);
-        assert_eq!(dynamic.to_string(), "scan [carry_count=1, length=length, reverse=false, unroll=4]");
+        assert_eq!(dynamic.to_string(), "scan [carry_count=1, iteration_count=length, reverse=false, unroll=4]");
 
         // Unrolling preserves every other field.
         let unrolled = TestScanOperation::new(2, 5).with_reverse(true).with_unroll(2).unwrap();
         assert_eq!(unrolled.carry_count(), 2);
-        assert_eq!(unrolled.length(), &Dimension::Static(5));
+        assert_eq!(unrolled.iteration_count(), &Dimension::Static(5));
         assert!(unrolled.reverse());
         assert_eq!(unrolled.unroll(), 2);
     }
@@ -4544,7 +4567,7 @@ mod tests {
         assert_eq!(operation.stacked_axis_shardings(), &[ShardingDimension::sharded(["m"])]);
         assert_eq!(
             operation.to_string(),
-            "scan [carry_count=0, length=2, reverse=false, stacked_axis_shardings=[{'m'}]]"
+            "scan [carry_count=0, iteration_count=2, reverse=false, stacked_axis_shardings=[{'m'}]]"
         );
         assert_ne!(operation, TestScanOperation::new(0, 2));
         assert_eq!(
@@ -4588,7 +4611,7 @@ mod tests {
         let operation = TestScanOperation::new(1, 3).with_reverse(true).with_unroll(3).unwrap();
         let widened = operation.with_added_carries(2);
         assert_eq!(widened.carry_count(), 3);
-        assert_eq!(widened.length(), &Dimension::Static(3));
+        assert_eq!(widened.iteration_count(), &Dimension::Static(3));
         assert!(widened.reverse());
         assert_eq!(widened.unroll(), 3);
         assert_eq!(operation.with_added_carries(0), operation);
@@ -4824,7 +4847,7 @@ mod tests {
             TestScanOperation::new(1, Dimension::Dynamic(length))
                 .infer_output_types(&[scalar_type, stacked_type], interfaces.as_slice()),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             )),
         );
@@ -4832,7 +4855,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn test_scan_type_inference_rejects_unrepresentable_length() {
+    fn test_scan_type_inference_rejects_unrepresentable_iteration_count() {
         // A carry-only scan has no stacked array whose shape would otherwise expose an oversized length, so both type
         // inference and eager interpretation reject the length itself before narrowing the counter to `i64`.
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -4843,7 +4866,7 @@ mod tests {
         );
         let operation = TestScanOperation::new(1, MAX_DIMENSION_EXTENT + 1);
         let expected = TypeError::invalid(format!(
-            "`scan` length {} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
+            "`scan` iteration count {} exceeds the maximum supported extent {MAX_DIMENSION_EXTENT}",
             MAX_DIMENSION_EXTENT + 1,
         ));
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&scalar_type), &[body]), Err(expected.clone()));
@@ -5241,7 +5264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_inference_specializes_renamed_identities_under_dynamic_lengths() {
+    fn test_scan_type_inference_specializes_renamed_identities_under_dynamic_iteration_counts() {
         // Tracing specializes a body declared over `extent` to inputs that rename that identity to `other`, whether the
         // trip count is static or supplied by an iteration count that the stacked input shares its identity with.
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
@@ -5273,7 +5296,7 @@ mod tests {
             trace(ScanOperation::new(1, 3), vec![other_type.clone(), stacked_type(Dimension::Static(3))]),
             Ok(indoc! {"
                 lambda %0:dimension<other ∈ [1, 8)>, %1:f32[3, other] .
-                let %2:dimension<other ∈ [1, 8)>, %3:f32[3, other] = scan [carry_count=1, length=3, reverse=false] \
+                let %2:dimension<other ∈ [1, 8)>, %3:f32[3, other] = scan [carry_count=1, iteration_count=3, reverse=false] \
                  %0 %1 [
                     body={
                         lambda %0:i64[], %1:dimension<other ∈ [1, 8)>, %2:f32[other] .
@@ -5290,7 +5313,7 @@ mod tests {
             ),
             Ok(indoc! {"
                 lambda %0:dimension<other ∈ [1, 8)>, %1:f32[length, other], %2:dimension<length ∈ [1, 5)> .
-                let %3:dimension<other ∈ [1, 8)>, %4:f32[length, other] = scan [carry_count=1, length=length, \
+                let %3:dimension<other ∈ [1, 8)>, %4:f32[length, other] = scan [carry_count=1, iteration_count=length, \
                  reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<other ∈ [1, 8)>, %2:f32[other] .
@@ -5354,7 +5377,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "`scan` iteration count input has type `dimension<unrelated ∈ [1, 5)>` but `scan` length \
+                "`scan` iteration count input has type `dimension<unrelated ∈ [1, 5)>` but `scan` iteration count \
                  requires `length`",
             )),
         );
@@ -5372,7 +5395,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "`scan` iteration count input has type `dimension<7>` but `scan` length requires `length`",
+                "`scan` iteration count input has type `dimension<7>` but `scan` iteration count requires `length`",
             )),
         );
         assert_eq!(
@@ -5453,7 +5476,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:dimension<length ∈ [0, 8)> .
-                let %2:f32[3] = scan [carry_count=1, length=length, reverse=false] %0 %1 [
+                let %2:f32[3] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[length] .
                         let %2:f32[length] = add %1 %1
@@ -5530,7 +5553,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:dimension<length ∈ [0, 8)> .
-                let %2:f32[3] = scan [carry_count=0, length=length, reverse=false] %0 %1 [
+                let %2:f32[3] = scan [carry_count=0, iteration_count=length, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         in (%1)
@@ -5846,7 +5869,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3] .
-                let %5:f64[], %6:f64[], %7:f64[3] = scan [carry_count=2, length=3, reverse=true, unroll=2] %0 %1 %3 [
+                let %5:f64[], %6:f64[], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true, unroll=2] %0 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = add %1 %2
@@ -5874,7 +5897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_boundary_pruning_zero_length() {
+    fn test_scan_boundary_pruning_zero_iteration_count() {
         // Pruning a zero-length scan follows the same liveness through its body even though no iteration executes:
         // the unused carry and stacked output are dropped, and the kept carry returns its initial value.
         let body = scalar_body(3, |builder, inputs| {
@@ -5900,7 +5923,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[0] .
-                let %3:f64[] = scan [carry_count=1, length=0, reverse=false] %0 %2 [
+                let %3:f64[] = scan [carry_count=1, iteration_count=0, reverse=false] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %1 %2
@@ -5987,7 +6010,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[length], %3:dimension<length ∈ [1, 8)> .
-                let %4:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %2 %3 [
+                let %4:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = add %1 %2
@@ -6100,7 +6123,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:dimension<length ∈ [1, 8)> .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = add %1 %1
@@ -6169,7 +6192,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)> .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = add %1 %1
@@ -6187,7 +6210,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:dimension<3> .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = add %1 %1
@@ -6233,7 +6256,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]>, %2:f32[3] .
-                let %3:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = add %1 %2
@@ -6280,7 +6303,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[3]>, %2:dimension<3> .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = add %1 %1
@@ -6329,7 +6352,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:dimension<length ∈ [0, 8)> .
-                let () = scan [carry_count=0, length=length, reverse=false] %0 %1 [
+                let () = scan [carry_count=0, iteration_count=length, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         in ()
@@ -6407,7 +6430,7 @@ mod tests {
             pruned.to_string(),
             indoc! {"
                 lambda %0:f32[n], %1:f32[3] .
-                let %2:f32[3], %3:f32[3] = scan [carry_count=2, length=2, reverse=false] %0 %1 [
+                let %2:f32[3], %3:f32[3] = scan [carry_count=2, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[n], %2:f32[n] .
                         in (%1, %2)
@@ -6471,7 +6494,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[3] .
-                let %3:f32[], %4:f32[], %5:f32[3] = scan [carry_count=2, length=3, reverse=true, unroll=3] %0 %1 %2 [
+                let %3:f32[], %4:f32[], %5:f32[3] = scan [carry_count=2, iteration_count=3, reverse=true, unroll=3] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[] .
                         let %4:f32[] = add %2 %3
@@ -6549,7 +6572,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
                 let %2:ref<f32[]> = reference_new %1
-                    %3:f32[], %4:ref<f32[]>, %5:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %2 [
+                    %3:f32[], %4:ref<f32[]>, %5:f32[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[]> .
                             let %3:f32[] = reference_read %2
@@ -6623,7 +6646,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:f32[], %2:f32[3] = scan [carry_count=1, length=3, reverse=true, unroll=3] %0 [
+                let %1:f32[], %2:f32[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=3] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = const 1.0
@@ -6694,7 +6717,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[3] .
-                let %3:f32[], %4:f32[] = scan [carry_count=2, length=3, reverse=false] %1 %0 %2 [
+                let %3:f32[], %4:f32[] = scan [carry_count=2, iteration_count=3, reverse=false] %1 %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[] .
                         let %4:f32[] = add %2 %3
@@ -6737,7 +6760,7 @@ mod tests {
             closed.program().to_string(),
             indoc! {"
                 lambda  .
-                let %0:f32[2] = scan [carry_count=0, length=2, reverse=true, unroll=2] [
+                let %0:f32[2] = scan [carry_count=0, iteration_count=2, reverse=true, unroll=2] [
                     body={
                         lambda %0:i64[] .
                         let %1:ref<f32[]> = const capture#0:ref<f32[]>
@@ -6752,7 +6775,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:f32[], %2:f32[2] = scan [carry_count=1, length=2, reverse=true, unroll=2] %0 [
+                let %1:f32[], %2:f32[2] = scan [carry_count=1, iteration_count=2, reverse=true, unroll=2] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         in (%1, %1)
@@ -6812,7 +6835,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
-                let %2:f32[], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %2:f32[], %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = const capture#1:f32[]
@@ -6878,7 +6901,7 @@ mod tests {
             closed.program().to_string(),
             indoc! {"
                 lambda  .
-                let %0:f32[2] = scan [carry_count=0, length=2, reverse=false] [
+                let %0:f32[2] = scan [carry_count=0, iteration_count=2, reverse=false] [
                     body={
                         lambda %0:i64[] .
                         let %1:ref<f32[3]> = const capture#0:ref<f32[3]>
@@ -6894,7 +6917,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:i32[] .
-                let %2:f32[3], %3:f32[2] = scan [carry_count=1, length=2, reverse=false] %0 [
+                let %2:f32[3], %3:f32[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:i32[] = const capture#1:i32[]
@@ -6914,7 +6937,7 @@ mod tests {
             resolve_captures(discharged.program(), &captures).to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:i32[] .
-                let %2:f32[3], %3:f32[2] = scan [carry_count=1, length=2, reverse=false] %0 [
+                let %2:f32[3], %3:f32[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:i32[] = const 2
@@ -7012,7 +7035,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[4] .
                 let %2:ref<f32[4]> = reference_new %1
-                    %3:f32[], %4:f32[4] = scan [carry_count=1, length=4, reverse=false] %0 %2 [
+                    %3:f32[], %4:f32[4] = scan [carry_count=1, iteration_count=4, reverse=false] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[4]> .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
@@ -7029,7 +7052,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[4] .
-                let %2:f32[], %3:f32[4], %4:f32[4] = scan [carry_count=2, length=4, reverse=false] %0 %1 [
+                let %2:f32[], %3:f32[4], %4:f32[4] = scan [carry_count=2, iteration_count=4, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[4] .
                         let %3:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -7084,7 +7107,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
-                let %2:f32[], %3:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %1 [
+                let %2:f32[], %3:f32[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3] .
                         let %3:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -7186,7 +7209,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
-                let %2:f32[], %3:f32[3] = scan [carry_count=2, length=3, reverse=true] %0 %1 [
+                let %2:f32[], %3:f32[3] = scan [carry_count=2, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3] .
                         let %3:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -7213,7 +7236,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
                 let %2:ref<f32[3]> = reference_new %1
-                    %3:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %2 [
+                    %3:f32[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                             let %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %0
@@ -7229,7 +7252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_publishes_zero_length_stacked_reference_unchanged() {
+    fn test_scan_reference_discharge_publishes_zero_iteration_count_stacked_reference_unchanged() {
         // A zero-trip scan publishes unchanged reference state without constructing an invalid access to an empty root.
         // Mutation summaries are conservative: a body that writes its per-iteration view publishes the stacked
         // allocation's final state even for a zero-length scan, whose published state is then simply the entering one.
@@ -7289,7 +7312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_preserves_zero_length_state_identity() {
+    fn test_scan_reference_discharge_preserves_zero_iteration_count_state_identity() {
         // A zero-length scan never runs the body that would update its reference carry, so the discharged state carry
         // publishes the entering state unchanged as the allocation's final state.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
@@ -7334,7 +7357,7 @@ mod tests {
             source.to_string(),
             indoc! {"
                 lambda %0:ref<f32[]> .
-                let %1:ref<f32[]>, %2:f32[0] = scan [carry_count=1, length=0, reverse=false] %0 [
+                let %1:ref<f32[]>, %2:f32[0] = scan [carry_count=1, iteration_count=0, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]> .
                         let %2:f32[] = const 1.0
@@ -7351,7 +7374,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:f32[], %2:f32[0] = scan [carry_count=1, length=0, reverse=false] %0 [
+                let %1:f32[], %2:f32[0] = scan [carry_count=1, iteration_count=0, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = const 1.0
@@ -7376,7 +7399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_builds_refined_zero_length_stacks() {
+    fn test_scan_reference_discharge_builds_refined_zero_iteration_count_stacks() {
         // A zero-length scan whose stacked reference reaches a nested `condition` whole is a carried root, so discharge
         // builds its outputs without running or lowering its body. The empty stacked output takes the scan's inferred
         // output types: a static `f32[3]` carry input refines the stacked `f32[rows]` slices to the type `f32[0, 3]`.
@@ -7448,7 +7471,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[0] .
                 let %3:ref<f32[0]> = reference_new %2
-                    %4:f32[], %5:f32[3], %6:f32[0, 3] = scan [carry_count=2, length=0, reverse=false] %0 %1 %3 [
+                    %4:f32[], %5:f32[3], %6:f32[0, 3] = scan [carry_count=2, iteration_count=0, reverse=false] %0 %1 %3 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[rows], %3:ref<f32[0]> .
                             let %4:bool[] = const true
@@ -7491,7 +7514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_dynamic_length() {
+    fn test_scan_reference_discharge_dynamic_iteration_count() {
         // A dynamic-length scan carries one iteration count instruction input after the body's inputs, so the scan
         // discharge rule's arity validation must accept the one-past-body parent arity instead of rejecting the
         // canonical dynamic form.
@@ -7543,7 +7566,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:dimension<length ∈ [1, 9)> .
                 let %2:ref<f32[]> = reference_new %0
-                    %3:ref<f32[]> = scan [carry_count=1, length=length, reverse=false] %2 %1 [
+                    %3:ref<f32[]> = scan [carry_count=1, iteration_count=length, reverse=false] %2 %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]> .
                             let %2:f32[] = const 3.0
@@ -7559,7 +7582,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:dimension<length ∈ [1, 9)> .
-                let %2:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = const 3.0
@@ -7579,7 +7602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_dynamic_length_with_an_empty_reference_carry() {
+    fn test_scan_reference_discharge_dynamic_iteration_count_with_an_empty_reference_carry() {
         // The body indexes an empty reference carry with its index, which is valid only when no iteration runs. A
         // iteration count that admits iterations keeps the body, whose discharged access would slice the empty axis, so
         // discharge (which every compiled execution performs before lowering) rejects the scan with that typed error
@@ -7620,7 +7643,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[0], %2:dimension<length ∈ [0, 8)> .
                 let %3:ref<f32[0]> = reference_new %1
-                    %4:f32[], %5:ref<f32[0]> = scan [carry_count=2, length=length, reverse=false] %0 %3 %2 [
+                    %4:f32[], %5:ref<f32[0]> = scan [carry_count=2, iteration_count=length, reverse=false] %0 %3 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[0]> .
                             let %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %0
@@ -7651,7 +7674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_preserves_zero_length_dimension_identities() {
+    fn test_scan_reference_discharge_preserves_zero_iteration_count_dimension_identities() {
         // Both the trip count and a slice dimension retain their nominal identities despite zero-trip elision.
         // The unreachable empty-root access is through a declared carry, not an optimized stacked reference. The
         // `rows` carry relates to the `f32[rows]` carry through the program inputs that share `rows`, so program entry
@@ -7737,7 +7760,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_zero_length_preserves_entry_relationships() {
+    fn test_scan_reference_discharge_zero_iteration_count_preserves_entry_relationships() {
         // A zero-trip scan still validates its entering carries: here, a renamed dimension constant of extent 2 must
         // agree with the referent of the `ref<f32[n]>` carry allocated from the program input. An empty reference
         // carry lets discharge elide the scan, which must not remove that validation: an entry guard over the
@@ -7836,7 +7859,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_zero_length_guards_preserved_reference_members() {
+    fn test_scan_reference_discharge_zero_iteration_count_guards_preserved_reference_members() {
         // As in `test_scan_reference_discharge_zero_length_preserves_entry_relationships`, a constant `f32[2]` carry
         // must agree with the referent of the `ref<f32[n]>` carry allocated from the program input, and discharging the
         // empty reference carry elides the zero-trip scan. Here, partial discharge preserves the `ref<f32[n]>` carry,
@@ -7903,7 +7926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_zero_length_recovers_output_shapes() {
+    fn test_scan_reference_discharge_zero_iteration_count_recovers_output_shapes() {
         // A zero-trip scan with an empty reference carry is elided by discharge, which allocates its empty stacked
         // output from an extent read off its other carries. Here the extent `rows` is the leading axis of an
         // `f32[rows]` array carry.
@@ -8052,7 +8075,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[0], %1:f32[rows] .
                 let %2:ref<f32[rows]> = reference_new %1
-                    %3:f32[0], %4:ref<f32[rows]>, %5:f32[0, rows] = scan [carry_count=2, length=0, reverse=false] %0 \
+                    %3:f32[0], %4:ref<f32[rows]>, %5:f32[0, rows] = scan [carry_count=2, iteration_count=0, reverse=false] %0 \
                     %2 [
                         body={
                             lambda %0:i64[], %1:f32[0], %2:ref<f32[rows]> .
@@ -8128,7 +8151,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3, 3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3, 3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:f32[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -8197,7 +8220,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[2, 3] .
-                let %1:f32[2, 3], %2:f32[2, 2] = scan [carry_count=1, length=2, reverse=false] %0 [
+                let %1:f32[2, 3], %2:f32[2, 2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[2, 3] .
                         let %2:f32[2, 1] = dynamic_slice [sizes=[2, 1]] %1 %0 %0
@@ -8228,7 +8251,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3] .
                 let %1:ref<f32[3]> = reference_new %0
-                    %2:f32[3] = scan [carry_count=0, length=3, reverse=false] %1 [
+                    %2:f32[3] = scan [carry_count=0, iteration_count=3, reverse=false] %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[3]> .
                             let %2:bool[] = const true
@@ -8253,7 +8276,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:bool[] = const true
@@ -8293,7 +8316,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3] .
                 let %1:ref<f32[3]> = reference_new %0
-                    %2:f32[3] = scan [carry_count=0, length=3, reverse=false] %1 [
+                    %2:f32[3] = scan [carry_count=0, iteration_count=3, reverse=false] %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[3]> .
                             let %2:bool[] = const true
@@ -8321,7 +8344,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:bool[] = const true
@@ -8370,7 +8393,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3], %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:f32[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -8391,7 +8414,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[3] .
-                let %2:f32[3], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f32[3], %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[3], %2:f32[] .
                         let %3:f32[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -8432,7 +8455,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[0] .
                 let %1:ref<f32[0]> = reference_new %0
-                    %2:f32[0] = scan [carry_count=0, length=0, reverse=false] %1 [
+                    %2:f32[0] = scan [carry_count=0, iteration_count=0, reverse=false] %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[0]> .
                             let %2:bool[] = const true
@@ -8513,7 +8536,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3]@Host[Pinned] .
                 let %1:ref<f32[3]@Host[Pinned]> = reference_new %0
-                    %2:f32[3]@Host[Pinned] = scan [carry_count=0, length=3, reverse=false] %1 [
+                    %2:f32[3]@Host[Pinned] = scan [carry_count=0, iteration_count=3, reverse=false] %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[3]@Host[Pinned]> .
                             let %2:i64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %0
@@ -8529,7 +8552,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3]@Host[Pinned] .
-                let %1:f32[3]@Host[Pinned], %2:f32[3]@Host[Pinned] = scan [carry_count=1, length=3, reverse=false] \
+                let %1:f32[3]@Host[Pinned], %2:f32[3]@Host[Pinned] = scan [carry_count=1, iteration_count=3, reverse=false] \
                 %0 [
                     body={
                         lambda %0:i64[], %1:f32[3]@Host[Pinned] .
@@ -8611,7 +8634,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:f32[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -8676,7 +8699,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3], %2:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                let %1:f32[3], %2:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f32[3] .
                         let %2:f32[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -8779,7 +8802,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[3] .
-                let %3:f32[], %4:f32[3], %5:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %1 %2 [
+                let %3:f32[], %4:f32[3], %5:f32[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3], %3:f32[] .
                         let %4:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -8808,7 +8831,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[3], %3:dimension<3> .
-                let %4:f32[], %5:f32[3], %6:f32[3] = scan [carry_count=2, length=length, reverse=false] %0 %1 %2 %3 [
+                let %4:f32[], %5:f32[3], %6:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3], %3:f32[] .
                         let %4:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -8847,7 +8870,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[3] .
-                let %2:f32[3], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f32[3], %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[3], %2:f32[] .
                         let %3:f32[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -8904,7 +8927,7 @@ mod tests {
             closed.discharge_references().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:f32[] .
-                let %2:f32[], %3:f32[3] = scan [carry_count=2, length=3, reverse=false] %1 %0 [
+                let %2:f32[], %3:f32[3] = scan [carry_count=2, iteration_count=3, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3] .
                         in (%1, %2)
@@ -9078,7 +9101,7 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             ))),
         );
@@ -9396,7 +9419,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2][sharding={mesh<['m'=1:manual, 'a'=1:auto]>, [{}]}] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, length=2, reverse=false, \
+                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false, \
                 stacked_axis_shardings=[{'m', 'a'}]] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
@@ -9516,7 +9539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_interpretation_validates_concrete_dynamic_stack_lengths() {
+    fn test_scan_interpretation_validates_concrete_dynamic_stack_iteration_counts() {
         // A concrete stack that shares the identity of the dynamic length must have the extent of the iteration count,
         // so both program replay and direct eager binding run a matching application and reject a mismatched one.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
@@ -9676,7 +9699,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
                 let %2:ref<f32[3]> = reference_new %1
-                    %3:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %2 [
+                    %3:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
@@ -9889,7 +9912,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -9914,7 +9937,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=false] %1 %0 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -9994,7 +10017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_splits_zero_length_scans_without_probing_the_body() {
+    fn test_scan_partial_evaluation_splits_zero_iteration_count_scans_without_probing_the_body() {
         // A zero-length scan runs no iteration, so partial evaluation must not evaluate its body's known work outside
         // the loop: the split keeps the division by the known zero carry in the zero-trip known scan, which stacks it
         // as an empty residual edge, and never hoists it (signed array division by zero would yield -1, but no slice
@@ -10031,7 +10054,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:i32[0], %1:i32[0] .
-                let %2:i32[0] = scan [carry_count=0, length=0, reverse=false] %0 %1 [
+                let %2:i32[0] = scan [carry_count=0, iteration_count=0, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:i32[], %2:i32[] .
                         let %3:i32[] = mul %2 %1
@@ -10093,7 +10116,7 @@ mod tests {
             known_program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[], %2:f64[3] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 [
+                let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         let %2:f64[] = print [label=scale] %1
@@ -10110,7 +10133,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3] .
-                let %3:f64[], %4:f64[3] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 %1 %2 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %3 %2
@@ -10153,7 +10176,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, length=2, reverse=false] %1 %0 [
+                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = print [label=known] %1
@@ -10197,7 +10220,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, length=2, reverse=false] %1 %0 [
+                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = print [label=known] %1
@@ -10246,7 +10269,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let () = scan [carry_count=0, length=3, reverse=false] %0 [
+                let () = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         let %2:f64[] = print [label=x] %1
@@ -10302,7 +10325,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 %1 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = const 4.0
@@ -10360,7 +10383,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:dimension<3> .
-                let %1:dimension<3> = scan [carry_count=1, length=2, reverse=false] %0 [
+                let %1:dimension<3> = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:dimension<3> .
                         in (%1)
@@ -10387,7 +10410,7 @@ mod tests {
         );
         let residual = indoc! {"
             lambda %0:f64[], %1:i64[2] .
-            let %2:f64[], %3:f64[2] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+            let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                 body={
                     lambda %0:i64[], %1:f64[], %2:i64[] .
                     let %3:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %2
@@ -10449,7 +10472,7 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:u64[] .
-                let %1:u64[], %2:i64[2] = scan [carry_count=1, length=2, reverse=false] %0 [
+                let %1:u64[], %2:i64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:u64[] .
                         let %2:u64[] = const 1
@@ -10665,7 +10688,7 @@ mod tests {
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[3], %2:f32[2, 3] .
                 let %3:f32[3], %4:f32[3] = guard [boundary="partial evaluation", declared_types=[f32[n], f32[n]]] %1 %0
-                    %5:f32[3] = scan [carry_count=1, length=2, reverse=false] %4 %2 [
+                    %5:f32[3] = scan [carry_count=1, iteration_count=2, reverse=false] %4 %2 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[3] .
                             let %3:f32[3] = add %1 %2
@@ -10705,7 +10728,7 @@ mod tests {
                     declared_types=[f32[n], f32[n]],
                     retained_identities=[n],
                 ] %1 %0
-                    %5:f32[n] = scan [carry_count=1, length=2, reverse=false] %4 %2 [
+                    %5:f32[n] = scan [carry_count=1, iteration_count=2, reverse=false] %4 %2 [
                         body={
                             lambda %0:i64[], %1:f32[n], %2:f32[n] .
                             let %3:f32[n] = add %1 %2
@@ -10770,7 +10793,7 @@ mod tests {
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[n] .
                 let %2:f32[n], %3:f32[n] = guard [boundary="partial evaluation", declared_types=[f32[n], f32[n]]] %1 %0
-                    %4:f32[n], %5:f32[2, n] = scan [carry_count=1, length=2, reverse=false] %1 [
+                    %4:f32[n], %5:f32[2, n] = scan [carry_count=1, iteration_count=2, reverse=false] %1 [
                         body={
                             lambda %0:i64[], %1:f32[n] .
                             let %2:f32[n] = print [label=known] %1
@@ -10778,7 +10801,7 @@ mod tests {
                             in (%3, %1)
                         },
                     ]
-                    %6:f32[n] = scan [carry_count=1, length=2, reverse=false] %3 %5 [
+                    %6:f32[n] = scan [carry_count=1, iteration_count=2, reverse=false] %3 %5 [
                         body={
                             lambda %0:i64[], %1:f32[n], %2:f32[n] .
                             let %3:f32[n] = add %1 %2
@@ -10869,11 +10892,11 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<length ∈ [1, 8)>, %1:f32[], %2:f32[3] .
-                let %3:dimension<length ∈ [1, 8)>, %4:f32[], %5:f32[3] = scan [carry_count=3, length=2, \
+                let %3:dimension<length ∈ [1, 8)>, %4:f32[], %5:f32[3] = scan [carry_count=3, iteration_count=2, \
                  reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<length ∈ [1, 8)>, %2:f32[], %3:f32[3] .
-                        let %4:f32[] = scan [carry_count=1, length=length, reverse=false] %2 %3 %1 [
+                        let %4:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %3 %1 [
                             body={
                                 lambda %0:i64[], %1:f32[], %2:f32[] .
                                 let %3:f32[] = add %1 %2
@@ -10907,7 +10930,7 @@ mod tests {
                 known_program.to_string(),
                 indoc! {"
                     lambda %0:dimension<length ∈ [1, 8)>, %1:f32[3] .
-                    let %2:dimension<length ∈ [1, 8)>, %3:f32[3], %4:i64[2] = scan [carry_count=2, length=2, \
+                    let %2:dimension<length ∈ [1, 8)>, %3:f32[3], %4:i64[2] = scan [carry_count=2, iteration_count=2, \
                      reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:dimension<length ∈ [1, 8)>, %2:f32[3] .
@@ -10926,11 +10949,11 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:i64[2] .
-                let %3:f32[3], %4:f32[] = scan [carry_count=2, length=2, reverse=false] %1 %0 %2 [
+                let %3:f32[3], %4:f32[] = scan [carry_count=2, iteration_count=2, reverse=false] %1 %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[3], %2:f32[], %3:i64[] .
                         let %4:dimension<3> = dimension_from_scalar [bounds=[3, 4)] %3
-                            %5:f32[] = scan [carry_count=1, length=length, reverse=false] %2 %1 %4 [
+                            %5:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %1 %4 [
                                 body={
                                     lambda %0:i64[], %1:f32[], %2:f32[] .
                                     let %3:f32[] = add %1 %2
@@ -10956,12 +10979,12 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:i64[2] .
-                let %2:f32[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:i64[] .
                         let %3:dimension<3> = dimension_from_scalar [bounds=[3, 4)] %2
                             %4:f32[3] = const [1.0, 2.0, 3.0]
-                            %5:f32[] = scan [carry_count=1, length=length, reverse=false] %1 %4 %3 [
+                            %5:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %1 %4 %3 [
                                 body={
                                     lambda %0:i64[], %1:f32[], %2:f32[] .
                                     let %3:f32[] = add %1 %2
@@ -11216,7 +11239,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[4], %2:f64[], %3:f64[] .
-                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, length=4, reverse=false] %2 %3 %0 \
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, iteration_count=4, reverse=false] %2 %3 %0 \
                  %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -11303,7 +11326,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %1 %2
@@ -11354,7 +11377,7 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = scan [carry_count=0, length=3, reverse=true, unroll=2] %0 [
+                let %1:f64[3] = scan [carry_count=0, iteration_count=3, reverse=true, unroll=2] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         let %2:f64[] = mul %1 %1
@@ -11375,7 +11398,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %1 %2
@@ -11417,7 +11440,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         in (%2)
@@ -11466,7 +11489,7 @@ mod tests {
             evaluation.program.to_string(),
             formatdoc! {"
                 lambda %0:{scalar}, %1:{stack} .
-                let %2:{scalar}, %3:{stack} = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:{scalar}, %3:{stack} = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={{
                         lambda %0:i64[], %1:{scalar}, %2:{scalar} .
                         let %3:{scalar} = mul %1 %2
@@ -11492,14 +11515,14 @@ mod tests {
             combined.to_string(),
             formatdoc! {"
                 lambda %0:{stack}, %2:{scalar} .
-                let %1:{stack} = scan [carry_count=0, length=3, reverse=false] %0 [
+                let %1:{stack} = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={{
                         lambda %0:i64[], %1:{scalar} .
                         let %2:{scalar} = sin %1
                         in (%2)
                     }},
                 ]
-                    %3:{scalar}, %4:{stack} = scan [carry_count=1, length=3, reverse=false] %2 %1 [
+                    %3:{scalar}, %4:{stack} = scan [carry_count=1, iteration_count=3, reverse=false] %2 %1 [
                         body={{
                             lambda %0:i64[], %1:{scalar}, %2:{scalar} .
                             let %3:{scalar} = mul %1 %2
@@ -11559,7 +11582,7 @@ mod tests {
             evaluation.program.to_string(),
             formatdoc! {"
                 lambda %0:{scalar}, %1:{stack}, %2:{scalar} .
-                let %3:{scalar}, %4:{scalar} = scan [carry_count=2, length=3, reverse=false] %2 %0 %1 [
+                let %3:{scalar}, %4:{scalar} = scan [carry_count=2, iteration_count=3, reverse=false] %2 %0 %1 [
                     body={{
                         lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar} .
                         let %4:{scalar} = mul %1 %3
@@ -11591,7 +11614,7 @@ mod tests {
             formatdoc! {"
                 lambda %0:{scalar}, %2:{scalar}, %3:{stack} .
                 let %1:{scalar} = mul %0 %0
-                    %4:{scalar}, %5:{scalar} = scan [carry_count=2, length=3, reverse=false] %1 %2 %3 [
+                    %4:{scalar}, %5:{scalar} = scan [carry_count=2, iteration_count=3, reverse=false] %1 %2 %3 [
                         body={{
                             lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar} .
                             let %4:{scalar} = mul %1 %3
@@ -11620,7 +11643,7 @@ mod tests {
             evaluation.program.to_string(),
             formatdoc! {"
                 lambda %0:{scalar}, %1:{stack} .
-                let %2:{scalar} = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:{scalar} = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={{
                         lambda %0:i64[], %1:{scalar}, %2:{scalar} .
                         let %3:{scalar} = const 4.0
@@ -11712,7 +11735,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
-                let %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, length=3, reverse=false] %2 %0 %1 [
+                let %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] %2 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %1 %3
@@ -11795,7 +11818,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
-                let %3:f64[], %4:f64[] = scan [carry_count=2, length=3, reverse=false] %2 %0 %1 [
+                let %3:f64[], %4:f64[] = scan [carry_count=2, iteration_count=3, reverse=false] %2 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = add %2 %1
@@ -11850,7 +11873,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[2, 3], %1:f64[3] .
-                let %2:f64[3], %3:f64[2, 3] = scan [carry_count=1, length=2, reverse=false] %1 %0 [
+                let %2:f64[3], %3:f64[2, 3] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3] .
                         let %3:f64[3] = add %1 %2
@@ -11872,7 +11895,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3] .
-                let %2:f64[3] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f64[3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3] .
                         let %3:f64[3] = add %1 %2
@@ -11900,7 +11923,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3] .
-                let %2:f64[3] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f64[3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3] .
                         let %3:f64[3] = add %1 %2
@@ -11922,7 +11945,7 @@ mod tests {
             known_program.to_string(),
             indoc! {"
                 lambda %0:f64[2, 3] .
-                let %1:f64[2, 3] = scan [carry_count=0, length=2, reverse=false] %0 [
+                let %1:f64[2, 3] = scan [carry_count=0, iteration_count=2, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f64[3] .
                         let %2:f64[3] = mul %1 %1
@@ -11962,7 +11985,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, length=2, reverse=false] %1 %0 [
+                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -12037,7 +12060,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = print [label=x] %2
@@ -12088,7 +12111,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3] .
-                let %1:f64[3] = scan [carry_count=0, length=3, reverse=false] %0 [
+                let %1:f64[3] = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         in (%1)
@@ -12133,7 +12156,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[3] .
-                let %2:f64[3] = scan [carry_count=0, length=3, reverse=false] %0 %1 [
+                let %2:f64[3] = scan [carry_count=0, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %2 %1
@@ -12179,7 +12202,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f64[], %1:f64[3] .
-                    let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                    let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[] .
                             let %3:f64[] = add %1 %2
@@ -12190,7 +12213,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[3] .
-                    let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                    let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[] .
                             let %3:f64[] = mul %1 %2
@@ -12229,7 +12252,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[3] .
-                let %2:f64[3] = scan [carry_count=0, length=3, reverse=false] %0 %1 [
+                let %2:f64[3] = scan [carry_count=0, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %2 %1
@@ -12290,7 +12313,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %1 %2
@@ -12336,7 +12359,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %1 %2
@@ -12348,7 +12371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_keeps_known_scans_of_dynamic_length_that_forward_stacked_outputs() {
+    fn test_scan_partial_evaluation_keeps_known_scans_of_dynamic_iteration_count_that_forward_stacked_outputs() {
         // The same coefficient-only known side under an iteration count keeps an explicit known scan, because the
         // outputs of a scan with a dynamic iteration count may refine the symbolic extent types of its stacked inputs.
         // The known scan is staged into the outer trace over the known stack and iteration count, while the residual
@@ -12408,7 +12431,7 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f32[length], %1:dimension<length ∈ [1, 8)> .
-                let %2:f32[length] = scan [carry_count=0, length=length, reverse=false] %0 %1 [
+                let %2:f32[length] = scan [carry_count=0, iteration_count=length, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         in (%1)
@@ -12429,7 +12452,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)> .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = add %1 %2
@@ -12471,7 +12494,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3] .
-                let %3:f64[], %4:f64[] = scan [carry_count=2, length=3, reverse=false] %0 %1 %2 [
+                let %3:f64[], %4:f64[] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %1 %3
@@ -12518,7 +12541,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
-                let %3:f64[], %4:f64[] = scan [carry_count=2, length=3, reverse=false] %2 %0 %1 [
+                let %3:f64[], %4:f64[] = scan [carry_count=2, iteration_count=3, reverse=false] %2 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %1 %3
@@ -12533,7 +12556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_dynamic_length() {
+    fn test_scan_partial_evaluation_dynamic_iteration_count() {
         // A dynamic-length array IR scan folds its loop-invariant known carry like a static one, and the rewritten
         // residual scan keeps the dynamic length and its trailing iteration count input. The body maps
         // `[scale, accumulator, x]` to `[scale, accumulator + scale * x, scale * x]`.
@@ -12596,7 +12619,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)> .
-                let %3:f32[], %4:f32[length] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %3:f32[], %4:f32[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = const 2.0
@@ -12627,7 +12650,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_dynamic_length_hoists_computed_invariants() {
+    fn test_scan_partial_evaluation_dynamic_iteration_count_hoists_computed_invariants() {
         // An iteration count whose bounds exclude zero guarantees an iteration, so the split hoists computed invariant
         // work as for a static length. The body maps `[scale, accumulator, x]` to
         // `[scale, accumulator + (scale * scale) * x]` over a known passed-through `scale`: the outer trace computes
@@ -12722,7 +12745,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)>, %3:f32[] .
-                let %4:f32[], %5:f32[] = scan [carry_count=2, length=length, reverse=false] %3 %0 %1 %2 [
+                let %4:f32[], %5:f32[] = scan [carry_count=2, iteration_count=length, reverse=false] %3 %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[] .
                         let %4:f32[] = mul %1 %3
@@ -12746,7 +12769,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_dynamic_length_that_admits_zero() {
+    fn test_scan_partial_evaluation_dynamic_iteration_count_that_admits_zero() {
         // Neither a known zero trip count nor an unknown trip count that admits zero may evaluate the body's
         // division by a known zero carry during specialization. The body is never executed when the count is zero.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -12807,7 +12830,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:i32[0], %1:i32[0], %2:dimension<0> .
-                let %3:i32[0] = scan [carry_count=0, length=length, reverse=false] %0 %1 %2 [
+                let %3:i32[0] = scan [carry_count=0, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:i32[], %2:i32[] .
                         let %3:i32[] = mul %2 %1
@@ -12850,7 +12873,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:i32[length], %1:dimension<length ∈ [0, 8)>, %2:i32[] .
-                let %3:i32[], %4:i32[length] = scan [carry_count=1, length=length, reverse=false] %2 %0 %1 [
+                let %3:i32[], %4:i32[length] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %0 %1 [
                     body={
                         lambda %0:i64[], %1:i32[], %2:i32[] .
                         let %3:i32[] = const 1
@@ -12917,7 +12940,7 @@ mod tests {
                     boundary="partial evaluation",
                     declared_types=[f32[length], dimension<length ∈ [1, 8)>],
                 ] %0 %1
-                    %5:f32[] = scan [carry_count=1, length=length, reverse=false] %2 %3 %1 [
+                    %5:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %3 %1 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[] .
                             let %3:f32[] = add %1 %2
@@ -12956,7 +12979,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<3> .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = add %1 %2
@@ -13035,7 +13058,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:dimension<length ∈ [0, 8)>, %2:f32[length] .
-                let %3:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %2 %1 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %2 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = mul %2 %2
@@ -13093,7 +13116,7 @@ mod tests {
                     boundary="partial evaluation",
                     declared_types=[f32[length], dimension<length ∈ [1, 8)>],
                 ] %2 %1
-                    %5:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %4 [
+                    %5:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %4 [
                         body={
                             lambda %0:i64[], %1:f32[] .
                             let %2:f32[] = mul %1 %1
@@ -13163,7 +13186,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:ref<f32[]> .
-                let %2:ref<f32[]> = scan [carry_count=1, length=3, reverse=false] %1 %0 [
+                let %2:ref<f32[]> = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[] .
                         let %3:f32[] = const 1.0
@@ -13201,7 +13224,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3], %1:f32[3] .
                 let %2:ref<f32[3]> = reference_new %0
-                    %3:ref<f32[3]>, %4:f32[3] = scan [carry_count=1, length=3, reverse=false] %2 %2 %1 [
+                    %3:ref<f32[3]>, %4:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %2 %2 %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[3]>, %2:ref<f32[3]>, %3:f32[] .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %1 %3 %0
@@ -13230,7 +13253,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[3], %1:f32[3] .
                 let %2:ref<f32[3]> = reference_new %1
-                    %3:ref<f32[3]>, %4:f32[3] = scan [carry_count=1, length=3, reverse=false] %2 %2 %0 [
+                    %3:ref<f32[3]>, %4:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %2 %2 %0 [
                         body={
                             lambda %0:i64[], %1:ref<f32[3]>, %2:ref<f32[3]>, %3:f32[] .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %1 %3 %0
@@ -13287,7 +13310,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f32[2], %1:ref<f32[3]> .
-                let %2:ref<f32[3]> = scan [carry_count=1, length=2, reverse=false] %1 [
+                let %2:ref<f32[3]> = scan [carry_count=1, iteration_count=2, reverse=false] %1 [
                     body={
                         lambda %0:i64[], %1:ref<f32[3]> .
                         let %2:f32[3] = reference_read %1
@@ -13333,7 +13356,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[3]> .
-                let %2:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                         let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
@@ -13373,7 +13396,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:ref<f32[3]>, %1:f32[] .
-                let %2:f32[] = scan [carry_count=1, length=3, reverse=false] %1 %0 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %0 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                         let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
@@ -13610,7 +13633,7 @@ mod tests {
                 let %4:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %0
                     %5:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %1
                     %6:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %2
-                    %7:f64[2], %8:f64[2], %9:f64[2], %10:f64[3, 2] = scan [carry_count=3, length=3, \
+                    %7:f64[2], %8:f64[2], %9:f64[2], %10:f64[3, 2] = scan [carry_count=3, iteration_count=3, \
                      reverse=false] %4 %5 %6 %3 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2], %3:f64[2], %4:f64[2] .
@@ -13720,7 +13743,7 @@ mod tests {
                 lambda %0:f64[3, 2], %1:f64[3] .
                 let %2:f64[2, 3] = transpose [permutation=[1, 0]] %0
                     %3:f64[2, 3] = broadcast [output_type=f64[2, 3], output_axes=[1]] %1
-                    %4:f64[2, 3], %5:f64[2, 3] = scan [carry_count=2, length=2, reverse=false] %2 %3 [
+                    %4:f64[2, 3], %5:f64[2, 3] = scan [carry_count=2, iteration_count=2, reverse=false] %2 %3 [
                         body={
                             lambda %0:i64[], %1:f64[2, 3], %2:f64[2, 3] .
                             let %3:f64[2, 3] = add %2 %1
@@ -13774,7 +13797,7 @@ mod tests {
                 lambda %0:f64[], %1:f64[2, 3] .
                 let %2:f64[3, 2] = transpose [permutation=[1, 0]] %1
                     %3:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %0
-                    %4:f64[2], %5:f64[3, 2] = scan [carry_count=1, length=3, reverse=true, unroll=2] %3 %2 [
+                    %4:f64[2], %5:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %3 %2 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2] .
                             let %3:f64[2] = mul %1 %2
@@ -13840,7 +13863,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[3, 2] .
-                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[2], %2:f64[2] .
                         let %3:f64[2] = mul %1 %2
@@ -13892,7 +13915,7 @@ mod tests {
                 lambda %0:f64[], %1:f64[2, 3] .
                 let %2:f64[3, 2] = transpose [permutation=[1, 0]] %1
                     %3:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %0
-                    %4:f64[2], %5:f64[3, 2] = scan [carry_count=1, length=3, reverse=false] %3 %2 [
+                    %4:f64[2], %5:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=false] %3 %2 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2] .
                             let %3:f64[2] = mul %1 %2
@@ -13904,7 +13927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_zero_length() {
+    fn test_scan_batching_zero_iteration_count() {
         // A zero-length scan batched under a staging parent still batches its body structurally: the carry keeps its
         // mapped axis, the stacked carry output is mapped behind the leading scan dimension, and the stacked constant
         // output stays replicated.
@@ -13951,7 +13974,7 @@ mod tests {
             program.to_string(),
             indoc! {r#"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %1:f64[0][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                let %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %3:f64[0, 2][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}], %4:f64[0][sharding={mesh<['x'=2:explicit]>, [{}]}] = scan [carry_count=1, length=0, reverse=false] %0 %1 [
+                let %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %3:f64[0, 2][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}], %4:f64[0][sharding={mesh<['x'=2:explicit]>, [{}]}] = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[2][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %2:f64[][sharding={mesh<['x'=2:explicit]>, []}] .
                         let %3:f64[][sharding={mesh<['x'=2:explicit]>, []}] = const 7.0
@@ -13992,7 +14015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_batching_zero_length_with_manual_axes() {
+    fn test_scan_batching_zero_iteration_count_with_manual_axes() {
         // A zero-length scan over values that vary over a manual mesh axis batches its body structurally like one over
         // explicit mesh axes: the carry and the stacked carry output keep the carry's manual variation, while the
         // stacked constant output stays replicated and invariant.
@@ -14042,7 +14065,7 @@ mod tests {
             program.to_string(),
             indoc! {r#"
                 lambda %0:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %1:f64[0][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                let %2:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %3:f64[0, 2][sharding={mesh<['x'=2:manual]>, [{}, {'x'}], varying_manual={'x'}}], %4:f64[0][sharding={mesh<['x'=2:manual]>, [{}]}] = scan [carry_count=1, length=0, reverse=false] %0 %1 [
+                let %2:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %3:f64[0, 2][sharding={mesh<['x'=2:manual]>, [{}, {'x'}], varying_manual={'x'}}], %4:f64[0][sharding={mesh<['x'=2:manual]>, [{}]}] = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], %2:f64[][sharding={mesh<['x'=2:manual]>, []}] .
                         let %3:f64[][sharding={mesh<['x'=2:manual]>, []}] = const 7.0
@@ -14267,7 +14290,7 @@ mod tests {
                     output_axes=[],
                 ] %0
                     %3:{transposed} = transpose [permutation=[1, 0]] %1
-                    %4:{vector}, %5:{transposed} = scan [carry_count=1, length=3, reverse=false] %2 %3 [
+                    %4:{vector}, %5:{transposed} = scan [carry_count=1, iteration_count=3, reverse=false] %2 %3 [
                         body={{
                             lambda %0:i64[], %1:{vector}, %2:{vector} .
                             let %3:{vector} = add %1 %2
@@ -14417,7 +14440,7 @@ mod tests {
                             %4:{invariant_matrix} = broadcast [output_axes=[1], output_sharding={replicated_matrix}] \
                 %0 %2 %3
                             %5:{slices} = transpose [permutation=[1, 0, 2]] %1
-                            %6:dimension<2>, %7:{invariant_matrix}, %8:{slices} = scan [carry_count=2, length=3, \
+                            %6:dimension<2>, %7:{invariant_matrix}, %8:{slices} = scan [carry_count=2, iteration_count=3, \
                 reverse=false] %2 %4 %5 [
                                 body={{
                                     lambda %0:i64[], %1:dimension<2>, %2:{invariant_matrix}, %3:{varying_matrix} .
@@ -14523,7 +14546,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[], %2:f32[length, 2], %3:dimension<length ∈ [1, 8)> .
                 let %4:f32[2] = broadcast [output_axes=[]] %1 %0
-                    %5:dimension<2>, %6:f32[2], %7:f32[length, 2] = scan [carry_count=2, length=length, \
+                    %5:dimension<2>, %6:f32[2], %7:f32[length, 2] = scan [carry_count=2, iteration_count=length, \
                      reverse=true, unroll=2] %0 %4 %2 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2] .
@@ -14599,7 +14622,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[length, 2], %3:dimension<length ∈ [1, 8)> .
-                let %4:dimension<2>, %5:f32[2], %6:f32[length, 2] = scan [carry_count=2, length=length, \
+                let %4:dimension<2>, %5:f32[2], %6:f32[length, 2] = scan [carry_count=2, iteration_count=length, \
                  reverse=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2] .
@@ -14721,7 +14744,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2, 3], %2:f32[n] .
-                let %3:dimension<2>, %4:f32[2, 3], %5:f32[3] = scan [carry_count=3, length=2, reverse=false] %0 %1 %2 [
+                let %3:dimension<2>, %4:f32[2, 3], %5:f32[3] = scan [carry_count=3, iteration_count=2, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2, n], %3:f32[n] .
                         in (%1, %2, %3)
@@ -14776,7 +14799,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[3], %3:dimension<length ∈ [1, 8)> .
-                let %4:dimension<2>, %5:f32[2] = scan [carry_count=2, length=length, reverse=false] %0 %1 %2 %3 [
+                let %4:dimension<2>, %5:f32[2] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[] .
                         in (%1, %2)
@@ -14826,7 +14849,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f64[2, 3], %2:f64[2, 3] .
-                let %3:dimension<2>, %4:f64[2, 3], %5:f64[2, 3] = scan [carry_count=2, length=2, reverse=false] %0 \
+                let %3:dimension<2>, %4:f64[2, 3], %5:f64[2, 3] = scan [carry_count=2, iteration_count=2, reverse=false] %0 \
                 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f64[2, 3], %3:f64[3] .
@@ -14965,7 +14988,7 @@ mod tests {
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2, 3] .
                 let %3:ref<f32[2]> = reference_new %1
                     %4:f32[3, 2] = transpose [permutation=[1, 0]] %2
-                    %5:dimension<2>, %6:ref<f32[2]>, %7:f32[3, 2] = scan [carry_count=2, length=3, reverse=false] \
+                    %5:dimension<2>, %6:ref<f32[2]>, %7:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
                 %0 %3 %4 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:ref<f32[2]>, %3:f32[2] .
@@ -14982,7 +15005,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2, 3] .
                 let %3:f32[3, 2] = transpose [permutation=[1, 0]] %2
-                    %4:dimension<2>, %5:f32[2], %6:f32[3, 2] = scan [carry_count=2, length=3, reverse=false] %0 %1 \
+                    %4:dimension<2>, %5:f32[2], %6:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 \
                 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2] .
@@ -15028,7 +15051,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[3, 2], %2:f32[3, 2] .
                 let %3:ref<f32[3, 2]> = reference_new %1
-                    %4:dimension<2>, %5:ref<f32[3, 2]>, %6:f32[3, 2] = scan [carry_count=2, length=3, reverse=false] \
+                    %4:dimension<2>, %5:ref<f32[3, 2]>, %6:f32[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
                 %0 %3 %3 %2 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:ref<f32[3, 2]>, %3:ref<f32[3, 2]>, %4:f32[2] .
@@ -15072,7 +15095,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[3, 2] .
                 let %3:ref<f32[3, 2]> = reference_new %2
-                    %4:dimension<2>, %5:f32[2] = scan [carry_count=2, length=3, reverse=false] %0 %1 %3 [
+                    %4:dimension<2>, %5:f32[2] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:ref<f32[3, 2]> .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %3 %2 %0
@@ -15121,7 +15144,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:ref<f32[3]> .
-                let %3:dimension<2>, %4:f32[2] = scan [carry_count=2, length=3, reverse=false] %0 %1 %2 [
+                let %3:dimension<2>, %4:f32[2] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:ref<f32[3]> .
                         let %4:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %3 %0
@@ -15218,7 +15241,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[length], %1:dimension<length ∈ [0, 4)>, %2:f64[] .
-                let %3:f64[], %4:f64[length] = scan [carry_count=1, length=length, reverse=false] %2 %0 %1 [
+                let %3:f64[], %4:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %2 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -15256,7 +15279,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:dimension<2>, %1:f64[2], %2:f64[length, 2], %3:dimension<length ∈ [0, 4)> .
-                let %4:dimension<2>, %5:f64[2], %6:f64[length, 2] = scan [carry_count=2, length=length, reverse=false] \
+                let %4:dimension<2>, %5:f64[2], %6:f64[length, 2] = scan [carry_count=2, iteration_count=length, reverse=false] \
                 %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<2>, %2:f64[2], %3:f64[2] .
@@ -15291,7 +15314,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
-                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, length=3, \
+                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, \
                  reverse=false] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -15467,7 +15490,7 @@ mod tests {
                 lambda %0:f32[3], %1:f32[], %2:dimension<length ∈ [1, 8)> .
                 let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", \
                  declared_types=[f32[length], dimension<length ∈ [1, 8)>]] %0 %2
-                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, length=length, reverse=false] %3 %1 %4 [
+                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %3 %1 %4 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[] .
                             let %3:f32[] = mul %2 %2
@@ -15551,7 +15574,7 @@ mod tests {
                  declared_types=[f32[length], dimension<length ∈ [1, 8)>]] %1 %2
                     %7:dimension<length ∈ [1, 8)> = dimension_size [axis=0] %1
                     %8:f32[3] = cast [type=f32[3], inputs=[f32[length], dimension<length ∈ [1, 8)>, f32[3]]] %4 %7 %5
-                    %9:f32[], %10:f32[] = scan [carry_count=2, length=length, reverse=false] %0 %3 %5 %8 %6 [
+                    %9:f32[], %10:f32[] = scan [carry_count=2, iteration_count=length, reverse=false] %0 %3 %5 %8 %6 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
                             let %5:f32[] = mul %1 %3
@@ -15575,7 +15598,7 @@ mod tests {
                 lambda %0:f32[], %1:f32[length], %2:dimension<3> .
                 let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", \
                  declared_types=[f32[length], dimension<length ∈ [1, 8)>]] %1 %2
-                    %5:f32[], %6:f32[3] = scan [carry_count=1, length=length, reverse=false] %0 %3 %4 [
+                    %5:f32[], %6:f32[3] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %3 %4 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[] .
                             let %3:f32[] = mul %1 %2
@@ -15590,7 +15613,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)>, %3:f32[3], %4:f32[3], %5:dimension<3> .
                 let %6:f32[3] = cast [type=f32[3], inputs=[f32[length], dimension<length ∈ [1, 8)>]] %1 %2
-                    %7:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %6 %3 %4 %5 [
+                    %7:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %6 %3 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
                             let %5:f32[] = mul %3 %1
@@ -15678,7 +15701,7 @@ mod tests {
                 ] %1 %2 %3
                     %8:dimension<length ∈ [1, 8)> = dimension_size [axis=0] %6
                     %9:f32[length] = cast [type=f32[length], inputs=[f32[3], dimension<length ∈ [1, 8)>]] %5 %8
-                    %10:f32[], %11:ref<f32[length]>, %12:f32[] = scan [carry_count=3, length=length, \
+                    %10:f32[], %11:ref<f32[length]>, %12:f32[] = scan [carry_count=3, iteration_count=length, \
                  reverse=false] %0 %1 %4 %6 %9 %7 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[length]>, %3:f32[], %4:f32[], %5:f32[] .
@@ -15722,7 +15745,7 @@ mod tests {
                     declared_types=[ref<f32[length]>, f32[length], dimension<length ∈ [1, 8)>],
                     retained_identities=[length],
                 ] %1 %2 %3
-                    %6:f32[], %7:ref<f32[length]>, %8:f32[length] = scan [carry_count=2, length=length, \
+                    %6:f32[], %7:ref<f32[length]>, %8:f32[length] = scan [carry_count=2, iteration_count=length, \
                  reverse=false] %0 %1 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[length]>, %3:f32[] .
@@ -15738,7 +15761,7 @@ mod tests {
             indoc! {r#"
                 lambda %0:f32[], %1:f32[3], %2:dimension<length ∈ [1, 8)>, %3:f32[length], %4:f32[length], %5:dimension<length ∈ [1, 8)> .
                 let %6:f32[length] = cast [type=f32[length], inputs=[f32[3], dimension<length ∈ [1, 8)>]] %1 %2
-                    %7:f32[] = scan [carry_count=1, length=length, reverse=false] %0 %6 %3 %4 %5 [
+                    %7:f32[] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %6 %3 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
                             let %5:f32[] = mul %3 %1
@@ -15833,7 +15856,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]> .
-                let %2:f32[], %3:ref<f32[]>, %4:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %1 [
+                let %2:f32[], %3:ref<f32[]>, %4:f32[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:ref<f32[]> .
                         let %3:f32[] = reference_read %2
@@ -15847,7 +15870,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
-                let %2:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = mul %2 %1
@@ -15878,7 +15901,7 @@ mod tests {
             pushforward.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]>, %2:f32[3] .
-                let %3:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %2 [
+                let %3:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = mul %2 %1
@@ -15944,7 +15967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_linearizes_zero_length_reference_carries() {
+    fn test_scan_differentiation_linearizes_zero_iteration_count_reference_carries() {
         // Linearizing a reference carry of a zero-trip scan must not restore an unused residual dimension whose
         // identity the tangent body's inputs already establish.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -15991,7 +16014,7 @@ mod tests {
             // The tangent body recovers the dimension from its carry tangent, so the primal scan stores no copy of it.
             let rendering = formatdoc! {"
                 lambda %0:f32[n] .
-                let %1:f32[n], %2:f32[{length}, n] = scan [carry_count=1, length={length}, reverse=false] %0 [
+                let %1:f32[n], %2:f32[{length}, n] = scan [carry_count=1, iteration_count={length}, reverse=false] %0 [
                     body={{
                         lambda %0:i64[], %1:f32[n] .
                         let %2:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %1
@@ -16036,7 +16059,7 @@ mod tests {
                     indoc! {"
                         lambda %0:ref<f32[3]> .
                         let %1:f32[3] = zero [type=f32[3]]
-                            %2:ref<f32[3]> = scan [carry_count=1, length={length}, reverse=false] %0 [
+                            %2:ref<f32[3]> = scan [carry_count=1, iteration_count={length}, reverse=false] %0 [
                                 body={{
                                     lambda %0:i64[], %1:ref<f32[3]> .
                                     in (%1)
@@ -16071,7 +16094,7 @@ mod tests {
             format!(
                 indoc! {"
                     lambda %0:f32[3], %1:ref<f32[3]> .
-                    let %2:f32[3], %3:ref<f32[3]> = scan [carry_count=2, length={length}, reverse={reverse}] %0 %1 [
+                    let %2:f32[3], %3:ref<f32[3]> = scan [carry_count=2, iteration_count={length}, reverse={reverse}] %0 %1 [
                         body={{
                             lambda %0:i64[], %1:f32[3], %2:ref<f32[3]> .
                             let %3:f32[3] = zero [type=f32[3]]
@@ -16123,7 +16146,7 @@ mod tests {
             pushforward.program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3] .
-                let %4:f64[], %5:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 %1 %2 %3 [
+                let %4:f64[], %5:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -16155,7 +16178,7 @@ mod tests {
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3] .
-                let %4:f64[], %5:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 %1 %2 %3 [
+                let %4:f64[], %5:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -16172,7 +16195,7 @@ mod tests {
             pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3] .
-                let %3:f64[], %4:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 %2 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %2 %1
@@ -16208,7 +16231,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
-                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, length=3, reverse=true, \
+                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true, \
                  unroll=2] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -16229,7 +16252,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3], %4:f64[3] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 %1 [
+                let %2:f64[], %3:f64[3], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %2
@@ -16244,7 +16267,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3] .
-                let %4:f64[], %5:f64[3] = scan [carry_count=1, length=3, reverse=true, unroll=2] %0 %1 %2 %3 [
+                let %4:f64[], %5:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true, unroll=2] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -16319,7 +16342,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_zero_length() {
+    fn test_scan_differentiation_zero_iteration_count() {
         // A zero-length scan returns its initial carries and empty stacked outputs, so the carry tangents and
         // cotangents pass through unchanged and the stacked tangents and cotangents are empty.
         let empty = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0]), &[]).unwrap();
@@ -16333,7 +16356,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[0], %2:f64[], %3:f64[0] .
-                let %4:f64[], %5:f64[], %6:f64[0], %7:f64[0] = scan [carry_count=2, length=0, \
+                let %4:f64[], %5:f64[], %6:f64[0], %7:f64[0] = scan [carry_count=2, iteration_count=0, \
                  reverse=false] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -16384,7 +16407,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[0] .
-                let %2:f64[], %3:f64[0], %4:f64[0] = scan [carry_count=1, length=0, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[0], %4:f64[0] = scan [carry_count=1, iteration_count=0, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %1 %1
@@ -16447,7 +16470,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 4)>, %3:f64[], %4:f64[length] .
-                let %5:f64[], %6:f64[], %7:f64[length], %8:f64[length] = scan [carry_count=2, length=length, \
+                let %5:f64[], %6:f64[], %7:f64[length], %8:f64[length] = scan [carry_count=2, iteration_count=length, \
                 reverse=false] %0 %3 %1 %4 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -16471,7 +16494,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 4)> .
-                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, length=length, reverse=false] \
+                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] \
                 %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
@@ -16485,7 +16508,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [0, 4)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -16501,7 +16524,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [0, 4)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, length=length, reverse=true] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = add %1 %2
@@ -16567,7 +16590,7 @@ mod tests {
                 let %5:f32[3], %6:dimension<3> = guard [boundary=\"scan\", \
                  declared_types=[f32[length], dimension<length ∈ [0, 8)>]] %0 %2
                     %7:f32[3] = cast [type=f32[3], inputs=[f32[3], f32[3]]] %3 %5
-                    %8:f32[3], %9:f32[], %10:f32[3], %11:f32[] = scan [carry_count=4, length=length, reverse=false] \
+                    %8:f32[3], %9:f32[], %10:f32[3], %11:f32[] = scan [carry_count=4, iteration_count=length, reverse=false] \
                  %5 %1 %7 %4 %6 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[], %3:f32[3], %4:f32[] .
@@ -16609,7 +16632,7 @@ mod tests {
                 lambda %0:f32[3], %1:f32[], %2:dimension<length ∈ [0, 8)> .
                 let %3:f32[3], %4:dimension<3> = guard [boundary=\"scan\", \
                  declared_types=[f32[length], dimension<length ∈ [0, 8)>]] %0 %2
-                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, length=length, reverse=false] %3 %1 %4 [
+                    %5:f32[3], %6:f32[], %7:f32[3] = scan [carry_count=2, iteration_count=length, reverse=false] %3 %1 %4 [
                         body={
                             lambda %0:i64[], %1:f32[3], %2:f32[] .
                             let %3:f32[] = mul %2 %2
@@ -16631,7 +16654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_dynamic_length() {
+    fn test_scan_differentiation_dynamic_iteration_count() {
         // A dynamic-length array IR scan differentiates through its fused scan like a static one, threading its
         // trailing iteration count input, which has no tangent. The body maps `[carry, x]` to `[carry * x, carry * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
@@ -16669,7 +16692,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[length], %2:dimension<length ∈ [1, 8)>, %3:f32[], %4:f32[length] .
-                let %5:f32[], %6:f32[], %7:f32[length], %8:f32[length] = scan [carry_count=2, length=length, \
+                let %5:f32[], %6:f32[], %7:f32[length], %8:f32[length] = scan [carry_count=2, iteration_count=length, \
                  reverse=false] %0 %3 %1 %4 %2 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
@@ -16744,7 +16767,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:dimension<length ∈ [0, 4)> .
-                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, length=length, reverse=false] \
+                let %3:f64[], %4:f64[length], %5:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] \
                     %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
@@ -16780,7 +16803,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_differentiation_jvp_forwards_dynamic_length_and_dimension_carry() {
+    fn test_scan_differentiation_jvp_forwards_dynamic_iteration_count_and_dimension_carry() {
         let carry_extent_type = DimensionType::new("carry_extent", DimensionBounds::positive(Some(8)).unwrap());
         let length_variable = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let length_type = DimensionType::from(length_variable.clone());
@@ -16875,7 +16898,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [1, 8)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, length=length, reverse=false] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=false] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -16892,7 +16915,7 @@ mod tests {
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[length], %2:f64[length], %3:f64[length], %4:dimension<length ∈ [1, 8)> .
-                let %5:f64[], %6:f64[length] = scan [carry_count=1, length=length, reverse=true] %0 %1 %2 %3 %4 [
+                let %5:f64[], %6:f64[length] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = add %1 %2
@@ -16953,7 +16976,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[3] .
                 let %2:f64[] = const 0.0
-                    %3:f64[], %4:f64[3], %5:f64[3] = scan [carry_count=1, length=3, reverse=false] %2 %0 %1 [
+                    %3:f64[], %4:f64[3], %5:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %2 %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                             let %4:f64[] = const 1.0
@@ -17002,7 +17025,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[3] = const [2.0, 3.0, 4.0]
-                    %3:f64[], %4:f64[], %5:f64[3], %6:f64[3] = scan [carry_count=2, length=3, reverse=false] %0 %1 %2 [
+                    %3:f64[], %4:f64[], %5:f64[3], %6:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                             let %4:f64[] = mul %1 %3
@@ -17052,7 +17075,7 @@ mod tests {
                 lambda %0:f64[3], %1:f64[3] .
                 let %2:f64[] = const 0.0
                     %3:f64[] = zero [type=f64[]]
-                    %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, length=3, \
+                    %4:f64[], %5:f64[], %6:f64[3], %7:f64[3] = scan [carry_count=2, iteration_count=3, \
                      reverse=false] %2 %3 %0 %1 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -17143,7 +17166,7 @@ mod tests {
                 let %5:f64[extent] = stop_gradient %1
                     %6:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %5
                     %7:f64[extent] = zero [type=f64[extent]] %6
-                    %8:dimension<extent ∈ [1, 8)>, %9:f64[extent], %10:f64[extent] = scan [carry_count=3, length=3, \
+                    %8:dimension<extent ∈ [1, 8)>, %9:f64[extent], %10:f64[extent] = scan [carry_count=3, iteration_count=3, \
                  reverse=false] %0 %5 %7 %2 %4 [
                         body={
                             lambda %0:i64[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:f64[extent], \
@@ -17199,7 +17222,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
                 let %4:f64[] = const 0.0
-                    %5:f64[], %6:f64[], %7:f64[], %8:f64[3] = scan [carry_count=3, length=3, \
+                    %5:f64[], %6:f64[], %7:f64[], %8:f64[3] = scan [carry_count=3, iteration_count=3, \
                      reverse=false] %4 %0 %2 %1 %3 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
@@ -17257,7 +17280,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
-                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, length=3, \
+                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, iteration_count=3, \
                  reverse=false] %0 %1 %3 %4 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
@@ -17292,7 +17315,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
                 let %4:f64[] = const 2.0
-                    %5:f64[], %6:f64[], %7:f64[] = scan [carry_count=3, length=3, reverse=false] %4 %0 %2 %1 %3 [
+                    %5:f64[], %6:f64[], %7:f64[] = scan [carry_count=3, iteration_count=3, reverse=false] %4 %0 %2 %1 %3 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
                             let %6:f64[] = mul %1 %4
@@ -17336,7 +17359,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3] .
-                let %3:f64[], %4:f64[] = scan [carry_count=2, length=3, reverse=false] %0 %1 %2 [
+                let %3:f64[], %4:f64[] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %2 %2
@@ -17354,7 +17377,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
-                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, length=3, \
+                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = scan [carry_count=4, iteration_count=3, \
                  reverse=false] %3 %4 %0 %1 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
@@ -17450,7 +17473,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3] .
-                let %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, length=3, reverse=true] %0 %1 %2 [
+                let %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %2 %2
@@ -17468,7 +17491,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
-                let %6:f64[], %7:f64[], %8:f64[], %9:f64[], %10:f64[3] = scan [carry_count=4, length=3, \
+                let %6:f64[], %7:f64[], %8:f64[], %9:f64[], %10:f64[3] = scan [carry_count=4, iteration_count=3, \
                  reverse=true] %3 %4 %0 %1 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
@@ -17492,7 +17515,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[3] .
                 let %6:f64[] = zero [type=f64[]]
-                    %7:f64[], %8:f64[], %9:f64[], %10:f64[], %11:f64[3] = scan [carry_count=4, length=3, \
+                    %7:f64[], %8:f64[], %9:f64[], %10:f64[], %11:f64[3] = scan [carry_count=4, iteration_count=3, \
                  reverse=false] %3 %4 %0 %6 %2 %5 [
                         body={
                             lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
@@ -17578,7 +17601,7 @@ mod tests {
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %2 %1
@@ -17593,7 +17616,7 @@ mod tests {
             pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %2:f64[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = mul %2 %1
@@ -17636,7 +17659,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:u64[] .
-                let %2:f64[], %3:u64[], %4:f64[2], %5:i64[2], %6:i64[2] = scan [carry_count=2, length=2, \
+                let %2:f64[], %3:u64[], %4:f64[2], %5:i64[2], %6:i64[2] = scan [carry_count=2, iteration_count=2, \
                  reverse=false] \
                  %0 %1 [
                     body={
@@ -17660,7 +17683,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:i64[2] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:i64[] .
                         let %3:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %2
@@ -17688,7 +17711,7 @@ mod tests {
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2], %2:i64[2] .
-                let %3:f64[] = scan [carry_count=1, length=2, reverse=true] %0 %1 %2 [
+                let %3:f64[] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:i64[] .
                         let %4:dimension<iteration ∈ [1, 4)> = dimension_from_scalar [bounds=[1, 4)] %3
@@ -17766,7 +17789,7 @@ mod tests {
                 let %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
                     %3:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
                     %4:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                    scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                    scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
                             %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
@@ -17844,7 +17867,7 @@ mod tests {
             formatdoc! {"
                 lambda %0:{scalar}, %1:{stack}, %2:{stack} .
                 let %3:{scalar} = zero [type={scalar}]
-                    %4:{scalar}, %5:{scalar}, %6:{stack}, %7:{stack} = scan [carry_count=2, length=3, reverse=false] \
+                    %4:{scalar}, %5:{scalar}, %6:{stack}, %7:{stack} = scan [carry_count=2, iteration_count=3, reverse=false] \
                  %0 %3 %1 %2 [
                         body={{
                             lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar}, %4:{scalar} .
@@ -17900,7 +17923,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:u64[], %2:f64[3], %3:f64[], %4:f64[3] .
-                let %5:f64[], %6:u64[], %7:f64[], %8:f64[3], %9:f64[3] = scan [carry_count=3, length=3, \
+                let %5:f64[], %6:u64[], %7:f64[], %8:f64[3], %9:f64[3] = scan [carry_count=3, iteration_count=3, \
                  reverse=false] %0 %1 %3 %2 %4 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:u64[], %3:f64[], %4:f64[], %5:f64[] .
@@ -17957,7 +17980,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3], %2:f64[3], %3:f64[2, 3] .
-                let %4:f64[3], %5:f64[3], %6:f64[2, 3], %7:f64[2, 3] = scan [carry_count=2, length=2, reverse=false] \
+                let %4:f64[3], %5:f64[3], %6:f64[2, 3], %7:f64[2, 3] = scan [carry_count=2, iteration_count=2, reverse=false] \
                  %0 \
                  %2 %1 %3 [
                     body={
@@ -17995,7 +18018,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3] .
-                let %2:f64[3], %3:f64[2, 3] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                let %2:f64[3], %3:f64[2, 3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3] .
                         let %3:f64[3] = add %1 %2
@@ -18011,7 +18034,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3], %2:f64[2, 3] .
-                let %3:f64[3], %4:f64[2, 3] = scan [carry_count=1, length=2, reverse=false] %0 %1 %2 [
+                let %3:f64[3], %4:f64[2, 3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3], %3:f64[3] .
                         let %4:f64[3] = add %1 %2
@@ -18029,7 +18052,7 @@ mod tests {
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[2, 3], %2:f64[2, 3] .
-                let %3:f64[3], %4:f64[2, 3] = scan [carry_count=1, length=2, reverse=true] %0 %1 %2 [
+                let %3:f64[3], %4:f64[2, 3] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[3], %2:f64[3], %3:f64[3] .
                         let %4:f64[3] = mul %3 %2
@@ -18117,10 +18140,10 @@ mod tests {
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2, 3] .
-                let %4:f64[], %5:f64[2, 3] = scan [carry_count=1, length=2, reverse=false] %0 %1 %2 %3 [
+                let %4:f64[], %5:f64[2, 3] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[3], %3:f64[3], %4:f64[3] .
-                        let %5:f64[], %6:f64[3] = scan [carry_count=1, length=3, reverse=false] %1 %2 %3 %4 [
+                        let %5:f64[], %6:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %1 %2 %3 %4 [
                             body={
                                 lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                                 let %5:f64[] = mul %3 %1
@@ -18138,10 +18161,10 @@ mod tests {
             pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3] .
-                let %3:f64[], %4:f64[2, 3] = scan [carry_count=1, length=2, reverse=true] %0 %1 %2 [
+                let %3:f64[], %4:f64[2, 3] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[3], %3:f64[3] .
-                        let %4:f64[], %5:f64[3] = scan [carry_count=1, length=3, reverse=true] %1 %2 %3 [
+                        let %4:f64[], %5:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %1 %2 %3 [
                             body={
                                 lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                                 let %4:f64[] = mul %2 %1
@@ -18301,7 +18324,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3] .
-                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3] = scan [carry_count=2, length=3, \
+                let %4:f64[], %5:f64[], %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3] = scan [carry_count=2, iteration_count=3, \
                  reverse=false] %0 %2 %1 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -18320,7 +18343,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[3], %6:f64[3], %7:f64[3] .
-                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, length=3, reverse=false] %0 %2 \
+                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %2 \
                  %1 %3 %4 %5 %6 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
@@ -18347,7 +18370,7 @@ mod tests {
             pullback.program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[3], %6:f64[3], %7:f64[3] .
-                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, length=3, reverse=true] %0 %2 \
+                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %0 %2 \
                  %1 %3 %4 %5 %6 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
@@ -18401,7 +18424,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[], %5:f64[3], %6:f64[3], %7:f64[3] .
-                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, length=3, reverse=true] %0 %4 \
+                let %8:f64[], %9:f64[], %10:f64[3], %11:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %0 %4 \
                  %1 %2 %3 %5 %6 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
@@ -18468,7 +18491,7 @@ mod tests {
                     %4:f64[3, 2] = transpose [permutation=[1, 0]] %1
                     %5:f64[3, 2] = transpose [permutation=[1, 0]] %2
                     %6:f64[2] = zero [type=f64[2]]
-                    %7:f64[2], %8:f64[2], %9:f64[3, 2], %10:f64[3, 2] = scan [carry_count=2, length=3, reverse=false] \
+                    %7:f64[2], %8:f64[2], %9:f64[3, 2], %10:f64[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
                  %3 %6 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2], %3:f64[2], %4:f64[2] .
@@ -18505,7 +18528,7 @@ mod tests {
                     %5:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %4
                     %6:f64[3, 2] = transpose [permutation=[1, 0]] %1
                     %7:f64[3, 2] = transpose [permutation=[1, 0]] %2
-                    %8:f64[2], %9:f64[2], %10:f64[3, 2], %11:f64[3, 2] = scan [carry_count=2, length=3, reverse=false] \
+                    %8:f64[2], %9:f64[2], %10:f64[3, 2], %11:f64[3, 2] = scan [carry_count=2, iteration_count=3, reverse=false] \
                  %3 %5 %6 %7 [
                         body={
                             lambda %0:i64[], %1:f64[2], %2:f64[2], %3:f64[2], %4:f64[2] .
@@ -18671,7 +18694,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[length], %1:dimension<length ∈ [1, 8)>, %2:f32[length], %3:f32[], %4:f32[] .
-                let %5:f32[], %6:f32[], %7:f32[length], %8:f32[length] = scan [carry_count=2, length=length, \
+                let %5:f32[], %6:f32[], %7:f32[length], %8:f32[length] = scan [carry_count=2, iteration_count=length, \
                  reverse=false] %3 %4 %0 %2 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[] .
@@ -18760,7 +18783,7 @@ mod tests {
                 lambda %0:f32[], %1:f32[3], %2:f32[], %3:f32[3] .
                 let %4:ref<f32[3]> = reference_new %1
                     %5:ref<f32[3]> = reference_new %3
-                    %6:f32[], %7:f32[] = scan [carry_count=2, length=3, reverse=false] %0 %2 %4 %5 [
+                    %6:f32[], %7:f32[] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %2 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:ref<f32[3]>, %4:ref<f32[3]> .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %3 %1 %0
@@ -18830,7 +18853,7 @@ mod tests {
             first.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[] .
-                let %5:f64[], %6:f64[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 %2 %3 [
+                let %5:f64[], %6:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
                         let %5:f64[] = mul %3 %1
@@ -18916,7 +18939,7 @@ mod tests {
             pushforward.program().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[4] .
-                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, length=4, reverse=false] %0 %1 %2 \
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[4] = scan [carry_count=3, iteration_count=4, reverse=false] %0 %1 %2 \
                  %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -18992,7 +19015,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f64[3, 3] .
-                let %1:f64[3, 1] = scan [carry_count=0, length=3, reverse=true] %0 [
+                let %1:f64[3, 1] = scan [carry_count=0, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[3] .
                         let %2:f64[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -19007,7 +19030,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f64[3, 3] .
-                let %1:f64[3, 1] = scan [carry_count=0, length=3, reverse=true] %0 [
+                let %1:f64[3, 1] = scan [carry_count=0, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[3] .
                         let %2:f64[1] = dynamic_slice [sizes=[1]] %1 %0
@@ -19022,7 +19045,7 @@ mod tests {
             linearization.pullback().unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f64[3, 1] .
-                let %1:f64[3, 3] = scan [carry_count=0, length=3, reverse=false] %0 [
+                let %1:f64[3, 3] = scan [carry_count=0, iteration_count=3, reverse=false] %0 [
                     body={
                         lambda %0:i64[], %1:f64[1] .
                         let %2:f64[3] = zero [type=f64[3]]
@@ -19073,7 +19096,7 @@ mod tests {
                 let %6:ref<f32[]> = reference_new %1
                     %7:ref<f32[]> = reference_new %4
                     %8:f32[], %9:ref<f32[]>, %10:f32[], %11:ref<f32[]>, %12:f32[3], %13:f32[3] = scan [carry_count=4, \
-                 length=3, reverse=false] %0 %6 %3 %7 %2 %5 [
+                 iteration_count=3, reverse=false] %0 %6 %3 %7 %2 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[]>, %3:f32[], %4:ref<f32[]>, %5:f32[], %6:f32[] .
                             let () = reference_add_update %2 %5
@@ -19110,7 +19133,7 @@ mod tests {
             discharged_jvp.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[3], %3:f32[], %4:f32[], %5:f32[3] .
-                let %6:f32[], %7:f32[], %8:f32[], %9:f32[], %10:f32[3], %11:f32[3] = scan [carry_count=4, length=3, \
+                let %6:f32[], %7:f32[], %8:f32[], %9:f32[], %10:f32[3], %11:f32[3] = scan [carry_count=4, iteration_count=3, \
                  reverse=false] %0 %1 %3 %4 %2 %5 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[], %4:f32[], %5:f32[], %6:f32[] .
@@ -19187,7 +19210,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
-                let %3:ref<f32[]>, %4:f32[], %5:f32[] = scan [carry_count=3, length=3, reverse=false] %0 %1 %2 [
+                let %3:ref<f32[]>, %4:f32[], %5:f32[] = scan [carry_count=3, iteration_count=3, reverse=false] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[], %3:f32[] .
                         let %4:f32[] = add %2 %2
@@ -19257,7 +19280,7 @@ mod tests {
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[3] .
-                let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[] .
                         let () = reference_add_update %1 %2
@@ -19309,7 +19332,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %2 %1
@@ -19337,7 +19360,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3] .
-                let %2:f64[], %3:f64[3] = scan [carry_count=1, length=3, reverse=false, unroll=2] %0 %1 [
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false, unroll=2] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %2 %1
@@ -19372,7 +19395,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[] .
-                let %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, length=3, reverse=true] %2 %0 %1 [
+                let %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %2 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %1 %2
@@ -19518,7 +19541,7 @@ mod tests {
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[3]>, %2:f32[3], %3:f32[3] .
-                let %4:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %1 %2 %3 [
+                let %4:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:ref<f32[3]>, %3:f32[], %4:f32[] .
                         let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
@@ -19543,7 +19566,7 @@ mod tests {
                 lambda %0:f32[], %1:f32[3], %2:f32[3] .
                 let %3:f32[3] = zero [type=f32[3]]
                     %4:ref<f32[3]> = reference_new %3
-                    %5:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %4 %1 %2 [
+                    %5:f32[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %4 %1 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]>, %3:f32[], %4:f32[] .
                             let %5:f32[] = mul %4 %1
@@ -19580,7 +19603,7 @@ mod tests {
             pullback.linear_program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
-                let %2:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = mul %2 %1
@@ -19595,7 +19618,7 @@ mod tests {
             pullback.transposed_program(&[]).unwrap().program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
-                let %2:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %2:f32[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
                         let %3:f32[] = mul %2 %1
@@ -19725,7 +19748,7 @@ mod tests {
         );
         let expected = indoc! {"
             lambda %0:f64[] .
-            let %1:f64[], %2:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 [
+            let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                 body={
                     lambda %0:i64[], %1:f64[] .
                     in (%1, %1)
@@ -19792,7 +19815,7 @@ mod tests {
             transposed.program().to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[], %2:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         let %2:f64[] = zero [type=f64[]]
@@ -19829,7 +19852,7 @@ mod tests {
             transposed.program().to_string(),
             indoc! {"
                 lambda %0:f64[extent] .
-                let %1:f64[extent], %2:f64[3, extent] = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:f64[extent], %2:f64[3, extent] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[extent] .
                         let %2:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %1
@@ -19887,7 +19910,7 @@ mod tests {
                 let %2:{scalar} = zero [
                     type={scalar},
                 ]
-                    %3:{scalar}, %4:{scalar}, %5:{stack} = scan [carry_count=2, length=3, reverse=true] %0 %2 %1 [
+                    %3:{scalar}, %4:{scalar}, %5:{stack} = scan [carry_count=2, iteration_count=3, reverse=true] %0 %2 %1 [
                         body={{
                             lambda %0:i64[], %1:{scalar}, %2:{scalar}, %3:{scalar} .
                             let %4:{scalar} = add %3 %2
@@ -19914,7 +19937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transposition_omits_disconnected_scanned_input_at_zero_length() {
+    fn test_scan_transposition_omits_disconnected_scanned_input_at_zero_iteration_count() {
         let body = scalar_body(3, |builder, inputs| {
             let next =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[3]], None).unwrap()[0];
@@ -19938,7 +19961,7 @@ mod tests {
             transposed.program().to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[], %2:f64[0] = scan [carry_count=1, length=0, reverse=true] %0 [
+                let %1:f64[], %2:f64[0] = scan [carry_count=1, iteration_count=0, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         in (%1, %1)
@@ -19987,7 +20010,7 @@ mod tests {
             batched.to_string(),
             indoc! {"
                 lambda %0:f64[2] .
-                let %1:f64[2], %2:f64[3, 2] = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:f64[2], %2:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[2] .
                         in (%1, %1)
@@ -20252,7 +20275,7 @@ mod tests {
         .unwrap();
         let rendering = indoc! {"
             lambda %0:f64[] .
-            let %1:f64[], %2:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 [
+            let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                 body={
                     lambda %0:i64[], %1:f64[] .
                     in (%1, %1)
@@ -20267,7 +20290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_transposition_zero_length() {
+    fn test_scan_transposition_zero_iteration_count() {
         // A zero-length scan is the identity on its carries, so its transposition passes the carry cotangent through
         // and gives the empty stacked input an empty cotangent.
         let body = scalar_body(2, |builder, inputs| {
@@ -20286,7 +20309,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[0] .
-                let %2:f64[], %3:f64[0] = scan [carry_count=1, length=0, reverse=true] %0 %1 [
+                let %2:f64[], %3:f64[0] = scan [carry_count=1, iteration_count=0, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %2 %1
@@ -20331,7 +20354,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[3, 2] .
-                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[2], %2:f64[2] .
                         let %3:f64[2] = add %2 %1
@@ -20370,7 +20393,7 @@ mod tests {
             batched_pullback.to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[3, 2] .
-                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
+                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[2], %2:f64[2] .
                         let %3:f64[2] = add %2 %1
@@ -20435,7 +20458,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:ref<f64[]> .
-                let %1:ref<f64[]> = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:ref<f64[]> = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:ref<f64[]> .
                         let %2:f64[] = const 1.0
@@ -20458,7 +20481,7 @@ mod tests {
             empty_transposed.to_string(),
             indoc! {"
                 lambda %0:ref<f64[]> .
-                let %1:ref<f64[]> = scan [carry_count=1, length=0, reverse=true] %0 [
+                let %1:ref<f64[]> = scan [carry_count=1, iteration_count=0, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:ref<f64[]> .
                         let %2:f64[] = const 1.0
@@ -20510,7 +20533,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:ref<f64[3]> .
-                let () = scan [carry_count=0, length=3, reverse=true] %0 [
+                let () = scan [carry_count=0, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:ref<f64[3]> .
                         let %2:f64[3] = const [1.0, 1.0, 1.0]
@@ -20545,7 +20568,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[3], %4:f64[], %5:f64[], %6:f64[] .
-                let %7:f64[], %8:f64[], %9:f64[], %10:f64[3] = scan [carry_count=3, length=3, reverse=true] \
+                let %7:f64[], %8:f64[], %9:f64[], %10:f64[3] = scan [carry_count=3, iteration_count=3, reverse=true] \
                  %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
@@ -20601,7 +20624,7 @@ mod tests {
             program.transpose_with_respect_to(&[1, 2], &[]).map(|pullback| pullback.to_string()),
             Ok(indoc! {"
                 lambda %0:zero[], %1:f64[], %2:i32[] .
-                let %3:i32[], %4:f64[], %5:f64[3] = scan [carry_count=2, length=3, reverse=true] %2 %1 [
+                let %3:i32[], %4:f64[], %5:f64[3] = scan [carry_count=2, iteration_count=3, reverse=true] %2 %1 [
                     body={
                         lambda %0:i64[], %1:i32[], %2:f64[] .
                         in (%1, %2, %2)
@@ -20635,7 +20658,7 @@ mod tests {
             program.transpose_with_respect_to(&[1], &[]).unwrap().to_string(),
             indoc! {"
                 lambda %0:zero[extent], %1:f64[], %2:u64[extent] .
-                let %3:u64[extent], %4:f64[] = scan [carry_count=2, length=3, reverse=true] %2 %1 [
+                let %3:u64[extent], %4:f64[] = scan [carry_count=2, iteration_count=3, reverse=true] %2 %1 [
                     body={
                         lambda %0:i64[], %1:u64[extent], %2:f64[] .
                         in (%1, %2)
@@ -20668,7 +20691,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:zero[3], %2:f64[3] .
-                let %3:f64[], %4:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 %2 [
+                let %3:f64[], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %2 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         let %3:f64[] = add %2 %1
@@ -20788,7 +20811,7 @@ mod tests {
                 lambda %0:f64[extent] .
                 let %1:dimension<extent \u{2208} [1, 8)> = dimension_size [axis=0] %0
                     %2:f64[extent] = zero [type=f64[extent]] %1
-                    %3:f64[extent], %4:f64[extent] = scan [carry_count=2, length=2, reverse=true] %0 %2 [
+                    %3:f64[extent], %4:f64[extent] = scan [carry_count=2, iteration_count=2, reverse=true] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f64[extent], %2:f64[extent] .
                             let %3:f64[extent] = add %2 %1
@@ -20840,7 +20863,7 @@ mod tests {
                 let %1:f64[extent] = reference_read %0
                     %2:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %1
                     %3:f64[extent] = zero [type=f64[extent]] %2
-                    %4:f64[extent], %5:ref<f64[extent]> = scan [carry_count=2, length=3, reverse=true] %3 %0 [
+                    %4:f64[extent], %5:ref<f64[extent]> = scan [carry_count=2, iteration_count=3, reverse=true] %3 %0 [
                         body={
                             lambda %0:i64[], %1:f64[extent], %2:ref<f64[extent]> .
                             let %3:f64[extent] = reference_read %2
@@ -20919,7 +20942,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[k], %1:dimension<length \u{2208} [1, 8)> .
-                let %2:f64[k], %3:f64[length, k] = scan [carry_count=1, length=length, reverse=true] %0 %1 [
+                let %2:f64[k], %3:f64[length, k] = scan [carry_count=1, iteration_count=length, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[k] .
                         in (%1, %1)
@@ -20961,7 +20984,7 @@ mod tests {
             transposed.program().to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[], %2:f64[3] = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f64[] .
                         in (%1, %1)
@@ -21010,7 +21033,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:ref<f32[extent]> .
-                let %1:ref<f32[extent]> = scan [carry_count=1, length=2, reverse=true] %0 [
+                let %1:ref<f32[extent]> = scan [carry_count=1, iteration_count=2, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[extent]> .
                         let %2:f32[extent] = reference_read %1
@@ -21047,7 +21070,7 @@ mod tests {
                 let %2:f32[3] = zero [type=f32[3]]
                     %3:ref<f32[3]> = reference_new %2
                     () = reference_add_update %3 %1
-                    %4:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %3 [
+                    %4:f32[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 %3 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                             let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
@@ -21159,7 +21182,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3] .
-                let %2:f32[], %3:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %1 [
+                let %2:f32[], %3:f32[3] = scan [carry_count=2, iteration_count=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[3] .
                         let %3:f32[1] = dynamic_slice [sizes=[1]] %2 %0
@@ -21275,7 +21298,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:f32[] = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:f32[] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = add %1 %1
@@ -21349,7 +21372,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:ref<f32[]> .
-                let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, length=3, reverse=true] %1 %0 [
+                let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=true] %1 %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[] .
                         let () = reference_add_update %1 %2
@@ -21399,7 +21422,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:ref<f32[2]> .
-                let %1:ref<f32[2]>, %2:f32[3] = scan [carry_count=1, length=3, reverse=true] %0 [
+                let %1:ref<f32[2]>, %2:f32[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[2]> .
                         let %2:f32[] = reference_read [transforms=[index(axis=0, index=1)]] %1
@@ -21461,7 +21484,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]> .
-                let %2:ref<f32[]>, %3:f32[] = scan [carry_count=2, length=3, reverse=true] %1 %0 [
+                let %2:ref<f32[]>, %3:f32[] = scan [carry_count=2, iteration_count=3, reverse=true] %1 %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[] .
                         let %3:f32[] = add %2 %2
@@ -21518,7 +21541,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[3] .
-                let %1:f32[3] = scan [carry_count=0, length=3, reverse=true] %0 [
+                let %1:f32[3] = scan [carry_count=0, iteration_count=3, reverse=true] %0 [
                     body={
                         lambda %0:i64[], %1:f32[] .
                         in (%1)
@@ -21545,7 +21568,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[3], %1:ref<f32[]> .
-                let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, length=3, reverse=true] %1 %0 [
+                let %2:ref<f32[]>, %3:f32[3] = scan [carry_count=1, iteration_count=3, reverse=true] %1 %0 [
                     body={
                         lambda %0:i64[], %1:ref<f32[]>, %2:f32[] .
                         let %3:f32[] = zero [type=f32[]]
@@ -21742,7 +21765,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
-                let %2:f32[], %3:f32[], %4:f32[] = scan [carry_count=3, length=2, reverse=false] %0 %0 %1 [
+                let %2:f32[], %3:f32[], %4:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] %0 %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[], %3:f32[] .
                         let %4:f32[] = add %1 %3
@@ -21763,7 +21786,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
                 let %2:ref<f32[]> = reference_new %0
-                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, length=2, reverse=false] %2 %2 %1 [
+                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] %2 %2 %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
                             let %4:f32[] = reference_read %2
@@ -21783,7 +21806,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
                 let %2:ref<f32[]> = reference_new %1
-                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, length=2, reverse=false] %2 %2 %0 [
+                    %3:ref<f32[]>, %4:ref<f32[]>, %5:f32[] = scan [carry_count=3, iteration_count=2, reverse=false] %2 %2 %0 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
                             let %4:f32[] = reference_read %2
@@ -21812,7 +21835,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2], %2:f32[2] .
                 let %3:ref<f32[2]> = reference_new %1
-                    %4:dimension<2>, %5:ref<f32[2]>, %6:ref<f32[2]>, %7:f32[2] = scan [carry_count=4, length=2, \
+                    %4:dimension<2>, %5:ref<f32[2]>, %6:ref<f32[2]>, %7:f32[2] = scan [carry_count=4, iteration_count=2, \
                 reverse=false] %0 %3 %3 %2 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:ref<f32[2]>, %3:ref<f32[2]>, %4:f32[2] .
@@ -21869,7 +21892,7 @@ mod tests {
                 let %2:f32[] = zero [type=f32[]]
                     %3:ref<f32[]> = reference_new %2
                     () = reference_add_update %3 %0
-                    %4:ref<f32[]>, %5:ref<f32[]>, %6:f32[] = scan [carry_count=3, length=2, reverse=true] %3 %3 %1 [
+                    %4:ref<f32[]>, %5:ref<f32[]>, %6:f32[] = scan [carry_count=3, iteration_count=2, reverse=true] %3 %3 %1 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[] .
                             let %4:f32[] = reference_read %1
@@ -21895,7 +21918,7 @@ mod tests {
         assert_eq!(
             <ArrayType as ScanType>::iteration_count_type(&length),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             )),
         );
@@ -21958,7 +21981,7 @@ mod tests {
         assert_eq!(
             ArrayType::validate_scan_body_type_signature(&body_input_types[1..], &[scalar_type.clone()], 0, &length),
             Err(TypeError::invalid(
-                "homogeneous array `scan` requires a static length but got `length`; use an array IR `scan` with a \
+                "homogeneous array `scan` requires a static iteration count but got `length`; use an array IR `scan` with a \
                  trailing first-class dimension input for a dynamic trip count",
             )),
         );
