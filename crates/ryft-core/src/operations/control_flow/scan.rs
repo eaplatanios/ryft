@@ -927,20 +927,18 @@ impl<T: Type> ScanOperation<T> {
         Ok(self)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns this [`ScanOperation`] with the leading scan axis of each stacked output placed as the corresponding
     /// entry of `shardings` declares, instead of replicated; the stacked outputs beyond the list stay replicated. A
     /// batching rule that turns a mapped batch axis into the scan axis (e.g., the sequential batching of a foreign
     /// kernel call) declares the batch axis's placement for every stacked output here, so that the stacked results
     /// carry the same placement as the batch axis of every other batched value. A placement enters the stacked output
     /// type through [`ArrayType::batched`], which also records the variation that a placement over manual mesh axes
-    /// introduces, mirroring how a stacked *input* whose scan axis is sharded over manual mesh axes yields slices that
+    /// introduces, mirroring how a stacked _input_ whose scan axis is sharded over manual mesh axes yields slices that
     /// vary over them. Output type inference rejects a placement over mesh axes that a slice's sharding does not know,
     /// a list with more entries than the body has stacked outputs, and a slice without a sharding stacks without
     /// placement. Eager interpretation assembles each stack at its placed type, so that an eager application produces
-    /// the inferred output types. Rules that derive a scan place its stacked outputs by the values they stack: the
-    /// tangents of the stacked outputs and the outputs themselves keep these placements, residual stacks are
+    /// the inferred output types. Rules that derive a scan place its stacked outputs by the values they stack:
+    /// the tangents of the stacked outputs and the outputs themselves keep these placements, residual stacks are
     /// replicated, and the cotangents that a reversed scan stacks take the placement of the stacked inputs.
     #[inline]
     pub fn with_stacked_axis_shardings(mut self, mut shardings: Vec<ShardingDimension>) -> Self {
@@ -972,6 +970,8 @@ impl<T: Type> ScanOperation<T> {
     pub fn stacked_axis_shardings(&self) -> &[ShardingDimension] {
         &self.stacked_axis_shardings
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the placement of the leading scan axis of the stacked output at `index` (counting stacked outputs
     /// only) of this [`ScanOperation`].
@@ -14668,7 +14668,7 @@ mod tests {
     #[test]
     fn test_scan_batching_array_ir_validates_concrete_eager_runtime_extents() {
         // An eager iteration count and the packed eager arrays it describes have exact types, so valid direct binding
-        // executes and unequal lengths are rejected before they can truncate or over-read the packed stack.
+        // executes and mismatched extents are rejected before they can truncate or over-read the packed stack.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
