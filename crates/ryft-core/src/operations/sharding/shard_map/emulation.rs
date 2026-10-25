@@ -1365,7 +1365,7 @@ mod tests {
     use crate::operations::collectives::parallel_vary::ParallelVary;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::operations::{
-        CompositeOperation, CompositeJvpRule, CompositeTransposeOperation,
+        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation,
     };
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::debugging::PrintOperation;

@@ -52,13 +52,12 @@ pub mod operations;
 pub mod rules;
 
 pub use functions::{
-    BatchingRuleConsistencyError, Composite, CompositeBatching, CompositeJvp, CompositeVjp, CustomCallPrimal,
-    DefaultBatching, DefaultJvp, DefaultVjp, JvpFromPrimal, WithAccumulatingVjp, WithAxisDependentBatching,
-    WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, check_batching_rule_consistency,
-    composite,
+    AccumulatingVjp, AxisDependentBatching, BatchingRuleConsistencyError, Composite, CompositeBatching, CompositeJvp,
+    CompositeVjp, CustomBatching, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite,
+    JvpFromPrimal, SymbolicZeroJvp, SymbolicZeroVjp, VjpComposite, check_batching_rule_consistency, composite,
 };
 pub use operations::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeOperation, CompositeJvpRule,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeJvpRule, CompositeOperation,
     CompositeTransposeOperation,
 };
 pub use rules::{

@@ -463,9 +463,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Composite call promoted from [`ArrayOperation`] with retained member-registered rules. [`LiftedCustomRules`]
     /// specializes and converts those rules into this family. Calls with attached rules instead use
     /// [`Composite`](Self::Composite).
-    LiftedComposite(
-        CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
-    ),
+    LiftedComposite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>),
 
     /// Reverse-mode carrier of [`LiftedComposite`](Self::LiftedComposite), whose backward rule is specialized by its
     /// member definition and converted into this family.
@@ -947,12 +945,13 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeOperation,
-        CompositeJvpRule, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
-        MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation, ReductionKind,
-        RematerializationOptimizationBarrier, ScanOperation, ShardMap, SinOperation, WhileOperation, ZeroOperation,
+        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeJvpRule,
+        CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation,
+        CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
+        DimensionMulOperation, DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
+        DynamicReshapeOperation, MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation,
+        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, ShardMap, SinOperation, WhileOperation,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
@@ -3711,10 +3710,7 @@ mod tests {
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
             (
-                ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(
-                    CompositeJvpRule::Explicit,
-                    false,
-                )),
+                ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 MemberKindSignature::RegionForwarding,
             ),
             (
@@ -3755,9 +3751,7 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(
-                    member_rules.reference(),
-                ))),
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(member_rules.reference()))),
                 MemberKindSignature::RegionForwarding,
             ),
             (

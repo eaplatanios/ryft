@@ -16,15 +16,19 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
+
+use lru::LruCache;
 
 use crate::arrays::ShardingDimension;
 use crate::axes::{Axis, NamedAxis};
@@ -675,8 +679,8 @@ impl<T: Type + Eq + Hash> CustomRuleBackwardSpecializationKey<T> {
 }
 
 /// Specialization key of the custom batching rule of a [`CustomRuleDefinition`] (refer to
-/// [`CustomRuleDefinition::with_batching_rule`]). It contains only static information: the level and the types and
-/// batch axes of the batched call's inputs.
+/// [`CustomRuleDefinition::with_batching_rule`]). It contains only static information: the level, the types and batch
+/// axes of the batched call's inputs, and whether the call was discharged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleBatchingRuleKey<T> {
     /// Batching level at which the call is batched.
@@ -695,6 +699,10 @@ pub struct CustomRuleBatchingRuleKey<T> {
 
     /// Batch axis of each batched input.
     pub(super) input_axes: Vec<BatchAxis>,
+
+    /// Whether the call's reference state was discharged, in which case the specialization, which becomes the primal
+    /// region of the batched call, is discharged as well.
+    pub(super) discharged: bool,
 }
 
 /// Kind of call that a derived definition (refer to [`CustomRuleDerivation`]) stages for the forward-mode derivative
@@ -843,6 +851,11 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// dropped), which reject recursive production exactly as a [`SpecializationCache`] does. The markers contain
     /// static keys only, so they never retain a program.
     uncached_in_flight: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
+
+    /// Definitions derived from this definition (refer to [`CustomRuleSpecializer::derived`]), held weakly so that a
+    /// derived definition that some call still holds keeps its identity whether or not its registration is alive,
+    /// while a derived definition, which holds this definition strongly, never forms a cycle with it.
+    derived_definitions: Mutex<HashMap<CustomRuleDerivationKey, Weak<CustomRuleDefinition<V, O>>>>,
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
@@ -864,6 +877,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             derivation: None,
             discharger: None,
             uncached_in_flight: Mutex::new(HashSet::new()),
+            derived_definitions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1156,7 +1170,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// batching level, the level's boundary inputs (e.g., a first-class batch extent), the call's batched inputs, and
     /// their batch axes, and it returns the batched outputs together with their batch axes. It is traced when a call is
     /// batched, once per batching level and input signature, and its program becomes the batched call's primal region,
-    /// so it also determines the batch axes of the call's outputs (instead of [`Self::with_batched_output_axes`]).
+    /// so it also determines the batch axes of the call's outputs (instead of [`Self::with_batched_output_axes`]). Each
+    /// output, unbatched along the batch axis that the rule declares for it, must have the type of the corresponding
+    /// output of the call's primal region, which is validated when the call is batched.
     ///
     /// Batching a call with this rule preserves the call and its derivative rules: derivative requests of a batched
     /// call still trace the derivative rules at the unbatched types and batch them structurally (refer to
@@ -1371,20 +1387,30 @@ pub(super) struct CustomRuleCaches<V: Typed + Parameter, O> {
         SpecializationCache<CustomRuleBatchingRuleKey<V::Type>, CustomRuleProgram<V, O>>,
 
     /// Registrations of the definitions derived from this definition (refer to [`CustomRuleDerivation`]), which these
-    /// caches own so that they live exactly as long as the specializations of this definition.
-    pub(super) derived_registrations: Mutex<HashMap<CustomRuleDerivationKey, CustomRuleRegistration<V, O>>>,
+    /// caches own so that they live at most as long as the specializations of this definition. Like the
+    /// specializations, they are bounded, and an evicted registration frees the specializations of its definition.
+    pub(super) derived_registrations: Mutex<LruCache<CustomRuleDerivationKey, CustomRuleRegistration<V, O>>>,
+
+    /// Specializations of this definition converted into the families that contain its family (refer to
+    /// [`LiftedCustomRules`]), keyed by the [`TypeId`] of the containing family and by the request of the
+    /// specialization from which each one was converted. Each one is a [`CustomRuleProgram`] of that family.
+    converted_specializations:
+        SpecializationCache<(TypeId, CustomRuleSpecializationRequest<V::Type>), Arc<dyn Any + Send + Sync>>,
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleCaches<V, O> {
     /// Creates empty [`CustomRuleCaches`] that retain up to [`CUSTOM_RULE_SPECIALIZATION_CAPACITY`] specializations of
-    /// each rule.
+    /// each rule and as many derived registrations.
     fn new() -> Self {
         Self {
             jvp_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
             forward_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
             backward_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
             batching_rule_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
-            derived_registrations: Mutex::new(HashMap::new()),
+            derived_registrations: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY).unwrap(),
+            )),
+            converted_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
         }
     }
 }
@@ -1419,7 +1445,13 @@ pub struct CustomRuleRegistration<V: Typed + Parameter, O> {
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleRegistration<V, O> {
     /// Registers the provided definition with empty specialization caches.
     pub fn new(definition: CustomRuleDefinition<V, O>) -> Self {
-        Self { definition: Arc::new(definition), caches: Arc::new(CustomRuleCaches::new()), marker: PhantomData }
+        Self::from_definition(Arc::new(definition))
+    }
+
+    /// Registers the provided shared definition with empty specialization caches, which is how a derived definition
+    /// that outlived its previous registration is registered again without changing its identity.
+    fn from_definition(definition: Arc<CustomRuleDefinition<V, O>>) -> Self {
+        Self { definition, caches: Arc::new(CustomRuleCaches::new()), marker: PhantomData }
     }
 
     /// Registers the definition returned by `build_fn`, which receives a weak handle to that same registration so that
@@ -1517,6 +1549,34 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             }
         }
         .map_err(specialization_error)
+    }
+
+    /// Returns the specialization for `request` converted into the family `(Vc, Oc)`, which contains this reference's
+    /// family, produced by `produce_fn` on a miss. Like the specializations themselves, it is retained in the
+    /// registration's caches while they are alive, and produced without caching otherwise.
+    fn converted_specialization<Vc, Oc, F>(
+        &self,
+        request: CustomRuleSpecializationRequest<V::Type>,
+        produce_fn: F,
+    ) -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>
+    where
+        Vc: 'static + Typed + Parameter,
+        Oc: 'static,
+        CustomRuleSpecialization<Vc, Oc>: Send + Sync,
+        F: FnOnce() -> Result<CustomRuleProgram<Vc, Oc>, DifferentiationError>,
+    {
+        let Some(caches) = self.caches.upgrade() else {
+            return produce_fn();
+        };
+        let specialization = caches
+            .converted_specializations
+            .get_or_try_insert_with((TypeId::of::<(Vc, Oc)>(), request), || {
+                Ok::<_, DifferentiationError>(produce_fn()? as Arc<dyn Any + Send + Sync>)
+            })
+            .map_err(specialization_error)?;
+
+        // The key names the family, so the retained specialization always belongs to it.
+        Ok(specialization.downcast::<CustomRuleSpecialization<Vc, Oc>>().unwrap())
     }
 }
 
@@ -1732,9 +1792,10 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
     ///     primal axes, and the tangents of such primals are recovered exactly from an outer product (refer to
     ///     [`DiagonalBatchingPolicy`]).
     ///
-    /// Derived definitions are owned by the source's registration, like its specializations: every request for the
-    /// same key returns the same derived definition while the registration's caches are alive, and a fresh one
-    /// otherwise.
+    /// Derived definitions are registered by the source's registration, which retains a bounded number of derived
+    /// registrations like its specializations. Every request for the same key returns the same derived definition while
+    /// that definition is alive (i.e., while its registration or a call holds it), whether or not the source's
+    /// registration is alive, and a fresh one otherwise.
     fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError>
     where
         Self: Sized;
@@ -1816,11 +1877,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 .into());
             }
         };
-        let inner = match key.split_outermost_level() {
-            Some((inner_key, level)) => Some((self.jvp_specialization(inner_key)?, level.clone())),
-            None => None,
-        };
+        // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Jvp(key.clone()), || {
+            let inner = match key.split_outermost_level() {
+                Some((inner_key, level)) => Some((self.jvp_specialization(inner_key)?, level.clone())),
+                None => None,
+            };
             let Some((inner, level)) = inner else {
                 // The traced program takes every primal input followed by the active tangents of the differentiated
                 // inputs and returns the primal outputs followed by their tangents, which is exactly the rule program
@@ -1951,12 +2013,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             ))
             .into());
         };
-        let inner = match key.split_outermost_level() {
-            Some((inner_key, level)) => Some((self.forward_specialization(inner_key)?, level.clone())),
-            None => None,
-        };
+        // The inner specialization is requested only when the outer one is not cached.
         let output_count = key.output_types.len();
         self.specialize(CustomRuleSpecializationRequest::Forward(key.clone()), || {
+            let inner = match key.split_outermost_level() {
+                Some((inner_key, level)) => Some((self.forward_specialization(inner_key)?, level.clone())),
+                None => None,
+            };
             let Some((inner, level)) = inner else {
                 // The primal outputs are validated as their own partition before the residuals are appended,
                 // because a residual whose type matches a missing output would otherwise pass as that output.
@@ -2047,11 +2110,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             ))
             .into());
         };
-        let inner = match key.split_outermost_level() {
-            Some((inner_key, level)) => Some((self.backward_specialization(inner_key)?, level.clone())),
-            None => None,
-        };
+        // The inner specialization is requested only when the outer one is not cached.
         self.specialize(CustomRuleSpecializationRequest::Backward(key.clone()), || {
+            let inner = match key.split_outermost_level() {
+                Some((inner_key, level)) => Some((self.backward_specialization(inner_key)?, level.clone())),
+                None => None,
+            };
             let leading_input_count = key.leading_input_types.len();
             let input_count = leading_input_count + key.input_tangent_types.len();
             let Some((inner, level)) = inner else {
@@ -2134,7 +2198,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
     {
         // Traces the custom batching rule over the level's boundary inputs followed by the batched inputs, recording
         // the batch axes that it declares for its outputs. A derived definition applies the JVP of its source's rule
-        // instead.
+        // instead. The program becomes the primal region of the batched call, so it is discharged with the call.
         let Some(rule) = &self.definition.batching_rule else {
             let Some(derivation) = &self.definition.derivation else {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -2144,7 +2208,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 .into());
             };
             return self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
-                derivation.batching_rule_specialization(self.definition.name(), &key)
+                let CustomRuleSpecialization { program, output_axes } =
+                    derivation.batching_rule_specialization(self.definition.name(), &key)?;
+                let program = self.definition.discharge_if(key.discharged, program)?;
+                Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
             });
         };
         self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
@@ -2170,6 +2237,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
                 self.definition.named_axes.clone(),
             )?;
+            let program = self.definition.discharge_if(key.discharged, program)?;
             Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
         })
     }
@@ -2201,14 +2269,37 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 ..CustomRuleDefinition::new("")
             }
         };
+        // A derived definition that is still alive is reused, so that its calls keep one identity (and with it the
+        // entries of enclosing caches) even after its registration was evicted or the source registration dropped.
+        let definition = {
+            let mut definitions =
+                self.definition.derived_definitions.lock().expect("custom rule derivation mutex is poisoned");
+            definitions.retain(|_, definition| definition.strong_count() > 0);
+            match definitions.get(&key).and_then(Weak::upgrade) {
+                Some(definition) => definition,
+                None => {
+                    let definition = Arc::new(derive(key.clone()));
+                    definitions.insert(key.clone(), Arc::downgrade(&definition));
+                    definition
+                }
+            }
+        };
         let Some(caches) = self.caches.upgrade() else {
-            return Ok(CustomRuleRegistration::new(derive(key)).reference());
+            return Ok(CustomRuleReference { definition, caches: Weak::new() });
         };
         let mut registrations = caches.derived_registrations.lock().expect("custom rule derivation mutex is poisoned");
-        Ok(registrations
-            .entry(key.clone())
-            .or_insert_with(|| CustomRuleRegistration::new(derive(key)))
-            .reference())
+        if let Some(registration) = registrations.get(&key) {
+            return Ok(registration.reference());
+        }
+        let registration = CustomRuleRegistration::from_definition(definition);
+        let reference = registration.reference();
+
+        // An evicted registration is dropped after the lock is released, because dropping its caches may drop
+        // programs whose destructors reach other definitions.
+        let evicted = registrations.push(key, registration);
+        drop(registrations);
+        drop(evicted);
+        Ok(reference)
     }
 }
 
@@ -2271,7 +2362,8 @@ impl UnavailableCustomRules {
 /// its key into the member family, obtains the specialization from the member definition (so that the member
 /// definition's caches, batcher, and transposer serve every family that its calls reach), and converts the program
 /// into the requesting family with [`Program::into_unprojected`]. Nested member calls inside that program are converted
-/// in turn, by the same conversion that converted the call.
+/// in turn, by the same conversion that converted the call. The converted programs are cached per requesting family
+/// with the member definition's specializations, so repeated requests convert each specialization once.
 ///
 /// A member family cannot represent every value of the families that contain it, so some requests of converted calls
 /// fail with exact errors at their first derivative request: rule inputs whose types have no member representation
@@ -2479,8 +2571,9 @@ where
     Om: Operation<Type = Vm::Type>
         + From<CompositeTransposeOperation<Vm, Om>>
         + ResidualZeroProvider<Vm::Type, Operation = Om>,
-    Vc: ValueProjection<Vm::Type, Projected = Vm, Type: Eq + Hash + From<Vm::Type>>,
-    Oc: From<Om>,
+    Vc: 'static + ValueProjection<Vm::Type, Projected = Vm, Type: Eq + Hash + From<Vm::Type>>,
+    Oc: 'static + From<Om>,
+    CustomRuleSpecialization<Vc, Oc>: Send + Sync,
     for<'t> &'t Vm::Type: TryFrom<&'t Vc::Type, Error = TypeError>,
 {
     fn jvp_specialization(
@@ -2492,18 +2585,21 @@ where
         Oc: Operation<Type = Vc::Type> + ResidualZeroProvider<Vc::Type, Operation = Oc>,
     {
         let member = self.member()?;
-        let specialization = member.jvp_specialization(CustomRuleSpecializationKey {
+        let member_key = CustomRuleSpecializationKey {
             input_types: self.project_types(&key.input_types)?,
             output_types: self.project_types(&key.output_types)?,
             non_differentiated_count: key.non_differentiated_count,
             tangent_activity: key.tangent_activity.clone(),
             levels: self.project_levels(&key.levels)?,
             discharged: key.discharged,
-        })?;
-        Ok(Arc::new(CustomRuleSpecialization {
-            program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
-            output_axes: specialization.output_axes.clone(),
-        }))
+        };
+        member.converted_specialization(CustomRuleSpecializationRequest::Jvp(member_key.clone()), || {
+            let specialization = member.jvp_specialization(member_key)?;
+            Ok(Arc::new(CustomRuleSpecialization {
+                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                output_axes: specialization.output_axes.clone(),
+            }))
+        })
     }
 
     fn forward_specialization(
@@ -2515,18 +2611,21 @@ where
         Oc: Operation<Type = Vc::Type>,
     {
         let member = self.member()?;
-        let specialization = member.forward_specialization(CustomRuleSpecializationKey {
+        let member_key = CustomRuleSpecializationKey {
             input_types: self.project_types(&key.input_types)?,
             output_types: self.project_types(&key.output_types)?,
             non_differentiated_count: key.non_differentiated_count,
             tangent_activity: key.tangent_activity.clone(),
             levels: self.project_levels(&key.levels)?,
             discharged: key.discharged,
-        })?;
-        Ok(Arc::new(CustomRuleSpecialization {
-            program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
-            output_axes: specialization.output_axes.clone(),
-        }))
+        };
+        member.converted_specialization(CustomRuleSpecializationRequest::Forward(member_key.clone()), || {
+            let specialization = member.forward_specialization(member_key)?;
+            Ok(Arc::new(CustomRuleSpecialization {
+                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                output_axes: specialization.output_axes.clone(),
+            }))
+        })
     }
 
     fn backward_specialization(
@@ -2558,7 +2657,7 @@ where
                     .transpose()
             })
             .collect::<Result<Vec<_>, DifferentiationError>>()?;
-        let specialization = member.backward_specialization(CustomRuleBackwardSpecializationKey {
+        let member_key = CustomRuleBackwardSpecializationKey {
             leading_input_types: self.project_types(&key.leading_input_types)?,
             seed_extent_count: key.seed_extent_count,
             input_tangent_types: self.project_types(&key.input_tangent_types)?,
@@ -2567,11 +2666,14 @@ where
             destination_kinds: key.destination_kinds.clone(),
             levels: self.project_levels(&key.levels)?,
             discharged: key.discharged,
-        })?;
-        Ok(Arc::new(CustomRuleSpecialization {
-            program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
-            output_axes: specialization.output_axes.clone(),
-        }))
+        };
+        member.converted_specialization(CustomRuleSpecializationRequest::Backward(member_key.clone()), || {
+            let specialization = member.backward_specialization(member_key)?;
+            Ok(Arc::new(CustomRuleSpecialization {
+                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                output_axes: specialization.output_axes.clone(),
+            }))
+        })
     }
     fn batching_rule_specialization(
         &self,
@@ -2598,7 +2700,7 @@ where
             BatchingLevelExtent::Static(extent) => BatchingLevelExtent::Static(*extent),
             BatchingLevelExtent::Dynamic(r#type) => BatchingLevelExtent::Dynamic(project(r#type)?),
         };
-        let specialization = member.batching_rule_specialization(CustomRuleBatchingRuleKey {
+        let member_key = CustomRuleBatchingRuleKey {
             level: BatchingLevel::new(
                 extent,
                 key.level.axis_name().map(str::to_owned),
@@ -2608,11 +2710,15 @@ where
             input_types: key.input_types.iter().map(project).collect::<Result<_, _>>()?,
             unbatched_input_types: key.unbatched_input_types.iter().map(project).collect::<Result<_, _>>()?,
             input_axes: key.input_axes.clone(),
-        })?;
-        Ok(Arc::new(CustomRuleSpecialization {
-            program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
-            output_axes: specialization.output_axes.clone(),
-        }))
+            discharged: key.discharged,
+        };
+        member.converted_specialization(CustomRuleSpecializationRequest::BatchingRule(member_key.clone()), || {
+            let specialization = member.batching_rule_specialization(member_key)?;
+            Ok(Arc::new(CustomRuleSpecialization {
+                program: specialization.program.clone().into_unprojected::<Vc, Oc>()?,
+                output_axes: specialization.output_axes.clone(),
+            }))
+        })
     }
 
     fn derived(&self, key: CustomRuleDerivationKey) -> Result<Self, DifferentiationError> {
@@ -2633,7 +2739,8 @@ where
     /// Returns the batched program of a derived call for `key` (refer to [`CustomRuleDerivation`] for its two modes),
     /// which consumes the level's boundary inputs followed by the derived call's batched inputs (i.e., its primal
     /// inputs, including the boundary inputs of earlier levels, followed by its active tangents) and returns its
-    /// batched outputs, together with their batch axes.
+    /// batched outputs, together with their batch axes. The source rule programs that it applies are discharged when
+    /// `key` is, while the returned program is left for the caller to discharge.
     ///
     /// # Parameters
     ///
@@ -2643,7 +2750,7 @@ where
         &self,
         name: &str,
         key: &CustomRuleBatchingRuleKey<V::Type>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
+    ) -> Result<CustomRuleSpecialization<V, O>, DifferentiationError> {
         let source = &self.source.definition;
         let (Some(differentiator), Some(batcher)) = (&source.differentiator, &source.batcher) else {
             return Err(ProgramError::UnsupportedOperation {
@@ -2693,6 +2800,7 @@ where
             input_types,
             unbatched_input_types: key.unbatched_input_types[..primal_count].to_vec(),
             input_axes,
+            discharged: key.discharged,
         };
         let program_types = key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>();
         let tangents_only = self.key.kind == CustomRuleDerivationKind::Pushforward;
@@ -2734,7 +2842,7 @@ where
                 program_types,
                 self.source.definition.named_axes.clone(),
             )?;
-            return Ok(Arc::new(CustomRuleSpecialization { program, output_axes }));
+            return Ok(CustomRuleSpecialization { program, output_axes });
         }
 
         // Rule mode: align each primal and tangent pair with a mapped side to one axis, preferring the primal's axis. Only
@@ -2828,7 +2936,7 @@ where
             program_types,
             self.source.definition.named_axes.clone(),
         )?;
-        Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
+        Ok(CustomRuleSpecialization { program, output_axes })
     }
 
     /// Returns the batched program of a derived call for `key` when its source batching rule depends on its input batch
@@ -2862,7 +2970,7 @@ where
         axis_dependence: &dyn CustomRuleAxisDependence<V, O>,
         differentiator: &CustomRuleDifferentiator<V, O>,
         batcher: &CustomRuleBatcher<V, O>,
-    ) -> Result<CustomRuleProgram<V, O>, DifferentiationError> {
+    ) -> Result<CustomRuleSpecialization<V, O>, DifferentiationError> {
         let tangents_only = self.key.kind == CustomRuleDerivationKind::Pushforward;
         let boundary_input_count = key.boundary_input_types.len();
         let primal_count = key.input_types.len() - tangent_primal_indices.len();
@@ -3055,13 +3163,16 @@ where
                 let outer_outputs = outer_product.interpret_in_context(&context, outer_inputs)?;
 
                 for (following, tangent_only, outer_axis, axis) in &tangents {
-                    let tangent_only = match (tangent_only, axis.axis()) {
-                        (None, _) => None,
-                        (Some(index), None) => Some(outer_outputs[*index].clone()),
-                        (Some(index), Some(axis)) => {
+                    let tangent_only = match (tangent_only, axis.axis(), *outer_axis) {
+                        (None, _, _) => None,
+                        (Some(index), None, _) => Some(outer_outputs[*index].clone()),
+
+                        // An output that does not depend on the tangent-only inputs (e.g., whose contribution is a
+                        // zero) is replicated along the second level, so its contribution already has `P`'s batch axis.
+                        (Some(index), Some(_), None) => Some(outer_outputs[*index].clone()),
+                        (Some(index), Some(axis), Some(outer_axis)) => {
                             // The second level's axis precedes `P`'s batch axis in the outer product exactly when its
                             // position does not exceed that axis's position in `P`'s output.
-                            let outer_axis = outer_axis.unwrap();
                             let axis = position(axis)?;
                             let kept_axis = if outer_axis <= axis { axis + 1 } else { axis };
                             Some(axis_dependence.diagonal(&outer_outputs[*index], kept_axis, outer_axis)?)
@@ -3080,7 +3191,7 @@ where
             key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
             self.source.definition.named_axes.clone(),
         )?;
-        Ok(Arc::new(CustomRuleSpecialization { program, output_axes: all_output_axes }))
+        Ok(CustomRuleSpecialization { program, output_axes: all_output_axes })
     }
 
     /// Returns the Jacobian-Vector Product (JVP) program of the source rule's batched `program` with respect to
@@ -3433,6 +3544,35 @@ mod tests {
     }
 
     #[test]
+    fn test_lifted_custom_rules_converted_specialization_cache() {
+        // The converted program of each specialization is cached with the member definition's specializations, so
+        // repeated requests share it instead of converting the member program again.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let lifted = LiftedCustomRules::Member(definition.reference());
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let key = CustomRuleSpecializationKey {
+            input_types: vec![scalar_type.clone()],
+            output_types: vec![scalar_type],
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels: Vec::new(),
+            discharged: false,
+        };
+        let specialize = || {
+            CustomRuleSpecializer::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::jvp_specialization(
+                &lifted,
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let first = specialize();
+        let second = specialize();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
     fn test_custom_rule_definition_batched_specialization_dynamic_extent() {
         // A first-class batch extent reaches batched specializations as a leading boundary input, so the traced rule is
         // batched at a level that records only the extent's type.
@@ -3706,6 +3846,35 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_reference_specialization_outer_cache_hit() {
+        // A batched specialization that is still cached is served without requesting the unbatched specialization from
+        // which it was batched, so evicting the latter neither traces the rule again nor caches it again.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key = CustomRuleSpecializationKey {
+            input_types: vec![scalar_type.clone()],
+            output_types: vec![scalar_type],
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels: vec![CustomRuleBatchingLevel {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_count: 0,
+                input_axes: vec![BatchAxis::new(0)],
+                output_axes: vec![BatchAxis::new(0)],
+            }],
+            discharged: false,
+        };
+        let first = definition.reference().jvp_specialization(key.clone()).unwrap();
+        assert_eq!(definition.caches().jvp_specializations.len(), 2);
+        assert_eq!(definition.caches().jvp_specializations.invalidate_entries_if(|key| key.levels.is_empty()), 1);
+        let second = definition.reference().jvp_specialization(key).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(definition.caches().jvp_specializations.len(), 1);
+        assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
     fn test_custom_rule_reference_specialization_retry_after_failure() {
         // A failed specialization is not retained, so the next request invokes the rule again.
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -3813,12 +3982,12 @@ mod tests {
         assert!(derived.caches.upgrade().is_some());
 
         // Dropping the source registration frees the derived registrations and their caches, and later derivations
-        // produce fresh definitions without caches, exactly like specializations.
+        // reuse the derived definitions that are still alive, without caches, exactly like specializations.
         let source = registration.reference();
         drop(registration);
         assert!(derived.caches.upgrade().is_none());
         let fresh = source.derived(key(CustomRuleDerivationKind::Jvp)).unwrap();
-        assert_ne!(fresh, derived);
+        assert_eq!(fresh, derived);
         assert!(fresh.caches.upgrade().is_none());
         let derived_definition = Arc::downgrade(&derived.definition);
         drop((derived, pushforward, fresh));
@@ -3834,5 +4003,35 @@ mod tests {
             "encountered malformed program: `composite` `sine` has no custom batching rule from which to derive \
              rules",
         );
+    }
+
+    #[test]
+    fn test_custom_rule_reference_derived_capacity() {
+        // The source registration retains as many derived registrations as specializations of each rule. A derived
+        // definition that is still alive is reused for its key, whether or not its registration was evicted or the
+        // source registration was dropped, so that it keeps its identity.
+        let registration = CustomRuleRegistration::new(
+            MemberDefinition::new("sine")
+                .with_jvp_from_primal()
+                .with_batching()
+                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+        );
+        let key = |input_count| CustomRuleDerivationKey {
+            kind: CustomRuleDerivationKind::Jvp,
+            input_count,
+            active_input_indices: vec![0],
+            output_tangent_mask: vec![true],
+        };
+        let derived = (1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1)
+            .map(|input_count| registration.reference().derived(key(input_count)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registration.caches().derived_registrations.lock().unwrap().len(),
+            CUSTOM_RULE_SPECIALIZATION_CAPACITY,
+        );
+        assert_eq!(registration.reference().derived(key(1)).unwrap(), derived[0]);
+        let source = registration.reference();
+        drop(registration);
+        assert_eq!(source.derived(key(2)).unwrap(), derived[1]);
     }
 }

@@ -14,7 +14,7 @@ use crate::operations::attention::{
     DotProductAttentionOperation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::composites::functions::{Composite, CompositeVjp, DefaultJvp, WithVjp, composite};
+use crate::operations::composites::functions::{CompositeVjp, ExplicitVjp, VjpComposite, composite};
 use crate::operations::composites::operations::CompositeOperation;
 use crate::operations::composites::rules::CustomRuleRegistration;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -121,46 +121,17 @@ where
     })
 }
 
-/// Boxed primal rule of a [`DifferentiableDotProductAttention`] function.
-type AttentionPrimal<D> =
-    Box<dyn Fn(AttentionInputs<DomainTracer<D>>) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>;
-
-/// Boxed reverse-mode forward rule of a [`DifferentiableDotProductAttention`] function.
-type AttentionForward<D> = Box<
-    dyn Fn(
-            AttentionInputs<DomainTracer<D>>,
-        ) -> Result<(DomainTracer<D>, AttentionResiduals<DomainTracer<D>>), ProgramError>
-        + Send
-        + Sync,
->;
-
-/// Boxed reverse-mode backward rule of a [`DifferentiableDotProductAttention`] function.
-type AttentionBackward<D> = Box<
-    dyn Fn(
-            AttentionResiduals<DomainTracer<D>>,
-            DomainTracer<D>,
-        ) -> Result<AttentionInputs<DomainTracer<D>>, ProgramError>
-        + Send
-        + Sync,
->;
-
 /// Differentiable scaled dot-product attention training function, built by [`differentiable_dot_product_attention`].
-/// It is a [`Composite`] with reverse-mode rules whose input variation transitions precede its composite boundary,
-/// which lets the transitions' transposes accumulate invariant-input contributions exactly once. Its forward and
-/// backward rules are retained: an ordinary call traces only the attention primal, and the rules are traced on the
-/// first reverse-mode request of each specialization and cached for as long as the function lives.
+/// It is a [`Composite`](crate::Composite) with reverse-mode rules whose input variation transitions precede its
+/// composite boundary, which lets the transitions' transposes accumulate invariant-input contributions exactly once.
+/// Its forward and backward rules are retained: an ordinary call traces only the attention primal, and the rules are
+/// traced on the first reverse-mode request of each specialization and cached for as long as the function lives.
 pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     /// Composite that stages the attention training call.
-    function: Composite<
-        AttentionInputs<DomainTracer<D>>,
-        DomainTracer<D>,
-        AttentionPrimal<D>,
-        DefaultJvp,
-        WithVjp<AttentionResiduals<DomainTracer<D>>, AttentionForward<D>, AttentionBackward<D>>,
-    >,
+    function: VjpComposite<AttentionInputs<DomainTracer<D>>, DomainTracer<D>, AttentionResiduals<DomainTracer<D>>>,
 }
 
 impl<D: Domain<Type = ArrayType>> DifferentiableDotProductAttention<D>
@@ -178,7 +149,7 @@ where
         <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
         CustomRuleRegistration<C::Constant, C::Operation>: Send,
-        WithVjp<AttentionResiduals<DomainTracer<D>>, AttentionForward<D>, AttentionBackward<D>>:
+        ExplicitVjp<AttentionInputs<DomainTracer<D>>, DomainTracer<D>, AttentionResiduals<DomainTracer<D>>>:
             CompositeVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
     {
         let signature = inputs.signature();
@@ -228,34 +199,34 @@ where
         AttentionImplementation::Automatic => configuration.with_implementation(AttentionImplementation::Portable),
         AttentionImplementation::Portable | AttentionImplementation::Fused => configuration,
     };
-    let primal: AttentionPrimal<D> = Box::new(move |inputs| {
+    let primal = move |inputs: AttentionInputs<DomainTracer<D>>| -> Result<_, ProgramError> {
         let (output, _) = DomainTracer::<D>::dot_product_attention(inputs, configuration.with_residual(false))?;
         Ok(output)
-    });
-    let forward: AttentionForward<D> = Box::new(move |inputs: AttentionInputs<DomainTracer<D>>| {
+    };
+    let forward = move |inputs: AttentionInputs<DomainTracer<D>>| -> Result<_, ProgramError> {
         let (output, statistic) =
             DomainTracer::<D>::dot_product_attention(inputs.clone(), configuration.with_residual(true))?;
         let statistic = statistic.unwrap();
         Ok((output.clone(), AttentionResiduals { inputs, output, statistic }))
-    });
-    let backward: AttentionBackward<D> =
-        Box::new(move |residuals: AttentionResiduals<DomainTracer<D>>, output_cotangent| {
-            let structural_inputs = residuals.inputs.clone();
-            let mut cotangents = bind_attention_backward::<D>(
-                residuals.inputs,
-                residuals.output,
-                residuals.statistic,
-                output_cotangent,
-                configuration.with_residual(true),
-            )?;
-            let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent()?);
-            cotangents.mask = structural_inputs.mask.as_ref().map(zero).transpose()?;
-            cotangents.query_sequence_lengths =
-                structural_inputs.query_sequence_lengths.as_ref().map(zero).transpose()?;
-            cotangents.key_value_sequence_lengths =
-                structural_inputs.key_value_sequence_lengths.as_ref().map(zero).transpose()?;
-            Ok(cotangents)
-        });
+    };
+    let backward = move |residuals: AttentionResiduals<DomainTracer<D>>,
+                         output_cotangent: DomainTracer<D>|
+          -> Result<_, ProgramError> {
+        let structural_inputs = residuals.inputs.clone();
+        let mut cotangents = bind_attention_backward::<D>(
+            residuals.inputs,
+            residuals.output,
+            residuals.statistic,
+            output_cotangent,
+            configuration.with_residual(true),
+        )?;
+        let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent()?);
+        cotangents.mask = structural_inputs.mask.as_ref().map(zero).transpose()?;
+        cotangents.query_sequence_lengths = structural_inputs.query_sequence_lengths.as_ref().map(zero).transpose()?;
+        cotangents.key_value_sequence_lengths =
+            structural_inputs.key_value_sequence_lengths.as_ref().map(zero).transpose()?;
+        Ok(cotangents)
+    };
     DifferentiableDotProductAttention {
         function: composite(primal).with_vjp(forward, backward).with_name(DOT_PRODUCT_ATTENTION_OPERATION_NAME),
     }

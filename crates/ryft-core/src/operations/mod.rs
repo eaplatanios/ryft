@@ -69,12 +69,12 @@ pub use complex::{
     RealOperation,
 };
 pub use composites::{
-    BatchingRuleConsistencyError, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite,
-    CompositeBatching, CompositeOperation, CompositeJvp, CompositeJvpRule, CompositeTransposeOperation,
-    CompositeVjp, CustomCallPrimal, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration,
-    CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer, DefaultBatching, DefaultJvp, DefaultVjp, JvpFromPrimal,
-    LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration, WithAccumulatingVjp,
-    WithAxisDependentBatching, WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp,
+    AccumulatingVjp, AxisDependentBatching, BatchingRuleConsistencyError, COMPOSITE_OPERATION_NAME,
+    COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeBatching, CompositeJvp, CompositeJvpRule,
+    CompositeOperation, CompositeTransposeOperation, CompositeVjp, CustomBatching, CustomRuleDefinition,
+    CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer,
+    DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, LiftedCustomRules,
+    SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite, WeakCustomRuleRegistration,
     check_batching_rule_consistency, composite,
 };
 pub use constants::{

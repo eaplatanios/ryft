@@ -971,7 +971,7 @@ pub(crate) mod tests {
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, CaptureReference,
-        CapturingContext, Compare, CompareOperation, ComparisonDirection, CompositeOperation, CompositeJvpRule,
+        CapturingContext, Compare, CompareOperation, ComparisonDirection, CompositeJvpRule, CompositeOperation,
         CompositeTransposeOperation, ConditionOperation, Context, DataType, DifferentiableType, Dimension,
         DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ErasedOperation,

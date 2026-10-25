@@ -1270,10 +1270,9 @@ mod tests {
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
     use crate::operations::{
-        CompositeOperation, CompositeJvpRule, CompositeTransposeOperation, ConditionOperation,
-        CustomRuleDefinition, CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation,
-        ZeroOperation,
+        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, CustomRuleDefinition,
+        CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, EffectClasses, ProgramBuilder, ReferenceAccessDescriptor, RegionId};
@@ -2564,9 +2563,7 @@ mod tests {
             CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member"));
         assert_eq!(
             definition(
-                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(
-                    member_rules.reference(),
-                ))),
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(member_rules.reference()))),
                 1,
             )
             .semantic_key(),

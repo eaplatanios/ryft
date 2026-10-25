@@ -2221,11 +2221,11 @@ mod tests {
     };
     use crate::differentiation::{MemoryTransferStorage, NothingSavable};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, CompositeOperation, CompositeJvpRule,
-        ConditionOperation, CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation,
-        LinearCallOperation, MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, RematerializeOperation, ScanOperation,
-        SinOperation, TagOperation, TransferToMemoryOperation, WhileOperation,
+        AddOperation, CompareOperation, ComparisonDirection, CompositeJvpRule, CompositeOperation, ConditionOperation,
+        CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation, LinearCallOperation,
+        MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, RematerializeOperation, ScanOperation, SinOperation,
+        TagOperation, TransferToMemoryOperation, WhileOperation,
     };
     use crate::partial::values::PartialEvaluationOutput;
     use crate::programs::{
@@ -4802,10 +4802,8 @@ mod tests {
             let body = branch.import_program(body.clone());
             let mut outputs = Vec::new();
             for (input, output_index) in inputs.into_iter().zip(selected_outputs) {
-                let call = TestOperation::Composite(CompositeOperation::from_rule_regions(
-                    CompositeJvpRule::Primal,
-                    false,
-                ));
+                let call =
+                    TestOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false));
                 outputs.push(branch.add_instruction(call, vec![body], vec![input], None).unwrap()[output_index]);
             }
             let sum = add(&mut branch, AddOperation::<ArrayType>::new().into(), outputs);

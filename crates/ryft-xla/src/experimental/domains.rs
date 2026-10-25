@@ -6943,7 +6943,7 @@ mod tests {
         Assert, AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation,
         BatchingContext, CalleeRegionDriver, CaptureReference, Cast, CastOperation, CollectiveOptions,
         CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
-        CompiledFunctionDispatcher, CompositeOperation, CompositeJvpRule, ConcatenateOperation, ConditionOperation,
+        CompiledFunctionDispatcher, CompositeJvpRule, CompositeOperation, ConcatenateOperation, ConditionOperation,
         ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
         CustomCallOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
         DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,

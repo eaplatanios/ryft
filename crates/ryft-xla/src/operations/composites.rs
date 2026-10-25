@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_composite_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{CompositeOperation, CompositeJvpRule, PrintOperation};
+        use ryft_core::{CompositeJvpRule, CompositeOperation, PrintOperation};
 
         // A retained `composite` call lowers only its primal program and threads its effects onto the enclosing
         // ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked here by the
@@ -151,10 +151,7 @@ mod tests {
         for (operation, rules) in [
             (CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false), vec![&jvp]),
             (CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true), vec![&forward, &backward]),
-            (
-                CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true),
-                vec![&jvp, &forward, &backward],
-            ),
+            (CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true), vec![&jvp, &forward, &backward]),
         ] {
             let mut builder = ArrayIrXlaProgramBuilder::new();
             let mut regions = vec![builder.import_region(primal.entry_region_ref())];

@@ -11,7 +11,7 @@ use ryft_core::kernels::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
-    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeOperation, CompositeJvpRule,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeJvpRule, CompositeOperation,
     ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     Domain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver,

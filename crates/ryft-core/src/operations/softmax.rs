@@ -67,7 +67,7 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
-use crate::operations::composites::functions::{Composite, WithJvp, composite};
+use crate::operations::composites::functions::{JvpComposite, composite};
 use crate::operations::composites::operations::CompositeOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
@@ -412,28 +412,12 @@ impl<
 /// probabilities, preserving small gradients when the two distributions nearly match. A retained custom Jacobian Vector
 /// Product (JVP) function supplies both differentiation modes and remains differentiable at higher orders. Create the
 /// function once and reuse it to share cached rule specializations across calls.
-#[allow(clippy::type_complexity)]
 pub struct SoftmaxCrossEntropyWithTargetLogits<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     /// Retained composite whose leading target input is non-differentiated plumbing.
-    composite: Composite<
-        (DomainTracer<D>, DomainTracer<D>),
-        DomainTracer<D>,
-        // TODO(eaplatanios): Can we make these a bit more ergonomic? Is this about the `Composite` design?
-        Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>,
-        WithJvp<
-            Box<
-                dyn Fn(
-                        (DomainTracer<D>, DomainTracer<D>),
-                        (DomainTracer<D>, DomainTracer<D>),
-                    ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-                    + Send
-                    + Sync,
-            >,
-        >,
-    >,
+    composite: JvpComposite<(DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
 }
 
 // TODO(eaplatanios): Review from here onwards.
@@ -546,30 +530,24 @@ where
 {
     let axes = axes.into();
     let primal_axes = axes.clone();
-    let primal: Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync> =
-        Box::new(move |(target_logits, logits)| {
-            let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &primal_axes)?;
-            let target_probabilities = inputs.target_logits.softmax(inputs.axis)?;
-            let log_probabilities = inputs.logits.log_softmax(inputs.axis)?;
+    let primal = move |(target_logits, logits): (DomainTracer<D>, DomainTracer<D>)| {
+        let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &primal_axes)?;
+        let target_probabilities = inputs.target_logits.softmax(inputs.axis)?;
+        let log_probabilities = inputs.logits.log_softmax(inputs.axis)?;
 
-            // Avoid multiplying zero target probabilities by masked log-probabilities.
-            // This literal has the logits' placement and variation because it is a non-differentiable constant.
-            let zero = target_probabilities.domain().fill(target_probabilities.r#type().as_ref(), 0.0)?;
-            let log_probabilities = target_probabilities.equal(&zero)?.select(&zero, &log_probabilities)?;
-            target_probabilities
-                .mul(&log_probabilities)?
-                .reduce_sum(&[inputs.axis], None)?
-                .neg()?
-                .convert_element_type(inputs.output_data_type)
-        });
-    let jvp: Box<
-        dyn Fn(
-                (DomainTracer<D>, DomainTracer<D>),
-                (DomainTracer<D>, DomainTracer<D>),
-            ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-            + Send
-            + Sync,
-    > = Box::new(move |(target_logits, logits), (_, tangent)| {
+        // Avoid multiplying zero target probabilities by masked log-probabilities.
+        // This literal has the logits' placement and variation because it is a non-differentiable constant.
+        let zero = target_probabilities.domain().fill(target_probabilities.r#type().as_ref(), 0.0)?;
+        let log_probabilities = target_probabilities.equal(&zero)?.select(&zero, &log_probabilities)?;
+        target_probabilities
+            .mul(&log_probabilities)?
+            .reduce_sum(&[inputs.axis], None)?
+            .neg()?
+            .convert_element_type(inputs.output_data_type)
+    };
+    let jvp = move |(target_logits, logits): (DomainTracer<D>, DomainTracer<D>),
+                    (_, tangent): (DomainTracer<D>, DomainTracer<D>)|
+          -> Result<_, ProgramError> {
         let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &axes)?;
         let CrossEntropyInputsWithTargetLogits { target_logits, logits, class_axes, axis, output_data_type } = inputs;
         let log_probabilities = logits.log_softmax(axis)?;
@@ -641,7 +619,7 @@ where
             .reduce_sum(&[axis], None)?
             .convert_element_type(loss.r#type().tangent()?.data_type())?;
         Ok((loss, output_tangent))
-    });
+    };
     SoftmaxCrossEntropyWithTargetLogits {
         composite: composite(primal)
             .with_jvp(jvp)
