@@ -94,15 +94,26 @@ pub use scan::{SCAN_OPERATION_NAME, ScanInterpretationDomain, ScanOperation, Sca
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
 
-/// Operation-family storage and conversions for residuals saved separately for each loop iteration.
+/// Operations for storing a loop's intermediate values in stacks and recovering them when needed. When partial
+/// evaluation or differentiation splits a loop body, the later computation may need values produced by the earlier
+/// computation. Those saved values are _residuals_. [`ScanOperation`] partial evaluation and bounded [`WhileOperation`]
+/// differentiation store per-iteration residuals in array stacks. Arrays already have a stackable representation;
+/// first-class dimensions are converted to scalar arrays first:
 ///
-/// Arrays store themselves directly. First-class dimensions are converted to scalar arrays before stacking and
-/// restored after slicing. Conversions are region-free unary operations with one output, so the stored type is
-/// inferred from the same operation that produces the stored value. Save and restore functions return `None` when no
-/// conversion is needed.
+/// ```text
+///   dimension<n> --save--> i64[] --stack--> i64[iterations] --slice--> i64[] --restore--> dimension<n>
+/// ```
+///
+/// Save and restore functions supply region-free unary operations with one output, or `None` when no conversion is
+/// needed. [`Self::residual_storage_type`] infers the type of one stored slice from the save operation. References
+/// cannot be stored as residual-stack entries; they must be threaded as loop carries.
+///
+/// If a consumer input already carries a saved dimension's identity, the consumer reuses that input or calls
+/// [`Self::residual_from_carrier`] to recover the dimension from it. This avoids creating a second definition
+/// of the same identity.
 pub(crate) trait ResidualStackOperation<T: Type>: Operation<Type = T> {
-    /// Returns the per-iteration array storage type, inferred from [`Self::residual_to_storage`] when conversion is
-    /// needed.
+    /// Returns the per-iteration storage type, inferred from [`Self::residual_to_storage`] when conversion is needed,
+    /// and [`None`] otherwise.
     fn residual_storage_type(residual_type: &T) -> Result<T, TypeError> {
         let Some(operation) = Self::residual_to_storage(residual_type)? else {
             return Ok(residual_type.clone());
@@ -112,15 +123,17 @@ pub(crate) trait ResidualStackOperation<T: Type>: Operation<Type = T> {
         Ok(output_types.remove(0))
     }
 
-    /// Returns the operation that converts a residual to an array for stacking, if conversion is required.
+    /// Returns the operation that converts a residual to the storage representation used for stacking, if conversion
+    /// is required, and [`None`] otherwise.
     fn residual_to_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 
-    /// Returns the operation that restores a residual from its stored array slice, if conversion is required.
+    /// Returns the operation that restores a residual from its storage representation,  if conversion is required,
+    /// and [`None`] otherwise.
     fn residual_from_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 
-    /// Returns the operation that recovers a residual of type `residual_type` from a value of type `carrier_type` that
-    /// already carries the residual's identity (e.g., the size of the array axis that a first-class dimension
-    /// describes), or `None` when `carrier_type` carries no such identity. A rebuilt loop body uses this instead of
+    /// Returns the operation that recovers a residual of type `residual_type` from a value of type `carrier_type`
+    /// that already carries the residual's identity (e.g., the size of the array axis that a first-class dimension
+    /// describes), or [`None`] when `carrier_type` carries no such identity. A rebuilt loop body uses this instead of
     /// restoring the residual from its stored value when one of its inputs already establishes that identity, because
     /// the restored residual would define the identity a second time.
     fn residual_from_carrier(residual_type: &T, carrier_type: &T) -> Result<Option<Self>, TypeError>;
@@ -143,15 +156,16 @@ impl<O: Operation<Type = ArrayType>> ResidualStackOperation<ArrayType> for O {
     }
 }
 
-// Array IR residuals store arrays directly and first-class dimensions as scalar arrays. References are threaded
-// through loop carries instead of stored in residual stacks.
-impl<O> ResidualStackOperation<ArrayIrType> for O
-where
+impl<
     O: Operation<Type = ArrayIrType>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>,
+> ResidualStackOperation<ArrayIrType> for O
 {
+    // Array IR residuals store arrays directly and first-class dimensions as scalar arrays.
+    // References are threaded through loop carries instead of stored in residual stacks.
+
     fn residual_to_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
             ArrayIrType::Array(_) => None,
@@ -197,6 +211,8 @@ where
             .transpose()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates that instruction input `index` of the control-flow operation named `operation_name`, of type
 /// `input_type`, may feed a region input of type `region_input_type`, i.e., that it refines that type (refer to
