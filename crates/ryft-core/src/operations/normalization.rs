@@ -278,7 +278,7 @@ impl<
     fn log_softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("log_softmax", &self.r#type(), axes.into())?;
         let (mut values, layout) = flatten_class_axes(vec![self.convert_element_type(working_type)?], &axes)?;
-        let output = log_softmax_along(&values.pop().unwrap(), layout.axis())?;
+        let output = log_softmax_along(&values.pop().unwrap(), layout.axis)?;
         layout.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
@@ -289,7 +289,7 @@ impl<
         let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
         let mask = values.pop().unwrap();
         let input = values.pop().unwrap();
-        let output = masked_log_softmax_along(&input, &mask, layout.axis())?;
+        let output = masked_log_softmax_along(&input, &mask, layout.axis)?;
         layout.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
@@ -305,8 +305,8 @@ impl<
         let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
         let targets = values.pop().unwrap();
         let input = values.pop().unwrap();
-        let log_probabilities = log_softmax_along(&input, layout.axis())?;
-        cross_entropy_loss(&targets, &log_probabilities, None, layout.axis())?
+        let log_probabilities = log_softmax_along(&input, layout.axis)?;
+        cross_entropy_loss(&targets, &log_probabilities, None, layout.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -328,8 +328,8 @@ impl<
         let mask = values.pop().unwrap();
         let targets = values.pop().unwrap();
         let input = values.pop().unwrap();
-        let log_probabilities = masked_log_softmax_along(&input, &mask, layout.axis())?;
-        cross_entropy_loss(&targets, &log_probabilities, Some(&mask), layout.axis())?
+        let log_probabilities = masked_log_softmax_along(&input, &mask, layout.axis)?;
+        cross_entropy_loss(&targets, &log_probabilities, Some(&mask), layout.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -352,7 +352,7 @@ impl<
         ])?;
         let labels = aligned.pop().unwrap();
         let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
-        integer_label_loss(&values.pop().unwrap(), &labels, None, layout.axis())?
+        integer_label_loss(&values.pop().unwrap(), &labels, None, layout.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 
@@ -374,12 +374,10 @@ impl<
         let labels = aligned.pop().unwrap();
         let (mut values, layout) = flatten_class_axes(aligned, &axes)?;
         let mask = values.pop().unwrap();
-        integer_label_loss(&values.pop().unwrap(), &labels, Some(&mask), layout.axis())?
+        integer_label_loss(&values.pop().unwrap(), &labels, Some(&mask), layout.axis)?
             .convert_element_type(self.r#type().data_type())
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Validates the logits contract shared by every normalization entry point and returns the normalized class axes in
 /// increasing order with the arithmetic data type: `f64` keeps its precision and every other real floating-point
@@ -401,22 +399,28 @@ fn validate_normalization(
             TypeError::invalid(format!("`{function}` axis name `{name}` is not bound by any enclosing transform"))
         }
     })?;
+
     if axes.is_empty() {
         return Err(TypeError::invalid(format!("`{function}` requires at least one class axis")).into());
     }
+
     axes.sort_unstable();
+
     if !input_type.data_type().is_floating_point() {
         return Err(TypeError::invalid(format!("`{function}` requires real floating-point logits")).into());
     }
+
     validate_normalization_placement(function, input_type)?;
+
     let shape = input_type
         .static_shape()
         .ok_or_else(|| TypeError::invalid(format!("`{function}` requires a static input shape")))?;
     if axes.iter().any(|&axis| shape[axis] == 0) {
         return Err(TypeError::invalid(format!("`{function}` requires a non-empty class axis")).into());
     }
-    let working_type = if input_type.data_type() == DataType::F64 { DataType::F64 } else { DataType::F32 };
-    Ok((axes, working_type))
+
+    let r#type = if input_type.data_type() == DataType::F64 { DataType::F64 } else { DataType::F32 };
+    Ok((axes, r#type))
 }
 
 /// Rejects inputs with partial sums or zero-filled replicas across mesh axes, which nonlinear normalization cannot
@@ -450,15 +454,15 @@ fn validate_normalization_targets(
 ) -> Result<(), ProgramError> {
     if targets_type.shape() != input_type.shape() || !targets_type.data_type().is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "`{function}` probability targets must have the logits' shape and real floating-point elements"
+            "`{function}` probability targets must have the logits' shape and real floating-point elements",
         ))
         .into());
     }
     validate_normalization_placement(function, targets_type)
 }
 
-/// Validates that `labels_type` is an integer array with the logits' shape without the class `axes` and a supported
-/// placement.
+/// Validates that `labels_type` is an integer array with the logits' shape without the class `axes`
+/// and a supported placement.
 fn validate_normalization_labels(
     function: &str,
     input_type: &ArrayType,
@@ -475,12 +479,14 @@ fn validate_normalization_labels(
         .collect::<Vec<_>>();
     if labels_type.shape().dimensions() != expected_shape || !labels_type.data_type().is_integer() {
         return Err(TypeError::invalid(format!(
-            "`{function}` labels must have the logits' shape with the class axes removed and integer elements"
+            "`{function}` labels must have the logits' shape with the class axes removed and integer elements",
         ))
         .into());
     }
     validate_normalization_placement(function, labels_type)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Layout of the class axes of the values that the single-axis arithmetic consumes: several class axes are moved to
 /// the end, in increasing order, and merged into one, while a single class axis leaves the values unchanged.
@@ -493,11 +499,6 @@ struct FlattenedClassAxes {
 }
 
 impl FlattenedClassAxes {
-    /// Returns the position of the class axis in the flattened values.
-    fn axis(&self) -> usize {
-        self.axis
-    }
-
     /// Restores the original layout of `value`, an output with the flattened values' shape.
     fn restore<V: Value<Type = ArrayType> + Reshape + Transpose>(&self, value: V) -> Result<V, ProgramError> {
         match &self.restoration {
@@ -876,7 +877,7 @@ where
     )?;
     let student = values.pop().unwrap();
     let teacher = values.pop().unwrap();
-    Ok(SoftTargetInputs { teacher, student, class_axes, axis: layout.axis(), output_data_type })
+    Ok(SoftTargetInputs { teacher, student, class_axes, axis: layout.axis, output_data_type })
 }
 
 /// Computes the primal loss without multiplying zero target probabilities by masked log-probabilities.
