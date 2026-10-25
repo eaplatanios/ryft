@@ -371,7 +371,10 @@ pub trait ScanType:
         // A runtime length input that only refines the declared bounds fixes the trip count to one exact extent, so the
         // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
         // them symbolic would type a concretely sized result as an independent runtime extent.
-        let effective_length = effective_scan_length(length, input_types, carry_count)?;
+        let effective_length = match validate_scan_runtime_length(length, input_types, carry_count)? {
+            Some(extent) => Dimension::Static(extent),
+            None => length.clone(),
+        };
         let output_types = scan_boundary_types(
             ScanBoundarySide::Output,
             body_output_types,
@@ -402,9 +405,8 @@ pub trait ScanType:
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ScanType for ArrayType {
+    #[inline]
     fn runtime_length_type(length: &Dimension) -> Result<Self, TypeError> {
         Err(TypeError::invalid(format!(
             "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use an array IR \
@@ -423,9 +425,8 @@ impl ScanType for ArrayType {
             for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() {
                     return Err(TypeError::invalid(format!(
-                        "`{SCAN_OPERATION_NAME}` body {role} {index} must have a fully static type but axis {axis} of \
-                         `{type}` has size `{dimension}`",
-                        r#type = r#type,
+                        "`{}` body {} {} must have a fully static type but axis {} of `{}` has size `{}`",
+                        SCAN_OPERATION_NAME, role, index, axis, r#type, dimension,
                     )));
                 }
             }
@@ -445,6 +446,8 @@ impl ScanType for ArrayIrType {
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Runtime iteration of a [`ScanOperation`] in a domain. [`ScanType`] describes the type-family contract independently
 /// of execution; this interface supplies the index, slices, and accumulators in the domain's own value representation.
@@ -1379,7 +1382,10 @@ impl<
             }
         }
         let summary = context.region_summary(self, 0, source_body, &body_allocations)?;
-        let length = effective_scan_length(&self.length, &input_types, carry_count)?;
+        let length = match validate_scan_runtime_length(&self.length, &input_types, carry_count)? {
+            Some(extent) => Dimension::Static(extent),
+            None => self.length.clone(),
+        };
         // No reference access executes for zero trips, including accesses through declared carries or captures.
         // Elide bodies whose whole-root states would otherwise lower an unreachable index into an empty axis.
         let mut has_empty_root = false;
@@ -2488,20 +2494,6 @@ fn validate_scan_runtime_length<T: ScanType>(
         }
     }
     Ok(extent)
-}
-
-/// Returns the [`Dimension`] that every stacked value of a scan is actually laid out over: the declared
-/// `length`, unless the runtime length input only refines the declared bounds to one exact extent (refer to the
-/// documentation of [`validate_scan_runtime_length`]), in which case it is that static extent.
-fn effective_scan_length<T: ScanType>(
-    length: &Dimension,
-    input_types: &[T],
-    carry_count: usize,
-) -> Result<Dimension, TypeError> {
-    Ok(match validate_scan_runtime_length(length, input_types, carry_count)? {
-        Some(extent) => Dimension::Static(extent),
-        None => length.clone(),
-    })
 }
 
 /// Returns the entry guard that checks a scan application whose inputs have the `actual` types against the `declared`
