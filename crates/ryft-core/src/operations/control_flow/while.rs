@@ -1082,12 +1082,12 @@ where
 // `jvp_array_backed_while`): bounded loops stage the reverse-capable hybrid of an augmented primal `while` and a masked
 // tangent `scan`, while unbounded loops stage the forward-only fused doubled-state loop (see the crate-private
 // `jvp_while_fused`). Both type families share that rule; they differ only in their array-backed storage, which
-// [`WhileResidualStackType`] and [`WhileResidualStackOperation`] describe.
+// [`WhileResidualStackOperation`] describes.
 impl<C> DifferentiableOperation<C> for WhileOperation<C::Type>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
+    C: Context<Type: DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
     C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
@@ -1650,23 +1650,12 @@ fn rotated_discharge_regions<V: Value, O: Operation<Type = V::Type>>(
     Ok((rotated_condition, rotated_body))
 }
 
-/// Type-family requirements of bounded `while` differentiation.
-///
-/// The [`WhileResidualStackOperation`] family supplies residual storage and conversions, so the shared loop rule does
-/// not need to inspect array IR variants.
-pub(crate) trait WhileResidualStackType:
-    DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>
-{
-}
-
-impl<T: DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>> WhileResidualStackType for T {}
-
 /// Operation-family constructors required by the shared bounded-`while` residual-stack algorithm.
 ///
 /// The functions return operations rather than binding values, so the same contract works in the parent
 /// differentiation context and in the nested tracing contexts used to build the augmented primal body and masked
 /// tangent scan body. The dimension/scalar gateway operations come from the [`ResidualStackOperation`] supertrait.
-pub(crate) trait WhileResidualStackOperation<T: WhileResidualStackType>: ResidualStackOperation<T> {
+pub(crate) trait WhileResidualStackOperation<T: Type>: ResidualStackOperation<T> {
     /// Constructs a zero for a statically shaped array-backed state type.
     fn residual_stack_zero(r#type: T) -> Self;
 
@@ -1854,7 +1843,7 @@ fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, P: DifferentiationPoli
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
+    C: Context<Type: DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + From<ConditionOperation<C::Type>>
@@ -1930,7 +1919,7 @@ fn jvp_while_bounded<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
-    C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
+    C: Context<Type: DifferentiableType + WhileType + ArrayMemberType + From<ArrayType>> + Zero<C::Value>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + WhileResidualStackOperation<C::Type>
         + From<ConditionOperation<C::Type>>
@@ -2442,7 +2431,7 @@ fn vary_while_index_or_mask<V, O>(
 ) -> Result<Tracer<TracingContext<V, O>>, ProgramError>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: Value<Type: WhileResidualStackType>,
+    V: Value<Type: ArrayMemberType>,
     O: WhileResidualStackOperation<V::Type>,
 {
     let Some(target_sharding) = target.sharding() else {
@@ -2504,7 +2493,7 @@ fn build_bounded_while_programs<V, O>(
 ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, Vec<V::Type>), ProgramError>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: Value<Type: WhileResidualStackType>,
+    V: Value<Type: ArrayMemberType + From<ArrayType>>,
     O: WhileResidualStackOperation<V::Type>,
 {
     let state_count = condition.input_types().len();
@@ -2722,7 +2711,7 @@ fn masked_while_programs<V, O>(
 ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-    V: Value<Type: WhileResidualStackType>,
+    V: Value<Type: ArrayMemberType>,
     O: WhileResidualStackOperation<V::Type>,
 {
     let state_types = body.input_types();

@@ -2001,8 +2001,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayType, Operation: From<ScanOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatchingPolicy<P>> for ScanOperation<ArrayType>
 {
@@ -2031,17 +2029,21 @@ impl<C: Context<Type = ArrayIrType, Operation: From<ScanOperation<ArrayIrType>>>
     }
 }
 
-impl<T: DifferentiableType + CastType + ScanType, C: Context<Type = T> + Zero<C::Value>> DifferentiableOperation<C>
-    for ScanOperation<T>
+impl<
+    T: DifferentiableType + CastType + ScanType,
+    C: Context<
+            Type = T,
+            Operation: ResidualZeroProvider<T, Operation = C::Operation>
+                           + ResidualStackOperation<T>
+                           + From<ScanOperation<T>>
+                           + From<GuardOperation<T>>
+                           + From<CastOperation<T>>
+                           + From<T::IdentityWitnessOperation>,
+        > + Zero<C::Value>,
+> DifferentiableOperation<C> for ScanOperation<T>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = T, Constant = C::Constant, Operation = C::Operation>,
-    C::Operation: ResidualZeroProvider<T, Operation = C::Operation>
-        + From<ScanOperation<T>>
-        + From<GuardOperation<T>>
-        + From<CastOperation<T>>
-        + From<T::IdentityWitnessOperation>
-        + ResidualStackOperation<T>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2049,17 +2051,15 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Forward-mode (JVP) rule for `ScanOperation`. The rule first stages an entry guard over the primal inputs when
-        // their types leave a relationship of the scan boundary unproven (refer to `scan_entry_guard`). It then
-        // analyzes which body inputs and outputs carry live tangents and derives the compact fused body through its
-        // driver (refer to `FusedScanJvp`). Shared destinations stage that fused scan directly. Separate destinations
-        // linearize the body and join the linearization over the fused boundary through the partition reconstruction of
-        // partial evaluation, which stacks varying residuals and hoists invariant ones (refer to
-        // `reconstruct_partitioned_scan`). Non-reference carries that the body passes through unchanged are forwarded
-        // from their guarded inputs.
+        // This rule first stages an entry guard over the primal inputs when their types leave a relationship of the
+        // scan boundary unproven. It then analyzes which body inputs and outputs carry live tangents and derives the
+        // compact fused body through its driver. Shared destinations stage that fused scan directly. Separate
+        // destinations linearize the body and join the linearization over the fused boundary through the partition
+        // reconstruction of partial evaluation, which stacks varying residuals and hoists invariant ones. Non-reference
+        // carries that the body passes through unchanged are forwarded from their guarded inputs.
 
-        // Direct differentiated binds can reach this rule before the original operation's output inference, so the
-        // complete primal application is validated before any tangent work.
+        // Direct differentiated binds can reach this rule before the original operation's output inference,
+        // so the complete primal application is validated before any tangent work.
         let body = driver.region(0)?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, body)?;
@@ -2080,6 +2080,7 @@ where
                 inputs[index] = dual;
             }
         }
+
         let fused = FusedScanJvp::<C>::new(self, driver, &inputs)?;
         let scan_inputs = fused.inputs(context, &inputs)?;
         let mut primal_outputs = if std::ptr::eq(context.primal(), context.tangent()) {
@@ -2087,6 +2088,7 @@ where
         } else {
             fused.bind_linearized(context, driver, body, &scan_inputs)?
         };
+
         // Both paths return primals followed by live tangents. Restore structural-zero output tangents before
         // forwarding unchanged carries from their guarded inputs.
         let output_live = fused.activity.output_tangent_liveness();
@@ -2096,6 +2098,8 @@ where
         Ok(outputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     T: ScanType + DifferentiableType,
