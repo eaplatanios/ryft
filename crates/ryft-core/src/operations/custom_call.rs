@@ -797,6 +797,115 @@ impl CustomCallOperation {
         context.bind(self.clone(), Vec::new(), inputs)
     }
 
+    /// Validates the attributes, declared input layouts, and aliases of this operation against the provided array input
+    /// types and effective output types.
+    fn validate_configuration(&self, input_types: &[&ArrayType], output_types: &[ArrayType]) -> Result<(), TypeError> {
+        /// Returns the first duplicate attribute name, including names in nested dictionaries.
+        fn duplicate_name(attributes: &[(String, CustomCallAttribute)]) -> Option<&str> {
+            attributes.iter().enumerate().find_map(|(index, (name, value))| {
+                if attributes[..index].iter().any(|(existing, _)| existing == name) {
+                    return Some(name.as_str());
+                }
+                match value {
+                    CustomCallAttribute::Dictionary(attributes) => duplicate_name(attributes),
+                    _ => None,
+                }
+            })
+        }
+
+        if let Some(name) = duplicate_name(self.attributes.as_slice()) {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` declares attribute `{name}` more than once",
+            )));
+        }
+
+        if let Some((name, _)) =
+            self.attributes.iter().find(|(name, _)| RESERVED_ATTRIBUTE_NAMES.contains(&name.as_str()))
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` attribute `{name}` reuses the name \
+                 of one of the operation's own fields",
+            )));
+        }
+
+        // A non-empty layout declaration names every array input. Validate its count and ranks before comparing
+        // the layouts of aliased buffers; an empty declaration still leaves the aliases to validate below.
+        if !self.input_layouts.is_empty() {
+            if self.input_layouts.len() != input_types.len() {
+                return Err(TypeError::invalid(format!(
+                    "`{}` declares {} input layout(s) but the call has {} array input(s)",
+                    CUSTOM_CALL_OPERATION_NAME,
+                    self.input_layouts.len(),
+                    input_types.len(),
+                )));
+            }
+
+            for (input_index, (layout, input_type)) in self.input_layouts.iter().zip(input_types).enumerate() {
+                let Some(layout) = layout else {
+                    continue;
+                };
+
+                let layout_rank = match layout {
+                    Layout::Tiled(layout) => layout.rank(),
+                    Layout::Strided(layout) => layout.rank(),
+                };
+
+                if layout_rank != input_type.rank() {
+                    return Err(TypeError::invalid(format!(
+                        "`{CUSTOM_CALL_OPERATION_NAME}` input layout `{layout}` has rank {layout_rank} but input \
+                         {input_index} has type `{input_type}`",
+                    )));
+                }
+            }
+        }
+
+        // Alias indices exclude trailing dimension inputs and refer to the effective output types
+        // supplied by inference.
+        for alias in &self.input_output_aliases {
+            let Some(input_type) = input_types.get(alias.input_index) else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` refers to input {} but the call has {} array input(s)",
+                    CUSTOM_CALL_OPERATION_NAME,
+                    alias,
+                    alias.input_index,
+                    input_types.len(),
+                )));
+            };
+
+            let Some(output_type) = output_types.get(alias.output_index) else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` refers to output {} but the call has {} output(s)",
+                    CUSTOM_CALL_OPERATION_NAME,
+                    alias,
+                    alias.output_index,
+                    output_types.len(),
+                )));
+            };
+
+            // The backend may convert the input's storage before the call. Aliases constrain its logical type and
+            // its layout at the kernel boundary, rather than the input value's original physical arrangement.
+            if (*input_type).clone().with_layout(None) != output_type.clone().with_layout(None) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` requires matching input and output types but \
+                     input {} has type `{}` and output {} has type `{}`",
+                    CUSTOM_CALL_OPERATION_NAME, alias, alias.input_index, input_type, alias.output_index, output_type,
+                )));
+            }
+
+            let row_major = Layout::Tiled(TiledLayout::new((0..input_type.rank()).rev().collect(), Vec::new()));
+            let input_layout = self.input_layouts.get(alias.input_index).and_then(Option::as_ref).unwrap_or(&row_major);
+            if input_layout != output_type.layout().unwrap_or(&row_major) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` alias `{}` requires the kernel layout `{}` of \
+                     input {} to match the layout of output {}",
+                    CUSTOM_CALL_OPERATION_NAME, alias, input_layout, alias.input_index, alias.output_index,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns this [`CustomCallOperation`] with every declared output identity renamed according to `renaming`.
     #[inline]
     fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -1127,101 +1236,6 @@ impl CustomCallOperation {
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect()
-    }
-
-    /// Validates the attributes, declared input layouts, and aliases of this operation against its
-    /// array input types and effective output types, which both universes share.
-    fn validate_configuration(&self, input_types: &[&ArrayType], output_types: &[ArrayType]) -> Result<(), TypeError> {
-        /// Returns the first duplicate attribute name, including names in nested dictionaries.
-        fn duplicate_name(attributes: &[(String, CustomCallAttribute)]) -> Option<&str> {
-            attributes.iter().enumerate().find_map(|(index, (name, value))| {
-                if attributes[..index].iter().any(|(existing, _)| existing == name) {
-                    return Some(name.as_str());
-                }
-                match value {
-                    CustomCallAttribute::Dictionary(attributes) => duplicate_name(attributes),
-                    _ => None,
-                }
-            })
-        }
-
-        if let Some(name) = duplicate_name(self.attributes.as_slice()) {
-            return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` declares attribute `{name}` more than once",
-            )));
-        }
-        if let Some((name, _)) =
-            self.attributes.iter().find(|(name, _)| RESERVED_ATTRIBUTE_NAMES.contains(&name.as_str()))
-        {
-            return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` attribute `{name}` reuses the name of one of the operation's own \
-                 fields",
-            )));
-        }
-        // A non-empty layout declaration names every array input. Validate its count and ranks before comparing
-        // the layouts of aliased buffers; an empty declaration still leaves the aliases to validate below.
-        if !self.input_layouts.is_empty() {
-            if self.input_layouts.len() != input_types.len() {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` declares {} input layout(s) but the call has {} array input(s)",
-                    self.input_layouts.len(),
-                    input_types.len(),
-                )));
-            }
-            for (input_index, (layout, input_type)) in self.input_layouts.iter().zip(input_types).enumerate() {
-                let Some(layout) = layout else {
-                    continue;
-                };
-                let layout_rank = match layout {
-                    Layout::Tiled(layout) => layout.rank(),
-                    Layout::Strided(layout) => layout.rank(),
-                };
-                if layout_rank != input_type.rank() {
-                    return Err(TypeError::invalid(format!(
-                        "`{CUSTOM_CALL_OPERATION_NAME}` input layout `{layout}` has rank {layout_rank} but input \
-                         {input_index} has type `{input_type}`",
-                    )));
-                }
-            }
-        }
-
-        // Alias indices exclude trailing dimension inputs and refer to the effective output types supplied by inference.
-        for alias in &self.input_output_aliases {
-            let Some(input_type) = input_types.get(alias.input_index) else {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to input {} but the call has \
-                     {} array input(s)",
-                    alias.input_index,
-                    input_types.len(),
-                )));
-            };
-            let Some(output_type) = output_types.get(alias.output_index) else {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to output {} but the call has {} output(s)",
-                    alias.output_index,
-                    output_types.len(),
-                )));
-            };
-            // The backend may convert the input's storage before the call. Aliases constrain its logical type and
-            // its layout at the kernel boundary, rather than the input value's original physical arrangement.
-            if (*input_type).clone().with_layout(None) != output_type.clone().with_layout(None) {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` requires matching input and output types but \
-                     input {} has type `{}` and output {} has type `{}`",
-                    alias.input_index, input_type, alias.output_index, output_type,
-                )));
-            }
-            let row_major = Layout::Tiled(TiledLayout::new((0..input_type.rank()).rev().collect(), Vec::new()));
-            let input_layout = self.input_layouts.get(alias.input_index).and_then(Option::as_ref).unwrap_or(&row_major);
-            if input_layout != output_type.layout().unwrap_or(&row_major) {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` requires the kernel layout `{input_layout}` of \
-                     input {} to match the layout of output {}",
-                    alias.input_index, alias.output_index,
-                )));
-            }
-        }
-        Ok(())
     }
 }
 
