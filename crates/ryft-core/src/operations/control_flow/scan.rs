@@ -449,19 +449,44 @@ impl ScanType for ArrayIrType {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Runtime iteration of a [`ScanOperation`] in a domain. [`ScanType`] describes the type-family contract independently
+/// Runtime iteration of a [`ScanOperation`] in a domain. [`ScanType`] describes the type family contract independently
 /// of execution; this interface supplies the index, slices, and accumulators in the domain's own value representation.
 /// The same type family can use different representations, such as eager array IR values and per-device bundles in the
 /// lockstep `shard_map` emulator, without changing its inference or transform rules.
-pub(crate) trait ScanInterpretationDomain: Domain<Type: ScanType> {
+///
+/// Custom backends implement this trait on their local domain to reuse the shared [`InterpretableOperation`] rule for
+/// [`ScanOperation`]. [`Context`] is not required as the domain supplies value construction and storage, while the
+/// [`InterpretationDriver`] executes the body. The scan validates its application before calling these functions.
+///
+/// Homogeneous domains with [`ArrayType`] types, [`Slice`] + [`UpdateSlice`] + [`Reshape`] values, and [`Zero`] and
+/// [`Fill<i64, Self::Value>`](Fill) construction already receive a blanket implementation. Other representations can
+/// provide their own implementation, including array IR backends with references and runtime dimensions. A domain
+/// covered by the blanket implementation cannot also provide an overlapping implementation of its own.
+pub trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// Returns the trip count that the trailing runtime length input of a dynamic-length scan, `runtime_length`,
-    /// supplies.
+    /// supplies, agreeing with the extent and bounds represented by that value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot supply a valid trip count. Static-only families never call this function
+    /// through a validated scan and may reject the request.
     fn runtime_length(runtime_length: &Self::Value) -> Result<usize, ProgramError>;
 
-    /// Returns the value of the intrinsic index input of iteration `iteration`.
+    /// Returns the value of the intrinsic index input of iteration `iteration`, as a scalar [`I64`](DataType::I64)
+    /// array in this domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index value cannot be constructed.
     fn iteration_index(&self, iteration: usize) -> Result<Self::Value, ProgramError>;
 
-    /// Returns the body input of iteration `iteration` for the stacked input `stack`.
+    /// Returns the body input of iteration `iteration` for the stacked input `stack`. Arrays lose their leading scan
+    /// axis with the placement inferred for that slice (refer to [`ScanOperation`]). References enter unchanged as
+    /// whole roots, preserving allocation identity and aliasing so the body can form its own views.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be sliced at the requested index with the required metadata.
     fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError>;
 
     /// Writes the body output `value` of iteration `iteration` as that slice of the stacked output `accumulator` (i.e.,
@@ -474,6 +499,14 @@ pub(crate) trait ScanInterpretationDomain: Domain<Type: ScanType> {
     /// rejects the slice. Only stacks are widened: a carry keeps the type that the last iteration returns for it (or
     /// its entry type when the scan runs no iteration), which can vary over fewer manual axes than the join of its
     /// entry and body types.
+    ///
+    /// `iteration` is the logical slice position, independently of visit order. The first write may target the last
+    /// slice of a reversed scan, and subsequent writes must preserve all previously written slices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when allocation or writing fails, or the slice, placement, or variation is incompatible with
+    /// the stack representation.
     fn write_iteration(
         &self,
         output: usize,
@@ -485,7 +518,13 @@ pub(crate) trait ScanInterpretationDomain: Domain<Type: ScanType> {
     ) -> Result<Self::Value, ProgramError>;
 
     /// Returns the empty stacked output of type `output_type` of a scan that runs no iteration, whose body declares
-    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs).
+    /// `body_input_types` and which is applied to `inputs` (i.e., its carries and stacked inputs, excluding the trailing
+    /// runtime length). The body types include the intrinsic index input. Resolve any dynamic slice dimensions that
+    /// the value representation requires from these type/value bindings; the leading stack extent is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output cannot be allocated or its dynamic dimensions cannot be resolved.
     fn empty_stack(
         &self,
         output_type: &Self::Type,
