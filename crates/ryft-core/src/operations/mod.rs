@@ -74,8 +74,8 @@ pub use composites::{
     CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, CompositeVjp, CustomBatching,
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
     CustomRuleTracer, CustomVjpOperation, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp,
-    JvpComposite, JvpFromPrimal, LiftedCustomRules, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules,
-    VjpComposite, WeakCustomRuleRegistration, check_batching_rule_consistency, composite,
+    JvpComposite, JvpFromPrimal, LiftedCustomRules, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp,
+    UnavailableCustomRules, VjpComposite, WeakCustomRuleRegistration, check_batching_rule_consistency, composite,
 };
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,

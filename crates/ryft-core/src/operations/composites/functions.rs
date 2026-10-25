@@ -2897,6 +2897,82 @@ mod tests {
     /// Tracer of [`EagerArrayIrContext`] values.
     type ArrayIrTracer = DomainTracer<EagerArrayIrContext>;
 
+    /// Returns `sin` with a custom batching rule that computes `2 · sin(x)` instead (expressed through addition to
+    /// avoid constant lifting), which makes visible whether a batched computation and each of its derivatives go
+    /// through the rule. The rule maps its output exactly when its input is mapped.
+    fn doubled_sine_when_batched()
+    -> BatchedComposite<DomainTracer<ArrayContext>, DomainTracer<ArrayContext>, DomainTracer<ArrayContext>> {
+        type Tracer = DomainTracer<ArrayContext>;
+        composite(|x: Tracer| Ok(x.sin()?))
+            .with_name("sine")
+            .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)))
+    }
+
+    /// Returns `x · y` with a custom batching rule that computes `2 · x · y` instead (refer to
+    /// [`doubled_sine_when_batched`]), whose output is mapped along the first mapped input axis.
+    fn doubled_product_when_batched() -> BatchedComposite<
+        DomainTracer<ArrayContext>,
+        (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>),
+        DomainTracer<ArrayContext>,
+    > {
+        type Tracer = DomainTracer<ArrayContext>;
+        composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_name("product").with_batching(
+            |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                let product = x * y;
+                Ok((product.clone() + product, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            },
+        )
+    }
+
+    /// Returns the elementwise values `2 · sin(x)` and `2 · cos(x)` of `x`.
+    fn doubled_sine_and_cosine(x: &[f64]) -> (Array, Array) {
+        (
+            Array::vector(x.iter().map(|x| 2.0 * f64::sin(*x)).collect()).unwrap(),
+            Array::vector(x.iter().map(|x| 2.0 * f64::cos(*x)).collect()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_retained_custom_batching_rule_leading_boundary_extent() {
+        // A dynamic batch extent is the leading boundary input of its batching level, which may have further boundary
+        // inputs that the rule does not receive.
+        type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let rule = |extent: BatchingLevelExtent<IrTracer>, _input: IrTracer, _axis: BatchAxis| match extent {
+            BatchingLevelExtent::Dynamic(extent) => Ok((extent, BatchAxis::replicated())),
+            BatchingLevelExtent::Static(_) => {
+                Err(ProgramError::InvalidArgument { message: "the test rule expects a dynamic extent".to_string() })
+            }
+        };
+        let adapter = retained_custom_batching_rule::<_, _, IrTracer, IrTracer, _>(
+            Arc::new(rule),
+            &Cow::Borrowed("rule"),
+            &Placeholder,
+            &Placeholder,
+        );
+        let extent_type = ArrayIrType::from(DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let other_type = ArrayIrType::from(DimensionType::new("m", DimensionBounds::new(1, Some(8)).unwrap()));
+        let level =
+            BatchingLevel::new(BatchingLevelExtent::Dynamic(extent_type.clone()), None, ShardingDimension::Replicated);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |values: Vec<IrTracer>| {
+                let (outputs, output_axes) = adapter(&level, &values[..2], &values[2..], &[BatchAxis::replicated()])?;
+                assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+                Ok(outputs)
+            },
+            vec![extent_type, other_type, ArrayType::scalar(DataType::F64).into()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<n ∈ [1, 8)>, %1:dimension<m ∈ [1, 8)>, %2:f64[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
     #[test]
     fn test_composite_from_custom_call() {
         // The primal calls the foreign kernel `my_sin`, which the reference backend cannot execute, while the rules
@@ -3131,27 +3207,6 @@ mod tests {
                                has only reverse-mode rules; it supports only reverse-mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
         ));
-    }
-
-    #[test]
-    fn test_composite_debug() {
-        // Debug output names each configuration kind and the function, but not the closures.
-        type Tracer = DomainTracer<ArrayContext>;
-        let function = composite(|x: Tracer| Ok(x.sin()?)).with_name("sine");
-        assert_eq!(
-            format!("{function:?}"),
-            "Composite { name: \"sine\", jvp: DefaultJvp, vjp: DefaultVjp, batching: DefaultBatching, \
-             batched_output_axes: None, non_differentiated_count: 0, .. }",
-        );
-        let function = function
-            .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
-            .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
-            .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()?, axis)));
-        assert_eq!(
-            format!("{function:?}"),
-            "Composite { name: \"sine\", jvp: ExplicitJvp { .. }, vjp: ExplicitVjp { .. }, \
-             batching: CustomBatching { .. }, batched_output_axes: None, non_differentiated_count: 0, .. }",
-        );
     }
 
     #[test]
@@ -5030,85 +5085,6 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_named_axes() {
-        // The primal and the rules are traced in fresh traces that are seeded with the named axes visible where the
-        // function is called, so a function called under `batch` resolves the batch axis `items` in its primal
-        // (`x ↦ x · i` at batch item `i`), its JVP rule (`(x, ẋ) ↦ (x · i, ẋ · i)`), its VJP rules (which save `i`
-        // and pull back `ȳ ↦ ȳ · i`), and its named collectives (`x ↦ Σᵢ xᵢ`).
-        type Tracer = DomainTracer<ArrayContext>;
-        let index = |x: &Tracer| -> Result<Tracer, ProgramError> {
-            x.context().axis_index("items")?.convert_element_type(DataType::F64)
-        };
-        let scaled = move |x: Tracer| -> Result<Tracer, ProgramError> { Ok(x.clone() * index(&x)?) };
-        let inputs = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
-        let ones = Array::vector(vec![1.0f64; 3]).unwrap();
-        let items = || BatchAxisSpecification::named("items");
-
-        // Outside of `batch`, nothing binds `items`.
-        let function = composite(scaled);
-        assert_eq!(
-            ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
-            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "items".to_string() })),
-        );
-        assert_eq!(
-            batch(|x| function.call(x), inputs.clone(), BatchAxis::new(0), BatchAxis::new(0), items()),
-            Ok(Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap()),
-        );
-        let (_, program) = ArrayContext::trace(
-            |x| Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?),
-            ArrayType::new_static(DataType::F64, [3]),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[3] = composite [
-                    name=\"composite\",
-                    batching=[(extent=3, axis_name=\"items\", input_axes=[axis 0], output_axes=[axis 0])],
-                ] %0 [
-                    primal={
-                        lambda %0:f64[3] .
-                        let %1:u64[3] = iota [type=u64[3], dimension=0]
-                            %2:f64[3] = convert_element_type [data_type=f64] %1
-                            %3:f64[3] = mul %0 %2
-                        in (%3)
-                    },
-                ]
-                in (%1)
-            "}
-            .trim_end(),
-        );
-
-        let function = composite(scaled)
-            .with_jvp(move |x: Tracer, tangent: Tracer| Ok((scaled(x.clone())?, tangent * index(&x)?)));
-        assert_eq!(
-            differentiate_at(inputs.clone()).jvp(ones.clone(), |x| {
-                Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?)
-            }),
-            Ok((Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap(), Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap())),
-        );
-
-        let function = composite(scaled).with_vjp(
-            move |x: Tracer| Ok((scaled(x.clone())?, index(&x)?)),
-            |index: Tracer, cotangent: Tracer| Ok(cotangent * index),
-        );
-        assert_eq!(
-            differentiate_at(inputs.clone()).gradient(|x| {
-                batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?
-                    .reduce(&[0], ReductionKind::Sum)
-            }),
-            Ok(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
-        );
-
-        let function = composite(|x: Tracer| x.parallel_reduce(ReductionKind::Sum, "items"));
-        assert_eq!(
-            batch(|x| function.call(x), inputs, BatchAxis::new(0), BatchAxis::new(0), items()),
-            Ok(Array::vector(vec![6.0f64; 3]).unwrap()),
-        );
-    }
-
-    #[test]
     fn test_composite_with_batching_references() {
         // The primal `(counter, x) ↦ x` adds `x` into its plumbing counter. Structurally batching it with a replicated
         // counter and a mapped `x` is rejected, because a replicated reference cannot receive a batched value, while
@@ -5334,41 +5310,6 @@ mod tests {
             differentiate_at(Array::scalar(2.0).unwrap()).gradient(|x| function.call(x)),
             Ok(Array::scalar(2.0f64.cos()).unwrap()),
         );
-    }
-
-    /// Returns `sin` with a custom batching rule that computes `2 · sin(x)` instead (expressed through addition to
-    /// avoid constant lifting), which makes visible whether a batched computation and each of its derivatives go
-    /// through the rule. The rule maps its output exactly when its input is mapped.
-    fn doubled_sine_when_batched()
-    -> BatchedComposite<DomainTracer<ArrayContext>, DomainTracer<ArrayContext>, DomainTracer<ArrayContext>> {
-        type Tracer = DomainTracer<ArrayContext>;
-        composite(|x: Tracer| Ok(x.sin()?))
-            .with_name("sine")
-            .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)))
-    }
-
-    /// Returns `x · y` with a custom batching rule that computes `2 · x · y` instead (refer to
-    /// [`doubled_sine_when_batched`]), whose output is mapped along the first mapped input axis.
-    fn doubled_product_when_batched() -> BatchedComposite<
-        DomainTracer<ArrayContext>,
-        (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>),
-        DomainTracer<ArrayContext>,
-    > {
-        type Tracer = DomainTracer<ArrayContext>;
-        composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_name("product").with_batching(
-            |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
-                let product = x * y;
-                Ok((product.clone() + product, if x_axis.is_replicated() { y_axis } else { x_axis }))
-            },
-        )
-    }
-
-    /// Returns the elementwise values `2 · sin(x)` and `2 · cos(x)` of `x`.
-    fn doubled_sine_and_cosine(x: &[f64]) -> (Array, Array) {
-        (
-            Array::vector(x.iter().map(|x| 2.0 * f64::sin(*x)).collect()).unwrap(),
-            Array::vector(x.iter().map(|x| 2.0 * f64::cos(*x)).collect()).unwrap(),
-        )
     }
 
     #[test]
@@ -6731,26 +6672,14 @@ mod tests {
 
         // The derivatives of the batched call are those of the scan, whose body differentiates the call one item at a
         // time, and a derivative taken before batching is batched sequentially as well.
-        let x = Array::matrix(3, 2, vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0]).unwrap();
-        let y = Array::vector(vec![2.0, -1.0]).unwrap();
-        let x_tangent = Array::matrix(3, 2, vec![1.0; 6]).unwrap();
-        let y_tangent = Array::vector(vec![0.0, 0.0]).unwrap();
-        let expected_tangent = Array::matrix(
-            3,
-            2,
-            [0.5f64, 1.0, 1.5, 2.0, 2.5, 3.0]
-                .iter()
-                .zip([2.0, -1.0].iter().cycle())
-                .map(|(x, y)| f64::cos(*x) * y)
-                .collect(),
-        )
-        .unwrap();
-        let (_, program) = ArrayContext::trace(
-            |inputs| sequential.call(inputs),
-            (ArrayType::new_static(DataType::F64, [2]), ArrayType::new_static(DataType::F64, [2])),
-        )
-        .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let (_, program) =
+            ArrayContext::trace(|inputs| sequential.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
         let program = program.into_flat_program();
+        let x = [0.5, 1.0, 1.5];
+        let inputs =
+            vec![Array::vector(x.to_vec()).unwrap(), Array::scalar(2.0).unwrap(), Array::vector(vec![1.0; 3]).unwrap()];
+        let expected_tangent = Array::vector(x.iter().map(|x| 2.0 * f64::cos(*x)).collect()).unwrap();
         let batch_then_differentiate = program
             .batched(
                 3,
@@ -6761,28 +6690,47 @@ mod tests {
             .unwrap()
             .into_parts()
             .0
-            .jvp()
+            .jvp_with_respect_to(&[0])
             .unwrap();
-        let outputs = batch_then_differentiate
-            .interpret(vec![x.clone(), y.clone(), x_tangent.clone(), y_tangent.clone()])
-            .unwrap();
-        assert_eq!(outputs[1], expected_tangent);
+        assert_eq!(batch_then_differentiate.interpret(inputs.clone()).unwrap()[1], expected_tangent);
         let differentiate_then_batch = program
-            .jvp()
+            .jvp_with_respect_to(&[0])
             .unwrap()
             .batched(
                 3,
                 ShardingDimension::Replicated,
-                &[BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0); 2]),
+                &[BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
             .into_parts()
             .0;
-        println!("RENDERING differentiate_then_batch\n{differentiate_then_batch}");
-        assert_eq!(differentiate_then_batch.to_string(), "");
-        let outputs = differentiate_then_batch.interpret(vec![x, y, x_tangent, y_tangent]).unwrap();
-        assert_eq!(outputs[1], expected_tangent);
+        assert_eq!(
+            differentiate_then_batch.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3] .
+                let %3:f64[], %4:f64[3], %5:f64[3] = scan [carry_count=1, length=3, reverse=false] %1 %0 %2 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[], %5:f64[] = composite [name=\"jvp(sine)\"] %2 %1 %3 [
+                            primal={
+                                lambda %0:f64[], %1:f64[], %2:f64[] .
+                                let %3:f64[] = sin %0
+                                    %4:f64[] = mul %3 %1
+                                    %5:f64[] = cos %0
+                                    %6:f64[] = mul %5 %2
+                                    %7:f64[] = mul %1 %6
+                                in (%4, %7)
+                            },
+                        ]
+                        in (%1, %4, %5)
+                    },
+                ]
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(differentiate_then_batch.interpret(inputs).unwrap()[1], expected_tangent);
     }
 
     #[test]
@@ -6841,96 +6789,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retained_custom_batching_rule_leading_boundary_extent() {
-        // A dynamic batch extent is the leading boundary input of its batching level, which may have further boundary
-        // inputs that the rule does not receive.
-        type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let rule = |extent: BatchingLevelExtent<IrTracer>, _input: IrTracer, _axis: BatchAxis| match extent {
-            BatchingLevelExtent::Dynamic(extent) => Ok((extent, BatchAxis::replicated())),
-            BatchingLevelExtent::Static(_) => {
-                Err(ProgramError::InvalidArgument { message: "the test rule expects a dynamic extent".to_string() })
-            }
-        };
-        let adapter = retained_custom_batching_rule::<_, _, IrTracer, IrTracer, _>(
-            Arc::new(rule),
-            &Cow::Borrowed("rule"),
-            &Placeholder,
-            &Placeholder,
-        );
-        let extent_type = ArrayIrType::from(DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
-        let other_type = ArrayIrType::from(DimensionType::new("m", DimensionBounds::new(1, Some(8)).unwrap()));
-        let level =
-            BatchingLevel::new(BatchingLevelExtent::Dynamic(extent_type.clone()), None, ShardingDimension::Replicated);
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-            |values: Vec<IrTracer>| {
-                let (outputs, output_axes) = adapter(&level, &values[..2], &values[2..], &[BatchAxis::replicated()])?;
-                assert_eq!(output_axes, vec![BatchAxis::replicated()]);
-                Ok(outputs)
-            },
-            vec![extent_type, other_type, ArrayType::scalar(DataType::F64).into()],
-            Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<n ∈ [1, 8)>, %1:dimension<m ∈ [1, 8)>, %2:f64[] .
-                in (%0)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_check_batching_rule_consistency() {
-        // A rule that computes `2xy` when both inputs are mapped and `3xy` otherwise changes its batched output when the
-        // replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
-        type Tracer = DomainTracer<ArrayContext>;
-        let scaled_product = |inconsistent: bool| {
-            composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
-                move |_: BatchingLevelExtent<Tracer>,
-                      (x, y): (Tracer, Tracer),
-                      (x_axis, y_axis): (BatchAxis, BatchAxis)| {
-                    let product = x * y;
-                    let scale = match inconsistent && !x_axis.is_replicated() && !y_axis.is_replicated() {
-                        true => 2.0,
-                        false => 1.0,
-                    };
-                    let scale = product.context().lift(Array::scalar(scale)?)?;
-                    Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
-                },
-            )
-        };
-        let input = (Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(), Array::scalar(4.0f64).unwrap());
-        let input_axes = (BatchAxis::new(0), BatchAxis::replicated());
-        let check = |inconsistent: bool| {
-            let function = scaled_product(inconsistent);
-            check_batching_rule_consistency(
-                |inputs| function.call(inputs),
-                input.clone(),
-                input_axes,
-                None,
-                |expected: &Array, actual: &Array| expected == actual,
-            )
-        };
-        assert_eq!(check(false), Ok(()));
-        assert_eq!(check(true), Err(BatchingRuleConsistencyError::Inconsistent { input: 1, output: 0 }));
-
-        // Every input of a fully replicated batch is broadcast in turn, which requires an explicit extent.
-        let function = scaled_product(true);
-        assert_eq!(
-            check_batching_rule_consistency(
-                |inputs| function.call(inputs),
-                (Array::scalar(1.0f64).unwrap(), Array::scalar(4.0f64).unwrap()),
-                (BatchAxis::replicated(), BatchAxis::replicated()),
-                3,
-                |expected: &Array, actual: &Array| expected == actual,
-            ),
-            Ok(()),
-        );
-    }
-
-    #[test]
     fn test_composite_call() {
         // Nothing but the primal is traced when the function is called. Calls that share a call structure share one
         // registered definition, whose rule is traced once per specialization and cached while the function lives.
@@ -6959,20 +6817,39 @@ mod tests {
         assert_eq!(rule_ids.len(), 2);
         assert_eq!(rule_ids[0], rule_ids[1]);
         assert_eq!(traces.load(Ordering::SeqCst), 0);
-        assert!(program.jvp().is_ok());
+
+        // The derivative of `sin(sin(x))` at `x = 2` is `cos(sin(2)) · cos(2)`.
+        let jvp = |program: &FlatProgram<ArrayContext>| {
+            program.jvp().unwrap().interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap()])
+        };
+        let expected = Ok(vec![
+            Array::scalar(2.0f64.sin().sin()).unwrap(),
+            Array::scalar(2.0f64.sin().cos() * 2.0f64.cos()).unwrap(),
+        ]);
+        assert_eq!(jvp(&program), expected);
         assert_eq!(traces.load(Ordering::SeqCst), 1);
-        assert!(program.jvp().is_ok());
+        assert_eq!(jvp(&program), expected);
         assert_eq!(traces.load(Ordering::SeqCst), 1);
 
         // A new input signature is a new specialization of the same definition.
         let (_, vector_program) =
             ArrayContext::trace(|x| function.call(x), ArrayType::new_static(DataType::F64, [2])).unwrap();
-        assert!(vector_program.into_flat_program().jvp().is_ok());
+        assert_eq!(
+            vector_program
+                .into_flat_program()
+                .jvp()
+                .unwrap()
+                .interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::vector(vec![1.0, 1.0]).unwrap(),]),
+            Ok(vec![
+                Array::vector(vec![2.0f64.sin(), 3.0f64.sin()]).unwrap(),
+                Array::vector(vec![2.0f64.cos(), 3.0f64.cos()]).unwrap(),
+            ]),
+        );
         assert_eq!(traces.load(Ordering::SeqCst), 2);
 
         // Once the function is dropped, the calls that it staged trace their rule again on every derivative request.
         drop(function);
-        assert!(program.jvp().is_ok());
+        assert_eq!(jvp(&program), expected);
         assert_eq!(traces.load(Ordering::SeqCst), 4);
     }
 
@@ -7011,6 +6888,106 @@ mod tests {
                 Ok(pair[0].clone() + pair[1].clone())
             }),
             Ok((Array::scalar(4.0).unwrap(), Array::scalar(2.0).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_composite_call_named_axes() {
+        // The primal and the rules are traced in fresh traces that are seeded with the named axes visible where the
+        // function is called, so a function called under `batch` resolves the batch axis `items` in its primal
+        // (`x ↦ x · i` at batch item `i`), its JVP rule (`(x, ẋ) ↦ (x · i, ẋ · i)`), its VJP rules (which save `i`
+        // and pull back `ȳ ↦ ȳ · i`), and its named collectives (`x ↦ Σᵢ xᵢ`).
+        type Tracer = DomainTracer<ArrayContext>;
+        let index = |x: &Tracer| -> Result<Tracer, ProgramError> {
+            x.context().axis_index("items")?.convert_element_type(DataType::F64)
+        };
+        let scaled = move |x: Tracer| -> Result<Tracer, ProgramError> { Ok(x.clone() * index(&x)?) };
+        let inputs = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
+        let ones = Array::vector(vec![1.0f64; 3]).unwrap();
+        let items = || BatchAxisSpecification::named("items");
+
+        // Outside of `batch`, nothing binds `items`.
+        let function = composite(scaled);
+        assert_eq!(
+            ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "items".to_string() })),
+        );
+        assert_eq!(
+            batch(|x| function.call(x), inputs.clone(), BatchAxis::new(0), BatchAxis::new(0), items()),
+            Ok(Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |x| Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?),
+            ArrayType::new_static(DataType::F64, [3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = composite [
+                    name=\"composite\",
+                    batching=[(extent=3, axis_name=\"items\", input_axes=[axis 0], output_axes=[axis 0])],
+                ] %0 [
+                    primal={
+                        lambda %0:f64[3] .
+                        let %1:u64[3] = iota [type=u64[3], dimension=0]
+                            %2:f64[3] = convert_element_type [data_type=f64] %1
+                            %3:f64[3] = mul %0 %2
+                        in (%3)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        let function = composite(scaled)
+            .with_jvp(move |x: Tracer, tangent: Tracer| Ok((scaled(x.clone())?, tangent * index(&x)?)));
+        assert_eq!(
+            differentiate_at(inputs.clone()).jvp(ones.clone(), |x| {
+                Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?)
+            }),
+            Ok((Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap(), Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap())),
+        );
+
+        let function = composite(scaled).with_vjp(
+            move |x: Tracer| Ok((scaled(x.clone())?, index(&x)?)),
+            |index: Tracer, cotangent: Tracer| Ok(cotangent * index),
+        );
+        assert_eq!(
+            differentiate_at(inputs.clone()).gradient(|x| {
+                batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?
+                    .reduce(&[0], ReductionKind::Sum)
+            }),
+            Ok(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
+        );
+
+        let function = composite(|x: Tracer| x.parallel_reduce(ReductionKind::Sum, "items"));
+        assert_eq!(
+            batch(|x| function.call(x), inputs, BatchAxis::new(0), BatchAxis::new(0), items()),
+            Ok(Array::vector(vec![6.0f64; 3]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_composite_debug() {
+        // Debug output names each configuration kind and the function, but not the closures.
+        type Tracer = DomainTracer<ArrayContext>;
+        let function = composite(|x: Tracer| Ok(x.sin()?)).with_name("sine");
+        assert_eq!(
+            format!("{function:?}"),
+            "Composite { name: \"sine\", jvp: DefaultJvp, vjp: DefaultVjp, batching: DefaultBatching, \
+             batched_output_axes: None, non_differentiated_count: 0, .. }",
+        );
+        let function = function
+            .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
+            .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+            .with_batching(|_: BatchingLevelExtent<Tracer>, x: Tracer, axis: BatchAxis| Ok((x.sin()?, axis)));
+        assert_eq!(
+            format!("{function:?}"),
+            "Composite { name: \"sine\", jvp: ExplicitJvp { .. }, vjp: ExplicitVjp { .. }, \
+             batching: CustomBatching { .. }, batched_output_axes: None, non_differentiated_count: 0, .. }",
         );
     }
 
@@ -7257,5 +7234,54 @@ mod tests {
         );
         assert_eq!(batched_jvp.interpret(vec![x, tangent]), Ok(vec![sine, cosine]));
         assert_eq!(batched_jvp.interpret(vec![wide_x, wide_tangent]), mismatch);
+    }
+
+    #[test]
+    fn test_check_batching_rule_consistency() {
+        // A rule that computes `2xy` when both inputs are mapped and `3xy` otherwise changes its batched output when the
+        // replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
+        type Tracer = DomainTracer<ArrayContext>;
+        let scaled_product = |inconsistent: bool| {
+            composite(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
+                move |_: BatchingLevelExtent<Tracer>,
+                      (x, y): (Tracer, Tracer),
+                      (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                    let product = x * y;
+                    let scale = match inconsistent && !x_axis.is_replicated() && !y_axis.is_replicated() {
+                        true => 2.0,
+                        false => 1.0,
+                    };
+                    let scale = product.context().lift(Array::scalar(scale)?)?;
+                    Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
+                },
+            )
+        };
+        let input = (Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(), Array::scalar(4.0f64).unwrap());
+        let input_axes = (BatchAxis::new(0), BatchAxis::replicated());
+        let check = |inconsistent: bool| {
+            let function = scaled_product(inconsistent);
+            check_batching_rule_consistency(
+                |inputs| function.call(inputs),
+                input.clone(),
+                input_axes,
+                None,
+                |expected: &Array, actual: &Array| expected == actual,
+            )
+        };
+        assert_eq!(check(false), Ok(()));
+        assert_eq!(check(true), Err(BatchingRuleConsistencyError::Inconsistent { input: 1, output: 0 }));
+
+        // Every input of a fully replicated batch is broadcast in turn, which requires an explicit extent.
+        let function = scaled_product(true);
+        assert_eq!(
+            check_batching_rule_consistency(
+                |inputs| function.call(inputs),
+                (Array::scalar(1.0f64).unwrap(), Array::scalar(4.0f64).unwrap()),
+                (BatchAxis::replicated(), BatchAxis::replicated()),
+                3,
+                |expected: &Array, actual: &Array| expected == actual,
+            ),
+            Ok(()),
+        );
     }
 }

@@ -894,6 +894,21 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
         Ok(LockstepValue::new(vec![index; self.device_count]))
     }
 
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        body_input_types: &[Self::Type],
+        inputs: &[LockstepValue<O>],
+    ) -> Result<LockstepValue<O>, ProgramError> {
+        (0..self.device_count)
+            .map(|device| {
+                let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
+                DeviceContext::new().empty_stack(output_type, body_input_types, &inputs)
+            })
+            .collect::<Result<_, _>>()
+            .map(LockstepValue::new)
+    }
+
     fn read_iteration(stack: &LockstepValue<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
         stack
             .0
@@ -905,37 +920,29 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
 
     fn write_iteration(
         &self,
-        output: usize,
-        accumulator: Option<LockstepValue<O>>,
-        length: usize,
-        placement: &ShardingDimension,
+        output_index: usize,
+        stack: Option<LockstepValue<O>>,
+        iteration_count: usize,
+        axis_sharding: &ShardingDimension,
         iteration: usize,
         value: LockstepValue<O>,
     ) -> Result<LockstepValue<O>, ProgramError> {
-        let accumulators = match accumulator {
-            Some(accumulator) => accumulator.0.into_iter().map(Some).collect(),
+        let stacks = match stack {
+            Some(stack) => stack.0.into_iter().map(Some).collect(),
             None => vec![None; self.device_count],
         };
-        accumulators
+        stacks
             .into_iter()
             .zip(value.0)
-            .map(|(accumulator, value)| {
-                DeviceContext::new().write_iteration(output, accumulator, length, placement, iteration, value)
-            })
-            .collect::<Result<_, _>>()
-            .map(LockstepValue::new)
-    }
-
-    fn empty_stack(
-        &self,
-        output_type: &Self::Type,
-        body_input_types: &[Self::Type],
-        inputs: &[LockstepValue<O>],
-    ) -> Result<LockstepValue<O>, ProgramError> {
-        (0..self.device_count)
-            .map(|device| {
-                let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
-                DeviceContext::new().empty_stack(output_type, body_input_types, &inputs)
+            .map(|(stack, value)| {
+                DeviceContext::new().write_iteration(
+                    output_index,
+                    stack,
+                    iteration_count,
+                    axis_sharding,
+                    iteration,
+                    value,
+                )
             })
             .collect::<Result<_, _>>()
             .map(LockstepValue::new)
@@ -2125,8 +2132,8 @@ mod tests {
     fn test_shard_map_interpretation_scan_rejects_divergent_dynamic_lengths() {
         // The trip count of a scan whose body reduces over the manual axis is the first-class dimension `length` that
         // the map body derives from its local count, which differs across the devices. Devices with different trip
-        // counts would reach the reduction a different number of times, so the emulator rejects the type of the runtime
-        // length (i.e., scan input 1, after the carry), which is its extent, before the first iteration.
+        // counts would reach the reduction a different number of times, so the emulator rejects the type of the
+        // iteration count (i.e., scan input 1, after the carry), which is its extent, before the first iteration.
         let mesh = manual_mesh();
         let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
         let shard_map =

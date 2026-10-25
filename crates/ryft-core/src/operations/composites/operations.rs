@@ -3294,7 +3294,9 @@ mod tests {
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::functions::composite;
-    use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleRegistration, CustomRuleSource};
+    use crate::operations::composites::rules::{
+        CustomRuleDefinition, CustomRuleRegistration, CustomRuleSource, LiftedCustomRules,
+    };
     use crate::operations::composites::tests::{
         MemberDefinition, ReferenceRuleDifferentiationDriver, RuleCounters, TestContext, TestDefinition,
         TestRegistration, call_jvp, composite_call_program, cube_definition, cube_program, custom_rule_program,
@@ -3305,6 +3307,7 @@ mod tests {
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::differentiation::linear_call::LinearCallOperation;
+    use crate::operations::differentiation::linear_call::tests::scalar_multiply_program;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::manipulation::padding::PadOperation;
     use crate::operations::manipulation::slicing::Slice;
@@ -3326,8 +3329,6 @@ mod tests {
     };
     use crate::tests::{TestArrayOperation, hash_of};
     use crate::tracing::{DomainTracer, Trace, TracingContext};
-
-    use crate::operations::differentiation::linear_call::tests::scalar_multiply_program;
 
     use super::*;
 
@@ -4627,6 +4628,73 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_into_family() {
+        // A call with retained rules follows its program into a containing family with the source that the conversion
+        // derives from its rules, and it keeps its other state.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let operation = ArrayComposite::new(definition.reference()).with_non_differentiated_count(1).unwrap();
+        let converted: CompositeOperation<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+            LiftedCustomRules<Array, ArrayOperation<Array>>,
+        > = operation.clone().into_family(LiftedCustomRules::Member);
+        assert_eq!(converted.non_differentiated_count(), 1);
+        assert_eq!(converted.rules(), Some(&LiftedCustomRules::Member(definition.reference())));
+        assert_eq!(converted.jvp_rule(), CompositeJvpRule::Explicit);
+        assert!(converted.has_vjp_rule());
+        assert_eq!(converted.to_string(), operation.to_string());
+        assert_eq!(
+            format!("{converted:?}"),
+            "CompositeOperation { name: \"cube\", non_differentiated_count: 1, batching: None, discharged: false, \
+             kept_outputs: None }",
+        );
+
+        // A call with attached rules carries no source, so the conversion never derives one.
+        let attached = || {
+            ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true)
+                .with_non_differentiated_count(1)
+                .unwrap()
+        };
+        let converted: ArrayIrComposite = attached().into_family(|_| unreachable!("attached rules carry no source"));
+        assert_eq!(
+            converted,
+            ArrayIrComposite::from_rule_regions(CompositeJvpRule::Explicit, true)
+                .with_non_differentiated_count(1)
+                .unwrap(),
+        );
+        assert_eq!(converted.to_string(), attached().to_string());
+    }
+
+    #[test]
+    fn test_composite_into_attached_family() {
+        // A call with attached rules converts into any family with any source type, while a call with retained rules is
+        // returned unchanged.
+        let attached = ArrayComposite::from_rule_regions(CompositeJvpRule::Primal, true);
+        assert_eq!(
+            attached.with_non_differentiated_count(1).unwrap().into_attached_family::<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            >(),
+            Ok(ArrayIrComposite::from_rule_regions(CompositeJvpRule::Primal, true)
+                .with_non_differentiated_count(1)
+                .unwrap()),
+        );
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let retained = ArrayComposite::new(definition.reference());
+        assert_eq!(
+            retained.clone().into_attached_family::<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            >(),
+            Err(retained),
+        );
+    }
+
+    #[test]
     fn test_composite_type_inference() {
         // A call with both a JVP rule region and reverse-mode rule regions validates every rule interface against the
         // primal interface.
@@ -5351,10 +5419,26 @@ mod tests {
         let expected_jvp = batch_program(&program).jvp().unwrap().interpret(vec![x.clone(), ones.clone()]).unwrap();
         let expected_reverse = reverse(&batch_program(&program), x.clone(), ones.clone());
         assert_eq!(expected_reverse, vec![Array::vector(vec![0.5f64.cos(), 1.0f64.cos(), 1.5f64.cos()]).unwrap()]);
-        println!("RENDERING pruned_then_batched\n{}", batch_program(&pruned));
-        println!("RENDERING batched_then_pruned\n{}", batch_program(&program).into_pruned().unwrap());
         for batched in [batch_program(&pruned), batch_program(&program).into_pruned().unwrap()] {
-            assert_eq!(batched.to_string(), "");
+            assert_eq!(
+                batched.to_string(),
+                indoc! {"
+                    lambda %0:f64[3] .
+                    let %1:f64[3] = composite [
+                        name=\"sine_cosine\",
+                        batching=[(extent=3, input_axes=[axis 0], output_axes=[axis 0])],
+                        kept_outputs=[true, false],
+                    ] %0 [
+                        primal={
+                            lambda %0:f64[3] .
+                            let %1:f64[3] = sin %0
+                            in (%1)
+                        },
+                    ]
+                    in (%1)
+                "}
+                .trim_end(),
+            );
             assert_eq!(batched.jvp().unwrap().interpret(vec![x.clone(), ones.clone()]), Ok(expected_jvp.clone()));
             assert_eq!(reverse(&batched, x.clone(), ones.clone()), expected_reverse);
         }
@@ -5650,6 +5734,24 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_interpretation() {
+        // Interpretation replays only the primal region of a call with every kind of rule, both eagerly and in staged
+        // programs.
+        let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true);
+        let regions = sin_regions(&operation);
+        let operation = ArrayOperation::Composite(operation);
+        assert_eq!(
+            ArrayContext::new().bind(operation.clone(), regions.clone(), &[Array::scalar(2.0).unwrap()]),
+            Ok(vec![Array::scalar(2.0f64.sin()).unwrap()]),
+        );
+        let program = composite_call_program(operation, regions, vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(
+            program.interpret(vec![Array::scalar(2.0).unwrap()]),
+            Ok(vec![Array::scalar(2.0f64.sin()).unwrap()])
+        );
+    }
+
+    #[test]
     fn test_composite_interpretation_jvp_rule() {
         // Interpretation replays the primal region only, so an un-differentiated call never pays for the tangent
         // computation of the JVP region.
@@ -5723,6 +5825,60 @@ mod tests {
         );
         assert_eq!(program.interpret(vec![Array::scalar(2f64).unwrap()]), Ok(vec![Array::scalar(8f64).unwrap()]));
         assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_composite_partial_evaluation() {
+        // A call with every kind of rule folds by interpreting its primal region when its inputs are known, and it is
+        // residualized unchanged, together with all of its rule regions, when an input is unknown.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true);
+        let regions = sin_regions(&operation);
+        let program = composite_call_program(ArrayOperation::Composite(operation), regions, vec![scalar_type.clone()]);
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(Array::scalar(2.0).unwrap())]).unwrap();
+        assert!(matches!(
+            &evaluation.outputs[0],
+            PartialEvaluationOutput::Known(output) if output == &Array::scalar(2.0f64.sin()).unwrap(),
+        ));
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_type)]).unwrap();
+        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = composite %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                    jvp={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = sin %0
+                            %3:f64[] = const 2.0
+                            %4:f64[] = cos %0
+                            %5:f64[] = mul %3 %4
+                            %6:f64[] = mul %5 %1
+                        in (%2, %6)
+                    },
+                    forward={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = cos %0
+                        in (%1, %2)
+                    },
+                    backward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 3.0
+                            %3:f64[] = mul %2 %0
+                            %4:f64[] = mul %3 %1
+                        in (%4)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -6976,80 +7132,6 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_differentiation_combined_rules_fresh_tangent_state() {
-        // Adding reverse-mode rules does not change forward-mode linearization: the tangent program still allocates
-        // fresh JVP rule state on every application, exactly as for a call that has only a JVP rule.
-        check_custom_jvp_linearization_fresh_tangent_state(false, true);
-        check_custom_jvp_linearization_fresh_tangent_state(true, true);
-    }
-
-    #[test]
-    fn test_composite_differentiation_combined_rules_repeated_pullback_effects() {
-        // A call over a plumbing counter with a pure JVP rule and an effectful backward rule. Forward mode uses only
-        // the JVP rule, so it never executes the backward rule, while every application of a pullback executes the
-        // backward rule, and with it its effect, exactly once.
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        primal.add_input(reference_type.clone());
-        let x = primal.add_input(scalar_type.clone());
-        let square = primal
-            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![x, x], None)
-            .unwrap()[0];
-        let primal = primal.build(vec![square], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-        let mut jvp = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        jvp.add_input(reference_type);
-        let x = jvp.add_input(scalar_type.clone());
-        let tangent = jvp.add_input(scalar_type);
-        let square =
-            jvp.add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![x, x], None).unwrap()[0];
-        let coefficient = jvp.add_instruction(AddOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
-        let output_tangent = jvp
-            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![coefficient, tangent], None)
-            .unwrap()[0];
-        let jvp = jvp.build(vec![square, output_tangent], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
-        let mut regions = vec![primal, jvp];
-        regions.extend(counting_square_vjp_regions());
-        let operation = ArrayIrOperation::Composite(
-            CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true)
-                .with_non_differentiated_count(1)
-                .unwrap(),
-        );
-        let counter = ArrayReference::new(Array::scalar(0.0f32).unwrap());
-        let counter_tangent = ArrayReference::new(Array::scalar(0.0f32).unwrap());
-        let inputs = (ArrayIrValue::Reference(counter.clone()), ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
-        let tangents =
-            (ArrayIrValue::Reference(counter_tangent.clone()), ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()));
-        assert_eq!(
-            differentiate_at(inputs.clone()).jvp(tangents, |(counter, x)| {
-                Ok(x.context().bind(operation.clone(), regions.clone(), &[counter, x.clone()])?.remove(0))
-            }),
-            Ok((
-                ArrayIrValue::Array(Array::scalar(9.0f32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()),
-            )),
-        );
-        assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
-        let (value, pullback) = differentiate_at(inputs)
-            .vjp(|(counter, x)| {
-                Ok(x.context().bind(operation.clone(), regions.clone(), &[counter, x.clone()])?.remove(0))
-            })
-            .unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::scalar(9.0f32).unwrap()));
-        assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
-        for application in 1..=3 {
-            assert_eq!(
-                pullback.apply_with_destinations(
-                    CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())),
-                    (CotangentDestination::Ignore, CotangentDestination::Return),
-                ),
-                Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()))))),
-            );
-            assert_eq!(counter.read(), Ok(Array::scalar(application as f32).unwrap()));
-        }
-    }
-
-    #[test]
     fn test_composite_differentiation_jvp_rule() {
         // The custom rule doubles the true derivative, which proves that it governs forward-mode differentiation.
         let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
@@ -7642,6 +7724,80 @@ mod tests {
                 .linearize(|input| Ok(input.context().bind(operation, regions, &[input.clone()])?.remove(0))),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
         ));
+    }
+
+    #[test]
+    fn test_composite_differentiation_combined_rules_fresh_tangent_state() {
+        // Adding reverse-mode rules does not change forward-mode linearization: the tangent program still allocates
+        // fresh JVP rule state on every application, exactly as for a call that has only a JVP rule.
+        check_custom_jvp_linearization_fresh_tangent_state(false, true);
+        check_custom_jvp_linearization_fresh_tangent_state(true, true);
+    }
+
+    #[test]
+    fn test_composite_differentiation_combined_rules_repeated_pullback_effects() {
+        // A call over a plumbing counter with a pure JVP rule and an effectful backward rule. Forward mode uses only
+        // the JVP rule, so it never executes the backward rule, while every application of a pullback executes the
+        // backward rule, and with it its effect, exactly once.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        primal.add_input(reference_type.clone());
+        let x = primal.add_input(scalar_type.clone());
+        let square = primal
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![x, x], None)
+            .unwrap()[0];
+        let primal = primal.build(vec![square], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let mut jvp = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        jvp.add_input(reference_type);
+        let x = jvp.add_input(scalar_type.clone());
+        let tangent = jvp.add_input(scalar_type);
+        let square =
+            jvp.add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![x, x], None).unwrap()[0];
+        let coefficient = jvp.add_instruction(AddOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+        let output_tangent = jvp
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![coefficient, tangent], None)
+            .unwrap()[0];
+        let jvp = jvp.build(vec![square, output_tangent], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
+        let mut regions = vec![primal, jvp];
+        regions.extend(counting_square_vjp_regions());
+        let operation = ArrayIrOperation::Composite(
+            CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true)
+                .with_non_differentiated_count(1)
+                .unwrap(),
+        );
+        let counter = ArrayReference::new(Array::scalar(0.0f32).unwrap());
+        let counter_tangent = ArrayReference::new(Array::scalar(0.0f32).unwrap());
+        let inputs = (ArrayIrValue::Reference(counter.clone()), ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+        let tangents =
+            (ArrayIrValue::Reference(counter_tangent.clone()), ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()));
+        assert_eq!(
+            differentiate_at(inputs.clone()).jvp(tangents, |(counter, x)| {
+                Ok(x.context().bind(operation.clone(), regions.clone(), &[counter, x.clone()])?.remove(0))
+            }),
+            Ok((
+                ArrayIrValue::Array(Array::scalar(9.0f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()),
+            )),
+        );
+        assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
+        let (value, pullback) = differentiate_at(inputs)
+            .vjp(|(counter, x)| {
+                Ok(x.context().bind(operation.clone(), regions.clone(), &[counter, x.clone()])?.remove(0))
+            })
+            .unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(9.0f32).unwrap()));
+        assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
+        for application in 1..=3 {
+            assert_eq!(
+                pullback.apply_with_destinations(
+                    CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())),
+                    (CotangentDestination::Ignore, CotangentDestination::Return),
+                ),
+                Ok((None, Some(MaybeZero::Value(ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()))))),
+            );
+            assert_eq!(counter.read(), Ok(Array::scalar(application as f32).unwrap()));
+        }
     }
 
     #[test]
@@ -8355,7 +8511,10 @@ mod tests {
             CustomRuleRegistration::new(cube_definition(&counters, false, true).with_jvp(move |_, _| Err(failure())));
         let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         assert_eq!(program.interpret(vec![x.clone()]), Ok(vec![Array::scalar(8f64).unwrap()]));
-        assert!(call_vjp(&definition, x.clone(), one.clone()).is_ok());
+        assert_eq!(
+            call_vjp(&definition, x.clone(), one.clone()),
+            Ok((vec![Array::scalar(8f64).unwrap()], Array::scalar(8f64).unwrap())),
+        );
         assert_eq!(call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "rule failure");
 
         // A JVP rule with the wrong result structure surfaces at the same stage with a type error.
@@ -8373,13 +8532,14 @@ mod tests {
         let definition = CustomRuleRegistration::new(
             cube_definition(&counters, true, false).with_vjp(move |_| Err(failure()), |_, _| unreachable!()),
         );
-        assert!(call_jvp(&definition, x.clone(), one.clone()).is_ok());
+        let jvp = Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()]));
+        assert_eq!(call_jvp(&definition, x.clone(), one.clone()), jvp);
         assert_eq!(call_vjp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "rule failure");
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false).with_vjp(
             |primals| Ok((vec![primals[0].clone() * primals[0].clone() * primals[0].clone()], vec![])),
             move |_, _| Err(failure()),
         ));
-        assert!(call_jvp(&definition, x.clone(), one.clone()).is_ok());
+        assert_eq!(call_jvp(&definition, x.clone(), one.clone()), jvp);
         let r#type = x.r#type().into_owned();
         let (_, pullback) = TestContext::new()
             .vjp(
@@ -8498,8 +8658,24 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert!(program.jvp().is_ok());
-        assert!(program.jvp_with_respect_to(&[1]).is_ok());
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                in (%0, %1, %2, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.jvp_with_respect_to(&[1]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = zero [type=f64[]]
+                    %4:f64[] = zero [type=f64[]]
+                in (%0, %1, %4, %2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(*observed.lock().unwrap(), vec![vec![true, false], vec![false, false]]);
     }
 
@@ -8823,6 +8999,30 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_transposition() {
+        // A call that is linear in its unknown inputs transposes its primal region with respect to them, and the
+        // transposed region receives the live seeds followed by the known inputs.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let operation = ArrayOperation::Composite(ArrayComposite::from_rule_regions(CompositeJvpRule::Absent, false));
+        let program =
+            composite_call_program(operation, vec![scalar_multiply_program()], vec![scalar_type.clone(), scalar_type]);
+        let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
+            Ok(vec![Array::scalar(6.0).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_composite_transposition_jvp_rule() {
         // Differentiation replaces the call with its replayed rule before transposition, so a direct transpose of an
         // un-linearized call transposes its primal region, whose nonlinear `sin` rejects it.
@@ -9023,6 +9223,72 @@ mod tests {
         assert!(carrier.region_slots().is_empty());
         assert!(carrier.effects().summary().has_deferred_work());
         assert_eq!(carrier.to_string(), "composite_transpose [name=\"cube\", leading_input_count=1]");
+    }
+
+    #[test]
+    fn test_composite_transpose_into_family() {
+        // A carrier with a retained backward rule follows its program into a containing family with the source that the
+        // conversion derives from its rules, converting its tangent types.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let ir_scalar_type = ArrayIrType::from(scalar_type.clone());
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let carrier = ArrayCompositeTranspose::new(
+            definition.reference(),
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
+        let converted: CompositeTransposeOperation<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+            LiftedCustomRules<Array, ArrayOperation<Array>>,
+        > = carrier.clone().into_family(LiftedCustomRules::Member);
+        assert_eq!(converted.leading_input_count(), 1);
+        assert_eq!(converted.seed_extent_count(), 0);
+        assert_eq!(converted.input_tangent_types(), std::slice::from_ref(&ir_scalar_type));
+        assert_eq!(converted.output_tangent_types(), std::slice::from_ref(&ir_scalar_type));
+        assert_eq!(converted.rules(), Some(&LiftedCustomRules::Member(definition.reference())));
+        assert_eq!(converted.to_string(), carrier.to_string());
+
+        // A carrier with an attached backward rule carries no source, so the conversion never derives one.
+        let attached = ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type]);
+        let converted: ArrayIrCompositeTranspose =
+            attached.into_family(|_| unreachable!("attached backward rules carry no source"));
+        assert_eq!(
+            converted,
+            ArrayIrCompositeTranspose::from_backward_region(1, vec![ir_scalar_type.clone()], vec![ir_scalar_type]),
+        );
+    }
+
+    #[test]
+    fn test_composite_transpose_into_attached_family() {
+        // A carrier with an attached backward rule converts into any family with any source type, while a carrier with
+        // a retained backward rule is returned unchanged.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let ir_scalar_type = ArrayIrType::from(scalar_type.clone());
+        let attached =
+            ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type.clone()]);
+        assert_eq!(
+            attached.into_attached_family::<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            >(),
+            Ok(ArrayIrCompositeTranspose::from_backward_region(1, vec![ir_scalar_type.clone()], vec![ir_scalar_type])),
+        );
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let retained =
+            ArrayCompositeTranspose::new(definition.reference(), 1, vec![scalar_type.clone()], vec![scalar_type]);
+        assert_eq!(
+            retained.clone().into_attached_family::<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                CustomRuleReference<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            >(),
+            Err(retained),
+        );
     }
 
     #[test]
@@ -9500,6 +9766,72 @@ mod tests {
             buffer.read(),
             Ok(Array::matrix(3, 4, vec![0.0f64, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0]).unwrap()),
         );
+    }
+
+    #[test]
+    fn test_composite_transpose_batching_retained_rules_source_carrier() {
+        // The source carriers from which backward specializations are derived invoke the backward rule directly and are
+        // only ever transposed in an unbatched source program, so batching one is rejected as a malformed program.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let carrier = CompositeTransposeOperation::direct(
+            definition.reference(),
+            1,
+            0,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+            false,
+        );
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type)];
+        let outputs = builder.add_instruction(carrier, Vec::new(), inputs, None).unwrap().to_vec();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        assert!(matches!(
+            program.batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::Program(ProgramError::MalformedProgram(message)))
+                if message == "`composite_transpose` `cube` source carriers are never batched",
+        ));
+        assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_composite_transpose_differentiation() {
+        // A carrier has no forward program, so forward mode rejects it whether its backward rule is attached or
+        // retained.
+        assert!(matches!(
+            attached_carrier_program().jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite_transpose` has no forward-mode (i.e., JVP) rule; it supports only \
+                               reverse-mode differentiation",
+        ));
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, false, true));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let carrier = CompositeTransposeOperation::new(
+            definition.reference(),
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type)];
+        let outputs = builder.add_instruction(carrier, Vec::new(), inputs, None).unwrap().to_vec();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite_transpose` `cube` has no forward-mode (i.e., JVP) rule; it supports only \
+                               reverse-mode differentiation",
+        ));
+        assert_eq!(counters.counts(), (0, 0, 0));
     }
 
     #[test]

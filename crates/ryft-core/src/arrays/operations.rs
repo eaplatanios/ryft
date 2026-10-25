@@ -2792,13 +2792,13 @@ mod tests {
         assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64).unwrap()));
         assert_eq!(gradient, MaybeZero::Value(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())));
 
-        // Transposing the raw, un-linearized call directly is still rejected, but now by the array IR payload's own
-        // non-transposable rule instead of by a projected adapter that never received its regions.
+        // Transposing the raw, un-linearized call directly transposes its primal region (`2 * x`) with respect to the
+        // linear input, through the array IR payload's own transposition rule rather than a projected adapter that
+        // never received its regions, so the result carries the primal's true scale of two rather than the rule's.
+        let pullback = array_ir_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
-            array_ir_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
-            DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "operation `composite` is not transposable".to_string(),
-            }),
+            pullback.interpret(vec![ArrayIrValue::Array(Array::scalar(1.0_f64).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap())]),
         );
     }
 

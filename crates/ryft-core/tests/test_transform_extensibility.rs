@@ -490,22 +490,6 @@ fn test_external_scan_interpretation_domain() {
             HostContext::new().iteration_index(iteration)
         }
 
-        fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError> {
-            HostContext::read_iteration(stack, iteration)
-        }
-
-        fn write_iteration(
-            &self,
-            output: usize,
-            accumulator: Option<Self::Value>,
-            length: usize,
-            placement: &ShardingDimension,
-            iteration: usize,
-            value: Self::Value,
-        ) -> Result<Self::Value, ProgramError> {
-            HostContext::new().write_iteration(output, accumulator, length, placement, iteration, value)
-        }
-
         fn empty_stack(
             &self,
             output_type: &Self::Type,
@@ -513,6 +497,22 @@ fn test_external_scan_interpretation_domain() {
             inputs: &[Self::Value],
         ) -> Result<Self::Value, ProgramError> {
             HostContext::new().empty_stack(output_type, body_input_types, inputs)
+        }
+
+        fn read_iteration(stack: &Self::Value, iteration: usize) -> Result<Self::Value, ProgramError> {
+            HostContext::read_iteration(stack, iteration)
+        }
+
+        fn write_iteration(
+            &self,
+            output_index: usize,
+            stack: Option<Self::Value>,
+            iteration_count: usize,
+            axis_sharding: &ShardingDimension,
+            iteration: usize,
+            value: Self::Value,
+        ) -> Result<Self::Value, ProgramError> {
+            HostContext::new().write_iteration(output_index, stack, iteration_count, axis_sharding, iteration, value)
         }
     }
 

@@ -3691,7 +3691,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, ShardingDimension,
+        DimensionType, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
@@ -3700,194 +3700,678 @@ mod tests {
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, cube_program, custom_rule_program,
         member_cube_definition,
     };
+    use crate::operations::references::{ReferenceAddUpdate, ReferenceNew, ReferenceRead};
     use crate::programs::ReferenceType;
+    use crate::tests::{TestArrayOperation, hash_of};
 
     use super::*;
 
-    #[test]
-    fn test_lifted_custom_rules() {
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
-        let lifted = LiftedCustomRules::Member(definition.reference());
-        let source = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>| {
-            <LiftedCustomRules<_, _> as CustomRuleSource<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::name(rules)
-                .to_owned()
-        };
-        assert_eq!(source(&lifted), "cube");
-        let key = |input_type: ArrayIrType, levels| CustomRuleSpecializationKey {
-            input_types: vec![input_type.clone()],
-            output_types: vec![input_type],
+    /// Tracer over which the rules of a [`MemberDefinition`] are written.
+    type MemberTracer = CustomRuleTracer<Array, ArrayOperation<Array>>;
+
+    /// Returns the specialization key of an unbatched and undischarged call with the provided input and output types,
+    /// whose differentiated inputs (i.e., all of them) have the provided tangent activity.
+    fn unbatched_key<T>(
+        input_types: Vec<T>,
+        output_types: Vec<T>,
+        tangent_activity: Vec<bool>,
+    ) -> CustomRuleSpecializationKey<T> {
+        CustomRuleSpecializationKey {
+            input_types,
+            output_types,
             kept_outputs: None,
             non_differentiated_count: 0,
-            tangent_activity: vec![true],
-            levels,
+            tangent_activity,
+            levels: Vec::new(),
             discharged: false,
-        };
-        let specialize = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>, key| {
-            CustomRuleSpecializer::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::jvp_specialization(rules, key)
-                .map(|_| ())
-                .unwrap_err()
-                .to_string()
-        };
+        }
+    }
 
-        // Types without a member representation are rejected at the first derivative request.
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
-        assert_eq!(
-            specialize(&lifted, key(reference_type, Vec::new())),
-            "`composite` `cube` cannot be differentiated with respect to type `ref<f64[]>`, which the family \
-             in which its rules were registered cannot represent",
-        );
+    /// Returns the specialization key of the unbatched backward rule of a call without non-differentiated inputs or
+    /// seed extents, whose output seeds have the provided types and whose input cotangents are all returned.
+    fn backward_key(
+        leading_input_types: Vec<ArrayType>,
+        input_tangent_types: Vec<ArrayType>,
+        seed_types: Vec<Option<ArrayType>>,
+    ) -> CustomRuleBackwardSpecializationKey<ArrayType> {
+        CustomRuleBackwardSpecializationKey {
+            leading_input_types,
+            seed_extent_count: 0,
+            destination_kinds: vec![CotangentDestinationKind::Return; input_tangent_types.len()],
+            input_tangent_types,
+            output_tangent_types: vec![ArrayType::scalar(DataType::F64)],
+            seed_types,
+            levels: Vec::new(),
+            discharged: false,
+        }
+    }
 
-        // So are first-class dimension batch extents, which array IR batching produces.
-        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let level = CustomRuleBatchingLevel {
-            level: BatchingLevel::new(
-                BatchingLevelExtent::Dynamic(DimensionType::from(items).into()),
-                None,
-                ShardingDimension::Replicated,
-            ),
-            boundary_input_count: 1,
-            input_axes: vec![BatchAxis::new(0)],
-            output_axes: vec![BatchAxis::new(0)],
+    /// Returns the key of the custom batching rule of an undischarged call batched at a static level of three items,
+    /// whose batched inputs have the provided types and batch axes.
+    fn batching_rule_key(
+        input_types: Vec<ArrayType>,
+        unbatched_input_types: Vec<ArrayType>,
+        input_axes: Vec<BatchAxis>,
+    ) -> CustomRuleBatchingRuleKey<ArrayType> {
+        CustomRuleBatchingRuleKey {
+            level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+            boundary_input_types: Vec::new(),
+            input_types,
+            unbatched_input_types,
+            input_axes,
+            discharged: false,
+        }
+    }
+
+    /// Returns a registration of `(x, y) ↦ x · y` whose forward-mode rule is derived from its primal and whose custom
+    /// batching rule maps the product along the first mapped input axis, which is axis-dependent when `axis_dependent`
+    /// is set and has batching support when `batching_support` is set.
+    fn product_registration(
+        batching_support: bool,
+        axis_dependent: bool,
+    ) -> CustomRuleRegistration<Array, ArrayOperation<Array>> {
+        let rule = |_: &BatchingLevel<ArrayType>, _: &[MemberTracer], inputs: &[MemberTracer], axes: &[BatchAxis]| {
+            let axis = if axes[0].is_replicated() { axes[1] } else { axes[0] };
+            Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[1].clone()], vec![axis]))
         };
-        assert_eq!(
-            specialize(&lifted, key(ArrayType::scalar(DataType::F64).into(), vec![level])),
-            "`composite` `cube` cannot differentiate a batched call whose batch extent has type \
-             `dimension<items ∈ [1, 9)>`, which the family in which its rules were registered cannot represent; \
-             differentiate the call before batching it instead",
-        );
+        let mut definition = MemberDefinition::new("product").with_jvp_from_primal();
+        if batching_support {
+            definition = definition.with_batching_support();
+        }
+        CustomRuleRegistration::new(match axis_dependent {
+            true => definition.with_axis_dependent_batching_rule(rule),
+            false => definition.with_batching_rule(rule),
+        })
+    }
 
-        // Unavailable rules keep the identity and description of their definition but reject every derivative request.
-        let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
-            UnavailableCustomRules::from_source(&definition.reference()),
-        );
-        assert_eq!(unavailable, lifted);
-        assert_eq!(source(&unavailable), "cube");
-        assert_eq!(
-            specialize(&unavailable, key(ArrayType::scalar(DataType::F64).into(), Vec::new())),
-            "`composite` `cube` was converted from a family whose values its current family cannot represent, \
-             so its derivative rules are unavailable",
-        );
-        assert_eq!(counters.counts(), (0, 0, 0));
+    /// Returns the key of the definition derived from a [`product_registration`] for calls of the provided kind with
+    /// the provided active inputs.
+    fn product_derivation_key(
+        kind: CustomRuleDerivationKind,
+        active_input_indices: Vec<usize>,
+    ) -> CustomRuleDerivationKey {
+        CustomRuleDerivationKey { kind, input_count: 2, active_input_indices, output_tangent_mask: vec![true] }
+    }
+
+    /// Applies the batching rule of the definition derived from `registration` for `derivation_key` directly (i.e.,
+    /// without the caches and the discharge of the derived definition) to the call batched as `key` describes.
+    fn derived_batching_rule_specialization(
+        registration: &CustomRuleRegistration<Array, ArrayOperation<Array>>,
+        derivation_key: CustomRuleDerivationKey,
+        key: &CustomRuleBatchingRuleKey<ArrayType>,
+    ) -> Result<CustomRuleSpecialization<Array, ArrayOperation<Array>>, DifferentiationError> {
+        let derived = registration.reference().derived(derivation_key)?;
+        derived.definition.derivation.as_ref().unwrap().batching_rule_specialization(derived.name(), key)
     }
 
     #[test]
-    fn test_lifted_custom_rules_derived() {
-        // A lifted source derives in the family that owns its definition, and unavailable rules stay unavailable.
+    fn test_custom_rule_definition_new() {
+        // A new definition has no rules, and its identity is its own: an equally named definition is another rule set.
+        let registration = CustomRuleRegistration::new(TestDefinition::new("cube"));
+        let reference = registration.reference();
+        assert_eq!(reference.definition().name(), "cube");
+        assert!(reference.definition().named_axes().is_empty());
+        assert!(!reference.definition().has_derivative_rules());
+        assert!(!reference.has_jvp());
+        assert!(!reference.derives_jvp_from_primal());
+        assert!(!reference.has_vjp());
+        assert_eq!(reference.batched_output_axes(), None);
+        assert!(!reference.has_batching_rule());
+        assert!(!reference.has_sequential_batching());
+        assert_eq!(
+            format!("{:?}", reference.definition()),
+            "CustomRuleDefinition { name: \"cube\", has_jvp: false, derives_jvp_from_primal: false, has_vjp: false, \
+             .. }",
+        );
+        assert_ne!(CustomRuleRegistration::new(TestDefinition::new("cube")).reference(), reference);
+
+        // Every request for a rule that the definition lacks is rejected.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key = unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], vec![true]);
+        assert!(matches!(
+            reference.jvp_specialization(key.clone()),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` has no forward-mode (i.e., JVP) rule",
+        ));
+        assert!(matches!(
+            reference.forward_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` has no reverse-mode forward rule",
+        ));
+        assert!(matches!(
+            reference.backward_specialization(backward_key(
+                vec![scalar_type.clone()],
+                vec![scalar_type.clone()],
+                vec![Some(scalar_type.clone())],
+            )),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite_transpose` `cube` has no backward rule",
+        ));
+        assert!(matches!(
+            reference.batching_rule_specialization(batching_rule_key(
+                vec![ArrayType::new_static(DataType::F64, [3])],
+                vec![scalar_type],
+                vec![BatchAxis::new(0)],
+            )),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` has no custom batching rule",
+        ));
+        assert!(matches!(
+            reference.sequential_batching_scan(3, 0, &ShardingDimension::Replicated, 1),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` does not batch its calls sequentially",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_named_axes() {
+        // Every rule is traced with the named axes, which the definitions derived from the definition inherit.
+        let named_axes = vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })];
         let registration = CustomRuleRegistration::new(
             MemberDefinition::new("sine")
+                .with_named_axes(named_axes.clone())
                 .with_jvp_from_primal()
                 .with_batching_support()
                 .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
         );
+        assert_eq!(registration.reference().definition().named_axes(), named_axes.as_slice());
         let key = CustomRuleDerivationKey {
             kind: CustomRuleDerivationKind::Jvp,
             input_count: 1,
             active_input_indices: vec![0],
             output_tangent_mask: vec![true],
         };
-        let derive = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>| {
-            <LiftedCustomRules<_, _> as CustomRuleSpecializer<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::derived(
-                rules,
-                key.clone(),
-            )
-            .unwrap()
-        };
-        let lifted = LiftedCustomRules::Member(registration.reference());
-        assert_eq!(derive(&lifted), LiftedCustomRules::Member(registration.reference().derived(key.clone()).unwrap()));
-        let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
-            UnavailableCustomRules::from_source(&registration.reference()),
-        );
-        assert!(matches!(derive(&unavailable), LiftedCustomRules::Unavailable(_)));
-        assert_eq!(derive(&unavailable), unavailable);
+        let derived = registration.reference().derived(key).unwrap();
+        assert_eq!(derived.definition().named_axes(), named_axes.as_slice());
     }
 
     #[test]
-    fn test_lifted_custom_rules_converted_specialization_cache() {
-        // The converted program of each specialization is cached with the member definition's specializations, so
-        // repeated requests share it instead of converting the member program again.
+    fn test_custom_rule_definition_with_jvp() {
+        // The rule receives every primal input and one tangent per differentiated input, in which an inactive tangent
+        // is a materialized zero, and its specialization returns the primal outputs followed by their tangents.
         let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
-        let lifted = LiftedCustomRules::Member(definition.reference());
-        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
-        let key = CustomRuleSpecializationKey {
-            input_types: vec![scalar_type.clone()],
-            output_types: vec![scalar_type],
-            kept_outputs: None,
-            non_differentiated_count: 0,
-            tangent_activity: vec![true],
-            levels: Vec::new(),
-            discharged: false,
-        };
-        let specialize = || {
-            CustomRuleSpecializer::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::jvp_specialization(
-                &lifted,
-                key.clone(),
-            )
-            .unwrap()
-        };
-        let first = specialize();
-        let second = specialize();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(counters.counts(), (1, 0, 0));
+        let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let reference = registration.reference();
+        assert!(reference.has_jvp());
+        assert!(!reference.derives_jvp_from_primal());
+        assert!(reference.definition().has_derivative_rules());
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key =
+            |tangent_activity| unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], tangent_activity);
+        let active = reference.jvp_specialization(key(vec![true])).unwrap();
+        assert!(active.output_axes.is_empty());
+        assert_eq!(
+            active.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %0
+                    %3:f64[] = mul %2 %0
+                    %4:f64[] = mul %2 %1
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+        let inactive = reference.jvp_specialization(key(vec![false])).unwrap();
+        assert_eq!(
+            inactive.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
+                    %2:f64[] = mul %0 %0
+                    %3:f64[] = mul %2 %0
+                    %4:f64[] = mul %2 %1
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(counters.counts(), (2, 0, 0));
+
+        // The rule replaces any previously configured forward-mode rule, including a JVP derived from the primal.
+        let replaced = CustomRuleRegistration::new(
+            TestDefinition::new("identity")
+                .with_jvp_from_primal()
+                .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
+        );
+        assert!(replaced.reference().has_jvp());
+        assert!(!replaced.reference().derives_jvp_from_primal());
     }
 
     #[test]
-    fn test_custom_rule_definition_batched_specialization_dynamic_extent() {
-        // A first-class batch extent reaches batched specializations as a leading boundary input, so the traced rule is
-        // batched at a level that records only the extent's type.
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let definition = CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("cube")
-            .with_jvp({
-                let invocations = invocations.clone();
-                move |primals, tangents| {
-                    invocations.fetch_add(1, Ordering::SeqCst);
-                    let multiply = |left: &CustomRuleTracer<_, _>, right: &CustomRuleTracer<_, _>| {
-                        let operation = ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new()));
-                        Ok::<_, ProgramError>(
-                            left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?.remove(0),
-                        )
-                    };
-                    let square = multiply(&primals[0], &primals[0])?;
-                    Ok((vec![multiply(&square, &primals[0])?], vec![multiply(&square, &tangents[0])?]))
-                }
-            })
-            .with_batching_support();
-        let item_type: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
-        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let level = CustomRuleBatchingLevel {
-            level: BatchingLevel::new(
-                BatchingLevelExtent::Dynamic(DimensionType::from(items).into()),
-                None,
-                ShardingDimension::Replicated,
-            ),
-            boundary_input_count: 1,
-            input_axes: vec![BatchAxis::new(0)],
-            output_axes: vec![BatchAxis::new(0)],
+    fn test_custom_rule_definition_with_symbolic_zero_jvp() {
+        // The rule of `(x, y) ↦ xy` receives the inactive tangents as structural zeros, which it skips, and declares
+        // the output tangent a structural zero when every input tangent is one. The specialization materializes that
+        // zero at its boundary.
+        let zero_tangents = Arc::new(AtomicUsize::new(0));
+        let registration = CustomRuleRegistration::new(TestDefinition::new("product").with_symbolic_zero_jvp({
+            let zero_tangents = zero_tangents.clone();
+            move |primals, tangents| {
+                let (x, y) = (&primals[0], &primals[1]);
+                let tangent = [(&tangents[0], y), (&tangents[1], x)]
+                    .into_iter()
+                    .filter_map(|(tangent, factor)| match tangent {
+                        MaybeZero::Value(tangent) => Some(tangent.clone() * factor.clone()),
+                        MaybeZero::Zero(_) => {
+                            zero_tangents.fetch_add(1, Ordering::SeqCst);
+                            None
+                        }
+                    })
+                    .reduce(|left, right| left + right);
+                let tangent = match tangent {
+                    Some(tangent) => MaybeZero::Value(tangent),
+                    None => MaybeZero::Zero(x.r#type().into_owned()),
+                };
+                Ok((vec![x.clone() * y.clone()], vec![tangent]))
+            }
+        }));
+        assert!(registration.reference().has_jvp());
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key = |tangent_activity| {
+            unbatched_key(vec![scalar_type.clone(), scalar_type.clone()], vec![scalar_type.clone()], tangent_activity)
         };
-        let key = CustomRuleSpecializationKey {
-            input_types: vec![item_type.clone()],
-            output_types: vec![item_type],
-            kept_outputs: None,
-            non_differentiated_count: 0,
-            tangent_activity: vec![true],
-            levels: vec![level],
-            discharged: false,
-        };
-        let specialization = CustomRuleRegistration::new(definition).reference().jvp_specialization(key).unwrap();
-        assert_eq!(specialization.output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
+        let specialization = registration.reference().jvp_specialization(key(vec![true, false])).unwrap();
         assert_eq!(
             specialization.program.to_string(),
             indoc! {"
-                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:f32[items, 3] .
-                let %3:f32[items, 3] = mul %1 %1
-                    %4:f32[items, 3] = mul %3 %1
-                    %5:f32[items, 3] = mul %3 %2
-                in (%4, %5)
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = mul %2 %1
+                    %4:f64[] = mul %0 %1
+                in (%4, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(zero_tangents.load(Ordering::SeqCst), 1);
+        let specialization = registration.reference().jvp_specialization(key(vec![false, false])).unwrap();
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                    %3:f64[] = zero [type=f64[]]
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(zero_tangents.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_jvp_from_primal() {
+        // A forward-mode rule derived from the primal is not traced by the definition: forward mode differentiates the
+        // primal region of each call instead, which computes the true derivative `3x²` of the cube.
+        let counters = Arc::new(RuleCounters::default());
+        let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false).with_jvp_from_primal());
+        let reference = registration.reference();
+        assert!(reference.derives_jvp_from_primal());
+        assert!(!reference.has_jvp());
+        assert!(reference.definition().has_derivative_rules());
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        assert!(matches!(
+            reference.jvp_specialization(unbatched_key(vec![scalar_type.clone()], vec![scalar_type], vec![true])),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` has no forward-mode (i.e., JVP) rule",
+        ));
+        assert_eq!(
+            call_jvp(&registration, Array::scalar(2f64).unwrap(), Array::scalar(1f64).unwrap()),
+            Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(12f64).unwrap()])),
+        );
+        assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_vjp() {
+        // The forward rule's specialization returns the primal outputs followed by the residuals, and the backward
+        // rule's specialization consumes the live seeds followed by the leading inputs (here, the residual `x²`) and
+        // returns the cotangent `2x²ȳ` of the differentiated input.
+        let counters = Arc::new(RuleCounters::default());
+        let registration = CustomRuleRegistration::new(cube_definition(&counters, false, true));
+        let reference = registration.reference();
+        assert!(reference.has_vjp());
+        assert!(!reference.has_jvp());
+        assert!(reference.definition().has_derivative_rules());
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let forward = reference
+            .forward_specialization(unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], Vec::new()))
+            .unwrap();
+        assert_eq!(
+            forward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                in (%2, %1)
+            "}
+            .trim_end(),
+        );
+        let backward = reference
+            .backward_specialization(backward_key(
+                vec![scalar_type.clone()],
+                vec![scalar_type.clone()],
+                vec![Some(scalar_type.clone())],
+            ))
+            .unwrap();
+        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Output]);
+        assert_eq!(
+            backward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                    %3:f64[] = add %2 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(counters.counts(), (0, 1, 1));
+
+        // A structural-zero seed reaches the backward rule materialized, so its specialization has no seed input.
+        let backward = reference
+            .backward_specialization(backward_key(vec![scalar_type.clone()], vec![scalar_type], vec![None]))
+            .unwrap();
+        assert_eq!(
+            backward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
+                    %2:f64[] = mul %0 %1
+                    %3:f64[] = add %2 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(counters.counts(), (0, 1, 2));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_symbolic_zero_vjp() {
+        // The backward rule of `(x, y) ↦ xy` treats `y` as a parameter, declaring its cotangent a structural zero, and
+        // returns structural zeros for a structural-zero seed. Structural-zero cotangents consume no program output.
+        let registration = CustomRuleRegistration::new(TestDefinition::new("product").with_symbolic_zero_vjp(
+            |primals| Ok((vec![primals[0].clone() * primals[1].clone()], vec![primals[1].clone()])),
+            |leading_inputs, seeds| {
+                let zero = MaybeZero::Zero(leading_inputs[0].r#type().into_owned());
+                match &seeds[0] {
+                    MaybeZero::Value(seed) => {
+                        Ok(vec![MaybeZero::Value(seed.clone() * leading_inputs[0].clone()), zero])
+                    }
+                    MaybeZero::Zero(_) => Ok(vec![zero.clone(), zero]),
+                }
+            },
+        ));
+        assert!(registration.reference().has_vjp());
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key = |seed_type| {
+            backward_key(vec![scalar_type.clone()], vec![scalar_type.clone(), scalar_type.clone()], vec![seed_type])
+        };
+        let backward = registration.reference().backward_specialization(key(Some(scalar_type.clone()))).unwrap();
+        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Output, TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            backward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let backward = registration.reference().backward_specialization(key(None)).unwrap();
+        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Zero, TransposedProgramCotangent::Zero]);
+        assert_eq!(
+            backward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in ()
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_accumulating_vjp() {
+        // The backward rule of the cube submits the contribution `x²ȳ` of its differentiated input to that input's
+        // accumulator, which follows the accumulators of the leading inputs (here, the residual `x²`).
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let registration = CustomRuleRegistration::new(TestDefinition::new("cube").with_accumulating_vjp(
+            |primals| {
+                let square = primals[0].clone() * primals[0].clone();
+                Ok((vec![square.clone() * primals[0].clone()], vec![square]))
+            },
+            {
+                let invocations = invocations.clone();
+                move |context, inputs, seeds, accumulators| {
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    let (Some(residual), MaybeZero::Value(seed)) = (inputs[0].as_known(), &seeds[0]) else {
+                        return Ok(());
+                    };
+                    accumulators[1].accumulate(context, MaybeZero::Value(residual.clone() * seed.clone()))?;
+                    Ok(())
+                }
+            },
+        ));
+        assert!(registration.reference().has_vjp());
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let backward = registration
+            .reference()
+            .backward_specialization(backward_key(
+                vec![scalar_type.clone()],
+                vec![scalar_type.clone()],
+                vec![Some(scalar_type)],
+            ))
+            .unwrap();
+        assert_eq!(backward.cotangents, vec![TransposedProgramCotangent::Output]);
+        assert_eq!(
+            backward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
             "}
             .trim_end(),
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_batching_support() {
+        // A batched specialization structurally batches the specialization traced at the unbatched types, which it
+        // shares with unbatched calls, and aligns each output and tangent to the output axes of its level.
+        let counters = Arc::new(RuleCounters::default());
+        let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let key = CustomRuleSpecializationKey {
+            levels: vec![CustomRuleBatchingLevel {
+                level: BatchingLevel::new(BatchingLevelExtent::Static(3), None, ShardingDimension::Replicated),
+                boundary_input_count: 0,
+                input_axes: vec![BatchAxis::new(0)],
+                output_axes: vec![BatchAxis::new(0)],
+            }],
+            ..unbatched_key(vec![scalar_type.clone()], vec![scalar_type], vec![true])
+        };
+        let specialization = registration.reference().jvp_specialization(key.clone()).unwrap();
+        assert_eq!(specialization.output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = mul %0 %0
+                    %3:f64[3] = mul %2 %0
+                    %4:f64[3] = mul %2 %1
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(registration.caches().jvp_specializations.len(), 2);
+        assert_eq!(counters.counts(), (1, 0, 0));
+
+        // Without batching support, batched calls cannot be differentiated.
+        let unsupported = CustomRuleRegistration::new(
+            TestDefinition::new("cube").with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
+        );
+        assert!(matches!(
+            unsupported.reference().jvp_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` cannot differentiate a batched call because its definition has no \
+                               batching support (refer to `CustomRuleDefinition::with_batching_support`)",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_batched_output_axes() {
+        // Batched calls map every output at axis 0 unless the definition declares their batch axes, one per output.
+        let default = CustomRuleRegistration::new(TestDefinition::new("pair"));
+        assert_eq!(default.reference().batched_output_axes(), None);
+        assert_eq!(default.reference().batched_call_output_axes(2), Ok(vec![BatchAxis::new(0); 2]));
+        let output_axes = vec![BatchAxis::new(0), BatchAxis::replicated()];
+        let declared =
+            CustomRuleRegistration::new(TestDefinition::new("pair").with_batched_output_axes(output_axes.clone()));
+        assert_eq!(declared.reference().batched_output_axes(), Some(output_axes.as_slice()));
+        assert_eq!(declared.reference().batched_call_output_axes(2), Ok(output_axes));
+        assert_eq!(
+            declared.reference().batched_call_output_axes(1),
+            Err(TypeError::invalid("expected 1 batched output axis but got 2")),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_batching_rule() {
+        // The rule's program is the batched primal of the call, with the batch axes that the rule declares.
+        let registration = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(
+            |_, _, inputs, input_axes| Ok((vec![inputs[0].clone() * inputs[0].clone()], input_axes.to_vec())),
+        ));
+        assert!(registration.reference().has_batching_rule());
+        let key = batching_rule_key(
+            vec![ArrayType::new_static(DataType::F64, [3])],
+            vec![ArrayType::scalar(DataType::F64)],
+            vec![BatchAxis::new(0)],
+        );
+        let specialization = registration.reference().batching_rule_specialization(key.clone()).unwrap();
+        assert_eq!(specialization.output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = mul %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // The rule must declare one batch axis per output.
+        let registration = CustomRuleRegistration::new(
+            MemberDefinition::new("square").with_batching_rule(|_, _, inputs, _| Ok((inputs.to_vec(), Vec::new()))),
+        );
+        assert!(matches!(
+            registration.reference().batching_rule_specialization(key),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `square` batching rule returned 1 outputs but 0 output batch axes",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_axis_dependent_batching_rule() {
+        // The rule batches calls exactly as a plain batching rule does, and it records the operations with which the
+        // derived definitions recover exact per-item tangents (refer to the `CustomRuleDerivation` tests).
+        let rule = |_: &BatchingLevel<ArrayType>, _: &[MemberTracer], inputs: &[MemberTracer], axes: &[BatchAxis]| {
+            Ok::<_, ProgramError>((vec![inputs[0].clone() * inputs[0].clone()], axes.to_vec()))
+        };
+        let plain = CustomRuleRegistration::new(MemberDefinition::new("square").with_batching_rule(rule));
+        let axis_dependent =
+            CustomRuleRegistration::new(MemberDefinition::new("square").with_axis_dependent_batching_rule(rule));
+        assert!(axis_dependent.reference().has_batching_rule());
+        assert!(axis_dependent.definition().axis_dependence.is_some());
+        assert!(plain.definition().axis_dependence.is_none());
+        let key = batching_rule_key(
+            vec![ArrayType::new_static(DataType::F64, [3])],
+            vec![ArrayType::scalar(DataType::F64)],
+            vec![BatchAxis::new(0)],
+        );
+        let specialization = axis_dependent.reference().batching_rule_specialization(key.clone()).unwrap();
+        let plain_specialization = plain.reference().batching_rule_specialization(key).unwrap();
+        assert_eq!(specialization.output_axes, plain_specialization.output_axes);
+        assert_eq!(specialization.program.to_string(), plain_specialization.program.to_string());
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_sequential_batching() {
+        // Sequential batching loops over the batch items with a scan that carries the replicated inputs and stacks the
+        // outputs, whose body receives an `i64[]` slice index first.
+        let registration = CustomRuleRegistration::new(MemberDefinition::new("square").with_sequential_batching());
+        assert!(registration.reference().has_sequential_batching());
+        assert!(!registration.reference().has_batching_rule());
+        let (operation, index_type) =
+            registration.reference().sequential_batching_scan(3, 1, &ShardingDimension::Replicated, 2).unwrap();
+        assert_eq!(operation.to_string(), "scan [carry_count=1, length=3, reverse=false]");
+        assert_eq!(index_type, ArrayType::scalar(DataType::I64));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_with_reference_discharge() {
+        // The JVP rule `(x, ẋ) ↦ (2x, 2ẋ)` keeps local reference state, which the specializations of discharged calls
+        // discharge when the definition supports it and reject otherwise.
+        type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let definition = || {
+            CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("doubled").with_jvp(
+                |primals: &[IrTracer], tangents: &[IrTracer]| {
+                    let output = primals[0].reference_new()?;
+                    output.add_update(&primals[0])?;
+                    let tangent = tangents[0].reference_new()?;
+                    tangent.add_update(&tangents[0])?;
+                    Ok((vec![output.read()?], vec![tangent.read()?]))
+                },
+            )
+        };
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let key = |discharged| CustomRuleSpecializationKey {
+            discharged,
+            ..unbatched_key(vec![scalar_type.clone()], vec![scalar_type.clone()], vec![true])
+        };
+        let has_reference_state = |specialization: &CustomRuleProgram<ArrayIrValue<Array>, ArrayIrOperation<Array>>| {
+            let regions = specialization.program.regions();
+            regions.iter().flat_map(|region| region.atoms()).any(|atom| atom.r#type().is_reference())
+        };
+        let supported = CustomRuleRegistration::new(definition().with_reference_discharge());
+        let discharged = supported.reference().jvp_specialization(key(true)).unwrap();
+        assert!(!has_reference_state(&discharged));
+        assert_eq!(
+            discharged.program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = add %0 %0
+                    %3:f32[] = add %1 %1
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        assert!(has_reference_state(&supported.reference().jvp_specialization(key(false)).unwrap()));
+
+        // Without discharge support, the specializations of discharged calls cannot keep the reference state.
+        let unsupported = CustomRuleRegistration::new(definition());
+        assert!(matches!(
+            unsupported.reference().jvp_specialization(key(true)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `doubled` cannot differentiate a call whose reference state was \
+                               discharged, because its rule programs contain reference state and its definition has \
+                               no reference discharge support",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_registration_new() {
+        // A registration owns empty caches, which its clones share, and its references share its definition.
+        let counters = Arc::new(RuleCounters::default());
+        let registration = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        assert!(registration.caches().jvp_specializations.is_empty());
+        assert!(registration.caches().forward_specializations.is_empty());
+        assert!(registration.caches().backward_specializations.is_empty());
+        assert!(registration.caches().batching_rule_specializations.is_empty());
+        assert_eq!(registration.caches().derived_registrations.lock().unwrap().len(), 0);
+        assert_eq!(registration.reference(), registration.reference());
+        let clone = registration.clone();
+        assert!(Arc::ptr_eq(clone.definition(), registration.definition()));
+        assert!(Arc::ptr_eq(clone.caches(), registration.caches()));
+        assert_eq!(
+            format!("{registration:?}"),
+            "CustomRuleRegistration(CustomRuleDefinition { name: \"cube\", has_jvp: true, derives_jvp_from_primal: \
+             false, has_vjp: false, .. })",
+        );
     }
 
     #[test]
@@ -3921,6 +4405,79 @@ mod tests {
         drop((program, linearization));
         assert!(retained_outer.upgrade().is_none());
         assert!(retained_inner.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_custom_rule_registration_drop() {
+        // Once the handle is dropped, the remaining calls trace their rules again on every derivative request, with
+        // results identical to the cached ones.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let cached = program.linearize().unwrap().tangent().to_string();
+        drop(definition);
+        for expected_invocations in [2, 3] {
+            assert_eq!(program.linearize().unwrap().tangent().to_string(), cached);
+            assert_eq!(counters.counts(), (expected_invocations, 0, 0));
+        }
+
+        // A rule that requests its own specialization while it is being traced is rejected, with and without a live
+        // handle, and a rejected request leaves nothing in flight.
+        let definition = CustomRuleRegistration::new_cyclic(|this| {
+            let this = this.clone();
+            TestDefinition::new("reentrant").with_jvp(move |primals, tangents| {
+                let r#type = primals[0].r#type().into_owned();
+                let key = CustomRuleSpecializationKey {
+                    input_types: vec![r#type.clone()],
+                    output_types: vec![r#type],
+                    kept_outputs: None,
+                    non_differentiated_count: 0,
+                    tangent_activity: vec![true],
+                    levels: Vec::new(),
+                    discharged: false,
+                };
+                this.reference()?
+                    .jvp_specialization(key)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                Ok((primals.to_vec(), tangents.to_vec()))
+            })
+        });
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let reentrant = "`composite` `reentrant` makes a recursive request for a specialization that is already being \
+                         produced on this thread";
+        assert!(matches!(
+            program.jvp(),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message })) if message == reentrant,
+        ));
+        let retained = Arc::downgrade(&definition.definition());
+        drop(definition);
+        for _ in 0..2 {
+            assert!(matches!(
+                program.jvp(),
+                Err(DifferentiationError::Program(ProgramError::InvalidArgument { message })) if message == reentrant,
+            ));
+            assert!(!retained.upgrade().unwrap().has_uncached_in_flight());
+        }
+    }
+
+    #[test]
+    fn test_custom_rule_registration_new_cyclic() {
+        // The build function receives a weak handle to the registration that it builds, which refers to that same
+        // registration and its caches once it is built, but keeps neither of them alive.
+        let mut weak = None;
+        let registration = CustomRuleRegistration::new_cyclic(|this| {
+            weak = Some(this.clone());
+            TestDefinition::new("cyclic")
+        });
+        let weak = weak.unwrap();
+        let reference = weak.reference().unwrap();
+        assert_eq!(reference, registration.reference());
+        assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), registration.caches()));
+        drop(reference);
+        let (definition, caches) = (Arc::downgrade(registration.definition()), Arc::downgrade(registration.caches()));
+        drop(registration);
+        assert!(definition.upgrade().is_none());
+        assert!(caches.upgrade().is_none());
     }
 
     #[test]
@@ -4014,50 +4571,24 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_registration_drop() {
-        // Once the handle is dropped, the remaining calls trace their rules again on every derivative request, with
-        // results identical to the cached ones.
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let cached = program.linearize().unwrap().tangent().to_string();
-        drop(definition);
-        for expected_invocations in [2, 3] {
-            assert_eq!(program.linearize().unwrap().tangent().to_string(), cached);
-            assert_eq!(counters.counts(), (expected_invocations, 0, 0));
-        }
-
-        // A rule that requests its own specialization while it is being traced is rejected, with and without a live
-        // handle, and a rejected request leaves nothing in flight.
-        let definition = CustomRuleRegistration::new_cyclic(|this| {
-            let this = this.clone();
-            TestDefinition::new("reentrant").with_jvp(move |primals, tangents| {
-                let r#type = primals[0].r#type().into_owned();
-                let key = CustomRuleSpecializationKey {
-                    input_types: vec![r#type.clone()],
-                    output_types: vec![r#type],
-                    kept_outputs: None,
-                    non_differentiated_count: 0,
-                    tangent_activity: vec![true],
-                    levels: Vec::new(),
-                    discharged: false,
-                };
-                this.reference()?
-                    .jvp_specialization(key)
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                Ok((primals.to_vec(), tangents.to_vec()))
-            })
-        });
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let reentrant = "`composite` `reentrant` makes a recursive request for a specialization that is already being \
-                         produced on this thread";
-        assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
-        let retained = Arc::downgrade(&definition.definition());
-        drop(definition);
-        for _ in 0..2 {
-            assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
-            assert!(!retained.upgrade().unwrap().has_uncached_in_flight());
-        }
+    fn test_custom_rule_registration_reference() {
+        // References compare and hash by the identity of the definition, and they keep the definition alive but not the
+        // caches, which only the registration owns.
+        let registration = CustomRuleRegistration::new(TestDefinition::new("cube"));
+        let reference = registration.reference();
+        assert_eq!(reference, registration.reference());
+        assert_eq!(reference.clone(), reference);
+        assert_eq!(hash_of(&reference), hash_of(&registration.reference()));
+        assert_ne!(reference, CustomRuleRegistration::new(TestDefinition::new("cube")).reference());
+        assert!(Arc::ptr_eq(&reference.caches.upgrade().unwrap(), registration.caches()));
+        assert_eq!(
+            format!("{reference:?}"),
+            "CustomRuleReference(CustomRuleDefinition { name: \"cube\", has_jvp: false, derives_jvp_from_primal: \
+             false, has_vjp: false, .. })",
+        );
+        drop(registration);
+        assert!(reference.caches.upgrade().is_none());
+        assert_eq!(reference.definition().name(), "cube");
     }
 
     #[test]
@@ -4155,7 +4686,11 @@ mod tests {
         }));
         let x = Array::scalar(2f64).unwrap();
         let one = Array::scalar(1f64).unwrap();
-        assert_eq!(call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "transient failure");
+        assert!(matches!(
+            call_jvp(&definition, x.clone(), one.clone()),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "transient failure",
+        ));
         assert!(definition.caches().jvp_specializations.is_empty());
         for _ in 0..2 {
             assert_eq!(
@@ -4218,6 +4753,30 @@ mod tests {
     }
 
     #[test]
+    fn test_weak_custom_rule_registration_reference() {
+        // A weak handle yields a reference while the definition is alive (e.g., while a reference keeps it alive after
+        // the registration is dropped), and fails once the definition was dropped.
+        let mut weak = None;
+        let registration = CustomRuleRegistration::new_cyclic(|this| {
+            weak = Some(this.clone());
+            TestDefinition::new("cyclic")
+        });
+        let weak = weak.unwrap();
+        assert_eq!(format!("{weak:?}"), "WeakCustomRuleRegistration { .. }");
+        assert_eq!(weak.reference().unwrap(), registration.reference());
+        let reference = registration.reference();
+        drop(registration);
+        let upgraded = weak.reference().unwrap();
+        assert_eq!(upgraded, reference);
+        assert!(upgraded.caches.upgrade().is_none());
+        drop((reference, upgraded));
+        assert!(matches!(
+            weak.reference(),
+            Err(ProgramError::InvalidArgument { message }) if message == "the `composite` definition was dropped",
+        ));
+    }
+
+    #[test]
     fn test_custom_rule_reference_derived() {
         // Derivations of one key share a definition that the source registration owns, together with its caches, and
         // the definition keeps only its source definition alive (i.e., there is no strong cycle back to the caches).
@@ -4259,14 +4818,14 @@ mod tests {
         assert!(derived_definition.upgrade().is_none());
 
         // A source without a custom batching rule has nothing to derive from.
-        assert_eq!(
+        assert!(matches!(
             CustomRuleRegistration::new(MemberDefinition::new("sine").with_jvp_from_primal())
                 .reference()
-                .derived(key(CustomRuleDerivationKind::Jvp))
-                .unwrap_err()
-                .to_string(),
-            "`composite` `sine` has neither a custom batching rule nor sequential batching from which to derive rules",
-        );
+                .derived(key(CustomRuleDerivationKind::Jvp)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `sine` has neither a custom batching rule nor sequential batching from \
+                               which to derive rules",
+        ));
     }
 
     #[test]
@@ -4297,5 +4856,652 @@ mod tests {
         let source = registration.reference();
         drop(registration);
         assert_eq!(source.derived(key(2)).unwrap(), derived[1]);
+    }
+
+    #[test]
+    fn test_unavailable_custom_rules_from_source() {
+        // Unavailable rules keep the identity and the description of their source.
+        let counters = Arc::new(RuleCounters::default());
+        let registration = CustomRuleRegistration::new(
+            member_cube_definition(&counters)
+                .with_batched_output_axes(vec![BatchAxis::replicated()])
+                .with_sequential_batching(),
+        );
+        let source = registration.reference();
+        let unavailable = UnavailableCustomRules::from_source(&source);
+        assert_eq!(unavailable.id, source.id());
+        assert_eq!(unavailable.name, "cube");
+        assert!(unavailable.has_jvp);
+        assert!(!unavailable.derives_jvp_from_primal);
+        assert!(unavailable.has_vjp);
+        assert_eq!(unavailable.batched_output_axes, Some(vec![BatchAxis::replicated()]));
+        assert!(!unavailable.has_batching_rule);
+        assert!(unavailable.has_sequential_batching);
+
+        let registration = CustomRuleRegistration::new(
+            MemberDefinition::new("sine")
+                .with_jvp_from_primal()
+                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+        );
+        let source = registration.reference();
+        let unavailable = UnavailableCustomRules::from_source(&source);
+        assert_eq!(unavailable.id, source.id());
+        assert_eq!(unavailable.name, "sine");
+        assert!(!unavailable.has_jvp);
+        assert!(unavailable.derives_jvp_from_primal);
+        assert!(!unavailable.has_vjp);
+        assert_eq!(unavailable.batched_output_axes, None);
+        assert!(unavailable.has_batching_rule);
+        assert!(!unavailable.has_sequential_batching);
+        assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_lifted_custom_rules() {
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let lifted = LiftedCustomRules::Member(definition.reference());
+        let source = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>| {
+            <LiftedCustomRules<_, _> as CustomRuleSource<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::name(rules)
+                .to_owned()
+        };
+        assert_eq!(source(&lifted), "cube");
+        let key = |input_type: ArrayIrType, levels| CustomRuleSpecializationKey {
+            input_types: vec![input_type.clone()],
+            output_types: vec![input_type],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels,
+            discharged: false,
+        };
+        let specialize = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>, key| {
+            CustomRuleSpecializer::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::jvp_specialization(rules, key)
+                .map(|_| ())
+        };
+
+        // Types without a member representation are rejected at the first derivative request.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
+        assert!(matches!(
+            specialize(&lifted, key(reference_type, Vec::new())),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` cannot be differentiated with respect to type `ref<f64[]>`, which \
+                               the family in which its rules were registered cannot represent",
+        ));
+
+        // So are first-class dimension batch extents, which array IR batching produces.
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let level = CustomRuleBatchingLevel {
+            level: BatchingLevel::new(
+                BatchingLevelExtent::Dynamic(DimensionType::from(items).into()),
+                None,
+                ShardingDimension::Replicated,
+            ),
+            boundary_input_count: 1,
+            input_axes: vec![BatchAxis::new(0)],
+            output_axes: vec![BatchAxis::new(0)],
+        };
+        assert!(matches!(
+            specialize(&lifted, key(ArrayType::scalar(DataType::F64).into(), vec![level])),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` cannot differentiate a batched call whose batch extent has type \
+                               `dimension<items ∈ [1, 9)>`, which the family in which its rules were registered \
+                               cannot represent; differentiate the call before batching it instead",
+        ));
+
+        // Unavailable rules keep the identity and description of their definition but reject every derivative request.
+        let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
+            UnavailableCustomRules::from_source(&definition.reference()),
+        );
+        assert_eq!(unavailable, lifted);
+        assert_eq!(source(&unavailable), "cube");
+        assert!(matches!(
+            specialize(&unavailable, key(ArrayType::scalar(DataType::F64).into(), Vec::new())),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `cube` was converted from a family whose values its current family \
+                               cannot represent, so its derivative rules are unavailable",
+        ));
+        assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_lifted_custom_rules_derived() {
+        // A lifted source derives in the family that owns its definition, and unavailable rules stay unavailable.
+        let registration = CustomRuleRegistration::new(
+            MemberDefinition::new("sine")
+                .with_jvp_from_primal()
+                .with_batching_support()
+                .with_batching_rule(|_, _, inputs, input_axes| Ok((inputs.to_vec(), input_axes.to_vec()))),
+        );
+        let key = CustomRuleDerivationKey {
+            kind: CustomRuleDerivationKind::Jvp,
+            input_count: 1,
+            active_input_indices: vec![0],
+            output_tangent_mask: vec![true],
+        };
+        let derive = |rules: &LiftedCustomRules<Array, ArrayOperation<Array>>| {
+            <LiftedCustomRules<_, _> as CustomRuleSpecializer<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::derived(
+                rules,
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let lifted = LiftedCustomRules::Member(registration.reference());
+        assert_eq!(derive(&lifted), LiftedCustomRules::Member(registration.reference().derived(key.clone()).unwrap()));
+        let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
+            UnavailableCustomRules::from_source(&registration.reference()),
+        );
+        assert!(matches!(derive(&unavailable), LiftedCustomRules::Unavailable(_)));
+        assert_eq!(derive(&unavailable), unavailable);
+    }
+
+    #[test]
+    fn test_lifted_custom_rules_converted_specialization_cache() {
+        // The converted program of each specialization is cached with the member definition's specializations, so
+        // repeated requests share it instead of converting the member program again.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
+        let lifted = LiftedCustomRules::Member(definition.reference());
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let key = CustomRuleSpecializationKey {
+            input_types: vec![scalar_type.clone()],
+            output_types: vec![scalar_type],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels: Vec::new(),
+            discharged: false,
+        };
+        let specialize = || {
+            CustomRuleSpecializer::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::jvp_specialization(
+                &lifted,
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let first = specialize();
+        let second = specialize();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_batching_rule_specialization() {
+        // Structural mode: with replicated primals, the source rule applied to them is replicated as well, so the JVP
+        // of its program is batched structurally over the mapped tangents (e.g., in a forward-mode Jacobian), which
+        // gives `ẋy + xẏ` per item.
+        let registration = product_registration(true, false);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
+        let scalar = |value: f64| Array::scalar(value).unwrap();
+        let vector = |values: Vec<f64>| Array::vector(values).unwrap();
+        let specialization = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0, 1]),
+            &batching_rule_key(
+                vec![scalar_type.clone(), scalar_type.clone(), vector_type.clone(), vector_type],
+                vec![scalar_type; 4],
+                vec![replicated, replicated, mapped, mapped],
+            ),
+        )
+        .unwrap();
+        assert_eq!(specialization.output_axes, vec![replicated, mapped]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[3], %3:f64[3] .
+                let %4:f64[] = mul %0 %1
+                    %5:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                    %6:f64[3] = mul %5 %2
+                    %7:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %0
+                    %8:f64[3] = mul %7 %3
+                    %9:f64[3] = add %6 %8
+                in (%4, %9)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            specialization.program.interpret(vec![
+                scalar(2.0),
+                scalar(3.0),
+                vector(vec![1.0, 2.0, 3.0]),
+                vector(vec![1.0, 0.0, 1.0]),
+            ]),
+            Ok(vec![scalar(6.0), vector(vec![5.0, 6.0, 11.0])]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_batching_rule_specialization_rule_mode() {
+        // Rule mode without alignment: the tangent of the mapped `x` follows its primal, so the JVP of the source rule
+        // applied at the primal axes computes both the primal outputs and their tangents `ẋy`.
+        let registration = product_registration(true, false);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
+        let specialization = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0]),
+            &batching_rule_key(
+                vec![vector_type.clone(), scalar_type.clone(), vector_type],
+                vec![scalar_type; 3],
+                vec![mapped, replicated, mapped],
+            ),
+        )
+        .unwrap();
+        assert_eq!(specialization.output_axes, vec![mapped, mapped]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3] .
+                let %3:f64[3] = mul %0 %1
+                    %4:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                    %5:f64[3] = mul %4 %2
+                in (%3, %5)
+            "}
+            .trim_end(),
+        );
+        let vector = |values: Vec<f64>| Array::vector(values).unwrap();
+        assert_eq!(
+            specialization.program.interpret(vec![
+                vector(vec![1.0, 2.0, 3.0]),
+                Array::scalar(3.0).unwrap(),
+                vector(vec![1.0, 1.0, 1.0]),
+            ]),
+            Ok(vec![vector(vec![3.0, 6.0, 9.0]), vector(vec![3.0, 3.0, 3.0])]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_batching_rule_specialization_alignment() {
+        // A tangent mapped along another axis than its primal is moved to the primal's axis before the JVP of the
+        // source rule is applied, so item `i` of the tangent `ẋy` is column `i` of `ẋ` scaled by `y`.
+        let registration = product_registration(true, false);
+        let item_type = ArrayType::new_static(DataType::F64, [2]);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let specialization = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0]),
+            &batching_rule_key(
+                vec![
+                    ArrayType::new_static(DataType::F64, [3, 2]),
+                    scalar_type.clone(),
+                    ArrayType::new_static(DataType::F64, [2, 3]),
+                ],
+                vec![item_type.clone(), scalar_type, item_type],
+                vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(1)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(specialization.output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3, 2], %1:f64[], %2:f64[2, 3] .
+                let %3:f64[3, 2] = transpose [permutation=[1, 0]] %2
+                    %4:f64[3, 2] = mul %0 %1
+                    %5:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[]] %1
+                    %6:f64[3, 2] = mul %5 %3
+                in (%4, %6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            specialization.program.interpret(vec![
+                Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+                Array::scalar(2.0).unwrap(),
+                Array::matrix(2, 3, vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0]).unwrap(),
+            ]),
+            Ok(vec![
+                Array::matrix(3, 2, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]).unwrap(),
+                Array::matrix(3, 2, vec![2.0, 0.0, 0.0, 2.0, 2.0, 0.0]).unwrap(),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_batching_rule_specialization_separate_primal() {
+        // A replicated `y` whose tangent is mapped is broadcast for the tangents `xẏ`, so the primal outputs come from
+        // a separate application of the source rule at the primal axes. A pushforward computes only the tangents, so
+        // it needs no separate application.
+        let registration = product_registration(true, false);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
+        let key = batching_rule_key(
+            vec![vector_type.clone(), scalar_type.clone(), vector_type],
+            vec![scalar_type; 3],
+            vec![mapped, replicated, mapped],
+        );
+        let vector = |values: Vec<f64>| Array::vector(values).unwrap();
+        let inputs = vec![vector(vec![1.0, 2.0, 3.0]), Array::scalar(3.0).unwrap(), vector(vec![1.0, 0.0, 2.0])];
+        let jvp = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Jvp, vec![1]),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(jvp.output_axes, vec![mapped, mapped]);
+        assert_eq!(
+            jvp.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3] .
+                let %3:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                    %4:f64[3] = mul %0 %1
+                    %5:f64[3] = mul %0 %2
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            jvp.program.interpret(inputs.clone()),
+            Ok(vec![vector(vec![3.0, 6.0, 9.0]), vector(vec![1.0, 0.0, 6.0])])
+        );
+        let pushforward = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Pushforward, vec![1]),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(pushforward.output_axes, vec![mapped]);
+        assert_eq!(
+            pushforward.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3] .
+                let %3:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                    %4:f64[3] = mul %0 %2
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(pushforward.program.interpret(inputs), Ok(vec![vector(vec![1.0, 0.0, 6.0])]));
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_batching_rule_specialization_without_batching_support() {
+        // A derivation batches the source rule's derivative with the source's batcher, which it cannot do without it.
+        let registration = product_registration(false, false);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        assert!(matches!(
+            derived_batching_rule_specialization(
+                &registration,
+                product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0]),
+                &batching_rule_key(
+                    vec![vector_type.clone(), scalar_type.clone(), vector_type],
+                    vec![scalar_type; 3],
+                    vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
+                ),
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`composite` `jvp(product)` cannot batch a derivative because its source definition has \
+                               no batching support (refer to `CustomRuleDefinition::with_batching_support`)",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_batching_rule_specialization_output_tangent_mismatch() {
+        // The derivative of the source rule must have live tangents for exactly the outputs whose tangents the derived
+        // calls declare.
+        let registration = product_registration(true, false);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        assert!(matches!(
+            derived_batching_rule_specialization(
+                &registration,
+                CustomRuleDerivationKey {
+                    output_tangent_mask: vec![false],
+                    ..product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0])
+                },
+                &batching_rule_key(
+                    vec![vector_type.clone(), scalar_type.clone(), vector_type],
+                    vec![scalar_type; 3],
+                    vec![BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0)],
+                ),
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`composite` `jvp(product)` batching rule program has live tangents for the outputs \
+                               [true], but the derivative of its primal has them for the outputs [false]",
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_derivation_axis_dependent_batching_rule_specialization() {
+        // An axis-dependent source rule is applied once, at the primal axes, and the tangent `xẏ` of the replicated `y`
+        // is the diagonal of the outer product of its mapped tangent with the rule's batch.
+        let registration = product_registration(true, true);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
+        let vector = |values: Vec<f64>| Array::vector(values).unwrap();
+        let primals = vec![vector(vec![1.0, 2.0, 3.0]), Array::scalar(3.0).unwrap()];
+        let specialization = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Jvp, vec![1]),
+            &batching_rule_key(
+                vec![vector_type.clone(), scalar_type.clone(), vector_type.clone()],
+                vec![scalar_type.clone(); 3],
+                vec![mapped, replicated, mapped],
+            ),
+        )
+        .unwrap();
+        assert_eq!(specialization.output_axes, vec![mapped, mapped]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3] .
+                let %3:f64[3] = mul %0 %1
+                    %4:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                    %5:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %2
+                    %6:f64[3, 3] = mul %4 %5
+                    %7:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                    %8:f64[3] = gather [
+                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                        slice_sizes=[1, 1],
+                    ] %6 %7
+                in (%3, %8)
+            "}
+            .trim_end(),
+        );
+        let mut inputs = primals.clone();
+        inputs.push(vector(vec![1.0, 0.0, 2.0]));
+        assert_eq!(
+            specialization.program.interpret(inputs),
+            Ok(vec![vector(vec![3.0, 6.0, 9.0]), vector(vec![1.0, 0.0, 6.0])]),
+        );
+
+        // With the tangent of the mapped `x` active as well, the following contribution `ẋy` is added to the
+        // tangent-only contribution `xẏ`.
+        let specialization = derived_batching_rule_specialization(
+            &registration,
+            product_derivation_key(CustomRuleDerivationKind::Jvp, vec![0, 1]),
+            &batching_rule_key(
+                vec![vector_type.clone(), scalar_type.clone(), vector_type.clone(), vector_type],
+                vec![scalar_type; 4],
+                vec![mapped, replicated, mapped, mapped],
+            ),
+        )
+        .unwrap();
+        assert_eq!(specialization.output_axes, vec![mapped, mapped]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[3] .
+                let %4:f64[3] = mul %0 %1
+                    %5:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                    %6:f64[3] = mul %5 %2
+                    %7:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                    %8:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %3
+                    %9:f64[3, 3] = mul %7 %8
+                    %10:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                    %11:f64[3] = gather [
+                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                        slice_sizes=[1, 1],
+                    ] %9 %10
+                    %12:f64[3] = add %6 %11
+                in (%4, %12)
+            "}
+            .trim_end(),
+        );
+        let mut inputs = primals;
+        inputs.extend([vector(vec![1.0, 1.0, 1.0]), vector(vec![1.0, 0.0, 2.0])]);
+        assert_eq!(
+            specialization.program.interpret(inputs),
+            Ok(vec![vector(vec![3.0, 6.0, 9.0]), vector(vec![4.0, 3.0, 9.0])]),
+        );
+    }
+
+    #[test]
+    fn test_custom_rule_definition_batched_specialization_dynamic_extent() {
+        // A first-class batch extent reaches batched specializations as a leading boundary input, so the traced rule is
+        // batched at a level that records only the extent's type.
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let definition = CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("cube")
+            .with_jvp({
+                let invocations = invocations.clone();
+                move |primals, tangents| {
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    let multiply = |left: &CustomRuleTracer<_, _>, right: &CustomRuleTracer<_, _>| {
+                        let operation = ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new()));
+                        Ok::<_, ProgramError>(
+                            left.context().bind(operation, Vec::new(), &[left.clone(), right.clone()])?.remove(0),
+                        )
+                    };
+                    let square = multiply(&primals[0], &primals[0])?;
+                    Ok((vec![multiply(&square, &primals[0])?], vec![multiply(&square, &tangents[0])?]))
+                }
+            })
+            .with_batching_support();
+        let item_type: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let level = CustomRuleBatchingLevel {
+            level: BatchingLevel::new(
+                BatchingLevelExtent::Dynamic(DimensionType::from(items).into()),
+                None,
+                ShardingDimension::Replicated,
+            ),
+            boundary_input_count: 1,
+            input_axes: vec![BatchAxis::new(0)],
+            output_axes: vec![BatchAxis::new(0)],
+        };
+        let key = CustomRuleSpecializationKey {
+            input_types: vec![item_type.clone()],
+            output_types: vec![item_type],
+            kept_outputs: None,
+            non_differentiated_count: 0,
+            tangent_activity: vec![true],
+            levels: vec![level],
+            discharged: false,
+        };
+        let specialization = CustomRuleRegistration::new(definition).reference().jvp_specialization(key).unwrap();
+        assert_eq!(specialization.output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            specialization.program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:f32[items, 3] .
+                let %3:f32[items, 3] = mul %1 %1
+                    %4:f32[items, 3] = mul %3 %1
+                    %5:f32[items, 3] = mul %3 %2
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_conform_rule_output_types() {
+        // A rule program whose outputs have the expected types is returned unchanged. Only its leading outputs (e.g.,
+        // the primal outputs of a forward rule, which its residuals follow) or the selected ones are compared.
+        let (f64_type, f32_type) = (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let inputs = vec![builder.add_input(f64_type.clone()), builder.add_input(f32_type.clone())];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        let rendering = program.to_string();
+        let conform = |expected: &[ArrayType], selected: Option<&[usize]>| {
+            conform_rule_output_types("pair", "forward", program.clone(), expected, selected)
+                .map(|program| program.to_string())
+        };
+        assert_eq!(conform(&[f64_type.clone(), f32_type.clone()], None), Ok(rendering.clone()));
+        assert_eq!(conform(std::slice::from_ref(&f64_type), None), Ok(rendering.clone()));
+        assert_eq!(conform(std::slice::from_ref(&f32_type), Some(&[1])), Ok(rendering));
+        assert!(matches!(
+            conform(std::slice::from_ref(&f32_type), None),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`composite` `pair` forward rule output type signature mismatch: expected [f32[]] but \
+                               got [f64[]]",
+        ));
+    }
+
+    #[test]
+    fn test_conform_rule_output_types_different_type_identities() {
+        // Outputs that render like the expected types but do not share their identities are rejected with a diagnostic
+        // that names the identities, which the renderings alone would not show.
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let vector_type =
+            |variable: &DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
+        let (first, second) = (DimensionVariable::new("n", bounds), DimensionVariable::new("n", bounds));
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let inputs = vec![builder.add_input(vector_type(&first)), builder.add_input(vector_type(&second))];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(inputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        assert!(matches!(
+            conform_rule_output_types("pair", "JVP", program, &[vector_type(&first), vector_type(&first)], None),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`composite` `pair` JVP rule output type signature mismatch: expected [f32[n], f32[n]] \
+                               but got [f32[n], f32[n]] with different type identities",
+        ));
+    }
+
+    #[test]
+    fn test_derive_bijective_identity_renaming() {
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let (a, b, c) = (
+            DimensionVariable::new("a", bounds),
+            DimensionVariable::new("b", bounds),
+            DimensionVariable::new("c", bounds),
+        );
+        let vector_type =
+            |variable: &DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
+
+        // Equal signatures are related by the identity renaming.
+        let renaming = derive_bijective_identity_renaming(&[vector_type(&a)], &[vector_type(&a)]).unwrap();
+        assert!(renaming.is_identity());
+
+        // A bijective renaming maps each source identity onto its target identity.
+        let renaming = derive_bijective_identity_renaming(
+            &[vector_type(&a), vector_type(&b)],
+            &[vector_type(&c), vector_type(&b)],
+        )
+        .unwrap();
+        assert!(!renaming.is_identity());
+        assert_eq!(vector_type(&a).rename_identities(&renaming), Ok(vector_type(&c)));
+        assert_eq!(vector_type(&b).rename_identities(&renaming), Ok(vector_type(&b)));
+
+        // Renamings that merge or split identities, and signatures that differ beyond their identities, have none.
+        assert!(
+            derive_bijective_identity_renaming(
+                &[vector_type(&a), vector_type(&b)],
+                &[vector_type(&c), vector_type(&c)]
+            )
+            .is_none()
+        );
+        assert!(
+            derive_bijective_identity_renaming(
+                &[vector_type(&a), vector_type(&a)],
+                &[vector_type(&b), vector_type(&c)]
+            )
+            .is_none()
+        );
+        assert!(derive_bijective_identity_renaming(&[vector_type(&a)], &[vector_type(&a), vector_type(&a)]).is_none());
+        assert!(
+            derive_bijective_identity_renaming(
+                &[vector_type(&a)],
+                &[ArrayType::new(DataType::F64, Shape::new(vec![a.clone().into()]))]
+            )
+            .is_none()
+        );
     }
 }
