@@ -14,8 +14,8 @@
 //!     [JAX](https://docs.jax.dev/en/latest/index.html) and [Optax](https://optax.readthedocs.io/en/latest/) functions.
 //!     Unselected classes have zero probability, contribute nothing to a loss, and receive zero derivatives.
 //!   - **Targets Supplied As Logits:** [`softmax_cross_entropy_with_target_logits`] creates a
-//!     [`DifferentiableSoftmaxCrossEntropyWithTargetLogits`] function that scores predictions against a fixed target
-//!     distribution supplied as logits rather than rounded probabilities.
+//!     [`SoftmaxCrossEntropyWithTargetLogits`] function that scores predictions against a fixed target distribution
+//!     supplied as logits rather than rounded probabilities.
 //!
 //! Inputs have real floating-point elements and static shapes, with at least one class along every class axis. Narrow
 //! floating-point formats compute in `f32` while `f64` keeps its precision, and outputs retain the input element type.
@@ -651,27 +651,14 @@ fn one_hot_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcas
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Boxed primal function whose leading input contains the fixed target logits.
-type SoftTargetPrimal<D> =
-    Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>;
-
-/// Boxed forward-mode rule with an unused placeholder tangent for the fixed target logits.
-type SoftTargetJvp<D> = Box<
-    dyn Fn(
-            (DomainTracer<D>, DomainTracer<D>),
-            (DomainTracer<D>, DomainTracer<D>),
-        ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
-        + Send
-        + Sync,
->;
-
 /// Cross-entropy function created by [`softmax_cross_entropy_with_target_logits`].
 ///
 /// Target logits parameterize a fixed distribution and are not differentiated. Prediction derivatives use the logits'
 /// difference before rounding probabilities, preserving small gradients when the two distributions nearly match. A
 /// retained custom JVP supplies both differentiation modes and remains differentiable at higher orders. Create the
 /// function once and reuse it to share cached rule specializations across calls.
-pub struct DifferentiableSoftmaxCrossEntropyWithTargetLogits<D: Domain<Type = ArrayType>>
+#[allow(clippy::type_complexity)]
+pub struct SoftmaxCrossEntropyWithTargetLogits<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
@@ -679,12 +666,21 @@ where
     function: CustomFunction<
         (DomainTracer<D>, DomainTracer<D>),
         DomainTracer<D>,
-        SoftTargetPrimal<D>,
-        WithJvp<SoftTargetJvp<D>>,
+        Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>,
+        WithJvp<
+            Box<
+                dyn Fn(
+                        (DomainTracer<D>, DomainTracer<D>),
+                        (DomainTracer<D>, DomainTracer<D>),
+                    ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
+                    + Send
+                    + Sync,
+            >,
+        >,
     >,
 }
 
-impl<D: Domain<Type = ArrayType>> DifferentiableSoftmaxCrossEntropyWithTargetLogits<D>
+impl<D: Domain<Type = ArrayType>> SoftmaxCrossEntropyWithTargetLogits<D>
 where
     D::Constant: 'static,
     D::Operation: 'static,
@@ -708,8 +704,16 @@ where
         <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
         CustomRuleRegistration<C::Constant, C::Operation>: Send,
-        WithJvp<SoftTargetJvp<D>>:
-            CustomFunctionJvp<C::Constant, C::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
+        WithJvp<
+            Box<
+                dyn Fn(
+                        (DomainTracer<D>, DomainTracer<D>),
+                        (DomainTracer<D>, DomainTracer<D>),
+                    ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
+                    + Send
+                    + Sync,
+            >,
+        >: CustomFunctionJvp<C::Constant, C::Operation, (DomainTracer<D>, DomainTracer<D>), DomainTracer<D>>,
     {
         // Placement is validated before the alignment below, which would otherwise report a `parallel_vary` error for
         // a reduced input instead of this function's own rejection. The primal validates the remaining contract.
@@ -743,8 +747,8 @@ where
 /// This implements the cancellation-resistant derivative in
 /// [A Fix for Softmax and Cross-Entropy](https://jonbarron.info/softmaxfix/) as a differentiable JVP, so prediction
 /// Hessians remain available. The returned function retains its rules and should be reused across calls; refer to
-/// [`DifferentiableSoftmaxCrossEntropyWithTargetLogits`]. To embed its staged calls and retained rules in a composite
-/// value universe, use [`Program::into_unprojected`](crate::programs::Program::into_unprojected).
+/// [`SoftmaxCrossEntropyWithTargetLogits`]. To embed its staged calls and retained rules in a composite value universe,
+/// use [`Program::into_unprojected`](crate::programs::Program::into_unprojected).
 ///
 /// # Example
 ///
@@ -759,9 +763,7 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub fn softmax_cross_entropy_with_target_logits<D>(
-    axes: impl Into<Axes>,
-) -> DifferentiableSoftmaxCrossEntropyWithTargetLogits<D>
+pub fn softmax_cross_entropy_with_target_logits<D>(axes: impl Into<Axes>) -> SoftmaxCrossEntropyWithTargetLogits<D>
 where
     D: Domain<Type = ArrayType>,
     D::Constant: 'static,
@@ -788,21 +790,33 @@ where
 {
     let axes = axes.into();
     let primal_axes = axes.clone();
-    let primal: SoftTargetPrimal<D> = Box::new(move |(teacher, student)| {
-        let inputs = prepare_soft_target_inputs(teacher, student, &primal_axes)?;
-        soft_target_loss(&inputs.teacher.softmax(inputs.axis)?, &inputs.student.log_softmax(inputs.axis)?, inputs.axis)?
+    let primal: Box<dyn Fn((DomainTracer<D>, DomainTracer<D>)) -> Result<DomainTracer<D>, ProgramError> + Send + Sync> =
+        Box::new(move |(target_logits, logits)| {
+            let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &primal_axes)?;
+            soft_target_loss(
+                &inputs.target_logits.softmax(inputs.axis)?,
+                &inputs.logits.log_softmax(inputs.axis)?,
+                inputs.axis,
+            )?
             .convert_element_type(inputs.output_data_type)
-    });
-    let jvp: SoftTargetJvp<D> = Box::new(move |(teacher, student), (_, tangent)| {
-        let inputs = prepare_soft_target_inputs(teacher, student, &axes)?;
-        let SoftTargetInputs { teacher, student, class_axes, axis, output_data_type } = inputs;
-        let log_probabilities = student.log_softmax(axis)?;
-        let student_probabilities = log_probabilities.exp()?;
-        let teacher_probabilities = teacher.softmax(axis)?;
-        let loss = soft_target_loss(&teacher_probabilities, &log_probabilities, axis)?
+        });
+    let jvp: Box<
+        dyn Fn(
+                (DomainTracer<D>, DomainTracer<D>),
+                (DomainTracer<D>, DomainTracer<D>),
+            ) -> Result<(DomainTracer<D>, DomainTracer<D>), ProgramError>
+            + Send
+            + Sync,
+    > = Box::new(move |(target_logits, logits), (_, tangent)| {
+        let inputs = CrossEntropyInputsWithTargetLogits::new(logits, target_logits, &axes)?;
+        let CrossEntropyInputsWithTargetLogits { target_logits, logits, class_axes, axis, output_data_type } = inputs;
+        let log_probabilities = logits.log_softmax(axis)?;
+        let probabilities = log_probabilities.exp()?;
+        let target_probabilities = target_logits.softmax(axis)?;
+        let loss = soft_target_loss(&target_probabilities, &log_probabilities, axis)?
             .convert_element_type(output_data_type)?;
-        let gradient = soft_target_gradient(&teacher, &student, &teacher_probabilities, &student_probabilities, axis)?;
-        let tangent = tangent.convert_element_type(student.r#type().data_type())?;
+        let gradient = soft_target_gradient(&target_logits, &logits, &target_probabilities, &probabilities, axis)?;
+        let tangent = tangent.convert_element_type(logits.r#type().data_type())?;
         let mut flattened = FlattenedClassInputs::new(vec![tangent], &class_axes)?;
         let output_tangent = gradient
             .mul(&flattened.inputs.pop().unwrap())?
@@ -810,7 +824,7 @@ where
             .convert_element_type(loss.r#type().tangent()?.data_type())?;
         Ok((loss, output_tangent))
     });
-    DifferentiableSoftmaxCrossEntropyWithTargetLogits {
+    SoftmaxCrossEntropyWithTargetLogits {
         function: custom_function(primal)
             .with_jvp(jvp)
             .with_non_differentiated_count(1)
@@ -818,13 +832,14 @@ where
     }
 }
 
-/// Validated and widened inputs of a soft-target rule, with their class axes flattened into one.
-struct SoftTargetInputs<V> {
+/// Validated target and prediction logits in working precision, with flattened class axes and metadata for the loss
+/// and its JVP.
+struct CrossEntropyInputsWithTargetLogits<V> {
     /// Target logits in the working representation, with the class axes flattened.
-    teacher: V,
+    target_logits: V,
 
     /// Prediction logits in the working representation, with the class axes flattened.
-    student: V,
+    logits: V,
 
     /// Normalized class axes of the original inputs, in increasing order.
     class_axes: Vec<usize>,
@@ -836,30 +851,39 @@ struct SoftTargetInputs<V> {
     output_data_type: DataType,
 }
 
-/// Validates the two logits arrays and widens their working representation before computing probabilities.
-fn prepare_soft_target_inputs<V>(teacher: V, student: V, axes: &Axes) -> Result<SoftTargetInputs<V>, ProgramError>
-where
-    V: Value<Type = ArrayType> + ConvertElementType + Reshape + Transpose,
-{
-    let student_type = student.r#type();
-    let teacher_type = teacher.r#type();
-    if student_type.shape() != teacher_type.shape() || student_type.data_type() != teacher_type.data_type() {
-        return Err(TypeError::invalid(
-            "`softmax_cross_entropy_with_target_logits` requires logits and target logits with the same shape and element type",
-        )
-        .into());
+impl<V: Value<Type = ArrayType> + ConvertElementType + Reshape + Transpose> CrossEntropyInputsWithTargetLogits<V> {
+    /// Validates `logits` and `target_logits`, widens them to working precision, and flattens their class `axes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for incompatible logits, invalid class axes or placement, or a failed conversion,
+    /// transpose, or reshape.
+    fn new(logits: V, target_logits: V, axes: &Axes) -> Result<Self, ProgramError> {
+        let logits_type = logits.r#type();
+        let target_logits_type = target_logits.r#type();
+        if logits_type.shape() != target_logits_type.shape()
+            || logits_type.data_type() != target_logits_type.data_type()
+        {
+            return Err(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` requires logits and target logits with the same shape and element type",
+            )
+            .into());
+        }
+        let (class_axes, working_data_type) =
+            validate_normalization("softmax_cross_entropy_with_target_logits", &logits_type, axes.clone())?;
+        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &target_logits_type)?;
+        let output_data_type = logits_type.data_type();
+        let mut flattened = FlattenedClassInputs::new(
+            vec![
+                target_logits.convert_element_type(working_data_type)?,
+                logits.convert_element_type(working_data_type)?,
+            ],
+            &class_axes,
+        )?;
+        let logits = flattened.inputs.pop().unwrap();
+        let target_logits = flattened.inputs.pop().unwrap();
+        Ok(Self { target_logits, logits, class_axes, axis: flattened.axis, output_data_type })
     }
-    let (class_axes, working_data_type) =
-        validate_normalization("softmax_cross_entropy_with_target_logits", &student_type, axes.clone())?;
-    validate_normalization_placement("softmax_cross_entropy_with_target_logits", &teacher_type)?;
-    let output_data_type = student_type.data_type();
-    let mut flattened = FlattenedClassInputs::new(
-        vec![teacher.convert_element_type(working_data_type)?, student.convert_element_type(working_data_type)?],
-        &class_axes,
-    )?;
-    let student = flattened.inputs.pop().unwrap();
-    let teacher = flattened.inputs.pop().unwrap();
-    Ok(SoftTargetInputs { teacher, student, class_axes, axis: flattened.axis, output_data_type })
 }
 
 /// Computes the primal loss without multiplying zero target probabilities by masked log-probabilities.
