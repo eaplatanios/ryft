@@ -529,7 +529,7 @@ impl<
 /// the program graph the sole source of data dependencies.
 ///
 /// A bound member operation may carry [`Region`](crate::Region)s (e.g., a
-/// [`CompositeCallOperation`](crate::CompositeCallOperation) and its primal program). Those regions are programs of the
+/// [`CompositeOperation`](crate::CompositeOperation) and its primal program). Those regions are programs of the
 /// member family, so every value that they carry is of the member kind by construction, and `bind` lifts them into the
 /// heterogeneous family with [`Program::into_unprojected`] before binding the lifted operation. Higher-order operations
 /// whose regions mix member kinds are family-level operations rather than member operations, so they never reach this

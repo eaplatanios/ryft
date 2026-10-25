@@ -1,4 +1,4 @@
-//! The [`CompositeCallOperation`] that calls a primal program with custom derivative rules and the
+//! The [`CompositeOperation`] that calls a primal program with custom derivative rules and the
 //! [`CompositeTransposeOperation`] carrier that reverse mode stages for its reverse-mode rules. Both operations hold
 //! their rules either as attached rule regions or as retained rule sets (refer to [`CustomRuleSource`]).
 
@@ -41,10 +41,28 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
-/// Canonical operation name for [`CompositeCallOperation`].
+/// Canonical operation name for [`CompositeOperation`].
 pub const COMPOSITE_OPERATION_NAME: &str = "composite";
 
-/// Forward-mode (i.e., Jacobian-Vector Product or JVP) rule of a [`CompositeCallOperation`].
+/// Renders the [`composite`](COMPOSITE_OPERATION_NAME) operation name for diagnostics, followed by the name of the
+/// retained definition `name` unless it is the default name of [`Composite`](crate::Composite)s (i.e., the operation
+/// name itself), so that diagnostics never print the default name twice.
+pub(super) fn describe_composite(name: &str) -> String {
+    describe_composite_operation(COMPOSITE_OPERATION_NAME, name)
+}
+
+/// Renders the [`composite_transpose`](COMPOSITE_TRANSPOSE_OPERATION_NAME) operation name for diagnostics, followed
+/// by the name of the retained definition `name` unless it is the default name of [`Composite`](crate::Composite)s.
+pub(super) fn describe_composite_transpose(name: &str) -> String {
+    describe_composite_operation(COMPOSITE_TRANSPOSE_OPERATION_NAME, name)
+}
+
+/// Renders `operation` for diagnostics, followed by the definition name `name` unless it is the default one.
+fn describe_composite_operation(operation: &str, name: &str) -> String {
+    if name == COMPOSITE_OPERATION_NAME { format!("`{operation}`") } else { format!("`{operation}` `{name}`") }
+}
+
+/// Forward-mode (i.e., Jacobian-Vector Product or JVP) rule of a [`CompositeOperation`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CompositeJvpRule {
     /// No forward-mode rule. Forward mode is rejected, and reverse mode requires a reverse-mode rule.
@@ -60,7 +78,7 @@ pub enum CompositeJvpRule {
     Primal,
 }
 
-/// Derivative rules of a [`CompositeCallOperation`], in one of its two representations.
+/// Derivative rules of a [`CompositeOperation`], in one of its two representations.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CompositeRules<T, S> {
     /// Rule programs attached as rule regions that follow the primal region.
@@ -183,7 +201,7 @@ enum CompositeRules<T, S> {
 ///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
 /// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
-pub struct CompositeCallOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
+pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
     /// Number of leading inputs that parameterize the call without being differentiated, including the boundary inputs
     /// that the batching levels of a call with retained rules prepended to its inputs.
     non_differentiated_count: usize,
@@ -196,7 +214,7 @@ pub struct CompositeCallOperation<V: Typed + Parameter, O, S = CustomRuleReferen
 }
 
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
-    CompositeCallOperation<V, O, S>
+    CompositeOperation<V, O, S>
 {
     /// Creates a new call of the retained rules of `rules`, whose inputs are all differentiated.
     #[inline]
@@ -255,7 +273,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
-    /// [`CompositeCallOperation`] for the impact of this property on the rule interfaces. For a batched call with
+    /// [`CompositeOperation`] for the impact of this property on the rule interfaces. For a batched call with
     /// retained rules, this count includes the boundary inputs that its batching levels prepended to its inputs.
     ///
     /// # Errors
@@ -267,10 +285,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             let boundary_input_count = batching.boundary_input_count();
             if non_differentiated_count < boundary_input_count {
                 return Err(TypeError::invalid(format!(
-                    "batched `{COMPOSITE_OPERATION_NAME}` `{}` must have at least {boundary_input_count} \
+                    "batched {} must have at least {boundary_input_count} \
                      non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
                      its inputs, but got {non_differentiated_count}",
-                    rules.name(),
+                    describe_composite(rules.name()),
                 )));
             }
         }
@@ -284,12 +302,12 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     /// array IR program). A call with attached rules carries no source, so `rules_fn` is only invoked for retained
     /// rules. Refer to [`Self::into_attached_family`] for converting calls with attached rules into a family whose
     /// source type the caller chooses independently.
-    pub fn into_family<V2, O2, S2, F>(self, rules_fn: F) -> CompositeCallOperation<V2, O2, S2>
+    pub fn into_family<V2, O2, S2, F>(self, rules_fn: F) -> CompositeOperation<V2, O2, S2>
     where
         V2: Typed<Type: DifferentiableType + Eq + Hash + From<V::Type>> + Parameter,
         F: FnOnce(S) -> S2,
     {
-        CompositeCallOperation {
+        CompositeOperation {
             non_differentiated_count: self.non_differentiated_count,
             rules: match self.rules {
                 CompositeRules::Attached { jvp_rule, has_vjp_rule } => {
@@ -309,12 +327,12 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     /// attached rules are regions that follow their call independently of any source. Returns this call unchanged when
     /// its rules are retained, which [`Self::into_family`] converts instead. Family conversions use this function to
     /// normalize every call with attached rules into the family's native variant.
-    pub fn into_attached_family<V2, O2, S2>(self) -> Result<CompositeCallOperation<V2, O2, S2>, Self>
+    pub fn into_attached_family<V2, O2, S2>(self) -> Result<CompositeOperation<V2, O2, S2>, Self>
     where
         V2: Typed + Parameter,
     {
         match self.rules {
-            CompositeRules::Attached { jvp_rule, has_vjp_rule } => Ok(CompositeCallOperation {
+            CompositeRules::Attached { jvp_rule, has_vjp_rule } => Ok(CompositeOperation {
                 non_differentiated_count: self.non_differentiated_count,
                 rules: CompositeRules::Attached { jvp_rule, has_vjp_rule },
                 marker: PhantomData,
@@ -360,7 +378,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Validates the composite contract over the attached region interfaces (refer to the documentation of
-    /// [`CompositeCallOperation`] for that contract) and returns the primal interface.
+    /// [`CompositeOperation`] for that contract) and returns the primal interface.
     fn validated_interfaces<'i>(
         &self,
         region_interfaces: &'i [RegionInterface<V::Type>],
@@ -512,9 +530,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     .checked_sub(batching.boundary_input_count())
                     .ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
-                            "batched `{COMPOSITE_OPERATION_NAME}` `{}` has fewer non-differentiated inputs \
+                            "batched {} has fewer non-differentiated inputs \
                              than boundary inputs",
-                            rules.name(),
+                            describe_composite(rules.name()),
                         ))
                     })?,
                 tangent_activity: Vec::new(),
@@ -525,16 +543,16 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Clone for CompositeCallOperation<V, O, S> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Clone for CompositeOperation<V, O, S> {
     fn clone(&self) -> Self {
         Self { non_differentiated_count: self.non_differentiated_count, rules: self.rules.clone(), marker: PhantomData }
     }
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug for CompositeCallOperation<V, O, S> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug for CompositeOperation<V, O, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Retained rules are identified by the name of their definition, whose own rendering would include its rules.
-        let mut debug = formatter.debug_struct("CompositeCallOperation");
+        let mut debug = formatter.debug_struct("CompositeOperation");
         match &self.rules {
             CompositeRules::Attached { jvp_rule, has_vjp_rule } => debug
                 .field("non_differentiated_count", &self.non_differentiated_count)
@@ -550,17 +568,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug 
     }
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> PartialEq
-    for CompositeCallOperation<V, O, S>
-{
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> PartialEq for CompositeOperation<V, O, S> {
     fn eq(&self, other: &Self) -> bool {
         self.non_differentiated_count == other.non_differentiated_count && self.rules == other.rules
     }
 }
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Eq for CompositeCallOperation<V, O, S> {}
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Eq for CompositeOperation<V, O, S> {}
 
-impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Hash for CompositeCallOperation<V, O, S> {
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Hash for CompositeOperation<V, O, S> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.non_differentiated_count.hash(state);
         self.rules.hash(state);
@@ -568,7 +584,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Hash f
 }
 
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Display
-    for CompositeCallOperation<V, O, S>
+    for CompositeOperation<V, O, S>
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -577,7 +593,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 }
 
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Operation
-    for CompositeCallOperation<V, O, S>
+    for CompositeOperation<V, O, S>
 {
     type Type = V::Type;
 
@@ -690,9 +706,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     let boundary_input_count = batching.boundary_input_count();
                     if input_types.len() != boundary_input_count + batching.input_types.len() {
                         return Err(TypeError::invalid(format!(
-                            "batched `{COMPOSITE_OPERATION_NAME}` `{}` has {} inputs but its batching levels \
+                            "batched {} has {} inputs but its batching levels \
                              record {} boundary inputs and {} unbatched inputs",
-                            rules.name(),
+                            describe_composite(rules.name()),
                             input_types.len(),
                             boundary_input_count,
                             batching.input_types.len(),
@@ -791,13 +807,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 }
 
-impl<C, P, V, O, S> ReferenceDischargeableOperation<C, P> for CompositeCallOperation<V, O, S>
+impl<C, P, V, O, S> ReferenceDischargeableOperation<C, P> for CompositeOperation<V, O, S>
 where
-    C: Context<Operation: From<CompositeCallOperation<V, O, S>>>,
+    C: Context<Operation: From<CompositeOperation<V, O, S>>>,
     P: ReferenceDischargePolicy<C>,
     V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter,
     S: CustomRuleSource<V, O>,
-    CompositeCallOperation<V, O, S>: Operation<Type = C::Type>,
+    CompositeOperation<V, O, S>: Operation<Type = C::Type>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -830,7 +846,7 @@ where
 // Interpretation replays only the primal region, so it applies in every context, including contexts of families that
 // embed this call's family (e.g., kernel bodies).
 impl<C: Domain, V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
-    InterpretableOperation<C> for CompositeCallOperation<V, O, S>
+    InterpretableOperation<C> for CompositeOperation<V, O, S>
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -849,18 +865,15 @@ impl<C: Domain, V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S
 // The default partial-evaluation rule is the desired one here: it interprets the primal region when every input is
 // known and otherwise residualizes the complete call, so that its rules remain available to later differentiation.
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
-    PartiallyEvaluatableOperation<C> for CompositeCallOperation<C::Constant, C::Operation, S>
+    PartiallyEvaluatableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
 where
-    C::Operation: From<CompositeCallOperation<C::Constant, C::Operation, S>>,
+    C::Operation: From<CompositeOperation<C::Constant, C::Operation, S>>,
 {
 }
 
-impl<C, P, S> BatchableOperation<C, P> for CompositeCallOperation<C::Constant, C::Operation, S>
+impl<C, P, S> BatchableOperation<C, P> for CompositeOperation<C::Constant, C::Operation, S>
 where
-    C: Context<
-            Type: DifferentiableType + Eq + Hash,
-            Operation: From<CompositeCallOperation<C::Constant, C::Operation, S>>,
-        >,
+    C: Context<Type: DifferentiableType + Eq + Hash, Operation: From<CompositeOperation<C::Constant, C::Operation, S>>>,
     P: CotangentBatchingPolicy<C>,
     S: CustomRuleSpecializer<C::Constant, C::Operation>,
 {
@@ -1104,14 +1117,14 @@ where
     }
 }
 
-impl<C, S> DifferentiableOperation<C> for CompositeCallOperation<C::Constant, C::Operation, S>
+impl<C, S> DifferentiableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
 where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<
             Type: DifferentiableType + Eq + Hash,
             Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + From<CompositeCallOperation<C::Constant, C::Operation, S>>
+                           + From<CompositeOperation<C::Constant, C::Operation, S>>
                            + From<CompositeTransposeOperation<C::Constant, C::Operation, S>>,
         > + Zero<C::Value>,
     S: CustomRuleSpecializer<C::Constant, C::Operation>,
@@ -1422,7 +1435,7 @@ where
 // transpose evaluates `backward(p, r, ȳ) = x̄`. Therefore, only an invalid direct transpose of an un-linearized call
 // can reach this rejection path.
 impl_non_transposable_operation!(
-    <V, O, S> CompositeCallOperation<V, O, S>
+    <V, O, S> CompositeOperation<V, O, S>
     where V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, S: CustomRuleSource<V, O>
 );
 
@@ -1458,7 +1471,7 @@ enum CompositeTransposeRules<T, S> {
     },
 }
 
-/// Selected reverse-mode carrier of a [`CompositeCallOperation`] with reverse-mode rules, which its
+/// Selected reverse-mode carrier of a [`CompositeOperation`] with reverse-mode rules, which its
 /// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule stages in place of the call. It represents
 /// the linear map `ẋ ↦ ẏ` from the differentiated inputs' tangents to the output tangents, whose transpose `ȳ ↦ x̄` is
 /// the call's backward rule. This is the role of the `custom_lin` primitive of [JAX's custom
@@ -1533,7 +1546,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 {
     /// Creates a new unbatched [`CompositeTransposeOperation`] that applies the retained backward rule of the provided
     /// rules, exactly as the [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule of a
-    /// [`CompositeCallOperation`] with retained rules stages it.
+    /// [`CompositeOperation`] with retained rules stages it.
     ///
     /// # Parameters
     ///
@@ -1565,7 +1578,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Creates a new [`CompositeTransposeOperation`] whose backward rule is its attached `"backward"` rule region,
     /// exactly as the [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule of a
-    /// [`CompositeCallOperation`] with attached rules stages it, except that it has no seed extents. The region maps
+    /// [`CompositeOperation`] with attached rules stages it, except that it has no seed extents. The region maps
     /// the leading inputs followed by one cotangent per output to one cotangent per differentiated input. When the zero
     /// seeds of dead outputs need runtime quantities (e.g., dynamic extents) that no leading input names, the region
     /// can receive them as additional leading inputs.
@@ -1640,7 +1653,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Converts this carrier into the family `(V2, O2)` with the rule source that `rules_fn` derives from its current
-    /// source (refer to [`CompositeCallOperation::into_family`]).
+    /// source (refer to [`CompositeOperation::into_family`]).
     pub fn into_family<V2, O2, S2, F>(self, rules_fn: F) -> CompositeTransposeOperation<V2, O2, S2>
     where
         V2: Typed<Type: DifferentiableType + Eq + Hash + From<V::Type>> + Parameter,
@@ -1669,7 +1682,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Converts this carrier into the family `(V2, O2)` with any rule source type when its backward rule is attached,
     /// or returns it unchanged when its backward rule is retained (refer to
-    /// [`CompositeCallOperation::into_attached_family`]).
+    /// [`CompositeOperation::into_attached_family`]).
     pub fn into_attached_family<V2, O2, S2>(self) -> Result<CompositeTransposeOperation<V2, O2, S2>, Self>
     where
         V2: Typed<Type: From<V::Type>> + Parameter,
@@ -1694,9 +1707,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     fn description(&self) -> String {
         match &self.rules {
             CompositeTransposeRules::Attached => format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}`"),
-            CompositeTransposeRules::Retained { rules, .. } => {
-                format!("`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{}`", rules.name())
-            }
+            CompositeTransposeRules::Retained { rules, .. } => describe_composite_transpose(rules.name()),
         }
     }
 }
@@ -2053,8 +2064,8 @@ where
             }
             CompositeTransposeRules::Retained { invokes_rule_directly: true, rules, .. } => {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{}` source carriers are never batched",
-                    rules.name(),
+                    "{} source carriers are never batched",
+                    describe_composite_transpose(rules.name()),
                 ))
                 .into());
             }
@@ -2261,8 +2272,8 @@ where
         if invokes_rule_directly {
             let Some(backward) = rules.native_definition().and_then(|definition| definition.backward.as_ref()) else {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{}` has no backward rule",
-                    rules.name(),
+                    "{} has no backward rule",
+                    describe_composite_transpose(rules.name()),
                 ))
                 .into());
             };
@@ -2549,7 +2560,7 @@ fn differentiate_primal_region<C, P, D, S>(
     context: &DifferentiationContext<C, P>,
     driver: &D,
     inputs: &[DifferentiationDual<C::Value>],
-    call: Option<&CompositeCallOperation<C::Constant, C::Operation, S>>,
+    call: Option<&CompositeOperation<C::Constant, C::Operation, S>>,
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
     TracingContext<C::Constant, C::Operation>:
@@ -2557,7 +2568,7 @@ where
     C: Context<
             Type: DifferentiableType + Eq + Hash,
             Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + From<CompositeCallOperation<C::Constant, C::Operation, S>>,
+                           + From<CompositeOperation<C::Constant, C::Operation, S>>,
         > + Zero<C::Value>,
     P: DifferentiationPolicy<C>,
     D: DifferentiationDriver<C>,
@@ -2605,14 +2616,14 @@ where
     // derivative to batch, so it is inlined.
     let call = call.filter(|_| !input_indices.is_empty());
     let derived_call = |kind: CustomRuleDerivationKind| match call {
-        Some(CompositeCallOperation { rules: CompositeRules::Retained { rules, discharged, .. }, .. }) => {
+        Some(CompositeOperation { rules: CompositeRules::Retained { rules, discharged, .. }, .. }) => {
             let rules = rules.derived(CustomRuleDerivationKey {
                 kind,
                 input_count: inputs.len(),
                 active_input_indices: input_indices.clone(),
                 output_tangent_mask: output_activity.clone(),
             })?;
-            Ok::<_, DifferentiationError>(Some(CompositeCallOperation {
+            Ok::<_, DifferentiationError>(Some(CompositeOperation {
                 non_differentiated_count,
                 rules: CompositeRules::Retained { rules, batching: None, discharged: *discharged },
                 marker: PhantomData,
@@ -2694,7 +2705,7 @@ pub(super) fn missing_custom_jvp_rule_error(call: &str, has_vjp_rule: bool) -> D
 
 /// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose leading
 /// `non_differentiated_count` inputs `p` are not differentiated. This is the shared forward-mode rule of
-/// [`CompositeCallOperation`] and of other custom-rule operations that obtain their JVP program differently (e.g., by
+/// [`CompositeOperation`] and of other custom-rule operations that obtain their JVP program differently (e.g., by
 /// tracing a retained callback lazily). A fused [`DifferentiationContext`] replays the rule directly, while a
 /// partitioned one replays its known and tangent parts in their own contexts. Structural-zero output tangents are
 /// recovered from literal zeros and zero-producing instructions of the rule.
@@ -2901,13 +2912,13 @@ mod tests {
     type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
     /// Composite call in the array operation family.
-    type ArrayComposite = CompositeCallOperation<Array, ArrayOperation<Array>>;
+    type ArrayComposite = CompositeOperation<Array, ArrayOperation<Array>>;
 
     /// Reverse-mode carrier of a composite call in the array operation family.
     type ArrayCompositeTranspose = CompositeTransposeOperation<Array, ArrayOperation<Array>>;
 
     /// Composite call in the array IR operation family.
-    type ArrayIrComposite = CompositeCallOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    type ArrayIrComposite = CompositeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Reverse-mode carrier of a composite call in the array IR operation family.
     type ArrayIrCompositeTranspose = CompositeTransposeOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -3534,7 +3545,7 @@ mod tests {
         let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let input_count = inputs.len();
         let operation = ArrayIrOperation::Composite(
-            CompositeCallOperation::new(definition.reference())
+            CompositeOperation::new(definition.reference())
                 .with_non_differentiated_count(non_differentiated_count)
                 .unwrap(),
         );
@@ -3585,7 +3596,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let primal = builder.import_program(member_cube_program(&r#type));
         let input = builder.add_input(r#type);
-        let operation = ArrayOperation::Composite(CompositeCallOperation::new(definition.reference()));
+        let operation = ArrayOperation::Composite(CompositeOperation::new(definition.reference()));
         let output = builder.add_instruction(operation, vec![primal], vec![input], None).unwrap()[0];
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -3599,7 +3610,7 @@ mod tests {
         let r#type = x.r#type().into_owned();
         let (outputs, pullback) = TestContext::new().vjp(
             |x, ()| {
-                let operation = CompositeCallOperation::new(definition.reference());
+                let operation = CompositeOperation::new(definition.reference());
                 x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
             },
             x,
@@ -4052,7 +4063,7 @@ mod tests {
         assert_eq!(format!("{operation}"), "composite");
         assert_eq!(
             format!("{operation:?}"),
-            "CompositeCallOperation { non_differentiated_count: 0, jvp_rule: Explicit, has_vjp_rule: false }",
+            "CompositeOperation { non_differentiated_count: 0, jvp_rule: Explicit, has_vjp_rule: false }",
         );
 
         // The primal program is a computation region and the user JVP program is a dormant rule region, in that order.
@@ -4080,7 +4091,7 @@ mod tests {
         assert_eq!(format!("{operation}"), "composite");
         assert_eq!(
             format!("{operation:?}"),
-            "CompositeCallOperation { non_differentiated_count: 0, jvp_rule: Absent, has_vjp_rule: true }",
+            "CompositeOperation { non_differentiated_count: 0, jvp_rule: Absent, has_vjp_rule: true }",
         );
 
         // The primal program is a computation region followed by the dormant forward and backward rule regions.
@@ -4168,16 +4179,15 @@ mod tests {
     fn test_composite_retained_rules() {
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
-        let operation = CompositeCallOperation::new(definition.reference());
-        assert_eq!(operation, CompositeCallOperation::new(definition.reference()));
-        assert_eq!(hash_of(&operation), hash_of(&CompositeCallOperation::new(definition.reference())));
+        let operation = CompositeOperation::new(definition.reference());
+        assert_eq!(operation, CompositeOperation::new(definition.reference()));
+        assert_eq!(hash_of(&operation), hash_of(&CompositeOperation::new(definition.reference())));
         assert_ne!(operation, operation.clone().with_non_differentiated_count(1).unwrap());
 
         // Identity is the definition allocation, so an equally named definition built from the same closure types is a
         // different rule set, even though it renders identically.
-        let twin = CompositeCallOperation::new(
-            CustomRuleRegistration::new(cube_definition(&counters, true, true)).reference(),
-        );
+        let twin =
+            CompositeOperation::new(CustomRuleRegistration::new(cube_definition(&counters, true, true)).reference());
         assert_ne!(operation, twin);
         assert_eq!(operation.to_string(), twin.to_string());
         assert_eq!(operation.to_string(), "composite [name=\"cube\"]");
@@ -4188,7 +4198,7 @@ mod tests {
         assert_eq!(operation.rules().unwrap().name(), "cube");
         assert_eq!(
             format!("{:?}", operation),
-            "CompositeCallOperation { name: \"cube\", non_differentiated_count: 0, batching: None, discharged: \
+            "CompositeOperation { name: \"cube\", non_differentiated_count: 0, batching: None, discharged: \
              false }",
         );
     }
@@ -4700,7 +4710,7 @@ mod tests {
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
         let scalar_type = ArrayType::scalar(DataType::F64);
         let region = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type.clone()], EffectClasses::NONE);
-        let operation = CompositeCallOperation::new(definition.reference());
+        let operation = CompositeOperation::new(definition.reference());
         assert_eq!(
             operation.infer_output_types(&[scalar_type.clone()], std::slice::from_ref(&region)),
             Ok(vec![scalar_type.clone()]),
@@ -4797,7 +4807,7 @@ mod tests {
         assert_eq!(
             builder
                 .add_instruction(
-                    ArrayIrOperation::Composite(CompositeCallOperation::new(definition.reference())),
+                    ArrayIrOperation::Composite(CompositeOperation::new(definition.reference())),
                     vec![primal],
                     inputs,
                     None,
@@ -5048,7 +5058,7 @@ mod tests {
         // computation of the JVP region.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
         let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
         assert_eq!(
             ArrayContext::new().bind(operation, regions, &[Array::scalar(2.0).unwrap()]),
@@ -5062,7 +5072,7 @@ mod tests {
         // succeed without running either dormant rule.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true));
         let mut regions = vec![
             sin_program(&scalar_type),
             sin_forward_program(&scalar_type),
@@ -5122,7 +5132,7 @@ mod tests {
     fn test_composite_partial_evaluation_jvp_rule() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
         let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
         let program = composite_call_program(operation, regions, vec![scalar_type.clone()]);
 
@@ -5235,7 +5245,7 @@ mod tests {
     fn test_composite_partial_evaluation_vjp_rule() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true));
         let regions = vec![
             sin_program(&scalar_type),
             sin_forward_program(&scalar_type),
@@ -5302,7 +5312,7 @@ mod tests {
         // Batching a call that has every kind of rule batches all of its regions and preserves both rules, so forward
         // mode through the batched call still uses the doubled JVP rule and reverse mode still uses the tripled
         // reverse-mode rules.
-        let operation = CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, true);
+        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true);
         let regions = sin_regions(&operation);
         let (value, tangent) = differentiate_at(Array::vector(vec![0.5, 1.0]).unwrap())
             .jvp(Array::vector(vec![1.0, 1.0]).unwrap(), |x| {
@@ -5346,10 +5356,8 @@ mod tests {
         let output: Array = batch(
             |x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
-                let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
-                    CompositeJvpRule::Explicit,
-                    false,
-                ));
+                let operation =
+                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
                 let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
                 Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
             },
@@ -5392,7 +5400,7 @@ mod tests {
                 .unwrap()
         };
         let program: FlatProgram<ArrayContext> = composite_call_program(
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
             vec![primal, jvp],
             vec![vector_type],
         );
@@ -5463,7 +5471,7 @@ mod tests {
         };
         let regions = vec![primal, jvp];
         let program = composite_call_program(
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
             regions.clone(),
             vec![scalar_type.clone(), scalar_type],
         );
@@ -5500,7 +5508,7 @@ mod tests {
                             Ok(coefficient
                                 .context()
                                 .bind(
-                                    ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                                         CompositeJvpRule::Explicit,
                                         false,
                                     )),
@@ -5556,7 +5564,7 @@ mod tests {
         // No input carries a mapped axis, but `axis_index("items")` observes the active transform inside both regions
         // and naturally produces a mapped output. Batching must therefore inspect the regions rather than assuming
         // that all-replicated call inputs imply all-replicated call outputs.
-        let outputs = CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)
+        let outputs = CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)
             .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(1.0).unwrap())])
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -5573,7 +5581,7 @@ mod tests {
                 let mapped = batch(
                     |item| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Explicit,
                             false,
                         ));
@@ -5598,10 +5606,8 @@ mod tests {
         let output: Array = batch(
             |x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
-                let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
-                    CompositeJvpRule::Absent,
-                    true,
-                ));
+                let operation =
+                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true));
                 let regions = vec![
                     sin_program(&scalar_type),
                     sin_forward_program(&scalar_type),
@@ -5647,7 +5653,7 @@ mod tests {
             builder.build(vec![x_cotangent, y_cotangent], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap()
         };
         let program: FlatProgram<ArrayContext> = composite_call_program(
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
             vec![primal, forward, backward],
             vec![scalar_type.clone(), scalar_type.clone()],
         );
@@ -5727,7 +5733,7 @@ mod tests {
                 let mapped = batch(
                     |item| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Absent,
                             true,
                         ));
@@ -5928,7 +5934,7 @@ mod tests {
             let primal = builder.import_program(primal.clone());
             let coefficient = builder.add_input(scalar_type.clone());
             let parameter = builder.add_input(scalar_type.clone());
-            let operation = CompositeCallOperation::new(CustomRuleRegistration::new(definition).reference())
+            let operation = CompositeOperation::new(CustomRuleRegistration::new(definition).reference())
                 .with_non_differentiated_count(1)
                 .unwrap();
             let output =
@@ -5986,7 +5992,7 @@ mod tests {
             let primal = builder.import_program(pair_primal);
             let coefficient = builder.add_input(scalar_type.clone());
             let parameter = builder.add_input(scalar_type.clone());
-            let operation = CompositeCallOperation::new(CustomRuleRegistration::new(definition).reference())
+            let operation = CompositeOperation::new(CustomRuleRegistration::new(definition).reference())
                 .with_non_differentiated_count(1)
                 .unwrap();
             let outputs = builder
@@ -6199,7 +6205,7 @@ mod tests {
                 .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let operation = CompositeCallOperation::from_rule_regions(CompositeJvpRule::Primal, false);
+        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false);
         let program = composite_call_program(
             ArrayOperation::Composite(operation),
             vec![primal],
@@ -6224,7 +6230,7 @@ mod tests {
     fn test_composite_differentiation_jvp_from_primal_linearization() {
         // Reusable linearization partitions a derived JVP like the primal region's own derivative: the primal program
         // saves `cos(x)` and the tangent program applies it.
-        let operation = CompositeCallOperation::from_rule_regions(CompositeJvpRule::Primal, false);
+        let operation = CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false);
         let program = composite_call_program(
             ArrayOperation::Composite(operation.clone()),
             sin_regions(&operation),
@@ -6257,7 +6263,7 @@ mod tests {
                 .unwrap()
         };
         let operation = ArrayOperation::Composite(
-            CompositeCallOperation::from_rule_regions(CompositeJvpRule::Primal, false)
+            CompositeOperation::from_rule_regions(CompositeJvpRule::Primal, false)
                 .with_non_differentiated_count(1)
                 .unwrap(),
         );
@@ -6318,7 +6324,7 @@ mod tests {
         let mut regions = vec![primal, jvp];
         regions.extend(counting_square_vjp_regions());
         let operation = ArrayIrOperation::Composite(
-            CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, true)
+            CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true)
                 .with_non_differentiated_count(1)
                 .unwrap(),
         );
@@ -6362,10 +6368,8 @@ mod tests {
         let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
             .jvp(Array::scalar(1.0).unwrap(), |x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
-                let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
-                    CompositeJvpRule::Explicit,
-                    false,
-                ));
+                let operation =
+                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
                 let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
                 Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
             })
@@ -6377,10 +6381,8 @@ mod tests {
         let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap())
             .value_and_gradient(|x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
-                let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
-                    CompositeJvpRule::Explicit,
-                    false,
-                ));
+                let operation =
+                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
                 let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
                 x.context().bind(operation, regions, &[x.clone()]).unwrap().remove(0)
             })
@@ -6399,7 +6401,7 @@ mod tests {
                 differentiate_at(x)
                     .gradient(|y| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Explicit,
                             false,
                         ));
@@ -6422,7 +6424,7 @@ mod tests {
                 Ok(differentiate_at(x)
                     .gradient(|y| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Explicit,
                             false,
                         ));
@@ -6445,7 +6447,7 @@ mod tests {
                 differentiate_at(x)
                     .jvp(direction, |y| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Explicit,
                             false,
                         ));
@@ -6468,7 +6470,7 @@ mod tests {
                 Ok(differentiate_at(x)
                     .jvp(direction, |y| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Explicit,
                             false,
                         ));
@@ -6493,7 +6495,7 @@ mod tests {
                 let (_, pullback) = differentiate_at(input)
                     .vjp(|y| {
                         let scalar_type = ArrayType::scalar(DataType::F64);
-                        let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                        let operation = ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                             CompositeJvpRule::Explicit,
                             false,
                         ));
@@ -6515,7 +6517,7 @@ mod tests {
         let input = builder.add_input(scalar_type);
         let output = builder
             .add_instruction(
-                CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false),
+                CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false),
                 vec![primal, jvp],
                 vec![input],
                 None,
@@ -6544,7 +6546,7 @@ mod tests {
             differentiate_at(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())).jvp(
                 ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()),
                 |input| {
-                    let operation = ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(
+                    let operation = ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(
                         CompositeJvpRule::Explicit,
                         false,
                     ));
@@ -6570,7 +6572,7 @@ mod tests {
         let error = differentiate_at(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()))
             .jvp(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()), |input| {
                 let lifted = input.context().lift(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()))?;
-                let operation = ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(
+                let operation = ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(
                     CompositeJvpRule::Explicit,
                     false,
                 ));
@@ -6593,7 +6595,7 @@ mod tests {
     fn test_composite_differentiation_jvp_rule_staged_local_reference_state() {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let program = composite_call_program(
-            ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+            ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
             custom_jvp_regions_with_reference_state(&scalar_type),
             vec![scalar_type],
         );
@@ -6732,7 +6734,7 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let program = composite_call_program(
-            CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false),
+            CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false),
             vec![primal, rule],
             vec![scalar_type],
         );
@@ -6897,7 +6899,7 @@ mod tests {
         let input = primal.add_input(scalar_type.clone());
         let primal = primal.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
         let regions = vec![primal, rule];
         let program = composite_call_program(operation.clone(), regions.clone(), vec![scalar_type]);
 
@@ -6926,7 +6928,7 @@ mod tests {
     fn test_composite_differentiation_jvp_rule_rejects_known_tangent_outputs() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
 
         // A constant non-zero tangent ignores the input tangent and is not a linear map.
         let mut builder = ProgramBuilder::new();
@@ -6962,10 +6964,8 @@ mod tests {
         let (value, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
-                let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
-                    CompositeJvpRule::Absent,
-                    true,
-                ));
+                let operation =
+                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true));
                 let regions = vec![
                     sin_program(&scalar_type),
                     sin_forward_program(&scalar_type),
@@ -6990,7 +6990,7 @@ mod tests {
                         input
                             .context()
                             .bind(
-                                ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                                ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                                     CompositeJvpRule::Absent,
                                     true,
                                 )),
@@ -7020,7 +7020,7 @@ mod tests {
                         input
                             .context()
                             .bind(
-                                ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                                ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                                     CompositeJvpRule::Absent,
                                     true,
                                 )),
@@ -7187,7 +7187,7 @@ mod tests {
         let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
         let outputs = builder
             .add_instruction(
-                ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
+                ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
                 vec![primal, forward, backward],
                 inputs,
                 None,
@@ -7239,7 +7239,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
-                CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true),
+                CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true),
                 vec![primal, forward, backward],
                 vec![input],
                 None,
@@ -7286,7 +7286,7 @@ mod tests {
         let input = builder.add_input(scalar_type);
         let output = builder
             .add_instruction(
-                CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true),
+                CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true),
                 vec![primal, forward, backward],
                 vec![input],
                 None,
@@ -7487,10 +7487,8 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let jacobian = differentiate_at(Array::vector(vec![0.5, 1.0]).unwrap())
             .jacobian_reverse(|x| {
-                let operation = ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
-                    CompositeJvpRule::Absent,
-                    true,
-                ));
+                let operation =
+                    ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true));
                 let regions = vec![
                     sin_program(&vector_type),
                     sin_forward_program(&vector_type),
@@ -7592,7 +7590,7 @@ mod tests {
             let result = crate::differentiation::differentiate_at(Array::scalar(x).unwrap()).jvp(
                 Array::scalar(1f64).unwrap(),
                 |input| {
-                    let operation = ArrayOperation::Composite(CompositeCallOperation::new(definition.reference()));
+                    let operation = ArrayOperation::Composite(CompositeOperation::new(definition.reference()));
                     Ok(input
                         .context()
                         .bind(operation, vec![member_cube_program(&scalar_type)], &[input.clone()])?
@@ -7609,7 +7607,7 @@ mod tests {
             }
             let result = crate::differentiation::differentiate_at(Array::scalar(x).unwrap())
                 .vjp(|input| {
-                    let operation = ArrayOperation::Composite(CompositeCallOperation::new(definition.reference()));
+                    let operation = ArrayOperation::Composite(CompositeOperation::new(definition.reference()));
                     Ok(input
                         .context()
                         .bind(operation, vec![member_cube_program(&scalar_type)], &[input.clone()])?
@@ -7638,8 +7636,7 @@ mod tests {
                 .jvp(Array::scalar(1f64).unwrap(), |input| {
                     Ok(crate::differentiation::differentiate_at(input)
                         .gradient(|input| {
-                            let operation =
-                                ArrayOperation::Composite(CompositeCallOperation::new(definition.reference()));
+                            let operation = ArrayOperation::Composite(CompositeOperation::new(definition.reference()));
                             input
                                 .context()
                                 .bind(operation, vec![member_cube_program(&scalar_type)], &[input.clone()])
@@ -7700,7 +7697,7 @@ mod tests {
         let (_, pullback) = TestContext::new()
             .vjp(
                 |x, ()| {
-                    let operation = CompositeCallOperation::new(definition.reference());
+                    let operation = CompositeOperation::new(definition.reference());
                     x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
                 },
                 x,
@@ -7759,7 +7756,7 @@ mod tests {
             let primal = builder.import_program(primal);
             let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
             let outputs = builder
-                .add_instruction(CompositeCallOperation::new(definition.reference()), vec![primal], inputs, None)
+                .add_instruction(CompositeOperation::new(definition.reference()), vec![primal], inputs, None)
                 .unwrap()
                 .to_vec();
             builder
@@ -7949,7 +7946,7 @@ mod tests {
             ))
             .vjp(|(counter, x)| {
                 let operation = ArrayIrOperation::Composite(
-                    CompositeCallOperation::new(definition.reference()).with_non_differentiated_count(1).unwrap(),
+                    CompositeOperation::new(definition.reference()).with_non_differentiated_count(1).unwrap(),
                 );
                 Ok(x.context().bind(operation, vec![ir_counter_square_program()], &[counter, x.clone()])?.remove(0))
             })?;
@@ -8102,7 +8099,7 @@ mod tests {
             TestContext::new().jvp(
                 |x, ()| {
                     x.context().bind(
-                        CompositeCallOperation::new(definition.reference()),
+                        CompositeOperation::new(definition.reference()),
                         vec![primal.clone()],
                         &[x.clone()],
                     )
@@ -8117,7 +8114,7 @@ mod tests {
                 .vjp(
                     |x, ()| {
                         x.context().bind(
-                            CompositeCallOperation::new(definition.reference()),
+                            CompositeOperation::new(definition.reference()),
                             vec![primal.clone()],
                             &[x.clone()],
                         )
@@ -8148,7 +8145,7 @@ mod tests {
         // an un-linearized call reaches the operation, which rejects it.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false));
         let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
         let program = composite_call_program(operation, regions, vec![scalar_type]);
         assert!(matches!(
@@ -8164,7 +8161,7 @@ mod tests {
         // transpose of an un-linearized call reaches the operation, which rejects it.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation =
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true));
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true));
         let regions = vec![
             sin_program(&scalar_type),
             sin_forward_program(&scalar_type),
@@ -9492,7 +9489,7 @@ mod tests {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let primal = builder.import_program(primal);
             let input = builder.add_input(r#type.clone());
-            let operation = ArrayIrOperation::Composite(CompositeCallOperation::new(definition.reference()));
+            let operation = ArrayIrOperation::Composite(CompositeOperation::new(definition.reference()));
             let output = builder.add_instruction(operation, vec![primal], vec![input], None).unwrap()[0];
             builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

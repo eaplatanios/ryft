@@ -8,7 +8,7 @@ use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayIrOperation, ArrayIrType,
     ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation,
     AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CastOperation, CeilOperation,
-    ClampOperation, CompareOperation, ComplexOperation, CompositeCallOperation, CompositeTransposeOperation,
+    ClampOperation, CompareOperation, ComplexOperation, CompositeOperation, CompositeTransposeOperation,
     ConcatenateOperation, Concretizable, ConditionOperation, ConjugateOperation, ConstantOperation,
     ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation,
     DataType, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
@@ -508,7 +508,7 @@ where
 
     /// Backend-owned composite call whose primal region can contain XLA operations, with either attached rule regions
     /// that can contain XLA operations or retained rules registered in this family, which are traced lazily.
-    Composite(CompositeCallOperation<Constant, XlaOperation<Constant>>),
+    Composite(CompositeOperation<Constant, XlaOperation<Constant>>),
 
     /// Reverse-mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
     /// backward rule.
@@ -526,7 +526,7 @@ where
     /// (refer to [`LiftedCustomRules`]). Conversions never produce such a call with attached rules, which follow their
     /// call into the [`Composite`](Self::Composite) variant instead.
     LiftedComposite(
-        CompositeCallOperation<
+        CompositeOperation<
             Constant,
             XlaOperation<Constant>,
             LiftedCustomRules<
@@ -971,7 +971,7 @@ pub(crate) mod tests {
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, CaptureReference,
-        CapturingContext, Compare, CompareOperation, ComparisonDirection, CompositeCallOperation, CompositeJvpRule,
+        CapturingContext, Compare, CompareOperation, ComparisonDirection, CompositeOperation, CompositeJvpRule,
         CompositeTransposeOperation, ConditionOperation, Context, DataType, DifferentiableType, Dimension,
         DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ErasedOperation,
@@ -1396,7 +1396,7 @@ pub(crate) mod tests {
             (CompositeJvpRule::Absent, true, 3),
             (CompositeJvpRule::Primal, true, 1),
         ] {
-            let composite = CompositeCallOperation::from_rule_regions(jvp_rule, has_vjp_rule)
+            let composite = CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule)
                 .with_non_differentiated_count(non_differentiated_count)
                 .unwrap();
             let promoted: XlaOperation<XlaConstant> =
@@ -1415,7 +1415,7 @@ pub(crate) mod tests {
             // A call with attached rules that reaches this family from the array member family follows its regions
             // into the native variant as well.
             let promoted: XlaOperation<XlaConstant> = ArrayOperation::<XlaArrayConstant>::Composite(
-                CompositeCallOperation::from_rule_regions(jvp_rule, has_vjp_rule),
+                CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule),
             )
             .into();
             assert!(matches!(
@@ -1468,7 +1468,7 @@ pub(crate) mod tests {
             ArrayOperation<XlaArrayConstant>,
         >::new("member"));
         let promoted: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::Composite(CompositeCallOperation::new(member.reference())).into();
+            ArrayOperation::<XlaArrayConstant>::Composite(CompositeOperation::new(member.reference())).into();
         assert!(matches!(
             &promoted,
             XlaOperation::LiftedComposite(operation)
@@ -1492,7 +1492,7 @@ pub(crate) mod tests {
                 .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
         );
         let promoted: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::Composite(CompositeCallOperation::new(array_ir.reference())).into();
+            ArrayIrOperation::<XlaArrayConstant>::Composite(CompositeOperation::new(array_ir.reference())).into();
         assert!(matches!(
             &promoted,
             XlaOperation::LiftedComposite(operation)

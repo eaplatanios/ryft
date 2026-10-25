@@ -12,7 +12,7 @@
 //!     reverse-mode differentiation ([`Composite::with_vjp`], the analogue of JAX's `jax.custom_vjp`), or both, as well
 //!     as a batching rule ([`Composite::with_batching`], the analogue of JAX's `jax.custom_batching.custom_vmap`).
 //!     [`Composite::from_custom_call`] creates a composite whose primal calls a foreign kernel.
-//!   - **Operations:** each call of a composite stages a [`CompositeCallOperation`], which carries the primal program
+//!   - **Operations:** each call of a composite stages a [`CompositeOperation`], which carries the primal program
 //!     as an attached region and retains the rules as callbacks that are traced on the first request of each
 //!     specialization. Callers whose rules are already programs (e.g., kernel staging with explicit rule programs)
 //!     stage the same operation with the rule programs attached as regions instead. Reverse mode replaces either kind
@@ -58,7 +58,7 @@ pub use functions::{
     composite,
 };
 pub use operations::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeCallOperation, CompositeJvpRule,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeOperation, CompositeJvpRule,
     CompositeTransposeOperation,
 };
 pub use rules::{
@@ -78,7 +78,7 @@ pub(crate) mod tests {
         DifferentiationPolicy, ForwardModeDifferentiate, Linearization,
     };
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::composites::operations::CompositeCallOperation;
+    use crate::operations::composites::operations::CompositeOperation;
     use crate::operations::composites::rules::{CustomRuleDefinition, CustomRuleRegistration};
     use crate::parameters::Placeholder;
     use crate::partial::PartitionedProgram;
@@ -265,7 +265,7 @@ pub(crate) mod tests {
         let primal = builder.import_program(cube_program(&r#type));
         let input = builder.add_input(r#type);
         let output = builder
-            .add_instruction(CompositeCallOperation::new(definition.reference()), vec![primal], vec![input], None)
+            .add_instruction(CompositeOperation::new(definition.reference()), vec![primal], vec![input], None)
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -280,7 +280,7 @@ pub(crate) mod tests {
         let r#type = x.r#type().into_owned();
         TestContext::new().jvp(
             |x, ()| {
-                let operation = CompositeCallOperation::new(definition.reference());
+                let operation = CompositeOperation::new(definition.reference());
                 x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
             },
             x,

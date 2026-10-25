@@ -1,7 +1,7 @@
 //! The [`Composite`] builder, which pairs a primal closure with structured rule closures, together with the type-state
 //! markers of its configurations (e.g., [`WithJvp`] and [`WithVjp`]) and the adapters that register the structured
 //! closures as the flat, family-level rules of [`CustomRuleDefinition`]s. Each call of a composite stages a
-//! [`CompositeCallOperation`] with retained rules.
+//! [`CompositeOperation`] with retained rules.
 
 // TODO(eaplatanios): Review this module.
 
@@ -28,7 +28,7 @@ use crate::differentiation::{
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::{
-    COMPOSITE_OPERATION_NAME, CompositeCallOperation, validate_non_differentiated_count,
+    COMPOSITE_OPERATION_NAME, CompositeOperation, validate_non_differentiated_count,
 };
 use crate::operations::composites::rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer,
@@ -1376,7 +1376,7 @@ where
 
 /// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
 /// rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
-/// non-differentiated input has no tangent slot in the [`CompositeCallOperation`] contract, so its tangent input is a
+/// non-differentiated input has no tangent slot in the [`CompositeOperation`] contract, so its tangent input is a
 /// placeholder that the rule must ignore. The traced program has inputs `[inputs..., input_tangents...]`, and the
 /// placeholders are the tangents at positions `input_count..input_count + non_differentiated_count`, which are
 /// projected away so that the remaining boundary is exactly `[inputs..., differentiated_input_tangents...]`.
@@ -1494,7 +1494,7 @@ impl CompositeRegistrations {
 /// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
 /// an optional forward-mode rule (refer to [`Self::with_jvp`] and [`Self::with_jvp_from_primal`]), optional
 /// reverse-mode rules (refer to [`Self::with_vjp`]), and an optional batching rule (refer to [`Self::with_batching`]),
-/// and each [`call`](Self::call) stages one [`CompositeCallOperation`] with retained rules over the traced primal.
+/// and each [`call`](Self::call) stages one [`CompositeOperation`] with retained rules over the traced primal.
 ///
 /// The rules are retained callbacks rather than traced programs: a call traces only its primal, and each rule is traced
 /// on the first derivative request of each specialization (e.g., each distinct input signature or batching level) and
@@ -1628,7 +1628,7 @@ impl<Input, Output, Primal, Vjp, Batching> Composite<Input, Output, Primal, Defa
     /// the same parameter structures as their corresponding primal values, and Ryft validates these structural and type
     /// relationships when it traces the rule. The rule keeps receiving a full `ẋ` value when the function has
     /// non-differentiated inputs, so that its signature mirrors the primal signature, but the tangent leaves of those
-    /// inputs are placeholders that it must not use, because the staged [`CompositeCallOperation`] has no tangent slot
+    /// inputs are placeholders that it must not use, because the staged [`CompositeOperation`] has no tangent slot
     /// for them. A rule that consumes or returns such a placeholder is rejected when it is first traced.
     ///
     /// # When to Use
@@ -1760,7 +1760,7 @@ impl<Input, Output, Primal, Jvp, Batching> Composite<Input, Output, Primal, Jvp,
     ///
     /// Non-differentiated inputs reach the primal and `forward` at their usual positions and receive no cotangent:
     /// `backward` keeps returning a full `x̄` value so that its signature mirrors the primal signature, but the leaves
-    /// that it returns at non-differentiated positions are ignored, because the staged [`CompositeCallOperation`]
+    /// that it returns at non-differentiated positions are ignored, because the staged [`CompositeOperation`]
     /// produces no cotangents for them. A non-differentiated value that `backward` needs must be forwarded to it as a
     /// residual in `r`.
     ///
@@ -2010,7 +2010,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number of
-    /// input leaves, when tracing the primal closure fails, or when the staged [`CompositeCallOperation`] rejects the
+    /// input leaves, when tracing the primal closure fails, or when the staged [`CompositeOperation`] rejects the
     /// call (e.g., because the call violates the reference contract). The rules are validated when they are first
     /// traced, so their errors are reported by the derivative requests that trace them.
     pub fn call<
@@ -2025,7 +2025,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         C::Constant: 'static,
-        C::Operation: 'static + From<CompositeCallOperation<C::Constant, C::Operation>>,
+        C::Operation: 'static + From<CompositeOperation<C::Constant, C::Operation>>,
         <C::Type as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
         CustomRuleRegistration<C::Constant, C::Operation>: Send,
@@ -2093,8 +2093,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         // The call binds through whatever context the input values flow through (e.g., a staging trace, a batching
         // context, or a differentiation context), so the batching or differentiation rule of the bound operation fires
         // and the function composes with those transforms.
-        let operation =
-            CompositeCallOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
+        let operation = CompositeOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
         let outputs = first.domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -2212,7 +2211,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
 /// # Tracing Semantics
 ///
 /// Nothing is traced at construction time. Each [`Composite::call`] recovers the tracing [`Context`] from the values
-/// that it is called with, traces only the primal closure at their types, and stages one [`CompositeCallOperation`]
+/// that it is called with, traces only the primal closure at their types, and stages one [`CompositeOperation`]
 /// that retains the rules into the context through which those values flow. The rules are traced lazily, at the types
 /// of each specialization (e.g., each distinct input signature): forward mode traces the JVP rule, reverse mode traces
 /// the forward rule when it stages its reverse-mode carrier and the backward rule when that carrier is transposed, and
@@ -2851,7 +2850,7 @@ mod tests {
         assert_eq!(
             program.into_flat_program().jvp().map(|_| ()).map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`composite` `composite` JVP rule output type signature mismatch: expected [f64[2], \
+                "`composite` JVP rule output type signature mismatch: expected [f64[2], \
                  f64[2]] but got [f64[2], f64[]]"
                     .to_string(),
             ))),
@@ -2961,7 +2960,7 @@ mod tests {
         assert_eq!(
             jvp(false).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`composite` `composite` JVP rule output type signature mismatch: expected \
+                "`composite` JVP rule output type signature mismatch: expected \
                  [dimension<n * n ∈ [4, 17)>, f64[n * n], zero[], f64[n * n]] but got [dimension<n * n ∈ [4, 17)>, \
                  f64[n * n], zero[], f64[n * n]] with different type identities"
                     .to_string(),
@@ -3518,7 +3517,7 @@ mod tests {
                 .map(|_| ())
                 .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`composite` `composite` forward rule output type signature mismatch: expected [f64[2]] \
+                "`composite` forward rule output type signature mismatch: expected [f64[2]] \
                  but got [f64[]]"
                     .to_string(),
             ))),
@@ -3534,7 +3533,7 @@ mod tests {
                 .map(|_| ())
                 .map_err(ProgramError::from),
             Err(ProgramError::Type(TypeError::invalid(
-                "`composite` `composite` backward rule output type signature mismatch: expected [f64[2]] \
+                "`composite` backward rule output type signature mismatch: expected [f64[2]] \
                  but got [f64[]]"
                     .to_string(),
             ))),

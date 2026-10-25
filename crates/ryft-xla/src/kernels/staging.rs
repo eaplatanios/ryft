@@ -11,7 +11,7 @@ use ryft_core::kernels::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
-    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeCallOperation, CompositeJvpRule,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeOperation, CompositeJvpRule,
     ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     Domain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver,
@@ -621,7 +621,7 @@ where
 }
 
 /// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
-/// active tangents and returns primal results followed by their tangents, as checked by a [`CompositeCallOperation`]
+/// active tangents and returns primal results followed by their tangents, as checked by a [`CompositeOperation`]
 /// with a JVP rule region. The supplied rule owns derivative semantics; the mutable kernel body is never implicitly
 /// differentiated.
 pub fn stage_kernel_with_jvp<C, Extension>(
@@ -635,7 +635,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CompositeCallOperation::<XlaConstant, XlaOperation>::from_rule_regions(CompositeJvpRule::Explicit, false),
+        CompositeOperation::<XlaConstant, XlaOperation>::from_rule_regions(CompositeJvpRule::Explicit, false),
         vec![kernel_primal(definition)?, jvp.clone()],
         inputs,
     )
@@ -643,7 +643,7 @@ where
 
 /// Stages a native kernel primal with explicit canonical forward and backward VJP regions. The forward region returns
 /// primal outputs and residuals; the backward region receives residuals and output cotangents and returns input
-/// cotangents. A [`CompositeCallOperation`] with reverse-mode rules validates these boundaries and retains its
+/// cotangents. A [`CompositeOperation`] with reverse-mode rules validates these boundaries and retains its
 /// reverse-mode-only contract.
 /// A forward rule may itself stage a kernel when its primal must execute natively during differentiation.
 pub fn stage_kernel_with_vjp<C, Extension>(
@@ -658,7 +658,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CompositeCallOperation::<XlaConstant, XlaOperation>::from_rule_regions(CompositeJvpRule::Absent, true),
+        CompositeOperation::<XlaConstant, XlaOperation>::from_rule_regions(CompositeJvpRule::Absent, true),
         vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
         inputs,
     )
@@ -680,9 +680,9 @@ where
     C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
     Extension: KernelExtension + Into<XlaKernelExtension>,
     S: CustomRuleSource<XlaConstant, XlaOperation>,
-    XlaOperation: From<CompositeCallOperation<XlaConstant, XlaOperation, S>>,
+    XlaOperation: From<CompositeOperation<XlaConstant, XlaOperation, S>>,
 {
-    context.bind(CompositeCallOperation::new(rules), vec![kernel_primal(definition)?], inputs)
+    context.bind(CompositeOperation::new(rules), vec![kernel_primal(definition)?], inputs)
 }
 
 /// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the

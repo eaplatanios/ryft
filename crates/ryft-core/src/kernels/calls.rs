@@ -1270,7 +1270,7 @@ mod tests {
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
     use crate::operations::{
-        CompositeCallOperation, CompositeJvpRule, CompositeTransposeOperation, ConditionOperation,
+        CompositeOperation, CompositeJvpRule, CompositeTransposeOperation, ConditionOperation,
         CustomRuleDefinition, CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation,
         ZeroOperation,
@@ -2542,7 +2542,7 @@ mod tests {
         };
 
         // A call with attached rules is encoded structurally, because its rules are regions of the body.
-        let attached = CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, false);
+        let attached = CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, false);
         assert!(definition(ArrayIrOperation::Composite(attached), 1).semantic_key().is_ok());
 
         // Calls and carriers with retained rules have no encoding, whether their rules are registered in this family or
@@ -2557,14 +2557,14 @@ mod tests {
             CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("retained"),
         );
         assert_eq!(
-            definition(ArrayIrOperation::Composite(CompositeCallOperation::new(rules.reference())), 1).semantic_key(),
+            definition(ArrayIrOperation::Composite(CompositeOperation::new(rules.reference())), 1).semantic_key(),
             retained("composite"),
         );
         let member_rules =
             CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member"));
         assert_eq!(
             definition(
-                ArrayIrOperation::from(ArrayOperation::Composite(CompositeCallOperation::new(
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(
                     member_rules.reference(),
                 ))),
                 1,

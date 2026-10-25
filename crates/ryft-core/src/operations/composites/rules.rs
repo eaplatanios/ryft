@@ -1,13 +1,13 @@
 //! Retained custom rule sets, whose derivative rules are callbacks rather than programs. A [`CustomRuleDefinition`]
 //! holds a human-readable name, an optional forward-mode (JVP) rule, optional reverse-mode (VJP) forward and backward
-//! rules, and optional batching support. A [`CompositeCallOperation`](crate::CompositeCallOperation) with retained
+//! rules, and optional batching support. A [`CompositeOperation`](crate::CompositeOperation) with retained
 //! rules calls a definition over a traced primal program: ordinary execution uses only the primal, forward mode traces
 //! and replays the JVP rule, and reverse mode traces the VJP forward rule and stages a [`CompositeTransposeOperation`]
 //! whose transposition specializes the backward rule against the actual cotangent destinations. Every rule is traced
 //! lazily, on the first request of each static specialization, and cached by the definition's
 //! [`CustomRuleRegistration`]. Batching a call or carrier likewise traces no rule: it records the batching level, and a
 //! later derivative request structurally batches the rule program traced at the unbatched types (refer to the Batching
-//! sections of [`CompositeCallOperation`](crate::CompositeCallOperation) and [`CompositeTransposeOperation`]).
+//! sections of [`CompositeOperation`](crate::CompositeOperation) and [`CompositeTransposeOperation`]).
 //!
 //! This module is the flat, family-level representation behind the public [`composite`](fn@crate::composite) builder,
 //! which adapts structured closures to the flat rule interfaces of this module. Rules may receive materialized zeros
@@ -40,7 +40,8 @@ use crate::differentiation::{
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::composites::operations::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation, describe_composite,
+    describe_composite_transpose,
 };
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, Placeholder};
@@ -485,7 +486,7 @@ type CustomRuleDifferentiator<V, O> = dyn Fn(&Program<V, O, Vec<V>, Vec<V>>, &[u
     + Send
     + Sync;
 
-/// One batching level applied to a [`CompositeCallOperation`](crate::CompositeCallOperation) or
+/// One batching level applied to a [`CompositeOperation`](crate::CompositeOperation) or
 /// [`CompositeTransposeOperation`] after it was staged. Batching such an operation batches no derivative rule. Instead,
 /// it records this level so that a later derivative request can batch the rule program that it traces at the unbatched
 /// types.
@@ -505,7 +506,7 @@ pub struct CustomRuleBatchingLevel<T> {
     pub(super) output_axes: Vec<BatchAxis>,
 }
 
-/// Batching applied to a [`CompositeCallOperation`](crate::CompositeCallOperation) or [`CompositeTransposeOperation`]
+/// Batching applied to a [`CompositeOperation`](crate::CompositeOperation) or [`CompositeTransposeOperation`]
 /// after it was staged, which determines how its lazily traced rule programs are batched.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CustomRuleBatching<T> {
@@ -1290,10 +1291,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         let Some(discharger) = &self.discharger else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `{}` cannot differentiate a call whose reference state was \
+                    "{} cannot differentiate a call whose reference state was \
                      discharged, because its rule programs contain reference state and its definition has no \
                      reference discharge support",
-                    self.name(),
+                    describe_composite(self.name()),
                 ),
             }
             .into());
@@ -1590,7 +1591,7 @@ impl<V: Typed + Parameter, O> sealed::Sealed for CustomRuleReference<V, O> {}
 
 impl<Vm: Typed + Parameter, Om> sealed::Sealed for LiftedCustomRules<Vm, Om> {}
 
-/// Source of the retained rules that a [`CompositeCallOperation`](crate::CompositeCallOperation) and its
+/// Source of the retained rules that a [`CompositeOperation`](crate::CompositeOperation) and its
 /// [`CompositeTransposeOperation`] apply, which provides their specializations as programs of the operations' own
 /// family `(V, O)`. [`CustomRuleReference`] is the source of a definition registered in that family, and
 /// [`LiftedCustomRules`] is the source of a call that was converted into that family from a member family (e.g., from
@@ -1809,8 +1810,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             _ => {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "`{COMPOSITE_OPERATION_NAME}` `{}` has no forward-mode (i.e., JVP) rule",
-                        self.definition.name()
+                        "{} has no forward-mode (i.e., JVP) rule",
+                        describe_composite(self.definition.name())
                     ),
                 }
                 .into());
@@ -1830,9 +1831,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 let differentiated_input_types = &key.input_types[key.non_differentiated_count..];
                 if key.tangent_activity.len() != differentiated_input_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "`{COMPOSITE_OPERATION_NAME}` `{}` JVP specialization key has {} tangent activity \
+                        "{} JVP specialization key has {} tangent activity \
                          flags for {} differentiated inputs",
-                        self.definition.name(),
+                        describe_composite(self.definition.name()),
                         key.tangent_activity.len(),
                         differentiated_input_types.len(),
                     ))
@@ -1878,9 +1879,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         };
                         if outputs.len() != output_count || output_tangents.len() != output_count {
                             return Err(TypeError::invalid(format!(
-                                "`{COMPOSITE_OPERATION_NAME}` `{}` JVP rule returned {} outputs and {} output \
+                                "{} JVP rule returned {} outputs and {} output \
                                      tangents but the primal has {output_count} outputs",
-                                self.definition.name(),
+                                describe_composite(self.definition.name()),
                                 outputs.len(),
                                 output_tangents.len(),
                             ))
@@ -1907,8 +1908,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 key.non_differentiated_count + boundary_input_count(&key.levels[..key.levels.len() - 1]);
             let differentiated_input_axes = level.input_axes.get(differentiated_input_start..).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `{}` batching level has too few input axes",
-                    self.definition.name(),
+                    "{} batching level has too few input axes",
+                    describe_composite(self.definition.name()),
                 ))
             })?;
             let mut input_axes = level.input_axes.clone();
@@ -1946,8 +1947,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // The traced rule is validated against the unbatched output types of `key`.
         let Some(forward) = &self.definition.forward else {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{COMPOSITE_OPERATION_NAME}` `{}` has no reverse-mode forward rule",
-                self.definition.name(),
+                "{} has no reverse-mode forward rule",
+                describe_composite(self.definition.name()),
             ))
             .into());
         };
@@ -1965,9 +1966,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         let (mut outputs, residuals) = forward.apply(&values)?;
                         if outputs.len() != output_count {
                             return Err(TypeError::invalid(format!(
-                                "`{COMPOSITE_OPERATION_NAME}` `{}` forward rule returned {} outputs but the \
+                                "{} forward rule returned {} outputs but the \
                                      primal has {output_count}",
-                                self.definition.name(),
+                                describe_composite(self.definition.name()),
                                 outputs.len(),
                             ))
                             .into());
@@ -1990,18 +1991,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     }
                     if !leading_inputs.contains(residual) {
                         return Err(TypeError::invalid(format!(
-                            "`{COMPOSITE_OPERATION_NAME}` `{}` forward rule returns residual {index} of \
+                            "{} forward rule returns residual {index} of \
                              reference type `{type}` that is not a leading non-differentiated input forwarded by \
                              identity",
-                            self.definition.name(),
+                            describe_composite(self.definition.name()),
                         ))
                         .into());
                     }
                     if !forwarded_inputs.insert(*residual) {
                         return Err(TypeError::invalid(format!(
-                            "`{COMPOSITE_OPERATION_NAME}` `{}` forward rule returns residual {index} of \
+                            "{} forward rule returns residual {index} of \
                              reference type `{type}` from an input already forwarded by an earlier residual",
-                            self.definition.name(),
+                            describe_composite(self.definition.name()),
                         ))
                         .into());
                     }
@@ -2042,8 +2043,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // inner key at its outermost level.
         let Some(transposer) = &self.definition.transposer else {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{}` has no backward rule",
-                self.definition.name(),
+                "{} has no backward rule",
+                describe_composite_transpose(self.definition.name()),
             ))
             .into());
         };
@@ -2138,8 +2139,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         let Some(rule) = &self.definition.batching_rule else {
             let Some(derivation) = &self.definition.derivation else {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `{}` has no custom batching rule",
-                    self.definition.name(),
+                    "{} has no custom batching rule",
+                    describe_composite(self.definition.name()),
                 ))
                 .into());
             };
@@ -2156,9 +2157,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     let (outputs, axes) = rule.apply(&key.level, boundary_inputs, inputs, &key.input_axes)?;
                     if axes.len() != outputs.len() {
                         return Err(TypeError::invalid(format!(
-                            "`{COMPOSITE_OPERATION_NAME}` `{}` batching rule returned {} outputs but {} output \
+                            "{} batching rule returned {} outputs but {} output \
                              batch axes",
-                            self.definition.name(),
+                            describe_composite(self.definition.name()),
                             outputs.len(),
                             axes.len(),
                         ))
@@ -2179,8 +2180,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         // program, so calls whose primal regions differ share it (refer to `CustomRuleSpecializer::derived`).
         if !self.has_batching_rule() {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{COMPOSITE_OPERATION_NAME}` `{}` has no custom batching rule from which to derive rules",
-                self.definition.name(),
+                "{} has no custom batching rule from which to derive rules",
+                describe_composite(self.definition.name()),
             ))
             .into());
         }
@@ -2257,9 +2258,9 @@ impl UnavailableCustomRules {
     fn error(&self) -> DifferentiationError {
         ProgramError::UnsupportedOperation {
             message: format!(
-                "`{COMPOSITE_OPERATION_NAME}` `{}` was converted from a family whose values its current family \
+                "{} was converted from a family whose values its current family \
                  cannot represent, so its derivative rules are unavailable",
-                self.name,
+                describe_composite(self.name),
             ),
         }
         .into()
@@ -2308,9 +2309,9 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
                 <&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
                     ProgramError::UnsupportedOperation {
                         message: format!(
-                            "`{COMPOSITE_OPERATION_NAME}` `{}` cannot be differentiated with respect to type \
+                            "{} cannot be differentiated with respect to type \
                              `{type}`, which the family in which its rules were registered cannot represent",
-                            self.name_or_unavailable(),
+                            describe_composite(self.name_or_unavailable()),
                         ),
                     }
                     .into()
@@ -2338,10 +2339,10 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
                         BatchingLevelExtent::Dynamic(<&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
                             ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "`{COMPOSITE_OPERATION_NAME}` `{}` cannot differentiate a batched call whose \
+                                    "{} cannot differentiate a batched call whose \
                                      batch extent has type `{type}`, which the family in which its rules were \
                                      registered cannot represent; differentiate the call before batching it instead",
-                                    self.name_or_unavailable(),
+                                    describe_composite(self.name_or_unavailable()),
                                 ),
                             }
                         })?)
@@ -2542,9 +2543,9 @@ where
         let member = self.member()?;
         if key.destination_kinds.contains(&CotangentDestinationKind::Reference) {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` `{}` requested a caller-buffer destination from rules \
+                "{} requested a caller-buffer destination from rules \
                  that cannot write caller buffers",
-                self.name_or_unavailable(),
+                describe_composite_transpose(self.name_or_unavailable()),
             ))
             .into());
         }
@@ -2587,9 +2588,9 @@ where
             <&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
                 DifferentiationError::from(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "`{COMPOSITE_OPERATION_NAME}` `{}` cannot batch a call over type `{type}`, which the \
+                        "{} cannot batch a call over type `{type}`, which the \
                          family in which its rules were registered cannot represent",
-                        self.name_or_unavailable(),
+                        describe_composite(self.name_or_unavailable()),
                     ),
                 })
             })
@@ -2648,8 +2649,9 @@ where
         let (Some(differentiator), Some(batcher)) = (&source.differentiator, &source.batcher) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `{name}` cannot batch a derivative because its source \
+                    "{} cannot batch a derivative because its source \
                      definition has no batching support",
+                    describe_composite(name),
                 ),
             }
             .into());
@@ -2662,8 +2664,9 @@ where
             .filter(|_| key.unbatched_input_types.len() == input_count && key.input_axes.len() == input_count)
             .ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "batched `{COMPOSITE_OPERATION_NAME}` `{name}` has {input_count} inputs, which do not cover \
+                    "batched {} has {input_count} inputs, which do not cover \
                      its {} primal inputs and {tangent_count} tangents",
+                    describe_composite(name),
                     self.key.input_count,
                 ))
             })?;
@@ -2870,7 +2873,8 @@ where
         let position = |axis: Axis| {
             usize::try_from(axis.value()).map_err(|_| {
                 ProgramError::MalformedProgram(format!(
-                    "batched `{COMPOSITE_OPERATION_NAME}` `{name}` has the unnormalized batch axis {axis}",
+                    "batched {} has the unnormalized batch axis {axis}",
+                    describe_composite(name),
                 ))
             })
         };
@@ -3135,8 +3139,9 @@ where
     ) -> Result<(), DifferentiationError> {
         if output_tangent_mask != self.key.output_tangent_mask {
             return Err(TypeError::invalid(format!(
-                "`{COMPOSITE_OPERATION_NAME}` `{name}` batching rule program has live tangents for the outputs \
+                "{} batching rule program has live tangents for the outputs \
                  {output_tangent_mask:?}, but the derivative of its primal has them for the outputs {:?}",
+                describe_composite(name),
                 self.key.output_tangent_mask,
             ))
             .into());
@@ -3174,8 +3179,9 @@ where
                 .map_err(ProgramError::from)?;
         if aligned_axes != output_axes {
             return Err(ProgramError::MalformedProgram(format!(
-                "batched `{COMPOSITE_OPERATION_NAME}` `{name}` could not align values from the batch axes \
+                "batched {} could not align values from the batch axes \
                  {input_axes:?} to {output_axes:?}",
+                describe_composite(name),
             ))
             .into());
         }
@@ -3200,9 +3206,9 @@ where
         let Some(batcher) = &self.batcher else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{COMPOSITE_OPERATION_NAME}` `{}` cannot differentiate a batched call because its \
+                    "{} cannot differentiate a batched call because its \
                      definition has no batching support",
-                    self.name(),
+                    describe_composite(self.name()),
                 ),
             }
             .into());
@@ -3225,7 +3231,7 @@ pub(super) fn validate_rule_output_types<T: Type>(
     expected: &[T],
     actual: &[T],
 ) -> Result<(), TypeError> {
-    check_types!(@same, format!("`{COMPOSITE_OPERATION_NAME}` `{name}` {rule} rule output"), [
+    check_types!(@same, format!("{} {rule} rule output", describe_composite(name)), [
         expected,
         actual,
     ]);
@@ -3259,8 +3265,9 @@ where
         let (expected, actual) = (render(expected), render(actual));
         let reason = if expected == actual { " with different type identities" } else { "" };
         return Err(TypeError::invalid(format!(
-            "`{COMPOSITE_OPERATION_NAME}` `{name}` {rule} rule output type signature mismatch: expected \
+            "{} {rule} rule output type signature mismatch: expected \
              [{expected}] but got [{actual}]{reason}",
+            describe_composite(name),
         ))
         .into());
     };
@@ -3318,7 +3325,7 @@ mod tests {
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::composites::operations::CompositeCallOperation;
+    use crate::operations::composites::operations::CompositeOperation;
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, cube_program, custom_rule_program,
         member_cube_definition,
@@ -3494,7 +3501,7 @@ mod tests {
         let inner_reference = inner.reference();
         let outer = CustomRuleRegistration::new(TestDefinition::new("outer").with_jvp(move |primals, tangents| {
             let r#type = primals[0].r#type().into_owned();
-            let operation = CompositeCallOperation::new(inner_reference.clone());
+            let operation = CompositeOperation::new(inner_reference.clone());
             let outputs = primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
             Ok((outputs, vec![tangents[0].clone()]))
         }));
@@ -3527,7 +3534,7 @@ mod tests {
             TestDefinition::new("recursive").with_jvp(move |primals, tangents| {
                 counters.jvp.fetch_add(1, Ordering::SeqCst);
                 let r#type = primals[0].r#type().into_owned();
-                let operation = CompositeCallOperation::new(this.reference()?);
+                let operation = CompositeOperation::new(this.reference()?);
                 let outputs =
                     primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
                 Ok((outputs, vec![primals[0].clone() * primals[0].clone() * tangents[0].clone()]))
@@ -3575,7 +3582,7 @@ mod tests {
             let registration =
                 CustomRuleRegistration::new(TestDefinition::new("b").with_jvp(move |primals, tangents| {
                     let r#type = primals[0].r#type().into_owned();
-                    let operation = CompositeCallOperation::new(a.reference()?);
+                    let operation = CompositeOperation::new(a.reference()?);
                     let outputs =
                         primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
                     Ok((outputs, vec![tangents[0].clone()]))
@@ -3584,7 +3591,7 @@ mod tests {
             b = Some(registration);
             TestDefinition::new("a").with_jvp(move |primals, tangents| {
                 let r#type = primals[0].r#type().into_owned();
-                let operation = CompositeCallOperation::new(reference.clone());
+                let operation = CompositeOperation::new(reference.clone());
                 let outputs =
                     primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
                 Ok((outputs, vec![tangents[0].clone()]))

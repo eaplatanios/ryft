@@ -18,7 +18,7 @@ use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
     AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
     ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations,
-    CompositeCallOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation,
+    CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation,
     ConstantOperation, ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation,
     Cumulative, CumulativeOperation, CustomCall, CustomCallOperation, DimensionAddOperation, DimensionDivOperation,
     DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
@@ -150,7 +150,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Guard(GuardOperation<ArrayType>),
     Cast(CastOperation<ArrayType>),
     CustomCall(CustomCallOperation),
-    Composite(CompositeCallOperation<V, ArrayOperation<V>>),
+    Composite(CompositeOperation<V, ArrayOperation<V>>),
     CompositeTranspose(CompositeTransposeOperation<V, ArrayOperation<V>>),
 }
 
@@ -454,7 +454,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Composite call with an array IR primal region and attached rules or retained rules registered in this family.
     /// Reference inputs are allowed only in the leading non-differentiated segment; reference outputs are rejected.
-    Composite(CompositeCallOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
+    Composite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
     /// Reverse-mode carrier of [`Composite`](Self::Composite), replaced by the call's backward rule during
     /// transposition.
@@ -464,7 +464,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// specializes and converts those rules into this family. Calls with attached rules instead use
     /// [`Composite`](Self::Composite).
     LiftedComposite(
-        CompositeCallOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
+        CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
 
     /// Reverse-mode carrier of [`LiftedComposite`](Self::LiftedComposite), whose backward rule is specialized by its
@@ -947,7 +947,7 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeCallOperation,
+        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeOperation,
         CompositeJvpRule, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, CustomRuleDefinition,
         CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
         DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
@@ -2480,7 +2480,7 @@ mod tests {
         // rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
         for jvp_rule in [CompositeJvpRule::Absent, CompositeJvpRule::Explicit, CompositeJvpRule::Primal] {
             for has_vjp_rule in [false, true] {
-                let operation = CompositeCallOperation::from_rule_regions(jvp_rule, has_vjp_rule)
+                let operation = CompositeOperation::from_rule_regions(jvp_rule, has_vjp_rule)
                     .with_non_differentiated_count(2)
                     .unwrap();
                 assert!(matches!(
@@ -2534,7 +2534,7 @@ mod tests {
         // The array IR carrier batches both regions structurally and threads the first-class mapped extent into
         // them as one additional leading non-differentiated input of the batched call.
         let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
             array_ir_custom_jvp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2572,7 +2572,7 @@ mod tests {
         // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
         // with the differentiated inputs only.
         let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
             array_ir_custom_vjp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2616,7 +2616,7 @@ mod tests {
         let mut regions = array_ir_custom_jvp_regions();
         regions.extend(array_ir_custom_vjp_regions().into_iter().skip(1));
         let (program, batch_axis) = batched_array_ir_payload(
-            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, true)),
+            ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true)),
             regions,
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2736,7 +2736,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output = builder
             .add_instruction(
-                ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                ArrayOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 regions,
                 vec![input],
                 None,
@@ -2776,7 +2776,7 @@ mod tests {
                     let context = input.context().clone();
                     Ok(context
                         .bind(
-                            ArrayOperation::Composite(CompositeCallOperation::from_rule_regions(
+                            ArrayOperation::Composite(CompositeOperation::from_rule_regions(
                                 CompositeJvpRule::Explicit,
                                 false,
                             )),
@@ -3711,14 +3711,14 @@ mod tests {
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
             (
-                ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(
+                ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(
                     CompositeJvpRule::Explicit,
                     false,
                 )),
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
+                ArrayIrOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true)),
                 MemberKindSignature::RegionForwarding,
             ),
             (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
@@ -3742,7 +3742,7 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::Composite(CompositeCallOperation::new(array_ir_rules.reference())),
+                ArrayIrOperation::Composite(CompositeOperation::new(array_ir_rules.reference())),
                 MemberKindSignature::RegionForwarding,
             ),
             (
@@ -3755,7 +3755,7 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::from(ArrayOperation::Composite(CompositeCallOperation::new(
+                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(
                     member_rules.reference(),
                 ))),
                 MemberKindSignature::RegionForwarding,

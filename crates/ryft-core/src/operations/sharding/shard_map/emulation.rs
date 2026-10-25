@@ -1365,7 +1365,7 @@ mod tests {
     use crate::operations::collectives::parallel_vary::ParallelVary;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::operations::{
-        CompositeCallOperation, CompositeJvpRule, CompositeTransposeOperation,
+        CompositeOperation, CompositeJvpRule, CompositeTransposeOperation,
     };
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::debugging::PrintOperation;
@@ -2386,7 +2386,7 @@ mod tests {
         let body = build_program(vec![local_type.clone()], |builder, inputs| {
             let primal = builder.import_program(reduce());
             let composite =
-                CompositeCallOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Primal, false);
+                CompositeOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Primal, false);
             let value = builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap()[0];
             let regions = vec![builder.import_program(reduce()), builder.import_program(identity)];
             let linear_call = LinearCallOperation::<ArrayIrType>::new(0);

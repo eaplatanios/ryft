@@ -15,7 +15,7 @@ use crate::operations::attention::{
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::composites::functions::{Composite, CompositeVjp, DefaultJvp, WithVjp, composite};
-use crate::operations::composites::operations::CompositeCallOperation;
+use crate::operations::composites::operations::CompositeOperation;
 use crate::operations::composites::rules::CustomRuleRegistration;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::parameters::Parameter;
@@ -173,7 +173,7 @@ where
     pub fn call<C, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
         C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation> + NamedAxes,
-        C::Operation: From<CompositeCallOperation<C::Constant, C::Operation>>,
+        C::Operation: From<CompositeOperation<C::Constant, C::Operation>>,
         V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
         <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,

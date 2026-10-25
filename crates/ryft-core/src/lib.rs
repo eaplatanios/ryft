@@ -107,7 +107,7 @@ pub use operations::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_CALL_OPERATION_NAME,
     Capability, Cast, CastOperation, CastType, CategoricalSamplingMode, Ceil, CeilOperation, Clamp, ClampOperation,
     CollectiveMode, CollectiveOperations, CollectiveOptions, Compare, CompareOperation, ComparisonDirection,
-    ComparisonType, ComplexOperation, ComplexOperations, Composite, CompositeBatching, CompositeCallOperation,
+    ComparisonType, ComplexOperation, ComplexOperations, Composite, CompositeBatching, CompositeOperation,
     CompositeJvp, CompositeJvpRule, CompositeTransposeOperation, CompositeVjp, Concatenate, ConcatenateOperation,
     Condition, ConditionOperation, ConditionType, Conjugate, ConjugateOperation, Constant, ConstantOperation,
     ConstantOperations, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, ConvertElementType,
@@ -263,7 +263,7 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::{check_count, impl_guardless_operation};
     use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, CompositeCallOperation, CompositeTransposeOperation,
+        AddOperation, BroadcastOperation, CompareOperation, CompositeOperation, CompositeTransposeOperation,
         ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation, DivOperation,
         ExpOperation, GuardOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation,
         PadOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation,
@@ -337,7 +337,7 @@ pub(crate) mod tests {
         Condition(ConditionOperation<ArrayType>),
         StopGradient(StopGradientOperation<ArrayType>),
         LinearCall(LinearCallOperation<ArrayType>),
-        Composite(CompositeCallOperation<Array, TestArrayOperation>),
+        Composite(CompositeOperation<Array, TestArrayOperation>),
         CompositeTranspose(CompositeTransposeOperation<Array, TestArrayOperation>),
         CustomCube(CustomCubeOperation),
         CustomWeightedCube(CustomWeightedCubeOperation),

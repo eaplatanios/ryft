@@ -312,7 +312,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// allocating [`Instruction`](crate::Instruction) defines a concrete local reference wherever it occurs.
     ///
     /// One class of enumerated targets is inert: an allocation inside a closure that no operation ever replays, such as
-    /// a dormant derivative rule region of a [`CompositeCallOperation`](crate::CompositeCallOperation). Discharge
+    /// a dormant derivative rule region of a [`CompositeOperation`](crate::CompositeOperation). Discharge
     /// rejects such a program outright, whichever way the target is selected, because how a reference boundary widens
     /// there has no defined meaning. The enumeration reports the target anyway rather than second-guessing the region
     /// roles, so that it stays a structural query.

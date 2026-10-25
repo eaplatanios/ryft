@@ -68,7 +68,7 @@ use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::composites::functions::{Composite, WithJvp, composite};
-use crate::operations::composites::operations::CompositeCallOperation;
+use crate::operations::composites::operations::CompositeOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -442,7 +442,7 @@ impl<
     D: Domain<
             Type = ArrayType,
             Constant: 'static + Send + Sync,
-            Operation: 'static + Send + Sync + From<CompositeCallOperation<D::Constant, D::Operation>>,
+            Operation: 'static + Send + Sync + From<CompositeOperation<D::Constant, D::Operation>>,
         >,
 > SoftmaxCrossEntropyWithTargetLogits<D>
 where

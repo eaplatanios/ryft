@@ -70,7 +70,7 @@ pub use complex::{
 };
 pub use composites::{
     BatchingRuleConsistencyError, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite,
-    CompositeBatching, CompositeCallOperation, CompositeJvp, CompositeJvpRule, CompositeTransposeOperation,
+    CompositeBatching, CompositeOperation, CompositeJvp, CompositeJvpRule, CompositeTransposeOperation,
     CompositeVjp, CustomCallPrimal, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration,
     CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer, DefaultBatching, DefaultJvp, DefaultVjp, JvpFromPrimal,
     LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration, WithAccumulatingVjp,

@@ -6943,7 +6943,7 @@ mod tests {
         Assert, AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation,
         BatchingContext, CalleeRegionDriver, CaptureReference, Cast, CastOperation, CollectiveOptions,
         CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
-        CompiledFunctionDispatcher, CompositeCallOperation, CompositeJvpRule, ConcatenateOperation, ConditionOperation,
+        CompiledFunctionDispatcher, CompositeOperation, CompositeJvpRule, ConcatenateOperation, ConditionOperation,
         ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
         CustomCallOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
         DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
@@ -14202,7 +14202,7 @@ mod tests {
         };
         assert_eq!(
             domain.bind(
-                XlaOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                XlaOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 vec![primal.clone(), rule],
                 &[],
             ),
@@ -14233,7 +14233,7 @@ mod tests {
         };
         assert_eq!(
             domain.bind(
-                XlaOperation::Composite(CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                XlaOperation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 vec![primal, pure_reference_rule],
                 &[],
             ),

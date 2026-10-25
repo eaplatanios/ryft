@@ -15,9 +15,9 @@ use crate::tracing::{Tracer, TracingContext};
 /// ```
 ///
 /// The capability is shared rather than being operation-specific. [`LinearCallOperation`](crate::LinearCallOperation)
-/// and [`CompositeCallOperation`](crate::CompositeCallOperation) each pass [`Self::sum_mapped_cotangents`] to
+/// and [`CompositeOperation`](crate::CompositeOperation) each pass [`Self::sum_mapped_cotangents`] to
 /// [`BatchingPolicy::adapt_batched_program`] while adapting their batched backward region back to its plain boundary,
-/// and a [`CompositeCallOperation`](crate::CompositeCallOperation) with retained rules does the same while adapting the
+/// and a [`CompositeOperation`](crate::CompositeOperation) with retained rules does the same while adapting the
 /// batched specialization of its backward rule. Operations whose attached regions are all forward-shaped require plain
 /// [`BatchingPolicy`] instead.
 ///

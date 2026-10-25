@@ -1,5 +1,5 @@
 use ryft_core::{
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeCallOperation, CompositeTransposeOperation,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeOperation, CompositeTransposeOperation,
     Operation, Parameter, ProgramError, RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
@@ -7,7 +7,7 @@ use ryft_mlir::ValueRef;
 use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
-impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeCallOperation<V, RegionOperation, S>
+impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeOperation<V, RegionOperation, S>
 where
     Self: Operation,
 {
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_composite_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{CompositeCallOperation, CompositeJvpRule, PrintOperation};
+        use ryft_core::{CompositeOperation, CompositeJvpRule, PrintOperation};
 
         // A retained `composite` call lowers only its primal program and threads its effects onto the enclosing
         // ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked here by the
@@ -149,10 +149,10 @@ mod tests {
                 .unwrap()
         };
         for (operation, rules) in [
-            (CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, false), vec![&jvp]),
-            (CompositeCallOperation::from_rule_regions(CompositeJvpRule::Absent, true), vec![&forward, &backward]),
+            (CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false), vec![&jvp]),
+            (CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true), vec![&forward, &backward]),
             (
-                CompositeCallOperation::from_rule_regions(CompositeJvpRule::Explicit, true),
+                CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true),
                 vec![&jvp, &forward, &backward],
             ),
         ] {
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn test_custom_rule_lowering_inlines_only_the_primal_program() {
         use ryft_core::{
-            CompositeCallOperation, CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration,
+            CompositeOperation, CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration,
         };
 
         // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
@@ -208,7 +208,7 @@ mod tests {
         let input = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Composite(CompositeCallOperation::new(rules.reference())),
+                XlaOperation::Composite(CompositeOperation::new(rules.reference())),
                 vec![primal_region],
                 vec![input],
                 None,

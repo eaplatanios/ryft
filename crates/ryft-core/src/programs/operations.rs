@@ -1238,7 +1238,7 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
 ///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
 ///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
-///     such as `CompositeCallOperation<V, ArrayOperation<V>>` are not exposed.
+///     such as `CompositeOperation<V, ArrayOperation<V>>` are not exposed.
 ///   - [`from_payload`](Self::from_payload) tries the family's own (family-native) variants first, in declaration
 ///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
 ///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
