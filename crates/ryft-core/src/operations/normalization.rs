@@ -379,6 +379,62 @@ impl<
     }
 }
 
+/// Array inputs with their class axes flattened for single-axis arithmetic, together with the information needed to
+/// restore their original shape and axis order.
+struct FlattenedClassInputs<V> {
+    /// Flattened inputs, in their original input order.
+    inputs: Vec<V>,
+
+    /// Position of the (possibly merged) class axis in the flattened inputs.
+    axis: usize,
+
+    /// Inverse permutation and transposed shape that restore the original layout, present for several class axes.
+    restoration: Option<(Vec<usize>, Vec<usize>)>,
+}
+
+impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
+    /// Creates a new [`FlattenedClassInputs`] instance by flattening the class `axes` of `inputs`. Callers provide at
+    /// least one input, a shared static shape, and non-empty, distinct axes validated for that shape in increasing
+    /// order. Several class axes are moved to the end and merged into one; a single class axis leaves the inputs
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if a transpose or reshape fails.
+    fn new(inputs: Vec<V>, axes: &[usize]) -> Result<Self, ProgramError> {
+        if let [axis] = axes {
+            return Ok(Self { inputs, axis: *axis, restoration: None });
+        }
+        let input_type = inputs[0].r#type();
+        let rank = input_type.rank();
+        let shape = input_type.static_shape().unwrap();
+        let permutation = (0..rank).filter(|axis| !axes.contains(axis)).chain(axes.iter().copied()).collect::<Vec<_>>();
+        let mut inverse_permutation = vec![0; rank];
+        for (position, &axis) in permutation.iter().enumerate() {
+            inverse_permutation[axis] = position;
+        }
+        let transposed_shape = permutation.iter().map(|&axis| shape[axis]).collect::<Vec<_>>();
+        let class_axis = rank - axes.len();
+        let mut flattened_shape = transposed_shape[..class_axis].to_vec();
+        flattened_shape.push(transposed_shape[class_axis..].iter().product());
+        let inputs = inputs
+            .into_iter()
+            .map(|input| input.transpose(permutation.clone())?.reshape(flattened_shape.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { inputs, axis: class_axis, restoration: Some((inverse_permutation, transposed_shape)) })
+    }
+
+    /// Restores the original shape and axis order of `value`, an output with the flattened inputs' shape.
+    fn restore(&self, value: V) -> Result<V, ProgramError> {
+        match &self.restoration {
+            None => Ok(value),
+            Some((inverse_permutation, transposed_shape)) => {
+                value.reshape(transposed_shape.clone())?.transpose(inverse_permutation.clone())
+            }
+        }
+    }
+}
+
 /// Validates the logits contract shared by every normalization entry point and returns the normalized class axes in
 /// increasing order with the arithmetic data type: `f64` keeps its precision and every other real floating-point
 /// format computes in `f32`. Diagnostics name `function`, the public entry point being validated.
@@ -487,61 +543,6 @@ fn validate_normalization_labels(
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Array inputs with their class axes flattened for single-axis arithmetic, together with the information needed to
-/// restore their original shape and axis order.
-struct FlattenedClassInputs<V> {
-    /// Flattened inputs, in their original input order.
-    inputs: Vec<V>,
-
-    /// Position of the (possibly merged) class axis in the flattened inputs.
-    axis: usize,
-
-    /// Inverse permutation and transposed shape that restore the original layout, present for several class axes.
-    restoration: Option<(Vec<usize>, Vec<usize>)>,
-}
-
-impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
-    /// Flattens the class `axes` of `inputs`. Callers provide at least one input, a shared static shape, and nonempty,
-    /// distinct axes validated for that shape in increasing order. Several class axes are moved to the end and merged
-    /// into one; a single class axis leaves the inputs unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] if a transpose or reshape fails.
-    fn new(inputs: Vec<V>, axes: &[usize]) -> Result<Self, ProgramError> {
-        if let [axis] = axes {
-            return Ok(Self { inputs, axis: *axis, restoration: None });
-        }
-        let input_type = inputs[0].r#type();
-        let rank = input_type.rank();
-        let shape = input_type.static_shape().unwrap();
-        let permutation = (0..rank).filter(|axis| !axes.contains(axis)).chain(axes.iter().copied()).collect::<Vec<_>>();
-        let mut inverse_permutation = vec![0; rank];
-        for (position, &axis) in permutation.iter().enumerate() {
-            inverse_permutation[axis] = position;
-        }
-        let transposed_shape = permutation.iter().map(|&axis| shape[axis]).collect::<Vec<_>>();
-        let class_axis = rank - axes.len();
-        let mut flattened_shape = transposed_shape[..class_axis].to_vec();
-        flattened_shape.push(transposed_shape[class_axis..].iter().product());
-        let inputs = inputs
-            .into_iter()
-            .map(|input| input.transpose(permutation.clone())?.reshape(flattened_shape.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { inputs, axis: class_axis, restoration: Some((inverse_permutation, transposed_shape)) })
-    }
-
-    /// Restores the original shape and axis order of `value`, an output with the flattened inputs' shape.
-    fn restore(&self, value: V) -> Result<V, ProgramError> {
-        match &self.restoration {
-            None => Ok(value),
-            Some((inverse_permutation, transposed_shape)) => {
-                value.reshape(transposed_shape.clone())?.transpose(inverse_permutation.clone())
-            }
-        }
-    }
-}
 
 /// Computes log-probabilities along `axis` with one pivot class per row held at a constant zero.
 fn log_softmax_along<V>(input: &V, axis: usize) -> Result<V, ProgramError>
@@ -749,7 +750,7 @@ where
 ///
 /// Each call returns `-sum(softmax(target_logits) * log_softmax(logits), axes)` and removes the class axes,
 /// which are normalized jointly as in [`Softmax`]. The inputs must have equal static shapes and real floating-point
-/// element types; every class axis must be nonempty. Negative axes count from the end. Computation uses `f32` for
+/// element types; every class axis must be non0empty. Negative axes count from the end. Computation uses `f32` for
 /// narrower inputs and restores the original output element type. Negative infinity can mask classes; NaN, positive
 /// infinity, and rows containing only masked logits produce NaNs as in [`Softmax`].
 ///
