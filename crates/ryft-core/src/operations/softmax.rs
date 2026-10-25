@@ -684,6 +684,63 @@ impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
     }
 }
 
+/// Validated target and prediction logits for [`softmax_cross_entropy_with_target_logits`] and its Jacobian-Vector
+/// Product (JVP). Both use `f64` for `f64` inputs and `f32` otherwise, with class axes combined into one. Original
+/// axes and element type are retained for preparing tangents and restoring the loss's element type.
+struct CrossEntropyInputsWithTargetLogits<V> {
+    /// Target logits in working precision, with the class axes combined into the axis at [`Self::axis`].
+    target_logits: V,
+
+    /// Prediction logits in working precision, with the class axes combined into the axis at [`Self::axis`].
+    logits: V,
+
+    /// Zero-based class-axis indices in the original input shape, sorted in increasing order.
+    class_axes: Vec<usize>,
+
+    /// Index of the single class axis in the prepared logits, which combines the original [`Self::class_axes`].
+    axis: usize,
+
+    /// Original element [`DataType`] of both inputs, used to convert the loss back from working precision.
+    output_data_type: DataType,
+}
+
+impl<V: Value<Type = ArrayType> + ConvertElementType + Reshape + Transpose> CrossEntropyInputsWithTargetLogits<V> {
+    /// Creates a new [`CrossEntropyInputsWithTargetLogits`] instance by validating `logits` and `target_logits`,
+    /// widening them to working precision, and flattening their class `axes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for incompatible logits, invalid class axes or placement, or a failed conversion,
+    /// transpose, or reshape.
+    fn new(logits: V, target_logits: V, axes: &Axes) -> Result<Self, ProgramError> {
+        let logits_type = logits.r#type();
+        let target_logits_type = target_logits.r#type();
+        if logits_type.shape() != target_logits_type.shape()
+            || logits_type.data_type() != target_logits_type.data_type()
+        {
+            return Err(TypeError::invalid(
+                "`softmax_cross_entropy_with_target_logits` requires logits and target logits \
+                 with the same shape and element type",
+            )
+            .into());
+        }
+        let (class_axes, working_data_type) =
+            validate_normalization("softmax_cross_entropy_with_target_logits", &logits_type, axes.clone())?;
+        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &target_logits_type)?;
+        let output_data_type = logits_type.data_type();
+        let mut flattened = FlattenedClassInputs::new(
+            vec![
+                target_logits.convert_element_type(working_data_type)?,
+                logits.convert_element_type(working_data_type)?,
+            ],
+            &class_axes,
+        )?;
+        let logits = flattened.inputs.pop().unwrap();
+        let target_logits = flattened.inputs.pop().unwrap();
+        Ok(Self { target_logits, logits, class_axes, axis: flattened.axis, output_data_type })
+    }
+}
+
 /// Validates the logits contract shared by every normalization entry point and returns the normalized class axes in
 /// increasing order with the arithmetic data type: `f64` keeps its precision and every other real floating-point
 /// format computes in `f32`. Diagnostics name `function`, the public entry point being validated.
@@ -867,62 +924,6 @@ fn one_hot_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcas
     let coordinates = input.domain().iota(&index_type, axis)?;
     let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
     coordinates.equal(&indices.broadcast(index_type, &output_axes)?)
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Validated target and prediction logits in working precision, with flattened class axes and metadata for the loss
-/// and its JVP.
-struct CrossEntropyInputsWithTargetLogits<V> {
-    /// Target logits in the working representation, with the class axes flattened.
-    target_logits: V,
-
-    /// Prediction logits in the working representation, with the class axes flattened.
-    logits: V,
-
-    /// Normalized class axes of the original inputs, in increasing order.
-    class_axes: Vec<usize>,
-
-    /// Position of the flattened class axis.
-    axis: usize,
-
-    /// Element type of the loss.
-    output_data_type: DataType,
-}
-
-impl<V: Value<Type = ArrayType> + ConvertElementType + Reshape + Transpose> CrossEntropyInputsWithTargetLogits<V> {
-    /// Validates `logits` and `target_logits`, widens them to working precision, and flattens their class `axes`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] for incompatible logits, invalid class axes or placement, or a failed conversion,
-    /// transpose, or reshape.
-    fn new(logits: V, target_logits: V, axes: &Axes) -> Result<Self, ProgramError> {
-        let logits_type = logits.r#type();
-        let target_logits_type = target_logits.r#type();
-        if logits_type.shape() != target_logits_type.shape()
-            || logits_type.data_type() != target_logits_type.data_type()
-        {
-            return Err(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` requires logits and target logits with the same shape and element type",
-            )
-            .into());
-        }
-        let (class_axes, working_data_type) =
-            validate_normalization("softmax_cross_entropy_with_target_logits", &logits_type, axes.clone())?;
-        validate_normalization_placement("softmax_cross_entropy_with_target_logits", &target_logits_type)?;
-        let output_data_type = logits_type.data_type();
-        let mut flattened = FlattenedClassInputs::new(
-            vec![
-                target_logits.convert_element_type(working_data_type)?,
-                logits.convert_element_type(working_data_type)?,
-            ],
-            &class_axes,
-        )?;
-        let logits = flattened.inputs.pop().unwrap();
-        let target_logits = flattened.inputs.pop().unwrap();
-        Ok(Self { target_logits, logits, class_axes, axis: flattened.axis, output_data_type })
-    }
 }
 
 #[cfg(test)]
