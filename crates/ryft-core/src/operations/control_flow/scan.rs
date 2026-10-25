@@ -1038,8 +1038,6 @@ impl<T: Type> ScanOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: ScanType> ScanOperation<T> {
     /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e., the
     /// intrinsic iteration index followed by the carries and the slices or reference stacks of the stacked inputs),
@@ -1209,14 +1207,14 @@ impl<T: ScanType> ScanOperation<T> {
     ///
     /// The boundary relates every stacked leading extent to the iteration count (refer to [`ScanType`]). Conflicting
     /// static extents are rejected here, while a relationship that the input types leave unproven (e.g., an exact
-    /// iteration count of type `dimension<3>` next to a stack of type `f32[iteration_count]`) is checked at runtime by
-    /// the scan boundary, or by the entry guard that a rule which removes or splits that boundary stages first.
+    /// iteration count of type `dimension<3>` next to a stack of type `f32[iteration_count]`) is checked at runtime
+    /// by the scan boundary, or by the entry guard that a rule which removes or splits that boundary stages first.
     ///
     /// # Parameters
     ///
     ///   - `input_types`: Types of the operation inputs.
     ///   - `body`: Iteration body of the scan.
-    pub(crate) fn validate_application<V: Value<Type = T>, O: Operation<Type = T>>(
+    fn validate_application<V: Value<Type = T>, O: Operation<Type = T>>(
         &self,
         input_types: &[T],
         body: RegionRef<'_, V, O>,
@@ -1237,6 +1235,7 @@ impl<T: ScanType> ScanOperation<T> {
             ProgramError
         );
         let output_types = self.infer_output_types(input_types, &[body.interface()])?;
+
         // The intrinsic index (body input 0) is never a reference, and carry `i` is body input `i + 1`.
         validate_reference_carry_roots(SCAN_OPERATION_NAME, body, 1..1 + self.carry_count)?;
         Ok(output_types)
@@ -1249,6 +1248,8 @@ impl<T: ScanType> Display for ScanOperation<T> {
         self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: ScanType> Operation for ScanOperation<T> {
     type Type = T;
