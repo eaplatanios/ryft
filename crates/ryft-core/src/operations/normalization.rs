@@ -234,8 +234,6 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     ) -> Result<Self, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
         + ZeroLike
@@ -258,7 +256,8 @@ impl<
 {
     fn softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("softmax", &self.r#type(), axes.into())?;
-        // Keep the exponential widened too: narrowing log-probabilities first would lose their small corrections.
+
+        // Keep the exponential widened too as narrowing log-probabilities first would lose their small corrections.
         self.convert_element_type(working_type)?
             .log_softmax(axes)?
             .exp()?
@@ -268,6 +267,7 @@ impl<
     fn masked_softmax<A: Into<Axes>>(&self, mask: &Self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("masked_softmax", &self.r#type(), axes.into())?;
         validate_normalization_mask("masked_softmax", &self.r#type(), &mask.r#type())?;
+
         // The exponential of a negative infinite log-probability is the zero probability of an unselected class.
         self.convert_element_type(working_type)?
             .masked_log_softmax(mask, axes)?
@@ -296,6 +296,7 @@ impl<
     fn softmax_cross_entropy<A: Into<Axes>>(&self, probability_targets: &Self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("softmax_cross_entropy", &self.r#type(), axes.into())?;
         validate_normalization_targets("softmax_cross_entropy", &self.r#type(), &probability_targets.r#type())?;
+
         // Aligning once here stages a single variation transition instead of one per binary operation below.
         let aligned = V::align_manual_variation(&[
             self.convert_element_type(working_type)?,
@@ -340,6 +341,7 @@ impl<
         let function = "softmax_cross_entropy_with_integer_labels";
         let (axes, working_type) = validate_normalization(function, &self.r#type(), axes.into())?;
         validate_normalization_labels(function, &self.r#type(), &labels.r#type(), &axes)?;
+
         // The class coordinates take the logits' type, including its varying manual axes, so the labels must vary over
         // the same axes before they are broadcast against them, just as a binary capability aligns its inputs before
         // binding. The transition that this stages on the logits, when they are the invariant input, transposes to
@@ -376,6 +378,8 @@ impl<
             .convert_element_type(self.r#type().data_type())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates the logits contract shared by every normalization entry point and returns the normalized class axes in
 /// increasing order with the arithmetic data type: `f64` keeps its precision and every other real floating-point
