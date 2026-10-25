@@ -881,8 +881,6 @@ pub struct ScanOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type> ScanOperation<T> {
     /// Creates a new [`ScanOperation`] with the provided carry count and iteration count, visiting iterations
     /// in increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`] mapping
@@ -908,19 +906,19 @@ impl<T: Type> ScanOperation<T> {
 
     /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. Reversal changes the order in which
     /// the body observes iteration indices, carries, and slices, while slice `i` of every stacked output still pairs
-    /// with slice `i` of every stacked input.
+    /// with slice `i` of every stacked input. Passing `false` restores forward order on an already reversed operation.
     #[inline]
     pub fn with_reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
         self
     }
 
-    /// Returns this [`ScanOperation`] with the lowering unroll factor set to `unroll`, which must be at least `1`.
-    /// Unrolling is lowering-only: interpretation and transform rules ignore the factor but preserve it on every scan
-    /// they derive, while lowerings emit `unroll` consecutive body copies per lowered loop iteration and follow the
-    /// loop with the `iteration_count % unroll` remaining iterations. A factor of at least a static
-    /// [`iteration_count`](Self::iteration_count) unrolls the scan completely, with no loop at all (e.g., `usize::MAX`
-    /// fully unrolls a scan of any static iteration count).
+    /// Returns this [`ScanOperation`] with the lowering unrolling factor set to `unroll`, which must be at least `1`.
+    /// Passing `1` restores the default factor. Note that unrolling is _lowering-only_, meaning that interpretation
+    /// and transform rules ignore the factor but preserve it on every scan they derive, while lowerings emit `unroll`
+    /// consecutive body copies per lowered loop iteration and follow the loop with the `iteration_count % unroll`
+    /// remaining iterations. A factor of at least a static [`iteration_count`](Self::iteration_count) unrolls the
+    /// scan completely, with no loop at all (e.g., `usize::MAX` fully unrolls a scan of any static iteration count).
     pub fn with_unroll(mut self, unroll: usize) -> Result<Self, ProgramError> {
         if unroll == 0 {
             return Err(TypeError::invalid(format!("`{SCAN_OPERATION_NAME}` unroll factor must be at least 1")).into());
@@ -928,6 +926,8 @@ impl<T: Type> ScanOperation<T> {
         self.unroll = unroll;
         Ok(self)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns this [`ScanOperation`] with the leading scan axis of each stacked output placed as the corresponding
     /// entry of `shardings` declares, instead of replicated; the stacked outputs beyond the list stay replicated. A
@@ -4527,8 +4527,9 @@ mod tests {
 
     #[test]
     fn test_scan_with_unroll() {
-        // The lowering-only unroll factor must be at least 1 but need not divide the length: lowerings run the
-        // remaining iterations after the unrolled loop, and a factor of at least the length unrolls completely.
+        // The lowering-only unroll factor must be at least 1 but need not divide the iteration count: lowerings run the
+        // remaining iterations after the unrolled loop, and a factor of at least the iteration count unrolls
+        // completely.
         assert_eq!(
             TestScanOperation::new(1, 3).with_unroll(0),
             Err(ProgramError::Type(TypeError::invalid("`scan` unroll factor must be at least 1"))),
@@ -4542,7 +4543,7 @@ mod tests {
             Ok(usize::MAX),
         );
 
-        // A dynamic length admits any positive factor as well, because the remainder is computed at run time.
+        // A dynamic iteration count admits any positive factor as well, because the remainder is computed at run time.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let dynamic = ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length)).with_unroll(4).unwrap();
         assert_eq!(dynamic.unroll(), 4);
@@ -4665,7 +4666,7 @@ mod tests {
     #[test]
     fn test_scan_declared_output_types() {
         // Carries keep their body types, and a stacked output gains a replicated leading scan axis of the declared
-        // length while keeping the sharding and memory placement of its slice.
+        // iteration count while keeping the sharding and memory placement of its slice.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let carry_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
@@ -4858,8 +4859,9 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_scan_type_inference_rejects_unrepresentable_iteration_count() {
-        // A carry-only scan has no stacked array whose shape would otherwise expose an oversized length, so both type
-        // inference and eager interpretation reject the length itself before narrowing the counter to `i64`.
+        // A carry-only scan has no stacked array whose shape would otherwise expose an oversized iteration count, so
+        // both type inference and eager interpretation reject the iteration count itself before narrowing the counter
+        // to `i64`.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = RegionInterface::new(
             vec![ArrayType::scalar(DataType::I64), scalar_type.clone()],
@@ -5151,9 +5153,9 @@ mod tests {
             Ok(vec![static_reference_type]),
         );
 
-        // When a first-class dimension carry shares the identity of the scan length, the carries that refer to it stay
-        // symbolic because that carry may change across iterations, while the stacked output's leading axis still takes
-        // the iteration count that the exact iteration count fixes before the first iteration.
+        // When a first-class dimension carry shares the identity of the iteration count, the carries that refer to it
+        // stay symbolic because that carry may change across iterations, while the stacked output's leading axis still
+        // takes the iteration count that the exact iteration count fixes before the first iteration.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let dimension_carry_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
         let array_carry_type =
@@ -5329,14 +5331,14 @@ mod tests {
 
     #[test]
     fn test_scan_type_inference_iteration_count() {
-        // A dynamic iteration count input must carry the scan length's nominal identity: an unrelated dynamic identity
-        // with compatible bounds cannot redefine the stacked axis. An iteration count input whose bounds pin one exact
-        // extent inside the declared bounds (and only such an input, not one whose exact extent lies outside them)
-        // fixes the iteration count to that extent, and the stacked inputs are related to it like to a nominal
+        // A dynamic iteration count input must carry the iteration count's nominal identity: an unrelated dynamic
+        // identity with compatible bounds cannot redefine the stacked axis. An iteration count input whose bounds pin
+        // one exact extent inside the declared bounds (and only such an input, not one whose exact extent lies outside
+        // them) fixes the iteration count to that extent, and the stacked inputs are related to it like to a nominal
         // iteration count: a stacked axis left symbolic is checked against the iteration count by the scan boundary
         // when it executes, so that it is never read a fixed number of times regardless of its independently determined
         // runtime size. The accepted refinement also types the stacked outputs at the concrete extent instead of at the
-        // still-symbolic declared length.
+        // still-symbolic declared iteration count.
         let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
@@ -5430,11 +5432,12 @@ mod tests {
 
     #[test]
     fn test_scan_type_inference_relates_carries_to_the_iteration_count() {
-        // A carry that the body declares with the dynamic length's identity shares that identity with the trailing
-        // iteration count input, so the scan boundary relates the two. An `f32[3]` carry refines `f32[length]` without
-        // proving that the iteration count is 3: the relationship is reported for runtime validation, staging keeps the
-        // declared body instead of specializing it away, and eager interpretation rejects another iteration count.
-        // Program construction and tracing agree in both cases, including on rejecting an unrelated symbolic extent.
+        // A carry that the body declares with the dynamic iteration count's identity shares that identity with the
+        // trailing iteration count input, so the scan boundary relates the two. An `f32[3]` carry refines `f32[length]`
+        // without proving that the iteration count is 3: the relationship is reported for runtime validation, staging
+        // keeps the declared body instead of specializing it away, and eager interpretation rejects another iteration
+        // count. Program construction and tracing agree in both cases, including on rejecting an unrelated symbolic
+        // extent.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
         let carry_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into()])));
         let length_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
@@ -5827,8 +5830,8 @@ mod tests {
             )),
         );
 
-        // A body with no outputs whose retained effect consumes its stacked input still executes for a positive length.
-        // `Some(empty)` keeps that retained body work, whereas `None` skips the body altogether.
+        // A body with no outputs whose retained effect consumes its stacked input still executes for a positive
+        // iteration count. `Some(empty)` keeps that retained body work, whereas `None` skips the body altogether.
         let mut liveness = TestRegionLiveness::new(|_| vec![false, true]);
         let regions = [RegionDataFlowRegionBoundary { input_count: 2, output_count: 0 }];
         let boundary = RegionDataFlowBoundary { input_count: 1, output_count: 0, regions: &regions };
@@ -6279,9 +6282,9 @@ mod tests {
 
     #[test]
     fn test_scan_boundary_pruning_drops_dead_reference_stacks() {
-        // A reference stack has a static type, so a scan with a dynamic length admits it only when its leading extent
-        // is provably equal to the iteration count (here, the exact iteration count `dimension<3>`). The scan boundary
-        // therefore has nothing to check about a dead reference stack, and pruning drops it.
+        // A reference stack has a static type, so a scan with a dynamic iteration count admits it only when its leading
+        // extent is provably equal to the iteration count (here, the exact iteration count `dimension<3>`). The scan
+        // boundary therefore has nothing to check about a dead reference stack, and pruning drops it.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -6450,8 +6453,8 @@ mod tests {
 
     #[test]
     fn test_scan_rename_type_identities() {
-        // Renaming rewrites the identity of a dynamic length and preserves every other field, while a static iteration
-        // count has no identity to rename.
+        // Renaming rewrites the identity of a dynamic iteration count and preserves every other field, while a static
+        // iteration count has no identity to rename.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let renamed = DimensionVariable::new("renamed", DimensionBounds::positive(Some(8)).unwrap());
         let mut renaming = TypeIdentityRenaming::new();
@@ -6744,7 +6747,7 @@ mod tests {
     #[test]
     fn test_scan_reference_discharge_threads_reference_captures() {
         // A capture read by a scan body becomes a synthesized carry appended after the declared carry prefix, which
-        // raises the rewritten scan's carry count without disturbing its length, direction, or unroll factor.
+        // raises the rewritten scan's carry count without disturbing its iteration count, direction, or unroll factor.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let concrete_reference = ArrayReference::new(Array::scalar(4.0f32).unwrap());
         let mut body_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
@@ -8728,8 +8731,8 @@ mod tests {
     fn test_scan_reference_discharge_moves_carried_stacks_ahead_of_array_stacks() {
         // The body maps `[carry, stack: ref<f32[3]>, x]` to `[carry + stack[index], stack[index]]` after adding `x` to
         // `stack[index]`. Discharge carries the state of the reference stack whole, so its input moves into the carry
-        // prefix ahead of the ordinary array stack, which keeps its order, and a dynamic length keeps its iteration
-        // count as the trailing input.
+        // prefix ahead of the ordinary array stack, which keeps its order, and a dynamic iteration count keeps its
+        // iteration count as the trailing input.
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
         let row_transforms =
             vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
@@ -8826,7 +8829,8 @@ mod tests {
         );
         assert_eq!(discharged.program().interpret(inputs.clone()), Ok(expected.clone()));
 
-        // A reference stack beside a dynamic length must have a leading extent that the exact iteration count proves.
+        // A reference stack beside a dynamic iteration count must have a leading extent that the exact iteration count
+        // proves.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         let source = program(ScanOperation::new(1, Dimension::Dynamic(length)), Some(&three));
@@ -9096,7 +9100,7 @@ mod tests {
             Ok(vec![Array::scalar(1.0).unwrap(), empty]),
         );
 
-        // A homogeneous array scan has no iteration count input, so its application rejects a dynamic length.
+        // A homogeneous array scan has no iteration count input, so its application rejects a dynamic iteration count.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let bodies = [Arc::new(product_body())];
         let region_driver = CalleeRegionDriver::new(&bodies);
@@ -9425,8 +9429,12 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[2][sharding={mesh<['m'=1:manual, 'a'=1:auto]>, [{}]}] .
-                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false, \
-                stacked_axis_shardings=[{'m', 'a'}]] %0 %1 [
+                let %2:f64[], %3:f64[2] = scan [
+                    carry_count=1,
+                    iteration_count=2,
+                    reverse=false,
+                    stacked_axis_shardings=[{'m', 'a'}],
+                ] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[] .
                         in (%2, %1)
@@ -9546,8 +9554,9 @@ mod tests {
 
     #[test]
     fn test_scan_interpretation_validates_concrete_dynamic_stack_iteration_counts() {
-        // A concrete stack that shares the identity of the dynamic length must have the extent of the iteration count,
-        // so both program replay and direct eager binding run a matching application and reject a mismatched one.
+        // A concrete stack that shares the identity of the dynamic iteration count must have the extent of the
+        // iteration count, so both program replay and direct eager binding run a matching application and reject a
+        // mismatched one.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(5)).unwrap());
         let scalar = ArrayType::scalar(DataType::F64);
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -12563,9 +12572,9 @@ mod tests {
 
     #[test]
     fn test_scan_partial_evaluation_dynamic_iteration_count() {
-        // A dynamic-length array IR scan folds its loop-invariant known carry like a static one, and the rewritten
-        // residual scan keeps the dynamic length and its trailing iteration count input. The body maps
-        // `[scale, accumulator, x]` to `[scale, accumulator + scale * x, scale * x]`.
+        // An array IR scan with a dynamic iteration count folds its loop-invariant known carry like a static one, and
+        // the rewritten residual scan keeps the dynamic iteration count and its trailing iteration count input. The
+        // body maps `[scale, accumulator, x]` to `[scale, accumulator + scale * x, scale * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -14508,9 +14517,9 @@ mod tests {
 
     #[test]
     fn test_scan_batching_array_ir_preserves_reverse_and_unroll() {
-        // The array IR rule threads the mapped extent as a leading replicated carry and keeps the dynamic length, its
-        // trailing iteration count input, the visit order, and the unroll factor of the source scan. The body maps
-        // `[carry, x]` to `[carry + x, carry]`.
+        // The array IR rule threads the mapped extent as a leading replicated carry and keeps the dynamic iteration
+        // count, its trailing iteration count input, the visit order, and the unroll factor of the source scan. The
+        // body maps `[carry, x]` to `[carry + x, carry]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -14584,9 +14593,9 @@ mod tests {
         // An iteration count mapped over the batch would give each batch item its own iteration count, which one scan
         // over the packed batch cannot express. A first-class dimension cannot be mapped in the first place (batch
         // construction rejects it before any rule runs, as the `ArrayIrBatch` tests pin), so the rule always receives a
-        // replicated iteration count. It threads that length unchanged as the trailing input of the batched reversed
-        // scan, while the carry stays at batch axis 0 and the stacked input keeps its batch axis behind the leading
-        // scan axis.
+        // replicated iteration count. It threads that iteration count unchanged as the trailing input of the batched
+        // reversed scan, while the carry stays at batch axis 0 and the stacked input keeps its batch axis behind the
+        // leading scan axis.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -15195,7 +15204,7 @@ mod tests {
     fn test_scan_zero_iteration_count_through_interpretation_partial_evaluation_and_batching() {
         // A scan with a dynamic iteration count whose iteration count is zero runs no iteration when interpreted,
         // partially evaluated, or batched: each staged program keeps one scan over the iteration count, and executing
-        // it at length zero returns the initial carry next to empty stacks.
+        // it with an iteration count of zero returns the initial carry next to empty stacks.
         // `test_scan_differentiation_zero_iteration_count` covers the differentiation transforms of the same scan.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
         let length_type = DimensionType::from(length.clone());
@@ -16436,7 +16445,7 @@ mod tests {
     fn test_scan_differentiation_zero_dynamic_iteration_count() {
         // A scan with a dynamic iteration count whose iteration count is zero runs no iteration under forward mode,
         // linearization, or its pullback: each staged program keeps one scan over the iteration count, and executing it
-        // at length zero returns the initial carry, or its tangent or cotangent, next to empty stacks.
+        // with an iteration count of zero returns the initial carry, or its tangent or cotangent, next to empty stacks.
         let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(4)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
@@ -16661,8 +16670,9 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_dynamic_iteration_count() {
-        // A dynamic-length array IR scan differentiates through its fused scan like a static one, threading its
-        // trailing iteration count input, which has no tangent. The body maps `[carry, x]` to `[carry * x, carry * x]`.
+        // An array IR scan with a dynamic iteration count differentiates through its fused scan like a static one,
+        // threading its trailing iteration count input, which has no tangent. The body maps `[carry, x]` to `[carry *
+        // x, carry * x]`.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -16847,7 +16857,7 @@ mod tests {
                 lambda %0:dimension<carry_extent ∈ [1, 8)>, %1:f64[], %2:f64[length], %3:dimension<length ∈ [1, 8)>, \
                  %4:f64[], %5:f64[length] .
                 let %6:dimension<carry_extent ∈ [1, 8)>, %7:f64[], %8:f64[], %9:f64[length], %10:f64[length] = scan \
-                 [carry_count=3, length=length, reverse=false] %0 %1 %4 %2 %5 %3 [
+                 [carry_count=3, iteration_count=length, reverse=false] %0 %1 %4 %2 %5 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<carry_extent ∈ [1, 8)>, %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
                         let %6:f64[] = mul %2 %4
@@ -16889,7 +16899,7 @@ mod tests {
                 lambda %0:dimension<carry_extent ∈ [1, 8)>, %1:f64[], %2:f64[length], %3:dimension<length ∈ [1, 8)> .
                 let %4:dimension<carry_extent ∈ [1, 8)>, %5:f64[], %6:f64[length], %7:f64[length] = scan \
                  [carry_count=2, \
-                 length=length, reverse=false] %0 %1 %2 %3 [
+                 iteration_count=length, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:dimension<carry_extent ∈ [1, 8)>, %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %2 %3
@@ -18262,7 +18272,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[3], %2:f64[], %3:f64[3], %4:f64[], %5:f64[3], %6:f64[], %7:f64[3] .
                 let %8:f64[], %9:f64[], %10:f64[], %11:f64[], %12:f64[3], %13:f64[3], %14:f64[3], %15:f64[3] = scan \
-                 [carry_count=4, length=3, reverse=false] %0 %2 %4 %6 %1 %3 %5 %7 [
+                 [carry_count=4, iteration_count=3, reverse=false] %0 %2 %4 %6 %1 %3 %5 %7 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[], %7:f64[], \
                  %8:f64[] .
@@ -18567,9 +18577,9 @@ mod tests {
 
     #[test]
     fn test_scan_transform_orders_with_an_unknown_iteration_count() {
-        // A dynamic-length cumulative product whose stacked input alone is differentiated and mapped. Both orders of
-        // batching and forward-mode differentiation stage the same fused scan, which keeps the trailing iteration count
-        // and threads the batch extent as a leading carry, and both compute the same values.
+        // A cumulative product with a dynamic iteration count whose stacked input alone is differentiated and mapped.
+        // Both orders of batching and forward-mode differentiation stage the same fused scan, which keeps the trailing
+        // iteration count and threads the batch extent as a leading carry, and both compute the same values.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stacked_type =
@@ -18615,7 +18625,7 @@ mod tests {
                     %7:f32[length, 2] = transpose [permutation=[1, 0]] %4
                     %8:f32[2] = zero [type=f32[2]]
                     %9:dimension<2>, %10:f32[2], %11:f32[2], %12:f32[length, 2], %13:f32[length, 2] = scan \
-                 [carry_count=3, length=length, reverse=false] %0 %5 %8 %6 %7 %3 [
+                 [carry_count=3, iteration_count=length, reverse=false] %0 %5 %8 %6 %7 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2], %4:f32[2], %5:f32[2] .
                             let %6:f32[2] = mul %2 %4
@@ -18652,7 +18662,7 @@ mod tests {
                     %8:f32[length, 2] = transpose [permutation=[1, 0]] %2
                     %9:f32[length, 2] = transpose [permutation=[1, 0]] %4
                     %10:dimension<2>, %11:f32[2], %12:f32[2], %13:f32[length, 2], %14:f32[length, 2] = scan \
-                 [carry_count=3, length=length, reverse=false] %0 %5 %7 %8 %9 %3 [
+                 [carry_count=3, iteration_count=length, reverse=false] %0 %5 %7 %8 %9 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:f32[2], %4:f32[2], %5:f32[2] .
                             let %6:f32[2] = mul %2 %4
@@ -19321,9 +19331,9 @@ mod tests {
     #[test]
     fn test_scan_transposition() {
         // The body maps `[carry, x]` to `[carry + x, carry]`, so the scan is linear in its carry and its stacked input.
-        // Its transposition is one scan in the opposite visit order with the same length and unroll factor, over the
-        // output cotangents, and with unit output cotangents, `x_j` receives `1` from the final carry plus `1` from
-        // every later stacked output.
+        // Its transposition is one scan in the opposite visit order with the same iteration count and unroll factor,
+        // over the output cotangents, and with unit output cotangents, `x_j` receives `1` from the final carry plus `1`
+        // from every later stacked output.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let stacked_type = ArrayType::new_static(DataType::F64, [3]);
         let body = scalar_body(2, |builder, inputs| {
@@ -19443,7 +19453,7 @@ mod tests {
                 lambda %0:f64[][sharding={mesh<['x'=1:auto]>, []}], %1:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], \
                  %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
                 let %4:f64[][sharding={mesh<['x'=1:auto]>, []}], %5:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] = scan \
-                 [carry_count=1, length=3, reverse=false] %0 %1 %2 %3 [
+                 [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 %3 [
                     body={
                         lambda %0:i64[], %1:f64[][sharding={mesh<['x'=1:auto]>, []}], \
                  %2:f64[][sharding={mesh<['x'=1:auto]>, []}], %3:f64[][sharding={mesh<['x'=1:auto]>, []}], \
@@ -19464,7 +19474,7 @@ mod tests {
                 lambda %0:f64[][sharding={mesh<['x'=1:auto]>, []}], %1:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}], \
                  %2:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] .
                 let %3:f64[][sharding={mesh<['x'=1:auto]>, []}], %4:f64[3][sharding={mesh<['x'=1:auto]>, [{}]}] = scan \
-                 [carry_count=1, length=3, reverse=true] %0 %1 %2 [
+                 [carry_count=1, iteration_count=3, reverse=true] %0 %1 %2 [
                     body={
                         lambda %0:i64[], %1:f64[][sharding={mesh<['x'=1:auto]>, []}], \
                  %2:f64[][sharding={mesh<['x'=1:auto]>, []}], %3:f64[][sharding={mesh<['x'=1:auto]>, []}] .
@@ -20891,9 +20901,9 @@ mod tests {
 
     #[test]
     fn test_scan_transposition_keeps_dead_dynamic_stacked_cotangents_symbolic() {
-        // A dead stacked output's cotangent has the scan-length-prefixed type `f64[length, k]`, which no single value
-        // at the transposition boundary carries. It stays a structural zero: the body is transposed without a seed
-        // for it, so the reversed scan neither materializes a zero stack nor adds a zero slice in every iteration.
+        // A dead stacked output's cotangent has the stacked type `f64[length, k]`, which no single value at the
+        // transposition boundary carries. It stays a structural zero: the body is transposed without a seed for it, so
+        // the reversed scan neither materializes a zero stack nor adds a zero slice in every iteration.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let extent = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
         let item_type =
@@ -21871,7 +21881,7 @@ mod tests {
                 let %4:ref<f32[]> = reference_new %0
                     %5:ref<f32[]> = reference_new %2
                     %6:ref<f32[]>, %7:ref<f32[]>, %8:f32[], %9:ref<f32[]>, %10:ref<f32[]>, %11:f32[] = scan \
-                [carry_count=6, length=2, reverse=false] %4 %4 %1 %5 %5 %3 [
+                [carry_count=6, iteration_count=2, reverse=false] %4 %4 %1 %5 %5 %3 [
                         body={
                             lambda %0:i64[], %1:ref<f32[]>, %2:ref<f32[]>, %3:f32[], %4:ref<f32[]>, %5:ref<f32[]>, \
                 %6:f32[] .
@@ -21962,7 +21972,7 @@ mod tests {
     #[test]
     fn test_scan_type_validate_scan_body_type_signature() {
         // A declared body needs a scalar `i64` index and the same carry types on both of its boundaries, independently
-        // of the inputs that bind it, and a dynamic length requires a family that admits an iteration count.
+        // of the inputs that bind it, and a dynamic iteration count requires a family that admits an iteration count.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap()));
@@ -22016,7 +22026,7 @@ mod tests {
     fn test_scan_type_validate_scan_input_type_signature() {
         // The inputs must refine the declared carries and supply stacks whose slices refine the declared slices,
         // followed by an iteration count of the declared identity, or of one exact extent within its bounds, for a
-        // dynamic length. How that iteration count relates to the stacked axes is not validated here.
+        // dynamic iteration count. How that iteration count relates to the stacked axes is not validated here.
         let index_type = ArrayType::scalar(DataType::I64);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
@@ -22101,8 +22111,8 @@ mod tests {
             Ok(vec![index_type.clone(), stacked_reference.clone()]),
         );
 
-        // The stacked referent must be a stack over the scan length, and a first-class dimension is neither an array
-        // nor a reference.
+        // The stacked referent must be a stack over the iteration count, and a first-class dimension is neither an
+        // array nor a reference.
         assert_eq!(
             ArrayIrType::infer_scan_body_input_types(
                 &[ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4, 2])))],
