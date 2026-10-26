@@ -31,7 +31,7 @@
 //! # Binding Protocol
 //!
 //! [`Context::lift`] translates a stored [`Domain::Constant`] into the context's flowing [`Domain::Value`].
-//! [`Context::bind`] applies one operation to flowing inputs and receives an application-scoped [`BindingRegionDriver`]
+//! [`Context::bind`] applies one operation to flowing inputs and receives its application-scoped [`AttachedRegions`]
 //! containing the operation's ordered attached computations. Eager contexts expose those regions to interpretation
 //! rules, staging contexts import or intern them into the destination program, and transform contexts recursively
 //! rewrite them according to the operation's rule.
@@ -90,8 +90,8 @@ use crate::macros::check_builders;
 use crate::operations::{ConstantOperation, GuardOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
-    AtomId, BindingRegionDriver, FlatProgram, Operation, OperationProjection, OperationProvider, Program,
-    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value,
+    AtomId, AttachedRegions, FlatProgram, Operation, OperationProjection, OperationProvider, Program, ProgramBuilder,
+    ProgramError, Provenance, ProvenanceScope, ReferenceIdentity, RegionDriver, Type, Typed, Value,
     ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
@@ -232,27 +232,32 @@ pub trait Context:
     /// [`Instruction`](crate::Instruction) in their [`ProgramBuilder`], and transform contexts apply the corresponding
     /// transformation rule before forwarding rewritten operations to a parent context.
     ///
-    /// Nested computations belong to an operation application rather than to the operation payload itself. They are
-    /// therefore supplied alongside the operation and its inputs through `driver`, which may provide owned regions,
-    /// borrowed regions from a replayed program, or shared callee programs through one ordered
-    /// [`Region`](crate::Region) namespace. Eager and transform contexts make those regions available to the
-    /// operation's interpretation or transform driver. Staging contexts import or intern them into the destination
-    /// program and attach their [`RegionId`](crate::RegionId)s to the recorded instruction. The resulting sequence
-    /// must match the number and order returned by [`Operation::region_slots`].
+    /// Nested computations belong to an operation application rather than to the operation payload itself.
+    /// They are therefore supplied alongside the operation and its inputs as `regions`: anything convertible into
+    /// [`AttachedRegions`], which carries owned regions, borrowed regions from a replayed program, or shared callee
+    /// programs through one ordered [`Region`](crate::Region) namespace. Implementations convert `regions` once and
+    /// hand the concrete [`AttachedRegions`] to a body that is compiled per context rather than per way of supplying
+    /// regions. Eager and transform contexts make those regions available to the operation's interpretation or
+    /// transform driver. Staging contexts import or intern them into the destination program and attach their
+    /// [`RegionId`](crate::RegionId)s to the recorded instruction. The resulting sequence must match the number
+    /// and order returned by [`Operation::region_slots`].
     ///
     /// # Parameters
     ///
     ///   - `operation`: [`Operation`] being applied.
-    ///   - `driver`: Application-scoped [`BindingRegionDriver`] providing the complete ordered
-    ///     [`Region`](crate::Region)s supplied by this [`Operation`] application. Binding consumes the driver because
-    ///     staging may import or intern its roots into the destination [`Program`].
+    ///   - `regions`: Application-scoped [`AttachedRegions`] (or anything convertible into them) providing the complete
+    ///     ordered [`Region`](crate::Region)s supplied by this [`Operation`] application. Binding consumes them because
+    ///     staging may import or intern their roots into the destination [`Program`].
     ///   - `inputs`: Input values supplied to the operation, in operation-defined order.
-    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError>;
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r;
 
     /// Returns `true` if this [`Context`] is *eager* meaning that its [`bind`](Self::bind) function computes
     /// concrete values immediately so that concretizing extractions such as
@@ -468,15 +473,20 @@ where
     }
 
     #[inline]
-    fn bind<P: Into<O>, D: BindingRegionDriver<V, O>>(
+    fn bind<'r, P: Into<O>, R: Into<AttachedRegions<'r, V, O>>>(
         &self,
         operation: P,
-        driver: D,
+        regions: R,
         inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        V: 'r,
+        O: 'r,
+    {
         let operation = operation.into();
-        operation.validate_region_interfaces(&driver.region_interfaces())?;
-        operation.interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
+        let regions = regions.into();
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
+        operation.interpret(self, &EagerInterpretationDriver::new(&regions), inputs)
     }
 
     #[inline]
@@ -558,22 +568,20 @@ impl<C: Domain, T: Type> ProjectedContext<C, T> {
 }
 
 impl<C: ContextProjection<T>, T: Type> ProjectedContext<C, T> {
-    /// Internal helper that lifts the member-family regions supplied by `driver` into parent-family [`Program`]s.
-    /// The regions of a member operation are member-family programs, so every value that they carry is of the member
-    /// kind, and they are lifted into the parent family exactly like the operation itself. This is generic over the
-    /// driver only, so that its iterator adapters are compiled once per driver rather than once per input operation
-    /// type.
+    /// Internal helper that lifts the member-family `regions` into parent-family [`Program`]s. The regions of a
+    /// member operation are member-family programs, so every value that they carry is of the member kind, and they
+    /// are lifted into the parent family exactly like the operation itself. This is compiled once per projection
+    /// rather than once per input operation type.
     #[allow(clippy::type_complexity)]
     #[inline]
-    fn unproject_regions<
-        D: BindingRegionDriver<
-                <C::Constant as ValueProjection<T>>::Projected,
-                <C::Operation as OperationProjection<T>>::Projected,
-            >,
-    >(
-        driver: &D,
+    fn unproject_regions(
+        regions: &AttachedRegions<
+            '_,
+            <C::Constant as ValueProjection<T>>::Projected,
+            <C::Operation as OperationProjection<T>>::Projected,
+        >,
     ) -> Result<Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, ProgramError> {
-        driver
+        regions
             .regions()
             .map(|region| region.to_program().into_unprojected::<C::Constant, C::Operation>())
             .collect()
@@ -645,15 +653,19 @@ impl<C: ContextProjection<T>, T: Type> Context for ProjectedContext<C, T> {
     }
 
     #[inline]
-    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
         // The regions of a member operation are member-family programs, so every value that they carry is
         // of the member kind, and they are lifted into the parent family exactly like the operation itself.
-        self.bind_operation(operation.into().into(), Self::unproject_regions(&driver)?, inputs)
+        self.bind_operation(operation.into().into(), Self::unproject_regions(&regions.into())?, inputs)
     }
 
     #[inline]
@@ -770,9 +782,9 @@ pub trait StagingContext:
         self.stage_operation::<O, _, Self::Value>(operation, [], &[])
     }
 
-    /// Stages an application of the provided [`Operation`] in this [`StagingContext`] and returns [`Tracer`]s for
-    /// its outputs. The application-scoped [`BindingRegionDriver`] provides the operation's complete ordered region
-    /// sequence. Staging consumes that driver through [`BindingRegionDriver::import_into`] to obtain destination
+    /// Stages an application of the provided [`Operation`] in this [`StagingContext`] and returns [`Tracer`]s for its
+    /// outputs. The application-scoped [`AttachedRegions`] provide the operation's complete ordered region sequence.
+    /// Staging consumes them through [`AttachedRegions::import_into`] to obtain destination
     /// [`RegionId`](crate::RegionId)s (owned region programs are imported, replayed regions preserve source-arena
     /// sharing, and shared callees are interned by [`Arc`](std::sync::Arc) identity). Staging specializes imported
     /// bodies when their requested inputs are more precise and reconciles signatures in region order. For example,
@@ -784,35 +796,37 @@ pub trait StagingContext:
     /// # Parameters
     ///
     ///   - `operation`: [`Operation`] being staged.
-    ///   - `driver`: [`BindingRegionDriver`] scoped to this [`Operation`] application.
+    ///   - `regions`: [`AttachedRegions`] (or anything convertible into them) scoped to this [`Operation`] application.
     ///   - `inputs`: Input [`Tracer`]s, in [`Operation`]-defined order.
     #[inline]
     fn stage_operation<
+        'r,
         O: Into<Self::Operation>,
-        D: BindingRegionDriver<Self::Constant, Self::Operation>,
+        R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>,
         I: std::borrow::Borrow<Self::Value>,
     >(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[I],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        stage_converted_operation(self, operation.into(), driver, inputs)
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        stage_converted_operation(self, operation.into(), regions.into(), inputs)
     }
 }
 
 /// Internal helper that stages an already converted [`Operation`] in `context`. This is the body of
-/// [`StagingContext::stage_operation`], which only converts its input operation, so that this body is compiled once
-/// per staging context, region driver, and input borrow rather than once per input operation type. Keep it free of
-/// the input operation type parameter: every closure and iterator adapter in it is instantiated per distinct signature.
-fn stage_converted_operation<
-    S: StagingContext,
-    D: BindingRegionDriver<S::Constant, S::Operation>,
-    I: std::borrow::Borrow<S::Value>,
->(
+/// [`StagingContext::stage_operation`], which only converts its input operation and regions, so that this body is
+/// compiled once per staging context and input borrow rather than once per input operation type or way of supplying
+/// regions. Keep it free of those type parameters: every closure and iterator adapter in it is instantiated per
+/// distinct signature.
+fn stage_converted_operation<S: StagingContext, I: std::borrow::Borrow<S::Value>>(
     context: &S,
     operation: S::Operation,
-    driver: D,
+    regions: AttachedRegions<'_, S::Constant, S::Operation>,
     inputs: &[I],
 ) -> Result<Vec<S::Value>, ProgramError> {
     // Every live input atom is local to exactly one builder. Validate that ownership before inspecting regions or
@@ -827,7 +841,7 @@ fn stage_converted_operation<
     // Region-free operations avoid collecting input types here as the checked builder path will infer them directly
     // from its atoms.
     let declared_region_count = operation.region_slots().len();
-    let region_interfaces = driver.region_interfaces();
+    let region_interfaces = regions.region_interfaces();
     operation.validate_region_interfaces(&region_interfaces).map_err(|error| context.error(error))?;
     let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
         (None, Vec::new(), Vec::new())
@@ -853,7 +867,7 @@ fn stage_converted_operation<
         // each hypothetical instantiated interface without importing it, then run ordinary output inference.
         let input_types = input_types
             .unwrap_or_else(|| inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>());
-        let region_interfaces = driver
+        let region_interfaces = regions
             .regions()
             .zip(&region_input_types)
             .map(|(region, input_types)| match input_types {
@@ -881,7 +895,7 @@ fn stage_converted_operation<
             .map(|r#type| Tracer::new(context.clone(), TracerState::Poison, r#type))
             .collect())
     } else {
-        // Only a healthy trace consumes the driver and mutates the builder. Importing with the operation-derived
+        // Only a healthy trace consumes the regions and mutates the builder. Importing with the operation-derived
         // input types makes each attached region boundary agree with this invocation before `add_instruction`
         // derives its output types and records the final instruction.
         let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
@@ -893,7 +907,7 @@ fn stage_converted_operation<
         // another. For example, specializing a linear call's forward region can change the cotangent shape its
         // transpose must accept. Importing both the provisional and replacement transpose directly into the final
         // builder would leave an unreachable region. Import only the finalized reachable closures below, preserving
-        // shared regions. Pure identity renaming uses the driver's ordinary import cache without a separate arena.
+        // shared regions. Pure identity renaming uses the regions' ordinary import cache without a separate arena.
         // Determine which regions require specialization before importing them, because importing instantiates
         // their type identities, which hides input types that only narrow bounds from the comparison below.
         // Valid mixed refinements that cannot be specialized (`None`) lack a structural substitution, so they
@@ -918,7 +932,7 @@ fn stage_converted_operation<
             .collect::<Vec<_>>();
 
         let mut region_ids =
-            driver.import_into(region_builder, &import_input_types).map_err(|error| context.error(error))?;
+            regions.import_into(region_builder, &import_input_types).map_err(|error| context.error(error))?;
         let instantiated_region_ids = region_ids.clone();
 
         // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
@@ -1844,14 +1858,14 @@ mod tests {
         impl_guardless_operation!(NarrowingOperation);
 
         /// Stages one narrowed body through the chosen driver and checks its result, inference count, and closure.
-        fn check_narrowed_body<D: BindingRegionDriver<DimensionValue, NarrowingOperation>>(
-            driver: D,
+        fn check_narrowed_body(
+            regions: AttachedRegions<'_, DimensionValue, NarrowingOperation>,
             inference_count: &Cell<usize>,
         ) {
             inference_count.set(0);
             let context = TracingContext::<DimensionValue, NarrowingOperation>::new();
             let input = context.input(DimensionValue::constant(3).unwrap().r#type().into_owned());
-            let outputs = context.stage_operation(NarrowingOperation::Call, driver, &[input]).unwrap();
+            let outputs = context.stage_operation(NarrowingOperation::Call, regions, &[input]).unwrap();
             assert_eq!(outputs[0].r#type().bounds(), DimensionBounds::new(5, Some(6)).unwrap());
             assert_eq!(inference_count.get(), 1);
             context
@@ -1884,13 +1898,13 @@ mod tests {
         let source = builder
             .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        check_narrowed_body(vec![source.clone()], &inference_count);
+        check_narrowed_body(vec![source.clone()].into(), &inference_count);
         let callees = [Arc::new(source.clone())];
-        check_narrowed_body(CalleeRegionDriver::new(&callees), &inference_count);
+        check_narrowed_body(CalleeRegionDriver::new(&callees).into(), &inference_count);
         let mappings = RegionReplayMappings::new();
         let roots = [source.entry()];
         check_narrowed_body(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap().into(),
             &inference_count,
         );
     }

@@ -44,9 +44,9 @@ use crate::operations::{
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    Operation, OperationProjection, OperationProvider, Program, ProgramError, ProjectedValue, ReferenceType, Region,
-    RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type, TypeError, Typed, Value,
-    ValueDirectDispatch, ValueProjection,
+    AttachedRegions, Operation, OperationProjection, OperationProvider, Program, ProgramError, ProjectedValue,
+    ReferenceType, Region, RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type,
+    TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1156,6 +1156,7 @@ where
                 // Run the batching rule inside the source instruction's recorded origin so that every staged
                 // instruction records where it came from.
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let regions = AttachedRegions::from(regions);
                 let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
                     instruction.operation().batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)
                 })?;
@@ -1599,6 +1600,7 @@ where
                 // Run the batching rule inside the source instruction's recorded origin so that every staged
                 // instruction records where it came from.
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let regions = AttachedRegions::from(regions);
                 let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
                     instruction.operation().batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)
                 })?;
@@ -2415,6 +2417,7 @@ where
                             // Run the batching rule inside the source instruction's recorded origin so that every
                             // staged instruction records where it came from.
                             let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                            let regions = AttachedRegions::from(regions);
                             let outputs = batching_context.invoke_with_provenance_origin(
                                 instruction.provenance().clone(),
                                 || {

@@ -66,8 +66,12 @@ pub enum KernelExtensionMemory {
 /// Adapter-owned kernel semantics over the canonical array and reference universe.
 ///
 /// Implementations are trusted semantic contracts, not target admission. A compiler must still validate the exact
-/// architecture, instruction capabilities, and resource requirements before compiling an extension.
-pub trait KernelExtension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> {
+/// architecture, instruction capabilities, and resource requirements before compiling an extension. Extensions are
+/// `'static` so that kernel interpretation can attach regions of any lifetime to the extended kernel operations
+/// through [`AttachedRegions`](crate::AttachedRegions).
+pub trait KernelExtension:
+    ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> + 'static
+{
     /// Returns the checked initialization timing and lifetime contract for this operation.
     ///
     /// The verifier checks consistency with canonical effects, output referents, and completion-token types. Nested

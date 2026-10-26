@@ -95,7 +95,7 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
+    AttachedRegions, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
     ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
     RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
@@ -1587,12 +1587,12 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
 
 impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> BatchingContext<C, P> {
     /// Internal helper that binds an already converted [`Operation`]. This is the body of [`Context::bind`] for this
-    /// context, which only converts its input operation, so that this body is compiled once per context and region
-    /// driver rather than once per input operation type.
-    fn bind_operation<D: BindingRegionDriver<C::Constant, C::Operation>>(
+    /// context, which only converts its input operation and regions, so that this body is compiled once per context
+    /// rather than once per input operation type or way of supplying regions.
+    fn bind_operation(
         &self,
         operation: C::Operation,
-        driver: D,
+        regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[BatchingTracer<C, P>],
     ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError> {
         // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
@@ -1600,9 +1600,9 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
         // an eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
         // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
         // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
-        operation.validate_region_interfaces(&driver.region_interfaces())?;
+        operation.validate_region_interfaces(&regions.region_interfaces())?;
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
-        let driver = RecursiveBatchingDriver::new(&driver);
+        let driver = RecursiveBatchingDriver::new(&regions);
         let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
         Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
     }
@@ -1642,13 +1642,17 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
     }
 
     #[inline]
-    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[BatchingTracer<C, P>],
-    ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError> {
-        self.bind_operation(operation.into(), driver, inputs)
+    ) -> Result<Vec<BatchingTracer<C, P>>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
+        self.bind_operation(operation.into(), regions.into(), inputs)
     }
 
     #[inline]

@@ -56,7 +56,7 @@ use crate::kernels::operations::{KernelExtension, KernelOperation};
 use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::Zero;
 use crate::programs::{
-    BindingRegionDriver, Operation, ProgramError, Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode,
+    AttachedRegions, Operation, ProgramError, Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode,
     ReferenceId, RegionDriver, RegionRef, TypeError, Typed, validated_reference_access_descriptors,
 };
 
@@ -289,7 +289,7 @@ where
         order: Option<&[usize]>,
     ) -> Result<Vec<Array>, ProgramError> {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation<Extension>>::new();
-        let regions = vec![self.body().clone()];
+        let regions = AttachedRegions::from(vec![self.body().clone()]);
         let driver = EagerInterpretationDriver::new(&regions);
         self.operation()
             .interpret_with_budget(
@@ -380,7 +380,7 @@ impl KernelCallOperation {
                 .collect::<Vec<_>>();
             let definition = KernelDefinition::new(self.clone(), body.to_program()).map_err(ProgramError::custom)?;
             let specialized = definition.specialize_prefetch(&prefetched).map_err(ProgramError::custom)?;
-            let regions = vec![specialized.body().clone()];
+            let regions = AttachedRegions::from(vec![specialized.body().clone()]);
             let driver = EagerInterpretationDriver::new(&regions);
             return specialized.operation().interpret_with_budget(
                 context,
@@ -727,13 +727,18 @@ where
         Ok(constant)
     }
 
-    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: O,
-        driver: D,
+        regions: R,
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        Self::Constant: 'r,
+        Self::Operation: 'r,
+    {
         let operation = operation.into();
+        let regions = regions.into();
         // Qualification and diagnostics inspect the same selection that ordinary access interpretation will apply.
         // Keep the original inputs for that interpretation so paths are never applied twice.
         let mut selected_references = BTreeMap::new();
@@ -777,7 +782,7 @@ where
         self.check_step(operation.name())?;
         self.check_nans(operation.name(), "input", inputs)?;
         let outputs = (|| {
-            operation.validate_region_interfaces(&driver.region_interfaces())?;
+            operation.validate_region_interfaces(&regions.region_interfaces())?;
             if let KernelOperation::Scratch(scratch) = &operation {
                 scratch.infer_output_types(
                     &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
@@ -794,7 +799,7 @@ where
             if let Some(mask_index) = mask_index {
                 operation.infer_output_types(
                     &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-                    &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+                    &regions.region_interfaces(),
                 )?;
                 let reference = selected_references.get(&0).unwrap();
                 if let Some(validity) = self.window_validity(reference)? {
@@ -809,7 +814,7 @@ where
                     inputs[mask_index] = ArrayIrValue::Array(Array::from_elements(mask.r#type().into_owned(), &lanes)?);
                     return operation.interpret(
                         &self.eager,
-                        &QualifiedKernelDriver { context: self, driver: &driver, operation: operation.name() },
+                        &QualifiedKernelDriver { context: self, driver: &regions, operation: operation.name() },
                         &inputs,
                     );
                 }
@@ -863,7 +868,7 @@ where
                 }
                 _ => operation.interpret(
                     &self.eager,
-                    &QualifiedKernelDriver { context: self, driver: &driver, operation: operation.name() },
+                    &QualifiedKernelDriver { context: self, driver: &regions, operation: operation.name() },
                     inputs,
                 ),
             }
@@ -936,11 +941,11 @@ where
         self.region(index)?.interpret_in_context(self.context, inputs)
     }
 
-    fn bind<R: BindingRegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>>(
+    fn bind(
         &self,
         _context: &EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>,
         operation: KernelOperation<Extension>,
-        regions: R,
+        regions: AttachedRegions<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
         inputs: &[ArrayIrValue<Array>],
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
         // Operations that a rule binds on its own behalf are qualified exactly like the body's instructions, so they
@@ -1670,7 +1675,7 @@ mod tests {
             check_count!("input", inputs, 1, ProgramError);
             let operation =
                 KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())));
-            driver.bind(context, operation, Vec::new(), &[inputs[0].clone(), inputs[0].clone()])
+            driver.bind(context, operation, AttachedRegions::Empty, &[inputs[0].clone(), inputs[0].clone()])
         }
     }
 
