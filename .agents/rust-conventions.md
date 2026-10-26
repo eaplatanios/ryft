@@ -14,6 +14,7 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   tests by the public functions while keeping edge cases together.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
+- Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
 - Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
   `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as `crate::Operation::name(self)` or
@@ -28,6 +29,7 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   constructor methods unless those constructors add validation or the user explicitly asks for them.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
+- Define bookkeeping types used only within one function at the beginning of that function.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical abstraction
   and keep one source of truth. For type-member classification, check `ArrayMemberType`, `DimensionMemberType`,

@@ -9,6 +9,11 @@ concurrency:
 permissions:
   contents: write
 
+# Every job builds in a fresh Cargo target directory, so incremental compilation only writes caches that no later build
+# reads, which made clean `ryft-core` test builds up to 30% slower when measured locally.
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   build:
     name: Build [${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}]
