@@ -2658,9 +2658,19 @@ impl<V: Value> ScanOptions<V> {
         &self.stacked_axis_shardings
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Resolves the count and constructs the primitive payload without discarding an explicit count value.
+    /// Creates a [`ScanOperation`] from these options. An inferred iteration count comes from a statically known
+    /// leading extent in `input_types`. [`Scan::scan`] supplies any explicit count value as a separate input, even
+    /// when its type fixes one extent, so that its runtime checks are preserved.
+    ///
+    /// # Parameters
+    ///
+    ///   - `carry_count`: Number of loop-carried values.
+    ///   - `input_types`: Types of the stacked inputs, excluding carries and the iteration-count input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a stacked input has no leading array dimension, an inferred count cannot be determined,
+    /// an explicit count value is not a dimension, or the unroll factor is zero.
     fn operation(&self, carry_count: usize, input_types: &[V::Type]) -> Result<ScanOperation<V::Type>, ProgramError>
     where
         V::Type: ScanType,
@@ -2680,6 +2690,7 @@ impl<V: Value> ScanOptions<V> {
                 Ok(array.dimension(0))
             })
             .collect::<Result<Vec<_>, TypeError>>()?;
+
         let iteration_count = match &self.iteration_count {
             ScanIterationCount::Inferred => {
                 let extent = leading_dimensions.iter().find_map(Dimension::value).ok_or_else(|| {
@@ -2696,6 +2707,7 @@ impl<V: Value> ScanOptions<V> {
             ScanIterationCount::Value(value) => {
                 let representation: ArrayIrType = value.r#type().into_owned().into();
                 let count = representation.as_dimension_type()?;
+
                 // A singleton value can refine a wider stack identity. Keep that declaration so the primitive checks
                 // their relationship, while retaining the supplied value and its ordered validation as an input.
                 let stack_dimension = count.extent().and_then(|_| {
@@ -2708,6 +2720,7 @@ impl<V: Value> ScanOptions<V> {
                 stack_dimension.cloned().unwrap_or_else(|| Dimension::Dynamic(count.to_variable()))
             }
         };
+
         Ok(ScanOperation::new(carry_count, iteration_count)
             .with_reverse(self.reverse)
             .with_unroll(self.unroll)?
@@ -2726,6 +2739,8 @@ impl<V: Value> Default for ScanOptions<V> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Context constructor for a structured [`ScanOperation`]. The explicit context also supports scans with no input
 /// values, for which the global [`scan()`] function cannot recover an execution domain.
