@@ -2740,10 +2740,8 @@ impl<V: Value> Default for ScanOptions<V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Context constructor for a structured [`ScanOperation`]. The explicit context also supports scans with no input
-/// values, for which the global [`scan()`] function cannot recover an execution domain.
+/// Context construction capability for a structured [`ScanOperation`]. The explicit context also supports scans with
+/// no input values, for which the global [`scan()`] function cannot recover an execution domain.
 ///
 /// The body receives the intrinsic scalar `i64` index, the carried state, and the slices of stacked array inputs.
 /// Reference stacks enter whole, so the index can be used to construct views explicitly. It returns the next carried
@@ -2755,7 +2753,8 @@ impl<V: Value> Default for ScanOptions<V> {
 /// including when the iteration count is zero, and its transpose preserves the corresponding reductions.
 /// Nonconstant values used by the body must be passed through its inputs; constants may be closed over.
 pub trait Scan: Context {
-    /// Traces `body` and binds one scan in this context, returning its final carry and structured stacked outputs.
+    /// Traces `body` and binds one [`ScanOperation`] in this context, returning its final carry
+    /// and structured stacked outputs.
     ///
     /// # Parameters
     ///
@@ -2769,7 +2768,11 @@ pub trait Scan: Context {
     /// Returns errors for invalid counts, signatures, carry structure/static-field changes, reference identities,
     /// incompatible metadata, or nonconvergent manual variation, and errors from tracing, alignment, or binding.
     fn scan<
-        Carry: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        Carry: Parameterized<
+                Self::Value,
+                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>,
+                ParameterStructure: PartialEq,
+            >,
         Input: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         Output: Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<Self::Value>>,
         F: FnMut(
@@ -2783,18 +2786,19 @@ pub trait Scan: Context {
         carry: Carry,
         inputs: Input,
         options: ScanOptions<Self::Value>,
-    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>
-    where
-        Carry::ParameterStructure: PartialEq;
+    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>;
 }
 
-impl<C: Context<Type: ScanType>> Scan for C
+impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>> Scan for C
 where
-    C::Operation: From<ScanOperation<C::Type>>,
     Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
 {
     fn scan<
-        Carry: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
+        Carry: Parameterized<
+                Self::Value,
+                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>,
+                ParameterStructure: PartialEq,
+            >,
         Input: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>>>,
         Output: Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<Self::Value>>,
         F: FnMut(
@@ -2808,10 +2812,7 @@ where
         carry: Carry,
         inputs: Input,
         options: ScanOptions<Self::Value>,
-    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError>
-    where
-        Carry::ParameterStructure: PartialEq,
-    {
+    ) -> Result<(Carry, Output::To<Self::Value>), ProgramError> {
         let carry_structure = carry.parameter_structure();
         let input_structure = inputs.parameter_structure();
         let carry_values = carry.into_parameters().collect::<Vec<_>>();
@@ -2830,6 +2831,7 @@ where
             carry_count,
             &operation.iteration_count,
         )?;
+
         // Validate the input-side family contract before calling the body. Matching carry-only outputs stand in for
         // its yet-untraced outputs; the complete application is validated below using the final body.
         C::Type::validate_scan_body_type_signature(
@@ -2861,8 +2863,8 @@ where
                     if next_carry.parameter_structure() != carry_structure {
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
-                                "`{SCAN_OPERATION_NAME}` body must preserve the carry parameter structure and static \
-                                 fields",
+                                "`{SCAN_OPERATION_NAME}` body must preserve the carry parameter structure \
+                                 and static fields",
                             ),
                         });
                     }
@@ -2922,6 +2924,7 @@ where
             let aligned = alignment.interpret_in_context(self, carry_values)?;
             operation_inputs[..carry_count].clone_from_slice(&aligned);
         }
+
         let output_count = body_program.output_ids().len();
         let mut outputs = self.bind(operation, vec![body_program], &operation_inputs)?;
         check_count!("output", outputs, output_count, ProgramError);
@@ -2932,6 +2935,8 @@ where
         ))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Runs [`Scan::scan`] in the execution domain recovered from the first carry or stacked-input leaf, or from an
 /// explicit iteration-count value. Structured carries and inputs may be empty individually; when all three sources
